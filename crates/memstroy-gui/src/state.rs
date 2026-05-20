@@ -248,6 +248,16 @@ pub struct EditorState {
     pub clip_editor_open: bool,
     /// Detected pose points from motion tracking (normalised [0,1] coordinates)
     pub detected_points: Vec<[f32; 2]>,
+
+    /// Index of text overlay currently being inline-edited on the preview
+    pub editing_text_overlay: Option<usize>,
+
+    /// AI generation: user prompt
+    pub ai_prompt: String,
+    /// AI generation: pasted JSON result from AI
+    pub ai_result_json: String,
+    /// AI generation: whether the AI window is open
+    pub ai_window_open: bool,
 }
 
 #[derive(Default)]
@@ -333,6 +343,11 @@ impl EditorState {
         s.clip_editor_open = false;
 
         s.detected_points = Vec::new();
+
+        s.editing_text_overlay = None;
+        s.ai_prompt = String::new();
+        s.ai_result_json = String::new();
+        s.ai_window_open = false;
 
         s
     }

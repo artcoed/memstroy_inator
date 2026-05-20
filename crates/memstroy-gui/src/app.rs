@@ -185,6 +185,11 @@ impl App {
                 }
             });
 
+            // AI Generate button
+            if ui.button(RichText::new("\u{1F916} AI Generate").strong().color(Color32::from_rgb(180, 120, 255))).clicked() {
+                self.state.ai_window_open = !self.state.ai_window_open;
+            }
+
             // Status indicator on the right
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if self.state.refreshing {
@@ -1035,6 +1040,9 @@ impl eframe::App for App {
         if self.state.clip_editor_open {
             self.state.clip_editor_open = clip_editor::clip_editor_window(ctx, &mut self.state);
         }
+
+        // AI generation floating window
+        panels::ai_generate_window(ctx, &mut self.state);
 
         // Repaint scheduling:
         // - When playing with ready frame cache: 16ms (~60fps)

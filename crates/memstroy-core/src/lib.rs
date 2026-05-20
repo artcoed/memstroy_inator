@@ -13,11 +13,13 @@ pub mod scene;
 pub mod easing;
 pub mod keyframe;
 pub mod anchor;
+pub mod ai_pipeline;
 
 pub use scene::*;
 pub use easing::*;
 pub use keyframe::*;
 pub use anchor::*;
+pub use ai_pipeline::*;
 
 use std::path::Path;
 use thiserror::Error;

@@ -509,6 +509,24 @@ fn inspector_actor_effects(ui: &mut egui::Ui, state: &mut EditorState, i: usize,
     ui.add(egui::Slider::new(&mut a.chroma_key.similarity, 0.0..=1.0).text("Similarity"));
     ui.add(egui::Slider::new(&mut a.chroma_key.blend, 0.0..=1.0).text("Blend"));
     ui.add(egui::Slider::new(&mut a.chroma_key.spill, 0.0..=1.0).text("Spill"));
+
+    ui.add_space(12.0);
+
+    // Color Correction
+    egui::CollapsingHeader::new(
+        RichText::new("Color Correction").size(12.0).strong().color(Color32::from_rgb(200, 180, 255))
+    ).default_open(true).show(ui, |ui| {
+        let cc = &mut state.scene.actors[i].color_correction;
+        ui.add(egui::Slider::new(&mut cc.brightness, -1.0..=1.0).text("Brightness"));
+        ui.add(egui::Slider::new(&mut cc.contrast, 0.0..=3.0).text("Contrast"));
+        ui.add(egui::Slider::new(&mut cc.saturation, 0.0..=3.0).text("Saturation"));
+        ui.add(egui::Slider::new(&mut cc.temperature, -1.0..=1.0).text("Temperature"));
+        ui.add_space(4.0);
+        if ui.small_button("Reset").clicked() {
+            let cc = &mut state.scene.actors[i].color_correction;
+            *cc = memstroy_core::ColorCorrection::default();
+        }
+    });
 }
 
 fn inspector_overlay(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
@@ -1582,6 +1600,125 @@ pub fn preview(ui: &mut egui::Ui, state: &mut EditorState) {
         }
     }
 
+    // ─── TEXT OVERLAY RENDERING & INLINE EDITING ───
+    {
+        let playhead = state.playhead;
+        let mut clicked_overlay: Option<usize> = None;
+
+        for (ov_idx, ov) in state.scene.overlays.iter().enumerate() {
+            if let Overlay::Text(text_ov) = ov {
+                // Check if overlay is active at current playhead
+                if playhead >= text_ov.t_in && playhead <= text_ov.t_out {
+                    // Calculate position on preview rect
+                    let ov_state = text_ov.layout.first()
+                        .map(|kf| kf.value)
+                        .unwrap_or_default();
+                    let ox = rect.min.x + ov_state.pos[0] * rect.width();
+                    let oy = rect.min.y + ov_state.pos[1] * rect.height();
+                    let scale_factor = ov_state.scale * (rect.width() / 1080.0);
+                    let font_size = text_ov.style.font_size * scale_factor * 0.3;
+
+                    // Draw the text at that position
+                    let text_color = Color32::from_rgb(
+                        text_ov.style.color[0],
+                        text_ov.style.color[1],
+                        text_ov.style.color[2],
+                    );
+
+                    let galley = ui.painter().layout_no_wrap(
+                        text_ov.text.clone(),
+                        egui::FontId::proportional(font_size.max(8.0)),
+                        text_color,
+                    );
+                    let text_rect = egui::Rect::from_center_size(
+                        egui::pos2(ox, oy),
+                        galley.size(),
+                    );
+
+                    // Draw background plate if configured
+                    if let Some(box_col) = text_ov.style.box_color {
+                        let pad = 4.0;
+                        let bg_rect = text_rect.expand(pad);
+                        ui.painter().rect_filled(
+                            bg_rect,
+                            Rounding::same(2.0),
+                            Color32::from_rgb(box_col[0], box_col[1], box_col[2]),
+                        );
+                    }
+
+                    ui.painter().galley(text_rect.min, galley, text_color);
+
+                    // Check if user clicked on this text overlay region
+                    if preview_resp.clicked() && !state.eyedropper_active {
+                        if let Some(pos) = preview_resp.interact_pointer_pos() {
+                            if text_rect.expand(6.0).contains(pos) {
+                                clicked_overlay = Some(ov_idx);
+                            }
+                        }
+                    }
+
+                    // Draw selection indicator if this overlay is selected
+                    if state.selection == Selection::Overlay(ov_idx) {
+                        ui.painter().rect_stroke(
+                            text_rect.expand(3.0),
+                            Rounding::same(2.0),
+                            Stroke::new(1.5, Color32::from_rgb(80, 200, 120)),
+                        );
+                    }
+                }
+            }
+        }
+
+        // Handle click selection
+        if let Some(ov_idx) = clicked_overlay {
+            state.selection = Selection::Overlay(ov_idx);
+            state.editing_text_overlay = Some(ov_idx);
+        }
+
+        // Handle Escape to stop editing
+        let escape_pressed = ui.input(|i| i.key_pressed(egui::Key::Escape));
+        if escape_pressed {
+            state.editing_text_overlay = None;
+        }
+
+        // If clicked outside overlays on preview (and not eyedropper), stop editing
+        if preview_resp.clicked() && !state.eyedropper_active && clicked_overlay.is_none() {
+            state.editing_text_overlay = None;
+        }
+
+        // Show floating TextEdit when editing_text_overlay is Some
+        if let Some(edit_idx) = state.editing_text_overlay {
+            if edit_idx < state.scene.overlays.len() {
+                if let Overlay::Text(text_ov) = &state.scene.overlays[edit_idx] {
+                    let ov_state = text_ov.layout.first()
+                        .map(|kf| kf.value)
+                        .unwrap_or_default();
+                    let ox = rect.min.x + ov_state.pos[0] * rect.width();
+                    let oy = rect.min.y + ov_state.pos[1] * rect.height();
+
+                    let area_id = ui.id().with("text_edit_overlay");
+                    egui::Area::new(area_id)
+                        .fixed_pos(egui::pos2(ox - 80.0, oy + 15.0))
+                        .show(ui.ctx(), |ui| {
+                            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                if let Overlay::Text(ref mut t) = &mut state.scene.overlays[edit_idx] {
+                                    let response = ui.add(
+                                        egui::TextEdit::multiline(&mut t.text)
+                                            .desired_width(200.0)
+                                            .desired_rows(2)
+                                            .hint_text("Enter text...")
+                                    );
+                                    if response.lost_focus() {
+                                        state.editing_text_overlay = None;
+                                    }
+                                }
+                            });
+                        });
+                }
+            }
+        }
+    }
+
     // Eyedropper handling
     if state.eyedropper_active && preview_resp.clicked() {
         if let Some(pos) = preview_resp.interact_pointer_pos() {
@@ -1662,6 +1799,58 @@ fn apply_chroma_key(image: &mut egui::ColorImage, params: &ChromaKeyParams) {
     }
 }
 
+/// Apply color correction (brightness, contrast, saturation, temperature) to a ColorImage.
+pub fn apply_color_correction(image: &mut egui::ColorImage, params: &memstroy_core::ColorCorrection) {
+    // Early exit if parameters are all defaults
+    if (params.brightness - 0.0).abs() < 0.001
+        && (params.contrast - 1.0).abs() < 0.001
+        && (params.saturation - 1.0).abs() < 0.001
+        && (params.temperature - 0.0).abs() < 0.001
+    {
+        return;
+    }
+
+    for pixel in image.pixels.iter_mut() {
+        let mut r = pixel.r() as f32 / 255.0;
+        let mut g = pixel.g() as f32 / 255.0;
+        let mut b = pixel.b() as f32 / 255.0;
+
+        // Brightness: add offset
+        r += params.brightness;
+        g += params.brightness;
+        b += params.brightness;
+
+        // Contrast: multiply around midpoint 0.5
+        r = (r - 0.5) * params.contrast + 0.5;
+        g = (g - 0.5) * params.contrast + 0.5;
+        b = (b - 0.5) * params.contrast + 0.5;
+
+        // Saturation: lerp toward luminance
+        let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        r = luma + (r - luma) * params.saturation;
+        g = luma + (g - luma) * params.saturation;
+        b = luma + (b - luma) * params.saturation;
+
+        // Temperature: shift warm (positive) / cool (negative)
+        // Positive temperature: add red, subtract blue
+        // Negative temperature: add blue, subtract red
+        r += params.temperature * 0.1;
+        b -= params.temperature * 0.1;
+
+        // Clamp
+        r = r.clamp(0.0, 1.0);
+        g = g.clamp(0.0, 1.0);
+        b = b.clamp(0.0, 1.0);
+
+        *pixel = Color32::from_rgba_unmultiplied(
+            (r * 255.0).round() as u8,
+            (g * 255.0).round() as u8,
+            (b * 255.0).round() as u8,
+            pixel.a(),
+        );
+    }
+}
+
 // ─── HELPERS ─────────────────────────────────────────────────────────
 
 fn color_edit_u8(ui: &mut egui::Ui, c: &mut [u8; 3]) {
@@ -1710,6 +1899,7 @@ pub fn add_actor_from_clip(state: &mut EditorState, path: &PathBuf) {
         flip_horizontal: false,
         attachments: Vec::new(),
         visible: true,
+        color_correction: ColorCorrection::default(),
     };
     state.scene.actors.push(actor);
     state.selection = Selection::Actor(state.scene.actors.len() - 1);
@@ -1764,6 +1954,7 @@ fn add_actor_from_clip_at_time(state: &mut EditorState, path: &PathBuf, t: f32) 
         flip_horizontal: false,
         attachments: Vec::new(),
         visible: true,
+        color_correction: ColorCorrection::default(),
     };
     state.scene.actors.push(actor);
     state.selection = Selection::Actor(state.scene.actors.len() - 1);
@@ -1808,6 +1999,203 @@ fn probe_video_duration(path: &PathBuf) -> f32 {
     {
         Ok(out) => String::from_utf8_lossy(&out.stdout).trim().parse::<f32>().unwrap_or(5.0),
         Err(_) => 5.0,
+    }
+}
+
+
+// ─── AI GENERATION PANEL ─────────────────────────────────────────────
+
+/// AI meme generation floating window.
+/// Shows prompt input, generate button, result paste area, and apply button.
+pub fn ai_generate_window(ctx: &egui::Context, state: &mut EditorState) {
+    if !state.ai_window_open {
+        return;
+    }
+
+    let mut open = state.ai_window_open;
+    egui::Window::new("AI Meme Generator")
+        .open(&mut open)
+        .resizable(true)
+        .default_width(500.0)
+        .default_height(600.0)
+        .show(ctx, |ui| {
+            ui.label(RichText::new("AI-Powered Meme Montage").size(16.0).strong()
+                .color(Color32::from_rgb(180, 120, 255)));
+            ui.add_space(4.0);
+            ui.label(RichText::new("Describe the meme you want to create. The AI will generate a montage plan.")
+                .size(11.0).color(COL_TEXT_DIM));
+            ui.add_space(8.0);
+
+            // Prompt input
+            ui.label(RichText::new("Creative Prompt:").size(12.0).strong());
+            ui.add(
+                egui::TextEdit::multiline(&mut state.ai_prompt)
+                    .desired_width(ui.available_width())
+                    .desired_rows(3)
+                    .hint_text("e.g. Сделай мем где Мелстрой бьет по столу когда видит цену биткоина")
+            );
+            ui.add_space(8.0);
+
+            // Generate button - builds ProjectInput and copies to clipboard
+            ui.horizontal(|ui| {
+                let generate_btn = egui::Button::new(
+                    RichText::new("Generate (Copy to Clipboard)").color(Color32::WHITE).size(13.0)
+                ).fill(Color32::from_rgb(100, 60, 200)).rounding(Rounding::same(6.0));
+
+                if ui.add(generate_btn).clicked() && !state.ai_prompt.is_empty() {
+                    let project_input = build_project_input(state);
+                    if let Ok(json) = serde_json::to_string_pretty(&project_input) {
+                        ui.output_mut(|o| o.copied_text = json.clone());
+                        state.status = "AI ProjectInput copied to clipboard!".into();
+                    }
+                }
+            });
+
+            ui.add_space(12.0);
+            ui.separator();
+            ui.add_space(8.0);
+
+            // Result paste area
+            ui.label(RichText::new("Paste AI Response (MontageOutput JSON):").size(12.0).strong());
+            egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::multiline(&mut state.ai_result_json)
+                        .desired_width(ui.available_width())
+                        .desired_rows(8)
+                        .hint_text("Paste the AI's JSON response here...")
+                        .code_editor()
+                );
+            });
+            ui.add_space(8.0);
+
+            // Apply button
+            ui.horizontal(|ui| {
+                let apply_btn = egui::Button::new(
+                    RichText::new("Apply to Scene").color(Color32::WHITE).size(13.0)
+                ).fill(Color32::from_rgb(50, 160, 80)).rounding(Rounding::same(6.0));
+
+                if ui.add(apply_btn).clicked() && !state.ai_result_json.is_empty() {
+                    match serde_json::from_str::<memstroy_core::MontageOutput>(&state.ai_result_json) {
+                        Ok(output) => {
+                            let clips_dir = state.clips_dir();
+                            // Save undo snapshot
+                            state.undo.push(&state.scene);
+                            output.apply_to_scene(&mut state.scene, &clips_dir);
+                            state.status = "AI montage applied to scene!".into();
+                        }
+                        Err(e) => {
+                            state.status = format!("JSON parse error: {}", e);
+                        }
+                    }
+                }
+
+                if ui.button("Clear").clicked() {
+                    state.ai_result_json.clear();
+                }
+            });
+
+            ui.add_space(8.0);
+
+            // Show AI reasoning if result was applied
+            if !state.ai_result_json.is_empty() {
+                if let Ok(output) = serde_json::from_str::<memstroy_core::MontageOutput>(&state.ai_result_json) {
+                    if !output.reasoning.is_empty() {
+                        ui.separator();
+                        ui.add_space(4.0);
+                        ui.label(RichText::new("AI Reasoning:").size(12.0).strong()
+                            .color(Color32::from_rgb(100, 200, 255)));
+                        ui.label(RichText::new(&output.reasoning).size(11.0).color(COL_TEXT_DIM));
+                    }
+                }
+            }
+        });
+    state.ai_window_open = open;
+}
+
+/// Build a ProjectInput from the current editor state.
+fn build_project_input(state: &EditorState) -> memstroy_core::ProjectInput {
+    use memstroy_core::*;
+
+    let available_clips: Vec<ClipInfo> = state.library.mellstroy_clips.iter().map(|c| {
+        ClipInfo {
+            id: format!("{}", c.id),
+            description: c.description.clone(),
+            duration: 5.0, // default estimate
+            path: c.path.display().to_string(),
+            tags: Vec::new(),
+            detected_actions: Vec::new(),
+        }
+    }).collect();
+
+    let available_backgrounds: Vec<AssetInfo> = state.library.backgrounds.iter().map(|p| {
+        AssetInfo {
+            id: p.file_stem().and_then(|s| s.to_str()).unwrap_or("bg").to_string(),
+            path: p.display().to_string(),
+            description: p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string(),
+            duration: None,
+        }
+    }).collect();
+
+    let available_props: Vec<AssetInfo> = state.library.props.iter().map(|p| {
+        AssetInfo {
+            id: p.file_stem().and_then(|s| s.to_str()).unwrap_or("prop").to_string(),
+            path: p.display().to_string(),
+            description: p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string(),
+            duration: None,
+        }
+    }).collect();
+
+    let current_scene = if !state.scene.actors.is_empty() || !state.scene.overlays.is_empty() {
+        Some(SceneSnapshot {
+            actors: state.scene.actors.iter().map(|a| {
+                let pos = a.layout.first().map(|kf| kf.value.pos).unwrap_or([0.5, 0.5]);
+                let scale = a.layout.first().map(|kf| kf.value.scale).unwrap_or(1.0);
+                ActorSnapshot {
+                    clip_id: a.id.clone(),
+                    t_in: a.t_in.unwrap_or(0.0),
+                    t_out: a.t_out.unwrap_or(state.scene.output.duration),
+                    position: pos,
+                    scale,
+                }
+            }).collect(),
+            texts: state.scene.overlays.iter().filter_map(|ov| {
+                if let Overlay::Text(t) = ov {
+                    let pos = t.layout.first().map(|kf| kf.value.pos).unwrap_or([0.5, 0.5]);
+                    Some(TextSnapshot {
+                        text: t.text.clone(),
+                        t_in: t.t_in,
+                        t_out: t.t_out,
+                        position: pos,
+                    })
+                } else {
+                    None
+                }
+            }).collect(),
+            duration: state.scene.output.duration,
+        })
+    } else {
+        None
+    };
+
+    ProjectInput {
+        prompt: state.ai_prompt.clone(),
+        available_clips,
+        available_backgrounds,
+        available_props,
+        available_audio: Vec::new(),
+        canvas: CanvasConstraints {
+            resolution: state.scene.output.resolution,
+            fps: state.scene.output.fps,
+            max_duration: 60.0,
+            target_duration: state.scene.output.duration,
+        },
+        current_scene,
+        style: StyleHints {
+            text_style: "meme_impact".to_string(),
+            pacing: "fast".to_string(),
+            use_chroma_key: true,
+            transitions: vec!["cut".to_string(), "snap".to_string()],
+        },
     }
 }
 
