@@ -172,7 +172,12 @@ pub struct Actor {
     pub flip_horizontal: bool,
     #[serde(default)]
     pub attachments: Vec<Attachment>,
+    /// Whether this actor is visible in preview. Defaults to true.
+    #[serde(default = "default_true")]
+    pub visible: bool,
 }
+
+fn default_true() -> bool { true }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct ActorState {

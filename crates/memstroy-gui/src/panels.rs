@@ -250,6 +250,7 @@ fn actor_editor(ui: &mut egui::Ui, a: &mut Actor) {
     );
     ui.add_space(6.0);
 
+    ui.checkbox(&mut a.visible, "\u{1F441} Visible");
     ui.checkbox(&mut a.flip_horizontal, "\u{1F500} Flip horizontally");
     ui.checkbox(&mut a.loop_source, "\u{1F501} Loop source");
     ui.add(egui::DragValue::new(&mut a.source_start).speed(0.05).prefix("Start: "));
@@ -639,7 +640,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             let mut end;
             {
                 let a = &state.scene.actors[i];
-                label = format!("\u{1F3AD} {}", a.id);
+                label = format!("[{}] \u{1F3AD} {}", i + 1, a.id);
                 start = a.t_in.unwrap_or(0.0);
                 // If no t_out, span full track width
                 end = a.t_out.unwrap_or(duration);
@@ -1040,6 +1041,57 @@ fn t_to_px(t_start: f32, t_end: f32, total: f32, track_left: f32, track_width: f
 
 // ─── PREVIEW ─────────────────────────────────────────────────────────
 
+/// Apply chroma-key processing to a ColorImage in-place.
+/// Uses RGB Euclidean distance (normalized to 0..1) for keying.
+fn apply_chroma_key(image: &mut egui::ColorImage, params: &memstroy_core::ChromaKeyParams) {
+    let kr = params.key_color[0] as f32 / 255.0;
+    let kg = params.key_color[1] as f32 / 255.0;
+    let kb = params.key_color[2] as f32 / 255.0;
+
+    let similarity = params.similarity;
+    let blend = params.blend;
+    let spill = params.spill;
+
+    for pixel in image.pixels.iter_mut() {
+        let r = pixel.r() as f32 / 255.0;
+        let g = pixel.g() as f32 / 255.0;
+        let b = pixel.b() as f32 / 255.0;
+
+        // Euclidean distance in RGB space, normalized by sqrt(3) so max distance = 1.0
+        let dr = r - kr;
+        let dg = g - kg;
+        let db = b - kb;
+        let distance = (dr * dr + dg * dg + db * db).sqrt() / 1.732_050_8; // sqrt(3)
+
+        if distance < similarity {
+            // Fully transparent
+            *pixel = Color32::from_rgba_unmultiplied(pixel.r(), pixel.g(), pixel.b(), 0);
+        } else if distance < similarity + blend {
+            // Feathered edge: proportional alpha
+            let t = (distance - similarity) / blend.max(0.001);
+            let alpha = (t * 255.0).round() as u8;
+            // Spill suppression on feathered pixels
+            let mut new_g = pixel.g() as f32;
+            let spill_factor = spill * (1.0 - distance);
+            new_g = (new_g - new_g * spill_factor).max(0.0);
+            *pixel = Color32::from_rgba_unmultiplied(
+                pixel.r(),
+                new_g.round() as u8,
+                pixel.b(),
+                alpha,
+            );
+        } else {
+            // Spill suppression for pixels near the key color
+            if distance < similarity + blend + 0.15 {
+                let proximity = 1.0 - ((distance - similarity - blend) / 0.15).clamp(0.0, 1.0);
+                let spill_factor = spill * proximity;
+                let new_g = (pixel.g() as f32 * (1.0 - spill_factor)).round() as u8;
+                *pixel = Color32::from_rgba_unmultiplied(pixel.r(), new_g, pixel.b(), pixel.a());
+            }
+        }
+    }
+}
+
 pub fn preview(ui: &mut egui::Ui, state: &mut EditorState) {
     ui.heading(RichText::new("\u{1F440} Preview").size(16.0).strong());
     ui.add_space(4.0);
@@ -1076,24 +1128,46 @@ pub fn preview(ui: &mut egui::Ui, state: &mut EditorState) {
     let t = state.playhead;
     let mut any_frame_shown = false;
 
-    for (actor_idx, actor) in state.scene.actors.iter().enumerate() {
+    // Collect actor data we need (to avoid borrow conflicts with frame_caches)
+    let actor_data: Vec<_> = state.scene.actors.iter().enumerate().map(|(idx, actor)| {
+        (
+            idx,
+            actor.visible,
+            actor.t_in.unwrap_or(0.0),
+            actor.t_out.unwrap_or(f32::MAX),
+            actor.source_start,
+            actor.chroma_key.clone(),
+        )
+    }).collect();
+
+    for (actor_idx, visible, t_in, t_out, source_start, chroma_key) in actor_data.iter() {
+        // Skip invisible actors
+        if !visible {
+            continue;
+        }
+
         // Check if this actor is active at current playhead time
-        let t_in = actor.t_in.unwrap_or(0.0);
-        let t_out = actor.t_out.unwrap_or(f32::MAX);
-        if t < t_in || t > t_out {
+        if t < *t_in || t > *t_out {
             continue; // clip not active at this time
         }
 
         // Compute local time within this clip
-        let local_t = t - t_in + actor.source_start;
+        let local_t = t - t_in + source_start;
 
         // Get frame from this actor's cache
-        if let Some(fc) = state.frame_caches.get_mut(actor_idx) {
+        if let Some(fc) = state.frame_caches.get_mut(*actor_idx) {
             if fc.is_ready() {
-                if let Some(tex) = fc.frame_at_time(local_t, ui.ctx()) {
-                    let tex_id = tex.id();
+                if let Some(mut img) = fc.raw_frame_at_time(local_t) {
+                    // Apply chroma-key processing
+                    apply_chroma_key(&mut img, chroma_key);
+                    // Upload to texture and display
+                    let tex = ui.ctx().load_texture(
+                        format!("layer_{}", actor_idx),
+                        img,
+                        egui::TextureOptions::LINEAR,
+                    );
                     let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-                    ui.painter().image(tex_id, rect, uv, Color32::WHITE);
+                    ui.painter().image(tex.id(), rect, uv, Color32::WHITE);
                     any_frame_shown = true;
                 }
             } else if fc.extracting {
@@ -1224,6 +1298,7 @@ fn add_actor_from_clip(state: &mut EditorState, path: &PathBuf) {
         loop_source: true,
         flip_horizontal: false,
         attachments: Vec::new(),
+        visible: true,
     };
 
     // Expand scene output duration to fit the clip if needed

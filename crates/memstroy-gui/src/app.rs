@@ -306,6 +306,8 @@ impl App {
                 right.id = format!("{}_R", right.id);
                 right.t_in = Some(t);
                 right.t_out = Some(end);
+                // Correct source_start for the right half
+                right.source_start = a.source_start + (t - start);
                 // Keep only keyframes in each half (by time).
                 right.layout.retain(|kf| kf.t >= t);
                 self.state.mutate(move |s| {

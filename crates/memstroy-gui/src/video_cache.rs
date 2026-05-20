@@ -197,6 +197,49 @@ impl FrameCache {
         self.ready
     }
 
+    /// Get the raw ColorImage for a given time (for post-processing like chroma-key).
+    /// Same logic as frame_at_time but returns the image, not the texture.
+    pub fn raw_frame_at_time(&mut self, t: f32) -> Option<ColorImage> {
+        if !self.ready || self.frame_count == 0 {
+            return None;
+        }
+
+        // Check for completed background pre-load
+        self.poll_preload();
+
+        // Compute frame index (0-based)
+        let frame_index = ((t * self.fps).floor() as usize)
+            .clamp(0, self.frame_count.saturating_sub(1));
+
+        // Try buffer first
+        if self.is_in_buffer(frame_index) {
+            let buf_idx = frame_index - self.buffer_start;
+            if let Some(img) = self.buffer.get(buf_idx).and_then(|s| s.clone()) {
+                // Trigger read-ahead
+                if frame_index != self.last_displayed_frame {
+                    self.last_displayed_frame = frame_index;
+                    let buffer_end = self.buffer_start + self.buffer_size;
+                    let remaining = buffer_end.saturating_sub(frame_index);
+                    if remaining < self.buffer_size / 3 && !self.preloading {
+                        self.trigger_preload(frame_index);
+                    }
+                }
+                return Some(img);
+            }
+        }
+
+        // Fallback: load from disk (seek case)
+        let img = self.load_frame_from_disk(frame_index);
+        if img.is_some() {
+            self.buffer_start = frame_index;
+            self.buffer = vec![None; self.buffer_size];
+            self.buffer[0] = img.clone();
+            self.trigger_preload(frame_index);
+            self.last_displayed_frame = frame_index;
+        }
+        img
+    }
+
     /// Get the texture for a given time `t` in seconds.
     /// Uses a ring buffer for O(1) access and reuses a single TextureHandle.
     /// Returns `None` if the cache is not ready or frame cannot be loaded.
