@@ -121,13 +121,24 @@ async fn generate_clip_thumbnails(
     clips_dir: &std::path::Path,
     state: &memstroy_tg::model::DownloadState,
 ) {
+    let bin = ffmpeg_binary();
+    // Check ffmpeg is available before attempting thumbnails
+    let ffmpeg_ok = std::process::Command::new(&bin)
+        .arg("-version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok();
+    if !ffmpeg_ok {
+        info!("ffmpeg not found, skipping thumbnail generation. Install ffmpeg and add to PATH.");
+        return;
+    }
+
     let thumbs_dir = clips_dir.join("thumbs");
     if let Err(e) = std::fs::create_dir_all(&thumbs_dir) {
         warn!("Failed to create thumbs dir: {}", e);
         return;
     }
-
-    let bin = ffmpeg_binary();
     for clip in state.all_clips_sorted() {
         if !clip.downloaded {
             continue;
