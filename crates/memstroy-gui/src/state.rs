@@ -239,6 +239,13 @@ pub struct EditorState {
     /// Multi-selection: additional actor indices selected via Ctrl+click.
     /// The primary `selection` field still tracks the "focused" element for the inspector.
     pub multi_select: Vec<usize>,
+
+    /// Whether curve editor panel is open
+    pub curve_editor_open: bool,
+    /// Which property is selected in curve editor (0=scale, 1=pos_x, 2=pos_y, 3=opacity, 4=rotation)
+    pub curve_editor_property: usize,
+    /// Whether clip editor window is open
+    pub clip_editor_open: bool,
 }
 
 #[derive(Default)]
@@ -316,6 +323,11 @@ impl EditorState {
             Track::audio("A2"),
         ];
 
+        // New window states
+        s.curve_editor_open = false;
+        s.curve_editor_property = 0;
+        s.clip_editor_open = false;
+
         s
     }
 
@@ -392,6 +404,53 @@ impl EditorState {
     pub fn add_audio_track(&mut self) {
         let n = self.tracks.iter().filter(|t| t.kind == TrackKind::Audio).count() + 1;
         self.tracks.push(Track::audio(format!("A{}", n)));
+    }
+
+    /// Save timeline layout state (zoom, scroll, track heights) to a JSON file.
+    pub fn save_layout(&self, path: &std::path::Path) {
+        let track_heights: Vec<f32> = self.tracks.iter().map(|t| t.height).collect();
+        let data = serde_json::json!({
+            "timeline_zoom": self.timeline_zoom,
+            "timeline_scroll": self.timeline_scroll,
+            "track_heights": track_heights,
+            "curve_editor_open": self.curve_editor_open,
+            "curve_editor_property": self.curve_editor_property,
+            "clip_editor_open": self.clip_editor_open,
+        });
+        if let Ok(json_str) = serde_json::to_string_pretty(&data) {
+            let _ = std::fs::write(path, json_str);
+        }
+    }
+
+    /// Load timeline layout state (zoom, scroll, track heights) from a JSON file.
+    pub fn load_layout(&mut self, path: &std::path::Path) {
+        let Ok(contents) = std::fs::read_to_string(path) else { return };
+        let Ok(data) = serde_json::from_str::<serde_json::Value>(&contents) else { return };
+
+        if let Some(zoom) = data.get("timeline_zoom").and_then(|v| v.as_f64()) {
+            self.timeline_zoom = zoom as f32;
+        }
+        if let Some(scroll) = data.get("timeline_scroll").and_then(|v| v.as_f64()) {
+            self.timeline_scroll = scroll as f32;
+        }
+        if let Some(heights) = data.get("track_heights").and_then(|v| v.as_array()) {
+            for (i, h) in heights.iter().enumerate() {
+                if i < self.tracks.len() {
+                    if let Some(hf) = h.as_f64() {
+                        self.tracks[i].height = hf as f32;
+                    }
+                }
+            }
+        }
+        if let Some(ce_open) = data.get("curve_editor_open").and_then(|v| v.as_bool()) {
+            self.curve_editor_open = ce_open;
+        }
+        if let Some(ce_prop) = data.get("curve_editor_property").and_then(|v| v.as_u64()) {
+            self.curve_editor_property = ce_prop as usize;
+        }
+        if let Some(clip_open) = data.get("clip_editor_open").and_then(|v| v.as_bool()) {
+            self.clip_editor_open = clip_open;
+        }
     }
 
     pub fn reload_library(&mut self) {

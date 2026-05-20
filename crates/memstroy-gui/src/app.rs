@@ -11,6 +11,8 @@ use crate::jobs::{spawn_preview, spawn_refresh, spawn_render, JobEvent};
 use crate::node_editor::NodeEditor;
 use crate::panels;
 use crate::state::{EditorState, Selection};
+use crate::clip_editor;
+use crate::curve_editor;
 
 pub struct App {
     rt: Runtime,
@@ -113,8 +115,11 @@ impl App {
                         match Scene::load(&path) {
                             Ok(s) => {
                                 self.state.scene = s;
-                                self.state.scene_path = Some(path);
+                                self.state.scene_path = Some(path.clone());
                                 self.state.status = "\u{2705} Scene loaded.".into();
+                                // Load layout alongside scene
+                                let layout_path = path.with_extension("layout.json");
+                                self.state.load_layout(&layout_path);
                             }
                             Err(e) => self.state.status = format!("\u{274C} Open failed: {e}"),
                         }
@@ -589,7 +594,12 @@ impl App {
     fn save_scene(&mut self) {
         if let Some(path) = self.state.scene_path.clone() {
             match self.state.scene.save(&path) {
-                Ok(()) => self.state.status = "\u{2705} Saved.".into(),
+                Ok(()) => {
+                    self.state.status = "\u{2705} Saved.".into();
+                    // Save layout alongside scene
+                    let layout_path = path.with_extension("layout.json");
+                    self.state.save_layout(&layout_path);
+                }
                 Err(e) => self.state.status = format!("\u{274C} Save failed: {e}"),
             }
         } else {
@@ -605,8 +615,11 @@ impl App {
         {
             match self.state.scene.save(&path) {
                 Ok(()) => {
-                    self.state.scene_path = Some(path);
+                    self.state.scene_path = Some(path.clone());
                     self.state.status = "\u{2705} Saved.".into();
+                    // Save layout alongside scene
+                    let layout_path = path.with_extension("layout.json");
+                    self.state.save_layout(&layout_path);
                 }
                 Err(e) => self.state.status = format!("\u{274C} Save failed: {e}"),
             }
@@ -801,6 +814,44 @@ impl eframe::App for App {
 
         // Node editor floating window (scaffold)
         self.node_editor.show(ctx, &mut self.state.node_editor_open);
+
+        // Curve editor floating window
+        if self.state.curve_editor_open {
+            let mut curve_open = self.state.curve_editor_open;
+            egui::Window::new("Curve Editor")
+                .open(&mut curve_open)
+                .default_size([600.0, 200.0])
+                .resizable(true)
+                .collapsible(true)
+                .anchor(egui::Align2::LEFT_BOTTOM, [10.0, -10.0])
+                .show(ctx, |ui| {
+                    match self.state.selection {
+                        Selection::Actor(i) if i < self.state.scene.actors.len() => {
+                            let duration = self.state.scene.output.duration;
+                            let playhead = self.state.playhead;
+                            let keyframes = &mut self.state.scene.actors[i].layout;
+                            curve_editor::curve_editor_panel(
+                                ui,
+                                keyframes,
+                                duration,
+                                &mut self.state.curve_editor_property,
+                                playhead,
+                            );
+                        }
+                        _ => {
+                            ui.label(egui::RichText::new("Select an actor to edit curves.")
+                                .italics()
+                                .color(Color32::from_rgb(140, 140, 160)));
+                        }
+                    }
+                });
+            self.state.curve_editor_open = curve_open;
+        }
+
+        // Clip editor floating window
+        if self.state.clip_editor_open {
+            self.state.clip_editor_open = clip_editor::clip_editor_window(ctx, &mut self.state);
+        }
 
         // Repaint scheduling:
         // - When playing with ready frame cache: 16ms (~60fps)
