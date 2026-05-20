@@ -200,12 +200,47 @@ pub async fn incremental_refresh(
     state.last_refresh = Some(chrono::Utc::now().to_rfc3339());
     state.save(state_path)?;
 
+    // Generate thumbnails for newly downloaded clips
+    on_progress("Generating thumbnails...");
+    let thumbs_dir = clips_dir.join("thumbs");
+    let _ = fs::create_dir_all(&thumbs_dir).await;
+    for id in &successfully_downloaded {
+        let video_path = clips_dir.join(format!("{}.mp4", id));
+        let thumb_path = thumbs_dir.join(format!("{}.jpg", id));
+        if !thumb_path.exists() {
+            let _ = generate_thumbnail(&video_path, &thumb_path).await;
+        }
+    }
+
     on_progress(&format!(
         "Done! {} downloaded, {} failed",
         stats.downloaded, stats.failed
     ));
 
     Ok((state, stats))
+}
+
+/// Extract a thumbnail frame from a video at t=1s using ffmpeg.
+async fn generate_thumbnail(video: &Path, output: &Path) -> Result<()> {
+    let status = tokio::process::Command::new("ffmpeg")
+        .args([
+            "-y", "-hide_banner", "-loglevel", "error",
+            "-i",
+        ])
+        .arg(video.as_os_str())
+        .args([
+            "-ss", "1.0",
+            "-vframes", "1",
+            "-vf", "scale=160:-1",
+            "-q:v", "5",
+        ])
+        .arg(output.as_os_str())
+        .status()
+        .await?;
+    if !status.success() {
+        anyhow::bail!("ffmpeg thumbnail failed for {}", video.display());
+    }
+    Ok(())
 }
 
 async fn fetch_one(client: &reqwest::Client, url: &str, target: &Path) -> Result<u64> {

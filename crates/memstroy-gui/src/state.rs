@@ -37,6 +37,7 @@ pub struct LibraryClip {
     pub path: PathBuf,
     pub description: String,
     pub downloaded: bool,
+    pub thumbnail: Option<PathBuf>,
 }
 
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
@@ -124,11 +125,16 @@ impl EditorState {
             .all_clips_sorted()
             .into_iter()
             .filter(|c| c.downloaded)
-            .map(|c| LibraryClip {
-                id: c.id,
-                path: clips_dir.join(&c.filename),
-                description: c.description.clone(),
-                downloaded: c.downloaded,
+            .map(|c| {
+                let thumb_path = clips_dir.join("thumbs").join(format!("{}.jpg", c.id));
+                let thumbnail = if thumb_path.exists() { Some(thumb_path) } else { None };
+                LibraryClip {
+                    id: c.id,
+                    path: clips_dir.join(&c.filename),
+                    description: c.description.clone(),
+                    downloaded: c.downloaded,
+                    thumbnail,
+                }
             })
             .collect();
 

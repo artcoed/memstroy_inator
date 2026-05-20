@@ -119,32 +119,43 @@ fn clip_card(ui: &mut egui::Ui, state: &mut EditorState, clip: &crate::state::Li
     let frame = egui::Frame::none()
         .fill(Color32::from_rgb(32, 32, 48))
         .rounding(Rounding::same(8.0))
-        .inner_margin(egui::Margin::same(8.0))
+        .inner_margin(egui::Margin::same(6.0))
         .stroke(egui::Stroke::new(1.0, Color32::from_rgb(50, 50, 70)));
 
     frame.show(ui, |ui| {
         ui.horizontal(|ui| {
-            // Add button
-            let add_btn = egui::Button::new(
-                RichText::new("+").size(16.0).color(Color32::WHITE).strong(),
-            )
-            .fill(Color32::from_rgb(60, 180, 80))
-            .rounding(Rounding::same(12.0))
-            .min_size(Vec2::new(28.0, 28.0));
-
-            if ui.add(add_btn).on_hover_text("Add as actor to scene").clicked() {
-                add_actor_from_clip(state, &clip.path);
+            // Thumbnail
+            if let Some(thumb) = &clip.thumbnail {
+                let uri = format!("file://{}", thumb.display());
+                ui.add(
+                    egui::Image::from_uri(uri)
+                        .fit_to_exact_size(Vec2::new(48.0, 64.0))
+                        .rounding(Rounding::same(4.0)),
+                );
+            } else {
+                // Placeholder
+                let (rect, _) = ui.allocate_exact_size(Vec2::new(48.0, 64.0), egui::Sense::hover());
+                ui.painter().rect_filled(rect, Rounding::same(4.0), Color32::from_rgb(40, 40, 55));
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "\u{1F3AC}",
+                    egui::FontId::proportional(18.0),
+                    Color32::from_rgb(80, 80, 100),
+                );
             }
 
             ui.vertical(|ui| {
+                // ID badge
                 ui.label(
                     RichText::new(format!("#{}", clip.id))
-                        .size(11.0)
+                        .size(10.0)
                         .color(Color32::from_rgb(140, 100, 255))
                         .strong(),
                 );
-                let desc = if clip.description.chars().count() > 60 {
-                    let truncated: String = clip.description.chars().take(57).collect();
+                // Description (cleaned)
+                let desc = if clip.description.chars().count() > 45 {
+                    let truncated: String = clip.description.chars().take(42).collect();
                     format!("{}...", truncated)
                 } else if clip.description.is_empty() {
                     "No description".to_string()
@@ -154,12 +165,26 @@ fn clip_card(ui: &mut egui::Ui, state: &mut EditorState, clip: &crate::state::Li
                 ui.label(
                     RichText::new(desc)
                         .size(11.0)
-                        .color(Color32::from_rgb(180, 180, 200)),
+                        .color(Color32::from_rgb(200, 200, 220)),
                 );
+            });
+
+            // Add button on the right
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let add_btn = egui::Button::new(
+                    RichText::new("+").size(14.0).color(Color32::WHITE).strong(),
+                )
+                .fill(Color32::from_rgb(60, 180, 80))
+                .rounding(Rounding::same(10.0))
+                .min_size(Vec2::new(24.0, 24.0));
+
+                if ui.add(add_btn).on_hover_text("Add as actor").clicked() {
+                    add_actor_from_clip(state, &clip.path);
+                }
             });
         });
     });
-    ui.add_space(4.0);
+    ui.add_space(3.0);
 }
 
 // ─── INSPECTOR ───────────────────────────────────────────────────────

@@ -39,23 +39,59 @@ impl TgPost {
     /// the first blank line (which separates the content description
     /// from the subscriber-facing boilerplate like voting links).
     pub fn clean_description(&self) -> String {
-        // Split on double-newline or on the "—Имба" / "—Топчик" pattern.
         let text = &self.text;
-        // Find first occurrence of a paragraph break (empty line).
-        if let Some(pos) = text.find("\n\n") {
-            text[..pos].trim().to_string()
+
+        // Take only the first line/paragraph (before first newline or "—Имба"/"—Топ" marker)
+        let raw = if let Some(pos) = text.find("\n\n") {
+            &text[..pos]
         } else if let Some(pos) = text.find('\n') {
-            // Sometimes there's only single newlines; take the first line
-            // if it looks like content (contains a dash or is short).
-            let first_line = &text[..pos];
-            // If the first line is descriptive enough, use it.
-            if first_line.len() > 5 {
-                first_line.trim().to_string()
-            } else {
-                text.trim().to_string()
-            }
+            &text[..pos]
         } else {
-            text.trim().to_string()
+            text.as_str()
+        };
+
+        // Remove boilerplate patterns: "—Имба", "—Топчик", "—Топ", "—Хрень", "—Херня"
+        // and emoji voting markers like "❤️‍🔥", "👍", "👎", "🔥", "□", "♡"
+        let mut result = raw.to_string();
+
+        // Remove common tail patterns (voting markers)
+        let cut_markers = [
+            "\u{2764}\u{FE0F}\u{200D}\u{1F525}", // ❤️‍🔥
+            "\u{1F44D}", // 👍
+            "\u{1F44E}", // 👎
+            "\u{1F525}", // 🔥
+            "❤️‍🔥",
+            "—Имба",
+            "—Топчик",
+            "—Топ",
+            "—Хрень",
+            "—Херня",
+            "—Такое себе",
+            "□",
+            "♡",
+        ];
+
+        // Find the earliest occurrence of any marker and cut there
+        let mut cut_pos = result.len();
+        for marker in cut_markers {
+            if let Some(pos) = result.find(marker) {
+                cut_pos = cut_pos.min(pos);
+            }
+        }
+        result.truncate(cut_pos);
+
+        // Also try to cut at a standalone em-dash followed by a known word
+        // Pattern: " ❤" or "❤" at end
+        let result = result.trim_end_matches(|c: char| {
+            c == '—' || c == ' ' || c == '\u{00A0}' || !c.is_alphanumeric() && c != '(' && c != ')' && c != '!' && c != '?' && c != '.'
+        });
+
+        let cleaned = result.trim().to_string();
+        if cleaned.is_empty() {
+            // Fallback: return first 40 chars of raw text
+            raw.chars().take(40).collect::<String>().trim().to_string()
+        } else {
+            cleaned
         }
     }
 }
