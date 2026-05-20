@@ -44,6 +44,7 @@ eframe = { version = "0.28", default-features = false, features = ["glow", "defa
 egui_extras = { version = "0.28", features = ["image", "all_loaders"] }
 rfd = "0.14"
 wgpu = "22"
+rodio = "0.19"
 
 # Internal crates
 memstroy-core = { path = "crates/memstroy-core" }
