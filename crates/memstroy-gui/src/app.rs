@@ -146,12 +146,27 @@ impl App {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if self.state.refreshing {
                     ui.spinner();
-                    ui.label(RichText::new("refreshing...").color(Color32::from_rgb(255, 200, 50)));
+                    ui.label(RichText::new("refreshing...").color(Color32::from_rgb(255, 200, 50)).size(11.0));
                 } else if let Some(rp) = &self.state.render_progress {
                     if !rp.done {
                         ui.spinner();
-                        ui.label(RichText::new("rendering...").color(Color32::from_rgb(100, 200, 255)));
+                        ui.label(RichText::new("rendering...").color(Color32::from_rgb(100, 200, 255)).size(11.0));
                     }
+                }
+                // Show status text (trimmed)
+                let status = &self.state.status;
+                if !status.is_empty() && !status.starts_with("__") {
+                    let display = if status.chars().count() > 60 {
+                        let t: String = status.chars().take(57).collect();
+                        format!("{}...", t)
+                    } else {
+                        status.clone()
+                    };
+                    ui.label(
+                        RichText::new(display)
+                            .size(11.0)
+                            .color(Color32::from_rgb(160, 160, 180)),
+                    );
                 }
             });
         });
@@ -498,9 +513,9 @@ impl eframe::App for App {
             ctx.request_repaint(); // keep animating
         }
 
-        // Auto-preview: if playhead moved significantly and no render in-flight, trigger
+        // Auto-preview: only if ffmpeg available and playhead moved significantly
         let playhead_delta = (self.state.playhead - self.state.last_rendered_playhead).abs();
-        if playhead_delta > 0.05 && !self.state.preview_rendering {
+        if self.state.ffmpeg_available && playhead_delta > 0.05 && !self.state.preview_rendering {
             self.state.preview_rendering = true;
             self.state.last_rendered_playhead = self.state.playhead;
             self.run_preview();
@@ -513,23 +528,6 @@ impl eframe::App for App {
         egui::TopBottomPanel::top("menu")
             .frame(egui::Frame::none().fill(Color32::from_rgb(25, 25, 35)).inner_margin(6.0))
             .show(ctx, |ui| self.menu(ctx, ui));
-
-        // Status bar at bottom
-        egui::TopBottomPanel::bottom("status")
-            .frame(
-                egui::Frame::none()
-                    .fill(Color32::from_rgb(30, 30, 42))
-                    .inner_margin(egui::Margin::symmetric(12.0, 6.0)),
-            )
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(&self.state.status)
-                            .color(Color32::from_rgb(200, 200, 220))
-                            .size(13.0),
-                    );
-                });
-            });
 
         // Left panel: Library + Refresh button
         egui::SidePanel::left("library")
@@ -586,11 +584,12 @@ impl eframe::App for App {
         // Bottom panel: Timeline
         egui::TopBottomPanel::bottom("timeline_panel")
             .resizable(true)
-            .default_height(240.0)
+            .default_height(220.0)
+            .min_height(120.0)
             .frame(
                 egui::Frame::none()
                     .fill(Color32::from_rgb(18, 18, 28))
-                    .inner_margin(10.0),
+                    .inner_margin(8.0),
             )
             .show(ctx, |ui| {
                 panels::timeline(ui, &mut self.state);

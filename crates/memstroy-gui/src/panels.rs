@@ -11,180 +11,162 @@ use crate::state::{EditorState, Selection};
 
 pub fn library(ui: &mut egui::Ui, state: &mut EditorState, _request_refresh: impl Fn()) {
     ui.horizontal(|ui| {
-        ui.heading(RichText::new("\u{1F3AC} Library").size(18.0).strong());
+        ui.label(RichText::new("Library").size(16.0).strong());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let btn = egui::Button::new(
-                RichText::new("\u{1F504} Refresh Clips")
+                RichText::new("Refresh")
                     .color(Color32::WHITE)
-                    .size(13.0),
+                    .size(12.0),
             )
             .fill(Color32::from_rgb(80, 50, 180))
-            .rounding(Rounding::same(8.0));
+            .rounding(Rounding::same(6.0));
 
             if ui.add_enabled(!state.refreshing, btn).clicked() {
-                // Signal the app to start refresh
                 state.status = "__REFRESH_REQUESTED__".into();
             }
         });
     });
 
+    ui.add_space(4.0);
+
+    // Search input
+    ui.add(
+        egui::TextEdit::singleline(&mut state.library_search)
+            .hint_text("Search clips...")
+            .desired_width(ui.available_width()),
+    );
+
+    ui.add_space(4.0);
+
+    // Clips list
+    let clip_count = state.library.mellstroy_clips.len();
+    let search_lower = state.library_search.to_lowercase();
+
+    ui.label(
+        RichText::new(format!("Clips ({})", clip_count))
+            .size(12.0)
+            .color(Color32::from_rgb(150, 150, 170)),
+    );
+
+    if state.library.mellstroy_clips.is_empty() {
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new("No clips. Hit Refresh to download.")
+                .italics()
+                .color(Color32::from_rgb(140, 140, 160))
+                .size(12.0),
+        );
+    } else {
+        egui::ScrollArea::vertical()
+            .max_height(ui.available_height() - 60.0)
+            .show(ui, |ui| {
+                let clips = state.library.mellstroy_clips.clone();
+                for clip in &clips {
+                    // Filter by search
+                    if !search_lower.is_empty() {
+                        let clean = clean_clip_text(&clip.description).to_lowercase();
+                        let id_str = clip.id.to_string();
+                        if !clean.contains(&search_lower) && !id_str.contains(&search_lower) {
+                            continue;
+                        }
+                    }
+                    clip_card(ui, state, clip);
+                }
+            });
+    }
+
     ui.add_space(6.0);
 
-    // Mellstroy clips section
-    let clip_count = state.library.mellstroy_clips.len();
-    egui::CollapsingHeader::new(
-        RichText::new(format!("\u{1F525} Mellstroy Clips ({})", clip_count))
-            .size(14.0)
-            .color(Color32::from_rgb(255, 150, 50)),
-    )
-    .default_open(true)
-    .show(ui, |ui| {
-        if state.library.mellstroy_clips.is_empty() {
-            ui.add_space(8.0);
-            ui.label(
-                RichText::new("No clips yet.\nHit \u{1F504} Refresh Clips to download from Telegram!")
-                    .italics()
-                    .color(Color32::from_rgb(140, 140, 160))
-                    .size(12.0),
-            );
-            ui.add_space(8.0);
-        } else {
-            egui::ScrollArea::vertical()
-                .max_height(400.0)
-                .show(ui, |ui| {
-                    let clips = state.library.mellstroy_clips.clone();
-                    for clip in &clips {
-                        clip_card(ui, state, clip);
-                    }
-                });
-        }
-    });
-
-    ui.add_space(10.0);
-
-    // Backgrounds
-    egui::CollapsingHeader::new(
-        RichText::new(format!(
-            "\u{1F5BC} Backgrounds ({})",
-            state.library.backgrounds.len()
-        ))
-        .size(14.0)
-        .color(Color32::from_rgb(100, 180, 255)),
-    )
-    .show(ui, |ui| {
-        if state.library.backgrounds.is_empty() {
-            ui.label(
-                RichText::new("Drop images/videos into assets/backgrounds/")
-                    .italics()
-                    .color(Color32::from_rgb(140, 140, 160))
-                    .size(12.0),
-            );
-        }
-        for p in state.library.backgrounds.clone() {
-            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("(?)").to_string();
-            if ui
-                .button(RichText::new(format!("\u{1F5BC} {}", name)).size(12.0))
-                .clicked()
-            {
-                add_background_from_path(state, &p);
+    // Backgrounds (compact)
+    if !state.library.backgrounds.is_empty() {
+        egui::CollapsingHeader::new(
+            RichText::new(format!("Backgrounds ({})", state.library.backgrounds.len()))
+                .size(12.0)
+                .color(Color32::from_rgb(100, 180, 255)),
+        )
+        .show(ui, |ui| {
+            for p in state.library.backgrounds.clone() {
+                let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("(?)").to_string();
+                if ui
+                    .button(RichText::new(&name).size(11.0))
+                    .clicked()
+                {
+                    add_background_from_path(state, &p);
+                }
             }
-        }
-    });
-
-    ui.add_space(10.0);
-
-    // Props
-    egui::CollapsingHeader::new(
-        RichText::new(format!("\u{1F3A9} Props ({})", state.library.props.len()))
-            .size(14.0)
-            .color(Color32::from_rgb(255, 100, 200)),
-    )
-    .show(ui, |ui| {
-        if state.library.props.is_empty() {
-            ui.label(
-                RichText::new("Drop PNG props into assets/props/")
-                    .italics()
-                    .color(Color32::from_rgb(140, 140, 160))
-                    .size(12.0),
-            );
-        }
-        for p in state.library.props.clone() {
-            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("(?)").to_string();
-            ui.label(RichText::new(format!("\u{1F3A9} {}", name)).size(12.0));
-        }
-    });
+        });
+    }
 }
 
 fn clip_card(ui: &mut egui::Ui, state: &mut EditorState, clip: &crate::state::LibraryClip) {
     let frame = egui::Frame::none()
         .fill(Color32::from_rgb(32, 32, 48))
-        .rounding(Rounding::same(8.0))
-        .inner_margin(egui::Margin::same(6.0))
+        .rounding(Rounding::same(6.0))
+        .inner_margin(egui::Margin::same(4.0))
         .stroke(egui::Stroke::new(1.0, Color32::from_rgb(50, 50, 70)));
 
     frame.show(ui, |ui| {
         ui.horizontal(|ui| {
-            // Thumbnail
+            // Thumbnail (left side)
             if let Some(thumb) = &clip.thumbnail {
                 let uri = format!("file://{}", thumb.display());
                 ui.add(
                     egui::Image::from_uri(uri)
-                        .fit_to_exact_size(Vec2::new(48.0, 64.0))
-                        .rounding(Rounding::same(4.0)),
+                        .fit_to_exact_size(Vec2::new(40.0, 56.0))
+                        .rounding(Rounding::same(3.0)),
                 );
             } else {
                 // Placeholder
-                let (rect, _) = ui.allocate_exact_size(Vec2::new(48.0, 64.0), egui::Sense::hover());
-                ui.painter().rect_filled(rect, Rounding::same(4.0), Color32::from_rgb(40, 40, 55));
+                let (rect, _) = ui.allocate_exact_size(Vec2::new(40.0, 56.0), egui::Sense::hover());
+                ui.painter().rect_filled(rect, Rounding::same(3.0), Color32::from_rgb(40, 40, 55));
                 ui.painter().text(
                     rect.center(),
                     egui::Align2::CENTER_CENTER,
-                    "\u{1F3AC}",
-                    egui::FontId::proportional(18.0),
-                    Color32::from_rgb(80, 80, 100),
+                    format!("{}", clip.id),
+                    egui::FontId::proportional(10.0),
+                    Color32::from_rgb(100, 100, 120),
                 );
             }
 
             ui.vertical(|ui| {
-                // ID badge
-                ui.label(
-                    RichText::new(format!("#{}", clip.id))
-                        .size(10.0)
-                        .color(Color32::from_rgb(140, 100, 255))
-                        .strong(),
-                );
-                // Description (cleaned)
-                let desc = if clip.description.chars().count() > 45 {
-                    let truncated: String = clip.description.chars().take(42).collect();
+                // Clean description
+                let desc = clean_clip_text(&clip.description);
+                let display = if desc.is_empty() {
+                    format!("Clip #{}", clip.id)
+                } else if desc.chars().count() > 40 {
+                    let truncated: String = desc.chars().take(37).collect();
                     format!("{}...", truncated)
-                } else if clip.description.is_empty() {
-                    "No description".to_string()
                 } else {
-                    clip.description.clone()
+                    desc
                 };
                 ui.label(
-                    RichText::new(desc)
+                    RichText::new(format!("#{}", clip.id))
+                        .size(9.0)
+                        .color(Color32::from_rgb(120, 100, 200)),
+                );
+                ui.label(
+                    RichText::new(display)
                         .size(11.0)
                         .color(Color32::from_rgb(200, 200, 220)),
                 );
             });
 
-            // Add button on the right
+            // Add button
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let add_btn = egui::Button::new(
-                    RichText::new("+").size(14.0).color(Color32::WHITE).strong(),
+                    RichText::new("+").size(13.0).color(Color32::WHITE),
                 )
-                .fill(Color32::from_rgb(60, 180, 80))
-                .rounding(Rounding::same(10.0))
-                .min_size(Vec2::new(24.0, 24.0));
+                .fill(Color32::from_rgb(60, 160, 80))
+                .rounding(Rounding::same(8.0))
+                .min_size(Vec2::new(22.0, 22.0));
 
-                if ui.add(add_btn).on_hover_text("Add as actor").clicked() {
+                if ui.add(add_btn).on_hover_text("Add to scene").clicked() {
                     add_actor_from_clip(state, &clip.path);
                 }
             });
         });
     });
-    ui.add_space(3.0);
+    ui.add_space(2.0);
 }
 
 // ─── INSPECTOR ───────────────────────────────────────────────────────
@@ -979,6 +961,28 @@ fn ellipsis(s: &str, n: usize) -> String {
         out.push_str("...");
         out
     }
+}
+
+/// Strip emoji spam and noise words (Имба, Топ, Херня, etc) from clip descriptions.
+fn clean_clip_text(raw: &str) -> String {
+    let noise: &[&str] = &[
+        "Имба", "Топ", "Херня", "имба", "топ", "херня",
+        "—", "\u{2014}", "\u{2764}\u{FE0F}\u{200D}\u{1F525}", // ❤️‍🔥
+    ];
+    let mut s = raw.to_string();
+    // Remove common emoji
+    s = s.chars().filter(|c| {
+        // Keep ASCII, Cyrillic, and basic punctuation
+        c.is_ascii() || ('\u{0400}'..='\u{04FF}').contains(c) || *c == ' ' || *c == '.' || *c == ',' || *c == '!' || *c == '?'
+    }).collect();
+    for n in noise {
+        s = s.replace(n, "");
+    }
+    // Collapse multiple spaces/dashes
+    while s.contains("  ") { s = s.replace("  ", " "); }
+    while s.contains("--") { s = s.replace("--", "-"); }
+    s = s.trim_matches(|c: char| c == ' ' || c == '-' || c == '\u{2014}').to_string();
+    s
 }
 
 fn add_actor_from_clip(state: &mut EditorState, path: &PathBuf) {

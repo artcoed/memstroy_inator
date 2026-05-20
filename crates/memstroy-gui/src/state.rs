@@ -35,6 +35,10 @@ pub struct EditorState {
     pub timeline_scroll: f32,
     /// Whether the (scaffold) node editor window is open.
     pub node_editor_open: bool,
+    /// Library search filter text.
+    pub library_search: String,
+    /// Whether ffmpeg is available (checked once at startup).
+    pub ffmpeg_available: bool,
 }
 
 #[derive(Default)]
@@ -97,10 +101,11 @@ impl EditorState {
         let mut s = Self::default();
         s.assets_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         s.scene = Scene::default();
-        s.status = "Ready. Click \u{1F504} Refresh Clips to download mellstroy footage!".into();
+        s.status = "Ready".into();
         s.playback_speed = 1.0;
         s.timeline_zoom = 1.0;
         s.last_rendered_playhead = -1.0; // force first render
+        s.ffmpeg_available = check_ffmpeg();
         s
     }
 
@@ -177,4 +182,14 @@ fn scan_dir(dir: &std::path::Path, exts: &[&str]) -> Vec<PathBuf> {
     }
     out.sort();
     out
+}
+
+/// Check if ffmpeg binary is accessible.
+fn check_ffmpeg() -> bool {
+    std::process::Command::new(memstroy_render::ffmpeg_binary())
+        .arg("-version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok()
 }
