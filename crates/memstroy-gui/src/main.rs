@@ -7,6 +7,7 @@ mod node_editor;
 mod panels;
 mod state;
 mod undo;
+mod video_cache;
 
 use anyhow::Result;
 use tracing_subscriber::EnvFilter;

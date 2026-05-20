@@ -1073,7 +1073,53 @@ pub fn preview(ui: &mut egui::Ui, state: &mut EditorState) {
         Color32::from_rgb(10, 10, 16),
     );
 
-    if let Some(p) = &state.last_preview {
+    // Use frame cache for real-time preview if available
+    if let Some(fc) = state.frame_cache.as_mut() {
+        if fc.is_ready() {
+            let t = state.playhead;
+            if let Some(tex) = fc.frame_at_time(t, ui.ctx()) {
+                let tex_id = tex.id();
+                let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                ui.painter().image(tex_id, rect, uv, Color32::WHITE);
+            } else {
+                ui.put(
+                    rect,
+                    egui::Label::new(
+                        RichText::new("\u{1F3AC}\n\nLoading frame...")
+                            .color(Color32::from_rgb(80, 80, 100))
+                            .size(14.0),
+                    ),
+                );
+            }
+        } else if fc.extracting {
+            ui.put(
+                rect,
+                egui::Label::new(
+                    RichText::new("\u{23F3}\n\nExtracting preview frames...")
+                        .color(Color32::from_rgb(180, 150, 60))
+                        .size(14.0),
+                ),
+            );
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+        } else {
+            // Fallback: old PNG-based preview
+            if let Some(p) = &state.last_preview {
+                let uri = format!("file://{}", p.display());
+                ui.put(rect, egui::Image::from_uri(uri).fit_to_exact_size(rect.size()));
+            } else {
+                ui.put(
+                    rect,
+                    egui::Label::new(
+                        RichText::new(
+                            "\u{1F3AC}\n\nRender \u{2192} Preview frame\nto see your meme here",
+                        )
+                        .color(Color32::from_rgb(80, 80, 100))
+                        .size(16.0),
+                    ),
+                );
+            }
+        }
+    } else if let Some(p) = &state.last_preview {
         let uri = format!("file://{}", p.display());
         ui.put(rect, egui::Image::from_uri(uri).fit_to_exact_size(rect.size()));
     } else {
@@ -1175,7 +1221,7 @@ fn add_actor_from_clip(state: &mut EditorState, path: &PathBuf) {
     };
     state.scene.actors.push(actor);
     state.selection = Selection::Actor(state.scene.actors.len() - 1);
-    state.status = format!("\u{2705} Added actor: {}", id);
+    state.status = "__EXTRACT_FRAMES__".into();
 }
 
 fn add_background_from_path(state: &mut EditorState, path: &PathBuf) {

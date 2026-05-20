@@ -1,6 +1,7 @@
 //! Main eframe application: wires panels together and dispatches jobs.
 
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 
 use egui::{Color32, RichText, ViewportCommand, Rounding, Stroke, Vec2};
 use memstroy_core::Scene;
@@ -17,6 +18,8 @@ pub struct App {
     tx: Sender<JobEvent>,
     rx: Receiver<JobEvent>,
     node_editor: NodeEditor,
+    /// Shared slot for receiving frame extraction completion data.
+    frame_extract_result: Arc<Mutex<Option<(f32, usize, std::path::PathBuf)>>>,
 }
 
 impl App {
@@ -24,7 +27,14 @@ impl App {
         let (tx, rx) = channel();
         let mut state = EditorState::new();
         state.reload_library();
-        Self { rt, state, tx, rx, node_editor: NodeEditor::default() }
+        Self {
+            rt,
+            state,
+            tx,
+            rx,
+            node_editor: NodeEditor::default(),
+            frame_extract_result: Arc::new(Mutex::new(None)),
+        }
     }
 
     fn pump_events(&mut self, ctx: &egui::Context) {
@@ -411,6 +421,63 @@ impl App {
         }
     }
 
+    /// Start frame extraction for the first actor's source video.
+    fn start_frame_extraction(&mut self) {
+        let source = if let Some(actor) = self.state.scene.actors.first() {
+            actor.source.clone()
+        } else {
+            return;
+        };
+
+        if !source.exists() {
+            return;
+        }
+
+        // Skip if we already have a cache for this source
+        if let Some(fc) = &self.state.frame_cache {
+            if fc.source == source && (fc.is_ready() || fc.extracting) {
+                return;
+            }
+        }
+
+        let mut cache = crate::video_cache::FrameCache::new(source.clone());
+        cache.extracting = true;
+        self.state.frame_cache = Some(cache);
+
+        let result_slot = self.frame_extract_result.clone();
+        // Clear any previous result
+        if let Ok(mut slot) = result_slot.lock() {
+            *slot = None;
+        }
+
+        crate::video_cache::FrameCache::start_extraction(
+            source,
+            self.rt.handle(),
+            move |duration, frame_count, cache_dir| {
+                if let Ok(mut slot) = result_slot.lock() {
+                    *slot = Some((duration, frame_count, cache_dir));
+                }
+            },
+        );
+
+        self.state.status = "\u{1F3AC} Extracting preview frames...".into();
+    }
+
+    /// Poll for frame extraction completion.
+    fn poll_frame_extraction(&mut self) {
+        if let Ok(mut slot) = self.frame_extract_result.lock() {
+            if let Some((duration, frame_count, cache_dir)) = slot.take() {
+                if let Some(fc) = self.state.frame_cache.as_mut() {
+                    fc.set_ready(duration, frame_count, cache_dir);
+                    self.state.status = format!(
+                        "\u{2705} Preview ready: {} frames ({:.1}s)",
+                        frame_count, duration
+                    );
+                }
+            }
+        }
+    }
+
     fn save_scene(&mut self) {
         if let Some(path) = self.state.scene_path.clone() {
             match self.state.scene.save(&path) {
@@ -499,6 +566,7 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.pump_events(ctx);
+        self.poll_frame_extraction();
 
         // Keyboard shortcuts
         self.handle_shortcuts(ctx);
@@ -513,8 +581,10 @@ impl eframe::App for App {
             ctx.request_repaint(); // keep animating
         }
 
-        // Auto-preview: only if ffmpeg available, not playing, and playhead was manually moved
-        if self.state.ffmpeg_available && !self.state.playing {
+        // Auto-preview: only if ffmpeg available, not playing, playhead was manually moved,
+        // and frame cache is NOT active (frame cache provides real-time preview instead).
+        let frame_cache_active = self.state.frame_cache.as_ref().is_some_and(|fc| fc.is_ready());
+        if self.state.ffmpeg_available && !self.state.playing && !frame_cache_active {
             let playhead_delta = (self.state.playhead - self.state.last_rendered_playhead).abs();
             if playhead_delta > 0.1 && !self.state.preview_rendering {
                 self.state.preview_rendering = true;
@@ -570,6 +640,12 @@ impl eframe::App for App {
             self.merge_next();
         }
 
+        // Handle frame extraction request
+        if self.state.status == "__EXTRACT_FRAMES__" {
+            self.state.status = String::new();
+            self.start_frame_extraction();
+        }
+
         // Right panel: Inspector
         egui::SidePanel::right("inspector")
             .resizable(false)
@@ -612,7 +688,11 @@ impl eframe::App for App {
 
         // Keep refreshing UI while jobs are running
         if self.state.playing {
-            ctx.request_repaint_after(std::time::Duration::from_millis(33)); // ~30fps during playback
+            if self.state.frame_cache.as_ref().is_some_and(|fc| fc.is_ready()) {
+                ctx.request_repaint_after(std::time::Duration::from_millis(16)); // ~60fps with frame cache
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(33)); // ~30fps during playback
+            }
         } else if self.state.refreshing
             || self.state.render_progress.as_ref().is_some_and(|p| !p.done)
         {
