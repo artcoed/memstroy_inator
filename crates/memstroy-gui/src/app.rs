@@ -664,6 +664,12 @@ impl eframe::App for App {
             self.start_frame_extraction();
         }
 
+        // Handle eyedropper activation
+        if self.state.status == "__EYEDROPPER_ON__" {
+            self.state.status = String::new();
+            self.state.eyedropper_active = true;
+        }
+
         // Right panel: Inspector
         egui::SidePanel::right("inspector")
             .resizable(false)

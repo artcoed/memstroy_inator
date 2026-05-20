@@ -43,6 +43,8 @@ pub struct EditorState {
     pub razor_mode: bool,
     /// Per-actor frame caches for real-time video preview. Key = actor index.
     pub frame_caches: Vec<crate::video_cache::FrameCache>,
+    /// Eyedropper mode: when true, clicking on preview picks the pixel color for chroma-key.
+    pub eyedropper_active: bool,
 }
 
 #[derive(Default)]

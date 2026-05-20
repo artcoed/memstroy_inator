@@ -191,8 +191,46 @@ pub fn inspector(ui: &mut egui::Ui, state: &mut EditorState) {
             output_spec_editor(ui, &mut state.scene.output);
         }
         Selection::Actor(i) => {
-            if let Some(a) = state.scene.actors.get_mut(i) {
-                actor_editor(ui, a);
+            let actor_count = state.scene.actors.len();
+            let cache_count = state.frame_caches.len();
+            if i < actor_count {
+                // Eyedropper button
+                ui.horizontal(|ui| {
+                    if state.eyedropper_active {
+                        ui.label(RichText::new("\u{1F50D} Click preview to pick chroma-key color...").color(Color32::from_rgb(255, 200, 50)));
+                    } else {
+                        if ui.button("\u{1F50D} Eyedropper").on_hover_text("Pick chroma-key color from preview").clicked() {
+                            state.eyedropper_active = true;
+                        }
+                    }
+                });
+                ui.add_space(4.0);
+                // Layer reorder controls
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Layer order:").size(11.0));
+                    if i > 0 {
+                        if ui.small_button("\u{2B06}").on_hover_text("Move layer up (renders later = on top)").clicked() {
+                            state.scene.actors.swap(i, i - 1);
+                            if cache_count > i {
+                                state.frame_caches.swap(i, i - 1);
+                            }
+                            state.selection = Selection::Actor(i - 1);
+                        }
+                    }
+                    if i + 1 < actor_count {
+                        if ui.small_button("\u{2B07}").on_hover_text("Move layer down (renders earlier = behind)").clicked() {
+                            state.scene.actors.swap(i, i + 1);
+                            if cache_count > i + 1 {
+                                state.frame_caches.swap(i, i + 1);
+                            }
+                            state.selection = Selection::Actor(i + 1);
+                        }
+                    }
+                });
+                ui.add_space(4.0);
+                if let Some(a) = state.scene.actors.get_mut(i) {
+                    actor_editor(ui, a);
+                }
             }
         }
         Selection::Overlay(i) => {
@@ -280,17 +318,63 @@ fn actor_editor(ui: &mut egui::Ui, a: &mut Actor) {
                 a.layout.push(Keyframe::new(0.0, ActorState::default()));
             }
         }
+
+        // Show keyframes as a mini timeline bar
+        if !a.layout.is_empty() {
+            let avail_w = ui.available_width();
+            let duration = a.t_out.unwrap_or(8.0) - a.t_in.unwrap_or(0.0);
+            let bar_height = 20.0;
+            let (bar_rect, _) = ui.allocate_exact_size(egui::vec2(avail_w, bar_height), Sense::hover());
+            let painter = ui.painter_at(bar_rect);
+            painter.rect_filled(bar_rect, Rounding::same(3.0), Color32::from_rgb(30, 30, 45));
+
+            // Draw keyframe diamonds on the bar
+            for kf in &a.layout {
+                let frac = (kf.t / duration.max(0.01)).clamp(0.0, 1.0);
+                let x = bar_rect.min.x + frac * bar_rect.width();
+                let y = bar_rect.center().y;
+                // Diamond shape
+                let size = 5.0;
+                painter.add(egui::Shape::convex_polygon(
+                    vec![
+                        egui::pos2(x, y - size),
+                        egui::pos2(x + size, y),
+                        egui::pos2(x, y + size),
+                        egui::pos2(x - size, y),
+                    ],
+                    Color32::from_rgb(255, 200, 50),
+                    Stroke::new(1.0, Color32::from_rgb(200, 150, 30)),
+                ));
+            }
+        }
+
+        // Editable keyframe list (improved layout)
         let mut to_remove = None;
         for (i, kf) in a.layout.iter_mut().enumerate() {
-            ui.horizontal(|ui| {
-                ui.add(egui::DragValue::new(&mut kf.t).range(0.0..=600.0).speed(0.05).prefix("t="));
-                ui.add(egui::DragValue::new(&mut kf.value.pos[0]).range(-2.0..=3.0).speed(0.01).prefix("x="));
-                ui.add(egui::DragValue::new(&mut kf.value.pos[1]).range(-2.0..=3.0).speed(0.01).prefix("y="));
-                ui.add(egui::DragValue::new(&mut kf.value.scale).range(0.05..=8.0).speed(0.01).prefix("s="));
-                if ui.small_button("\u{2716}").clicked() {
-                    to_remove = Some(i);
-                }
+            let frame = egui::Frame::none()
+                .fill(Color32::from_rgb(28, 28, 40))
+                .rounding(Rounding::same(4.0))
+                .inner_margin(egui::Margin::same(4.0));
+            frame.show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("KF {}", i + 1)).size(10.0).color(Color32::from_rgb(255, 200, 50)));
+                    ui.add(egui::DragValue::new(&mut kf.t).range(0.0..=600.0).speed(0.05).prefix("t: ").suffix("s"));
+                    if ui.small_button("\u{2716}").clicked() {
+                        to_remove = Some(i);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Pos:");
+                    ui.add(egui::DragValue::new(&mut kf.value.pos[0]).range(-2.0..=3.0).speed(0.01).prefix("X "));
+                    ui.add(egui::DragValue::new(&mut kf.value.pos[1]).range(-2.0..=3.0).speed(0.01).prefix("Y "));
+                });
+                ui.horizontal(|ui| {
+                    ui.add(egui::DragValue::new(&mut kf.value.scale).range(0.05..=8.0).speed(0.01).prefix("Scale: "));
+                    ui.add(egui::DragValue::new(&mut kf.value.rotation_deg).range(-360.0..=360.0).speed(0.5).prefix("Rot: ").suffix("\u{00B0}"));
+                    ui.add(egui::DragValue::new(&mut kf.value.opacity).range(0.0..=1.0).speed(0.01).prefix("\u{03B1}: "));
+                });
             });
+            ui.add_space(2.0);
         }
         if let Some(i) = to_remove {
             a.layout.remove(i);
@@ -771,6 +855,40 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             ui.add_space(track_spacing);
         }
 
+        // Audio tracks
+        for i in 0..state.scene.audio.len() {
+            let id_str = format!("audio-{}", i);
+            let label;
+            let mut start;
+            let mut end;
+            {
+                let audio = &state.scene.audio[i];
+                label = format!("\u{1F50A} {}", audio.id);
+                start = audio.t_in;
+                end = audio.t_out.unwrap_or(duration);
+            }
+            let resp = draw_track_bar(
+                ui,
+                &id_str,
+                &label,
+                &mut start,
+                &mut end,
+                duration,
+                avail_width,
+                track_height,
+                Color32::from_rgb(80, 180, 180), // teal for audio
+                false, // no selection tracking for audio yet
+                state.playhead,
+                state.razor_mode,
+            );
+            if resp.changed {
+                let audio = &mut state.scene.audio[i];
+                audio.t_in = start.max(0.0);
+                audio.t_out = Some(end.max(start + 0.05));
+            }
+            ui.add_space(track_spacing);
+        }
+
         if state.scene.actors.is_empty()
             && state.scene.overlays.is_empty()
             && state.scene.backgrounds.is_empty()
@@ -1110,8 +1228,15 @@ pub fn preview(ui: &mut egui::Ui, state: &mut EditorState) {
     let offset_x = (avail.x - w) * 0.5;
     let offset_y = (avail.y - h) * 0.5;
 
+    // Make preview clickable for eyedropper
+    let preview_sense = if state.eyedropper_active {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+
     // Reserve full available space then position content in center
-    let (full_rect, _) = ui.allocate_exact_size(avail, egui::Sense::hover());
+    let (full_rect, preview_resp) = ui.allocate_exact_size(avail, preview_sense);
     let rect = egui::Rect::from_min_size(
         egui::pos2(full_rect.min.x + offset_x, full_rect.min.y + offset_y),
         egui::vec2(w, h),
@@ -1127,6 +1252,7 @@ pub fn preview(ui: &mut egui::Ui, state: &mut EditorState) {
     // Layer compositing: iterate actors bottom-to-top
     let t = state.playhead;
     let mut any_frame_shown = false;
+    let eyedropper_active = state.eyedropper_active;
 
     // Collect actor data we need (to avoid borrow conflicts with frame_caches)
     let actor_data: Vec<_> = state.scene.actors.iter().enumerate().map(|(idx, actor)| {
@@ -1158,8 +1284,10 @@ pub fn preview(ui: &mut egui::Ui, state: &mut EditorState) {
         if let Some(fc) = state.frame_caches.get_mut(*actor_idx) {
             if fc.is_ready() {
                 if let Some(mut img) = fc.raw_frame_at_time(local_t) {
-                    // Apply chroma-key processing
-                    apply_chroma_key(&mut img, chroma_key);
+                    // Apply chroma-key ONLY if eyedropper is NOT active
+                    if !eyedropper_active {
+                        apply_chroma_key(&mut img, chroma_key);
+                    }
                     // Upload to texture and display
                     let tex = ui.ctx().load_texture(
                         format!("layer_{}", actor_idx),
@@ -1180,6 +1308,42 @@ pub fn preview(ui: &mut egui::Ui, state: &mut EditorState) {
                 }
             }
         }
+    }
+
+    // Handle eyedropper click
+    if state.eyedropper_active && preview_resp.clicked() {
+        if let Some(pos) = preview_resp.interact_pointer_pos() {
+            // Compute UV coordinates within the preview rect
+            let u = ((pos.x - rect.min.x) / rect.width()).clamp(0.0, 1.0);
+            let v = ((pos.y - rect.min.y) / rect.height()).clamp(0.0, 1.0);
+
+            // Sample from the selected actor's raw frame at current playhead
+            if let Selection::Actor(idx) = state.selection {
+                if idx < state.scene.actors.len() {
+                    let actor_t_in = state.scene.actors[idx].t_in.unwrap_or(0.0);
+                    let actor_source_start = state.scene.actors[idx].source_start;
+                    let local_t = state.playhead - actor_t_in + actor_source_start;
+                    if let Some(fc) = state.frame_caches.get_mut(idx) {
+                        if let Some(img) = fc.raw_frame_at_time(local_t) {
+                            let px = (u * img.size[0] as f32) as usize;
+                            let py = (v * img.size[1] as f32) as usize;
+                            let px = px.min(img.size[0].saturating_sub(1));
+                            let py = py.min(img.size[1].saturating_sub(1));
+                            let pixel = img.pixels[py * img.size[0] + px];
+                            // Set the chroma key color
+                            state.scene.actors[idx].chroma_key.key_color = [pixel.r(), pixel.g(), pixel.b()];
+                            state.status = format!("Picked color: ({}, {}, {})", pixel.r(), pixel.g(), pixel.b());
+                        }
+                    }
+                }
+            }
+            state.eyedropper_active = false;
+        }
+    }
+
+    // Show eyedropper cursor
+    if state.eyedropper_active && preview_resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
     }
 
     if !any_frame_shown && state.frame_caches.is_empty() {
