@@ -4,11 +4,13 @@ mod app;
 mod audio_engine;
 mod clip_editor;
 mod curve_editor;
+mod export_presets;
 mod gpu_preview;
 mod jobs;
 mod node_editor;
 mod panels;
 mod state;
+mod title_templates;
 mod undo;
 mod video_cache;
 
