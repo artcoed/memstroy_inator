@@ -39,6 +39,8 @@ pub struct EditorState {
     pub library_search: String,
     /// Whether ffmpeg is available (checked once at startup).
     pub ffmpeg_available: bool,
+    /// Razor tool mode: when active, clicking a track bar splits at click position.
+    pub razor_mode: bool,
 }
 
 #[derive(Default)]
@@ -106,6 +108,7 @@ impl EditorState {
         s.timeline_zoom = 1.0;
         s.last_rendered_playhead = -1.0; // force first render
         s.ffmpeg_available = check_ffmpeg();
+        s.razor_mode = false;
         s
     }
 

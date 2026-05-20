@@ -390,18 +390,15 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             state.playing = !state.playing;
         }
 
-        // Speed selector
+        // Speed DragValue
         ui.add_space(4.0);
-        egui::ComboBox::from_id_source("speed")
-            .width(50.0)
-            .selected_text(format!("{}x", state.playback_speed))
-            .show_ui(ui, |ui| {
-                ui.selectable_value(&mut state.playback_speed, 0.25, "0.25x");
-                ui.selectable_value(&mut state.playback_speed, 0.5, "0.5x");
-                ui.selectable_value(&mut state.playback_speed, 1.0, "1x");
-                ui.selectable_value(&mut state.playback_speed, 2.0, "2x");
-                ui.selectable_value(&mut state.playback_speed, 4.0, "4x");
-            });
+        ui.add(
+            egui::DragValue::new(&mut state.playback_speed)
+                .range(0.1..=8.0)
+                .speed(0.05)
+                .prefix("Speed: ")
+                .suffix("x"),
+        );
 
         ui.add_space(8.0);
 
@@ -433,25 +430,8 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                 .strong(),
         );
 
-        ui.add_space(8.0);
-
-        // Playhead slider
-        ui.add(
-            egui::Slider::new(&mut state.playhead, 0.0..=state.scene.output.duration)
-                .show_value(false),
-        );
-
-        // Timeline zoom
-        ui.add_space(4.0);
-        ui.label(RichText::new("\u{1F50D}").size(12.0));
-        ui.add(
-            egui::Slider::new(&mut state.timeline_zoom, 1.0..=8.0)
-                .show_value(false)
-                .logarithmic(true),
-        );
-
         // Delete / Duplicate / Split / Merge buttons
-        ui.add_space(4.0);
+        ui.add_space(8.0);
         if ui.button("\u{1F5D1}").on_hover_text("Delete (Del)").clicked() {
             state.status = "__DELETE_SELECTED__".into();
         }
@@ -473,6 +453,26 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             state.status = "__MERGE_NEXT__".into();
         }
 
+        // Razor mode toggle
+        ui.add_space(4.0);
+        let razor_btn = egui::Button::new(
+            RichText::new("\u{1FA92}").size(14.0).color(if state.razor_mode {
+                Color32::from_rgb(255, 80, 80)
+            } else {
+                Color32::WHITE
+            }),
+        )
+        .fill(if state.razor_mode {
+            Color32::from_rgb(80, 30, 30)
+        } else {
+            Color32::from_rgb(50, 50, 70)
+        })
+        .rounding(Rounding::same(6.0))
+        .min_size(egui::vec2(28.0, 22.0));
+        if ui.add(razor_btn).on_hover_text("Razor tool: click a clip to split at that point").clicked() {
+            state.razor_mode = !state.razor_mode;
+        }
+
         // Node editor toggle
         ui.add_space(2.0);
         if ui
@@ -483,23 +483,105 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             state.node_editor_open = !state.node_editor_open;
         }
     });
-    ui.add_space(4.0);
-    ui.separator();
     ui.add_space(2.0);
+    ui.separator();
 
-    // Visual timeline tracks
+    // ─── Scrubber / Ruler at the top of the track area ───
     let duration = state.scene.output.duration.max(0.01);
     let avail_width = ui.available_width() - 100.0; // reserve label space
+    let label_width = 90.0_f32;
+    let track_width = avail_width.max(50.0);
+    let ruler_height = 20.0;
+
+    let (ruler_rect, ruler_resp) = ui.allocate_exact_size(
+        egui::vec2(label_width + track_width + 8.0, ruler_height),
+        Sense::click_and_drag(),
+    );
+    let ruler_track_left = ruler_rect.min.x + label_width + 4.0;
+    let ruler_track_right = ruler_track_left + track_width;
+    let painter = ui.painter_at(ruler_rect);
+
+    // Draw ruler background
+    let ruler_track_rect = egui::Rect::from_min_max(
+        egui::pos2(ruler_track_left, ruler_rect.min.y),
+        egui::pos2(ruler_track_right, ruler_rect.max.y),
+    );
+    painter.rect_filled(ruler_track_rect, Rounding::same(2.0), Color32::from_rgb(30, 30, 45));
+
+    // Draw time markers
+    let step = choose_ruler_step(duration);
+    let mut t = 0.0_f32;
+    while t <= duration {
+        let frac = t / duration;
+        let x = ruler_track_left + frac * track_width;
+        let is_major = (t / step).round() as i32 % 5 == 0 || step >= duration;
+        let tick_h = if is_major { ruler_height * 0.7 } else { ruler_height * 0.4 };
+        painter.line_segment(
+            [
+                egui::pos2(x, ruler_rect.max.y - tick_h),
+                egui::pos2(x, ruler_rect.max.y),
+            ],
+            Stroke::new(1.0, Color32::from_rgb(100, 100, 130)),
+        );
+        if is_major {
+            painter.text(
+                egui::pos2(x, ruler_rect.min.y + 2.0),
+                egui::Align2::CENTER_TOP,
+                format!("{:.1}s", t),
+                egui::FontId::proportional(9.0),
+                Color32::from_rgb(150, 150, 180),
+            );
+        }
+        t += step;
+    }
+
+    // Draw playhead indicator on ruler
+    let ph_frac = (state.playhead / duration).clamp(0.0, 1.0);
+    let ph_x = ruler_track_left + ph_frac * track_width;
+    // Triangle head
+    let tri_size = 5.0;
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            egui::pos2(ph_x - tri_size, ruler_rect.min.y),
+            egui::pos2(ph_x + tri_size, ruler_rect.min.y),
+            egui::pos2(ph_x, ruler_rect.min.y + tri_size * 1.5),
+        ],
+        Color32::from_rgb(255, 80, 80),
+        Stroke::NONE,
+    ));
+    painter.line_segment(
+        [
+            egui::pos2(ph_x, ruler_rect.min.y + tri_size * 1.5),
+            egui::pos2(ph_x, ruler_rect.max.y),
+        ],
+        Stroke::new(1.5, Color32::from_rgb(255, 80, 80)),
+    );
+
+    // Handle click/drag on ruler to set playhead
+    if ruler_resp.clicked() || ruler_resp.dragged() {
+        if let Some(pos) = ruler_resp.interact_pointer_pos() {
+            let frac = ((pos.x - ruler_track_left) / track_width).clamp(0.0, 1.0);
+            state.playhead = frac * duration;
+        }
+    }
+    if ruler_resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+
+    ui.add_space(2.0);
+
+    // Visual timeline tracks — use ALL remaining height
     let track_height = 24.0;
     let track_spacing = 3.0;
 
     let mut to_select: Option<Selection> = None;
+    let mut razor_split: Option<(Selection, f32)> = None;
 
     // Snapshot scene before any drag mutation, commit only if a drag started this frame.
     let scene_snapshot = state.scene.clone();
     let mut drag_started_this_frame = false;
 
-    egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
+    egui::ScrollArea::vertical().show(ui, |ui| {
         // Backgrounds
         for i in 0..state.scene.backgrounds.len() {
             let id_str = format!("bg-{}", i);
@@ -524,6 +606,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                 Color32::from_rgb(60, 120, 200),
                 state.selection == Selection::Background(i),
                 state.playhead,
+                state.razor_mode,
             );
             if resp.drag_started {
                 drag_started_this_frame = true;
@@ -531,17 +614,23 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             if resp.changed {
                 let bg = &mut state.scene.backgrounds[i];
                 let new_start = start.max(0.0);
-                let new_end = end.max(new_start + 0.05).min(duration);
+                let new_end = end.max(new_start + 0.05);
                 bg.start = new_start;
                 bg.duration = new_end - new_start;
             }
             if resp.clicked {
-                to_select = Some(Selection::Background(i));
+                if state.razor_mode {
+                    if let Some(razor_t) = resp.razor_time {
+                        razor_split = Some((Selection::Background(i), razor_t));
+                    }
+                } else {
+                    to_select = Some(Selection::Background(i));
+                }
             }
             ui.add_space(track_spacing);
         }
 
-        // Actors
+        // Actors — clips span full track width when no t_in/t_out
         for i in 0..state.scene.actors.len() {
             let id_str = format!("act-{}", i);
             let label;
@@ -551,20 +640,23 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                 let a = &state.scene.actors[i];
                 label = format!("\u{1F3AD} {}", a.id);
                 start = a.t_in.unwrap_or(0.0);
-                end = a.t_out.unwrap_or(duration);
+                // If no t_out, span full track width (not limited to output duration)
+                end = a.t_out.unwrap_or(duration.max(30.0));
             }
+            let effective_duration = end.max(duration);
             let resp = draw_track_bar(
                 ui,
                 &id_str,
                 &label,
                 &mut start,
                 &mut end,
-                duration,
+                effective_duration,
                 avail_width,
                 track_height,
                 Color32::from_rgb(200, 120, 50),
                 state.selection == Selection::Actor(i),
                 state.playhead,
+                state.razor_mode,
             );
             if resp.drag_started {
                 drag_started_this_frame = true;
@@ -572,7 +664,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             if resp.changed {
                 let a = &mut state.scene.actors[i];
                 let new_start = start.max(0.0);
-                let new_end = end.max(new_start + 0.05).min(duration);
+                let new_end = end.max(new_start + 0.05);
                 a.t_in = Some(new_start);
                 a.t_out = Some(new_end);
                 if resp.move_delta != 0.0 {
@@ -582,7 +674,13 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                 }
             }
             if resp.clicked {
-                to_select = Some(Selection::Actor(i));
+                if state.razor_mode {
+                    if let Some(razor_t) = resp.razor_time {
+                        razor_split = Some((Selection::Actor(i), razor_t));
+                    }
+                } else {
+                    to_select = Some(Selection::Actor(i));
+                }
             }
             ui.add_space(track_spacing);
         }
@@ -620,13 +718,14 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                 Color32::from_rgb(100, 200, 100),
                 state.selection == Selection::Overlay(i),
                 state.playhead,
+                state.razor_mode,
             );
             if resp.drag_started {
                 drag_started_this_frame = true;
             }
             if resp.changed {
                 let new_start = start.max(0.0);
-                let new_end = end.max(new_start + 0.05).min(duration);
+                let new_end = end.max(new_start + 0.05);
                 let move_delta = resp.move_delta;
                 let ov = &mut state.scene.overlays[i];
                 match ov {
@@ -660,7 +759,13 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                 }
             }
             if resp.clicked {
-                to_select = Some(Selection::Overlay(i));
+                if state.razor_mode {
+                    if let Some(razor_t) = resp.razor_time {
+                        razor_split = Some((Selection::Overlay(i), razor_t));
+                    }
+                } else {
+                    to_select = Some(Selection::Overlay(i));
+                }
             }
             ui.add_space(track_spacing);
         }
@@ -688,6 +793,13 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     if let Some(sel) = to_select {
         state.selection = sel;
     }
+
+    // Handle razor split (set selection + playhead, then trigger split)
+    if let Some((sel, t)) = razor_split {
+        state.selection = sel;
+        state.playhead = t;
+        state.status = "__SPLIT_AT_PLAYHEAD__".into();
+    }
 }
 
 /// Result of interacting with a single timeline track row.
@@ -700,6 +812,8 @@ struct BarResponse {
     changed: bool,
     /// Net seconds the body was translated this frame (signed). 0 unless body-drag.
     move_delta: f32,
+    /// If razor mode is active and the bar was clicked, this is the time at the click point.
+    razor_time: Option<f32>,
 }
 
 /// Draw a single horizontal track row: label, track background, draggable bar with
@@ -717,6 +831,7 @@ fn draw_track_bar(
     color: Color32,
     selected: bool,
     playhead: f32,
+    razor_mode: bool,
 ) -> BarResponse {
     let label_width = 90.0_f32;
     let track_width = avail_width.max(50.0);
@@ -776,7 +891,11 @@ fn draw_track_bar(
     let id_root = ui.make_persistent_id(id_source);
     let body = ui
         .interact(body_rect, id_root.with("body"), Sense::click_and_drag())
-        .on_hover_cursor(egui::CursorIcon::Grab);
+        .on_hover_cursor(if razor_mode {
+            egui::CursorIcon::Crosshair
+        } else {
+            egui::CursorIcon::Grab
+        });
     let left = ui
         .interact(left_handle, id_root.with("left"), Sense::click_and_drag())
         .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
@@ -886,6 +1005,20 @@ fn draw_track_bar(
         drag_started,
         changed,
         move_delta,
+        razor_time: if razor_mode && (body.clicked() || left.clicked() || right.clicked()) {
+            // Compute the time at the click position
+            if let Some(pos) = body.interact_pointer_pos()
+                .or_else(|| left.interact_pointer_pos())
+                .or_else(|| right.interact_pointer_pos())
+            {
+                let frac = ((pos.x - track_left) / track_width).clamp(0.0, 1.0);
+                Some(frac * total_duration)
+            } else {
+                None
+            }
+        } else {
+            None
+        },
     }
 }
 
@@ -912,7 +1045,17 @@ pub fn preview(ui: &mut egui::Ui, state: &mut EditorState) {
         w = avail.x;
         h = w / target_aspect;
     }
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
+
+    // Center the preview rect both horizontally and vertically
+    let offset_x = (avail.x - w) * 0.5;
+    let offset_y = (avail.y - h) * 0.5;
+
+    // Reserve full available space then position content in center
+    let (full_rect, _) = ui.allocate_exact_size(avail, egui::Sense::hover());
+    let rect = egui::Rect::from_min_size(
+        egui::pos2(full_rect.min.x + offset_x, full_rect.min.y + offset_y),
+        egui::vec2(w, h),
+    );
 
     // Draw preview background
     ui.painter().rect_filled(
@@ -939,6 +1082,23 @@ pub fn preview(ui: &mut egui::Ui, state: &mut EditorState) {
 }
 
 // ─── HELPERS ─────────────────────────────────────────────────────────
+
+/// Choose a reasonable step size for ruler tick marks based on total duration.
+fn choose_ruler_step(duration: f32) -> f32 {
+    if duration <= 2.0 {
+        0.1
+    } else if duration <= 10.0 {
+        0.5
+    } else if duration <= 30.0 {
+        1.0
+    } else if duration <= 60.0 {
+        2.0
+    } else if duration <= 300.0 {
+        5.0
+    } else {
+        10.0
+    }
+}
 
 fn color_edit_u8(ui: &mut egui::Ui, c: &mut [u8; 3]) {
     let mut rgb = [

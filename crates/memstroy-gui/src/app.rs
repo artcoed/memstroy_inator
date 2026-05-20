@@ -531,8 +531,8 @@ impl eframe::App for App {
 
         // Left panel: Library + Refresh button
         egui::SidePanel::left("library")
-            .resizable(true)
-            .default_width(320.0)
+            .resizable(false)
+            .default_width(300.0)
             .frame(
                 egui::Frame::none()
                     .fill(Color32::from_rgb(22, 22, 32))
@@ -570,8 +570,8 @@ impl eframe::App for App {
 
         // Right panel: Inspector
         egui::SidePanel::right("inspector")
-            .resizable(true)
-            .default_width(380.0)
+            .resizable(false)
+            .default_width(350.0)
             .frame(
                 egui::Frame::none()
                     .fill(Color32::from_rgb(22, 22, 32))
@@ -583,9 +583,8 @@ impl eframe::App for App {
 
         // Bottom panel: Timeline
         egui::TopBottomPanel::bottom("timeline_panel")
-            .resizable(true)
-            .default_height(220.0)
-            .min_height(120.0)
+            .resizable(false)
+            .exact_height(280.0)
             .frame(
                 egui::Frame::none()
                     .fill(Color32::from_rgb(18, 18, 28))
