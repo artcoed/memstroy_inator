@@ -20,6 +20,8 @@ pub struct App {
     node_editor: NodeEditor,
     /// Per-actor extraction results. Key = actor index.
     frame_extract_results: Vec<Arc<Mutex<Option<(f32, usize, std::path::PathBuf)>>>>,
+    /// Per-audio-track waveform extraction results.
+    waveform_extract_results: Vec<Arc<Mutex<Option<(Vec<f32>, f32)>>>>,
 }
 
 impl App {
@@ -34,6 +36,7 @@ impl App {
             rx,
             node_editor: NodeEditor::default(),
             frame_extract_results: Vec::new(),
+            waveform_extract_results: Vec::new(),
         }
     }
 
@@ -423,6 +426,93 @@ impl App {
         }
     }
 
+    // ─── AUDIO PLAYBACK (TODO) ────────────────────────────────────────
+    // Architecture:
+    // 1. Add `rodio` or `cpal` dependency
+    // 2. Create AudioEngine struct with output stream + sink
+    // 3. On play: decode audio tracks active at playhead, mix, send to sink
+    // 4. On seek: flush sink, re-decode from new position
+    // 5. On pause: pause sink
+    // Integration point: in the `update()` method after playhead advance
+
+    /// Start waveform extraction for all audio tracks that don't yet have waveform data.
+    /// Spawns background tasks (similar to frame extraction pattern) that call
+    /// `AudioWaveform::extract_peaks()` and store results in shared slots.
+    fn start_waveform_extraction(&mut self) {
+        let num_audio = self.state.scene.audio.len();
+        if num_audio == 0 {
+            return;
+        }
+
+        // Ensure audio_waveforms vec is sized to match audio tracks
+        while self.state.audio_waveforms.len() < num_audio {
+            self.state.audio_waveforms.push(crate::state::AudioWaveform::default());
+        }
+
+        for audio_idx in 0..num_audio {
+            let wf = &self.state.audio_waveforms[audio_idx];
+            if wf.ready || wf.extracting {
+                continue;
+            }
+
+            let source = self.state.scene.audio[audio_idx].source.clone();
+            if !source.exists() {
+                continue;
+            }
+
+            // Mark as extracting
+            self.state.audio_waveforms[audio_idx].extracting = true;
+
+            let source_clone = source.clone();
+            // Use a shared slot to communicate results back
+            let result_slot: Arc<Mutex<Option<(Vec<f32>, f32)>>> = Arc::new(Mutex::new(None));
+            let slot_clone = result_slot.clone();
+
+            self.rt.spawn(async move {
+                let peaks = crate::state::AudioWaveform::extract_peaks(&source_clone, 512);
+                if let Ok(mut slot) = slot_clone.lock() {
+                    *slot = peaks;
+                }
+            });
+
+            // Store the result slot for polling — we reuse audio_waveforms to check later
+            // Since we can't easily add another vec, we'll poll inline.
+            // Instead, store via a simpler approach: poll on next frame via the waveform's fields.
+            // We'll use a dedicated polling vec similar to frame_extract_results.
+            // For simplicity, store in a field on the waveform struct itself isn't possible (no Arc).
+            // Use the existing pattern: store slots in a parallel vec.
+            if self.waveform_extract_results.len() <= audio_idx {
+                while self.waveform_extract_results.len() <= audio_idx {
+                    self.waveform_extract_results.push(Arc::new(Mutex::new(None)));
+                }
+            }
+            self.waveform_extract_results[audio_idx] = result_slot;
+        }
+
+        self.state.status = "\u{1F3B5} Extracting audio waveforms...".into();
+    }
+
+    /// Poll for waveform extraction completion across all audio tracks.
+    fn poll_waveform_extraction(&mut self) {
+        for audio_idx in 0..self.waveform_extract_results.len() {
+            if audio_idx >= self.state.audio_waveforms.len() { break; }
+            if self.state.audio_waveforms[audio_idx].ready { continue; }
+
+            if let Ok(mut slot) = self.waveform_extract_results[audio_idx].lock() {
+                if let Some((peaks, duration)) = slot.take() {
+                    self.state.audio_waveforms[audio_idx].peaks = peaks;
+                    self.state.audio_waveforms[audio_idx].duration = duration;
+                    self.state.audio_waveforms[audio_idx].ready = true;
+                    self.state.audio_waveforms[audio_idx].extracting = false;
+                    self.state.status = format!(
+                        "\u{2705} Waveform ready (audio {}): {:.1}s",
+                        audio_idx, duration
+                    );
+                }
+            }
+        }
+    }
+
     /// Start frame extraction for ALL actors in the scene.
     fn start_frame_extraction(&mut self) {
         let num_actors = self.state.scene.actors.len();
@@ -585,6 +675,7 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.pump_events(ctx);
         self.poll_frame_extraction();
+        self.poll_waveform_extraction();
 
         // Keyboard shortcuts
         self.handle_shortcuts(ctx);
@@ -662,6 +753,7 @@ impl eframe::App for App {
         if self.state.status == "__EXTRACT_FRAMES__" {
             self.state.status = String::new();
             self.start_frame_extraction();
+            self.start_waveform_extraction();
         }
 
         // Handle eyedropper activation

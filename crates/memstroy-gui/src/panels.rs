@@ -617,6 +617,54 @@ fn inspector_audio(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
 }
 
 
+// ─── SNAP HELPER ─────────────────────────────────────────────────────
+
+/// Snap a time value to the closest target if within threshold.
+/// Returns the snapped value if close enough, otherwise returns `t` unchanged.
+fn snap_time(t: f32, targets: &[f32], threshold: f32) -> f32 {
+    let mut best = t;
+    let mut best_dist = threshold;
+    for &target in targets {
+        let dist = (t - target).abs();
+        if dist < best_dist {
+            best = target;
+            best_dist = dist;
+        }
+    }
+    best
+}
+
+/// Collect all clip edges (start/end times) from the scene, excluding a specific actor index.
+fn collect_clip_edges(state: &EditorState, exclude_actor: Option<usize>) -> Vec<f32> {
+    let mut edges = Vec::new();
+    let duration = state.scene.output.duration;
+
+    for (i, a) in state.scene.actors.iter().enumerate() {
+        if exclude_actor == Some(i) { continue; }
+        edges.push(a.t_in.unwrap_or(0.0));
+        edges.push(a.t_out.unwrap_or(duration));
+    }
+    for bg in &state.scene.backgrounds {
+        edges.push(bg.start);
+        edges.push(bg.start + bg.duration);
+    }
+    for ov in &state.scene.overlays {
+        let (s, e) = match ov {
+            Overlay::Text(t) => (t.t_in, t.t_out),
+            Overlay::Image(im) => (im.t_in, im.t_out),
+            Overlay::Video(v) => (v.t_in, v.t_out),
+        };
+        edges.push(s);
+        edges.push(e);
+    }
+    for au in &state.scene.audio {
+        edges.push(au.t_in);
+        edges.push(au.t_out.unwrap_or(duration));
+    }
+    edges
+}
+
+
 // ─── TIMELINE ────────────────────────────────────────────────────────
 
 pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
@@ -818,8 +866,33 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                         {
                             if clicked < 0.0 {
                                 // Drag: move the actor's time window
-                                let new_start = (-clicked).max(0.0);
+                                let mut new_start = (-clicked).max(0.0);
                                 let dur = clip_end - clip_start;
+
+                                // ── Undo snapshot on drag start ──
+                                if state.timeline_drag.dragging_clip.is_none() {
+                                    state.undo.push(&state.scene);
+                                    state.timeline_drag.dragging_clip = Some(ai);
+                                }
+
+                                // ── Snap-to-edges logic ──
+                                if state.snap_enabled {
+                                    let new_end = new_start + dur;
+                                    let mut snap_targets = collect_clip_edges(state, Some(ai));
+                                    snap_targets.push(state.playhead);
+                                    let threshold = 0.1;
+
+                                    let snapped_start = snap_time(new_start, &snap_targets, threshold);
+                                    let snapped_end = snap_time(new_end, &snap_targets, threshold);
+
+                                    // Prefer start snap, fall back to end snap
+                                    if (snapped_start - new_start).abs() < threshold {
+                                        new_start = snapped_start;
+                                    } else if (snapped_end - new_end).abs() < threshold {
+                                        new_start = snapped_end - dur;
+                                    }
+                                }
+
                                 state.scene.actors[ai].t_in = Some(new_start);
                                 state.scene.actors[ai].t_out = Some(new_start + dur);
                                 to_select = Some(Selection::Actor(ai));
@@ -828,6 +901,18 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                 state.playhead = clicked;
                                 state.status = "__SPLIT_AT_PLAYHEAD__".into();
                             } else {
+                                // ── Ctrl+click multi-select ──
+                                let ctrl_held = ui.input(|i| i.modifiers.ctrl || i.modifiers.mac_cmd);
+                                if ctrl_held {
+                                    // Toggle in multi_select
+                                    if let Some(pos) = state.multi_select.iter().position(|&x| x == ai) {
+                                        state.multi_select.remove(pos);
+                                    } else {
+                                        state.multi_select.push(ai);
+                                    }
+                                } else {
+                                    state.multi_select.clear();
+                                }
                                 to_select = Some(Selection::Actor(ai));
                             }
                         }
@@ -914,6 +999,12 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
 
     if let Some(sel) = to_select {
         state.selection = sel;
+    }
+
+    // ── Reset drag state when mouse is released (no active drag) ──
+    let any_dragging = ui.input(|i| i.pointer.any_down());
+    if !any_dragging {
+        state.timeline_drag.dragging_clip = None;
     }
 }
 

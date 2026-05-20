@@ -236,6 +236,9 @@ pub struct EditorState {
     pub snap_enabled: bool,
     /// Inspector tab: 0=Transform, 1=Timing, 2=Effects
     pub inspector_tab: usize,
+    /// Multi-selection: additional actor indices selected via Ctrl+click.
+    /// The primary `selection` field still tracks the "focused" element for the inspector.
+    pub multi_select: Vec<usize>,
 }
 
 #[derive(Default)]
