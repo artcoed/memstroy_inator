@@ -1,16 +1,33 @@
-//! UI panels — modern dark theme with emoji and accent colors.
+//! UI panels — Premiere Pro-style timeline, modern inspector, drag&drop.
 
 use std::path::PathBuf;
 
 use egui::{Color32, RichText, Rounding, Sense, Stroke, Vec2};
 use memstroy_core::*;
 
-use crate::state::{EditorState, Selection};
+use crate::state::{AssetDragKind, EditorState, Selection, TrackKind};
+
+
+// ─── COLORS ──────────────────────────────────────────────────────────
+
+const COL_BG_DARK: Color32 = Color32::from_rgb(18, 18, 26);
+const COL_BG_TRACK: Color32 = Color32::from_rgb(24, 24, 34);
+const COL_BG_TRACK_ALT: Color32 = Color32::from_rgb(28, 28, 38);
+const COL_RULER: Color32 = Color32::from_rgb(32, 32, 44);
+const COL_PLAYHEAD: Color32 = Color32::from_rgb(255, 60, 60);
+const COL_ACCENT: Color32 = Color32::from_rgb(100, 80, 220);
+const COL_TEXT_DIM: Color32 = Color32::from_rgb(140, 140, 160);
+const COL_TEXT: Color32 = Color32::from_rgb(220, 220, 240);
+const COL_CLIP_ACTOR: Color32 = Color32::from_rgb(220, 130, 50);
+const COL_CLIP_BG: Color32 = Color32::from_rgb(60, 130, 220);
+const COL_CLIP_OVERLAY: Color32 = Color32::from_rgb(80, 200, 120);
+const COL_CLIP_AUDIO: Color32 = Color32::from_rgb(50, 180, 180);
+const COL_SELECTED: Color32 = Color32::from_rgb(255, 220, 80);
+
 
 // ─── LIBRARY ─────────────────────────────────────────────────────────
 
 pub fn library(ui: &mut egui::Ui, state: &mut EditorState, _request_refresh: impl Fn()) {
-    // Tab selector
     ui.horizontal(|ui| {
         let clips_tab = ui.selectable_label(!state.assets_tab_active, "Clips");
         let assets_tab = ui.selectable_label(state.assets_tab_active, "Assets");
@@ -27,89 +44,69 @@ pub fn library(ui: &mut egui::Ui, state: &mut EditorState, _request_refresh: imp
     }
 }
 
+
 fn clips_panel(ui: &mut egui::Ui, state: &mut EditorState) {
     ui.horizontal(|ui| {
         ui.label(RichText::new("Library").size(16.0).strong());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let btn = egui::Button::new(
-                RichText::new("Refresh")
-                    .color(Color32::WHITE)
-                    .size(12.0),
-            )
-            .fill(Color32::from_rgb(80, 50, 180))
-            .rounding(Rounding::same(6.0));
-
+            let btn = egui::Button::new(RichText::new("Refresh").color(Color32::WHITE).size(12.0))
+                .fill(Color32::from_rgb(80, 50, 180))
+                .rounding(Rounding::same(6.0));
             if ui.add_enabled(!state.refreshing, btn).clicked() {
                 state.status = "__REFRESH_REQUESTED__".into();
             }
         });
     });
-
     ui.add_space(4.0);
-
-    // Search input
     ui.add(
         egui::TextEdit::singleline(&mut state.library_search)
             .hint_text("Search clips...")
             .desired_width(ui.available_width()),
     );
-
     ui.add_space(4.0);
 
-    // Clips list
     let clip_count = state.library.mellstroy_clips.len();
     let search_lower = state.library_search.to_lowercase();
-
-    ui.label(
-        RichText::new(format!("Clips ({})", clip_count))
-            .size(12.0)
-            .color(Color32::from_rgb(150, 150, 170)),
-    );
+    ui.label(RichText::new(format!("Clips ({})", clip_count)).size(12.0).color(COL_TEXT_DIM));
 
     if state.library.mellstroy_clips.is_empty() {
         ui.add_space(8.0);
-        ui.label(
-            RichText::new("No clips. Hit Refresh to download.")
-                .italics()
-                .color(Color32::from_rgb(140, 140, 160))
-                .size(12.0),
-        );
+        ui.label(RichText::new("No clips. Hit Refresh to download.").italics().color(COL_TEXT_DIM).size(12.0));
     } else {
-        egui::ScrollArea::vertical()
-            .max_height(ui.available_height() - 60.0)
-            .show(ui, |ui| {
-                for idx in 0..state.library.mellstroy_clips.len() {
-                    let clip = &state.library.mellstroy_clips[idx];
-                    // Filter by search
-                    if !search_lower.is_empty() {
-                        let clean = clean_clip_text(&clip.description).to_lowercase();
-                        let id_str = clip.id.to_string();
-                        if !clean.contains(&search_lower) && !id_str.contains(&search_lower) {
-                            continue;
-                        }
+        egui::ScrollArea::vertical().max_height(ui.available_height() - 60.0).show(ui, |ui| {
+            for idx in 0..state.library.mellstroy_clips.len() {
+                let clip = &state.library.mellstroy_clips[idx];
+                if !search_lower.is_empty() {
+                    let clean = clean_clip_text(&clip.description).to_lowercase();
+                    let id_str = clip.id.to_string();
+                    if !clean.contains(&search_lower) && !id_str.contains(&search_lower) {
+                        continue;
                     }
-                    let clip = state.library.mellstroy_clips[idx].clone();
-                    clip_card(ui, state, &clip);
                 }
-            });
+                let clip = state.library.mellstroy_clips[idx].clone();
+                clip_card(ui, state, &clip);
+            }
+        });
     }
 
     ui.add_space(6.0);
-
-    // Backgrounds (compact)
     if !state.library.backgrounds.is_empty() {
         egui::CollapsingHeader::new(
             RichText::new(format!("Backgrounds ({})", state.library.backgrounds.len()))
-                .size(12.0)
-                .color(Color32::from_rgb(100, 180, 255)),
-        )
-        .show(ui, |ui| {
+                .size(12.0).color(Color32::from_rgb(100, 180, 255)),
+        ).show(ui, |ui| {
             for p in state.library.backgrounds.clone() {
                 let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("(?)").to_string();
-                if ui
-                    .button(RichText::new(&name).size(11.0))
-                    .clicked()
-                {
+                let resp = ui.button(RichText::new(&name).size(11.0));
+                // Drag support: start drag on press+move
+                if resp.dragged() {
+                    state.asset_drag.dragging = Some(p.clone());
+                    state.asset_drag.kind = AssetDragKind::Background;
+                    if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
+                        state.asset_drag.pos = [pos.x, pos.y];
+                    }
+                }
+                if resp.clicked() {
                     add_background_from_path(state, &p);
                 }
             }
@@ -117,28 +114,33 @@ fn clips_panel(ui: &mut egui::Ui, state: &mut EditorState) {
     }
 }
 
+
 fn assets_panel(ui: &mut egui::Ui, state: &mut EditorState) {
     ui.label(RichText::new("Props & Images").size(14.0).strong());
     ui.add_space(4.0);
 
     if state.library.props.is_empty() {
-        ui.label(
-            RichText::new("No props found.\nAdd PNG/WebP files to assets/props/")
-                .italics()
-                .color(Color32::from_rgb(140, 140, 160))
-                .size(12.0),
-        );
+        ui.label(RichText::new("No props found.\nAdd PNG/WebP to assets/props/").italics().color(COL_TEXT_DIM).size(12.0));
     } else {
         egui::ScrollArea::vertical().show(ui, |ui| {
             for p in state.library.props.clone() {
                 let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("(?)").to_string();
-                ui.horizontal(|ui| {
+                let resp = ui.horizontal(|ui| {
                     ui.label(RichText::new("\u{1F5BC}").size(14.0));
-                    ui.label(RichText::new(&name).size(11.0));
+                    let r = ui.label(RichText::new(&name).size(11.0));
                     if ui.small_button("+").on_hover_text("Add as image overlay").clicked() {
                         add_image_overlay(state, &p);
                     }
-                });
+                    r
+                }).inner;
+                // Drag support
+                if resp.dragged() {
+                    state.asset_drag.dragging = Some(p.clone());
+                    state.asset_drag.kind = AssetDragKind::Prop;
+                    if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
+                        state.asset_drag.pos = [pos.x, pos.y];
+                    }
+                }
             }
         });
     }
@@ -148,12 +150,7 @@ fn assets_panel(ui: &mut egui::Ui, state: &mut EditorState) {
     ui.add_space(4.0);
 
     if state.library.backgrounds.is_empty() {
-        ui.label(
-            RichText::new("No backgrounds found.")
-                .italics()
-                .color(Color32::from_rgb(140, 140, 160))
-                .size(12.0),
-        );
+        ui.label(RichText::new("No backgrounds found.").italics().color(COL_TEXT_DIM).size(12.0));
     } else {
         for p in state.library.backgrounds.clone() {
             let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("(?)").to_string();
@@ -164,20 +161,21 @@ fn assets_panel(ui: &mut egui::Ui, state: &mut EditorState) {
     }
 }
 
+
 fn add_image_overlay(state: &mut EditorState, path: &PathBuf) {
     let id = path.file_stem().and_then(|s| s.to_str())
         .map(|s| format!("img_{}", s))
         .unwrap_or_else(|| format!("img_{}", state.scene.overlays.len() + 1));
-    let overlay = Overlay::Image(memstroy_core::ImageOverlay {
+    let overlay = Overlay::Image(ImageOverlay {
         id: id.clone(),
         source: path.clone(),
-        t_in: 0.0,
-        t_out: state.scene.output.duration,
-        layout: vec![Keyframe::new(0.0, memstroy_core::OverlayState { pos: [0.5, 0.5], scale: 0.3, rotation_deg: 0.0, opacity: 1.0 })],
+        t_in: state.playhead,
+        t_out: (state.playhead + 3.0).min(state.scene.output.duration),
+        layout: vec![Keyframe::new(0.0, OverlayState { pos: [0.5, 0.5], scale: 0.3, rotation_deg: 0.0, opacity: 1.0 })],
     });
     state.scene.overlays.push(overlay);
     state.selection = Selection::Overlay(state.scene.overlays.len() - 1);
-    state.status = format!("Added image overlay: {}", id);
+    state.status = format!("Added overlay: {}", id);
 }
 
 fn clip_card(ui: &mut egui::Ui, state: &mut EditorState, clip: &crate::state::LibraryClip) {
@@ -185,11 +183,10 @@ fn clip_card(ui: &mut egui::Ui, state: &mut EditorState, clip: &crate::state::Li
         .fill(Color32::from_rgb(32, 32, 48))
         .rounding(Rounding::same(4.0))
         .inner_margin(egui::Margin::same(3.0))
-        .stroke(egui::Stroke::new(1.0, Color32::from_rgb(50, 50, 70)));
+        .stroke(Stroke::new(1.0, Color32::from_rgb(50, 50, 70)));
 
     frame.show(ui, |ui| {
         ui.horizontal(|ui| {
-            // Thumbnail (fixed 48x48 square, cover-fill)
             let thumb_size = Vec2::new(48.0, 48.0);
             if let Some(thumb) = &clip.thumbnail {
                 let uri = format!("file://{}", thumb.display());
@@ -200,49 +197,27 @@ fn clip_card(ui: &mut egui::Ui, state: &mut EditorState, clip: &crate::state::Li
                         .rounding(Rounding::same(3.0)),
                 );
             } else {
-                let (rect, _) = ui.allocate_exact_size(thumb_size, egui::Sense::hover());
+                let (rect, _) = ui.allocate_exact_size(thumb_size, Sense::hover());
                 ui.painter().rect_filled(rect, Rounding::same(3.0), Color32::from_rgb(40, 40, 55));
-                ui.painter().text(
-                    rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    format!("{}", clip.id),
-                    egui::FontId::proportional(11.0),
-                    Color32::from_rgb(100, 100, 120),
-                );
+                ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER,
+                    format!("{}", clip.id), egui::FontId::proportional(11.0), COL_TEXT_DIM);
             }
 
             ui.vertical(|ui| {
                 let desc = clean_clip_text(&clip.description);
-                let display = if desc.is_empty() {
-                    format!("Clip #{}", clip.id)
-                } else if desc.chars().count() > 35 {
-                    let truncated: String = desc.chars().take(32).collect();
-                    format!("{}...", truncated)
-                } else {
-                    desc
-                };
-                ui.label(
-                    RichText::new(format!("#{}", clip.id))
-                        .size(9.0)
-                        .color(Color32::from_rgb(120, 100, 200)),
-                );
-                ui.label(
-                    RichText::new(display)
-                        .size(11.0)
-                        .color(Color32::from_rgb(200, 200, 220)),
-                );
+                let display = if desc.is_empty() { format!("Clip #{}", clip.id) }
+                    else if desc.chars().count() > 35 { format!("{}...", desc.chars().take(32).collect::<String>()) }
+                    else { desc };
+                ui.label(RichText::new(format!("#{}", clip.id)).size(9.0).color(Color32::from_rgb(120, 100, 200)));
+                ui.label(RichText::new(display).size(11.0).color(COL_TEXT));
             });
 
-            // Add button
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let add_btn = egui::Button::new(
-                    RichText::new("+").size(13.0).color(Color32::WHITE),
-                )
-                .fill(Color32::from_rgb(60, 160, 80))
-                .rounding(Rounding::same(8.0))
-                .min_size(Vec2::new(22.0, 22.0));
-
-                if ui.add(add_btn).on_hover_text("Add to scene").clicked() {
+                let add_btn = egui::Button::new(RichText::new("+").size(13.0).color(Color32::WHITE))
+                    .fill(Color32::from_rgb(60, 160, 80))
+                    .rounding(Rounding::same(8.0))
+                    .min_size(Vec2::new(22.0, 22.0));
+                if ui.add(add_btn).on_hover_text("Add to scene (or drag to timeline)").clicked() {
                     add_actor_from_clip(state, &clip.path);
                 }
             });
@@ -251,343 +226,356 @@ fn clip_card(ui: &mut egui::Ui, state: &mut EditorState, clip: &crate::state::Li
     ui.add_space(2.0);
 }
 
+
 // ─── INSPECTOR ───────────────────────────────────────────────────────
 
 pub fn inspector(ui: &mut egui::Ui, state: &mut EditorState) {
-    ui.heading(RichText::new("\u{1F50D} Inspector").size(18.0).strong());
-    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Inspector").size(16.0).strong());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if state.eyedropper_active {
+                ui.label(RichText::new("PICK").size(10.0).color(Color32::from_rgb(255, 200, 50)));
+            }
+        });
+    });
     ui.separator();
-    ui.add_space(6.0);
+    ui.add_space(4.0);
 
     match state.selection {
         Selection::None => {
-            ui.label(
-                RichText::new(
-                    "\u{1F447} Select an actor, overlay, or background\nfrom the timeline below.",
-                )
-                .italics()
-                .color(Color32::from_rgb(140, 140, 160)),
-            );
-            ui.add_space(12.0);
-            output_spec_editor(ui, &mut state.scene.output);
+            inspector_nothing(ui, state);
         }
         Selection::Actor(i) => {
-            let actor_count = state.scene.actors.len();
-            let cache_count = state.frame_caches.len();
-            if i < actor_count {
-                // Eyedropper button
-                ui.horizontal(|ui| {
-                    if state.eyedropper_active {
-                        ui.label(RichText::new("\u{1F50D} Click preview to pick chroma-key color...").color(Color32::from_rgb(255, 200, 50)));
-                    } else {
-                        if ui.button("\u{1F50D} Eyedropper").on_hover_text("Pick chroma-key color from preview").clicked() {
-                            state.eyedropper_active = true;
-                        }
-                    }
-                });
-                ui.add_space(4.0);
-                // Layer reorder controls
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Layer order:").size(11.0));
-                    if i > 0 {
-                        if ui.small_button("\u{2B06}").on_hover_text("Move layer up (renders later = on top)").clicked() {
-                            state.scene.actors.swap(i, i - 1);
-                            if cache_count > i {
-                                state.frame_caches.swap(i, i - 1);
-                            }
-                            state.selection = Selection::Actor(i - 1);
-                        }
-                    }
-                    if i + 1 < actor_count {
-                        if ui.small_button("\u{2B07}").on_hover_text("Move layer down (renders earlier = behind)").clicked() {
-                            state.scene.actors.swap(i, i + 1);
-                            if cache_count > i + 1 {
-                                state.frame_caches.swap(i, i + 1);
-                            }
-                            state.selection = Selection::Actor(i + 1);
-                        }
-                    }
-                });
-                ui.add_space(4.0);
-                if let Some(a) = state.scene.actors.get_mut(i) {
-                    actor_editor(ui, a);
-                }
+            if i < state.scene.actors.len() {
+                inspector_actor(ui, state, i);
             }
         }
         Selection::Overlay(i) => {
-            if let Some(o) = state.scene.overlays.get_mut(i) {
-                overlay_editor(ui, o);
+            if i < state.scene.overlays.len() {
+                inspector_overlay(ui, state, i);
             }
         }
         Selection::Background(i) => {
-            if let Some(b) = state.scene.backgrounds.get_mut(i) {
-                background_editor(ui, b);
+            if i < state.scene.backgrounds.len() {
+                inspector_background(ui, state, i);
+            }
+        }
+        Selection::Audio(i) => {
+            if i < state.scene.audio.len() {
+                inspector_audio(ui, state, i);
             }
         }
         Selection::Camera(_) => {
-            ui.label("\u{1F4F7} Camera keyframe editing \u{2014} coming soon.");
+            ui.label("Camera editing coming soon.");
         }
     }
 }
 
-fn output_spec_editor(ui: &mut egui::Ui, spec: &mut OutputSpec) {
-    egui::CollapsingHeader::new(
-        RichText::new("\u{2699} Output Settings")
-            .size(14.0)
-            .color(Color32::from_rgb(100, 200, 255)),
-    )
-    .default_open(true)
-    .show(ui, |ui| {
-        ui.horizontal(|ui| {
-            ui.label("Resolution:");
-            ui.add(egui::DragValue::new(&mut spec.resolution[0]).range(64..=4096));
-            ui.label("\u{00D7}");
-            ui.add(egui::DragValue::new(&mut spec.resolution[1]).range(64..=4096));
-        });
-        ui.horizontal(|ui| {
-            ui.label("FPS:");
-            ui.add(egui::DragValue::new(&mut spec.fps).range(24..=120));
-        });
-        ui.horizontal(|ui| {
-            ui.label("Duration (s):");
-            ui.add(egui::DragValue::new(&mut spec.duration).range(0.5..=600.0).speed(0.1));
-        });
+
+fn inspector_nothing(ui: &mut egui::Ui, state: &mut EditorState) {
+    ui.add_space(20.0);
+    ui.label(RichText::new("Select a clip on the timeline").italics().color(COL_TEXT_DIM).size(13.0));
+    ui.add_space(20.0);
+    ui.separator();
+    ui.add_space(8.0);
+
+    // Output settings always visible when nothing selected
+    ui.label(RichText::new("Output Settings").size(14.0).strong().color(Color32::from_rgb(100, 200, 255)));
+    ui.add_space(4.0);
+    let spec = &mut state.scene.output;
+    ui.horizontal(|ui| {
+        ui.label("Size:");
+        ui.add(egui::DragValue::new(&mut spec.resolution[0]).range(64..=4096).speed(1.0));
+        ui.label("x");
+        ui.add(egui::DragValue::new(&mut spec.resolution[1]).range(64..=4096).speed(1.0));
+    });
+    ui.horizontal(|ui| {
+        ui.label("FPS:");
+        ui.add(egui::DragValue::new(&mut spec.fps).range(24..=120));
+    });
+    ui.horizontal(|ui| {
+        ui.label("Duration:");
+        ui.add(egui::DragValue::new(&mut spec.duration).range(0.5..=600.0).speed(0.1).suffix("s"));
     });
 }
 
-fn actor_editor(ui: &mut egui::Ui, a: &mut Actor) {
-    ui.label(
-        RichText::new(format!("\u{1F3AD} Actor: {}", a.id))
-            .strong()
-            .size(15.0)
-            .color(Color32::from_rgb(255, 150, 50)),
-    );
-    ui.label(
-        RichText::new(format!("Source: {}", a.source.display()))
-            .size(11.0)
-            .color(Color32::from_rgb(150, 150, 170)),
-    );
+
+fn inspector_actor(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
+    let actor_count = state.scene.actors.len();
+    let cache_count = state.frame_caches.len();
+
+    // Header with name and quick actions
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(format!("Actor: {}", state.scene.actors[i].id))
+            .strong().size(14.0).color(COL_CLIP_ACTOR));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.small_button("\u{1F5D1}").on_hover_text("Delete").clicked() {
+                state.status = "__DELETE_SELECTED__".into();
+            }
+            if ui.small_button("\u{1F4CB}").on_hover_text("Duplicate").clicked() {
+                state.status = "__DUPLICATE_SELECTED__".into();
+            }
+        });
+    });
+    ui.add_space(2.0);
+    ui.label(RichText::new(
+        state.scene.actors[i].source.file_name().and_then(|s| s.to_str()).unwrap_or("(source)")
+    ).size(10.0).color(COL_TEXT_DIM));
     ui.add_space(6.0);
 
-    ui.checkbox(&mut a.visible, "\u{1F441} Visible");
-    ui.checkbox(&mut a.flip_horizontal, "\u{1F500} Flip horizontally");
-    ui.checkbox(&mut a.loop_source, "\u{1F501} Loop source");
-    ui.add(egui::DragValue::new(&mut a.source_start).speed(0.05).prefix("Start: "));
-
-    ui.add_space(8.0);
-    egui::CollapsingHeader::new(
-        RichText::new("\u{1F7E2} Chroma Key").color(Color32::from_rgb(100, 255, 100)),
-    )
-    .show(ui, |ui| {
-        ui.horizontal(|ui| {
-            ui.label("Key color:");
-            color_edit_u8(ui, &mut a.chroma_key.key_color);
-        });
-        ui.add(egui::Slider::new(&mut a.chroma_key.similarity, 0.0..=1.0).text("Similarity"));
-        ui.add(egui::Slider::new(&mut a.chroma_key.blend, 0.0..=1.0).text("Blend"));
-        ui.add(egui::Slider::new(&mut a.chroma_key.spill, 0.0..=1.0).text("Spill"));
+    // Tab bar: Transform | Timing | Effects
+    ui.horizontal(|ui| {
+        if ui.selectable_label(state.inspector_tab == 0, "Transform").clicked() { state.inspector_tab = 0; }
+        if ui.selectable_label(state.inspector_tab == 1, "Timing").clicked() { state.inspector_tab = 1; }
+        if ui.selectable_label(state.inspector_tab == 2, "Effects").clicked() { state.inspector_tab = 2; }
     });
-
-    ui.add_space(8.0);
-    egui::CollapsingHeader::new(
-        RichText::new("\u{1F4CD} Keyframes").color(Color32::from_rgb(255, 200, 100)),
-    )
-    .default_open(true)
-    .show(ui, |ui| {
-        if a.layout.is_empty() {
-            if ui.button("\u{2795} Add starting keyframe").clicked() {
-                a.layout.push(Keyframe::new(0.0, ActorState::default()));
-            }
-        }
-
-        // Show keyframes as a mini timeline bar
-        if !a.layout.is_empty() {
-            let avail_w = ui.available_width();
-            let duration = a.t_out.unwrap_or(8.0) - a.t_in.unwrap_or(0.0);
-            let bar_height = 20.0;
-            let (bar_rect, _) = ui.allocate_exact_size(egui::vec2(avail_w, bar_height), Sense::hover());
-            let painter = ui.painter_at(bar_rect);
-            painter.rect_filled(bar_rect, Rounding::same(3.0), Color32::from_rgb(30, 30, 45));
-
-            // Draw keyframe diamonds on the bar
-            for kf in &a.layout {
-                let frac = (kf.t / duration.max(0.01)).clamp(0.0, 1.0);
-                let x = bar_rect.min.x + frac * bar_rect.width();
-                let y = bar_rect.center().y;
-                // Diamond shape
-                let size = 5.0;
-                painter.add(egui::Shape::convex_polygon(
-                    vec![
-                        egui::pos2(x, y - size),
-                        egui::pos2(x + size, y),
-                        egui::pos2(x, y + size),
-                        egui::pos2(x - size, y),
-                    ],
-                    Color32::from_rgb(255, 200, 50),
-                    Stroke::new(1.0, Color32::from_rgb(200, 150, 30)),
-                ));
-            }
-        }
-
-        // Editable keyframe list (improved layout)
-        let mut to_remove = None;
-        for (i, kf) in a.layout.iter_mut().enumerate() {
-            let frame = egui::Frame::none()
-                .fill(Color32::from_rgb(28, 28, 40))
-                .rounding(Rounding::same(4.0))
-                .inner_margin(egui::Margin::same(4.0));
-            frame.show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("KF {}", i + 1)).size(10.0).color(Color32::from_rgb(255, 200, 50)));
-                    ui.add(egui::DragValue::new(&mut kf.t).range(0.0..=600.0).speed(0.05).prefix("t: ").suffix("s"));
-                    if ui.small_button("\u{2716}").clicked() {
-                        to_remove = Some(i);
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Pos:");
-                    ui.add(egui::DragValue::new(&mut kf.value.pos[0]).range(-2.0..=3.0).speed(0.01).prefix("X "));
-                    ui.add(egui::DragValue::new(&mut kf.value.pos[1]).range(-2.0..=3.0).speed(0.01).prefix("Y "));
-                });
-                ui.horizontal(|ui| {
-                    ui.add(egui::DragValue::new(&mut kf.value.scale).range(0.05..=8.0).speed(0.01).prefix("Scale: "));
-                    ui.add(egui::DragValue::new(&mut kf.value.rotation_deg).range(-360.0..=360.0).speed(0.5).prefix("Rot: ").suffix("\u{00B0}"));
-                    ui.add(egui::DragValue::new(&mut kf.value.opacity).range(0.0..=1.0).speed(0.01).prefix("\u{03B1}: "));
-                });
-            });
-            ui.add_space(2.0);
-        }
-        if let Some(i) = to_remove {
-            a.layout.remove(i);
-        }
-        if ui.button("\u{2795} Add keyframe").clicked() {
-            let last = a.layout.last().cloned().unwrap_or_else(|| Keyframe::new(0.0, ActorState::default()));
-            a.layout.push(Keyframe::new(last.t + 1.0, last.value));
-        }
-    });
-
-    // Visual curve editor for selected property
+    ui.separator();
     ui.add_space(4.0);
-    egui::CollapsingHeader::new(
-        RichText::new("\u{1F4C8} Curve Editor").color(Color32::from_rgb(150, 200, 255)),
-    )
-    .show(ui, |ui| {
-        if a.layout.len() < 2 {
-            ui.label(RichText::new("Need 2+ keyframes to show curve").italics().size(11.0).color(Color32::from_rgb(140, 140, 160)));
-            return;
+
+    match state.inspector_tab {
+        0 => inspector_actor_transform(ui, state, i),
+        1 => inspector_actor_timing(ui, state, i),
+        2 => inspector_actor_effects(ui, state, i, actor_count, cache_count),
+        _ => {}
+    }
+}
+
+
+fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
+    let a = &mut state.scene.actors[i];
+
+    // Current keyframe (or interpolated) display
+    ui.label(RichText::new("Position & Scale").size(12.0).strong());
+    ui.add_space(2.0);
+
+    // Show the keyframe closest to playhead or allow editing the interpolated state
+    let playhead = state.playhead;
+    let t_in = a.t_in.unwrap_or(0.0);
+    let local_t = playhead - t_in;
+
+    // Find or create nearest keyframe
+    let kf_idx = a.layout.iter().position(|kf| (kf.t - local_t).abs() < 0.05);
+
+    if let Some(ki) = kf_idx {
+        let kf = &mut a.layout[ki];
+        inspector_keyframe_editor(ui, kf);
+    } else if !a.layout.is_empty() {
+        // Show interpolated values (read-only preview)
+        ui.label(RichText::new("(interpolated at current time)").size(10.0).color(COL_TEXT_DIM));
+        if ui.button(RichText::new("+ Add Keyframe Here").size(11.0)).clicked() {
+            let val = if a.layout.len() >= 2 {
+                // Simple nearest value
+                a.layout.last().map(|k| k.value).unwrap_or_default()
+            } else {
+                a.layout.first().map(|k| k.value).unwrap_or_default()
+            };
+            a.layout.push(Keyframe::new(local_t.max(0.0), val));
+            a.layout.sort_by(|x, y| x.t.partial_cmp(&y.t).unwrap());
         }
-
-        let avail_w = ui.available_width();
-        let graph_h = 100.0;
-        let duration = a.t_out.unwrap_or(8.0) - a.t_in.unwrap_or(0.0);
-
-        let (graph_rect, _) = ui.allocate_exact_size(egui::vec2(avail_w, graph_h), Sense::hover());
-        let painter = ui.painter_at(graph_rect);
-
-        // Background
-        painter.rect_filled(graph_rect, Rounding::same(4.0), Color32::from_rgb(20, 20, 32));
-
-        // Grid lines
-        for i in 1..4 {
-            let y = graph_rect.min.y + (i as f32 / 4.0) * graph_h;
-            painter.line_segment(
-                [egui::pos2(graph_rect.min.x, y), egui::pos2(graph_rect.max.x, y)],
-                Stroke::new(1.0, Color32::from_rgb(35, 35, 50)),
-            );
+        // Still show the values of the nearest keyframe for reference
+        if let Some(kf) = a.layout.first_mut() {
+            inspector_keyframe_editor(ui, kf);
         }
-
-        // Draw scale curve (Y axis = scale 0..2, X axis = time)
-        let scale_min = 0.0_f32;
-        let scale_max = 2.0_f32;
-
-        if a.layout.len() >= 2 {
-            let mut prev_point: Option<egui::Pos2> = None;
-            // Draw lines between keyframes
-            for kf in &a.layout {
-                let x_frac = (kf.t / duration.max(0.01)).clamp(0.0, 1.0);
-                let y_frac = 1.0 - ((kf.value.scale - scale_min) / (scale_max - scale_min)).clamp(0.0, 1.0);
-                let x = graph_rect.min.x + x_frac * avail_w;
-                let y = graph_rect.min.y + y_frac * graph_h;
-                let point = egui::pos2(x, y);
-
-                if let Some(prev) = prev_point {
-                    painter.line_segment([prev, point], Stroke::new(2.0, Color32::from_rgb(100, 200, 255)));
-                }
-                prev_point = Some(point);
-
-                // Draw point
-                painter.circle_filled(point, 4.0, Color32::from_rgb(100, 200, 255));
-                painter.circle_stroke(point, 4.0, Stroke::new(1.0, Color32::WHITE));
-            }
+    } else {
+        ui.label(RichText::new("No keyframes").color(COL_TEXT_DIM).size(11.0));
+        if ui.button("+ Add Keyframe").clicked() {
+            a.layout.push(Keyframe::new(0.0, ActorState::default()));
         }
+    }
 
-        // Labels
-        painter.text(
-            egui::pos2(graph_rect.min.x + 4.0, graph_rect.min.y + 2.0),
-            egui::Align2::LEFT_TOP,
-            "Scale",
-            egui::FontId::proportional(9.0),
-            Color32::from_rgb(100, 200, 255),
-        );
-        painter.text(
-            egui::pos2(graph_rect.min.x + 4.0, graph_rect.max.y - 12.0),
-            egui::Align2::LEFT_TOP,
-            format!("0-{:.1}s", duration),
-            egui::FontId::proportional(9.0),
-            Color32::from_rgb(120, 120, 150),
-        );
+    ui.add_space(8.0);
+
+    // Keyframe list (compact)
+    ui.label(RichText::new("All Keyframes").size(12.0).strong());
+    ui.add_space(2.0);
+
+    let mut to_remove = None;
+    egui::ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
+        for (ki, kf) in a.layout.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("{:.2}s", kf.t)).size(10.0).color(COL_ACCENT));
+                ui.label(RichText::new(format!("({:.0}%, {:.0}%)", kf.value.pos[0]*100.0, kf.value.pos[1]*100.0)).size(10.0).color(COL_TEXT_DIM));
+                ui.label(RichText::new(format!("s:{:.2}", kf.value.scale)).size(10.0).color(COL_TEXT_DIM));
+                if ui.small_button("x").clicked() { to_remove = Some(ki); }
+            });
+        }
+    });
+    if let Some(ri) = to_remove {
+        state.scene.actors[i].layout.remove(ri);
+    }
+}
+
+
+fn inspector_keyframe_editor(ui: &mut egui::Ui, kf: &mut Keyframe<ActorState>) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Time:").size(11.0));
+        ui.add(egui::DragValue::new(&mut kf.t).range(0.0..=600.0).speed(0.02).suffix("s"));
+    });
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("X:").size(11.0));
+        ui.add(egui::DragValue::new(&mut kf.value.pos[0]).range(-2.0..=3.0).speed(0.005));
+        ui.label(RichText::new("Y:").size(11.0));
+        ui.add(egui::DragValue::new(&mut kf.value.pos[1]).range(-2.0..=3.0).speed(0.005));
+    });
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Scale:").size(11.0));
+        ui.add(egui::Slider::new(&mut kf.value.scale, 0.05..=5.0).logarithmic(true));
+    });
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Rotation:").size(11.0));
+        ui.add(egui::Slider::new(&mut kf.value.rotation_deg, -360.0..=360.0).suffix("\u{00B0}"));
+    });
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Opacity:").size(11.0));
+        ui.add(egui::Slider::new(&mut kf.value.opacity, 0.0..=1.0));
     });
 }
 
-fn overlay_editor(ui: &mut egui::Ui, o: &mut Overlay) {
-    match o {
-        Overlay::Text(t) => {
-            ui.label(
-                RichText::new(format!("\u{1F4DD} Text: {}", t.id))
-                    .strong()
-                    .size(15.0)
-                    .color(Color32::from_rgb(100, 200, 255)),
-            );
-            ui.text_edit_multiline(&mut t.text);
-            ui.horizontal(|ui| {
-                ui.add(egui::DragValue::new(&mut t.t_in).speed(0.05).prefix("in="));
-                ui.add(egui::DragValue::new(&mut t.t_out).speed(0.05).prefix("out="));
-            });
-            ui.add(egui::Slider::new(&mut t.style.font_size, 16.0..=512.0).text("Font size"));
-            ui.horizontal(|ui| {
-                ui.label("Color:");
-                color_edit_u8(ui, &mut t.style.color);
-            });
-            let mut has_box = t.style.box_color.is_some();
-            ui.checkbox(&mut has_box, "\u{2B1C} White plate");
-            if has_box && t.style.box_color.is_none() {
-                t.style.box_color = Some([255, 255, 255]);
-            }
-            if !has_box {
-                t.style.box_color = None;
-            }
+fn inspector_actor_timing(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
+    let duration = state.scene.output.duration;
+    let a = &mut state.scene.actors[i];
+
+    ui.label(RichText::new("Clip Timing").size(12.0).strong());
+    ui.add_space(4.0);
+
+    let mut t_in = a.t_in.unwrap_or(0.0);
+    let mut t_out = a.t_out.unwrap_or(duration);
+
+    ui.horizontal(|ui| {
+        ui.label("In:");
+        ui.add(egui::DragValue::new(&mut t_in).range(0.0..=duration).speed(0.02).suffix("s"));
+        ui.label("Out:");
+        ui.add(egui::DragValue::new(&mut t_out).range(0.0..=duration).speed(0.02).suffix("s"));
+    });
+    a.t_in = Some(t_in);
+    a.t_out = Some(t_out);
+
+    ui.horizontal(|ui| {
+        ui.label("Duration:");
+        ui.label(RichText::new(format!("{:.2}s", t_out - t_in)).color(COL_ACCENT));
+    });
+
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.label("Source offset:");
+        ui.add(egui::DragValue::new(&mut a.source_start).range(0.0..=300.0).speed(0.02).suffix("s"));
+    });
+
+    ui.add_space(4.0);
+    ui.checkbox(&mut a.loop_source, "Loop source clip");
+    ui.checkbox(&mut a.flip_horizontal, "Flip horizontal");
+    ui.checkbox(&mut a.visible, "Visible");
+
+    ui.add_space(8.0);
+
+    // Layer order
+    let actor_count = state.scene.actors.len();
+    ui.label(RichText::new("Layer Order").size(12.0).strong());
+    ui.horizontal(|ui| {
+        if i > 0 && ui.button("\u{2191} Up").clicked() {
+            state.scene.actors.swap(i, i - 1);
+            let cc = state.frame_caches.len();
+            if cc > i { state.frame_caches.swap(i, i - 1); }
+            state.selection = Selection::Actor(i - 1);
         }
-        Overlay::Image(i) => {
-            ui.label(RichText::new(format!("\u{1F5BC} Image: {}", i.id)).strong().size(15.0));
-            ui.label(format!("Source: {}", i.source.display()));
+        if i + 1 < actor_count && ui.button("\u{2193} Down").clicked() {
+            state.scene.actors.swap(i, i + 1);
+            let cc = state.frame_caches.len();
+            if cc > i + 1 { state.frame_caches.swap(i, i + 1); }
+            state.selection = Selection::Actor(i + 1);
+        }
+    });
+}
+
+
+fn inspector_actor_effects(ui: &mut egui::Ui, state: &mut EditorState, i: usize, _actor_count: usize, _cache_count: usize) {
+    let a = &mut state.scene.actors[i];
+
+    ui.label(RichText::new("Chroma Key").size(12.0).strong().color(Color32::from_rgb(100, 255, 100)));
+    ui.add_space(4.0);
+
+    // Eyedropper
+    ui.horizontal(|ui| {
+        if state.eyedropper_active {
+            ui.label(RichText::new("Click preview to pick color...").color(Color32::from_rgb(255, 200, 50)).size(11.0));
+        } else if ui.button("Eyedropper").on_hover_text("Pick color from preview").clicked() {
+            state.eyedropper_active = true;
+        }
+        ui.label("Key:");
+        color_edit_u8(ui, &mut a.chroma_key.key_color);
+    });
+
+    ui.add_space(4.0);
+    ui.add(egui::Slider::new(&mut a.chroma_key.similarity, 0.0..=1.0).text("Similarity"));
+    ui.add(egui::Slider::new(&mut a.chroma_key.blend, 0.0..=1.0).text("Blend"));
+    ui.add(egui::Slider::new(&mut a.chroma_key.spill, 0.0..=1.0).text("Spill"));
+}
+
+fn inspector_overlay(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
+    let duration = state.scene.output.duration;
+    let ov = &mut state.scene.overlays[i];
+
+    match ov {
+        Overlay::Text(t) => {
+            ui.label(RichText::new(format!("Text: {}", t.id)).strong().size(14.0).color(COL_CLIP_OVERLAY));
+            ui.add_space(4.0);
+            ui.text_edit_multiline(&mut t.text);
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("In:");
+                ui.add(egui::DragValue::new(&mut t.t_in).range(0.0..=duration).speed(0.02).suffix("s"));
+                ui.label("Out:");
+                ui.add(egui::DragValue::new(&mut t.t_out).range(0.0..=duration).speed(0.02).suffix("s"));
+            });
+            ui.add(egui::Slider::new(&mut t.style.font_size, 16.0..=512.0).text("Font Size"));
+            ui.horizontal(|ui| { ui.label("Color:"); color_edit_u8(ui, &mut t.style.color); });
+            let mut has_box = t.style.box_color.is_some();
+            ui.checkbox(&mut has_box, "Background plate");
+            if has_box && t.style.box_color.is_none() { t.style.box_color = Some([255, 255, 255]); }
+            if !has_box { t.style.box_color = None; }
+        }
+        Overlay::Image(im) => {
+            ui.label(RichText::new(format!("Image: {}", im.id)).strong().size(14.0).color(COL_CLIP_OVERLAY));
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("In:");
+                ui.add(egui::DragValue::new(&mut im.t_in).range(0.0..=duration).speed(0.02).suffix("s"));
+                ui.label("Out:");
+                ui.add(egui::DragValue::new(&mut im.t_out).range(0.0..=duration).speed(0.02).suffix("s"));
+            });
+            if let Some(kf) = im.layout.first_mut() {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("X:"); ui.add(egui::DragValue::new(&mut kf.value.pos[0]).speed(0.005));
+                    ui.label("Y:"); ui.add(egui::DragValue::new(&mut kf.value.pos[1]).speed(0.005));
+                });
+                ui.add(egui::Slider::new(&mut kf.value.scale, 0.05..=5.0).text("Scale").logarithmic(true));
+                ui.add(egui::Slider::new(&mut kf.value.opacity, 0.0..=1.0).text("Opacity"));
+            }
         }
         Overlay::Video(v) => {
-            ui.label(RichText::new(format!("\u{1F3AC} Video: {}", v.id)).strong().size(15.0));
-            ui.label(format!("Source: {}", v.source.display()));
+            ui.label(RichText::new(format!("Video: {}", v.id)).strong().size(14.0).color(COL_CLIP_OVERLAY));
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("In:");
+                ui.add(egui::DragValue::new(&mut v.t_in).range(0.0..=duration).speed(0.02).suffix("s"));
+                ui.label("Out:");
+                ui.add(egui::DragValue::new(&mut v.t_out).range(0.0..=duration).speed(0.02).suffix("s"));
+            });
         }
     }
 }
 
-fn background_editor(ui: &mut egui::Ui, b: &mut Background) {
-    ui.label(
-        RichText::new(format!("\u{1F304} Background: {}", b.id))
-            .strong()
-            .size(15.0)
-            .color(Color32::from_rgb(100, 180, 255)),
-    );
+
+fn inspector_background(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
+    let b = &mut state.scene.backgrounds[i];
+    ui.label(RichText::new(format!("Background: {}", b.id)).strong().size(14.0).color(COL_CLIP_BG));
+    ui.add_space(4.0);
     ui.horizontal(|ui| {
-        ui.add(egui::DragValue::new(&mut b.start).speed(0.05).prefix("start="));
-        ui.add(egui::DragValue::new(&mut b.duration).speed(0.05).prefix("dur="));
+        ui.label("Start:");
+        ui.add(egui::DragValue::new(&mut b.start).speed(0.02).suffix("s"));
+        ui.label("Duration:");
+        ui.add(egui::DragValue::new(&mut b.duration).speed(0.02).suffix("s"));
     });
     egui::ComboBox::from_label("Fit")
         .selected_text(format!("{:?}", b.fit))
@@ -606,719 +594,654 @@ fn background_editor(ui: &mut egui::Ui, b: &mut Background) {
         });
 }
 
+fn inspector_audio(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
+    let duration = state.scene.output.duration;
+    let audio = &mut state.scene.audio[i];
+    ui.label(RichText::new(format!("Audio: {}", audio.id)).strong().size(14.0).color(COL_CLIP_AUDIO));
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.label("In:");
+        ui.add(egui::DragValue::new(&mut audio.t_in).range(0.0..=duration).speed(0.02).suffix("s"));
+        let mut t_out = audio.t_out.unwrap_or(duration);
+        ui.label("Out:");
+        if ui.add(egui::DragValue::new(&mut t_out).range(0.0..=duration).speed(0.02).suffix("s")).changed() {
+            audio.t_out = Some(t_out);
+        }
+    });
+    ui.add_space(4.0);
+    ui.add(egui::Slider::new(&mut audio.volume, 0.0..=2.0).text("Volume"));
+    ui.horizontal(|ui| {
+        ui.label("Source offset:");
+        ui.add(egui::DragValue::new(&mut audio.source_start).range(0.0..=600.0).speed(0.02).suffix("s"));
+    });
+}
+
+
 // ─── TIMELINE ────────────────────────────────────────────────────────
 
 pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
+    // ── Toolbar ──
     ui.horizontal(|ui| {
-        ui.heading(RichText::new("\u{23F1} Timeline").size(16.0).strong());
-        ui.add_space(8.0);
-
-        // Play/Pause button
+        // Play/Pause
         let play_label = if state.playing { "\u{23F8}" } else { "\u{25B6}" };
-        let play_btn = egui::Button::new(
-            RichText::new(play_label).size(16.0).color(Color32::WHITE),
-        )
-        .fill(if state.playing {
-            Color32::from_rgb(200, 80, 80)
-        } else {
-            Color32::from_rgb(60, 180, 80)
-        })
-        .rounding(Rounding::same(6.0))
-        .min_size(egui::vec2(32.0, 24.0));
-        if ui.add(play_btn).on_hover_text("Play/Pause (Space)").clicked() {
-            state.playing = !state.playing;
-        }
+        let play_btn = egui::Button::new(RichText::new(play_label).size(16.0).color(Color32::WHITE))
+            .fill(if state.playing { Color32::from_rgb(200, 60, 60) } else { Color32::from_rgb(50, 170, 70) })
+            .rounding(Rounding::same(6.0)).min_size(Vec2::new(32.0, 24.0));
+        if ui.add(play_btn).clicked() { state.playing = !state.playing; }
 
-        // Speed DragValue
-        ui.add_space(4.0);
-        ui.add(
-            egui::DragValue::new(&mut state.playback_speed)
-                .range(0.1..=8.0)
-                .speed(0.05)
-                .prefix("Speed: ")
-                .suffix("x"),
-        );
+        ui.add(egui::DragValue::new(&mut state.playback_speed).range(0.1..=8.0).speed(0.05).prefix("x"));
 
-        ui.add_space(8.0);
+        ui.separator();
 
-        // Undo/redo buttons
-        let can_undo = state.undo.can_undo();
-        let can_redo = state.undo.can_redo();
-        if ui
-            .add_enabled(can_undo, egui::Button::new("\u{21A9}").min_size(egui::vec2(28.0, 22.0)))
-            .on_hover_text("Undo (Ctrl+Z)")
-            .clicked()
-        {
-            state.undo();
-        }
-        if ui
-            .add_enabled(can_redo, egui::Button::new("\u{21AA}").min_size(egui::vec2(28.0, 22.0)))
-            .on_hover_text("Redo (Ctrl+Y)")
-            .clicked()
-        {
-            state.redo();
-        }
+        // Time display
+        let duration = state.scene.output.duration;
+        ui.label(RichText::new(format_time(state.playhead)).size(13.0).strong().color(COL_TEXT));
+        ui.label(RichText::new(format!("/ {}", format_time(duration))).size(11.0).color(COL_TEXT_DIM));
 
-        ui.add_space(8.0);
+        ui.separator();
 
-        // Playhead time display
-        ui.label(
-            RichText::new(format!("{:.2}s / {:.1}s", state.playhead, state.scene.output.duration))
-                .size(12.0)
-                .color(Color32::from_rgb(180, 180, 220))
-                .strong(),
-        );
+        // Undo/Redo
+        if ui.add_enabled(state.undo.can_undo(), egui::Button::new("\u{21A9}").min_size(Vec2::new(24.0, 20.0))).clicked() { state.undo(); }
+        if ui.add_enabled(state.undo.can_redo(), egui::Button::new("\u{21AA}").min_size(Vec2::new(24.0, 20.0))).clicked() { state.redo(); }
 
-        // Delete / Duplicate / Split / Merge buttons
-        ui.add_space(8.0);
-        if ui.button("\u{1F5D1}").on_hover_text("Delete (Del)").clicked() {
-            state.status = "__DELETE_SELECTED__".into();
-        }
-        if ui.button("\u{1F4CB}").on_hover_text("Duplicate (Ctrl+D)").clicked() {
-            state.status = "__DUPLICATE_SELECTED__".into();
-        }
-        if ui
-            .button("\u{2702}")
-            .on_hover_text("Split selected at playhead")
-            .clicked()
-        {
-            state.status = "__SPLIT_AT_PLAYHEAD__".into();
-        }
-        if ui
-            .button("\u{1F517}")
-            .on_hover_text("Merge selected with next sibling")
-            .clicked()
-        {
-            state.status = "__MERGE_NEXT__".into();
-        }
+        ui.separator();
 
-        // Razor mode toggle
-        ui.add_space(4.0);
-        let razor_btn = egui::Button::new(
-            RichText::new("\u{1FA92}").size(14.0).color(if state.razor_mode {
-                Color32::from_rgb(255, 80, 80)
-            } else {
-                Color32::WHITE
-            }),
-        )
-        .fill(if state.razor_mode {
-            Color32::from_rgb(80, 30, 30)
-        } else {
-            Color32::from_rgb(50, 50, 70)
-        })
-        .rounding(Rounding::same(6.0))
-        .min_size(egui::vec2(28.0, 22.0));
-        if ui.add(razor_btn).on_hover_text("Razor tool: click a clip to split at that point").clicked() {
+        // Tools
+        if ui.button("\u{1F5D1}").on_hover_text("Delete (Del)").clicked() { state.status = "__DELETE_SELECTED__".into(); }
+        if ui.button("\u{2702}").on_hover_text("Split at playhead").clicked() { state.status = "__SPLIT_AT_PLAYHEAD__".into(); }
+
+        let razor_color = if state.razor_mode { Color32::from_rgb(255, 80, 80) } else { COL_TEXT };
+        if ui.button(RichText::new("\u{1FA92}").color(razor_color)).on_hover_text("Razor tool").clicked() {
             state.razor_mode = !state.razor_mode;
         }
 
-        // Node editor toggle
-        ui.add_space(2.0);
-        if ui
-            .button("\u{1F9E9}")
-            .on_hover_text("Toggle node editor (scaffold)")
-            .clicked()
-        {
-            state.node_editor_open = !state.node_editor_open;
+        ui.separator();
+
+        // Snap toggle
+        let snap_color = if state.snap_enabled { COL_ACCENT } else { COL_TEXT_DIM };
+        if ui.button(RichText::new("S").color(snap_color)).on_hover_text("Snap to grid/edges").clicked() {
+            state.snap_enabled = !state.snap_enabled;
         }
+
+        // Zoom controls
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.button("+").on_hover_text("Zoom in").clicked() {
+                state.timeline_zoom = (state.timeline_zoom * 1.3).min(500.0);
+            }
+            if ui.button("-").on_hover_text("Zoom out").clicked() {
+                state.timeline_zoom = (state.timeline_zoom / 1.3).max(20.0);
+            }
+            ui.label(RichText::new(format!("{:.0}px/s", state.timeline_zoom)).size(10.0).color(COL_TEXT_DIM));
+        });
     });
     ui.add_space(2.0);
-    ui.separator();
 
-    // ─── Scrubber / Ruler at the top of the track area ───
+    // ── Track area: header column + scrollable tracks ──
+    let available = ui.available_size();
+    let header_width = 80.0_f32;
+    let track_area_width = (available.x - header_width - 4.0).max(100.0);
     let duration = state.scene.output.duration.max(0.01);
-    let avail_width = ui.available_width() - 100.0; // reserve label space
-    let label_width = 90.0_f32;
-    let track_width = avail_width.max(50.0);
-    let ruler_height = 20.0;
+    let pps = state.timeline_zoom; // pixels per second
 
+    // Handle zoom via scroll wheel on timeline area
+    let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
+    if scroll_delta.y.abs() > 0.1 && ui.rect_contains_pointer(ui.max_rect()) {
+        if ui.input(|i| i.modifiers.ctrl) {
+            // Ctrl+scroll = zoom
+            let factor = if scroll_delta.y > 0.0 { 1.08 } else { 1.0 / 1.08 };
+            state.timeline_zoom = (state.timeline_zoom * factor).clamp(20.0, 500.0);
+        } else {
+            // Scroll = horizontal pan
+            state.timeline_scroll = (state.timeline_scroll - scroll_delta.y / pps).max(0.0);
+        }
+    }
+
+    // ── Ruler ──
+    let ruler_height = 22.0;
     let (ruler_rect, ruler_resp) = ui.allocate_exact_size(
-        egui::vec2(label_width + track_width + 8.0, ruler_height),
-        Sense::click_and_drag(),
-    );
-    let ruler_track_left = ruler_rect.min.x + label_width + 4.0;
-    let ruler_track_right = ruler_track_left + track_width;
+        Vec2::new(header_width + track_area_width + 4.0, ruler_height), Sense::click_and_drag());
     let painter = ui.painter_at(ruler_rect);
 
-    // Draw ruler background
+    let track_left = ruler_rect.min.x + header_width + 2.0;
+    let track_right = track_left + track_area_width;
     let ruler_track_rect = egui::Rect::from_min_max(
-        egui::pos2(ruler_track_left, ruler_rect.min.y),
-        egui::pos2(ruler_track_right, ruler_rect.max.y),
+        egui::pos2(track_left, ruler_rect.min.y),
+        egui::pos2(track_right, ruler_rect.max.y),
     );
-    painter.rect_filled(ruler_track_rect, Rounding::same(2.0), Color32::from_rgb(30, 30, 45));
+    painter.rect_filled(ruler_track_rect, Rounding::ZERO, COL_RULER);
 
-    // Draw time markers
-    let step = choose_ruler_step(duration);
-    let mut t = 0.0_f32;
-    while t <= duration {
-        let frac = t / duration;
-        let x = ruler_track_left + frac * track_width;
-        let is_major = (t / step).round() as i32 % 5 == 0 || step >= duration;
-        let tick_h = if is_major { ruler_height * 0.7 } else { ruler_height * 0.4 };
-        painter.line_segment(
-            [
-                egui::pos2(x, ruler_rect.max.y - tick_h),
-                egui::pos2(x, ruler_rect.max.y),
-            ],
-            Stroke::new(1.0, Color32::from_rgb(100, 100, 130)),
-        );
-        if is_major {
-            painter.text(
-                egui::pos2(x, ruler_rect.min.y + 2.0),
-                egui::Align2::CENTER_TOP,
-                format!("{:.1}s", t),
-                egui::FontId::proportional(9.0),
-                Color32::from_rgb(150, 150, 180),
-            );
-        }
-        t += step;
+    // Time markers on ruler
+    draw_ruler_marks(&painter, ruler_track_rect, state.timeline_scroll, pps, duration);
+
+    // Playhead on ruler
+    let ph_x = time_to_x(state.playhead, state.timeline_scroll, pps, track_left, track_right);
+    if let Some(x) = ph_x {
+        let tri = 5.0;
+        painter.add(egui::Shape::convex_polygon(
+            vec![egui::pos2(x - tri, ruler_rect.min.y), egui::pos2(x + tri, ruler_rect.min.y), egui::pos2(x, ruler_rect.min.y + tri * 1.5)],
+            COL_PLAYHEAD, Stroke::NONE));
+        painter.line_segment([egui::pos2(x, ruler_rect.min.y + tri * 1.5), egui::pos2(x, ruler_rect.max.y)],
+            Stroke::new(1.5, COL_PLAYHEAD));
     }
 
-    // Draw playhead indicator on ruler
-    let ph_frac = (state.playhead / duration).clamp(0.0, 1.0);
-    let ph_x = ruler_track_left + ph_frac * track_width;
-    // Triangle head
-    let tri_size = 5.0;
-    painter.add(egui::Shape::convex_polygon(
-        vec![
-            egui::pos2(ph_x - tri_size, ruler_rect.min.y),
-            egui::pos2(ph_x + tri_size, ruler_rect.min.y),
-            egui::pos2(ph_x, ruler_rect.min.y + tri_size * 1.5),
-        ],
-        Color32::from_rgb(255, 80, 80),
-        Stroke::NONE,
-    ));
-    painter.line_segment(
-        [
-            egui::pos2(ph_x, ruler_rect.min.y + tri_size * 1.5),
-            egui::pos2(ph_x, ruler_rect.max.y),
-        ],
-        Stroke::new(1.5, Color32::from_rgb(255, 80, 80)),
-    );
-
-    // Handle click/drag on ruler to set playhead
+    // Click ruler to seek
     if ruler_resp.clicked() || ruler_resp.dragged() {
         if let Some(pos) = ruler_resp.interact_pointer_pos() {
-            let frac = ((pos.x - ruler_track_left) / track_width).clamp(0.0, 1.0);
-            state.playhead = frac * duration;
+            if pos.x >= track_left && pos.x <= track_right {
+                state.playhead = x_to_time(pos.x, state.timeline_scroll, pps, track_left).clamp(0.0, duration);
+            }
         }
     }
-    if ruler_resp.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
 
-    ui.add_space(2.0);
 
-    // Visual timeline tracks — use ALL remaining height
-    let track_height = 24.0;
-    let track_spacing = 3.0;
-
+    // ── Track rows ──
     let mut to_select: Option<Selection> = None;
-    let mut razor_split: Option<(Selection, f32)> = None;
-
-    // Snapshot scene before any drag mutation, commit only if a drag started this frame.
-    let scene_snapshot = state.scene.clone();
-    let mut drag_started_this_frame = false;
 
     egui::ScrollArea::vertical().show(ui, |ui| {
-        // Backgrounds
-        for i in 0..state.scene.backgrounds.len() {
-            let id_str = format!("bg-{}", i);
-            let label;
-            let mut start;
-            let mut end;
-            {
-                let bg = &state.scene.backgrounds[i];
-                label = format!("\u{1F304} {}", bg.id);
-                start = bg.start;
-                end = bg.start + bg.duration;
-            }
-            let resp = draw_track_bar(
-                ui,
-                &id_str,
-                &label,
-                &mut start,
-                &mut end,
-                duration,
-                avail_width,
-                track_height,
-                Color32::from_rgb(60, 120, 200),
-                state.selection == Selection::Background(i),
-                state.playhead,
-                state.razor_mode,
-            );
-            if resp.drag_started {
-                drag_started_this_frame = true;
-            }
-            if resp.changed {
-                let bg = &mut state.scene.backgrounds[i];
-                let new_start = start.max(0.0);
-                let new_end = end.max(new_start + 0.05);
-                bg.start = new_start;
-                bg.duration = new_end - new_start;
-            }
-            if resp.clicked {
-                if state.razor_mode {
-                    if let Some(razor_t) = resp.razor_time {
-                        razor_split = Some((Selection::Background(i), razor_t));
-                    }
-                } else {
-                    to_select = Some(Selection::Background(i));
-                }
-            }
-            ui.add_space(track_spacing);
-        }
+        let num_tracks = state.tracks.len();
+        for track_idx in 0..num_tracks {
+            let track = &state.tracks[track_idx];
+            let track_h = track.height;
+            let track_kind = track.kind;
+            let track_name = track.name.clone();
+            let track_muted = track.muted;
+            let track_locked = track.locked;
 
-        // Actors — clips use scene output duration as ruler scale for all tracks
-        for i in 0..state.scene.actors.len() {
-            let id_str = format!("act-{}", i);
-            let label;
-            let mut start;
-            let mut end;
-            {
-                let a = &state.scene.actors[i];
-                label = format!("[{}] \u{1F3AD} {}", i + 1, a.id);
-                start = a.t_in.unwrap_or(0.0);
-                // If no t_out, span full track width
-                end = a.t_out.unwrap_or(duration);
-            }
-            let resp = draw_track_bar(
-                ui,
-                &id_str,
-                &label,
-                &mut start,
-                &mut end,
-                duration,
-                avail_width,
-                track_height,
-                Color32::from_rgb(200, 120, 50),
-                state.selection == Selection::Actor(i),
-                state.playhead,
-                state.razor_mode,
-            );
-            if resp.drag_started {
-                drag_started_this_frame = true;
-            }
-            if resp.changed {
-                let a = &mut state.scene.actors[i];
-                let new_start = start.max(0.0);
-                let new_end = end.max(new_start + 0.05);
-                a.t_in = Some(new_start);
-                a.t_out = Some(new_end);
-                if resp.move_delta != 0.0 {
-                    for kf in a.layout.iter_mut() {
-                        kf.t = (kf.t + resp.move_delta).max(0.0);
-                    }
-                }
-            }
-            if resp.clicked {
-                if state.razor_mode {
-                    if let Some(razor_t) = resp.razor_time {
-                        razor_split = Some((Selection::Actor(i), razor_t));
-                    }
-                } else {
-                    to_select = Some(Selection::Actor(i));
-                }
-            }
-            ui.add_space(track_spacing);
-        }
+            let (row_rect, _) = ui.allocate_exact_size(
+                Vec2::new(header_width + track_area_width + 4.0, track_h), Sense::hover());
+            let painter = ui.painter_at(row_rect);
 
-        // Overlays
-        for i in 0..state.scene.overlays.len() {
-            let id_str = format!("ov-{}", i);
-            let label;
-            let mut start;
-            let mut end;
-            {
-                let ov = &state.scene.overlays[i];
-                label = match ov {
-                    Overlay::Text(t) => format!("\u{1F4DD} {}", ellipsis(&t.text, 12)),
-                    Overlay::Image(im) => format!("\u{1F5BC} {}", im.id),
-                    Overlay::Video(v) => format!("\u{1F3AC} {}", v.id),
-                };
-                let (s, e) = match ov {
-                    Overlay::Text(t) => (t.t_in, t.t_out),
-                    Overlay::Image(im) => (im.t_in, im.t_out),
-                    Overlay::Video(v) => (v.t_in, v.t_out),
-                };
-                start = s;
-                end = e;
-            }
-            let resp = draw_track_bar(
-                ui,
-                &id_str,
-                &label,
-                &mut start,
-                &mut end,
-                duration,
-                avail_width,
-                track_height,
-                Color32::from_rgb(100, 200, 100),
-                state.selection == Selection::Overlay(i),
-                state.playhead,
-                state.razor_mode,
-            );
-            if resp.drag_started {
-                drag_started_this_frame = true;
-            }
-            if resp.changed {
-                let new_start = start.max(0.0);
-                let new_end = end.max(new_start + 0.05);
-                let move_delta = resp.move_delta;
-                let ov = &mut state.scene.overlays[i];
-                match ov {
-                    Overlay::Text(t) => {
-                        t.t_in = new_start;
-                        t.t_out = new_end;
-                        if move_delta != 0.0 {
-                            for kf in t.layout.iter_mut() {
-                                kf.t = (kf.t + move_delta).max(0.0);
+            // Track background (alternating)
+            let bg = if track_idx % 2 == 0 { COL_BG_TRACK } else { COL_BG_TRACK_ALT };
+            painter.rect_filled(row_rect, Rounding::ZERO, bg);
+
+            // Header area
+            let hdr_rect = egui::Rect::from_min_size(row_rect.min, Vec2::new(header_width, track_h));
+            painter.rect_filled(hdr_rect, Rounding::ZERO, Color32::from_rgb(30, 30, 42));
+            painter.text(hdr_rect.center(), egui::Align2::CENTER_CENTER,
+                &track_name, egui::FontId::proportional(11.0),
+                if track_muted { COL_TEXT_DIM } else { COL_TEXT });
+
+            // Track content area
+            let content_left = row_rect.min.x + header_width + 2.0;
+            let content_rect = egui::Rect::from_min_max(
+                egui::pos2(content_left, row_rect.min.y + 1.0),
+                egui::pos2(row_rect.max.x, row_rect.max.y - 1.0));
+
+            // Draw clips on this track
+            match track_kind {
+                TrackKind::Video => {
+                    // Draw backgrounds on track 0
+                    if track_idx == 0 {
+                        for bi in 0..state.scene.backgrounds.len() {
+                            let bg_elem = &state.scene.backgrounds[bi];
+                            let clip_start = bg_elem.start;
+                            let clip_end = bg_elem.start + bg_elem.duration;
+                            let sel = state.selection == Selection::Background(bi);
+                            if let Some(clicked) = draw_clip(ui, &painter, content_rect, &bg_elem.id,
+                                clip_start, clip_end, state.timeline_scroll, pps, track_left, track_right,
+                                COL_CLIP_BG, sel, track_h, track_locked, state.razor_mode)
+                            {
+                                if state.razor_mode {
+                                    to_select = Some(Selection::Background(bi));
+                                    state.playhead = clicked;
+                                    state.status = "__SPLIT_AT_PLAYHEAD__".into();
+                                } else {
+                                    to_select = Some(Selection::Background(bi));
+                                }
                             }
                         }
                     }
-                    Overlay::Image(im) => {
-                        im.t_in = new_start;
-                        im.t_out = new_end;
-                        if move_delta != 0.0 {
-                            for kf in im.layout.iter_mut() {
-                                kf.t = (kf.t + move_delta).max(0.0);
+
+                    // Draw actors assigned to this track (by index mod video tracks)
+                    let video_tracks: Vec<usize> = (0..num_tracks).filter(|ti| state.tracks[*ti].kind == TrackKind::Video).collect();
+                    let vt_pos = video_tracks.iter().position(|t| *t == track_idx);
+
+                    for ai in 0..state.scene.actors.len() {
+                        // Assign actor to track by round-robin across video tracks
+                        let target_vt = if video_tracks.is_empty() { 0 } else { ai % video_tracks.len() };
+                        if vt_pos != Some(target_vt) { continue; }
+
+                        let actor = &state.scene.actors[ai];
+                        let clip_start = actor.t_in.unwrap_or(0.0);
+                        let clip_end = actor.t_out.unwrap_or(duration);
+                        let sel = state.selection == Selection::Actor(ai);
+                        if let Some(clicked) = draw_clip(ui, &painter, content_rect, &actor.id,
+                            clip_start, clip_end, state.timeline_scroll, pps, track_left, track_right,
+                            COL_CLIP_ACTOR, sel, track_h, track_locked, state.razor_mode)
+                        {
+                            if state.razor_mode {
+                                to_select = Some(Selection::Actor(ai));
+                                state.playhead = clicked;
+                                state.status = "__SPLIT_AT_PLAYHEAD__".into();
+                            } else {
+                                to_select = Some(Selection::Actor(ai));
                             }
                         }
                     }
-                    Overlay::Video(v) => {
-                        v.t_in = new_start;
-                        v.t_out = new_end;
-                        if move_delta != 0.0 {
-                            for kf in v.layout.iter_mut() {
-                                kf.t = (kf.t + move_delta).max(0.0);
+
+                    // Draw overlays on video tracks (track 1+)
+                    if vt_pos.unwrap_or(0) >= 1 || video_tracks.len() <= 1 {
+                        for oi in 0..state.scene.overlays.len() {
+                            let target_vt = if video_tracks.len() >= 2 { 1 } else { 0 };
+                            if vt_pos != Some(target_vt) && video_tracks.len() > 1 { continue; }
+
+                            let ov = &state.scene.overlays[oi];
+                            let (clip_start, clip_end, label) = match ov {
+                                Overlay::Text(t) => (t.t_in, t.t_out, format!("T: {}", ellipsis(&t.text, 10))),
+                                Overlay::Image(im) => (im.t_in, im.t_out, format!("I: {}", im.id)),
+                                Overlay::Video(v) => (v.t_in, v.t_out, format!("V: {}", v.id)),
+                            };
+                            let sel = state.selection == Selection::Overlay(oi);
+                            if let Some(clicked) = draw_clip(ui, &painter, content_rect, &label,
+                                clip_start, clip_end, state.timeline_scroll, pps, track_left, track_right,
+                                COL_CLIP_OVERLAY, sel, track_h, track_locked, state.razor_mode)
+                            {
+                                if state.razor_mode {
+                                    to_select = Some(Selection::Overlay(oi));
+                                    state.playhead = clicked;
+                                    state.status = "__SPLIT_AT_PLAYHEAD__".into();
+                                } else {
+                                    to_select = Some(Selection::Overlay(oi));
+                                }
                             }
                         }
                     }
                 }
-            }
-            if resp.clicked {
-                if state.razor_mode {
-                    if let Some(razor_t) = resp.razor_time {
-                        razor_split = Some((Selection::Overlay(i), razor_t));
+                TrackKind::Audio => {
+                    let audio_tracks: Vec<usize> = (0..num_tracks).filter(|ti| state.tracks[*ti].kind == TrackKind::Audio).collect();
+                    let at_pos = audio_tracks.iter().position(|t| *t == track_idx);
+
+                    for aui in 0..state.scene.audio.len() {
+                        let target_at = if audio_tracks.is_empty() { 0 } else { aui % audio_tracks.len() };
+                        if at_pos != Some(target_at) { continue; }
+
+                        let audio = &state.scene.audio[aui];
+                        let clip_start = audio.t_in;
+                        let clip_end = audio.t_out.unwrap_or(duration);
+                        let sel = state.selection == Selection::Audio(aui);
+                        if let Some(clicked) = draw_audio_clip(ui, &painter, content_rect, &audio.id,
+                            clip_start, clip_end, state.timeline_scroll, pps, track_left, track_right,
+                            sel, track_h, track_locked, state.razor_mode,
+                            state.audio_waveforms.get(aui))
+                        {
+                            to_select = Some(Selection::Audio(aui));
+                        }
                     }
-                } else {
-                    to_select = Some(Selection::Overlay(i));
                 }
             }
-            ui.add_space(track_spacing);
+
+            // Playhead line on each track
+            let ph_x = time_to_x(state.playhead, state.timeline_scroll, pps, track_left, track_right);
+            if let Some(x) = ph_x {
+                painter.line_segment(
+                    [egui::pos2(x, row_rect.min.y), egui::pos2(x, row_rect.max.y)],
+                    Stroke::new(1.0, COL_PLAYHEAD));
+            }
         }
 
-        // Audio tracks
-        for i in 0..state.scene.audio.len() {
-            let id_str = format!("audio-{}", i);
-            let label;
-            let mut start;
-            let mut end;
-            {
-                let audio = &state.scene.audio[i];
-                label = format!("\u{1F50A} {}", audio.id);
-                start = audio.t_in;
-                end = audio.t_out.unwrap_or(duration);
-            }
-            let resp = draw_track_bar(
-                ui,
-                &id_str,
-                &label,
-                &mut start,
-                &mut end,
-                duration,
-                avail_width,
-                track_height,
-                Color32::from_rgb(80, 180, 180), // teal for audio
-                false, // no selection tracking for audio yet
-                state.playhead,
-                state.razor_mode,
-            );
-            if resp.changed {
-                let audio = &mut state.scene.audio[i];
-                audio.t_in = start.max(0.0);
-                audio.t_out = Some(end.max(start + 0.05));
-            }
-            ui.add_space(track_spacing);
-        }
-
-        if state.scene.actors.is_empty()
-            && state.scene.overlays.is_empty()
-            && state.scene.backgrounds.is_empty()
-        {
+        // Empty state
+        if state.scene.actors.is_empty() && state.scene.overlays.is_empty()
+            && state.scene.backgrounds.is_empty() && state.scene.audio.is_empty() {
             ui.add_space(20.0);
-            ui.label(
-                RichText::new(
-                    "\u{1F4AD} Empty scene. Add clips from library \u{2192} they appear here.",
-                )
-                .italics()
-                .color(Color32::from_rgb(120, 120, 140))
-                .size(12.0),
-            );
+            ui.label(RichText::new("Drag clips from the library or click + to add them here")
+                .italics().color(COL_TEXT_DIM).size(12.0));
         }
     });
-
-    if drag_started_this_frame {
-        state.undo.push(&scene_snapshot);
-    }
 
     if let Some(sel) = to_select {
         state.selection = sel;
     }
-
-    // Handle razor split (set selection + playhead, then trigger split)
-    if let Some((sel, t)) = razor_split {
-        state.selection = sel;
-        state.playhead = t;
-        state.status = "__SPLIT_AT_PLAYHEAD__".into();
-    }
 }
 
-/// Result of interacting with a single timeline track row.
-struct BarResponse {
-    /// User clicked the bar (without dragging).
-    clicked: bool,
-    /// A drag (resize OR move) started on this frame — caller should snapshot for undo.
-    drag_started: bool,
-    /// Bar bounds were modified this frame.
-    changed: bool,
-    /// Net seconds the body was translated this frame (signed). 0 unless body-drag.
-    move_delta: f32,
-    /// If razor mode is active and the bar was clicked, this is the time at the click point.
-    razor_time: Option<f32>,
-}
 
-/// Draw a single horizontal track row: label, track background, draggable bar with
-/// resize handles on each edge, and the playhead vertical line over this row.
+/// Draw a single clip bar on the timeline. Returns Some(time) if clicked (for razor or select).
+/// NO resize handles — just a solid bar that can be clicked/dragged as a whole.
 #[allow(clippy::too_many_arguments)]
-fn draw_track_bar(
+fn draw_clip(
     ui: &mut egui::Ui,
-    id_source: &str,
+    painter: &egui::Painter,
+    content_rect: egui::Rect,
     label: &str,
-    t_start: &mut f32,
-    t_end: &mut f32,
-    total_duration: f32,
-    avail_width: f32,
-    height: f32,
+    clip_start: f32,
+    clip_end: f32,
+    scroll: f32,
+    pps: f32,
+    track_left: f32,
+    track_right: f32,
     color: Color32,
     selected: bool,
-    playhead: f32,
+    _track_h: f32,
+    locked: bool,
     razor_mode: bool,
-) -> BarResponse {
-    let label_width = 90.0_f32;
-    let track_width = avail_width.max(50.0);
+) -> Option<f32> {
+    let x_start = (clip_start - scroll) * pps + track_left;
+    let x_end = (clip_end - scroll) * pps + track_left;
 
-    let (rect, _) = ui.allocate_exact_size(
-        egui::vec2(label_width + track_width + 8.0, height),
-        Sense::hover(),
-    );
-    let painter = ui.painter_at(rect);
+    // Clip is off-screen
+    if x_end < track_left || x_start > track_right { return None; }
 
-    // Label column
-    let label_rect = egui::Rect::from_min_size(rect.min, egui::vec2(label_width, height));
-    painter.text(
-        label_rect.center(),
-        egui::Align2::CENTER_CENTER,
-        label,
-        egui::FontId::proportional(11.0),
-        Color32::from_rgb(180, 180, 200),
-    );
+    let x_start = x_start.max(track_left);
+    let x_end = x_end.min(track_right);
 
-    // Track background
-    let track_left = rect.min.x + label_width + 4.0;
-    let track_top = rect.min.y + 2.0;
-    let track_h = height - 4.0;
-    let track_rect = egui::Rect::from_min_size(
-        egui::pos2(track_left, track_top),
-        egui::vec2(track_width, track_h),
-    );
-    painter.rect_filled(track_rect, Rounding::same(3.0), Color32::from_rgb(25, 25, 38));
+    if x_end - x_start < 2.0 { return None; }
 
-    // Compute initial bar geometry (in pixels) from t_start/t_end
-    let secs_per_pixel = total_duration / track_width.max(1.0);
-    let (bar_left, bar_right) = t_to_px(*t_start, *t_end, total_duration, track_left, track_width);
     let bar_rect = egui::Rect::from_min_max(
-        egui::pos2(bar_left, track_top + 1.0),
-        egui::pos2(bar_right, track_top + track_h - 1.0),
+        egui::pos2(x_start, content_rect.min.y + 2.0),
+        egui::pos2(x_end, content_rect.max.y - 2.0),
     );
 
-    // Compute handle / body sub-rects.
-    let handle_w = 6.0_f32.min(bar_rect.width() / 3.0).max(2.0);
-    let body_rect = egui::Rect::from_min_max(
-        egui::pos2(bar_rect.min.x + handle_w, bar_rect.min.y),
-        egui::pos2(bar_rect.max.x - handle_w, bar_rect.max.y),
-    );
-    let left_handle = egui::Rect::from_min_max(
-        egui::pos2(bar_rect.min.x - 1.0, bar_rect.min.y),
-        egui::pos2(bar_rect.min.x + handle_w, bar_rect.max.y),
-    );
-    let right_handle = egui::Rect::from_min_max(
-        egui::pos2(bar_rect.max.x - handle_w, bar_rect.min.y),
-        egui::pos2(bar_rect.max.x + 1.0, bar_rect.max.y),
-    );
-
-    // Allocate independent interactions. egui's hit-testing prefers the
-    // most-recently-allocated overlapping widget, so allocate body first
-    // and the edge handles last so they win over body on the edges.
-    let id_root = ui.make_persistent_id(id_source);
-    let body = ui
-        .interact(body_rect, id_root.with("body"), Sense::click_and_drag())
-        .on_hover_cursor(if razor_mode {
-            egui::CursorIcon::Crosshair
-        } else {
-            egui::CursorIcon::Grab
-        });
-    let left = ui
-        .interact(left_handle, id_root.with("left"), Sense::click_and_drag())
-        .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
-    let right = ui
-        .interact(right_handle, id_root.with("right"), Sense::click_and_drag())
-        .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
-
-    let mut changed = false;
-    let mut move_delta = 0.0_f32;
-    let drag_started = body.drag_started() || left.drag_started() || right.drag_started();
-
-    if left.dragged() {
-        let dx = left.drag_delta().x;
-        let new_start = (*t_start + dx * secs_per_pixel).clamp(0.0, *t_end - 0.05);
-        if (new_start - *t_start).abs() > f32::EPSILON {
-            *t_start = new_start;
-            changed = true;
-        }
-    }
-    if right.dragged() {
-        let dx = right.drag_delta().x;
-        let new_end = (*t_end + dx * secs_per_pixel).clamp(*t_start + 0.05, total_duration);
-        if (new_end - *t_end).abs() > f32::EPSILON {
-            *t_end = new_end;
-            changed = true;
-        }
-    }
-    if body.dragged() {
-        let dx = body.drag_delta().x;
-        let delta_secs = dx * secs_per_pixel;
-        let dur = *t_end - *t_start;
-        let new_start = (*t_start + delta_secs).clamp(0.0, (total_duration - dur).max(0.0));
-        let actual = new_start - *t_start;
-        if actual.abs() > f32::EPSILON {
-            *t_start = new_start;
-            *t_end = new_start + dur;
-            move_delta = actual;
-            changed = true;
-        }
-    }
-
-    // Re-compute final bar after any drag.
-    let (bar_left, bar_right) = t_to_px(*t_start, *t_end, total_duration, track_left, track_width);
-    let bar_rect = egui::Rect::from_min_max(
-        egui::pos2(bar_left, track_top + 1.0),
-        egui::pos2(bar_right.max(bar_left + 4.0), track_top + track_h - 1.0),
-    );
-
-    let any_hover = body.hovered() || left.hovered() || right.hovered();
+    // Fill
     let fill = if selected {
-        Color32::from_rgb(
-            color.r().saturating_add(40),
-            color.g().saturating_add(40),
-            color.b().saturating_add(40),
-        )
-    } else if any_hover {
-        Color32::from_rgb(
-            color.r().saturating_add(20),
-            color.g().saturating_add(20),
-            color.b().saturating_add(20),
-        )
-    } else {
-        color
-    };
+        Color32::from_rgb(color.r().saturating_add(30), color.g().saturating_add(30), color.b().saturating_add(30))
+    } else { color };
     painter.rect_filled(bar_rect, Rounding::same(4.0), fill);
-
-    // Draw subtle handle indicators inside the bar.
-    let indicator_w = handle_w.min(bar_rect.width() / 4.0).max(1.5);
-    let handle_color = Color32::from_rgba_premultiplied(255, 255, 255, 90);
-    let left_h_rect = egui::Rect::from_min_max(
-        bar_rect.min,
-        egui::pos2(bar_rect.min.x + indicator_w, bar_rect.max.y),
-    );
-    let right_h_rect = egui::Rect::from_min_max(
-        egui::pos2(bar_rect.max.x - indicator_w, bar_rect.min.y),
-        bar_rect.max,
-    );
-    painter.rect_filled(left_h_rect, Rounding::same(2.0), handle_color);
-    painter.rect_filled(right_h_rect, Rounding::same(2.0), handle_color);
 
     // Selection border
     if selected {
-        painter.rect_stroke(
-            bar_rect.expand(1.0),
-            Rounding::same(5.0),
-            Stroke::new(2.0, Color32::WHITE),
-        );
+        painter.rect_stroke(bar_rect.expand(1.0), Rounding::same(5.0), Stroke::new(2.0, COL_SELECTED));
     }
 
-    // Time label inside bar
-    if bar_rect.width() > 50.0 {
+    // Label inside
+    if bar_rect.width() > 30.0 {
+        let text = if bar_rect.width() > 80.0 { label.to_string() } else { ellipsis(label, 6) };
         painter.text(
-            bar_rect.center(),
-            egui::Align2::CENTER_CENTER,
-            format!("{:.1}-{:.1}s", *t_start, *t_end),
-            egui::FontId::proportional(9.0),
-            Color32::WHITE,
-        );
+            egui::pos2(bar_rect.min.x + 6.0, bar_rect.center().y),
+            egui::Align2::LEFT_CENTER, &text,
+            egui::FontId::proportional(10.0), Color32::WHITE);
     }
 
-    // Playhead vertical line over this track segment (drawn LAST so it sits on top).
-    if playhead >= 0.0 && playhead <= total_duration {
-        let ph_x = track_left + (playhead / total_duration).clamp(0.0, 1.0) * track_width;
-        painter.line_segment(
-            [
-                egui::pos2(ph_x, track_top - 1.0),
-                egui::pos2(ph_x, track_top + track_h + 1.0),
-            ],
-            Stroke::new(1.5, Color32::from_rgb(255, 80, 80)),
-        );
+    // Interaction (simple click/drag, no resize handles)
+    let id = ui.make_persistent_id(("clip", label, clip_start as u32));
+    let sense = if locked { Sense::hover() } else { Sense::click_and_drag() };
+    let resp = ui.interact(bar_rect, id, sense);
+
+    if resp.hovered() && !locked {
+        ui.ctx().set_cursor_icon(if razor_mode { egui::CursorIcon::Crosshair } else { egui::CursorIcon::Grab });
     }
 
-    BarResponse {
-        clicked: body.clicked() || left.clicked() || right.clicked(),
-        drag_started,
-        changed,
-        move_delta,
-        razor_time: if razor_mode && (body.clicked() || left.clicked() || right.clicked()) {
-            // Compute the time at the click position
-            if let Some(pos) = body.interact_pointer_pos()
-                .or_else(|| left.interact_pointer_pos())
-                .or_else(|| right.interact_pointer_pos())
-            {
-                let frac = ((pos.x - track_left) / track_width).clamp(0.0, 1.0);
-                Some(frac * total_duration)
-            } else {
-                None
+    if resp.clicked() {
+        if razor_mode {
+            if let Some(pos) = resp.interact_pointer_pos() {
+                let t = x_to_time(pos.x, scroll, pps, track_left);
+                return Some(t);
             }
-        } else {
-            None
-        },
+        }
+        return Some(clip_start); // signal selection
+    }
+
+    // Drag to move clip horizontally (no track change for now - just time shift)
+    if resp.dragged() && !locked && !razor_mode {
+        // Return start time to signal it's selected
+        return Some(clip_start);
+    }
+
+    None
+}
+
+
+/// Draw an audio clip with waveform visualization.
+#[allow(clippy::too_many_arguments)]
+fn draw_audio_clip(
+    ui: &mut egui::Ui,
+    painter: &egui::Painter,
+    content_rect: egui::Rect,
+    label: &str,
+    clip_start: f32,
+    clip_end: f32,
+    scroll: f32,
+    pps: f32,
+    track_left: f32,
+    track_right: f32,
+    selected: bool,
+    _track_h: f32,
+    locked: bool,
+    _razor_mode: bool,
+    waveform: Option<&crate::state::AudioWaveform>,
+) -> Option<f32> {
+    let x_start = (clip_start - scroll) * pps + track_left;
+    let x_end = (clip_end - scroll) * pps + track_left;
+
+    if x_end < track_left || x_start > track_right { return None; }
+
+    let x_start = x_start.max(track_left);
+    let x_end = x_end.min(track_right);
+    if x_end - x_start < 2.0 { return None; }
+
+    let bar_rect = egui::Rect::from_min_max(
+        egui::pos2(x_start, content_rect.min.y + 2.0),
+        egui::pos2(x_end, content_rect.max.y - 2.0),
+    );
+
+    // Fill
+    let fill = if selected { Color32::from_rgb(70, 200, 200) } else { COL_CLIP_AUDIO };
+    painter.rect_filled(bar_rect, Rounding::same(4.0), fill);
+
+    // Draw waveform
+    if let Some(wf) = waveform {
+        if wf.ready && !wf.peaks.is_empty() {
+            let bar_w = bar_rect.width();
+            let bar_h = bar_rect.height();
+            let center_y = bar_rect.center().y;
+            let num_samples = (bar_w as usize).min(wf.peaks.len());
+
+            if num_samples > 1 {
+                let step = wf.peaks.len() as f32 / num_samples as f32;
+                for i in 0..num_samples {
+                    let sample_idx = (i as f32 * step) as usize;
+                    let peak = wf.peaks.get(sample_idx).copied().unwrap_or(0.0);
+                    let h = peak * bar_h * 0.4;
+                    let x = bar_rect.min.x + (i as f32 / num_samples as f32) * bar_w;
+                    painter.line_segment(
+                        [egui::pos2(x, center_y - h), egui::pos2(x, center_y + h)],
+                        Stroke::new(1.0, Color32::from_rgba_premultiplied(255, 255, 255, 120)));
+                }
+            }
+        }
+    }
+
+    // Selection border
+    if selected {
+        painter.rect_stroke(bar_rect.expand(1.0), Rounding::same(5.0), Stroke::new(2.0, COL_SELECTED));
+    }
+
+    // Label
+    if bar_rect.width() > 40.0 {
+        painter.text(
+            egui::pos2(bar_rect.min.x + 4.0, bar_rect.min.y + 4.0),
+            egui::Align2::LEFT_TOP, label,
+            egui::FontId::proportional(9.0), Color32::WHITE);
+    }
+
+    // Interaction
+    let id = ui.make_persistent_id(("audio_clip", label, clip_start as u32));
+    let resp = ui.interact(bar_rect, id, if locked { Sense::hover() } else { Sense::click() });
+    if resp.clicked() { return Some(clip_start); }
+
+    None
+}
+
+
+/// Draw ruler time marks with proper spacing.
+fn draw_ruler_marks(painter: &egui::Painter, rect: egui::Rect, scroll: f32, pps: f32, duration: f32) {
+    // Choose step based on zoom level
+    let step = choose_ruler_step_pps(pps);
+    let start_t = (scroll / step).floor() * step;
+    let end_t = scroll + rect.width() / pps;
+
+    let mut t = start_t;
+    while t <= end_t.min(duration) {
+        let x = rect.min.x + (t - scroll) * pps;
+        if x >= rect.min.x && x <= rect.max.x {
+            let is_major = (t / step).round() as i32 % 5 == 0 || step >= duration;
+            let tick_h = if is_major { rect.height() * 0.7 } else { rect.height() * 0.35 };
+            painter.line_segment(
+                [egui::pos2(x, rect.max.y - tick_h), egui::pos2(x, rect.max.y)],
+                Stroke::new(1.0, Color32::from_rgb(80, 80, 100)));
+            if is_major {
+                painter.text(egui::pos2(x, rect.min.y + 2.0), egui::Align2::CENTER_TOP,
+                    format_time(t), egui::FontId::proportional(9.0), COL_TEXT_DIM);
+            }
+        }
+        t += step;
     }
 }
 
-fn t_to_px(t_start: f32, t_end: f32, total: f32, track_left: f32, track_width: f32) -> (f32, f32) {
-    let s = (t_start / total).clamp(0.0, 1.0);
-    let e = (t_end / total).clamp(0.0, 1.0);
-    let left = track_left + s * track_width;
-    let right = (track_left + e * track_width).max(left + 4.0);
-    (left, right)
+/// Convert time to X pixel position. Returns None if off-screen.
+fn time_to_x(t: f32, scroll: f32, pps: f32, track_left: f32, track_right: f32) -> Option<f32> {
+    let x = track_left + (t - scroll) * pps;
+    if x >= track_left && x <= track_right { Some(x) } else { None }
 }
+
+/// Convert X pixel position back to time.
+fn x_to_time(x: f32, scroll: f32, pps: f32, track_left: f32) -> f32 {
+    scroll + (x - track_left) / pps
+}
+
+/// Choose ruler step based on pixels-per-second zoom.
+fn choose_ruler_step_pps(pps: f32) -> f32 {
+    // Target ~60-100px between major marks (every 5 steps)
+    let target_px = 80.0;
+    let step_secs = target_px / pps / 5.0;
+    // Round to nice values
+    if step_secs < 0.02 { 0.01 }
+    else if step_secs < 0.05 { 0.02 }
+    else if step_secs < 0.1 { 0.05 }
+    else if step_secs < 0.2 { 0.1 }
+    else if step_secs < 0.5 { 0.2 }
+    else if step_secs < 1.0 { 0.5 }
+    else if step_secs < 2.0 { 1.0 }
+    else if step_secs < 5.0 { 2.0 }
+    else if step_secs < 10.0 { 5.0 }
+    else { 10.0 }
+}
+
+fn format_time(t: f32) -> String {
+    let mins = (t / 60.0).floor() as u32;
+    let secs = t % 60.0;
+    if mins > 0 { format!("{}:{:05.2}", mins, secs) }
+    else { format!("{:.2}s", secs) }
+}
+
 
 // ─── PREVIEW ─────────────────────────────────────────────────────────
 
-/// Apply chroma-key processing to a ColorImage in-place.
-/// Uses RGB Euclidean distance (normalized to 0..1) for keying.
-fn apply_chroma_key(image: &mut egui::ColorImage, params: &memstroy_core::ChromaKeyParams) {
+pub fn preview(ui: &mut egui::Ui, state: &mut EditorState) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Preview").size(14.0).strong());
+        if state.eyedropper_active {
+            ui.label(RichText::new(" [Eyedropper active]").size(11.0).color(Color32::from_rgb(255, 200, 50)));
+        }
+    });
+    ui.add_space(2.0);
+
+    let avail = ui.available_size_before_wrap();
+    let target_aspect = state.scene.output.resolution[0] as f32 / state.scene.output.resolution[1] as f32;
+    let mut h = avail.y.min(800.0);
+    let mut w = h * target_aspect;
+    if w > avail.x { w = avail.x; h = w / target_aspect; }
+
+    let offset_x = (avail.x - w) * 0.5;
+    let offset_y = (avail.y - h) * 0.5;
+
+    let preview_sense = if state.eyedropper_active { Sense::click() } else { Sense::hover() };
+    let (full_rect, preview_resp) = ui.allocate_exact_size(avail, preview_sense);
+    let rect = egui::Rect::from_min_size(
+        egui::pos2(full_rect.min.x + offset_x, full_rect.min.y + offset_y), Vec2::new(w, h));
+
+    ui.painter().rect_filled(rect, Rounding::same(6.0), Color32::from_rgb(10, 10, 16));
+
+    // Composite layers — use a SINGLE combined texture to avoid lag
+    let t = state.playhead;
+    let mut any_frame_shown = false;
+
+    // Collect actor info to avoid borrow conflicts
+    let actor_data: Vec<_> = state.scene.actors.iter().enumerate().map(|(idx, actor)| {
+        (idx, actor.visible, actor.t_in.unwrap_or(0.0), actor.t_out.unwrap_or(f32::MAX),
+         actor.source_start, actor.chroma_key.clone())
+    }).collect();
+
+    // Only render the TOPMOST visible actor at current time to avoid lag
+    // (compositing multiple actors requires GPU — for now just show the primary one)
+    let mut active_actor: Option<usize> = None;
+    for (idx, visible, t_in, t_out, _, _) in actor_data.iter().rev() {
+        if *visible && t >= *t_in && t <= *t_out {
+            active_actor = Some(*idx);
+            break;
+        }
+    }
+
+    if let Some(actor_idx) = active_actor {
+        let (_, _, t_in, _, source_start, ref chroma_key) = actor_data[actor_idx];
+        let local_t = t - t_in + source_start;
+
+        if let Some(fc) = state.frame_caches.get_mut(actor_idx) {
+            if fc.is_ready() {
+                if let Some(mut img) = fc.raw_frame_at_time(local_t) {
+                    if !state.eyedropper_active {
+                        apply_chroma_key(&mut img, chroma_key);
+                    }
+                    let tex = ui.ctx().load_texture(
+                        format!("preview_layer_{}", actor_idx), img, egui::TextureOptions::LINEAR);
+                    let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                    ui.painter().image(tex.id(), rect, uv, Color32::WHITE);
+                    any_frame_shown = true;
+                }
+            } else if fc.extracting && !any_frame_shown {
+                ui.put(rect, egui::Label::new(
+                    RichText::new("Extracting frames...").color(Color32::from_rgb(180, 150, 60)).size(14.0)));
+            }
+        }
+    }
+
+    // Eyedropper handling
+    if state.eyedropper_active && preview_resp.clicked() {
+        if let Some(pos) = preview_resp.interact_pointer_pos() {
+            let u = ((pos.x - rect.min.x) / rect.width()).clamp(0.0, 1.0);
+            let v = ((pos.y - rect.min.y) / rect.height()).clamp(0.0, 1.0);
+            if let Selection::Actor(idx) = state.selection {
+                if idx < state.scene.actors.len() {
+                    let t_in = state.scene.actors[idx].t_in.unwrap_or(0.0);
+                    let src_start = state.scene.actors[idx].source_start;
+                    let local_t = state.playhead - t_in + src_start;
+                    if let Some(fc) = state.frame_caches.get_mut(idx) {
+                        if let Some(img) = fc.raw_frame_at_time(local_t) {
+                            let px = ((u * img.size[0] as f32) as usize).min(img.size[0].saturating_sub(1));
+                            let py = ((v * img.size[1] as f32) as usize).min(img.size[1].saturating_sub(1));
+                            let pixel = img.pixels[py * img.size[0] + px];
+                            state.scene.actors[idx].chroma_key.key_color = [pixel.r(), pixel.g(), pixel.b()];
+                            state.status = format!("Picked: ({}, {}, {})", pixel.r(), pixel.g(), pixel.b());
+                        }
+                    }
+                }
+            }
+            state.eyedropper_active = false;
+        }
+    }
+    if state.eyedropper_active && preview_resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+    }
+
+    if !any_frame_shown && state.frame_caches.is_empty() {
+        if let Some(p) = &state.last_preview {
+            let uri = format!("file://{}", p.display());
+            ui.put(rect, egui::Image::from_uri(uri).fit_to_exact_size(rect.size()));
+        } else {
+            ui.put(rect, egui::Label::new(
+                RichText::new("Preview\n\nAdd clips and hit play").color(Color32::from_rgb(60, 60, 80)).size(14.0)));
+        }
+    } else if !any_frame_shown {
+        ui.put(rect, egui::Label::new(
+            RichText::new("No clip active at this time").color(Color32::from_rgb(60, 60, 80)).size(13.0)));
+    }
+}
+
+
+/// Apply chroma-key processing to a ColorImage.
+fn apply_chroma_key(image: &mut egui::ColorImage, params: &ChromaKeyParams) {
     let kr = params.key_color[0] as f32 / 255.0;
     let kg = params.key_color[1] as f32 / 255.0;
     let kb = params.key_color[2] as f32 / 255.0;
-
     let similarity = params.similarity;
     let blend = params.blend;
     let spill = params.spill;
@@ -1328,232 +1251,33 @@ fn apply_chroma_key(image: &mut egui::ColorImage, params: &memstroy_core::Chroma
         let g = pixel.g() as f32 / 255.0;
         let b = pixel.b() as f32 / 255.0;
 
-        // Euclidean distance in RGB space, normalized by sqrt(3) so max distance = 1.0
         let dr = r - kr;
         let dg = g - kg;
         let db = b - kb;
-        let distance = (dr * dr + dg * dg + db * db).sqrt() / 1.732_050_8; // sqrt(3)
+        let distance = (dr * dr + dg * dg + db * db).sqrt() / 1.732_050_8;
 
         if distance < similarity {
-            // Fully transparent
             *pixel = Color32::from_rgba_unmultiplied(pixel.r(), pixel.g(), pixel.b(), 0);
         } else if distance < similarity + blend {
-            // Feathered edge: proportional alpha
             let t = (distance - similarity) / blend.max(0.001);
             let alpha = (t * 255.0).round() as u8;
-            // Spill suppression on feathered pixels
             let mut new_g = pixel.g() as f32;
             let spill_factor = spill * (1.0 - distance);
             new_g = (new_g - new_g * spill_factor).max(0.0);
-            *pixel = Color32::from_rgba_unmultiplied(
-                pixel.r(),
-                new_g.round() as u8,
-                pixel.b(),
-                alpha,
-            );
-        } else {
-            // Spill suppression for pixels near the key color
-            if distance < similarity + blend + 0.15 {
-                let proximity = 1.0 - ((distance - similarity - blend) / 0.15).clamp(0.0, 1.0);
-                let spill_factor = spill * proximity;
-                let new_g = (pixel.g() as f32 * (1.0 - spill_factor)).round() as u8;
-                *pixel = Color32::from_rgba_unmultiplied(pixel.r(), new_g, pixel.b(), pixel.a());
-            }
+            *pixel = Color32::from_rgba_unmultiplied(pixel.r(), new_g.round() as u8, pixel.b(), alpha);
+        } else if distance < similarity + blend + 0.15 {
+            let proximity = 1.0 - ((distance - similarity - blend) / 0.15).clamp(0.0, 1.0);
+            let spill_factor = spill * proximity;
+            let new_g = (pixel.g() as f32 * (1.0 - spill_factor)).round() as u8;
+            *pixel = Color32::from_rgba_unmultiplied(pixel.r(), new_g, pixel.b(), pixel.a());
         }
-    }
-}
-
-pub fn preview(ui: &mut egui::Ui, state: &mut EditorState) {
-    ui.heading(RichText::new("\u{1F440} Preview").size(16.0).strong());
-    ui.add_space(4.0);
-
-    let avail = ui.available_size_before_wrap();
-    let target_aspect =
-        state.scene.output.resolution[0] as f32 / state.scene.output.resolution[1] as f32;
-    let mut h = avail.y.min(800.0);
-    let mut w = h * target_aspect;
-    if w > avail.x {
-        w = avail.x;
-        h = w / target_aspect;
-    }
-
-    // Center the preview rect both horizontally and vertically
-    let offset_x = (avail.x - w) * 0.5;
-    let offset_y = (avail.y - h) * 0.5;
-
-    // Make preview clickable for eyedropper
-    let preview_sense = if state.eyedropper_active {
-        egui::Sense::click()
-    } else {
-        egui::Sense::hover()
-    };
-
-    // Reserve full available space then position content in center
-    let (full_rect, preview_resp) = ui.allocate_exact_size(avail, preview_sense);
-    let rect = egui::Rect::from_min_size(
-        egui::pos2(full_rect.min.x + offset_x, full_rect.min.y + offset_y),
-        egui::vec2(w, h),
-    );
-
-    // Draw preview background
-    ui.painter().rect_filled(
-        rect,
-        Rounding::same(8.0),
-        Color32::from_rgb(10, 10, 16),
-    );
-
-    // Layer compositing: iterate actors bottom-to-top
-    let t = state.playhead;
-    let mut any_frame_shown = false;
-    let eyedropper_active = state.eyedropper_active;
-
-    // Collect actor data we need (to avoid borrow conflicts with frame_caches)
-    let actor_data: Vec<_> = state.scene.actors.iter().enumerate().map(|(idx, actor)| {
-        (
-            idx,
-            actor.visible,
-            actor.t_in.unwrap_or(0.0),
-            actor.t_out.unwrap_or(f32::MAX),
-            actor.source_start,
-            actor.chroma_key.clone(),
-        )
-    }).collect();
-
-    for (actor_idx, visible, t_in, t_out, source_start, chroma_key) in actor_data.iter() {
-        // Skip invisible actors
-        if !visible {
-            continue;
-        }
-
-        // Check if this actor is active at current playhead time
-        if t < *t_in || t > *t_out {
-            continue; // clip not active at this time
-        }
-
-        // Compute local time within this clip
-        let local_t = t - t_in + source_start;
-
-        // Get frame from this actor's cache
-        if let Some(fc) = state.frame_caches.get_mut(*actor_idx) {
-            if fc.is_ready() {
-                if let Some(mut img) = fc.raw_frame_at_time(local_t) {
-                    // Apply chroma-key ONLY if eyedropper is NOT active
-                    if !eyedropper_active {
-                        apply_chroma_key(&mut img, chroma_key);
-                    }
-                    // Upload to texture and display
-                    let tex = ui.ctx().load_texture(
-                        format!("layer_{}", actor_idx),
-                        img,
-                        egui::TextureOptions::LINEAR,
-                    );
-                    let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-                    ui.painter().image(tex.id(), rect, uv, Color32::WHITE);
-                    any_frame_shown = true;
-                }
-            } else if fc.extracting {
-                // Show extracting indicator only if no other frame is shown
-                if !any_frame_shown {
-                    ui.put(rect, egui::Label::new(
-                        RichText::new("\u{23F3} Extracting frames...")
-                            .color(Color32::from_rgb(180, 150, 60)).size(14.0),
-                    ));
-                }
-            }
-        }
-    }
-
-    // Handle eyedropper click
-    if state.eyedropper_active && preview_resp.clicked() {
-        if let Some(pos) = preview_resp.interact_pointer_pos() {
-            // Compute UV coordinates within the preview rect
-            let u = ((pos.x - rect.min.x) / rect.width()).clamp(0.0, 1.0);
-            let v = ((pos.y - rect.min.y) / rect.height()).clamp(0.0, 1.0);
-
-            // Sample from the selected actor's raw frame at current playhead
-            if let Selection::Actor(idx) = state.selection {
-                if idx < state.scene.actors.len() {
-                    let actor_t_in = state.scene.actors[idx].t_in.unwrap_or(0.0);
-                    let actor_source_start = state.scene.actors[idx].source_start;
-                    let local_t = state.playhead - actor_t_in + actor_source_start;
-                    if let Some(fc) = state.frame_caches.get_mut(idx) {
-                        if let Some(img) = fc.raw_frame_at_time(local_t) {
-                            let px = (u * img.size[0] as f32) as usize;
-                            let py = (v * img.size[1] as f32) as usize;
-                            let px = px.min(img.size[0].saturating_sub(1));
-                            let py = py.min(img.size[1].saturating_sub(1));
-                            let pixel = img.pixels[py * img.size[0] + px];
-                            // Set the chroma key color
-                            state.scene.actors[idx].chroma_key.key_color = [pixel.r(), pixel.g(), pixel.b()];
-                            state.status = format!("Picked color: ({}, {}, {})", pixel.r(), pixel.g(), pixel.b());
-                        }
-                    }
-                }
-            }
-            state.eyedropper_active = false;
-        }
-    }
-
-    // Show eyedropper cursor
-    if state.eyedropper_active && preview_resp.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
-    }
-
-    if !any_frame_shown && state.frame_caches.is_empty() {
-        // Fallback: old PNG-based preview or placeholder
-        if let Some(p) = &state.last_preview {
-            let uri = format!("file://{}", p.display());
-            ui.put(rect, egui::Image::from_uri(uri).fit_to_exact_size(rect.size()));
-        } else {
-            ui.put(
-                rect,
-                egui::Label::new(
-                    RichText::new(
-                        "\u{1F3AC}\n\nRender \u{2192} Preview frame\nto see your meme here",
-                    )
-                    .color(Color32::from_rgb(80, 80, 100))
-                    .size(16.0),
-                ),
-            );
-        }
-    } else if !any_frame_shown {
-        // Frame caches exist but no clip is active at current time
-        ui.put(
-            rect,
-            egui::Label::new(
-                RichText::new("\u{1F3AC}\n\nNo clip active at this time")
-                    .color(Color32::from_rgb(80, 80, 100))
-                    .size(14.0),
-            ),
-        );
     }
 }
 
 // ─── HELPERS ─────────────────────────────────────────────────────────
 
-/// Choose a reasonable step size for ruler tick marks based on total duration.
-fn choose_ruler_step(duration: f32) -> f32 {
-    if duration <= 2.0 {
-        0.1
-    } else if duration <= 10.0 {
-        0.5
-    } else if duration <= 30.0 {
-        1.0
-    } else if duration <= 60.0 {
-        2.0
-    } else if duration <= 300.0 {
-        5.0
-    } else {
-        10.0
-    }
-}
-
 fn color_edit_u8(ui: &mut egui::Ui, c: &mut [u8; 3]) {
-    let mut rgb = [
-        c[0] as f32 / 255.0,
-        c[1] as f32 / 255.0,
-        c[2] as f32 / 255.0,
-    ];
+    let mut rgb = [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0];
     if ui.color_edit_button_rgb(&mut rgb).changed() {
         c[0] = (rgb[0] * 255.0).round() as u8;
         c[1] = (rgb[1] * 255.0).round() as u8;
@@ -1562,46 +1286,28 @@ fn color_edit_u8(ui: &mut egui::Ui, c: &mut [u8; 3]) {
 }
 
 fn ellipsis(s: &str, n: usize) -> String {
-    if s.chars().count() <= n {
-        s.to_string()
-    } else {
-        let mut out: String = s.chars().take(n).collect();
-        out.push_str("...");
-        out
-    }
+    if s.chars().count() <= n { s.to_string() }
+    else { format!("{}...", s.chars().take(n).collect::<String>()) }
 }
 
-/// Strip emoji spam and noise words (Имба, Топ, Херня, etc) from clip descriptions.
 fn clean_clip_text(raw: &str) -> String {
-    let noise: &[&str] = &[
-        "Имба", "Топ", "Херня", "имба", "топ", "херня",
-        "—", "\u{2014}", "\u{2764}\u{FE0F}\u{200D}\u{1F525}", // ❤️‍🔥
-    ];
-    let mut s = raw.to_string();
-    // Remove common emoji
-    s = s.chars().filter(|c| {
-        // Keep ASCII, Cyrillic, and basic punctuation
+    let noise: &[&str] = &["Имба", "Топ", "Херня", "имба", "топ", "херня", "—", "\u{2014}"];
+    let mut s: String = raw.chars().filter(|c| {
         c.is_ascii() || ('\u{0400}'..='\u{04FF}').contains(c) || *c == ' ' || *c == '.' || *c == ',' || *c == '!' || *c == '?'
     }).collect();
-    for n in noise {
-        s = s.replace(n, "");
-    }
-    // Collapse multiple spaces/dashes
+    for n in noise { s = s.replace(n, ""); }
     while s.contains("  ") { s = s.replace("  ", " "); }
-    while s.contains("--") { s = s.replace("--", "-"); }
-    s = s.trim_matches(|c: char| c == ' ' || c == '-' || c == '\u{2014}').to_string();
-    s
+    s.trim_matches(|c: char| c == ' ' || c == '-').to_string()
 }
 
-fn add_actor_from_clip(state: &mut EditorState, path: &PathBuf) {
-    let id = path
-        .file_stem()
-        .and_then(|s| s.to_str())
+pub fn add_actor_from_clip(state: &mut EditorState, path: &PathBuf) {
+    let id = path.file_stem().and_then(|s| s.to_str())
         .map(|s| format!("mellstroy_{}", s))
         .unwrap_or_else(|| format!("actor_{}", state.scene.actors.len() + 1));
 
-    // Probe video duration via ffprobe for accurate timeline display
     let clip_duration = probe_video_duration(path);
+    let t_in = state.playhead;
+    let t_out = (t_in + clip_duration).min(state.scene.output.duration);
 
     let actor = Actor {
         id: id.clone(),
@@ -1609,73 +1315,55 @@ fn add_actor_from_clip(state: &mut EditorState, path: &PathBuf) {
         anchors: None,
         chroma_key: ChromaKeyParams::default(),
         layout: vec![Keyframe::new(0.0, ActorState::default())],
-        t_in: Some(0.0),
-        t_out: Some(clip_duration),
+        t_in: Some(t_in),
+        t_out: Some(t_out),
         source_start: 0.0,
-        loop_source: true,
+        loop_source: false,
         flip_horizontal: false,
         attachments: Vec::new(),
         visible: true,
     };
-
-    // Expand scene output duration to fit the clip if needed
-    if clip_duration > state.scene.output.duration {
-        state.scene.output.duration = clip_duration;
-    }
-
     state.scene.actors.push(actor);
     state.selection = Selection::Actor(state.scene.actors.len() - 1);
-    state.status = "__EXTRACT_FRAMES__".into();
-}
-
-/// Probe video duration using ffprobe. Returns duration in seconds, or 8.0 as fallback.
-fn probe_video_duration(path: &std::path::Path) -> f32 {
-    let ffmpeg_bin = memstroy_render::ffmpeg_binary();
-    let ffprobe = {
-        let mut p = ffmpeg_bin.clone();
-        p.set_file_name(if cfg!(windows) { "ffprobe.exe" } else { "ffprobe" });
-        if p.exists() { p } else { std::path::PathBuf::from("ffprobe") }
-    };
-
-    match std::process::Command::new(&ffprobe)
-        .args(["-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1"])
-        .arg(path)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-    {
-        Ok(out) => {
-            let s = String::from_utf8_lossy(&out.stdout);
-            s.trim().parse::<f32>().unwrap_or(8.0)
-        }
-        Err(_) => 8.0,
-    }
+    state.status = format!("Added: {}", id);
 }
 
 fn add_background_from_path(state: &mut EditorState, path: &PathBuf) {
-    let id = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .map(|s| format!("bg_{}", s))
-        .unwrap_or_else(|| format!("bg_{}", state.scene.backgrounds.len() + 1));
-    let kind_image = matches!(
-        path.extension().and_then(|s| s.to_str()).map(|s| s.to_lowercase()).as_deref(),
-        Some("jpg" | "jpeg" | "png" | "webp")
-    );
-    let source = if kind_image {
+    let id = path.file_stem().and_then(|s| s.to_str())
+        .map(|s| s.to_string()).unwrap_or_else(|| format!("bg_{}", state.scene.backgrounds.len() + 1));
+
+    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+    let source = if ["jpg", "jpeg", "png", "webp"].iter().any(|e| e.eq_ignore_ascii_case(ext)) {
         MediaSource::Image { path: path.clone() }
     } else {
         MediaSource::Video { path: path.clone(), r#loop: true, start_at: 0.0 }
     };
+
+    let dur = if ["mp4", "mov", "webm"].iter().any(|e| e.eq_ignore_ascii_case(ext)) {
+        probe_video_duration(path)
+    } else { state.scene.output.duration };
+
     let bg = Background {
-        id: id.clone(),
-        source,
-        start: 0.0,
-        duration: state.scene.output.duration,
-        fit: Fit::Cover,
-        transition: Transition::Cut,
+        id, source, start: state.playhead,
+        duration: dur.min(state.scene.output.duration - state.playhead),
+        fit: Fit::Cover, transition: Transition::Cut,
     };
     state.scene.backgrounds.push(bg);
     state.selection = Selection::Background(state.scene.backgrounds.len() - 1);
-    state.status = format!("\u{2705} Added background: {}", id);
+    state.status = "Background added".into();
+}
+
+fn probe_video_duration(path: &PathBuf) -> f32 {
+    let ffprobe = {
+        let mut p = memstroy_render::ffmpeg_binary();
+        p.set_file_name("ffprobe");
+        if !p.exists() { PathBuf::from("ffprobe") } else { p }
+    };
+    match std::process::Command::new(&ffprobe)
+        .args(["-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1"])
+        .arg(path).output()
+    {
+        Ok(out) => String::from_utf8_lossy(&out.stdout).trim().parse::<f32>().unwrap_or(5.0),
+        Err(_) => 5.0,
+    }
 }
