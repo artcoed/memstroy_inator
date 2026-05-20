@@ -9,7 +9,7 @@ use tokio::runtime::Runtime;
 
 use crate::jobs::{spawn_preview, spawn_refresh, spawn_render, JobEvent};
 use crate::panels;
-use crate::state::EditorState;
+use crate::state::{EditorState, Selection};
 
 pub struct App {
     rt: Runtime,
@@ -154,6 +154,85 @@ impl App {
         });
     }
 
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        let modifiers = ctx.input(|i| i.modifiers);
+        let ctrl = modifiers.ctrl || modifiers.mac_cmd;
+
+        ctx.input(|i| {
+            // Ctrl+Z = Undo
+            if ctrl && i.key_pressed(egui::Key::Z) && !modifiers.shift {
+                self.state.undo();
+            }
+            // Ctrl+Shift+Z or Ctrl+Y = Redo
+            if ctrl && ((i.key_pressed(egui::Key::Z) && modifiers.shift) || i.key_pressed(egui::Key::Y)) {
+                self.state.redo();
+            }
+            // Delete key = remove selected element
+            if i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace) {
+                self.delete_selected();
+            }
+            // Ctrl+D = duplicate selected
+            if ctrl && i.key_pressed(egui::Key::D) {
+                self.duplicate_selected();
+            }
+        });
+    }
+
+    fn delete_selected(&mut self) {
+        match self.state.selection {
+            Selection::Actor(i) if i < self.state.scene.actors.len() => {
+                self.state.mutate(|s| { s.actors.remove(i); });
+                self.state.selection = Selection::None;
+                self.state.status = "\u{1F5D1} Actor deleted.".into();
+            }
+            Selection::Overlay(i) if i < self.state.scene.overlays.len() => {
+                self.state.mutate(|s| { s.overlays.remove(i); });
+                self.state.selection = Selection::None;
+                self.state.status = "\u{1F5D1} Overlay deleted.".into();
+            }
+            Selection::Background(i) if i < self.state.scene.backgrounds.len() => {
+                self.state.mutate(|s| { s.backgrounds.remove(i); });
+                self.state.selection = Selection::None;
+                self.state.status = "\u{1F5D1} Background deleted.".into();
+            }
+            _ => {}
+        }
+    }
+
+    fn duplicate_selected(&mut self) {
+        match self.state.selection {
+            Selection::Actor(i) if i < self.state.scene.actors.len() => {
+                let mut dup = self.state.scene.actors[i].clone();
+                dup.id = format!("{}_copy", dup.id);
+                let new_idx = self.state.scene.actors.len();
+                self.state.mutate(move |s| { s.actors.push(dup); });
+                self.state.selection = Selection::Actor(new_idx);
+                self.state.status = "\u{1F4CB} Actor duplicated.".into();
+            }
+            Selection::Overlay(i) if i < self.state.scene.overlays.len() => {
+                let mut dup = self.state.scene.overlays[i].clone();
+                match &mut dup {
+                    memstroy_core::Overlay::Text(t) => t.id = format!("{}_copy", t.id),
+                    memstroy_core::Overlay::Image(im) => im.id = format!("{}_copy", im.id),
+                    memstroy_core::Overlay::Video(v) => v.id = format!("{}_copy", v.id),
+                }
+                let new_idx = self.state.scene.overlays.len();
+                self.state.mutate(move |s| { s.overlays.push(dup); });
+                self.state.selection = Selection::Overlay(new_idx);
+                self.state.status = "\u{1F4CB} Overlay duplicated.".into();
+            }
+            Selection::Background(i) if i < self.state.scene.backgrounds.len() => {
+                let mut dup = self.state.scene.backgrounds[i].clone();
+                dup.id = format!("{}_copy", dup.id);
+                let new_idx = self.state.scene.backgrounds.len();
+                self.state.mutate(move |s| { s.backgrounds.push(dup); });
+                self.state.selection = Selection::Background(new_idx);
+                self.state.status = "\u{1F4CB} Background duplicated.".into();
+            }
+            _ => {}
+        }
+    }
+
     fn save_scene(&mut self) {
         if let Some(path) = self.state.scene_path.clone() {
             match self.state.scene.save(&path) {
@@ -243,6 +322,9 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.pump_events(ctx);
 
+        // Keyboard shortcuts
+        self.handle_shortcuts(ctx);
+
         // Apply modern dark style
         apply_style(ctx);
 
@@ -289,6 +371,14 @@ impl eframe::App for App {
         if self.state.status == "__REFRESH_REQUESTED__" {
             self.state.status = String::new();
             self.run_refresh();
+        }
+        if self.state.status == "__DELETE_SELECTED__" {
+            self.state.status = String::new();
+            self.delete_selected();
+        }
+        if self.state.status == "__DUPLICATE_SELECTED__" {
+            self.state.status = String::new();
+            self.duplicate_selected();
         }
 
         // Right panel: Inspector

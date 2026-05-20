@@ -364,54 +364,126 @@ fn background_editor(ui: &mut egui::Ui, b: &mut Background) {
 pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     ui.horizontal(|ui| {
         ui.heading(RichText::new("\u{23F1} Timeline").size(16.0).strong());
-        ui.add_space(20.0);
+        ui.add_space(12.0);
+
+        // Undo/redo buttons
+        let can_undo = state.undo.can_undo();
+        let can_redo = state.undo.can_redo();
+        if ui
+            .add_enabled(can_undo, egui::Button::new("\u{21A9}").min_size(egui::vec2(28.0, 22.0)))
+            .on_hover_text("Undo (Ctrl+Z)")
+            .clicked()
+        {
+            state.undo();
+        }
+        if ui
+            .add_enabled(can_redo, egui::Button::new("\u{21AA}").min_size(egui::vec2(28.0, 22.0)))
+            .on_hover_text("Redo (Ctrl+Y)")
+            .clicked()
+        {
+            state.redo();
+        }
+
+        ui.add_space(12.0);
+
+        // Playhead slider
         ui.add(
             egui::Slider::new(&mut state.playhead, 0.0..=state.scene.output.duration)
                 .text("s")
                 .show_value(true),
         );
+
+        // Delete / Duplicate buttons
+        ui.add_space(8.0);
+        if ui.button("\u{1F5D1}").on_hover_text("Delete selected (Del)").clicked() {
+            // Will be handled by app shortcut logic via flag
+            state.status = "__DELETE_SELECTED__".into();
+        }
+        if ui.button("\u{1F4CB}").on_hover_text("Duplicate selected (Ctrl+D)").clicked() {
+            state.status = "__DUPLICATE_SELECTED__".into();
+        }
     });
     ui.add_space(4.0);
     ui.separator();
+    ui.add_space(2.0);
+
+    // Visual timeline tracks
+    let duration = state.scene.output.duration;
+    let avail_width = ui.available_width() - 100.0; // reserve label space
+    let track_height = 24.0;
+    let track_spacing = 3.0;
 
     let mut to_select: Option<Selection> = None;
-    egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
-        for (i, b) in state.scene.backgrounds.iter().enumerate() {
-            let sel = state.selection == Selection::Background(i);
-            let resp = ui.selectable_label(
-                sel,
-                RichText::new(format!(
-                    "\u{1F304} {} ({:.1}s @ {:.1})",
-                    b.id, b.duration, b.start
-                ))
-                .size(12.0),
-            );
-            if resp.clicked() {
+
+    egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
+        // Backgrounds
+        for (i, bg) in state.scene.backgrounds.clone().iter().enumerate() {
+            let selected = state.selection == Selection::Background(i);
+            if draw_track_bar(
+                ui,
+                &format!("\u{1F304} {}", bg.id),
+                bg.start,
+                bg.start + bg.duration,
+                duration,
+                avail_width,
+                track_height,
+                Color32::from_rgb(60, 120, 200),
+                selected,
+            ) {
                 to_select = Some(Selection::Background(i));
             }
+            ui.add_space(track_spacing);
         }
-        for (i, a) in state.scene.actors.iter().enumerate() {
-            let sel = state.selection == Selection::Actor(i);
-            let resp = ui.selectable_label(
-                sel,
-                RichText::new(format!("\u{1F3AD} {}", a.id)).size(12.0),
-            );
-            if resp.clicked() {
+
+        // Actors
+        for (i, actor) in state.scene.actors.clone().iter().enumerate() {
+            let t_start = actor.t_in.unwrap_or(0.0);
+            let t_end = actor.t_out.unwrap_or(duration);
+            let selected = state.selection == Selection::Actor(i);
+            if draw_track_bar(
+                ui,
+                &format!("\u{1F3AD} {}", actor.id),
+                t_start,
+                t_end,
+                duration,
+                avail_width,
+                track_height,
+                Color32::from_rgb(200, 120, 50),
+                selected,
+            ) {
                 to_select = Some(Selection::Actor(i));
             }
+            ui.add_space(track_spacing);
         }
-        for (i, o) in state.scene.overlays.iter().enumerate() {
-            let label = match o {
-                Overlay::Text(t) => format!("\u{1F4DD} {} \"{}\"", t.id, ellipsis(&t.text, 20)),
-                Overlay::Image(im) => format!("\u{1F5BC} {}", im.id),
-                Overlay::Video(v) => format!("\u{1F3AC} {}", v.id),
+
+        // Overlays
+        for (i, ov) in state.scene.overlays.clone().iter().enumerate() {
+            let (label, t_start, t_end) = match ov {
+                Overlay::Text(t) => (
+                    format!("\u{1F4DD} {}", ellipsis(&t.text, 12)),
+                    t.t_in,
+                    t.t_out,
+                ),
+                Overlay::Image(im) => (format!("\u{1F5BC} {}", im.id), im.t_in, im.t_out),
+                Overlay::Video(v) => (format!("\u{1F3AC} {}", v.id), v.t_in, v.t_out),
             };
-            let sel = state.selection == Selection::Overlay(i);
-            let resp = ui.selectable_label(sel, RichText::new(label).size(12.0));
-            if resp.clicked() {
+            let selected = state.selection == Selection::Overlay(i);
+            if draw_track_bar(
+                ui,
+                &label,
+                t_start,
+                t_end,
+                duration,
+                avail_width,
+                track_height,
+                Color32::from_rgb(100, 200, 100),
+                selected,
+            ) {
                 to_select = Some(Selection::Overlay(i));
             }
+            ui.add_space(track_spacing);
         }
+
         if state.scene.actors.is_empty()
             && state.scene.overlays.is_empty()
             && state.scene.backgrounds.is_empty()
@@ -419,7 +491,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             ui.add_space(20.0);
             ui.label(
                 RichText::new(
-                    "\u{1F4AD} Empty scene.\nAdd clips from the library \u{2192} they appear here.",
+                    "\u{1F4AD} Empty scene. Add clips from library \u{2192} they appear here.",
                 )
                 .italics()
                 .color(Color32::from_rgb(120, 120, 140))
@@ -427,9 +499,96 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             );
         }
     });
+
     if let Some(sel) = to_select {
         state.selection = sel;
     }
+
+    // Draw playhead marker
+    // (visual only — the actual position is controlled by the slider above)
+}
+
+/// Draw a single horizontal track bar. Returns true if clicked.
+fn draw_track_bar(
+    ui: &mut egui::Ui,
+    label: &str,
+    t_start: f32,
+    t_end: f32,
+    total_duration: f32,
+    avail_width: f32,
+    height: f32,
+    color: Color32,
+    selected: bool,
+) -> bool {
+    let label_width = 90.0;
+    let track_width = avail_width;
+
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(label_width + track_width + 8.0, height),
+        egui::Sense::click_and_drag(),
+    );
+
+    let painter = ui.painter_at(rect);
+
+    // Label
+    let label_rect = egui::Rect::from_min_size(rect.min, egui::vec2(label_width, height));
+    painter.text(
+        label_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        label,
+        egui::FontId::proportional(11.0),
+        Color32::from_rgb(180, 180, 200),
+    );
+
+    // Track background
+    let track_left = rect.min.x + label_width + 4.0;
+    let track_rect = egui::Rect::from_min_size(
+        egui::pos2(track_left, rect.min.y + 2.0),
+        egui::vec2(track_width, height - 4.0),
+    );
+    painter.rect_filled(track_rect, Rounding::same(3.0), Color32::from_rgb(25, 25, 38));
+
+    // Bar representing the element's time span
+    let bar_start_frac = (t_start / total_duration).clamp(0.0, 1.0);
+    let bar_end_frac = (t_end / total_duration).clamp(0.0, 1.0);
+    let bar_left = track_left + bar_start_frac * track_width;
+    let bar_right = track_left + bar_end_frac * track_width;
+    let bar_rect = egui::Rect::from_min_max(
+        egui::pos2(bar_left, rect.min.y + 3.0),
+        egui::pos2(bar_right.max(bar_left + 4.0), rect.min.y + height - 3.0),
+    );
+
+    let fill = if selected {
+        color.gamma_multiply(1.3)
+    } else if resp.hovered() {
+        color.gamma_multiply(1.1)
+    } else {
+        color
+    };
+
+    painter.rect_filled(bar_rect, Rounding::same(4.0), fill);
+
+    // Selection border
+    if selected {
+        painter.rect_stroke(
+            bar_rect.expand(1.0),
+            Rounding::same(5.0),
+            egui::Stroke::new(2.0, Color32::WHITE),
+        );
+    }
+
+    // Time label inside bar
+    if bar_rect.width() > 40.0 {
+        painter.text(
+            bar_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            format!("{:.1}-{:.1}s", t_start, t_end),
+            egui::FontId::proportional(9.0),
+            Color32::WHITE,
+        );
+    }
+
+    resp.clicked()
 }
 
 // ─── PREVIEW ─────────────────────────────────────────────────────────

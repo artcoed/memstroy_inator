@@ -4,6 +4,7 @@ mod app;
 mod jobs;
 mod panels;
 mod state;
+mod undo;
 
 use anyhow::Result;
 use tracing_subscriber::EnvFilter;

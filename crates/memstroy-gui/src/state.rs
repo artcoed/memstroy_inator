@@ -1,10 +1,11 @@
 use std::path::PathBuf;
 
 use memstroy_core::Scene;
-use memstroy_tg::model::{ClipEntry, DownloadState};
+use memstroy_tg::model::DownloadState;
 
-/// Editor-side selection state. The GUI mutates the scene through
-/// these handles.
+use crate::undo::UndoStack;
+
+/// Editor-side selection state.
 #[derive(Default)]
 pub struct EditorState {
     pub scene: Scene,
@@ -12,24 +13,23 @@ pub struct EditorState {
     pub assets_root: PathBuf,
     pub library: AssetLibrary,
     pub selection: Selection,
-    /// Current playhead time (seconds).
     pub playhead: f32,
     pub status: String,
     pub last_preview: Option<PathBuf>,
     pub render_progress: Option<RenderProgress>,
-    /// Whether a download/refresh job is currently running.
     pub refreshing: bool,
+    pub undo: UndoStack,
+    /// Drag state for timeline interactions.
+    pub drag: DragState,
 }
 
 #[derive(Default)]
 pub struct AssetLibrary {
-    /// Mellstroy clips with metadata from state.json
     pub mellstroy_clips: Vec<LibraryClip>,
     pub backgrounds: Vec<PathBuf>,
     pub props: Vec<PathBuf>,
 }
 
-/// A clip in the library with its metadata.
 #[derive(Debug, Clone)]
 pub struct LibraryClip {
     pub id: u64,
@@ -56,6 +56,23 @@ pub struct RenderProgress {
     pub error: Option<String>,
 }
 
+/// What's currently being dragged in the timeline.
+#[derive(Default, Clone, Copy, PartialEq)]
+pub enum DragState {
+    #[default]
+    None,
+    /// Dragging a background segment's start time.
+    BackgroundStart(usize),
+    /// Dragging a background segment's end (duration).
+    BackgroundEnd(usize),
+    /// Moving a background segment (both start & end).
+    BackgroundMove(usize, f32), // index, original_start
+    /// Moving an actor's t_in/t_out window.
+    ActorMove(usize),
+    /// Moving an overlay's time window.
+    OverlayMove(usize),
+}
+
 impl EditorState {
     pub fn new() -> Self {
         let mut s = Self::default();
@@ -65,17 +82,36 @@ impl EditorState {
         s
     }
 
-    /// Path to the clips directory.
     pub fn clips_dir(&self) -> PathBuf {
         self.assets_root.join("assets").join("mellstroy")
     }
 
-    /// Path to the download state file.
     pub fn state_path(&self) -> PathBuf {
         self.clips_dir().join("state.json")
     }
 
-    /// Reload library from download state on disk.
+    /// Save undo snapshot, then apply a mutation via the closure.
+    pub fn mutate(&mut self, f: impl FnOnce(&mut Scene)) {
+        self.undo.push(&self.scene);
+        f(&mut self.scene);
+    }
+
+    /// Undo the last action.
+    pub fn undo(&mut self) {
+        if let Some(prev) = self.undo.undo(&self.scene) {
+            self.scene = prev;
+            self.status = "\u{21A9} Undo".into();
+        }
+    }
+
+    /// Redo the last undone action.
+    pub fn redo(&mut self) {
+        if let Some(next) = self.undo.redo(&self.scene) {
+            self.scene = next;
+            self.status = "\u{21AA} Redo".into();
+        }
+    }
+
     pub fn reload_library(&mut self) {
         let state = DownloadState::load(&self.state_path());
         let clips_dir = self.clips_dir();
@@ -92,10 +128,8 @@ impl EditorState {
             })
             .collect();
 
-        // Sort by id ascending (oldest first)
         self.library.mellstroy_clips.sort_by_key(|c| c.id);
 
-        // Scan backgrounds and props
         self.library.backgrounds =
             scan_dir(&self.assets_root.join("assets/backgrounds"), &["mp4", "mov", "webm", "jpg", "jpeg", "png", "webp"]);
         self.library.props =
