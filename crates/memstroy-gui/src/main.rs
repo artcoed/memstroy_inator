@@ -1,6 +1,9 @@
 //! Entry point for the desktop editor.
 
 mod app;
+mod audio_engine;
+mod clip_editor;
+mod curve_editor;
 mod gpu_preview;
 mod jobs;
 mod node_editor;
