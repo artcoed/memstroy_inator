@@ -1,0 +1,15 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Workspace artifacts
+/assets/mellstroy/*.mp4
+/assets/mellstroy/*.json
+/out/
+/.cache/
+
+# Editor
+.idea/
+.vscode/
+*.swp
+.DS_Store

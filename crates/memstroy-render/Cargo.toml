@@ -1,0 +1,17 @@
+[package]
+name = "memstroy-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Compose memstroy scenes into MP4s via FFmpeg"
+
+[dependencies]
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+memstroy-core = { workspace = true }
+memstroy-vision = { path = "../memstroy-vision" }

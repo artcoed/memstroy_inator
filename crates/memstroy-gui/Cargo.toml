@@ -1,0 +1,31 @@
+[package]
+name = "memstroy-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "egui/eframe editor for memstroy_generator scenes"
+
+[[bin]]
+name = "memstroy-gui"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+egui = { workspace = true }
+eframe = { workspace = true }
+egui_extras = { workspace = true }
+rfd = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+image = { workspace = true }
+chrono = { workspace = true }
+memstroy-core = { workspace = true }
+memstroy-tg = { workspace = true }
+memstroy-render = { workspace = true }
+memstroy-vision = { workspace = true }

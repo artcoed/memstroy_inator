@@ -1,0 +1,23 @@
+[package]
+name = "memstroy-tg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Scraper for Telegram public channel previews (t.me/s/...)"
+
+[dependencies]
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+reqwest = { workspace = true }
+scraper = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+regex = { workspace = true }
+futures = { workspace = true }
+chrono = { workspace = true }
+async-trait = { workspace = true }
