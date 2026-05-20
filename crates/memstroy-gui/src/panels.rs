@@ -711,6 +711,18 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             state.snap_enabled = !state.snap_enabled;
         }
 
+        // Curve editor toggle
+        let curve_color = if state.curve_editor_open { COL_ACCENT } else { COL_TEXT_DIM };
+        if ui.button(RichText::new("Curve").size(11.0).color(curve_color)).on_hover_text("Toggle curve editor").clicked() {
+            state.curve_editor_open = !state.curve_editor_open;
+        }
+
+        // Clip editor toggle
+        let clip_ed_color = if state.clip_editor_open { COL_ACCENT } else { COL_TEXT_DIM };
+        if ui.button(RichText::new("Clip").size(11.0).color(clip_ed_color)).on_hover_text("Toggle clip editor").clicked() {
+            state.clip_editor_open = !state.clip_editor_open;
+        }
+
         // Zoom controls
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui.button("+").on_hover_text("Zoom in").clicked() {
@@ -1055,6 +1067,21 @@ fn draw_clip(
     } else { color };
     painter.rect_filled(bar_rect, Rounding::same(4.0), fill);
 
+    // Color-coded left stripe (3px wide, brighter) for visual clip identification
+    {
+        let stripe_w = 3.0_f32;
+        let stripe_rect = egui::Rect::from_min_max(
+            egui::pos2(bar_rect.min.x, bar_rect.min.y + 1.0),
+            egui::pos2(bar_rect.min.x + stripe_w, bar_rect.max.y - 1.0),
+        );
+        let stripe_color = Color32::from_rgb(
+            color.r().saturating_add(60),
+            color.g().saturating_add(60),
+            color.b().saturating_add(60),
+        );
+        painter.rect_filled(stripe_rect, Rounding::same(2.0), stripe_color);
+    }
+
     // Selection border
     if selected {
         painter.rect_stroke(bar_rect.expand(1.0), Rounding::same(5.0), Stroke::new(2.0, COL_SELECTED));
@@ -1064,7 +1091,7 @@ fn draw_clip(
     if bar_rect.width() > 30.0 {
         let text = if bar_rect.width() > 80.0 { label.to_string() } else { ellipsis(label, 6) };
         painter.text(
-            egui::pos2(bar_rect.min.x + 6.0, bar_rect.center().y),
+            egui::pos2(bar_rect.min.x + 8.0, bar_rect.center().y),
             egui::Align2::LEFT_CENTER, &text,
             egui::FontId::proportional(10.0), Color32::WHITE);
     }
