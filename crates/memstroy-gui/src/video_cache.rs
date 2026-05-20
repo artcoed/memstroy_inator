@@ -1,17 +1,21 @@
 //! Frame-cache for real-time video preview.
-//! Extracts frames via ffmpeg CLI, loads them as textures on demand.
+//! Extracts frames via ffmpeg CLI at reduced quality for speed, then pre-loads
+//! a ring buffer of frames into memory for smooth 60fps playback with a single
+//! reusable texture handle.
 
-use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::thread;
 
-use egui::TextureHandle;
+use egui::{ColorImage, TextureHandle, TextureOptions};
 use tokio::runtime::Handle;
 
-/// Maximum number of decoded textures kept in memory.
-const MAX_TEXTURES: usize = 10;
+/// Number of frames to keep pre-loaded in the ring buffer.
+const BUFFER_SIZE: usize = 30;
 
-/// Frame-cache: extracts video frames to disk via ffmpeg, then loads
-/// individual JPEG frames on demand and caches them as egui textures.
+/// Frame-cache: extracts video frames to disk via ffmpeg, then pre-loads
+/// frames into a memory ring buffer and uploads them to a single reusable
+/// texture handle for smooth playback.
 pub struct FrameCache {
     /// Temp directory holding extracted JPEG frames.
     pub cache_dir: PathBuf,
@@ -27,10 +31,26 @@ pub struct FrameCache {
     pub ready: bool,
     /// Whether extraction is currently running.
     pub extracting: bool,
-    /// LRU cache of loaded textures keyed by frame index.
-    textures: HashMap<usize, TextureHandle>,
-    /// Access order for LRU eviction (front = oldest).
-    last_accessed: VecDeque<usize>,
+    /// Single reusable texture handle — updated each frame.
+    texture: Option<TextureHandle>,
+    /// Pre-loaded frame images in memory (ring buffer).
+    buffer: Vec<Option<ColorImage>>,
+    /// First frame index represented in the buffer.
+    buffer_start: usize,
+    /// How many slots in the buffer.
+    buffer_size: usize,
+    /// Last frame index that was displayed (to detect movement).
+    last_displayed_frame: usize,
+    /// Shared slot for background pre-load thread results.
+    preload_slot: Arc<Mutex<Option<PreloadResult>>>,
+    /// Whether a background pre-load is currently running.
+    preloading: bool,
+}
+
+/// Result from the background pre-load thread.
+struct PreloadResult {
+    start: usize,
+    frames: Vec<Option<ColorImage>>,
 }
 
 impl FrameCache {
@@ -44,14 +64,20 @@ impl FrameCache {
             duration: 0.0,
             ready: false,
             extracting: false,
-            textures: HashMap::new(),
-            last_accessed: VecDeque::new(),
+            texture: None,
+            buffer: Vec::new(),
+            buffer_start: 0,
+            buffer_size: BUFFER_SIZE,
+            last_displayed_frame: usize::MAX,
+            preload_slot: Arc::new(Mutex::new(None)),
+            preloading: false,
         }
     }
 
     /// Start frame extraction in the background via tokio.
     ///
-    /// Spawns ffprobe to get duration, then ffmpeg to extract frames at 30fps/640px.
+    /// Spawns ffprobe to get duration, then ffmpeg to extract frames at 30fps/480px
+    /// with quality level 8 (fast, smaller files).
     /// Calls `on_done` with (duration, frame_count, cache_dir) when finished.
     pub fn start_extraction(
         source: PathBuf,
@@ -105,7 +131,7 @@ impl FrameCache {
                 }
             };
 
-            // Extract frames
+            // Extract frames at lower quality/smaller size for speed
             let output_pattern = cache_dir.join("%06d.jpg");
             let status = std::process::Command::new(&ffmpeg)
                 .args([
@@ -116,8 +142,8 @@ impl FrameCache {
                 ])
                 .arg(&source)
                 .args([
-                    "-vf", "fps=30,scale=640:-1",
-                    "-q:v", "4",
+                    "-vf", "fps=30,scale=480:-1",
+                    "-q:v", "8",
                 ])
                 .arg(&output_pattern)
                 .status();
@@ -147,13 +173,20 @@ impl FrameCache {
         });
     }
 
-    /// Mark the cache as ready with extraction results.
+    /// Mark the cache as ready with extraction results and pre-load initial frames.
     pub fn set_ready(&mut self, duration: f32, frame_count: usize, cache_dir: PathBuf) {
         self.duration = duration;
         self.frame_count = frame_count;
         self.cache_dir = cache_dir;
         self.ready = true;
         self.extracting = false;
+
+        // Initialize ring buffer
+        self.buffer = vec![None; self.buffer_size];
+        self.buffer_start = 0;
+
+        // Synchronously pre-load initial frames
+        self.load_buffer_range(0);
     }
 
     /// Whether the cache has extracted frames and is ready for use.
@@ -162,26 +195,77 @@ impl FrameCache {
     }
 
     /// Get the texture for a given time `t` in seconds.
-    /// Loads from disk and caches if not already in memory.
+    /// Uses a ring buffer for O(1) access and reuses a single TextureHandle.
     /// Returns `None` if the cache is not ready or frame cannot be loaded.
     pub fn frame_at_time(&mut self, t: f32, ctx: &egui::Context) -> Option<&TextureHandle> {
         if !self.ready || self.frame_count == 0 {
             return None;
         }
 
-        // Compute frame index (1-based file naming)
-        let frame_index = ((t * self.fps).floor() as usize).clamp(0, self.frame_count.saturating_sub(1));
+        // Check for completed background pre-load
+        self.poll_preload();
 
-        // Check if already cached
-        if self.textures.contains_key(&frame_index) {
-            // Move to back of LRU
-            self.last_accessed.retain(|&x| x != frame_index);
-            self.last_accessed.push_back(frame_index);
-            return self.textures.get(&frame_index);
+        // Compute frame index (0-based)
+        let frame_index = ((t * self.fps).floor() as usize)
+            .clamp(0, self.frame_count.saturating_sub(1));
+
+        // Check if frame is in the ring buffer
+        let image = if self.is_in_buffer(frame_index) {
+            let buf_idx = frame_index - self.buffer_start;
+            self.buffer.get(buf_idx).and_then(|slot| slot.clone())
+        } else {
+            // Frame not in buffer — load synchronously (happens on seeks)
+            let img = self.load_frame_from_disk(frame_index);
+            // Reposition buffer around this frame and trigger background pre-load
+            self.buffer_start = frame_index;
+            self.buffer = vec![None; self.buffer_size];
+            if let Some(ref image) = img {
+                self.buffer[0] = Some(image.clone());
+            }
+            // Fill rest in background
+            self.trigger_preload(frame_index);
+            img
+        };
+
+        let image = image?;
+
+        // Update the single TextureHandle with the new image data
+        let options = TextureOptions::LINEAR;
+        match self.texture.as_mut() {
+            Some(tex) => {
+                tex.set(image, options);
+            }
+            None => {
+                let tex = ctx.load_texture("frame_preview", image, options);
+                self.texture = Some(tex);
+            }
         }
 
-        // Load from disk
-        let file_name = format!("{:06}.jpg", frame_index + 1);
+        // Trigger read-ahead if playhead advanced
+        if frame_index != self.last_displayed_frame {
+            self.last_displayed_frame = frame_index;
+            // If we're approaching the end of the buffer, trigger pre-load ahead
+            let buffer_end = self.buffer_start + self.buffer_size;
+            let frames_remaining = buffer_end.saturating_sub(frame_index);
+            if frames_remaining < self.buffer_size / 3 && !self.preloading {
+                // Pre-load next chunk starting from current position
+                self.trigger_preload(frame_index);
+            }
+        }
+
+        self.texture.as_ref()
+    }
+
+    /// Check if a frame index is within the current ring buffer range.
+    fn is_in_buffer(&self, frame_index: usize) -> bool {
+        frame_index >= self.buffer_start
+            && frame_index < self.buffer_start + self.buffer_size
+            && frame_index < self.frame_count
+    }
+
+    /// Load a single frame from disk as a ColorImage.
+    fn load_frame_from_disk(&self, frame_index: usize) -> Option<ColorImage> {
+        let file_name = format!("{:06}.jpg", frame_index + 1); // 1-based file naming
         let frame_path = self.cache_dir.join(&file_name);
 
         let img = match image::open(&frame_path) {
@@ -191,26 +275,81 @@ impl FrameCache {
 
         let size = [img.width() as usize, img.height() as usize];
         let pixels = img.into_raw();
-        let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
+        Some(ColorImage::from_rgba_unmultiplied(size, &pixels))
+    }
 
-        let texture = ctx.load_texture(
-            format!("frame_{}", frame_index),
-            color_image,
-            egui::TextureOptions::LINEAR,
-        );
+    /// Synchronously load frames into the buffer starting at `start_frame`.
+    fn load_buffer_range(&mut self, start_frame: usize) {
+        self.buffer_start = start_frame;
+        self.buffer = vec![None; self.buffer_size];
 
-        // Evict oldest if at capacity
-        while self.textures.len() >= MAX_TEXTURES {
-            if let Some(oldest) = self.last_accessed.pop_front() {
-                self.textures.remove(&oldest);
-            } else {
+        for i in 0..self.buffer_size {
+            let idx = start_frame + i;
+            if idx >= self.frame_count {
                 break;
             }
+            self.buffer[i] = self.load_frame_from_disk(idx);
         }
+    }
 
-        self.textures.insert(frame_index, texture);
-        self.last_accessed.push_back(frame_index);
+    /// Trigger a background thread to pre-load frames starting at `start_frame`.
+    fn trigger_preload(&mut self, start_frame: usize) {
+        if self.preloading {
+            return;
+        }
+        self.preloading = true;
 
-        self.textures.get(&frame_index)
+        let cache_dir = self.cache_dir.clone();
+        let frame_count = self.frame_count;
+        let buffer_size = self.buffer_size;
+        let slot = self.preload_slot.clone();
+
+        thread::spawn(move || {
+            let mut frames = Vec::with_capacity(buffer_size);
+            for i in 0..buffer_size {
+                let idx = start_frame + i;
+                if idx >= frame_count {
+                    frames.push(None);
+                    continue;
+                }
+                let file_name = format!("{:06}.jpg", idx + 1);
+                let frame_path = cache_dir.join(&file_name);
+                let img = match image::open(&frame_path) {
+                    Ok(img) => {
+                        let rgba = img.to_rgba8();
+                        let size = [rgba.width() as usize, rgba.height() as usize];
+                        let pixels = rgba.into_raw();
+                        Some(ColorImage::from_rgba_unmultiplied(size, &pixels))
+                    }
+                    Err(_) => None,
+                };
+                frames.push(img);
+            }
+
+            if let Ok(mut guard) = slot.lock() {
+                *guard = Some(PreloadResult {
+                    start: start_frame,
+                    frames,
+                });
+            }
+        });
+    }
+
+    /// Poll for completed background pre-load and apply results.
+    fn poll_preload(&mut self) {
+        if !self.preloading {
+            return;
+        }
+        let result = if let Ok(mut guard) = self.preload_slot.lock() {
+            guard.take()
+        } else {
+            None
+        };
+
+        if let Some(result) = result {
+            self.buffer_start = result.start;
+            self.buffer = result.frames;
+            self.preloading = false;
+        }
     }
 }

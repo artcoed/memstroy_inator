@@ -631,7 +631,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             ui.add_space(track_spacing);
         }
 
-        // Actors — clips span full track width when no t_in/t_out
+        // Actors — clips use scene output duration as ruler scale for all tracks
         for i in 0..state.scene.actors.len() {
             let id_str = format!("act-{}", i);
             let label;
@@ -641,17 +641,16 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                 let a = &state.scene.actors[i];
                 label = format!("\u{1F3AD} {}", a.id);
                 start = a.t_in.unwrap_or(0.0);
-                // If no t_out, span full track width (not limited to output duration)
-                end = a.t_out.unwrap_or(duration.max(30.0));
+                // If no t_out, span full track width
+                end = a.t_out.unwrap_or(duration);
             }
-            let effective_duration = end.max(duration);
             let resp = draw_track_bar(
                 ui,
                 &id_str,
                 &label,
                 &mut start,
                 &mut end,
-                effective_duration,
+                duration,
                 avail_width,
                 track_height,
                 Color32::from_rgb(200, 120, 50),

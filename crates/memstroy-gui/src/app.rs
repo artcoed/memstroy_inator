@@ -686,18 +686,22 @@ impl eframe::App for App {
         // Node editor floating window (scaffold)
         self.node_editor.show(ctx, &mut self.state.node_editor_open);
 
-        // Keep refreshing UI while jobs are running
+        // Repaint scheduling:
+        // - When playing with ready frame cache: 16ms (~60fps)
+        // - When playing without frame cache: 33ms (~30fps)
+        // - When idle/paused: only repaint if jobs are running (reactive mode)
         if self.state.playing {
             if self.state.frame_cache.as_ref().is_some_and(|fc| fc.is_ready()) {
-                ctx.request_repaint_after(std::time::Duration::from_millis(16)); // ~60fps with frame cache
+                ctx.request_repaint_after(std::time::Duration::from_millis(16));
             } else {
-                ctx.request_repaint_after(std::time::Duration::from_millis(33)); // ~30fps during playback
+                ctx.request_repaint_after(std::time::Duration::from_millis(33));
             }
         } else if self.state.refreshing
             || self.state.render_progress.as_ref().is_some_and(|p| !p.done)
         {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
+        // When idle/paused with no jobs: don't request repaint (reactive mode)
     }
 }
 
