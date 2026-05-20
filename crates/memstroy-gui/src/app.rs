@@ -13,6 +13,8 @@ use crate::panels;
 use crate::state::{EditorState, Selection};
 use crate::clip_editor;
 use crate::curve_editor;
+use crate::audio_engine::AudioEngine;
+use memstroy_vision::PoseEstimator;
 
 pub struct App {
     rt: Runtime,
@@ -24,6 +26,12 @@ pub struct App {
     frame_extract_results: Vec<Arc<Mutex<Option<(f32, usize, std::path::PathBuf)>>>>,
     /// Per-audio-track waveform extraction results.
     waveform_extract_results: Vec<Arc<Mutex<Option<(Vec<f32>, f32)>>>>,
+    /// Audio playback engine
+    audio_engine: AudioEngine,
+    /// Previous playing state (for detecting transitions)
+    was_playing: bool,
+    /// Previous playhead for detecting seeks
+    prev_playhead: f32,
 }
 
 impl App {
@@ -39,6 +47,9 @@ impl App {
             node_editor: NodeEditor::default(),
             frame_extract_results: Vec::new(),
             waveform_extract_results: Vec::new(),
+            audio_engine: AudioEngine::new(),
+            was_playing: false,
+            prev_playhead: 0.0,
         }
     }
 
@@ -57,7 +68,21 @@ impl App {
                 }
                 JobEvent::RenderLog(line) => {
                     if let Some(rp) = self.state.render_progress.as_mut() {
-                        rp.last_log = line;
+                        rp.last_log = line.clone();
+                        // Parse ffmpeg progress from log lines
+                        // Look for "frame= 120" or "time=00:00:04.00"
+                        if let Some(time_progress) = parse_ffmpeg_time(&line) {
+                            let total = self.state.scene.output.duration;
+                            if total > 0.0 {
+                                rp.progress = (time_progress / total).clamp(0.0, 1.0);
+                            }
+                        } else if let Some(frame_num) = parse_ffmpeg_frame(&line) {
+                            let total_frames = (self.state.scene.output.duration
+                                * self.state.scene.output.fps as f32) as u32;
+                            if total_frames > 0 {
+                                rp.progress = (frame_num as f32 / total_frames as f32).clamp(0.0, 1.0);
+                            }
+                        }
                     }
                 }
                 JobEvent::RenderFinished(Ok(p)) => {
@@ -167,8 +192,7 @@ impl App {
                     ui.label(RichText::new("refreshing...").color(Color32::from_rgb(255, 200, 50)).size(11.0));
                 } else if let Some(rp) = &self.state.render_progress {
                     if !rp.done {
-                        ui.spinner();
-                        ui.label(RichText::new("rendering...").color(Color32::from_rgb(100, 200, 255)).size(11.0));
+                        ui.add(egui::ProgressBar::new(rp.progress).text(format!("{:.0}%", rp.progress * 100.0)));
                     }
                 }
                 // Show status text (trimmed)
@@ -654,6 +678,7 @@ impl App {
             last_log: String::new(),
             done: false,
             error: None,
+            progress: 0.0,
         });
         spawn_render(
             self.rt.handle(),
@@ -682,6 +707,129 @@ impl App {
             4,
         );
     }
+
+    /// Run pose detection on the current frame of the selected actor.
+    /// Uses memstroy-vision's pose estimation. Falls back to dummy points
+    /// if ONNX runtime is not available.
+    fn run_pose_detection(&mut self) {
+        let actor_idx = match self.state.selection {
+            Selection::Actor(i) if i < self.state.scene.actors.len() => i,
+            _ => {
+                self.state.status = "Select an actor first for pose detection.".into();
+                return;
+            }
+        };
+
+        let actor = &self.state.scene.actors[actor_idx];
+        let source = actor.source.clone();
+
+        // Check if we can load anchor data from existing file
+        if let Some(anchors_path) = &actor.anchors {
+            if anchors_path.exists() {
+                if let Some(track) = memstroy_vision::load_anchor_track(&source) {
+                    // Extract points from the sample nearest to current time
+                    let t_in = actor.t_in.unwrap_or(0.0);
+                    let local_t = self.state.playhead - t_in + actor.source_start;
+                    let points: Vec<[f32; 2]> = track.samples.iter()
+                        .min_by(|a, b| (a.t - local_t).abs().partial_cmp(&(b.t - local_t).abs()).unwrap())
+                        .map(|sample| {
+                            sample.points.values()
+                                .map(|kp| [kp.x, kp.y])
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    self.state.detected_points = points;
+                    self.state.status = format!(
+                        "Loaded {} pose points from anchors file.",
+                        self.state.detected_points.len()
+                    );
+                    return;
+                }
+            }
+        }
+
+        // Try to run pose detection; gracefully degrade if ONNX isn't available
+        let model_path = self.state.assets_root.join("assets/models/yolov8n-pose.onnx");
+        if !model_path.exists() {
+            // Provide dummy detection points as a graceful degradation
+            self.state.detected_points = vec![
+                [0.50, 0.15], // head
+                [0.50, 0.35], // body center
+                [0.40, 0.30], // left shoulder
+                [0.60, 0.30], // right shoulder
+                [0.35, 0.50], // left elbow
+                [0.65, 0.50], // right elbow
+                [0.30, 0.65], // left wrist
+                [0.70, 0.65], // right wrist
+                [0.43, 0.55], // left hip
+                [0.57, 0.55], // right hip
+                [0.40, 0.75], // left knee
+                [0.60, 0.75], // right knee
+                [0.38, 0.90], // left ankle
+                [0.62, 0.90], // right ankle
+            ];
+            self.state.status =
+                "Pose detection requires ONNX runtime (model not found). Showing placeholder points."
+                    .into();
+            return;
+        }
+
+        // Attempt real detection via spawned task
+        let tx = self.tx.clone();
+        let source_clone = source.clone();
+        let model_clone = model_path.clone();
+
+        self.rt.spawn(async move {
+            let estimator = memstroy_vision::OnnxPoseEstimator::new(model_clone);
+            match estimator.estimate(&source_clone, 1.0).await {
+                Ok(track) => {
+                    if let Some(sample) = track.samples.first() {
+                        let points: Vec<[f32; 2]> = sample.points.values()
+                            .map(|kp| [kp.x, kp.y])
+                            .collect();
+                        let msg = format!("Detected {} pose points.", points.len());
+                        let _ = tx.send(JobEvent::Status(msg));
+                    } else {
+                        let _ = tx.send(JobEvent::Status("No pose detected in frame.".into()));
+                    }
+                }
+                Err(e) => {
+                    let msg = format!("Pose detection requires ONNX runtime: {}", e);
+                    let _ = tx.send(JobEvent::Status(msg));
+                }
+            }
+        });
+
+        // Show placeholder while waiting
+        self.state.status = "Running pose detection...".into();
+    }
+}
+
+/// Parse ffmpeg time output like "time=00:00:04.00" and return seconds.
+fn parse_ffmpeg_time(line: &str) -> Option<f32> {
+    let time_prefix = "time=";
+    let idx = line.find(time_prefix)?;
+    let after = &line[idx + time_prefix.len()..];
+    let time_str = after.split_whitespace().next().unwrap_or("");
+    // Parse HH:MM:SS.xx format
+    let parts: Vec<&str> = time_str.split(':').collect();
+    if parts.len() == 3 {
+        let hours: f32 = parts[0].parse().ok()?;
+        let minutes: f32 = parts[1].parse().ok()?;
+        let seconds: f32 = parts[2].parse().ok()?;
+        Some(hours * 3600.0 + minutes * 60.0 + seconds)
+    } else {
+        None
+    }
+}
+
+/// Parse ffmpeg frame output like "frame=  120" and return frame number.
+fn parse_ffmpeg_frame(line: &str) -> Option<u32> {
+    let frame_prefix = "frame=";
+    let idx = line.find(frame_prefix)?;
+    let after = &line[idx + frame_prefix.len()..];
+    let num_str = after.trim_start().split_whitespace().next().unwrap_or("");
+    num_str.parse().ok()
 }
 
 impl eframe::App for App {
@@ -774,6 +922,41 @@ impl eframe::App for App {
             self.state.status = String::new();
             self.state.eyedropper_active = true;
         }
+
+        // Handle pose detection request
+        if self.state.status == "__DETECT_POSE__" {
+            self.state.status = String::new();
+            self.run_pose_detection();
+        }
+
+        // ── Audio engine synchronization ──
+        // Detect play/pause transitions
+        if self.state.playing && !self.was_playing {
+            // Transition: paused → playing
+            let sources: Vec<_> = self.state.scene.audio.iter()
+                .filter(|a| {
+                    let t_out = a.t_out.unwrap_or(self.state.scene.output.duration);
+                    self.state.playhead >= a.t_in && self.state.playhead <= t_out
+                })
+                .map(|a| (a.source.clone(), a.t_in, a.volume))
+                .collect();
+            if !sources.is_empty() {
+                self.audio_engine.play(&sources);
+            }
+        } else if !self.state.playing && self.was_playing {
+            // Transition: playing → paused
+            self.audio_engine.pause();
+        }
+
+        // Detect seeks (playhead jumped by more than expected)
+        let expected_delta = if self.state.playing { 0.2 } else { 0.0 };
+        let actual_delta = (self.state.playhead - self.prev_playhead).abs();
+        if actual_delta > expected_delta && actual_delta > 0.5 {
+            self.audio_engine.seek(self.state.playhead);
+        }
+
+        self.was_playing = self.state.playing;
+        self.prev_playhead = self.state.playhead;
 
         // Right panel: Inspector
         egui::SidePanel::right("inspector")

@@ -2,6 +2,7 @@
 //!
 //! Opens on double-click of a clip (or via a button in inspector).
 //! Shows the source video frame, in/out markers, and basic clip info.
+//! Also provides pose detection integration and detected point overlay.
 
 use egui::{Color32, RichText, Rounding, Stroke, Vec2};
 
@@ -66,6 +67,7 @@ fn clip_editor_content(ui: &mut egui::Ui, state: &mut EditorState) {
         // Try to show a frame from the cache if available
         let local_t = state.playhead - t_in + source_start;
         let mut frame_shown = false;
+        let mut img_rect_for_overlay = frame_rect;
 
         if let Some(fc) = state.frame_caches.get_mut(actor_idx) {
             if fc.is_ready() {
@@ -94,6 +96,7 @@ fn clip_editor_content(ui: &mut egui::Ui, state: &mut EditorState) {
                     );
                     painter.add(egui::Shape::mesh(mesh));
                     frame_shown = true;
+                    img_rect_for_overlay = img_rect;
                 }
             }
         }
@@ -107,6 +110,52 @@ fn clip_editor_content(ui: &mut egui::Ui, state: &mut EditorState) {
                 Color32::from_rgb(100, 100, 120),
             );
         }
+
+        // ── Draw detected pose points as overlay circles on the preview ──
+        if !state.detected_points.is_empty() && frame_shown {
+            for point in &state.detected_points {
+                let px = img_rect_for_overlay.min.x + point[0] * img_rect_for_overlay.width();
+                let py = img_rect_for_overlay.min.y + point[1] * img_rect_for_overlay.height();
+                painter.circle_filled(
+                    egui::pos2(px, py),
+                    4.0,
+                    Color32::from_rgb(255, 50, 200),
+                );
+                painter.circle_stroke(
+                    egui::pos2(px, py),
+                    4.0,
+                    Stroke::new(1.5, Color32::WHITE),
+                );
+            }
+        }
+
+        ui.add_space(8.0);
+
+        // ── Pose Detection section ──
+        ui.horizontal(|ui| {
+            let detect_btn = egui::Button::new(
+                RichText::new("Detect Pose")
+                    .size(12.0)
+                    .color(Color32::WHITE),
+            )
+            .fill(Color32::from_rgb(140, 60, 200))
+            .rounding(Rounding::same(6.0));
+            if ui
+                .add(detect_btn)
+                .on_hover_text("Run pose detection on current frame")
+                .clicked()
+            {
+                state.status = "__DETECT_POSE__".into();
+            }
+
+            if !state.detected_points.is_empty() {
+                ui.label(
+                    RichText::new(format!("{} points", state.detected_points.len()))
+                        .size(11.0)
+                        .color(Color32::from_rgb(200, 100, 255)),
+                );
+            }
+        });
 
         ui.add_space(8.0);
 
@@ -298,6 +347,32 @@ fn clip_editor_content(ui: &mut egui::Ui, state: &mut EditorState) {
                     );
                 });
             }
+        }
+
+        // ── Detected Points info ──
+        if !state.detected_points.is_empty() {
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("Detected Pose Points")
+                    .size(12.0)
+                    .strong()
+                    .color(Color32::from_rgb(200, 100, 255)),
+            );
+            ui.add_space(2.0);
+            egui::ScrollArea::vertical().max_height(80.0).show(ui, |ui| {
+                for (i, point) in state.detected_points.iter().enumerate() {
+                    ui.label(
+                        RichText::new(format!(
+                            "  Point {}: ({:.3}, {:.3})",
+                            i, point[0], point[1]
+                        ))
+                        .size(10.0)
+                        .color(Color32::from_rgb(180, 140, 220)),
+                    );
+                }
+            });
         }
     } else {
         // No actor selected

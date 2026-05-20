@@ -246,6 +246,8 @@ pub struct EditorState {
     pub curve_editor_property: usize,
     /// Whether clip editor window is open
     pub clip_editor_open: bool,
+    /// Detected pose points from motion tracking (normalised [0,1] coordinates)
+    pub detected_points: Vec<[f32; 2]>,
 }
 
 #[derive(Default)]
@@ -284,6 +286,8 @@ pub struct RenderProgress {
     pub last_log: String,
     pub done: bool,
     pub error: Option<String>,
+    /// Render progress as a float (0.0 - 1.0), parsed from ffmpeg output.
+    pub progress: f32,
 }
 
 /// Legacy DragState kept for compatibility but mostly unused now.
@@ -327,6 +331,8 @@ impl EditorState {
         s.curve_editor_open = false;
         s.curve_editor_property = 0;
         s.clip_editor_open = false;
+
+        s.detected_points = Vec::new();
 
         s
     }

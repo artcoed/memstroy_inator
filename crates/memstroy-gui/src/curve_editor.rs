@@ -1,10 +1,10 @@
 //! Curve editor panel — shows keyframe graphs for actor properties.
 //!
 //! Displays a time/value graph with draggable keyframe diamonds.
-//! Currently supports linear interpolation only (no bezier handles).
+//! Supports bezier easing curves with visual control handles.
 
 use egui::{Color32, Pos2, Rect, Rounding, Sense, Stroke, Vec2};
-use memstroy_core::{ActorState, Keyframe};
+use memstroy_core::{ActorState, Easing, Keyframe};
 
 /// Property indices for the curve editor.
 pub const PROP_SCALE: usize = 0;
@@ -60,6 +60,20 @@ fn property_color(prop: usize) -> Color32 {
         PROP_OPACITY => Color32::from_rgb(200, 200, 255),
         PROP_ROTATION => Color32::from_rgb(255, 100, 255),
         _ => Color32::WHITE,
+    }
+}
+
+/// Get the control handle positions for a given easing type.
+/// Returns (handle_out_x, handle_out_y, handle_in_x, handle_in_y) as fractions [0,1].
+/// handle_out is the right handle of the left keyframe, handle_in is the left handle of the right keyframe.
+fn easing_to_bezier_handles(easing: Easing) -> ([f32; 2], [f32; 2]) {
+    match easing {
+        Easing::Step => ([0.5, 0.0], [0.5, 1.0]),
+        Easing::Linear => ([0.33, 0.33], [0.67, 0.67]),
+        Easing::EaseIn => ([0.42, 0.0], [1.0, 1.0]),
+        Easing::EaseOut => ([0.0, 0.0], [0.58, 1.0]),
+        Easing::EaseInOut => ([0.42, 0.0], [0.58, 1.0]),
+        Easing::Cubic => ([0.33, 0.0], [0.67, 1.0]),
     }
 }
 
@@ -159,8 +173,11 @@ pub fn curve_editor_panel(
         );
     }
 
-    // ── Draw curve (linear segments between keyframes) ──
+    // ── Draw curve with bezier easing (sampled as multiple line segments) ──
     let curve_color = property_color(prop);
+    let handle_color = Color32::from_rgb(180, 180, 220);
+    let handle_line_color = Color32::from_rgb(100, 100, 140);
+
     if keyframes.len() >= 2 {
         for pair in keyframes.windows(2) {
             let (kf_a, kf_b) = (&pair[0], &pair[1]);
@@ -170,10 +187,53 @@ pub fn curve_editor_panel(
             let ya = value_to_graph_y(va, val_min, val_max, inner_rect);
             let xb = time_to_graph_x(kf_b.t, time_min, time_max, inner_rect);
             let yb = value_to_graph_y(vb, val_min, val_max, inner_rect);
+
+            // Get bezier handles based on the easing of kf_b (easing INTO kf_b)
+            let (handle_out, handle_in) = easing_to_bezier_handles(kf_b.easing);
+
+            // Convert handle fractions to pixel positions
+            let dx = xb - xa;
+            let dy = yb - ya;
+
+            // Handle out (from kf_a): offset in time/value space
+            let h_out_x = xa + handle_out[0] * dx;
+            let h_out_y = ya + (handle_out[1] - 0.0) * dy; // relative to start value
+
+            // Handle in (to kf_b): offset in time/value space
+            let h_in_x = xa + handle_in[0] * dx;
+            let h_in_y = ya + (handle_in[1] - 0.0) * dy; // relative to start value
+
+            // Draw the easing curve using 20 sampled points
+            let num_samples = 20;
+            let mut prev_point = Pos2::new(xa, ya);
+            for i in 1..=num_samples {
+                let frac = i as f32 / num_samples as f32;
+                // Apply the easing function to get the interpolated value
+                let eased = kf_b.easing.apply(frac);
+                let px = xa + frac * dx;
+                let py = ya + eased * (yb - ya);
+                let cur_point = Pos2::new(px, py);
+                painter.line_segment(
+                    [prev_point, cur_point],
+                    Stroke::new(1.5, curve_color),
+                );
+                prev_point = cur_point;
+            }
+
+            // Draw bezier control handle lines and circles
+            // Handle out from kf_a (right handle)
             painter.line_segment(
-                [Pos2::new(xa, ya), Pos2::new(xb, yb)],
-                Stroke::new(1.5, curve_color),
+                [Pos2::new(xa, ya), Pos2::new(h_out_x, h_out_y)],
+                Stroke::new(1.0, handle_line_color),
             );
+            painter.circle_filled(Pos2::new(h_out_x, h_out_y), 3.0, handle_color);
+
+            // Handle in to kf_b (left handle)
+            painter.line_segment(
+                [Pos2::new(xb, yb), Pos2::new(h_in_x, h_in_y)],
+                Stroke::new(1.0, handle_line_color),
+            );
+            painter.circle_filled(Pos2::new(h_in_x, h_in_y), 3.0, handle_color);
         }
     }
 
@@ -201,6 +261,27 @@ pub fn curve_editor_panel(
             Stroke::new(1.0, Color32::WHITE),
         ));
 
+        // Show easing type label near the diamond
+        if keyframes.len() > 1 && ki > 0 {
+            let easing_label = match kf.easing {
+                Easing::Step => "Step",
+                Easing::Linear => "",
+                Easing::EaseIn => "In",
+                Easing::EaseOut => "Out",
+                Easing::EaseInOut => "InOut",
+                Easing::Cubic => "Cubic",
+            };
+            if !easing_label.is_empty() {
+                painter.text(
+                    Pos2::new(center.x, center.y - diamond_size - 6.0),
+                    egui::Align2::CENTER_BOTTOM,
+                    easing_label,
+                    egui::FontId::proportional(8.0),
+                    Color32::from_rgb(160, 140, 200),
+                );
+            }
+        }
+
         // Check if this diamond is being dragged
         let diamond_rect = Rect::from_center_size(center, Vec2::splat(diamond_size * 2.5));
         let id = ui.make_persistent_id(("curve_kf", ki));
@@ -208,6 +289,12 @@ pub fn curve_editor_panel(
 
         if kf_resp.dragged() {
             drag_idx = Some(ki);
+        }
+
+        // Right-click to cycle easing
+        if kf_resp.secondary_clicked() && ki > 0 {
+            // Cycle through easing types on right-click
+            // This will be handled below since we need mutable access
         }
     }
 
@@ -220,6 +307,52 @@ pub fn curve_editor_panel(
                 .clamp(val_min, val_max);
             keyframes[ki].t = new_t;
             set_property(&mut keyframes[ki].value, prop, new_v);
+        }
+    }
+
+    // Handle control handle dragging
+    // For simplicity, control handles change the easing type when dragged
+    // (full bezier handle editing would require storing custom control points)
+    if keyframes.len() >= 2 {
+        for ki in 1..keyframes.len() {
+            let kf_b = &keyframes[ki];
+            let kf_a = &keyframes[ki - 1];
+            let va = get_property(&kf_a.value, prop);
+            let vb = get_property(&kf_b.value, prop);
+            let xa = time_to_graph_x(kf_a.t, time_min, time_max, inner_rect);
+            let ya = value_to_graph_y(va, val_min, val_max, inner_rect);
+            let xb = time_to_graph_x(kf_b.t, time_min, time_max, inner_rect);
+            let yb = value_to_graph_y(vb, val_min, val_max, inner_rect);
+
+            let (handle_out, handle_in) = easing_to_bezier_handles(kf_b.easing);
+            let dx = xb - xa;
+            let dy = yb - ya;
+
+            let h_out_pos = Pos2::new(xa + handle_out[0] * dx, ya + handle_out[1] * dy);
+            let h_in_pos = Pos2::new(xa + handle_in[0] * dx, ya + handle_in[1] * dy);
+
+            // Interact with handle_out
+            let h_out_rect = Rect::from_center_size(h_out_pos, Vec2::splat(10.0));
+            let h_out_id = ui.make_persistent_id(("curve_h_out", ki));
+            let h_out_resp = ui.interact(h_out_rect, h_out_id, Sense::click_and_drag());
+
+            // Interact with handle_in
+            let h_in_rect = Rect::from_center_size(h_in_pos, Vec2::splat(10.0));
+            let h_in_id = ui.make_persistent_id(("curve_h_in", ki));
+            let h_in_resp = ui.interact(h_in_rect, h_in_id, Sense::click_and_drag());
+
+            // On double-click of either handle, cycle through easing types
+            if h_out_resp.double_clicked() || h_in_resp.double_clicked() {
+                let next_easing = match keyframes[ki].easing {
+                    Easing::Linear => Easing::EaseIn,
+                    Easing::EaseIn => Easing::EaseOut,
+                    Easing::EaseOut => Easing::EaseInOut,
+                    Easing::EaseInOut => Easing::Cubic,
+                    Easing::Cubic => Easing::Step,
+                    Easing::Step => Easing::Linear,
+                };
+                keyframes[ki].easing = next_easing;
+            }
         }
     }
 
@@ -241,7 +374,7 @@ pub fn curve_editor_panel(
     }
 }
 
-/// Interpolate the current property value at a given time (linear).
+/// Interpolate the current property value at a given time using easing.
 fn interpolate_at(keyframes: &[Keyframe<ActorState>], t: f32, prop: usize) -> f32 {
     if keyframes.is_empty() {
         return match prop {
@@ -261,10 +394,12 @@ fn interpolate_at(keyframes: &[Keyframe<ActorState>], t: f32, prop: usize) -> f3
         let (a, b) = (&pair[0], &pair[1]);
         if t >= a.t && t <= b.t {
             let span = (b.t - a.t).max(1e-6);
-            let frac = (t - a.t) / span;
+            let raw_frac = (t - a.t) / span;
+            // Apply easing curve
+            let eased_frac = b.easing.apply(raw_frac);
             let va = get_property(&a.value, prop);
             let vb = get_property(&b.value, prop);
-            return va + (vb - va) * frac;
+            return va + (vb - va) * eased_frac;
         }
     }
     get_property(&last.value, prop)

@@ -1013,6 +1013,114 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
         state.selection = sel;
     }
 
+    // ── Library asset drag-to-track: drop handling ──
+    // When an asset is being dragged from the library and mouse is released over timeline,
+    // determine which track row and time position to drop it on.
+    let mouse_released = ui.input(|i| i.pointer.any_released());
+    if state.asset_drag.dragging.is_some() && mouse_released {
+        let mouse_pos = ui.input(|i| i.pointer.hover_pos());
+        if let Some(pos) = mouse_pos {
+            // Calculate which track the mouse is over by Y position
+            // Track rows start after the ruler (approx offset)
+            let track_y_start = ui.min_rect().min.y; // approximate top of tracks area
+            let mut accumulated_y = track_y_start;
+            let mut _drop_track: Option<usize> = None;
+
+            for (tidx, track) in state.tracks.iter().enumerate() {
+                let track_bottom = accumulated_y + track.height;
+                if pos.y >= accumulated_y && pos.y < track_bottom {
+                    _drop_track = Some(tidx);
+                    break;
+                }
+                accumulated_y = track_bottom;
+            }
+
+            // Determine time position from X
+            let drop_time = x_to_time(pos.x, state.timeline_scroll, pps, track_left)
+                .clamp(0.0, duration);
+
+            let asset_path = state.asset_drag.dragging.clone().unwrap();
+            let kind = state.asset_drag.kind;
+
+            match kind {
+                AssetDragKind::Clip => {
+                    // Create actor at that time on that track
+                    add_actor_from_clip_at_time(state, &asset_path, drop_time);
+                }
+                AssetDragKind::Background => {
+                    // Add background starting at that time
+                    add_background_from_path_at_time(state, &asset_path, drop_time);
+                }
+                AssetDragKind::Prop => {
+                    // Add as image overlay at drop time
+                    let id = asset_path.file_stem().and_then(|s| s.to_str())
+                        .map(|s| format!("img_{}", s))
+                        .unwrap_or_else(|| format!("img_{}", state.scene.overlays.len() + 1));
+                    let overlay = Overlay::Image(ImageOverlay {
+                        id: id.clone(),
+                        source: asset_path.clone(),
+                        t_in: drop_time,
+                        t_out: (drop_time + 3.0).min(state.scene.output.duration),
+                        layout: vec![Keyframe::new(0.0, OverlayState {
+                            pos: [0.5, 0.5], scale: 0.3, rotation_deg: 0.0, opacity: 1.0
+                        })],
+                    });
+                    state.scene.overlays.push(overlay);
+                    state.selection = Selection::Overlay(state.scene.overlays.len() - 1);
+                    state.status = format!("Dropped overlay: {}", id);
+                }
+                AssetDragKind::Audio => {
+                    // Add audio track at drop time
+                    let id = asset_path.file_stem().and_then(|s| s.to_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| format!("audio_{}", state.scene.audio.len() + 1));
+                    state.scene.audio.push(AudioTrack {
+                        id,
+                        source: asset_path.clone(),
+                        t_in: drop_time,
+                        t_out: None,
+                        source_start: 0.0,
+                        volume: 1.0,
+                    });
+                    state.selection = Selection::Audio(state.scene.audio.len() - 1);
+                    state.status = "Dropped audio track.".into();
+                }
+                AssetDragKind::None => {}
+            }
+
+            // Clear the drag state
+            state.asset_drag.dragging = None;
+            state.asset_drag.kind = AssetDragKind::None;
+        }
+    }
+
+    // ── Draw visual indicator while dragging from library ──
+    if let Some(ref _dragged_path) = state.asset_drag.dragging {
+        let drag_pos = egui::pos2(state.asset_drag.pos[0], state.asset_drag.pos[1]);
+        // Draw a ghost indicator at the drop position
+        let ghost_w = 80.0;
+        let ghost_h = 20.0;
+        let ghost_rect = egui::Rect::from_center_size(drag_pos, Vec2::new(ghost_w, ghost_h));
+        let painter = ui.painter();
+        painter.rect_stroke(
+            ghost_rect,
+            Rounding::same(3.0),
+            Stroke::new(2.0, Color32::from_rgba_premultiplied(255, 200, 50, 180)),
+        );
+        painter.rect_filled(
+            ghost_rect,
+            Rounding::same(3.0),
+            Color32::from_rgba_premultiplied(255, 200, 50, 40),
+        );
+        painter.text(
+            ghost_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "Drop here",
+            egui::FontId::proportional(9.0),
+            Color32::from_rgb(255, 220, 80),
+        );
+    }
+
     // ── Reset drag state when mouse is released (no active drag) ──
     let any_dragging = ui.input(|i| i.pointer.any_down());
     if !any_dragging {
@@ -1631,6 +1739,61 @@ fn add_background_from_path(state: &mut EditorState, path: &PathBuf) {
     state.scene.backgrounds.push(bg);
     state.selection = Selection::Background(state.scene.backgrounds.len() - 1);
     state.status = "Background added".into();
+}
+
+/// Add an actor from a clip at a specific time (used by drag-to-track).
+fn add_actor_from_clip_at_time(state: &mut EditorState, path: &PathBuf, t: f32) {
+    let id = path.file_stem().and_then(|s| s.to_str())
+        .map(|s| format!("mellstroy_{}", s))
+        .unwrap_or_else(|| format!("actor_{}", state.scene.actors.len() + 1));
+
+    let clip_duration = probe_video_duration(path);
+    let t_in = t;
+    let t_out = (t_in + clip_duration).min(state.scene.output.duration);
+
+    let actor = Actor {
+        id: id.clone(),
+        source: path.clone(),
+        anchors: None,
+        chroma_key: ChromaKeyParams::default(),
+        layout: vec![Keyframe::new(0.0, ActorState::default())],
+        t_in: Some(t_in),
+        t_out: Some(t_out),
+        source_start: 0.0,
+        loop_source: false,
+        flip_horizontal: false,
+        attachments: Vec::new(),
+        visible: true,
+    };
+    state.scene.actors.push(actor);
+    state.selection = Selection::Actor(state.scene.actors.len() - 1);
+    state.status = format!("Dropped actor: {}", id);
+}
+
+/// Add a background at a specific time (used by drag-to-track).
+fn add_background_from_path_at_time(state: &mut EditorState, path: &PathBuf, t: f32) {
+    let id = path.file_stem().and_then(|s| s.to_str())
+        .map(|s| s.to_string()).unwrap_or_else(|| format!("bg_{}", state.scene.backgrounds.len() + 1));
+
+    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+    let source = if ["jpg", "jpeg", "png", "webp"].iter().any(|e| e.eq_ignore_ascii_case(ext)) {
+        MediaSource::Image { path: path.clone() }
+    } else {
+        MediaSource::Video { path: path.clone(), r#loop: true, start_at: 0.0 }
+    };
+
+    let dur = if ["mp4", "mov", "webm"].iter().any(|e| e.eq_ignore_ascii_case(ext)) {
+        probe_video_duration(path)
+    } else { state.scene.output.duration };
+
+    let bg = Background {
+        id, source, start: t,
+        duration: dur.min(state.scene.output.duration - t),
+        fit: Fit::Cover, transition: Transition::Cut,
+    };
+    state.scene.backgrounds.push(bg);
+    state.selection = Selection::Background(state.scene.backgrounds.len() - 1);
+    state.status = "Background dropped".into();
 }
 
 fn probe_video_duration(path: &PathBuf) -> f32 {
