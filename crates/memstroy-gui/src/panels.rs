@@ -282,6 +282,10 @@ fn inspector_nothing(ui: &mut egui::Ui, state: &mut EditorState) {
     // Output settings always visible when nothing selected
     ui.label(RichText::new("Output Settings").size(14.0).strong().color(Color32::from_rgb(100, 200, 255)));
     ui.add_space(4.0);
+
+    // Quick Preset row (TikTok / YouTube / IG / etc.)
+    inspector_export_preset_row(ui, state);
+
     let spec = &mut state.scene.output;
     ui.horizontal(|ui| {
         ui.label("Size:");
@@ -297,6 +301,53 @@ fn inspector_nothing(ui: &mut egui::Ui, state: &mut EditorState) {
         ui.label("Duration:");
         ui.add(egui::DragValue::new(&mut spec.duration).range(0.5..=600.0).speed(0.1).suffix("s"));
     });
+}
+
+/// Render the "Quick Preset" combo + Apply button used in the Output Settings.
+fn inspector_export_preset_row(ui: &mut egui::Ui, state: &mut EditorState) {
+    use crate::export_presets::{apply_preset, PRESETS};
+
+    // Selected preset index lives in egui memory so it persists across frames.
+    let mem_id = egui::Id::new("export_preset_idx");
+    let mut idx: usize = ui
+        .ctx()
+        .memory(|m| m.data.get_temp::<usize>(mem_id).unwrap_or(0));
+    if idx >= PRESETS.len() {
+        idx = 0;
+    }
+
+    ui.horizontal(|ui| {
+        ui.label("Preset:");
+        let preset = &PRESETS[idx];
+        egui::ComboBox::from_id_source("export_preset_combo")
+            .selected_text(format!("{} {}", preset.icon, preset.name))
+            .show_ui(ui, |ui| {
+                for (i, p) in PRESETS.iter().enumerate() {
+                    let label = format!(
+                        "{} {} ({}, {}x{} @ {} fps)",
+                        p.icon, p.name, p.aspect_label, p.resolution[0], p.resolution[1], p.fps
+                    );
+                    if ui.selectable_value(&mut idx, i, label).clicked() {
+                        // selection changes are persisted below
+                    }
+                }
+            });
+        if ui
+            .button(RichText::new("Apply").size(11.0))
+            .on_hover_text(PRESETS[idx].description)
+            .clicked()
+        {
+            let preset = &PRESETS[idx];
+            apply_preset(&mut state.scene.output, preset);
+            state.status = format!(
+                "\u{1F39E} Preset applied: {} ({}x{} @ {} fps)",
+                preset.name, preset.resolution[0], preset.resolution[1], preset.fps
+            );
+        }
+    });
+
+    ui.ctx().memory_mut(|m| m.data.insert_temp(mem_id, idx));
+    ui.add_space(4.0);
 }
 
 
@@ -527,6 +578,59 @@ fn inspector_actor_effects(ui: &mut egui::Ui, state: &mut EditorState, i: usize,
             *cc = memstroy_core::ColorCorrection::default();
         }
     });
+
+    ui.add_space(12.0);
+
+    // Transitions in/out (visible window edges)
+    inspector_actor_transitions(ui, state, i);
+}
+
+fn inspector_actor_transitions(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
+    egui::CollapsingHeader::new(
+        RichText::new("Transitions").size(12.0).strong().color(Color32::from_rgb(255, 180, 100))
+    ).default_open(true).show(ui, |ui| {
+        let a = &mut state.scene.actors[i];
+
+        ui.horizontal(|ui| {
+            ui.label("In:");
+            transition_combo(ui, "transition_in", &mut a.transition_in);
+        });
+        ui.horizontal(|ui| {
+            ui.label("Out:");
+            transition_combo(ui, "transition_out", &mut a.transition_out);
+        });
+        ui.horizontal(|ui| {
+            ui.label("Duration:");
+            ui.add(
+                egui::DragValue::new(&mut a.transition_duration)
+                    .range(0.0..=5.0)
+                    .speed(0.02)
+                    .suffix("s"),
+            );
+        });
+        ui.add_space(2.0);
+        ui.label(
+            RichText::new(
+                "Cut = no effect. Fade = opacity. Slide* = enter/exit by sliding off-screen.",
+            )
+            .size(10.0)
+            .color(COL_TEXT_DIM)
+            .italics(),
+        );
+    });
+}
+
+fn transition_combo(ui: &mut egui::Ui, id: &str, t: &mut Transition) {
+    egui::ComboBox::from_id_source(id)
+        .selected_text(format!("{:?}", t))
+        .show_ui(ui, |ui| {
+            ui.selectable_value(t, Transition::Cut, "Cut");
+            ui.selectable_value(t, Transition::Fade, "Fade");
+            ui.selectable_value(t, Transition::SlideLeft, "SlideLeft");
+            ui.selectable_value(t, Transition::SlideRight, "SlideRight");
+            ui.selectable_value(t, Transition::SlideUp, "SlideUp");
+            ui.selectable_value(t, Transition::SlideDown, "SlideDown");
+        });
 }
 
 fn inspector_overlay(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
@@ -729,6 +833,31 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             state.snap_enabled = !state.snap_enabled;
         }
 
+        // Loop preview toggle
+        let loop_color = if state.loop_mode { Color32::from_rgb(255, 180, 80) } else { COL_TEXT_DIM };
+        if ui
+            .button(RichText::new("\u{1F501} Loop").size(11.0).color(loop_color))
+            .on_hover_text(
+                "Loop preview: Shift+click on the ruler to set loop start, Shift+click again for end. \
+                Shift+drag = define a region.",
+            )
+            .clicked()
+        {
+            state.loop_mode = !state.loop_mode;
+            if !state.loop_mode {
+                state.loop_pending_start = None;
+            }
+        }
+
+        // Add Title (template picker)
+        if ui
+            .button(RichText::new("\u{1F4DD} Add Title").size(11.0).color(COL_ACCENT))
+            .on_hover_text("Insert a styled meme title at the playhead")
+            .clicked()
+        {
+            state.title_picker_open = true;
+        }
+
         // Curve editor toggle
         let curve_color = if state.curve_editor_open { COL_ACCENT } else { COL_TEXT_DIM };
         if ui.button(RichText::new("Curve").size(11.0).color(curve_color)).on_hover_text("Toggle curve editor").clicked() {
@@ -806,7 +935,98 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     if ruler_resp.clicked() || ruler_resp.dragged() {
         if let Some(pos) = ruler_resp.interact_pointer_pos() {
             if pos.x >= track_left && pos.x <= track_right {
-                state.playhead = x_to_time(pos.x, state.timeline_scroll, pps, track_left).clamp(0.0, duration);
+                let clicked_t = x_to_time(pos.x, state.timeline_scroll, pps, track_left)
+                    .clamp(0.0, duration);
+                let shift_held = ui.input(|i| i.modifiers.shift);
+
+                if state.loop_mode && shift_held {
+                    // Shift+drag to define a region
+                    if ruler_resp.dragged() {
+                        let press = ruler_resp.interact_pointer_pos().unwrap_or(pos);
+                        let press_t = x_to_time(press.x, state.timeline_scroll, pps, track_left)
+                            .clamp(0.0, duration);
+                        let drag_t = clicked_t;
+                        let (a, b) = if press_t <= drag_t {
+                            (press_t, drag_t)
+                        } else {
+                            (drag_t, press_t)
+                        };
+                        if (b - a).abs() > 0.01 {
+                            state.loop_region = Some((a, b));
+                            state.status =
+                                format!("\u{1F501} Loop region: {:.2}s - {:.2}s", a, b);
+                        }
+                        state.loop_pending_start = None;
+                    } else if ruler_resp.clicked() {
+                        match state.loop_pending_start.take() {
+                            None => {
+                                state.loop_pending_start = Some(clicked_t);
+                                state.status = format!(
+                                    "\u{1F501} Loop start set to {:.2}s. Shift+click for end.",
+                                    clicked_t
+                                );
+                            }
+                            Some(start) => {
+                                let (a, b) = if start <= clicked_t {
+                                    (start, clicked_t)
+                                } else {
+                                    (clicked_t, start)
+                                };
+                                if (b - a).abs() > 0.01 {
+                                    state.loop_region = Some((a, b));
+                                    state.status = format!(
+                                        "\u{1F501} Loop region: {:.2}s - {:.2}s",
+                                        a, b
+                                    );
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    state.playhead = clicked_t;
+                }
+            }
+        }
+    }
+
+    // Draw loop region band on the ruler.
+    if state.loop_mode {
+        if let Some((ls, le)) = state.loop_region {
+            let (ls, le) = if ls <= le { (ls, le) } else { (le, ls) };
+            let lx0 = (ls - state.timeline_scroll) * pps + track_left;
+            let lx1 = (le - state.timeline_scroll) * pps + track_left;
+            let lx0c = lx0.clamp(track_left, track_right);
+            let lx1c = lx1.clamp(track_left, track_right);
+            if lx1c > lx0c {
+                let band = egui::Rect::from_min_max(
+                    egui::pos2(lx0c, ruler_rect.min.y),
+                    egui::pos2(lx1c, ruler_rect.max.y),
+                );
+                painter.rect_filled(
+                    band,
+                    Rounding::ZERO,
+                    Color32::from_rgba_premultiplied(255, 180, 80, 60),
+                );
+                // Handles at start/end
+                let handle_color = Color32::from_rgb(255, 180, 80);
+                painter.line_segment(
+                    [egui::pos2(lx0c, ruler_rect.min.y), egui::pos2(lx0c, ruler_rect.max.y)],
+                    Stroke::new(2.0, handle_color),
+                );
+                painter.line_segment(
+                    [egui::pos2(lx1c, ruler_rect.min.y), egui::pos2(lx1c, ruler_rect.max.y)],
+                    Stroke::new(2.0, handle_color),
+                );
+            }
+        }
+        // Pending start marker
+        if let Some(start) = state.loop_pending_start {
+            let lx = (start - state.timeline_scroll) * pps + track_left;
+            if lx >= track_left && lx <= track_right {
+                painter.line_segment(
+                    [egui::pos2(lx, ruler_rect.min.y), egui::pos2(lx, ruler_rect.max.y)],
+                    Stroke::new(1.5, Color32::from_rgba_premultiplied(255, 220, 120, 200)),
+                );
             }
         }
     }
@@ -889,6 +1109,9 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                         let actor = &state.scene.actors[ai];
                         let clip_start = actor.t_in.unwrap_or(0.0);
                         let clip_end = actor.t_out.unwrap_or(duration);
+                        let trans_in = actor.transition_in;
+                        let trans_out = actor.transition_out;
+                        let trans_dur = actor.transition_duration;
                         let sel = state.selection == Selection::Actor(ai);
                         if let Some(clicked) = draw_clip(ui, &painter, content_rect, &actor.id,
                             clip_start, clip_end, state.timeline_scroll, pps, track_left, track_right,
@@ -946,6 +1169,21 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                 to_select = Some(Selection::Actor(ai));
                             }
                         }
+
+                        // Transition indicators on the clip bar (faded gradient near edges).
+                        draw_transition_indicators(
+                            &painter,
+                            content_rect,
+                            clip_start,
+                            clip_end,
+                            trans_in,
+                            trans_out,
+                            trans_dur,
+                            state.timeline_scroll,
+                            pps,
+                            track_left,
+                            track_right,
+                        );
                     }
 
                     // Draw overlays on video tracks (track 1+)
@@ -1367,6 +1605,93 @@ fn draw_audio_clip(
 }
 
 
+/// Draw a small triangle marker + faded gradient overlay representing a
+/// non-`Cut` transition at either edge of an actor clip on the timeline.
+#[allow(clippy::too_many_arguments)]
+fn draw_transition_indicators(
+    painter: &egui::Painter,
+    content_rect: egui::Rect,
+    clip_start: f32,
+    clip_end: f32,
+    trans_in: Transition,
+    trans_out: Transition,
+    trans_dur: f32,
+    scroll: f32,
+    pps: f32,
+    track_left: f32,
+    track_right: f32,
+) {
+    if trans_dur <= 0.0 {
+        return;
+    }
+
+    let x_start = (clip_start - scroll) * pps + track_left;
+    let x_end = (clip_end - scroll) * pps + track_left;
+    if x_end < track_left || x_start > track_right {
+        return;
+    }
+
+    let band_w = (trans_dur * pps).clamp(2.0, (clip_end - clip_start) * pps * 0.5);
+
+    // In-edge band: from x_start..x_start+band_w
+    if !matches!(trans_in, Transition::Cut) {
+        let bx0 = x_start.max(track_left);
+        let bx1 = (x_start + band_w).min(track_right);
+        if bx1 > bx0 + 1.0 {
+            let band = egui::Rect::from_min_max(
+                egui::pos2(bx0, content_rect.min.y + 2.0),
+                egui::pos2(bx1, content_rect.max.y - 2.0),
+            );
+            painter.rect_filled(
+                band,
+                Rounding::same(2.0),
+                Color32::from_rgba_premultiplied(255, 255, 255, 50),
+            );
+            // Triangle marker pointing right at the in-edge
+            let tri = 4.0;
+            let ty = content_rect.min.y + 4.0;
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    egui::pos2(bx0, ty),
+                    egui::pos2(bx0 + tri * 1.4, ty + tri),
+                    egui::pos2(bx0, ty + tri * 2.0),
+                ],
+                Color32::from_rgb(255, 220, 120),
+                Stroke::NONE,
+            ));
+        }
+    }
+
+    // Out-edge band: from x_end-band_w..x_end
+    if !matches!(trans_out, Transition::Cut) {
+        let bx0 = (x_end - band_w).max(track_left);
+        let bx1 = x_end.min(track_right);
+        if bx1 > bx0 + 1.0 {
+            let band = egui::Rect::from_min_max(
+                egui::pos2(bx0, content_rect.min.y + 2.0),
+                egui::pos2(bx1, content_rect.max.y - 2.0),
+            );
+            painter.rect_filled(
+                band,
+                Rounding::same(2.0),
+                Color32::from_rgba_premultiplied(255, 255, 255, 50),
+            );
+            let tri = 4.0;
+            let ty = content_rect.min.y + 4.0;
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    egui::pos2(bx1, ty),
+                    egui::pos2(bx1 - tri * 1.4, ty + tri),
+                    egui::pos2(bx1, ty + tri * 2.0),
+                ],
+                Color32::from_rgb(255, 220, 120),
+                Stroke::NONE,
+            ));
+        }
+    }
+}
+
+
 /// Draw ruler time marks with proper spacing.
 fn draw_ruler_marks(painter: &egui::Painter, rect: egui::Rect, scroll: f32, pps: f32, duration: f32) {
     // Choose step based on zoom level
@@ -1456,22 +1781,28 @@ pub fn preview(ui: &mut egui::Ui, state: &mut EditorState) {
     let actor_data: Vec<_> = state.scene.actors.iter().enumerate().map(|(idx, actor)| {
         (idx, actor.visible, actor.t_in.unwrap_or(0.0), actor.t_out.unwrap_or(f32::MAX),
          actor.source_start, actor.chroma_key.clone(),
-         actor.layout.first().map(|kf| kf.value).unwrap_or_default())
+         actor.layout.first().map(|kf| kf.value).unwrap_or_default(),
+         actor.transition_in, actor.transition_out, actor.transition_duration)
     }).collect();
 
-    for (actor_idx, visible, t_in, t_out, source_start, ref chroma_key, actor_state) in actor_data.iter() {
+    for (actor_idx, visible, t_in, t_out, source_start, ref chroma_key,
+         actor_state, trans_in, trans_out, trans_dur) in actor_data.iter() {
         if !visible { continue; }
         if t < *t_in || t > *t_out { continue; }
 
         let local_t = t - t_in + source_start;
+
+        // Compute transition modulation (opacity + slide offset, normalized).
+        let (trans_alpha, trans_offset) =
+            compute_actor_transition(t, *t_in, *t_out, *trans_in, *trans_out, *trans_dur);
 
         if let Some(fc) = state.frame_caches.get_mut(*actor_idx) {
             if fc.is_ready() {
                 // Use frame_at_time which reuses a single TextureHandle per actor (no allocation per frame)
                 if let Some(tex) = fc.frame_at_time(local_t, ui.ctx()) {
                     // Compute actor rect based on layout state (position/scale)
-                    let ax = actor_state.pos[0];
-                    let ay = actor_state.pos[1];
+                    let ax = actor_state.pos[0] + trans_offset[0];
+                    let ay = actor_state.pos[1] + trans_offset[1];
                     let ascale = actor_state.scale;
                     let rotation_rad = actor_state.rotation_deg.to_radians();
 
@@ -1481,7 +1812,8 @@ pub fn preview(ui: &mut egui::Ui, state: &mut EditorState) {
                     let cx = rect.min.x + ax * rect.width();
                     let cy = rect.min.y + ay * rect.height();
 
-                    let tint = Color32::from_rgba_unmultiplied(255, 255, 255, (actor_state.opacity * 255.0) as u8);
+                    let final_alpha = (actor_state.opacity * trans_alpha).clamp(0.0, 1.0);
+                    let tint = Color32::from_rgba_unmultiplied(255, 255, 255, (final_alpha * 255.0) as u8);
 
                     if rotation_rad.abs() > 0.001 {
                         // Draw rotated: compute rotated corner positions
@@ -1762,6 +2094,57 @@ pub fn preview(ui: &mut egui::Ui, state: &mut EditorState) {
 }
 
 
+/// Compute the visual modulation produced by `transition_in` / `transition_out`
+/// at scene time `t` for an actor whose visible window is `[t_in, t_out]`.
+///
+/// Returns `(alpha, [dx, dy])` where `alpha` is multiplied with the actor's
+/// existing opacity and `[dx, dy]` is a normalised position offset (scene
+/// space, [0, 1] coordinates).
+fn compute_actor_transition(
+    t: f32,
+    t_in: f32,
+    t_out: f32,
+    trans_in: Transition,
+    trans_out: Transition,
+    duration: f32,
+) -> (f32, [f32; 2]) {
+    if duration <= 0.0 {
+        return (1.0, [0.0, 0.0]);
+    }
+    let mut alpha = 1.0_f32;
+    let mut offset = [0.0_f32, 0.0_f32];
+
+    // In transition: progress from 0 → 1 across the first `duration` seconds.
+    if t >= t_in && t <= t_in + duration && !matches!(trans_in, Transition::Cut) {
+        let p = ((t - t_in) / duration).clamp(0.0, 1.0);
+        match trans_in {
+            Transition::Fade | Transition::Snap => alpha = p,
+            Transition::SlideLeft => offset[0] = -(1.0 - p),
+            Transition::SlideRight => offset[0] = 1.0 - p,
+            Transition::SlideUp => offset[1] = -(1.0 - p),
+            Transition::SlideDown => offset[1] = 1.0 - p,
+            Transition::Cut => {}
+        }
+    }
+
+    // Out transition: progress from 0 → 1 across the last `duration` seconds.
+    if t <= t_out && t >= t_out - duration && !matches!(trans_out, Transition::Cut) {
+        let p = ((t_out - t) / duration).clamp(0.0, 1.0);
+        // p == 1 at t_out - duration (start of out), 0 at t_out (full out)
+        match trans_out {
+            Transition::Fade | Transition::Snap => alpha = alpha.min(p),
+            Transition::SlideLeft => offset[0] += -(1.0 - p),
+            Transition::SlideRight => offset[0] += 1.0 - p,
+            Transition::SlideUp => offset[1] += -(1.0 - p),
+            Transition::SlideDown => offset[1] += 1.0 - p,
+            Transition::Cut => {}
+        }
+    }
+
+    (alpha.clamp(0.0, 1.0), offset)
+}
+
+
 /// Apply chroma-key processing to a ColorImage.
 fn apply_chroma_key(image: &mut egui::ColorImage, params: &ChromaKeyParams) {
     let kr = params.key_color[0] as f32 / 255.0;
@@ -1900,6 +2283,9 @@ pub fn add_actor_from_clip(state: &mut EditorState, path: &PathBuf) {
         attachments: Vec::new(),
         visible: true,
         color_correction: ColorCorrection::default(),
+        transition_in: Transition::Cut,
+        transition_out: Transition::Cut,
+        transition_duration: 0.3,
     };
     state.scene.actors.push(actor);
     state.selection = Selection::Actor(state.scene.actors.len() - 1);
@@ -1955,6 +2341,9 @@ fn add_actor_from_clip_at_time(state: &mut EditorState, path: &PathBuf, t: f32) 
         attachments: Vec::new(),
         visible: true,
         color_correction: ColorCorrection::default(),
+        transition_in: Transition::Cut,
+        transition_out: Transition::Cut,
+        transition_duration: 0.3,
     };
     state.scene.actors.push(actor);
     state.selection = Selection::Actor(state.scene.actors.len() - 1);

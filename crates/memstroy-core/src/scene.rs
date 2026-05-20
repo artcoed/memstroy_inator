@@ -178,9 +178,19 @@ pub struct Actor {
     /// Color correction parameters for this actor.
     #[serde(default)]
     pub color_correction: ColorCorrection,
+    /// Transition applied when the actor enters its visible window.
+    #[serde(default)]
+    pub transition_in: Transition,
+    /// Transition applied when the actor leaves its visible window.
+    #[serde(default)]
+    pub transition_out: Transition,
+    /// Duration of the in/out transitions in seconds.
+    #[serde(default = "default_transition_duration")]
+    pub transition_duration: f32,
 }
 
 fn default_true() -> bool { true }
+fn default_transition_duration() -> f32 { 0.3 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct ActorState {

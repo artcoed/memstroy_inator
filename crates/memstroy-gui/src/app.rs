@@ -39,6 +39,30 @@ impl App {
         let (tx, rx) = channel();
         let mut state = EditorState::new();
         state.reload_library();
+
+        // Recovery: if an autosave from a previous session exists and is newer
+        // than the user's current scene file, surface a recovery dialog.
+        let autosave_path = EditorState::autosave_path();
+        if autosave_path.exists() {
+            let autosave_modified = std::fs::metadata(&autosave_path)
+                .and_then(|m| m.modified())
+                .ok();
+            // If there is no scene file, any autosave is a candidate.
+            // If there is one, only show recovery when the autosave is newer.
+            let should_offer = match (&state.scene_path, autosave_modified) {
+                (None, Some(_)) => true,
+                (Some(p), Some(am)) => match std::fs::metadata(p).and_then(|m| m.modified()) {
+                    Ok(scene_modified) => am > scene_modified,
+                    Err(_) => true,
+                },
+                _ => true,
+            };
+            if should_offer {
+                state.recovery_pending = Some(autosave_path);
+                state.recovery_dialog_open = true;
+            }
+        }
+
         Self {
             rt,
             state,
@@ -808,6 +832,229 @@ impl App {
         // Show placeholder while waiting
         self.state.status = "Running pose detection...".into();
     }
+
+    // ─── AUTO-SAVE / RECOVERY ────────────────────────────────────────
+
+    /// Periodically saves the current scene to `~/.memstroy/autosave.scene.yaml`.
+    /// Triggered from `update()`. Updates `last_autosave` and shows a 2 s toast.
+    fn tick_autosave(&mut self) {
+        let interval = self.state.autosave_interval;
+        let due = match self.state.last_autosave {
+            Some(t) => t.elapsed().as_secs_f32() > interval,
+            None => true, // schedule the first autosave shortly after launch
+        };
+        if !due {
+            return;
+        }
+
+        // First call (None): just stamp the timer so we don't autosave on the very
+        // first frame; we'll wait the configured interval before writing.
+        if self.state.last_autosave.is_none() {
+            self.state.last_autosave = Some(std::time::Instant::now());
+            return;
+        }
+
+        let path = EditorState::autosave_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match self.state.scene.save(&path) {
+            Ok(()) => {
+                self.state.last_autosave = Some(std::time::Instant::now());
+                self.state.autosave_toast_until =
+                    Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
+                self.state.status = "\u{1F4BE} Auto-saved".into();
+            }
+            Err(e) => {
+                self.state.status = format!("\u{26A0} Autosave failed: {e}");
+            }
+        }
+    }
+
+    /// Render the recovery modal when an autosave from a previous launch was
+    /// detected. Lets the user restore, discard, or postpone the decision.
+    fn show_recovery_dialog(&mut self, ctx: &egui::Context) {
+        if !self.state.recovery_dialog_open {
+            return;
+        }
+        let Some(autosave_path) = self.state.recovery_pending.clone() else {
+            self.state.recovery_dialog_open = false;
+            return;
+        };
+
+        let mut close = false;
+        let mut decision: Option<&'static str> = None;
+
+        egui::Window::new("Recover scene?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new("\u{26A0} A recovered scene was found.")
+                        .size(14.0)
+                        .strong()
+                        .color(Color32::from_rgb(255, 200, 80)),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(autosave_path.display().to_string())
+                        .size(10.0)
+                        .color(Color32::from_rgb(160, 160, 180)),
+                );
+                ui.add_space(8.0);
+                ui.label("Restore the auto-saved scene?");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let yes = egui::Button::new(RichText::new("Yes, restore").color(Color32::WHITE))
+                        .fill(Color32::from_rgb(60, 160, 80));
+                    if ui.add(yes).clicked() {
+                        decision = Some("yes");
+                        close = true;
+                    }
+                    let no = egui::Button::new(RichText::new("No, discard").color(Color32::WHITE))
+                        .fill(Color32::from_rgb(200, 60, 60));
+                    if ui.add(no).clicked() {
+                        decision = Some("no");
+                        close = true;
+                    }
+                    if ui.button("Later").clicked() {
+                        decision = Some("later");
+                        close = true;
+                    }
+                });
+            });
+
+        if !close {
+            return;
+        }
+
+        match decision {
+            Some("yes") => match Scene::load(&autosave_path) {
+                Ok(scene) => {
+                    self.state.scene = scene;
+                    self.state.scene_path = None;
+                    self.state.status = "\u{2705} Recovered scene loaded.".into();
+                }
+                Err(e) => {
+                    self.state.status = format!("\u{274C} Recovery failed: {e}");
+                }
+            },
+            Some("no") => {
+                let _ = std::fs::remove_file(&autosave_path);
+                self.state.status = "\u{1F5D1} Recovery discarded.".into();
+            }
+            Some("later") => {
+                self.state.status = "Recovery postponed.".into();
+            }
+            _ => {}
+        }
+        self.state.recovery_dialog_open = false;
+        self.state.recovery_pending = None;
+    }
+
+    // ─── TITLE TEMPLATES PICKER ──────────────────────────────────────
+
+    /// Modal-style egui Window listing built-in title templates as cards.
+    /// Clicking a card adds an overlay at the playhead with a 3-second window.
+    fn show_title_picker(&mut self, ctx: &egui::Context) {
+        if !self.state.title_picker_open {
+            return;
+        }
+
+        let mut open = self.state.title_picker_open;
+        let playhead = self.state.playhead;
+        let scene_dur = self.state.scene.output.duration;
+        let mut chosen: Option<usize> = None;
+
+        egui::Window::new("Add Title")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(520.0)
+            .default_height(420.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new("Pick a title template")
+                        .strong()
+                        .size(14.0)
+                        .color(Color32::from_rgb(180, 140, 255)),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(
+                        "Adds a 3-second text overlay at the playhead. \
+                        Edit text/style afterwards in the Inspector.",
+                    )
+                    .size(11.0)
+                    .color(Color32::from_rgb(160, 160, 180)),
+                );
+                ui.add_space(8.0);
+
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false; 2])
+                    .show(ui, |ui| {
+                        for (i, tpl) in crate::title_templates::TEMPLATES.iter().enumerate() {
+                            let frame = egui::Frame::none()
+                                .fill(Color32::from_rgb(32, 32, 48))
+                                .rounding(Rounding::same(8.0))
+                                .stroke(Stroke::new(1.0, Color32::from_rgb(60, 60, 80)))
+                                .inner_margin(egui::Margin::same(8.0));
+
+                            let resp = frame
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(RichText::new(tpl.icon).size(22.0));
+                                        ui.vertical(|ui| {
+                                            ui.label(
+                                                RichText::new(tpl.name).strong().size(13.0),
+                                            );
+                                            ui.label(
+                                                RichText::new(tpl.description)
+                                                    .size(10.0)
+                                                    .color(Color32::from_rgb(160, 160, 180)),
+                                            );
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "\u{201C}{}\u{201D}",
+                                                    tpl.default_text
+                                                ))
+                                                .size(10.0)
+                                                .italics()
+                                                .color(Color32::from_rgb(200, 200, 220)),
+                                            );
+                                        });
+                                    });
+                                })
+                                .response;
+                            if resp.interact(egui::Sense::click()).clicked() {
+                                chosen = Some(i);
+                            }
+                            ui.add_space(4.0);
+                        }
+                    });
+            });
+
+        self.state.title_picker_open = open;
+
+        if let Some(idx) = chosen {
+            let templates = crate::title_templates::TEMPLATES;
+            if idx < templates.len() {
+                let tpl: &'static crate::title_templates::TitleTemplate = &templates[idx];
+                let t_in = playhead;
+                let t_out = (t_in + 3.0).min(scene_dur.max(t_in + 0.1));
+                let mut new_idx_out: usize = 0;
+                self.state.mutate(|scene| {
+                    new_idx_out = crate::title_templates::add_template_to_scene(
+                        scene, tpl, t_in, t_out,
+                    );
+                });
+                self.state.selection = Selection::Overlay(new_idx_out);
+                self.state.status = format!("\u{2728} Added title: {}", tpl.name);
+                self.state.title_picker_open = false;
+            }
+        }
+    }
 }
 
 /// Parse ffmpeg time output like "time=00:00:04.00" and return seconds.
@@ -850,8 +1097,19 @@ impl eframe::App for App {
         if self.state.playing {
             let dt = ctx.input(|i| i.stable_dt).min(0.1); // cap at 100ms
             self.state.playhead += dt * self.state.playback_speed;
+
+            // Loop preview: clamp playhead within the loop region.
+            if self.state.loop_mode {
+                if let Some((ls, le)) = self.state.loop_region {
+                    let (ls, le) = if ls <= le { (ls, le) } else { (le, ls) };
+                    if self.state.playhead > le || self.state.playhead < ls {
+                        self.state.playhead = ls;
+                    }
+                }
+            }
+
             if self.state.playhead >= self.state.scene.output.duration {
-                self.state.playhead = 0.0; // loop
+                self.state.playhead = 0.0; // loop full scene
             }
             ctx.request_repaint(); // keep animating
         }
@@ -1043,6 +1301,13 @@ impl eframe::App for App {
 
         // AI generation floating window
         panels::ai_generate_window(ctx, &mut self.state);
+
+        // Title-templates picker (popup grid of preset captions)
+        self.show_title_picker(ctx);
+
+        // Auto-save tick + recovery modal
+        self.tick_autosave();
+        self.show_recovery_dialog(ctx);
 
         // Repaint scheduling:
         // - When playing with ready frame cache: 16ms (~60fps)

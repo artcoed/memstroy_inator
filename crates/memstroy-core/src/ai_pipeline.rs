@@ -273,6 +273,9 @@ impl MontageOutput {
                 attachments: Vec::new(),
                 visible: true,
                 color_correction: crate::ColorCorrection::default(),
+                transition_in: crate::Transition::Cut,
+                transition_out: crate::Transition::Cut,
+                transition_duration: 0.3,
             };
             scene.actors.push(actor);
         }
