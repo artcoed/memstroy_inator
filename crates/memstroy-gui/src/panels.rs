@@ -782,7 +782,13 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                 clip_start, clip_end, state.timeline_scroll, pps, track_left, track_right,
                                 COL_CLIP_BG, sel, track_h, track_locked, state.razor_mode)
                             {
-                                if state.razor_mode {
+                                if clicked < 0.0 {
+                                    let new_start = (-clicked).max(0.0);
+                                    let dur = clip_end - clip_start;
+                                    state.scene.backgrounds[bi].start = new_start;
+                                    state.scene.backgrounds[bi].duration = dur;
+                                    to_select = Some(Selection::Background(bi));
+                                } else if state.razor_mode {
                                     to_select = Some(Selection::Background(bi));
                                     state.playhead = clicked;
                                     state.status = "__SPLIT_AT_PLAYHEAD__".into();
@@ -810,7 +816,14 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             clip_start, clip_end, state.timeline_scroll, pps, track_left, track_right,
                             COL_CLIP_ACTOR, sel, track_h, track_locked, state.razor_mode)
                         {
-                            if state.razor_mode {
+                            if clicked < 0.0 {
+                                // Drag: move the actor's time window
+                                let new_start = (-clicked).max(0.0);
+                                let dur = clip_end - clip_start;
+                                state.scene.actors[ai].t_in = Some(new_start);
+                                state.scene.actors[ai].t_out = Some(new_start + dur);
+                                to_select = Some(Selection::Actor(ai));
+                            } else if state.razor_mode {
                                 to_select = Some(Selection::Actor(ai));
                                 state.playhead = clicked;
                                 state.status = "__SPLIT_AT_PLAYHEAD__".into();
@@ -837,7 +850,17 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                 clip_start, clip_end, state.timeline_scroll, pps, track_left, track_right,
                                 COL_CLIP_OVERLAY, sel, track_h, track_locked, state.razor_mode)
                             {
-                                if state.razor_mode {
+                                if clicked < 0.0 {
+                                    let new_start = (-clicked).max(0.0);
+                                    let dur = clip_end - clip_start;
+                                    let new_end = new_start + dur;
+                                    match &mut state.scene.overlays[oi] {
+                                        Overlay::Text(t) => { t.t_in = new_start; t.t_out = new_end; }
+                                        Overlay::Image(im) => { im.t_in = new_start; im.t_out = new_end; }
+                                        Overlay::Video(v) => { v.t_in = new_start; v.t_out = new_end; }
+                                    }
+                                    to_select = Some(Selection::Overlay(oi));
+                                } else if state.razor_mode {
                                     to_select = Some(Selection::Overlay(oi));
                                     state.playhead = clicked;
                                     state.status = "__SPLIT_AT_PLAYHEAD__".into();
@@ -970,10 +993,16 @@ fn draw_clip(
         return Some(clip_start); // signal selection
     }
 
-    // Drag to move clip horizontally (no track change for now - just time shift)
+    // Drag to move clip horizontally — return negative value to signal drag delta
     if resp.dragged() && !locked && !razor_mode {
-        // Return start time to signal it's selected
-        return Some(clip_start);
+        let dx = resp.drag_delta().x;
+        let delta_secs = dx / pps;
+        // Encode: return -(clip_start + delta) as a signal that this is a drag
+        // We use a special sentinel: if delta != 0, return the NEW start time as negative
+        if delta_secs.abs() > 0.001 {
+            return Some(-(clip_start + delta_secs));
+        }
+        return Some(clip_start); // just select if no movement
     }
 
     None
@@ -1127,14 +1156,6 @@ fn format_time(t: f32) -> String {
 // ─── PREVIEW ─────────────────────────────────────────────────────────
 
 pub fn preview(ui: &mut egui::Ui, state: &mut EditorState) {
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("Preview").size(14.0).strong());
-        if state.eyedropper_active {
-            ui.label(RichText::new(" [Eyedropper active]").size(11.0).color(Color32::from_rgb(255, 200, 50)));
-        }
-    });
-    ui.add_space(2.0);
-
     let avail = ui.available_size_before_wrap();
     let target_aspect = state.scene.output.resolution[0] as f32 / state.scene.output.resolution[1] as f32;
     let mut h = avail.y.min(800.0);
@@ -1144,52 +1165,111 @@ pub fn preview(ui: &mut egui::Ui, state: &mut EditorState) {
     let offset_x = (avail.x - w) * 0.5;
     let offset_y = (avail.y - h) * 0.5;
 
-    let preview_sense = if state.eyedropper_active { Sense::click() } else { Sense::hover() };
-    let (full_rect, preview_resp) = ui.allocate_exact_size(avail, preview_sense);
+    // Preview needs click+drag for gizmo manipulation
+    let (full_rect, preview_resp) = ui.allocate_exact_size(avail, Sense::click_and_drag());
     let rect = egui::Rect::from_min_size(
         egui::pos2(full_rect.min.x + offset_x, full_rect.min.y + offset_y), Vec2::new(w, h));
 
     ui.painter().rect_filled(rect, Rounding::same(6.0), Color32::from_rgb(10, 10, 16));
 
-    // Composite layers — use a SINGLE combined texture to avoid lag
+    // Render ALL visible actors (composited bottom-to-top) using frame_at_time for texture reuse
     let t = state.playhead;
     let mut any_frame_shown = false;
 
     // Collect actor info to avoid borrow conflicts
     let actor_data: Vec<_> = state.scene.actors.iter().enumerate().map(|(idx, actor)| {
         (idx, actor.visible, actor.t_in.unwrap_or(0.0), actor.t_out.unwrap_or(f32::MAX),
-         actor.source_start, actor.chroma_key.clone())
+         actor.source_start, actor.chroma_key.clone(),
+         actor.layout.first().map(|kf| kf.value).unwrap_or_default())
     }).collect();
 
-    // Only render the TOPMOST visible actor at current time to avoid lag
-    // (compositing multiple actors requires GPU — for now just show the primary one)
-    let mut active_actor: Option<usize> = None;
-    for (idx, visible, t_in, t_out, _, _) in actor_data.iter().rev() {
-        if *visible && t >= *t_in && t <= *t_out {
-            active_actor = Some(*idx);
-            break;
-        }
-    }
+    for (actor_idx, visible, t_in, t_out, source_start, ref chroma_key, actor_state) in actor_data.iter() {
+        if !visible { continue; }
+        if t < *t_in || t > *t_out { continue; }
 
-    if let Some(actor_idx) = active_actor {
-        let (_, _, t_in, _, source_start, ref chroma_key) = actor_data[actor_idx];
         let local_t = t - t_in + source_start;
 
-        if let Some(fc) = state.frame_caches.get_mut(actor_idx) {
+        if let Some(fc) = state.frame_caches.get_mut(*actor_idx) {
             if fc.is_ready() {
-                if let Some(mut img) = fc.raw_frame_at_time(local_t) {
-                    if !state.eyedropper_active {
-                        apply_chroma_key(&mut img, chroma_key);
-                    }
-                    let tex = ui.ctx().load_texture(
-                        format!("preview_layer_{}", actor_idx), img, egui::TextureOptions::LINEAR);
+                // Use frame_at_time which reuses a single TextureHandle per actor (no allocation per frame)
+                if let Some(tex) = fc.frame_at_time(local_t, ui.ctx()) {
+                    // Compute actor rect based on layout state (position/scale)
+                    let ax = actor_state.pos[0];
+                    let ay = actor_state.pos[1];
+                    let ascale = actor_state.scale;
+
+                    // Actor rect centered at (ax, ay) in normalized coords, scaled
+                    let actor_w = rect.width() * ascale * 0.5;
+                    let actor_h = rect.height() * ascale * 0.5;
+                    let cx = rect.min.x + ax * rect.width();
+                    let cy = rect.min.y + ay * rect.height();
+                    let actor_rect = egui::Rect::from_center_size(
+                        egui::pos2(cx, cy), Vec2::new(actor_w, actor_h));
+
                     let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-                    ui.painter().image(tex.id(), rect, uv, Color32::WHITE);
+                    let tint = Color32::from_rgba_unmultiplied(255, 255, 255, (actor_state.opacity * 255.0) as u8);
+                    ui.painter().image(tex.id(), actor_rect, uv, tint);
                     any_frame_shown = true;
                 }
             } else if fc.extracting && !any_frame_shown {
                 ui.put(rect, egui::Label::new(
                     RichText::new("Extracting frames...").color(Color32::from_rgb(180, 150, 60)).size(14.0)));
+            }
+        }
+    }
+
+    // ─── GIZMO: Interactive transform on selected actor ───
+    if let Selection::Actor(sel_idx) = state.selection {
+        if sel_idx < state.scene.actors.len() {
+            let a = &state.scene.actors[sel_idx];
+            if let Some(kf) = a.layout.first() {
+                let ax = kf.value.pos[0];
+                let ay = kf.value.pos[1];
+                let ascale = kf.value.scale;
+
+                let actor_w = rect.width() * ascale * 0.5;
+                let actor_h = rect.height() * ascale * 0.5;
+                let cx = rect.min.x + ax * rect.width();
+                let cy = rect.min.y + ay * rect.height();
+                let gizmo_rect = egui::Rect::from_center_size(egui::pos2(cx, cy), Vec2::new(actor_w, actor_h));
+
+                // Draw selection frame
+                ui.painter().rect_stroke(gizmo_rect, Rounding::same(2.0),
+                    Stroke::new(2.0, Color32::from_rgb(255, 220, 80)));
+
+                // Corner handles
+                let handle_size = 8.0;
+                let corners = [gizmo_rect.left_top(), gizmo_rect.right_top(),
+                               gizmo_rect.left_bottom(), gizmo_rect.right_bottom()];
+                for corner in &corners {
+                    let hr = egui::Rect::from_center_size(*corner, Vec2::splat(handle_size));
+                    ui.painter().rect_filled(hr, Rounding::same(2.0), Color32::from_rgb(255, 220, 80));
+                }
+
+                // Center crosshair
+                ui.painter().circle_stroke(egui::pos2(cx, cy), 6.0,
+                    Stroke::new(1.5, Color32::from_rgb(255, 220, 80)));
+            }
+
+            // Handle drag on preview to move actor position
+            if preview_resp.dragged() && !state.eyedropper_active {
+                let delta = preview_resp.drag_delta();
+                let dx_norm = delta.x / rect.width();
+                let dy_norm = delta.y / rect.height();
+
+                if let Some(kf) = state.scene.actors[sel_idx].layout.first_mut() {
+                    kf.value.pos[0] = (kf.value.pos[0] + dx_norm).clamp(-0.5, 1.5);
+                    kf.value.pos[1] = (kf.value.pos[1] + dy_norm).clamp(-0.5, 1.5);
+                }
+            }
+
+            // Handle scroll wheel on preview to scale actor
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+            if scroll.abs() > 0.5 && preview_resp.hovered() {
+                let scale_delta = scroll * 0.002;
+                if let Some(kf) = state.scene.actors[sel_idx].layout.first_mut() {
+                    kf.value.scale = (kf.value.scale + scale_delta).clamp(0.05, 5.0);
+                }
             }
         }
     }
