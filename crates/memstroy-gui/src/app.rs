@@ -513,12 +513,14 @@ impl eframe::App for App {
             ctx.request_repaint(); // keep animating
         }
 
-        // Auto-preview: only if ffmpeg available and playhead moved significantly
-        let playhead_delta = (self.state.playhead - self.state.last_rendered_playhead).abs();
-        if self.state.ffmpeg_available && playhead_delta > 0.05 && !self.state.preview_rendering {
-            self.state.preview_rendering = true;
-            self.state.last_rendered_playhead = self.state.playhead;
-            self.run_preview();
+        // Auto-preview: only if ffmpeg available, not playing, and playhead was manually moved
+        if self.state.ffmpeg_available && !self.state.playing {
+            let playhead_delta = (self.state.playhead - self.state.last_rendered_playhead).abs();
+            if playhead_delta > 0.1 && !self.state.preview_rendering {
+                self.state.preview_rendering = true;
+                self.state.last_rendered_playhead = self.state.playhead;
+                self.run_preview();
+            }
         }
 
         // Apply modern dark style
@@ -609,11 +611,12 @@ impl eframe::App for App {
         self.node_editor.show(ctx, &mut self.state.node_editor_open);
 
         // Keep refreshing UI while jobs are running
-        if self.state.playing
-            || self.state.refreshing
+        if self.state.playing {
+            ctx.request_repaint_after(std::time::Duration::from_millis(33)); // ~30fps during playback
+        } else if self.state.refreshing
             || self.state.render_progress.as_ref().is_some_and(|p| !p.done)
         {
-            ctx.request_repaint_after(std::time::Duration::from_millis(16)); // ~60fps during playback
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
     }
 }

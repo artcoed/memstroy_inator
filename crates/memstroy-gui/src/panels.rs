@@ -60,8 +60,8 @@ pub fn library(ui: &mut egui::Ui, state: &mut EditorState, _request_refresh: imp
         egui::ScrollArea::vertical()
             .max_height(ui.available_height() - 60.0)
             .show(ui, |ui| {
-                let clips = state.library.mellstroy_clips.clone();
-                for clip in &clips {
+                for idx in 0..state.library.mellstroy_clips.len() {
+                    let clip = &state.library.mellstroy_clips[idx];
                     // Filter by search
                     if !search_lower.is_empty() {
                         let clean = clean_clip_text(&clip.description).to_lowercase();
@@ -70,7 +70,8 @@ pub fn library(ui: &mut egui::Ui, state: &mut EditorState, _request_refresh: imp
                             continue;
                         }
                     }
-                    clip_card(ui, state, clip);
+                    let clip = state.library.mellstroy_clips[idx].clone();
+                    clip_card(ui, state, &clip);
                 }
             });
     }
@@ -101,40 +102,40 @@ pub fn library(ui: &mut egui::Ui, state: &mut EditorState, _request_refresh: imp
 fn clip_card(ui: &mut egui::Ui, state: &mut EditorState, clip: &crate::state::LibraryClip) {
     let frame = egui::Frame::none()
         .fill(Color32::from_rgb(32, 32, 48))
-        .rounding(Rounding::same(6.0))
-        .inner_margin(egui::Margin::same(4.0))
+        .rounding(Rounding::same(4.0))
+        .inner_margin(egui::Margin::same(3.0))
         .stroke(egui::Stroke::new(1.0, Color32::from_rgb(50, 50, 70)));
 
     frame.show(ui, |ui| {
         ui.horizontal(|ui| {
-            // Thumbnail (left side)
+            // Thumbnail (fixed 48x48 square, cover-fill)
+            let thumb_size = Vec2::new(48.0, 48.0);
             if let Some(thumb) = &clip.thumbnail {
                 let uri = format!("file://{}", thumb.display());
                 ui.add(
                     egui::Image::from_uri(uri)
-                        .fit_to_exact_size(Vec2::new(40.0, 56.0))
+                        .fit_to_exact_size(thumb_size)
+                        .maintain_aspect_ratio(false)
                         .rounding(Rounding::same(3.0)),
                 );
             } else {
-                // Placeholder
-                let (rect, _) = ui.allocate_exact_size(Vec2::new(40.0, 56.0), egui::Sense::hover());
+                let (rect, _) = ui.allocate_exact_size(thumb_size, egui::Sense::hover());
                 ui.painter().rect_filled(rect, Rounding::same(3.0), Color32::from_rgb(40, 40, 55));
                 ui.painter().text(
                     rect.center(),
                     egui::Align2::CENTER_CENTER,
                     format!("{}", clip.id),
-                    egui::FontId::proportional(10.0),
+                    egui::FontId::proportional(11.0),
                     Color32::from_rgb(100, 100, 120),
                 );
             }
 
             ui.vertical(|ui| {
-                // Clean description
                 let desc = clean_clip_text(&clip.description);
                 let display = if desc.is_empty() {
                     format!("Clip #{}", clip.id)
-                } else if desc.chars().count() > 40 {
-                    let truncated: String = desc.chars().take(37).collect();
+                } else if desc.chars().count() > 35 {
+                    let truncated: String = desc.chars().take(32).collect();
                     format!("{}...", truncated)
                 } else {
                     desc
@@ -946,9 +947,17 @@ fn draw_track_bar(
 
     let any_hover = body.hovered() || left.hovered() || right.hovered();
     let fill = if selected {
-        color.gamma_multiply(1.3)
+        Color32::from_rgb(
+            color.r().saturating_add(40),
+            color.g().saturating_add(40),
+            color.b().saturating_add(40),
+        )
     } else if any_hover {
-        color.gamma_multiply(1.1)
+        Color32::from_rgb(
+            color.r().saturating_add(20),
+            color.g().saturating_add(20),
+            color.b().saturating_add(20),
+        )
     } else {
         color
     };
