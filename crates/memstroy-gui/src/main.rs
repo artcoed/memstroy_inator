@@ -1,6 +1,7 @@
 //! Entry point for the desktop editor.
 
 mod app;
+mod gpu_preview;
 mod jobs;
 mod panels;
 mod state;
