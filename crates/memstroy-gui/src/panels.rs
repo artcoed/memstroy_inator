@@ -1206,22 +1206,56 @@ fn add_actor_from_clip(state: &mut EditorState, path: &PathBuf) {
         .and_then(|s| s.to_str())
         .map(|s| format!("mellstroy_{}", s))
         .unwrap_or_else(|| format!("actor_{}", state.scene.actors.len() + 1));
+
+    // Probe video duration via ffprobe for accurate timeline display
+    let clip_duration = probe_video_duration(path);
+
     let actor = Actor {
         id: id.clone(),
         source: path.clone(),
         anchors: None,
         chroma_key: ChromaKeyParams::default(),
         layout: vec![Keyframe::new(0.0, ActorState::default())],
-        t_in: None,
-        t_out: None,
+        t_in: Some(0.0),
+        t_out: Some(clip_duration),
         source_start: 0.0,
         loop_source: true,
         flip_horizontal: false,
         attachments: Vec::new(),
     };
+
+    // Expand scene output duration to fit the clip if needed
+    if clip_duration > state.scene.output.duration {
+        state.scene.output.duration = clip_duration;
+    }
+
     state.scene.actors.push(actor);
     state.selection = Selection::Actor(state.scene.actors.len() - 1);
     state.status = "__EXTRACT_FRAMES__".into();
+}
+
+/// Probe video duration using ffprobe. Returns duration in seconds, or 8.0 as fallback.
+fn probe_video_duration(path: &std::path::Path) -> f32 {
+    let ffmpeg_bin = memstroy_render::ffmpeg_binary();
+    let ffprobe = {
+        let mut p = ffmpeg_bin.clone();
+        p.set_file_name(if cfg!(windows) { "ffprobe.exe" } else { "ffprobe" });
+        if p.exists() { p } else { std::path::PathBuf::from("ffprobe") }
+    };
+
+    match std::process::Command::new(&ffprobe)
+        .args(["-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1"])
+        .arg(path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+    {
+        Ok(out) => {
+            let s = String::from_utf8_lossy(&out.stdout);
+            s.trim().parse::<f32>().unwrap_or(8.0)
+        }
+        Err(_) => 8.0,
+    }
 }
 
 fn add_background_from_path(state: &mut EditorState, path: &PathBuf) {
