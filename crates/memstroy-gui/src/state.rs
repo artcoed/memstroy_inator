@@ -33,6 +33,8 @@ pub struct EditorState {
     pub timeline_zoom: f32,
     /// Timeline scroll offset (normalised 0..1)
     pub timeline_scroll: f32,
+    /// Whether the (scaffold) node editor window is open.
+    pub node_editor_open: bool,
 }
 
 #[derive(Default)]

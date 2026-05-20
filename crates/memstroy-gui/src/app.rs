@@ -7,6 +7,7 @@ use memstroy_core::Scene;
 use tokio::runtime::Runtime;
 
 use crate::jobs::{spawn_preview, spawn_refresh, spawn_render, JobEvent};
+use crate::node_editor::NodeEditor;
 use crate::panels;
 use crate::state::{EditorState, Selection};
 
@@ -15,6 +16,7 @@ pub struct App {
     state: EditorState,
     tx: Sender<JobEvent>,
     rx: Receiver<JobEvent>,
+    node_editor: NodeEditor,
 }
 
 impl App {
@@ -22,7 +24,7 @@ impl App {
         let (tx, rx) = channel();
         let mut state = EditorState::new();
         state.reload_library();
-        Self { rt, state, tx, rx }
+        Self { rt, state, tx, rx, node_editor: NodeEditor::default() }
     }
 
     fn pump_events(&mut self, ctx: &egui::Context) {
@@ -243,6 +245,157 @@ impl App {
         }
     }
 
+    /// Split the selected element at the current playhead position.
+    /// Creates two adjacent elements: [original_start..playhead] and [playhead..original_end].
+    fn split_at_playhead(&mut self) {
+        let t = self.state.playhead;
+        match self.state.selection {
+            Selection::Background(i) if i < self.state.scene.backgrounds.len() => {
+                let bg = &self.state.scene.backgrounds[i];
+                let start = bg.start;
+                let end = bg.start + bg.duration;
+                if t <= start || t >= end {
+                    self.state.status = "\u{26A0} Playhead is outside this background's range.".into();
+                    return;
+                }
+                let mut right = bg.clone();
+                right.id = format!("{}_R", right.id);
+                right.start = t;
+                right.duration = end - t;
+                let left_dur = t - start;
+                self.state.mutate(move |s| {
+                    s.backgrounds[i].duration = left_dur;
+                    s.backgrounds.insert(i + 1, right);
+                });
+                self.state.status = "\u{2702} Background split at playhead.".into();
+            }
+            Selection::Actor(i) if i < self.state.scene.actors.len() => {
+                let a = &self.state.scene.actors[i];
+                let start = a.t_in.unwrap_or(0.0);
+                let end = a.t_out.unwrap_or(self.state.scene.output.duration);
+                if t <= start || t >= end {
+                    self.state.status = "\u{26A0} Playhead is outside this actor's range.".into();
+                    return;
+                }
+                let mut right = a.clone();
+                right.id = format!("{}_R", right.id);
+                right.t_in = Some(t);
+                right.t_out = Some(end);
+                // Keep only keyframes in each half (by time).
+                right.layout.retain(|kf| kf.t >= t);
+                self.state.mutate(move |s| {
+                    s.actors[i].t_out = Some(t);
+                    s.actors[i].layout.retain(|kf| kf.t <= t);
+                    s.actors.insert(i + 1, right);
+                });
+                self.state.status = "\u{2702} Actor split at playhead.".into();
+            }
+            Selection::Overlay(i) if i < self.state.scene.overlays.len() => {
+                let ov = &self.state.scene.overlays[i];
+                let (start, end) = match ov {
+                    memstroy_core::Overlay::Text(txt) => (txt.t_in, txt.t_out),
+                    memstroy_core::Overlay::Image(im) => (im.t_in, im.t_out),
+                    memstroy_core::Overlay::Video(v) => (v.t_in, v.t_out),
+                };
+                if t <= start || t >= end {
+                    self.state.status = "\u{26A0} Playhead is outside this overlay's range.".into();
+                    return;
+                }
+                let mut right = ov.clone();
+                match &mut right {
+                    memstroy_core::Overlay::Text(txt) => {
+                        txt.id = format!("{}_R", txt.id);
+                        txt.t_in = t;
+                        txt.layout.retain(|kf| kf.t >= t);
+                    }
+                    memstroy_core::Overlay::Image(im) => {
+                        im.id = format!("{}_R", im.id);
+                        im.t_in = t;
+                        im.layout.retain(|kf| kf.t >= t);
+                    }
+                    memstroy_core::Overlay::Video(v) => {
+                        v.id = format!("{}_R", v.id);
+                        v.t_in = t;
+                        v.layout.retain(|kf| kf.t >= t);
+                    }
+                }
+                self.state.mutate(move |s| {
+                    match &mut s.overlays[i] {
+                        memstroy_core::Overlay::Text(txt) => {
+                            txt.t_out = t;
+                            txt.layout.retain(|kf| kf.t <= t);
+                        }
+                        memstroy_core::Overlay::Image(im) => {
+                            im.t_out = t;
+                            im.layout.retain(|kf| kf.t <= t);
+                        }
+                        memstroy_core::Overlay::Video(v) => {
+                            v.t_out = t;
+                            v.layout.retain(|kf| kf.t <= t);
+                        }
+                    }
+                    s.overlays.insert(i + 1, right);
+                });
+                self.state.status = "\u{2702} Overlay split at playhead.".into();
+            }
+            _ => {
+                self.state.status = "\u{26A0} Select an element to split.".into();
+            }
+        }
+    }
+
+    /// Merge the selected element with its next sibling of the same kind.
+    /// The merged result spans from the selected's start to the sibling's end.
+    fn merge_next(&mut self) {
+        match self.state.selection {
+            Selection::Background(i) if i + 1 < self.state.scene.backgrounds.len() => {
+                let next_end = self.state.scene.backgrounds[i + 1].start
+                    + self.state.scene.backgrounds[i + 1].duration;
+                let start = self.state.scene.backgrounds[i].start;
+                self.state.mutate(move |s| {
+                    s.backgrounds[i].duration = next_end - start;
+                    s.backgrounds.remove(i + 1);
+                });
+                self.state.status = "\u{1F517} Backgrounds merged.".into();
+            }
+            Selection::Actor(i) if i + 1 < self.state.scene.actors.len() => {
+                let next = self.state.scene.actors[i + 1].clone();
+                self.state.mutate(move |s| {
+                    let end = next.t_out.unwrap_or(s.output.duration);
+                    s.actors[i].t_out = Some(end);
+                    // Merge keyframes from the next actor.
+                    for kf in &next.layout {
+                        if !s.actors[i].layout.iter().any(|k| (k.t - kf.t).abs() < 0.01) {
+                            s.actors[i].layout.push(kf.clone());
+                        }
+                    }
+                    s.actors[i].layout.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap());
+                    s.actors.remove(i + 1);
+                });
+                self.state.status = "\u{1F517} Actors merged.".into();
+            }
+            Selection::Overlay(i) if i + 1 < self.state.scene.overlays.len() => {
+                let next_end = match &self.state.scene.overlays[i + 1] {
+                    memstroy_core::Overlay::Text(t) => t.t_out,
+                    memstroy_core::Overlay::Image(im) => im.t_out,
+                    memstroy_core::Overlay::Video(v) => v.t_out,
+                };
+                self.state.mutate(move |s| {
+                    match &mut s.overlays[i] {
+                        memstroy_core::Overlay::Text(t) => t.t_out = next_end,
+                        memstroy_core::Overlay::Image(im) => im.t_out = next_end,
+                        memstroy_core::Overlay::Video(v) => v.t_out = next_end,
+                    }
+                    s.overlays.remove(i + 1);
+                });
+                self.state.status = "\u{1F517} Overlays merged.".into();
+            }
+            _ => {
+                self.state.status = "\u{26A0} Select an element with a next sibling to merge.".into();
+            }
+        }
+    }
+
     fn save_scene(&mut self) {
         if let Some(path) = self.state.scene_path.clone() {
             match self.state.scene.save(&path) {
@@ -408,6 +561,14 @@ impl eframe::App for App {
             self.state.status = String::new();
             self.duplicate_selected();
         }
+        if self.state.status == "__SPLIT_AT_PLAYHEAD__" {
+            self.state.status = String::new();
+            self.split_at_playhead();
+        }
+        if self.state.status == "__MERGE_NEXT__" {
+            self.state.status = String::new();
+            self.merge_next();
+        }
 
         // Right panel: Inspector
         egui::SidePanel::right("inspector")
@@ -445,6 +606,9 @@ impl eframe::App for App {
             .show(ctx, |ui| {
                 panels::preview(ui, &mut self.state);
             });
+
+        // Node editor floating window (scaffold)
+        self.node_editor.show(ctx, &mut self.state.node_editor_open);
 
         // Keep refreshing UI while jobs are running
         if self.state.playing

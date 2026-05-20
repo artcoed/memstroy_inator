@@ -3,6 +3,7 @@
 mod app;
 mod gpu_preview;
 mod jobs;
+mod node_editor;
 mod panels;
 mod state;
 mod undo;

@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use egui::{Color32, RichText, Rounding, Vec2};
+use egui::{Color32, RichText, Rounding, Sense, Stroke, Vec2};
 use memstroy_core::*;
 
 use crate::state::{EditorState, Selection};
@@ -468,7 +468,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                 .logarithmic(true),
         );
 
-        // Delete / Duplicate buttons
+        // Delete / Duplicate / Split / Merge buttons
         ui.add_space(4.0);
         if ui.button("\u{1F5D1}").on_hover_text("Delete (Del)").clicked() {
             state.status = "__DELETE_SELECTED__".into();
@@ -476,83 +476,208 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
         if ui.button("\u{1F4CB}").on_hover_text("Duplicate (Ctrl+D)").clicked() {
             state.status = "__DUPLICATE_SELECTED__".into();
         }
+        if ui
+            .button("\u{2702}")
+            .on_hover_text("Split selected at playhead")
+            .clicked()
+        {
+            state.status = "__SPLIT_AT_PLAYHEAD__".into();
+        }
+        if ui
+            .button("\u{1F517}")
+            .on_hover_text("Merge selected with next sibling")
+            .clicked()
+        {
+            state.status = "__MERGE_NEXT__".into();
+        }
+
+        // Node editor toggle
+        ui.add_space(2.0);
+        if ui
+            .button("\u{1F9E9}")
+            .on_hover_text("Toggle node editor (scaffold)")
+            .clicked()
+        {
+            state.node_editor_open = !state.node_editor_open;
+        }
     });
     ui.add_space(4.0);
     ui.separator();
     ui.add_space(2.0);
 
     // Visual timeline tracks
-    let duration = state.scene.output.duration;
+    let duration = state.scene.output.duration.max(0.01);
     let avail_width = ui.available_width() - 100.0; // reserve label space
     let track_height = 24.0;
     let track_spacing = 3.0;
 
     let mut to_select: Option<Selection> = None;
 
+    // Snapshot scene before any drag mutation, commit only if a drag started this frame.
+    let scene_snapshot = state.scene.clone();
+    let mut drag_started_this_frame = false;
+
     egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
         // Backgrounds
-        for (i, bg) in state.scene.backgrounds.clone().iter().enumerate() {
-            let selected = state.selection == Selection::Background(i);
-            if draw_track_bar(
+        for i in 0..state.scene.backgrounds.len() {
+            let id_str = format!("bg-{}", i);
+            let label;
+            let mut start;
+            let mut end;
+            {
+                let bg = &state.scene.backgrounds[i];
+                label = format!("\u{1F304} {}", bg.id);
+                start = bg.start;
+                end = bg.start + bg.duration;
+            }
+            let resp = draw_track_bar(
                 ui,
-                &format!("\u{1F304} {}", bg.id),
-                bg.start,
-                bg.start + bg.duration,
+                &id_str,
+                &label,
+                &mut start,
+                &mut end,
                 duration,
                 avail_width,
                 track_height,
                 Color32::from_rgb(60, 120, 200),
-                selected,
-            ) {
+                state.selection == Selection::Background(i),
+                state.playhead,
+            );
+            if resp.drag_started {
+                drag_started_this_frame = true;
+            }
+            if resp.changed {
+                let bg = &mut state.scene.backgrounds[i];
+                let new_start = start.max(0.0);
+                let new_end = end.max(new_start + 0.05).min(duration);
+                bg.start = new_start;
+                bg.duration = new_end - new_start;
+            }
+            if resp.clicked {
                 to_select = Some(Selection::Background(i));
             }
             ui.add_space(track_spacing);
         }
 
         // Actors
-        for (i, actor) in state.scene.actors.clone().iter().enumerate() {
-            let t_start = actor.t_in.unwrap_or(0.0);
-            let t_end = actor.t_out.unwrap_or(duration);
-            let selected = state.selection == Selection::Actor(i);
-            if draw_track_bar(
+        for i in 0..state.scene.actors.len() {
+            let id_str = format!("act-{}", i);
+            let label;
+            let mut start;
+            let mut end;
+            {
+                let a = &state.scene.actors[i];
+                label = format!("\u{1F3AD} {}", a.id);
+                start = a.t_in.unwrap_or(0.0);
+                end = a.t_out.unwrap_or(duration);
+            }
+            let resp = draw_track_bar(
                 ui,
-                &format!("\u{1F3AD} {}", actor.id),
-                t_start,
-                t_end,
+                &id_str,
+                &label,
+                &mut start,
+                &mut end,
                 duration,
                 avail_width,
                 track_height,
                 Color32::from_rgb(200, 120, 50),
-                selected,
-            ) {
+                state.selection == Selection::Actor(i),
+                state.playhead,
+            );
+            if resp.drag_started {
+                drag_started_this_frame = true;
+            }
+            if resp.changed {
+                let a = &mut state.scene.actors[i];
+                let new_start = start.max(0.0);
+                let new_end = end.max(new_start + 0.05).min(duration);
+                a.t_in = Some(new_start);
+                a.t_out = Some(new_end);
+                if resp.move_delta != 0.0 {
+                    for kf in a.layout.iter_mut() {
+                        kf.t = (kf.t + resp.move_delta).max(0.0);
+                    }
+                }
+            }
+            if resp.clicked {
                 to_select = Some(Selection::Actor(i));
             }
             ui.add_space(track_spacing);
         }
 
         // Overlays
-        for (i, ov) in state.scene.overlays.clone().iter().enumerate() {
-            let (label, t_start, t_end) = match ov {
-                Overlay::Text(t) => (
-                    format!("\u{1F4DD} {}", ellipsis(&t.text, 12)),
-                    t.t_in,
-                    t.t_out,
-                ),
-                Overlay::Image(im) => (format!("\u{1F5BC} {}", im.id), im.t_in, im.t_out),
-                Overlay::Video(v) => (format!("\u{1F3AC} {}", v.id), v.t_in, v.t_out),
-            };
-            let selected = state.selection == Selection::Overlay(i);
-            if draw_track_bar(
+        for i in 0..state.scene.overlays.len() {
+            let id_str = format!("ov-{}", i);
+            let label;
+            let mut start;
+            let mut end;
+            {
+                let ov = &state.scene.overlays[i];
+                label = match ov {
+                    Overlay::Text(t) => format!("\u{1F4DD} {}", ellipsis(&t.text, 12)),
+                    Overlay::Image(im) => format!("\u{1F5BC} {}", im.id),
+                    Overlay::Video(v) => format!("\u{1F3AC} {}", v.id),
+                };
+                let (s, e) = match ov {
+                    Overlay::Text(t) => (t.t_in, t.t_out),
+                    Overlay::Image(im) => (im.t_in, im.t_out),
+                    Overlay::Video(v) => (v.t_in, v.t_out),
+                };
+                start = s;
+                end = e;
+            }
+            let resp = draw_track_bar(
                 ui,
+                &id_str,
                 &label,
-                t_start,
-                t_end,
+                &mut start,
+                &mut end,
                 duration,
                 avail_width,
                 track_height,
                 Color32::from_rgb(100, 200, 100),
-                selected,
-            ) {
+                state.selection == Selection::Overlay(i),
+                state.playhead,
+            );
+            if resp.drag_started {
+                drag_started_this_frame = true;
+            }
+            if resp.changed {
+                let new_start = start.max(0.0);
+                let new_end = end.max(new_start + 0.05).min(duration);
+                let move_delta = resp.move_delta;
+                let ov = &mut state.scene.overlays[i];
+                match ov {
+                    Overlay::Text(t) => {
+                        t.t_in = new_start;
+                        t.t_out = new_end;
+                        if move_delta != 0.0 {
+                            for kf in t.layout.iter_mut() {
+                                kf.t = (kf.t + move_delta).max(0.0);
+                            }
+                        }
+                    }
+                    Overlay::Image(im) => {
+                        im.t_in = new_start;
+                        im.t_out = new_end;
+                        if move_delta != 0.0 {
+                            for kf in im.layout.iter_mut() {
+                                kf.t = (kf.t + move_delta).max(0.0);
+                            }
+                        }
+                    }
+                    Overlay::Video(v) => {
+                        v.t_in = new_start;
+                        v.t_out = new_end;
+                        if move_delta != 0.0 {
+                            for kf in v.layout.iter_mut() {
+                                kf.t = (kf.t + move_delta).max(0.0);
+                            }
+                        }
+                    }
+                }
+            }
+            if resp.clicked {
                 to_select = Some(Selection::Overlay(i));
             }
             ui.add_space(track_spacing);
@@ -574,38 +699,53 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
         }
     });
 
+    if drag_started_this_frame {
+        state.undo.push(&scene_snapshot);
+    }
+
     if let Some(sel) = to_select {
         state.selection = sel;
     }
-
-    // Draw playhead indicator line over tracks
-    // (We need to recalculate the track area position)
-    // This is a simplified version — the playhead slider above is the primary control
 }
 
-/// Draw a single horizontal track bar. Returns true if clicked.
+/// Result of interacting with a single timeline track row.
+struct BarResponse {
+    /// User clicked the bar (without dragging).
+    clicked: bool,
+    /// A drag (resize OR move) started on this frame — caller should snapshot for undo.
+    drag_started: bool,
+    /// Bar bounds were modified this frame.
+    changed: bool,
+    /// Net seconds the body was translated this frame (signed). 0 unless body-drag.
+    move_delta: f32,
+}
+
+/// Draw a single horizontal track row: label, track background, draggable bar with
+/// resize handles on each edge, and the playhead vertical line over this row.
+#[allow(clippy::too_many_arguments)]
 fn draw_track_bar(
     ui: &mut egui::Ui,
+    id_source: &str,
     label: &str,
-    t_start: f32,
-    t_end: f32,
+    t_start: &mut f32,
+    t_end: &mut f32,
     total_duration: f32,
     avail_width: f32,
     height: f32,
     color: Color32,
     selected: bool,
-) -> bool {
-    let label_width = 90.0;
-    let track_width = avail_width;
+    playhead: f32,
+) -> BarResponse {
+    let label_width = 90.0_f32;
+    let track_width = avail_width.max(50.0);
 
-    let (rect, resp) = ui.allocate_exact_size(
+    let (rect, _) = ui.allocate_exact_size(
         egui::vec2(label_width + track_width + 8.0, height),
-        egui::Sense::click_and_drag(),
+        Sense::hover(),
     );
-
     let painter = ui.painter_at(rect);
 
-    // Label
+    // Label column
     let label_rect = egui::Rect::from_min_size(rect.min, egui::vec2(label_width, height));
     painter.text(
         label_rect.center(),
@@ -617,53 +757,162 @@ fn draw_track_bar(
 
     // Track background
     let track_left = rect.min.x + label_width + 4.0;
+    let track_top = rect.min.y + 2.0;
+    let track_h = height - 4.0;
     let track_rect = egui::Rect::from_min_size(
-        egui::pos2(track_left, rect.min.y + 2.0),
-        egui::vec2(track_width, height - 4.0),
+        egui::pos2(track_left, track_top),
+        egui::vec2(track_width, track_h),
     );
     painter.rect_filled(track_rect, Rounding::same(3.0), Color32::from_rgb(25, 25, 38));
 
-    // Bar representing the element's time span
-    let bar_start_frac = (t_start / total_duration).clamp(0.0, 1.0);
-    let bar_end_frac = (t_end / total_duration).clamp(0.0, 1.0);
-    let bar_left = track_left + bar_start_frac * track_width;
-    let bar_right = track_left + bar_end_frac * track_width;
+    // Compute initial bar geometry (in pixels) from t_start/t_end
+    let secs_per_pixel = total_duration / track_width.max(1.0);
+    let (bar_left, bar_right) = t_to_px(*t_start, *t_end, total_duration, track_left, track_width);
     let bar_rect = egui::Rect::from_min_max(
-        egui::pos2(bar_left, rect.min.y + 3.0),
-        egui::pos2(bar_right.max(bar_left + 4.0), rect.min.y + height - 3.0),
+        egui::pos2(bar_left, track_top + 1.0),
+        egui::pos2(bar_right, track_top + track_h - 1.0),
     );
 
+    // Compute handle / body sub-rects.
+    let handle_w = 6.0_f32.min(bar_rect.width() / 3.0).max(2.0);
+    let body_rect = egui::Rect::from_min_max(
+        egui::pos2(bar_rect.min.x + handle_w, bar_rect.min.y),
+        egui::pos2(bar_rect.max.x - handle_w, bar_rect.max.y),
+    );
+    let left_handle = egui::Rect::from_min_max(
+        egui::pos2(bar_rect.min.x - 1.0, bar_rect.min.y),
+        egui::pos2(bar_rect.min.x + handle_w, bar_rect.max.y),
+    );
+    let right_handle = egui::Rect::from_min_max(
+        egui::pos2(bar_rect.max.x - handle_w, bar_rect.min.y),
+        egui::pos2(bar_rect.max.x + 1.0, bar_rect.max.y),
+    );
+
+    // Allocate independent interactions. egui's hit-testing prefers the
+    // most-recently-allocated overlapping widget, so allocate body first
+    // and the edge handles last so they win over body on the edges.
+    let id_root = ui.make_persistent_id(id_source);
+    let body = ui
+        .interact(body_rect, id_root.with("body"), Sense::click_and_drag())
+        .on_hover_cursor(egui::CursorIcon::Grab);
+    let left = ui
+        .interact(left_handle, id_root.with("left"), Sense::click_and_drag())
+        .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+    let right = ui
+        .interact(right_handle, id_root.with("right"), Sense::click_and_drag())
+        .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+
+    let mut changed = false;
+    let mut move_delta = 0.0_f32;
+    let drag_started = body.drag_started() || left.drag_started() || right.drag_started();
+
+    if left.dragged() {
+        let dx = left.drag_delta().x;
+        let new_start = (*t_start + dx * secs_per_pixel).clamp(0.0, *t_end - 0.05);
+        if (new_start - *t_start).abs() > f32::EPSILON {
+            *t_start = new_start;
+            changed = true;
+        }
+    }
+    if right.dragged() {
+        let dx = right.drag_delta().x;
+        let new_end = (*t_end + dx * secs_per_pixel).clamp(*t_start + 0.05, total_duration);
+        if (new_end - *t_end).abs() > f32::EPSILON {
+            *t_end = new_end;
+            changed = true;
+        }
+    }
+    if body.dragged() {
+        let dx = body.drag_delta().x;
+        let delta_secs = dx * secs_per_pixel;
+        let dur = *t_end - *t_start;
+        let new_start = (*t_start + delta_secs).clamp(0.0, (total_duration - dur).max(0.0));
+        let actual = new_start - *t_start;
+        if actual.abs() > f32::EPSILON {
+            *t_start = new_start;
+            *t_end = new_start + dur;
+            move_delta = actual;
+            changed = true;
+        }
+    }
+
+    // Re-compute final bar after any drag.
+    let (bar_left, bar_right) = t_to_px(*t_start, *t_end, total_duration, track_left, track_width);
+    let bar_rect = egui::Rect::from_min_max(
+        egui::pos2(bar_left, track_top + 1.0),
+        egui::pos2(bar_right.max(bar_left + 4.0), track_top + track_h - 1.0),
+    );
+
+    let any_hover = body.hovered() || left.hovered() || right.hovered();
     let fill = if selected {
         color.gamma_multiply(1.3)
-    } else if resp.hovered() {
+    } else if any_hover {
         color.gamma_multiply(1.1)
     } else {
         color
     };
-
     painter.rect_filled(bar_rect, Rounding::same(4.0), fill);
+
+    // Draw subtle handle indicators inside the bar.
+    let indicator_w = handle_w.min(bar_rect.width() / 4.0).max(1.5);
+    let handle_color = Color32::from_rgba_premultiplied(255, 255, 255, 90);
+    let left_h_rect = egui::Rect::from_min_max(
+        bar_rect.min,
+        egui::pos2(bar_rect.min.x + indicator_w, bar_rect.max.y),
+    );
+    let right_h_rect = egui::Rect::from_min_max(
+        egui::pos2(bar_rect.max.x - indicator_w, bar_rect.min.y),
+        bar_rect.max,
+    );
+    painter.rect_filled(left_h_rect, Rounding::same(2.0), handle_color);
+    painter.rect_filled(right_h_rect, Rounding::same(2.0), handle_color);
 
     // Selection border
     if selected {
         painter.rect_stroke(
             bar_rect.expand(1.0),
             Rounding::same(5.0),
-            egui::Stroke::new(2.0, Color32::WHITE),
+            Stroke::new(2.0, Color32::WHITE),
         );
     }
 
     // Time label inside bar
-    if bar_rect.width() > 40.0 {
+    if bar_rect.width() > 50.0 {
         painter.text(
             bar_rect.center(),
             egui::Align2::CENTER_CENTER,
-            format!("{:.1}-{:.1}s", t_start, t_end),
+            format!("{:.1}-{:.1}s", *t_start, *t_end),
             egui::FontId::proportional(9.0),
             Color32::WHITE,
         );
     }
 
-    resp.clicked()
+    // Playhead vertical line over this track segment (drawn LAST so it sits on top).
+    if playhead >= 0.0 && playhead <= total_duration {
+        let ph_x = track_left + (playhead / total_duration).clamp(0.0, 1.0) * track_width;
+        painter.line_segment(
+            [
+                egui::pos2(ph_x, track_top - 1.0),
+                egui::pos2(ph_x, track_top + track_h + 1.0),
+            ],
+            Stroke::new(1.5, Color32::from_rgb(255, 80, 80)),
+        );
+    }
+
+    BarResponse {
+        clicked: body.clicked() || left.clicked() || right.clicked(),
+        drag_started,
+        changed,
+        move_delta,
+    }
+}
+
+fn t_to_px(t_start: f32, t_end: f32, total: f32, track_left: f32, track_width: f32) -> (f32, f32) {
+    let s = (t_start / total).clamp(0.0, 1.0);
+    let e = (t_end / total).clamp(0.0, 1.0);
+    let left = track_left + s * track_width;
+    let right = (track_left + e * track_width).max(left + 4.0);
+    (left, right)
 }
 
 // ─── PREVIEW ─────────────────────────────────────────────────────────
