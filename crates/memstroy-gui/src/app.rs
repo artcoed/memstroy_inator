@@ -3,13 +3,11 @@
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 
-use egui::{Color32, RichText, ViewportCommand};
+use egui::{Color32, RichText, ViewportCommand, Rounding, Stroke, Vec2};
 use memstroy_core::Scene;
 use tokio::runtime::Runtime;
 
-use crate::jobs::{
-    spawn_download, spawn_preview, spawn_render, JobEvent,
-};
+use crate::jobs::{spawn_preview, spawn_refresh, spawn_render, JobEvent};
 use crate::panels;
 use crate::state::EditorState;
 
@@ -18,49 +16,17 @@ pub struct App {
     state: EditorState,
     tx: Sender<JobEvent>,
     rx: Receiver<JobEvent>,
-    download_form: DownloadForm,
-}
-
-struct DownloadForm {
-    open: bool,
-    channel: String,
-    out: PathBuf,
-    filter: String,
-    max_pages: usize,
-    overwrite: bool,
-    concurrency: usize,
-}
-
-impl Default for DownloadForm {
-    fn default() -> Self {
-        Self {
-            open: false,
-            channel: "MELLSTROYfonz".into(),
-            out: PathBuf::from("assets/mellstroy"),
-            filter: "Имба".into(),
-            max_pages: 80,
-            overwrite: false,
-            concurrency: 4,
-        }
-    }
 }
 
 impl App {
     pub fn new(rt: Runtime) -> Self {
         let (tx, rx) = channel();
         let mut state = EditorState::new();
-        rescan_library(&mut state);
-        Self {
-            rt,
-            state,
-            tx,
-            rx,
-            download_form: DownloadForm::default(),
-        }
+        state.reload_library();
+        Self { rt, state, tx, rx }
     }
 
     fn pump_events(&mut self, ctx: &egui::Context) {
-        // Drain all pending background events.
         while let Ok(ev) = self.rx.try_recv() {
             match ev {
                 JobEvent::Status(s) => self.state.status = s,
@@ -69,7 +35,7 @@ impl App {
                     ctx.forget_all_images();
                 }
                 JobEvent::PreviewFailed(e) => {
-                    self.state.status = format!("Preview failed: {}", e);
+                    self.state.status = format!("\u{274C} Preview failed: {}", e);
                 }
                 JobEvent::RenderLog(line) => {
                     if let Some(rp) = self.state.render_progress.as_mut() {
@@ -77,27 +43,38 @@ impl App {
                     }
                 }
                 JobEvent::RenderFinished(Ok(p)) => {
-                    self.state.status = format!("Rendered {}", p.display());
+                    self.state.status = format!("\u{2705} Rendered: {}", p.display());
                     if let Some(rp) = self.state.render_progress.as_mut() {
                         rp.done = true;
                     }
                 }
                 JobEvent::RenderFinished(Err(e)) => {
-                    self.state.status = format!("Render failed: {}", e);
+                    self.state.status = format!("\u{274C} Render failed: {}", e);
                     if let Some(rp) = self.state.render_progress.as_mut() {
                         rp.done = true;
                         rp.error = Some(e);
                     }
                 }
-                JobEvent::DownloadFinished(Ok(s)) => {
-                    self.state.status = format!(
-                        "Download done: {}/{} kept, {} new, {} skipped, {} failed",
-                        s.kept, s.total, s.downloaded, s.skipped, s.failed
-                    );
-                    rescan_library(&mut self.state);
+                JobEvent::RefreshProgress(msg) => {
+                    self.state.status = format!("\u{1F504} {}", msg);
                 }
-                JobEvent::DownloadFinished(Err(e)) => {
-                    self.state.status = format!("Download failed: {}", e);
+                JobEvent::RefreshFinished(Ok(summary)) => {
+                    self.state.refreshing = false;
+                    self.state.reload_library();
+                    self.state.status = format!(
+                        "\u{1F389} Refresh done! {} new clips, {} total in library",
+                        summary.new_clips, summary.total_clips
+                    );
+                    if summary.failed > 0 {
+                        self.state.status.push_str(&format!(
+                            " ({} failed)",
+                            summary.failed
+                        ));
+                    }
+                }
+                JobEvent::RefreshFinished(Err(e)) => {
+                    self.state.refreshing = false;
+                    self.state.status = format!("\u{274C} Refresh failed: {}", e);
                 }
             }
         }
@@ -105,14 +82,14 @@ impl App {
 
     fn menu(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         egui::menu::bar(ui, |ui| {
-            ui.menu_button("File", |ui| {
-                if ui.button("New scene").clicked() {
+            ui.menu_button(RichText::new("\u{1F4C1} File").strong(), |ui| {
+                if ui.button("\u{2728} New scene").clicked() {
                     self.state.scene = Scene::default();
                     self.state.scene_path = None;
-                    self.state.status = "New scene.".into();
+                    self.state.status = "\u{2728} New scene created.".into();
                     ui.close_menu();
                 }
-                if ui.button("Open scene…").clicked() {
+                if ui.button("\u{1F4C2} Open scene...").clicked() {
                     if let Some(path) = rfd::FileDialog::new()
                         .add_filter("Scene", &["yaml", "yml", "json"])
                         .pick_file()
@@ -121,77 +98,71 @@ impl App {
                             Ok(s) => {
                                 self.state.scene = s;
                                 self.state.scene_path = Some(path);
-                                self.state.status = "Loaded scene.".into();
+                                self.state.status = "\u{2705} Scene loaded.".into();
                             }
-                            Err(e) => self.state.status = format!("Open failed: {e}"),
+                            Err(e) => self.state.status = format!("\u{274C} Open failed: {e}"),
                         }
                     }
                     ui.close_menu();
                 }
-                if ui.button("Save scene").clicked() {
-                    if let Some(path) = self.state.scene_path.clone() {
-                        if let Err(e) = self.state.scene.save(&path) {
-                            self.state.status = format!("Save failed: {e}");
-                        } else {
-                            self.state.status = "Saved.".into();
-                        }
-                    } else {
-                        self.save_as();
-                    }
+                if ui.button("\u{1F4BE} Save scene").clicked() {
+                    self.save_scene();
                     ui.close_menu();
                 }
-                if ui.button("Save scene as…").clicked() {
+                if ui.button("\u{1F4BE} Save scene as...").clicked() {
                     self.save_as();
                     ui.close_menu();
                 }
                 ui.separator();
-                if ui.button("Exit").clicked() {
+                if ui.button("\u{1F6AA} Exit").clicked() {
                     ctx.send_viewport_cmd(ViewportCommand::Close);
                 }
             });
 
-            ui.menu_button("Channel", |ui| {
-                if ui.button("Download from Telegram…").clicked() {
-                    self.download_form.open = true;
-                    ui.close_menu();
-                }
-                if ui.button("Rescan library").clicked() {
-                    rescan_library(&mut self.state);
-                    ui.close_menu();
-                }
-            });
-
-            ui.menu_button("Render", |ui| {
-                if ui.button("Render preview frame").clicked() {
+            ui.menu_button(RichText::new("\u{1F3AC} Render").strong(), |ui| {
+                if ui.button("\u{1F5BC} Preview frame").clicked() {
                     self.run_preview();
                     ui.close_menu();
                 }
-                if ui.button("Render full clip…").clicked() {
+                if ui.button("\u{1F3A5} Render full clip...").clicked() {
                     self.run_render();
                     ui.close_menu();
                 }
             });
 
-            ui.menu_button("Tools", |ui| {
-                if ui.button("Detect anchors (pose)…").clicked() {
+            ui.menu_button(RichText::new("\u{1F9E0} Tools").strong(), |ui| {
+                if ui.button("\u{1F9CD} Detect anchors (pose)...").clicked() {
                     self.state.status =
-                        "Pose detection: ONNX backend not yet wired in. Coming next iteration."
+                        "\u{1F6A7} Pose detection: ONNX backend coming in next iteration."
                             .into();
                     ui.close_menu();
                 }
             });
 
+            // Status indicator on the right
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if let Some(rp) = &self.state.render_progress {
-                    let label = if rp.done {
-                        if rp.error.is_some() { "render: error" } else { "render: done" }
-                    } else {
-                        "render: running…"
-                    };
-                    ui.label(label);
+                if self.state.refreshing {
+                    ui.spinner();
+                    ui.label(RichText::new("refreshing...").color(Color32::from_rgb(255, 200, 50)));
+                } else if let Some(rp) = &self.state.render_progress {
+                    if !rp.done {
+                        ui.spinner();
+                        ui.label(RichText::new("rendering...").color(Color32::from_rgb(100, 200, 255)));
+                    }
                 }
             });
         });
+    }
+
+    fn save_scene(&mut self) {
+        if let Some(path) = self.state.scene_path.clone() {
+            match self.state.scene.save(&path) {
+                Ok(()) => self.state.status = "\u{2705} Saved.".into(),
+                Err(e) => self.state.status = format!("\u{274C} Save failed: {e}"),
+            }
+        } else {
+            self.save_as();
+        }
     }
 
     fn save_as(&mut self) {
@@ -203,9 +174,9 @@ impl App {
             match self.state.scene.save(&path) {
                 Ok(()) => {
                     self.state.scene_path = Some(path);
-                    self.state.status = "Saved.".into();
+                    self.state.status = "\u{2705} Saved.".into();
                 }
-                Err(e) => self.state.status = format!("Save failed: {e}"),
+                Err(e) => self.state.status = format!("\u{274C} Save failed: {e}"),
             }
         }
     }
@@ -223,7 +194,7 @@ impl App {
             self.state.playhead,
             out,
         );
-        self.state.status = "Rendering preview…".into();
+        self.state.status = "\u{1F5BC} Rendering preview...".into();
     }
 
     fn run_render(&mut self) {
@@ -246,60 +217,25 @@ impl App {
             self.state.assets_root.clone(),
             path,
         );
-        self.state.status = "Rendering…".into();
+        self.state.status = "\u{1F3A5} Rendering...".into();
     }
 
-    fn download_modal(&mut self, ctx: &egui::Context) {
-        if !self.download_form.open {
+    fn run_refresh(&mut self) {
+        if self.state.refreshing {
             return;
         }
-        let mut open = self.download_form.open;
-        egui::Window::new("Download from Telegram")
-            .open(&mut open)
-            .resizable(false)
-            .show(ctx, |ui| {
-                ui.label("Public channel handle:");
-                ui.text_edit_singleline(&mut self.download_form.channel);
-                ui.label("Output directory:");
-                ui.horizontal(|ui| {
-                    let mut s = self.download_form.out.display().to_string();
-                    if ui.text_edit_singleline(&mut s).changed() {
-                        self.download_form.out = PathBuf::from(s);
-                    }
-                    if ui.button("…").clicked() {
-                        if let Some(p) = rfd::FileDialog::new().pick_folder() {
-                            self.download_form.out = p;
-                        }
-                    }
-                });
-                ui.label("Body must contain (empty = all posts):");
-                ui.text_edit_singleline(&mut self.download_form.filter);
-                ui.add(
-                    egui::Slider::new(&mut self.download_form.max_pages, 1..=400)
-                        .text("max pages"),
-                );
-                ui.add(
-                    egui::Slider::new(&mut self.download_form.concurrency, 1..=16)
-                        .text("concurrency"),
-                );
-                ui.checkbox(&mut self.download_form.overwrite, "Overwrite existing files");
-                ui.separator();
-                if ui.button("Start").clicked() {
-                    spawn_download(
-                        self.rt.handle(),
-                        self.tx.clone(),
-                        self.download_form.channel.clone(),
-                        self.download_form.out.clone(),
-                        self.download_form.filter.clone(),
-                        self.download_form.max_pages,
-                        self.download_form.overwrite,
-                        self.download_form.concurrency,
-                    );
-                    self.state.status = "Download started…".into();
-                    self.download_form.open = false;
-                }
-            });
-        self.download_form.open = open;
+        self.state.refreshing = true;
+        self.state.status = "\u{1F504} Refreshing clips from Telegram...".into();
+        spawn_refresh(
+            self.rt.handle(),
+            self.tx.clone(),
+            "MELLSTROYfonz".into(),
+            self.state.clips_dir(),
+            self.state.state_path(),
+            "\u{0418}\u{043C}\u{0431}\u{0430}".into(), // "Имба"
+            80,
+            4,
+        );
     }
 }
 
@@ -307,65 +243,134 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.pump_events(ctx);
 
-        egui::TopBottomPanel::top("menu").show(ctx, |ui| self.menu(ctx, ui));
+        // Apply modern dark style
+        apply_style(ctx);
 
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(&self.state.status).color(Color32::LIGHT_GRAY));
+        // Top menu bar
+        egui::TopBottomPanel::top("menu")
+            .frame(egui::Frame::none().fill(Color32::from_rgb(25, 25, 35)).inner_margin(6.0))
+            .show(ctx, |ui| self.menu(ctx, ui));
+
+        // Status bar at bottom
+        egui::TopBottomPanel::bottom("status")
+            .frame(
+                egui::Frame::none()
+                    .fill(Color32::from_rgb(30, 30, 42))
+                    .inner_margin(egui::Margin::symmetric(12.0, 6.0)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(&self.state.status)
+                            .color(Color32::from_rgb(200, 200, 220))
+                            .size(13.0),
+                    );
+                });
             });
-        });
 
+        // Left panel: Library + Refresh button
         egui::SidePanel::left("library")
             .resizable(true)
-            .default_width(280.0)
+            .default_width(320.0)
+            .frame(
+                egui::Frame::none()
+                    .fill(Color32::from_rgb(22, 22, 32))
+                    .inner_margin(10.0),
+            )
             .show(ctx, |ui| {
-                panels::library(ui, &mut self.state);
+                panels::library(ui, &mut self.state, || {
+                    // This closure doesn't have access to self, so we use a flag
+                });
+
+                // Refresh button at top of library
             });
 
+        // Check if refresh was requested via flag
+        if self.state.status == "__REFRESH_REQUESTED__" {
+            self.state.status = String::new();
+            self.run_refresh();
+        }
+
+        // Right panel: Inspector
         egui::SidePanel::right("inspector")
             .resizable(true)
-            .default_width(360.0)
+            .default_width(380.0)
+            .frame(
+                egui::Frame::none()
+                    .fill(Color32::from_rgb(22, 22, 32))
+                    .inner_margin(10.0),
+            )
             .show(ctx, |ui| {
                 panels::inspector(ui, &mut self.state);
             });
 
+        // Bottom panel: Timeline
         egui::TopBottomPanel::bottom("timeline_panel")
             .resizable(true)
-            .default_height(260.0)
+            .default_height(240.0)
+            .frame(
+                egui::Frame::none()
+                    .fill(Color32::from_rgb(18, 18, 28))
+                    .inner_margin(10.0),
+            )
             .show(ctx, |ui| {
                 panels::timeline(ui, &mut self.state);
             });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            panels::preview(ui, &mut self.state);
-        });
+        // Central panel: Preview
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::none()
+                    .fill(Color32::from_rgb(15, 15, 22))
+                    .inner_margin(10.0),
+            )
+            .show(ctx, |ui| {
+                panels::preview(ui, &mut self.state);
+            });
 
-        self.download_modal(ctx);
-
-        // Animate the status bar / progress while a job is running.
-        if self.state.render_progress.as_ref().is_some_and(|p| !p.done) {
-            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        // Keep refreshing UI while jobs are running
+        if self.state.refreshing
+            || self.state.render_progress.as_ref().is_some_and(|p| !p.done)
+        {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
     }
 }
 
-fn rescan_library(state: &mut EditorState) {
-    state.library.mellstroy_clips = scan_dir(&state.assets_root.join("assets/mellstroy"), &["mp4", "mov", "webm"]);
-    state.library.backgrounds = scan_dir(&state.assets_root.join("assets/backgrounds"), &["mp4", "mov", "webm", "jpg", "jpeg", "png", "webp"]);
-    state.library.props = scan_dir(&state.assets_root.join("assets/props"), &["png", "webp", "svg"]);
-}
+/// Apply a modern dark theme with accent colors.
+fn apply_style(ctx: &egui::Context) {
+    let mut style = (*ctx.style()).clone();
+    let mut visuals = egui::Visuals::dark();
 
-fn scan_dir(dir: &std::path::Path, exts: &[&str]) -> Vec<PathBuf> {
-    let Ok(read) = std::fs::read_dir(dir) else { return Vec::new() };
-    let mut out = Vec::new();
-    for entry in read.flatten() {
-        let path = entry.path();
-        if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-            if exts.iter().any(|e| e.eq_ignore_ascii_case(ext)) {
-                out.push(path);
-            }
-        }
-    }
-    out.sort();
-    out
+    // Background colors
+    visuals.panel_fill = Color32::from_rgb(20, 20, 30);
+    visuals.window_fill = Color32::from_rgb(28, 28, 40);
+    visuals.extreme_bg_color = Color32::from_rgb(12, 12, 18);
+
+    // Widget colors
+    visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(35, 35, 50);
+    visuals.widgets.inactive.bg_fill = Color32::from_rgb(40, 40, 58);
+    visuals.widgets.hovered.bg_fill = Color32::from_rgb(60, 60, 90);
+    visuals.widgets.active.bg_fill = Color32::from_rgb(80, 60, 180);
+
+    // Accent colors
+    visuals.selection.bg_fill = Color32::from_rgb(100, 60, 200);
+    visuals.selection.stroke = Stroke::new(1.0, Color32::from_rgb(180, 140, 255));
+    visuals.hyperlink_color = Color32::from_rgb(140, 100, 255);
+
+    // Rounded corners
+    visuals.widgets.noninteractive.rounding = Rounding::same(6.0);
+    visuals.widgets.inactive.rounding = Rounding::same(6.0);
+    visuals.widgets.hovered.rounding = Rounding::same(6.0);
+    visuals.widgets.active.rounding = Rounding::same(6.0);
+    visuals.window_rounding = Rounding::same(10.0);
+
+    // Text
+    visuals.override_text_color = Some(Color32::from_rgb(220, 220, 240));
+
+    style.visuals = visuals;
+    style.spacing.item_spacing = Vec2::new(8.0, 6.0);
+    style.spacing.button_padding = Vec2::new(10.0, 5.0);
+
+    ctx.set_style(style);
 }

@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// One scraped message from a public Telegram channel preview.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,9 +34,97 @@ impl TgPost {
         let lower = self.text.to_lowercase();
         lower.contains(&needle.to_lowercase())
     }
+
+    /// Extract the "useful" part of the post text: everything before
+    /// the first blank line (which separates the content description
+    /// from the subscriber-facing boilerplate like voting links).
+    pub fn clean_description(&self) -> String {
+        // Split on double-newline or on the "—Имба" / "—Топчик" pattern.
+        let text = &self.text;
+        // Find first occurrence of a paragraph break (empty line).
+        if let Some(pos) = text.find("\n\n") {
+            text[..pos].trim().to_string()
+        } else if let Some(pos) = text.find('\n') {
+            // Sometimes there's only single newlines; take the first line
+            // if it looks like content (contains a dash or is short).
+            let first_line = &text[..pos];
+            // If the first line is descriptive enough, use it.
+            if first_line.len() > 5 {
+                first_line.trim().to_string()
+            } else {
+                text.trim().to_string()
+            }
+        } else {
+            text.trim().to_string()
+        }
+    }
 }
 
-/// Catalog file written next to the downloaded clips.
+/// Persistent state for incremental downloads. Stored as
+/// `assets/mellstroy/state.json`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DownloadState {
+    pub channel: String,
+    /// Sorted list of all clip entries we know about (downloaded or not).
+    pub clips: BTreeMap<u64, ClipEntry>,
+    /// Timestamp of the last successful refresh.
+    pub last_refresh: Option<String>,
+}
+
+/// Metadata for one downloaded clip.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClipEntry {
+    pub id: u64,
+    /// Clean description (before the boilerplate).
+    pub description: String,
+    /// Filename relative to the clips directory (e.g. `"919.mp4"`).
+    pub filename: String,
+    /// Whether the video file has been successfully downloaded.
+    pub downloaded: bool,
+    /// Original full text for reference.
+    pub full_text: String,
+    /// Publication date if available.
+    pub date: Option<String>,
+}
+
+impl DownloadState {
+    pub fn load(path: &std::path::Path) -> Self {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        let json = serde_json::to_string_pretty(self)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, json)?;
+        Ok(())
+    }
+
+    /// IDs that are in the catalog but not yet downloaded.
+    pub fn pending_ids(&self) -> Vec<u64> {
+        self.clips
+            .values()
+            .filter(|c| !c.downloaded)
+            .map(|c| c.id)
+            .collect()
+    }
+
+    /// Total downloaded count.
+    pub fn downloaded_count(&self) -> usize {
+        self.clips.values().filter(|c| c.downloaded).count()
+    }
+
+    /// Get all clips sorted by id ascending.
+    pub fn all_clips_sorted(&self) -> Vec<&ClipEntry> {
+        self.clips.values().collect()
+    }
+}
+
+/// Catalog file written next to the downloaded clips (legacy compat).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ChannelCatalog {
     pub channel: String,

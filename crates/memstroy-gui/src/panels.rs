@@ -1,79 +1,184 @@
-//! UI panels. Each function takes the editor state by mutable reference
-//! and the egui context; they are wired up from `App::update`.
+//! UI panels — modern dark theme with emoji and accent colors.
 
 use std::path::PathBuf;
 
-use egui::{Color32, RichText};
+use egui::{Color32, RichText, Rounding, Vec2};
 use memstroy_core::*;
 
 use crate::state::{EditorState, Selection};
 
-pub fn library(ui: &mut egui::Ui, state: &mut EditorState) {
-    ui.heading("Library");
-    ui.separator();
+// ─── LIBRARY ─────────────────────────────────────────────────────────
 
-    ui.collapsing("Mellstroy clips", |ui| {
+pub fn library(ui: &mut egui::Ui, state: &mut EditorState, _request_refresh: impl Fn()) {
+    ui.horizontal(|ui| {
+        ui.heading(RichText::new("\u{1F3AC} Library").size(18.0).strong());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let btn = egui::Button::new(
+                RichText::new("\u{1F504} Refresh Clips")
+                    .color(Color32::WHITE)
+                    .size(13.0),
+            )
+            .fill(Color32::from_rgb(80, 50, 180))
+            .rounding(Rounding::same(8.0));
+
+            if ui.add_enabled(!state.refreshing, btn).clicked() {
+                // Signal the app to start refresh
+                state.status = "__REFRESH_REQUESTED__".into();
+            }
+        });
+    });
+
+    ui.add_space(6.0);
+
+    // Mellstroy clips section
+    let clip_count = state.library.mellstroy_clips.len();
+    egui::CollapsingHeader::new(
+        RichText::new(format!("\u{1F525} Mellstroy Clips ({})", clip_count))
+            .size(14.0)
+            .color(Color32::from_rgb(255, 150, 50)),
+    )
+    .default_open(true)
+    .show(ui, |ui| {
         if state.library.mellstroy_clips.is_empty() {
-            ui.label(RichText::new("No clips found.").italics().color(Color32::GRAY));
-            ui.label("Run Channel → Download to populate.");
-        }
-        for clip in state.library.mellstroy_clips.clone() {
-            let name = clip
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("(?)")
-                .to_string();
-            ui.horizontal(|ui| {
-                if ui.button("+").on_hover_text("Add as actor").clicked() {
-                    add_actor_from_clip(state, &clip);
-                }
-                ui.label(name);
-            });
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new("No clips yet.\nHit \u{1F504} Refresh Clips to download from Telegram!")
+                    .italics()
+                    .color(Color32::from_rgb(140, 140, 160))
+                    .size(12.0),
+            );
+            ui.add_space(8.0);
+        } else {
+            egui::ScrollArea::vertical()
+                .max_height(400.0)
+                .show(ui, |ui| {
+                    let clips = state.library.mellstroy_clips.clone();
+                    for clip in &clips {
+                        clip_card(ui, state, clip);
+                    }
+                });
         }
     });
 
-    ui.collapsing("Backgrounds", |ui| {
+    ui.add_space(10.0);
+
+    // Backgrounds
+    egui::CollapsingHeader::new(
+        RichText::new(format!(
+            "\u{1F5BC} Backgrounds ({})",
+            state.library.backgrounds.len()
+        ))
+        .size(14.0)
+        .color(Color32::from_rgb(100, 180, 255)),
+    )
+    .show(ui, |ui| {
         if state.library.backgrounds.is_empty() {
-            ui.label(RichText::new("Drop images/videos into assets/backgrounds.").italics());
+            ui.label(
+                RichText::new("Drop images/videos into assets/backgrounds/")
+                    .italics()
+                    .color(Color32::from_rgb(140, 140, 160))
+                    .size(12.0),
+            );
         }
         for p in state.library.backgrounds.clone() {
-            let name = p
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("(?)")
-                .to_string();
-            if ui.button(name).clicked() {
+            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("(?)").to_string();
+            if ui
+                .button(RichText::new(format!("\u{1F5BC} {}", name)).size(12.0))
+                .clicked()
+            {
                 add_background_from_path(state, &p);
             }
         }
     });
 
-    ui.collapsing("Props", |ui| {
+    ui.add_space(10.0);
+
+    // Props
+    egui::CollapsingHeader::new(
+        RichText::new(format!("\u{1F3A9} Props ({})", state.library.props.len()))
+            .size(14.0)
+            .color(Color32::from_rgb(255, 100, 200)),
+    )
+    .show(ui, |ui| {
         if state.library.props.is_empty() {
-            ui.label(RichText::new("Drop PNG/SVG props into assets/props.").italics());
+            ui.label(
+                RichText::new("Drop PNG props into assets/props/")
+                    .italics()
+                    .color(Color32::from_rgb(140, 140, 160))
+                    .size(12.0),
+            );
         }
         for p in state.library.props.clone() {
-            let name = p
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("(?)")
-                .to_string();
-            ui.label(name);
+            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("(?)").to_string();
+            ui.label(RichText::new(format!("\u{1F3A9} {}", name)).size(12.0));
         }
     });
 }
 
+fn clip_card(ui: &mut egui::Ui, state: &mut EditorState, clip: &crate::state::LibraryClip) {
+    let frame = egui::Frame::none()
+        .fill(Color32::from_rgb(32, 32, 48))
+        .rounding(Rounding::same(8.0))
+        .inner_margin(egui::Margin::same(8.0))
+        .stroke(egui::Stroke::new(1.0, Color32::from_rgb(50, 50, 70)));
+
+    frame.show(ui, |ui| {
+        ui.horizontal(|ui| {
+            // Add button
+            let add_btn = egui::Button::new(
+                RichText::new("+").size(16.0).color(Color32::WHITE).strong(),
+            )
+            .fill(Color32::from_rgb(60, 180, 80))
+            .rounding(Rounding::same(12.0))
+            .min_size(Vec2::new(28.0, 28.0));
+
+            if ui.add(add_btn).on_hover_text("Add as actor to scene").clicked() {
+                add_actor_from_clip(state, &clip.path);
+            }
+
+            ui.vertical(|ui| {
+                ui.label(
+                    RichText::new(format!("#{}", clip.id))
+                        .size(11.0)
+                        .color(Color32::from_rgb(140, 100, 255))
+                        .strong(),
+                );
+                let desc = if clip.description.len() > 60 {
+                    format!("{}...", &clip.description[..57])
+                } else if clip.description.is_empty() {
+                    "No description".to_string()
+                } else {
+                    clip.description.clone()
+                };
+                ui.label(
+                    RichText::new(desc)
+                        .size(11.0)
+                        .color(Color32::from_rgb(180, 180, 200)),
+                );
+            });
+        });
+    });
+    ui.add_space(4.0);
+}
+
+// ─── INSPECTOR ───────────────────────────────────────────────────────
+
 pub fn inspector(ui: &mut egui::Ui, state: &mut EditorState) {
-    ui.heading("Inspector");
+    ui.heading(RichText::new("\u{1F50D} Inspector").size(18.0).strong());
+    ui.add_space(6.0);
     ui.separator();
+    ui.add_space(6.0);
 
     match state.selection {
         Selection::None => {
             ui.label(
-                RichText::new("Select an actor, overlay, or background.")
-                    .italics()
-                    .color(Color32::GRAY),
+                RichText::new(
+                    "\u{1F447} Select an actor, overlay, or background\nfrom the timeline below.",
+                )
+                .italics()
+                .color(Color32::from_rgb(140, 140, 160)),
             );
+            ui.add_space(12.0);
             output_spec_editor(ui, &mut state.scene.output);
         }
         Selection::Actor(i) => {
@@ -92,17 +197,23 @@ pub fn inspector(ui: &mut egui::Ui, state: &mut EditorState) {
             }
         }
         Selection::Camera(_) => {
-            ui.label("Camera keyframe editing — coming soon.");
+            ui.label("\u{1F4F7} Camera keyframe editing \u{2014} coming soon.");
         }
     }
 }
 
 fn output_spec_editor(ui: &mut egui::Ui, spec: &mut OutputSpec) {
-    ui.collapsing("Output", |ui| {
+    egui::CollapsingHeader::new(
+        RichText::new("\u{2699} Output Settings")
+            .size(14.0)
+            .color(Color32::from_rgb(100, 200, 255)),
+    )
+    .default_open(true)
+    .show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.label("Resolution:");
             ui.add(egui::DragValue::new(&mut spec.resolution[0]).range(64..=4096));
-            ui.label("×");
+            ui.label("\u{00D7}");
             ui.add(egui::DragValue::new(&mut spec.resolution[1]).range(64..=4096));
         });
         ui.horizontal(|ui| {
@@ -117,110 +228,121 @@ fn output_spec_editor(ui: &mut egui::Ui, spec: &mut OutputSpec) {
 }
 
 fn actor_editor(ui: &mut egui::Ui, a: &mut Actor) {
-    ui.label(RichText::new(format!("Actor: {}", a.id)).strong());
-    ui.label(format!("Source: {}", a.source.display()));
-    ui.checkbox(&mut a.flip_horizontal, "Flip horizontally");
-    ui.checkbox(&mut a.loop_source, "Loop source");
-    ui.add(egui::DragValue::new(&mut a.source_start).speed(0.05).prefix("source_start="));
+    ui.label(
+        RichText::new(format!("\u{1F3AD} Actor: {}", a.id))
+            .strong()
+            .size(15.0)
+            .color(Color32::from_rgb(255, 150, 50)),
+    );
+    ui.label(
+        RichText::new(format!("Source: {}", a.source.display()))
+            .size(11.0)
+            .color(Color32::from_rgb(150, 150, 170)),
+    );
+    ui.add_space(6.0);
 
-    ui.collapsing("Chroma key", |ui| {
+    ui.checkbox(&mut a.flip_horizontal, "\u{1F500} Flip horizontally");
+    ui.checkbox(&mut a.loop_source, "\u{1F501} Loop source");
+    ui.add(egui::DragValue::new(&mut a.source_start).speed(0.05).prefix("Start: "));
+
+    ui.add_space(8.0);
+    egui::CollapsingHeader::new(
+        RichText::new("\u{1F7E2} Chroma Key").color(Color32::from_rgb(100, 255, 100)),
+    )
+    .show(ui, |ui| {
         ui.horizontal(|ui| {
-            ui.label("Color:");
+            ui.label("Key color:");
             color_edit_u8(ui, &mut a.chroma_key.key_color);
         });
-        ui.add(egui::Slider::new(&mut a.chroma_key.similarity, 0.0..=1.0).text("similarity"));
-        ui.add(egui::Slider::new(&mut a.chroma_key.blend, 0.0..=1.0).text("blend"));
-        ui.add(egui::Slider::new(&mut a.chroma_key.spill, 0.0..=1.0).text("spill"));
+        ui.add(egui::Slider::new(&mut a.chroma_key.similarity, 0.0..=1.0).text("Similarity"));
+        ui.add(egui::Slider::new(&mut a.chroma_key.blend, 0.0..=1.0).text("Blend"));
+        ui.add(egui::Slider::new(&mut a.chroma_key.spill, 0.0..=1.0).text("Spill"));
     });
 
-    ui.collapsing("Layout keyframes", |ui| {
+    ui.add_space(8.0);
+    egui::CollapsingHeader::new(
+        RichText::new("\u{1F4CD} Keyframes").color(Color32::from_rgb(255, 200, 100)),
+    )
+    .default_open(true)
+    .show(ui, |ui| {
         if a.layout.is_empty() {
-            if ui.button("Add starting keyframe").clicked() {
+            if ui.button("\u{2795} Add starting keyframe").clicked() {
                 a.layout.push(Keyframe::new(0.0, ActorState::default()));
             }
         }
         let mut to_remove = None;
         for (i, kf) in a.layout.iter_mut().enumerate() {
             ui.horizontal(|ui| {
-                ui.label(format!("t={:.2}", kf.t));
-                ui.add(egui::DragValue::new(&mut kf.t).range(0.0..=600.0).speed(0.05));
+                ui.add(egui::DragValue::new(&mut kf.t).range(0.0..=600.0).speed(0.05).prefix("t="));
                 ui.add(egui::DragValue::new(&mut kf.value.pos[0]).range(-2.0..=3.0).speed(0.01).prefix("x="));
                 ui.add(egui::DragValue::new(&mut kf.value.pos[1]).range(-2.0..=3.0).speed(0.01).prefix("y="));
                 ui.add(egui::DragValue::new(&mut kf.value.scale).range(0.05..=8.0).speed(0.01).prefix("s="));
-                if ui.small_button("✕").clicked() { to_remove = Some(i); }
+                if ui.small_button("\u{2716}").clicked() {
+                    to_remove = Some(i);
+                }
             });
         }
-        if let Some(i) = to_remove { a.layout.remove(i); }
-        if ui.button("+ Add keyframe").clicked() {
+        if let Some(i) = to_remove {
+            a.layout.remove(i);
+        }
+        if ui.button("\u{2795} Add keyframe").clicked() {
             let last = a.layout.last().cloned().unwrap_or_else(|| Keyframe::new(0.0, ActorState::default()));
             a.layout.push(Keyframe::new(last.t + 1.0, last.value));
         }
-    });
-
-    ui.collapsing(format!("Attachments ({})", a.attachments.len()), |ui| {
-        ui.label(
-            RichText::new(
-                "Attachments follow body anchors detected by the pose pass. \
-                 Run Tools → Detect anchors on the source clip first.",
-            )
-            .italics(),
-        );
     });
 }
 
 fn overlay_editor(ui: &mut egui::Ui, o: &mut Overlay) {
     match o {
         Overlay::Text(t) => {
-            ui.label(RichText::new(format!("Text overlay: {}", t.id)).strong());
+            ui.label(
+                RichText::new(format!("\u{1F4DD} Text: {}", t.id))
+                    .strong()
+                    .size(15.0)
+                    .color(Color32::from_rgb(100, 200, 255)),
+            );
             ui.text_edit_multiline(&mut t.text);
             ui.horizontal(|ui| {
                 ui.add(egui::DragValue::new(&mut t.t_in).speed(0.05).prefix("in="));
                 ui.add(egui::DragValue::new(&mut t.t_out).speed(0.05).prefix("out="));
             });
-            ui.add(egui::Slider::new(&mut t.style.font_size, 16.0..=512.0).text("font_size"));
+            ui.add(egui::Slider::new(&mut t.style.font_size, 16.0..=512.0).text("Font size"));
             ui.horizontal(|ui| {
-                ui.label("color:");
+                ui.label("Color:");
                 color_edit_u8(ui, &mut t.style.color);
             });
             let mut has_box = t.style.box_color.is_some();
-            ui.checkbox(&mut has_box, "white plate");
+            ui.checkbox(&mut has_box, "\u{2B1C} White plate");
             if has_box && t.style.box_color.is_none() {
                 t.style.box_color = Some([255, 255, 255]);
             }
             if !has_box {
                 t.style.box_color = None;
             }
-            if let Some(box_color) = &mut t.style.box_color {
-                color_edit_u8(ui, box_color);
-                ui.add(egui::Slider::new(&mut t.style.box_padding, 0.0..=128.0).text("padding"));
-            }
         }
         Overlay::Image(i) => {
-            ui.label(RichText::new(format!("Image overlay: {}", i.id)).strong());
+            ui.label(RichText::new(format!("\u{1F5BC} Image: {}", i.id)).strong().size(15.0));
             ui.label(format!("Source: {}", i.source.display()));
-            ui.horizontal(|ui| {
-                ui.add(egui::DragValue::new(&mut i.t_in).speed(0.05).prefix("in="));
-                ui.add(egui::DragValue::new(&mut i.t_out).speed(0.05).prefix("out="));
-            });
         }
         Overlay::Video(v) => {
-            ui.label(RichText::new(format!("Video overlay: {}", v.id)).strong());
+            ui.label(RichText::new(format!("\u{1F3AC} Video: {}", v.id)).strong().size(15.0));
             ui.label(format!("Source: {}", v.source.display()));
-            ui.horizontal(|ui| {
-                ui.add(egui::DragValue::new(&mut v.t_in).speed(0.05).prefix("in="));
-                ui.add(egui::DragValue::new(&mut v.t_out).speed(0.05).prefix("out="));
-            });
         }
     }
 }
 
 fn background_editor(ui: &mut egui::Ui, b: &mut Background) {
-    ui.label(RichText::new(format!("Background: {}", b.id)).strong());
+    ui.label(
+        RichText::new(format!("\u{1F304} Background: {}", b.id))
+            .strong()
+            .size(15.0)
+            .color(Color32::from_rgb(100, 180, 255)),
+    );
     ui.horizontal(|ui| {
         ui.add(egui::DragValue::new(&mut b.start).speed(0.05).prefix("start="));
-        ui.add(egui::DragValue::new(&mut b.duration).speed(0.05).prefix("duration="));
+        ui.add(egui::DragValue::new(&mut b.duration).speed(0.05).prefix("dur="));
     });
-    egui::ComboBox::from_label("fit")
+    egui::ComboBox::from_label("Fit")
         .selected_text(format!("{:?}", b.fit))
         .show_ui(ui, |ui| {
             ui.selectable_value(&mut b.fit, Fit::Cover, "Cover");
@@ -228,42 +350,51 @@ fn background_editor(ui: &mut egui::Ui, b: &mut Background) {
             ui.selectable_value(&mut b.fit, Fit::Stretch, "Stretch");
             ui.selectable_value(&mut b.fit, Fit::Original, "Original");
         });
-    egui::ComboBox::from_label("transition")
+    egui::ComboBox::from_label("Transition")
         .selected_text(format!("{:?}", b.transition))
         .show_ui(ui, |ui| {
             ui.selectable_value(&mut b.transition, Transition::Cut, "Cut");
             ui.selectable_value(&mut b.transition, Transition::Snap, "Snap");
             ui.selectable_value(&mut b.transition, Transition::Fade, "Fade");
-            ui.selectable_value(&mut b.transition, Transition::SlideLeft, "Slide left");
-            ui.selectable_value(&mut b.transition, Transition::SlideRight, "Slide right");
-            ui.selectable_value(&mut b.transition, Transition::SlideUp, "Slide up");
-            ui.selectable_value(&mut b.transition, Transition::SlideDown, "Slide down");
         });
 }
 
+// ─── TIMELINE ────────────────────────────────────────────────────────
+
 pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
-    ui.heading("Timeline");
-    ui.add(
-        egui::Slider::new(&mut state.playhead, 0.0..=state.scene.output.duration as f32)
-            .text("playhead (s)"),
-    );
+    ui.horizontal(|ui| {
+        ui.heading(RichText::new("\u{23F1} Timeline").size(16.0).strong());
+        ui.add_space(20.0);
+        ui.add(
+            egui::Slider::new(&mut state.playhead, 0.0..=state.scene.output.duration)
+                .text("s")
+                .show_value(true),
+        );
+    });
+    ui.add_space(4.0);
     ui.separator();
 
     let mut to_select: Option<Selection> = None;
-    egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+    egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
         for (i, b) in state.scene.backgrounds.iter().enumerate() {
+            let sel = state.selection == Selection::Background(i);
             let resp = ui.selectable_label(
-                state.selection == Selection::Background(i),
-                format!("[bg] {} ({:.1}s @ {:.1})", b.id, b.duration, b.start),
+                sel,
+                RichText::new(format!(
+                    "\u{1F304} {} ({:.1}s @ {:.1})",
+                    b.id, b.duration, b.start
+                ))
+                .size(12.0),
             );
             if resp.clicked() {
                 to_select = Some(Selection::Background(i));
             }
         }
         for (i, a) in state.scene.actors.iter().enumerate() {
+            let sel = state.selection == Selection::Actor(i);
             let resp = ui.selectable_label(
-                state.selection == Selection::Actor(i),
-                format!("[actor] {}", a.id),
+                sel,
+                RichText::new(format!("\u{1F3AD} {}", a.id)).size(12.0),
             );
             if resp.clicked() {
                 to_select = Some(Selection::Actor(i));
@@ -271,11 +402,12 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
         }
         for (i, o) in state.scene.overlays.iter().enumerate() {
             let label = match o {
-                Overlay::Text(t) => format!("[text] {} \"{}\"", t.id, ellipsis(&t.text, 24)),
-                Overlay::Image(im) => format!("[image] {} {}", im.id, im.source.display()),
-                Overlay::Video(v) => format!("[video] {} {}", v.id, v.source.display()),
+                Overlay::Text(t) => format!("\u{1F4DD} {} \"{}\"", t.id, ellipsis(&t.text, 20)),
+                Overlay::Image(im) => format!("\u{1F5BC} {}", im.id),
+                Overlay::Video(v) => format!("\u{1F3AC} {}", v.id),
             };
-            let resp = ui.selectable_label(state.selection == Selection::Overlay(i), label);
+            let sel = state.selection == Selection::Overlay(i);
+            let resp = ui.selectable_label(sel, RichText::new(label).size(12.0));
             if resp.clicked() {
                 to_select = Some(Selection::Overlay(i));
             }
@@ -284,13 +416,14 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             && state.scene.overlays.is_empty()
             && state.scene.backgrounds.is_empty()
         {
+            ui.add_space(20.0);
             ui.label(
                 RichText::new(
-                    "Empty scene. Add a background, drop an actor from the library, \
-                 then add a text overlay.",
+                    "\u{1F4AD} Empty scene.\nAdd clips from the library \u{2192} they appear here.",
                 )
                 .italics()
-                .color(Color32::GRAY),
+                .color(Color32::from_rgb(120, 120, 140))
+                .size(12.0),
             );
         }
     });
@@ -299,20 +432,29 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     }
 }
 
+// ─── PREVIEW ─────────────────────────────────────────────────────────
+
 pub fn preview(ui: &mut egui::Ui, state: &mut EditorState) {
-    ui.heading("Preview");
-    ui.separator();
+    ui.heading(RichText::new("\u{1F440} Preview").size(16.0).strong());
+    ui.add_space(4.0);
+
     let avail = ui.available_size_before_wrap();
     let target_aspect =
         state.scene.output.resolution[0] as f32 / state.scene.output.resolution[1] as f32;
-    let mut h = avail.y.min(900.0);
+    let mut h = avail.y.min(800.0);
     let mut w = h * target_aspect;
     if w > avail.x {
         w = avail.x;
         h = w / target_aspect;
     }
     let (rect, _) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
-    ui.painter().rect_filled(rect, 4.0, Color32::from_rgb(20, 22, 28));
+
+    // Draw preview background
+    ui.painter().rect_filled(
+        rect,
+        Rounding::same(8.0),
+        Color32::from_rgb(10, 10, 16),
+    );
 
     if let Some(p) = &state.last_preview {
         let uri = format!("file://{}", p.display());
@@ -322,14 +464,16 @@ pub fn preview(ui: &mut egui::Ui, state: &mut EditorState) {
             rect,
             egui::Label::new(
                 RichText::new(
-                    "Preview placeholder.\nClick \"Render preview\" \
-                     to ask FFmpeg for a still at the playhead.",
+                    "\u{1F3AC}\n\nRender \u{2192} Preview frame\nto see your meme here",
                 )
-                .color(Color32::LIGHT_GRAY),
+                .color(Color32::from_rgb(80, 80, 100))
+                .size(16.0),
             ),
         );
     }
 }
+
+// ─── HELPERS ─────────────────────────────────────────────────────────
 
 fn color_edit_u8(ui: &mut egui::Ui, c: &mut [u8; 3]) {
     let mut rgb = [
@@ -349,7 +493,7 @@ fn ellipsis(s: &str, n: usize) -> String {
         s.to_string()
     } else {
         let mut out: String = s.chars().take(n).collect();
-        out.push('…');
+        out.push_str("...");
         out
     }
 }
@@ -358,10 +502,10 @@ fn add_actor_from_clip(state: &mut EditorState, path: &PathBuf) {
     let id = path
         .file_stem()
         .and_then(|s| s.to_str())
-        .map(|s| format!("actor_{}", s))
+        .map(|s| format!("mellstroy_{}", s))
         .unwrap_or_else(|| format!("actor_{}", state.scene.actors.len() + 1));
     let actor = Actor {
-        id,
+        id: id.clone(),
         source: path.clone(),
         anchors: None,
         chroma_key: ChromaKeyParams::default(),
@@ -369,13 +513,13 @@ fn add_actor_from_clip(state: &mut EditorState, path: &PathBuf) {
         t_in: None,
         t_out: None,
         source_start: 0.0,
-        loop_source: false,
+        loop_source: true,
         flip_horizontal: false,
         attachments: Vec::new(),
     };
     state.scene.actors.push(actor);
     state.selection = Selection::Actor(state.scene.actors.len() - 1);
-    state.status = format!("Added actor from {}", path.display());
+    state.status = format!("\u{2705} Added actor: {}", id);
 }
 
 fn add_background_from_path(state: &mut EditorState, path: &PathBuf) {
@@ -394,7 +538,7 @@ fn add_background_from_path(state: &mut EditorState, path: &PathBuf) {
         MediaSource::Video { path: path.clone(), r#loop: true, start_at: 0.0 }
     };
     let bg = Background {
-        id,
+        id: id.clone(),
         source,
         start: 0.0,
         duration: state.scene.output.duration,
@@ -403,5 +547,5 @@ fn add_background_from_path(state: &mut EditorState, path: &PathBuf) {
     };
     state.scene.backgrounds.push(bg);
     state.selection = Selection::Background(state.scene.backgrounds.len() - 1);
-    state.status = format!("Added background {}", path.display());
+    state.status = format!("\u{2705} Added background: {}", id);
 }

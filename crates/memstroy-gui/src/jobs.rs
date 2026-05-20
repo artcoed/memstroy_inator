@@ -1,17 +1,11 @@
 //! Background jobs orchestration.
-//!
-//! The GUI runs all heavy work (scrape, download, render, preview) on
-//! a tokio runtime owned by the [`App`]. Results travel back to the UI
-//! thread via a `crossbeam-style` mpsc — except we just use the std
-//! channel since the volume is tiny.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::mpsc::Sender;
-use std::time::Instant;
 
 use memstroy_core::Scene;
 use memstroy_render::{render_preview_frame, render_scene};
-use memstroy_tg::{download_videos, fetch_all, ChannelCatalog};
+use memstroy_tg::download::incremental_refresh;
 use tokio::runtime::Handle;
 use tracing::warn;
 
@@ -23,15 +17,14 @@ pub enum JobEvent {
     PreviewFailed(String),
     RenderLog(String),
     RenderFinished(Result<PathBuf, String>),
-    DownloadFinished(Result<DownloadSummary, String>),
+    RefreshProgress(String),
+    RefreshFinished(Result<RefreshSummary, String>),
 }
 
 #[derive(Debug, Clone)]
-pub struct DownloadSummary {
-    pub total: usize,
-    pub kept: usize,
-    pub downloaded: usize,
-    pub skipped: usize,
+pub struct RefreshSummary {
+    pub new_clips: usize,
+    pub total_clips: usize,
     pub failed: usize,
 }
 
@@ -64,85 +57,53 @@ pub fn spawn_render(
     out_path: PathBuf,
 ) {
     rt.spawn(async move {
-        let started = Instant::now();
         let log_tx = tx.clone();
         let result = render_scene(&scene, &assets, &out_path, |line| {
             let _ = log_tx.send(JobEvent::RenderLog(line.to_string()));
         })
         .await;
-        let _ = tx.send(JobEvent::Status(format!(
-            "render finished in {:.1}s",
-            started.elapsed().as_secs_f32()
-        )));
         let _ = tx.send(JobEvent::RenderFinished(
             result.map(|_| out_path).map_err(|e| e.to_string()),
         ));
     });
 }
 
-pub fn spawn_download(
+pub fn spawn_refresh(
     rt: &Handle,
     tx: Sender<JobEvent>,
     channel: String,
-    out_dir: PathBuf,
+    clips_dir: PathBuf,
+    state_path: PathBuf,
     filter: String,
     max_pages: usize,
-    overwrite: bool,
     concurrency: usize,
 ) {
     rt.spawn(async move {
-        let _ = tx.send(JobEvent::Status(format!("scraping {}…", channel)));
-        let posts = match fetch_all(&channel, max_pages).await {
-            Ok(p) => p,
-            Err(e) => {
-                let _ = tx.send(JobEvent::DownloadFinished(Err(e.to_string())));
-                return;
-            }
-        };
-        let total = posts.len();
-        let mut kept = posts.clone();
-        if !filter.is_empty() {
-            kept.retain(|p| p.body_contains(&filter));
-        }
-        let kept_count = kept.len();
-        let _ = tx.send(JobEvent::Status(format!(
-            "scraped {} posts, kept {} for download",
-            total, kept_count
-        )));
+        let progress_tx = tx.clone();
+        let result = incremental_refresh(
+            &channel,
+            &clips_dir,
+            &state_path,
+            &filter,
+            max_pages,
+            concurrency,
+            |msg| {
+                let _ = progress_tx.send(JobEvent::RefreshProgress(msg.to_string()));
+            },
+        )
+        .await;
 
-        if let Err(e) = tokio::fs::create_dir_all(&out_dir).await {
-            let _ = tx.send(JobEvent::DownloadFinished(Err(format!("mkdir: {e}"))));
-            return;
-        }
-
-        let catalog = ChannelCatalog {
-            channel,
-            fetched_at: chrono::Utc::now().to_rfc3339(),
-            posts: kept.clone(),
-        };
-        if let Err(e) = write_catalog(&out_dir, &catalog).await {
-            warn!(error = %e, "writing catalog");
-        }
-
-        match download_videos(&kept, &out_dir, overwrite, concurrency).await {
-            Ok(stats) => {
-                let _ = tx.send(JobEvent::DownloadFinished(Ok(DownloadSummary {
-                    total,
-                    kept: kept_count,
-                    downloaded: stats.downloaded,
-                    skipped: stats.skipped,
+        match result {
+            Ok((state, stats)) => {
+                let _ = tx.send(JobEvent::RefreshFinished(Ok(RefreshSummary {
+                    new_clips: stats.downloaded,
+                    total_clips: state.downloaded_count(),
                     failed: stats.failed,
                 })));
             }
             Err(e) => {
-                let _ = tx.send(JobEvent::DownloadFinished(Err(e.to_string())));
+                let _ = tx.send(JobEvent::RefreshFinished(Err(e.to_string())));
             }
         }
     });
-}
-
-async fn write_catalog(dir: &Path, c: &ChannelCatalog) -> anyhow::Result<()> {
-    let path = dir.join("catalog.json");
-    tokio::fs::write(path, serde_json::to_vec_pretty(c)?).await?;
-    Ok(())
 }

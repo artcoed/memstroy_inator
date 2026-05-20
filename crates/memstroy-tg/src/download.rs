@@ -7,8 +7,8 @@ use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tracing::{info, warn};
 
-use crate::model::TgPost;
-use crate::scrape::build_client;
+use crate::model::{ClipEntry, DownloadState, TgPost};
+use crate::scrape::{build_client, fetch_all};
 
 /// Download every `TgPost::primary_video()` into `dir`. Files are named
 /// `{id}.mp4`. Existing files are skipped unless `overwrite` is true.
@@ -61,6 +61,151 @@ pub async fn download_videos(
 
     let final_stats = std::mem::take(&mut *stats.lock().unwrap());
     Ok(final_stats)
+}
+
+/// Incremental refresh: scrape all posts, find new ones that haven't
+/// been downloaded yet, download them oldest-first, and update the
+/// persistent state.
+///
+/// Returns the updated state and download stats.
+pub async fn incremental_refresh(
+    channel: &str,
+    clips_dir: &Path,
+    state_path: &Path,
+    filter: &str,
+    max_pages: usize,
+    concurrency: usize,
+    mut on_progress: impl FnMut(&str),
+) -> Result<(DownloadState, DownloadStats)> {
+    // Load existing state
+    let mut state = DownloadState::load(state_path);
+    state.channel = channel.to_string();
+
+    on_progress("Scanning channel...");
+
+    // Scrape all posts
+    let all_posts = fetch_all(channel, max_pages).await?;
+    let total_scraped = all_posts.len();
+
+    // Filter by keyword
+    let matching: Vec<TgPost> = all_posts
+        .into_iter()
+        .filter(|p| {
+            if filter.is_empty() {
+                true
+            } else {
+                p.body_contains(filter)
+            }
+        })
+        .filter(|p| p.primary_video().is_some())
+        .collect();
+
+    on_progress(&format!(
+        "Found {} posts with video (total scraped: {})",
+        matching.len(),
+        total_scraped
+    ));
+
+    // Register all matching posts in state (mark new ones as not downloaded)
+    let mut new_ids: Vec<u64> = Vec::new();
+    for post in &matching {
+        if !state.clips.contains_key(&post.id) {
+            state.clips.insert(
+                post.id,
+                ClipEntry {
+                    id: post.id,
+                    description: post.clean_description(),
+                    filename: format!("{}.mp4", post.id),
+                    downloaded: false,
+                    full_text: post.text.clone(),
+                    date: post.date.clone(),
+                },
+            );
+            new_ids.push(post.id);
+        }
+    }
+
+    // Find all pending downloads (not yet downloaded), sorted ascending (oldest first)
+    let mut pending: Vec<u64> = state.pending_ids();
+    pending.sort();
+
+    if pending.is_empty() {
+        on_progress("All clips are up to date!");
+        state.last_refresh = Some(chrono::Utc::now().to_rfc3339());
+        state.save(state_path)?;
+        return Ok((state, DownloadStats::default()));
+    }
+
+    on_progress(&format!(
+        "Downloading {} new clips (oldest first)...",
+        pending.len()
+    ));
+
+    // Build a lookup from id -> post (for video URLs)
+    let post_by_id: std::collections::HashMap<u64, &TgPost> =
+        matching.iter().map(|p| (p.id, p)).collect();
+
+    // Download sequentially from oldest to newest for predictability
+    fs::create_dir_all(clips_dir).await.context("mkdir clips dir")?;
+    let client = build_client()?;
+    let mut stats = DownloadStats::default();
+
+    // Use concurrent download but within ordered chunks
+    let work: Vec<(u64, String, PathBuf)> = pending
+        .iter()
+        .filter_map(|id| {
+            post_by_id.get(id).and_then(|p| {
+                p.primary_video().map(|url| {
+                    (*id, url.to_string(), clips_dir.join(format!("{}.mp4", id)))
+                })
+            })
+        })
+        .collect();
+
+    let downloaded_ids = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+
+    futures::stream::iter(work)
+        .for_each_concurrent(concurrency, |(id, url, target)| {
+            let client = client.clone();
+            let downloaded_ids = downloaded_ids.clone();
+            async move {
+                if target.exists() {
+                    downloaded_ids.lock().unwrap().push(id);
+                    return;
+                }
+                match fetch_one(&client, &url, &target).await {
+                    Ok(bytes) => {
+                        downloaded_ids.lock().unwrap().push(id);
+                        info!(id, bytes, "downloaded");
+                    }
+                    Err(e) => {
+                        warn!(id, error = %e, "download failed");
+                    }
+                }
+            }
+        })
+        .await;
+
+    let successfully_downloaded = downloaded_ids.lock().unwrap().clone();
+    stats.downloaded = successfully_downloaded.len();
+
+    // Mark downloaded in state
+    for id in &successfully_downloaded {
+        if let Some(entry) = state.clips.get_mut(id) {
+            entry.downloaded = true;
+        }
+    }
+
+    stats.failed = pending.len() - successfully_downloaded.len();
+    state.last_refresh = Some(chrono::Utc::now().to_rfc3339());
+    state.save(state_path)?;
+
+    on_progress(&format!(
+        "Done! {} downloaded, {} failed",
+        stats.downloaded, stats.failed
+    ));
+
+    Ok((state, stats))
 }
 
 async fn fetch_one(client: &reqwest::Client, url: &str, target: &Path) -> Result<u64> {
