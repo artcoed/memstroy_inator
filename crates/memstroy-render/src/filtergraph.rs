@@ -62,6 +62,7 @@ impl<'a> FilterGraphBuilder<'a> {
         self.emit_backgrounds()?;
         self.emit_actors()?;
         self.emit_overlays()?;
+        self.emit_camera()?;
         self.emit_audio()?;
         Ok(())
     }
@@ -167,10 +168,7 @@ impl<'a> FilterGraphBuilder<'a> {
             };
             self.chunks.push(format!("[{idx}:v]{fit},setsar=1,format=yuva420p{out}", idx = idx, fit = fit, out = scaled));
 
-            // Apply a transition by altering the overlay alpha at the
-            // segment start. For the first iteration we support only
-            // Cut / Fade. Snap is identical to Cut visually (with a
-            // 1-frame flash), Slide* are TODO.
+            // Transitions: Cut, Snap, Fade, Slide*
             let composed = self.alloc_label("bgstack");
             let alpha_expr = match bg.transition {
                 Transition::Fade => format!(
@@ -178,10 +176,52 @@ impl<'a> FilterGraphBuilder<'a> {
                     a = bg.start,
                     fade_out = (bg.start + bg.duration - 0.25).max(bg.start),
                 ),
+                Transition::Snap => {
+                    // Snap: 2-frame white flash at the start of this segment.
+                    // We fade in extremely fast (1 frame ≈ 0.017s @ 60fps).
+                    format!(
+                        "fade=t=in:st={a}:d=0.033:alpha=1",
+                        a = bg.start
+                    )
+                }
                 _ => String::new(),
             };
+
+            // Slide transitions: offset the overlay position over time
+            let slide_overlay = match bg.transition {
+                Transition::SlideLeft => {
+                    let dur = 0.3;
+                    format!(
+                        "overlay=x='if(lt(t,{end}),W*(1-((t-{start})/{dur})),0)':y=0:enable='between(t,{start},{seg_end})':eof_action=pass",
+                        start = bg.start, end = bg.start + dur, dur = dur, seg_end = bg.start + bg.duration
+                    )
+                }
+                Transition::SlideRight => {
+                    let dur = 0.3;
+                    format!(
+                        "overlay=x='if(lt(t,{end}),-W*(1-((t-{start})/{dur})),0)':y=0:enable='between(t,{start},{seg_end})':eof_action=pass",
+                        start = bg.start, end = bg.start + dur, dur = dur, seg_end = bg.start + bg.duration
+                    )
+                }
+                Transition::SlideUp => {
+                    let dur = 0.3;
+                    format!(
+                        "overlay=x=0:y='if(lt(t,{end}),H*(1-((t-{start})/{dur})),0)':enable='between(t,{start},{seg_end})':eof_action=pass",
+                        start = bg.start, end = bg.start + dur, dur = dur, seg_end = bg.start + bg.duration
+                    )
+                }
+                Transition::SlideDown => {
+                    let dur = 0.3;
+                    format!(
+                        "overlay=x=0:y='if(lt(t,{end}),-H*(1-((t-{start})/{dur})),0)':enable='between(t,{start},{seg_end})':eof_action=pass",
+                        start = bg.start, end = bg.start + dur, dur = dur, seg_end = bg.start + bg.duration
+                    )
+                }
+                _ => String::new(),
+            };
+
             let staged = if alpha_expr.is_empty() {
-                scaled
+                scaled.clone()
             } else {
                 let tagged = self.alloc_label("bgfade");
                 self.chunks.push(format!(
@@ -193,15 +233,49 @@ impl<'a> FilterGraphBuilder<'a> {
                 tagged
             };
 
-            self.chunks.push(format!(
-                "{cur}{staged}overlay=enable='between(t,{a},{b})':eof_action=pass{out}",
-                cur = self.cursor,
-                staged = staged,
-                a = bg.start,
-                b = bg.start + bg.duration,
-                out = composed
-            ));
-            self.cursor = composed;
+            if !slide_overlay.is_empty() {
+                // Slide: use custom overlay expression
+                self.chunks.push(format!(
+                    "{cur}{staged}{slide}{out}",
+                    cur = self.cursor,
+                    staged = staged,
+                    slide = slide_overlay,
+                    out = composed
+                ));
+            } else {
+                self.chunks.push(format!(
+                    "{cur}{staged}overlay=enable='between(t,{a},{b})':eof_action=pass{out}",
+                    cur = self.cursor,
+                    staged = staged,
+                    a = bg.start,
+                    b = bg.start + bg.duration,
+                    out = composed
+                ));
+            }
+
+            // Snap flash: overlay a white frame for 2 frames at transition start
+            if matches!(bg.transition, Transition::Snap) {
+                let flash = self.alloc_label("flash");
+                let flash_dur = 0.033; // ~2 frames at 60fps
+                self.chunks.push(format!(
+                    "color=c=0xFFFFFF:s={w}x{h}:r={fps}:d={fd}[{fl}raw]",
+                    w = w, h = h, fps = self.scene.output.fps,
+                    fd = flash_dur, fl = &flash[1..flash.len()-1]
+                ));
+                let raw_label = format!("[{}raw]", &flash[1..flash.len()-1]);
+                let after_flash = self.alloc_label("postflash");
+                self.chunks.push(format!(
+                    "{composed}{raw}overlay=enable='between(t,{a},{b})':eof_action=pass{out}",
+                    composed = composed,
+                    raw = raw_label,
+                    a = bg.start,
+                    b = bg.start + flash_dur,
+                    out = after_flash,
+                ));
+                self.cursor = after_flash;
+            } else {
+                self.cursor = composed;
+            }
         }
         Ok(())
     }
@@ -475,6 +549,96 @@ impl<'a> FilterGraphBuilder<'a> {
             out = next,
         ));
         self.cursor = next;
+        Ok(())
+    }
+
+    /// Apply camera moves (zoom/pan/rotate) to the final composite.
+    /// Uses FFmpeg's `crop` + `scale` filters with piecewise expressions
+    /// driven by `CameraState` keyframes.
+    fn emit_camera(&mut self) -> Result<()> {
+        if self.scene.camera.is_empty() {
+            return Ok(());
+        }
+
+        let [w, h] = self.scene.output.resolution;
+        let camera = &self.scene.camera;
+
+        // Build piecewise expressions for zoom, center_x, center_y, rotation
+        let make_expr = |getter: fn(&CameraState) -> f32| -> String {
+            if camera.len() == 1 {
+                return format!("{}", getter(&camera[0].value));
+            }
+            let mut expr = format!("{}", getter(&camera.last().unwrap().value));
+            for win in camera.windows(2).rev() {
+                let (a, b) = (&win[0], &win[1]);
+                let v0 = getter(&a.value);
+                let v1 = getter(&b.value);
+                let span = (b.t - a.t).max(1e-6);
+                expr = format!(
+                    "if(lt(t,{tb}),{v0}+({v1}-{v0})*((t-{ta})/{span}),{else_})",
+                    tb = b.t, v0 = v0, v1 = v1, ta = a.t, span = span, else_ = expr
+                );
+            }
+            expr
+        };
+
+        let zoom_expr = make_expr(|c| c.zoom);
+        let cx_expr = make_expr(|c| c.center[0]);
+        let cy_expr = make_expr(|c| c.center[1]);
+        let rot_expr = make_expr(|c| c.rotation_deg);
+
+        // Strategy: use crop to select a sub-region of the composite,
+        // then scale back up to output resolution. This simulates zoom + pan.
+        //
+        // crop_w = W / zoom, crop_h = H / zoom
+        // crop_x = center_x * W - crop_w / 2
+        // crop_y = center_y * H - crop_h / 2
+        //
+        // Then scale the cropped region back to WxH.
+
+        let crop_w = format!("floor({w}/({zoom})/2)*2", w = w, zoom = zoom_expr);
+        let crop_h = format!("floor({h}/({zoom})/2)*2", h = h, zoom = zoom_expr);
+        let crop_x = format!(
+            "max(0,min({w}-floor({w}/({zoom})/2)*2, floor(({cx})*{w}-floor({w}/({zoom})/2)*2/2)))",
+            w = w, zoom = zoom_expr, cx = cx_expr
+        );
+        let crop_y = format!(
+            "max(0,min({h}-floor({h}/({zoom})/2)*2, floor(({cy})*{h}-floor({h}/({zoom})/2)*2/2)))",
+            h = h, zoom = zoom_expr, cy = cy_expr
+        );
+
+        let cam_label = self.alloc_label("cam");
+
+        // Check if there's any rotation
+        let has_rotation = camera.iter().any(|kf| kf.value.rotation_deg.abs() > 0.01);
+
+        if has_rotation {
+            // With rotation: use rotate filter before crop
+            let rot_rad = format!("({})*PI/180", rot_expr);
+            let rot_label = self.alloc_label("rot");
+            self.chunks.push(format!(
+                "{cur}rotate={rad}:c=none:ow=iw:oh=ih{out}",
+                cur = self.cursor,
+                rad = rot_rad,
+                out = rot_label,
+            ));
+            self.chunks.push(format!(
+                "{rot}crop=w='{cw}':h='{ch}':x='{cx}':y='{cy}',scale={w}:{h}{out}",
+                rot = rot_label,
+                cw = crop_w, ch = crop_h, cx = crop_x, cy = crop_y,
+                w = w, h = h, out = cam_label,
+            ));
+        } else {
+            // No rotation: just crop + scale
+            self.chunks.push(format!(
+                "{cur}crop=w='{cw}':h='{ch}':x='{cx}':y='{cy}',scale={w}:{h}{out}",
+                cur = self.cursor,
+                cw = crop_w, ch = crop_h, cx = crop_x, cy = crop_y,
+                w = w, h = h, out = cam_label,
+            ));
+        }
+
+        self.cursor = cam_label;
         Ok(())
     }
 
