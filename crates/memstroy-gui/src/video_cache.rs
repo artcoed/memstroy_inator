@@ -17,6 +17,8 @@ const BUFFER_SIZE: usize = 30;
 /// frames into a memory ring buffer and uploads them to a single reusable
 /// texture handle for smooth playback.
 pub struct FrameCache {
+    /// Which actor this cache belongs to.
+    pub actor_index: usize,
     /// Temp directory holding extracted JPEG frames.
     pub cache_dir: PathBuf,
     /// Source video file path.
@@ -55,8 +57,9 @@ struct PreloadResult {
 
 impl FrameCache {
     /// Create a new empty frame cache (not yet ready).
-    pub fn new(source: PathBuf) -> Self {
+    pub fn new(source: PathBuf, actor_index: usize) -> Self {
         Self {
+            actor_index,
             cache_dir: PathBuf::new(),
             source,
             fps: 30.0,

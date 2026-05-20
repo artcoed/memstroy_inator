@@ -1072,64 +1072,67 @@ pub fn preview(ui: &mut egui::Ui, state: &mut EditorState) {
         Color32::from_rgb(10, 10, 16),
     );
 
-    // Use frame cache for real-time preview if available
-    if let Some(fc) = state.frame_cache.as_mut() {
-        if fc.is_ready() {
-            let t = state.playhead;
-            if let Some(tex) = fc.frame_at_time(t, ui.ctx()) {
-                let tex_id = tex.id();
-                let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-                ui.painter().image(tex_id, rect, uv, Color32::WHITE);
-            } else {
-                ui.put(
-                    rect,
-                    egui::Label::new(
-                        RichText::new("\u{1F3AC}\n\nLoading frame...")
-                            .color(Color32::from_rgb(80, 80, 100))
-                            .size(14.0),
-                    ),
-                );
+    // Layer compositing: iterate actors bottom-to-top
+    let t = state.playhead;
+    let mut any_frame_shown = false;
+
+    for (actor_idx, actor) in state.scene.actors.iter().enumerate() {
+        // Check if this actor is active at current playhead time
+        let t_in = actor.t_in.unwrap_or(0.0);
+        let t_out = actor.t_out.unwrap_or(f32::MAX);
+        if t < t_in || t > t_out {
+            continue; // clip not active at this time
+        }
+
+        // Compute local time within this clip
+        let local_t = t - t_in + actor.source_start;
+
+        // Get frame from this actor's cache
+        if let Some(fc) = state.frame_caches.get_mut(actor_idx) {
+            if fc.is_ready() {
+                if let Some(tex) = fc.frame_at_time(local_t, ui.ctx()) {
+                    let tex_id = tex.id();
+                    let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                    ui.painter().image(tex_id, rect, uv, Color32::WHITE);
+                    any_frame_shown = true;
+                }
+            } else if fc.extracting {
+                // Show extracting indicator only if no other frame is shown
+                if !any_frame_shown {
+                    ui.put(rect, egui::Label::new(
+                        RichText::new("\u{23F3} Extracting frames...")
+                            .color(Color32::from_rgb(180, 150, 60)).size(14.0),
+                    ));
+                }
             }
-        } else if fc.extracting {
+        }
+    }
+
+    if !any_frame_shown && state.frame_caches.is_empty() {
+        // Fallback: old PNG-based preview or placeholder
+        if let Some(p) = &state.last_preview {
+            let uri = format!("file://{}", p.display());
+            ui.put(rect, egui::Image::from_uri(uri).fit_to_exact_size(rect.size()));
+        } else {
             ui.put(
                 rect,
                 egui::Label::new(
-                    RichText::new("\u{23F3}\n\nExtracting preview frames...")
-                        .color(Color32::from_rgb(180, 150, 60))
-                        .size(14.0),
+                    RichText::new(
+                        "\u{1F3AC}\n\nRender \u{2192} Preview frame\nto see your meme here",
+                    )
+                    .color(Color32::from_rgb(80, 80, 100))
+                    .size(16.0),
                 ),
             );
-            ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
-        } else {
-            // Fallback: old PNG-based preview
-            if let Some(p) = &state.last_preview {
-                let uri = format!("file://{}", p.display());
-                ui.put(rect, egui::Image::from_uri(uri).fit_to_exact_size(rect.size()));
-            } else {
-                ui.put(
-                    rect,
-                    egui::Label::new(
-                        RichText::new(
-                            "\u{1F3AC}\n\nRender \u{2192} Preview frame\nto see your meme here",
-                        )
-                        .color(Color32::from_rgb(80, 80, 100))
-                        .size(16.0),
-                    ),
-                );
-            }
         }
-    } else if let Some(p) = &state.last_preview {
-        let uri = format!("file://{}", p.display());
-        ui.put(rect, egui::Image::from_uri(uri).fit_to_exact_size(rect.size()));
-    } else {
+    } else if !any_frame_shown {
+        // Frame caches exist but no clip is active at current time
         ui.put(
             rect,
             egui::Label::new(
-                RichText::new(
-                    "\u{1F3AC}\n\nRender \u{2192} Preview frame\nto see your meme here",
-                )
-                .color(Color32::from_rgb(80, 80, 100))
-                .size(16.0),
+                RichText::new("\u{1F3AC}\n\nNo clip active at this time")
+                    .color(Color32::from_rgb(80, 80, 100))
+                    .size(14.0),
             ),
         );
     }

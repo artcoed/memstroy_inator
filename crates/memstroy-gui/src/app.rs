@@ -18,8 +18,8 @@ pub struct App {
     tx: Sender<JobEvent>,
     rx: Receiver<JobEvent>,
     node_editor: NodeEditor,
-    /// Shared slot for receiving frame extraction completion data.
-    frame_extract_result: Arc<Mutex<Option<(f32, usize, std::path::PathBuf)>>>,
+    /// Per-actor extraction results. Key = actor index.
+    frame_extract_results: Vec<Arc<Mutex<Option<(f32, usize, std::path::PathBuf)>>>>,
 }
 
 impl App {
@@ -33,7 +33,7 @@ impl App {
             tx,
             rx,
             node_editor: NodeEditor::default(),
-            frame_extract_result: Arc::new(Mutex::new(None)),
+            frame_extract_results: Vec::new(),
         }
     }
 
@@ -421,58 +421,74 @@ impl App {
         }
     }
 
-    /// Start frame extraction for the first actor's source video.
+    /// Start frame extraction for ALL actors in the scene.
     fn start_frame_extraction(&mut self) {
-        let source = if let Some(actor) = self.state.scene.actors.first() {
-            actor.source.clone()
-        } else {
-            return;
-        };
-
-        if !source.exists() {
+        let num_actors = self.state.scene.actors.len();
+        if num_actors == 0 {
             return;
         }
 
-        // Skip if we already have a cache for this source
-        if let Some(fc) = &self.state.frame_cache {
-            if fc.source == source && (fc.is_ready() || fc.extracting) {
-                return;
+        // Ensure frame_caches and frame_extract_results are sized to match actors
+        while self.state.frame_caches.len() < num_actors {
+            let idx = self.state.frame_caches.len();
+            let source = self.state.scene.actors[idx].source.clone();
+            self.state.frame_caches.push(crate::video_cache::FrameCache::new(source, idx));
+        }
+        while self.frame_extract_results.len() < num_actors {
+            self.frame_extract_results.push(Arc::new(Mutex::new(None)));
+        }
+
+        for actor_idx in 0..num_actors {
+            let source = self.state.scene.actors[actor_idx].source.clone();
+
+            if !source.exists() {
+                continue;
             }
-        }
 
-        let mut cache = crate::video_cache::FrameCache::new(source.clone());
-        cache.extracting = true;
-        self.state.frame_cache = Some(cache);
-
-        let result_slot = self.frame_extract_result.clone();
-        // Clear any previous result
-        if let Ok(mut slot) = result_slot.lock() {
-            *slot = None;
-        }
-
-        crate::video_cache::FrameCache::start_extraction(
-            source,
-            self.rt.handle(),
-            move |duration, frame_count, cache_dir| {
-                if let Ok(mut slot) = result_slot.lock() {
-                    *slot = Some((duration, frame_count, cache_dir));
+            // Skip if this actor's cache is already ready or extracting
+            if let Some(fc) = self.state.frame_caches.get(actor_idx) {
+                if (fc.is_ready() || fc.extracting) && fc.source == source {
+                    continue;
                 }
-            },
-        );
+            }
+
+            // Initialize or re-initialize the cache for this actor
+            let mut cache = crate::video_cache::FrameCache::new(source.clone(), actor_idx);
+            cache.extracting = true;
+            self.state.frame_caches[actor_idx] = cache;
+
+            let result_slot = self.frame_extract_results[actor_idx].clone();
+            // Clear any previous result
+            if let Ok(mut slot) = result_slot.lock() {
+                *slot = None;
+            }
+
+            crate::video_cache::FrameCache::start_extraction(
+                source,
+                self.rt.handle(),
+                move |duration, frame_count, cache_dir| {
+                    if let Ok(mut slot) = result_slot.lock() {
+                        *slot = Some((duration, frame_count, cache_dir));
+                    }
+                },
+            );
+        }
 
         self.state.status = "\u{1F3AC} Extracting preview frames...".into();
     }
 
-    /// Poll for frame extraction completion.
+    /// Poll for frame extraction completion across all actors.
     fn poll_frame_extraction(&mut self) {
-        if let Ok(mut slot) = self.frame_extract_result.lock() {
-            if let Some((duration, frame_count, cache_dir)) = slot.take() {
-                if let Some(fc) = self.state.frame_cache.as_mut() {
-                    fc.set_ready(duration, frame_count, cache_dir);
-                    self.state.status = format!(
-                        "\u{2705} Preview ready: {} frames ({:.1}s)",
-                        frame_count, duration
-                    );
+        for actor_idx in 0..self.frame_extract_results.len() {
+            if let Ok(mut slot) = self.frame_extract_results[actor_idx].lock() {
+                if let Some((duration, frame_count, cache_dir)) = slot.take() {
+                    if let Some(fc) = self.state.frame_caches.get_mut(actor_idx) {
+                        fc.set_ready(duration, frame_count, cache_dir);
+                        self.state.status = format!(
+                            "\u{2705} Preview ready (actor {}): {} frames ({:.1}s)",
+                            actor_idx, frame_count, duration
+                        );
+                    }
                 }
             }
         }
@@ -583,7 +599,7 @@ impl eframe::App for App {
 
         // Auto-preview: only if ffmpeg available, not playing, playhead was manually moved,
         // and frame cache is NOT active (frame cache provides real-time preview instead).
-        let frame_cache_active = self.state.frame_cache.as_ref().is_some_and(|fc| fc.is_ready());
+        let frame_cache_active = self.state.frame_caches.iter().any(|fc| fc.is_ready());
         if self.state.ffmpeg_available && !self.state.playing && !frame_cache_active {
             let playhead_delta = (self.state.playhead - self.state.last_rendered_playhead).abs();
             if playhead_delta > 0.1 && !self.state.preview_rendering {
@@ -691,7 +707,7 @@ impl eframe::App for App {
         // - When playing without frame cache: 33ms (~30fps)
         // - When idle/paused: only repaint if jobs are running (reactive mode)
         if self.state.playing {
-            if self.state.frame_cache.as_ref().is_some_and(|fc| fc.is_ready()) {
+            if self.state.frame_caches.iter().any(|fc| fc.is_ready()) {
                 ctx.request_repaint_after(std::time::Duration::from_millis(16));
             } else {
                 ctx.request_repaint_after(std::time::Duration::from_millis(33));

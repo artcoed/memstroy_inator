@@ -41,8 +41,8 @@ pub struct EditorState {
     pub ffmpeg_available: bool,
     /// Razor tool mode: when active, clicking a track bar splits at click position.
     pub razor_mode: bool,
-    /// Frame cache for real-time video preview playback.
-    pub frame_cache: Option<crate::video_cache::FrameCache>,
+    /// Per-actor frame caches for real-time video preview. Key = actor index.
+    pub frame_caches: Vec<crate::video_cache::FrameCache>,
 }
 
 #[derive(Default)]
