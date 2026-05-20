@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use memstroy_core::{AnchorSample, AnchorTrack, Keypoint};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
-use tracing::{info, warn};
+use tracing::info;
 
 /// COCO-17 keypoint names in standard YOLO-pose output order.
 const COCO_KEYPOINTS: &[&str] = &[
@@ -131,7 +131,7 @@ fn run_onnx_inference(
 ) -> Result<Vec<AnchorSample>> {
     use ort::session::builder::GraphOptimizationLevel;
 
-    let mut builder = ort::session::Session::builder()
+    let builder = ort::session::Session::builder()
         .map_err(|e| anyhow!("ort session builder: {}", e))?;
     let mut builder = builder
         .with_optimization_level(GraphOptimizationLevel::Level3)

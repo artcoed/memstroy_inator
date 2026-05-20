@@ -11,6 +11,7 @@ use tracing::warn;
 
 /// Messages from background jobs to the UI thread.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum JobEvent {
     Status(String),
     PreviewReady(PathBuf),

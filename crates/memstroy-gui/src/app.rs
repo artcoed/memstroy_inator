@@ -1,6 +1,5 @@
 //! Main eframe application: wires panels together and dispatches jobs.
 
-use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 
 use egui::{Color32, RichText, ViewportCommand, Rounding, Stroke, Vec2};

@@ -143,8 +143,9 @@ fn clip_card(ui: &mut egui::Ui, state: &mut EditorState, clip: &crate::state::Li
                         .color(Color32::from_rgb(140, 100, 255))
                         .strong(),
                 );
-                let desc = if clip.description.len() > 60 {
-                    format!("{}...", &clip.description[..57])
+                let desc = if clip.description.chars().count() > 60 {
+                    let truncated: String = clip.description.chars().take(57).collect();
+                    format!("{}...", truncated)
                 } else if clip.description.is_empty() {
                     "No description".to_string()
                 } else {

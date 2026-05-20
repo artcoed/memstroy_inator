@@ -1,4 +1,5 @@
 //! Undo/Redo system based on scene snapshots.
+#![allow(dead_code)]
 //!
 //! Every mutation that should be undoable must be wrapped in
 //! `push_undo()`. The system stores up to MAX_HISTORY full scene

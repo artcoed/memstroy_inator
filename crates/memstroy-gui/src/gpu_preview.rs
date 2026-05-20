@@ -1,4 +1,5 @@
 //! GPU-accelerated preview compositor using wgpu.
+#![allow(dead_code)]
 //!
 //! Renders the scene at a given time `t` into an RGBA pixel buffer
 //! that can be uploaded to an egui texture for live scrubbing.
@@ -14,11 +15,10 @@
 //! scrubbing at 30+ fps even on integrated GPUs.
 
 use std::path::Path;
-use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use memstroy_core::*;
-use tracing::{info, warn};
+use tracing::info;
 
 /// Output of a single preview frame render.
 pub struct PreviewFrame {
@@ -188,7 +188,7 @@ impl PreviewCompositor {
 
     /// Render one frame of the scene at time `t`.
     /// Returns RGBA8 pixel buffer of size width * height * 4.
-    pub fn render_frame(&self, scene: &Scene, t: f32, assets_root: &Path) -> Result<PreviewFrame> {
+    pub fn render_frame(&self, scene: &Scene, _t: f32, _assets_root: &Path) -> Result<PreviewFrame> {
         let w = self.width;
         let h = self.height;
 

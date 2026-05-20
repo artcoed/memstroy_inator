@@ -20,7 +20,7 @@ pub struct EditorState {
     pub refreshing: bool,
     pub undo: UndoStack,
     /// Drag state for timeline interactions.
-    pub drag: DragState,
+    pub _drag: DragState,
 }
 
 #[derive(Default)]
@@ -31,6 +31,7 @@ pub struct AssetLibrary {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct LibraryClip {
     pub id: u64,
     pub path: PathBuf,
@@ -39,6 +40,7 @@ pub struct LibraryClip {
 }
 
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum Selection {
     #[default]
     None,
@@ -49,6 +51,7 @@ pub enum Selection {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct RenderProgress {
     pub started: std::time::Instant,
     pub last_log: String,
@@ -58,6 +61,7 @@ pub struct RenderProgress {
 
 /// What's currently being dragged in the timeline.
 #[derive(Default, Clone, Copy, PartialEq)]
+#[allow(dead_code)]
 pub enum DragState {
     #[default]
     None,

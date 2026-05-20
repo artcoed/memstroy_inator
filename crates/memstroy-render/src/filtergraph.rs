@@ -787,7 +787,7 @@ fn build_anchor_position_expr(
     track: &AnchorTrack,
     anchor_name: &str,
     offset: [f32; 2],
-    prop_scale: f32,
+    _prop_scale: f32,
     actor_layout: &[Keyframe<ActorState>],
     w: u32,
     h: u32,
