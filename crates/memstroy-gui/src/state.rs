@@ -248,6 +248,40 @@ pub struct EditorState {
     pub clip_editor_open: bool,
     /// Detected pose points from motion tracking (normalised [0,1] coordinates)
     pub detected_points: Vec<[f32; 2]>,
+
+    /// Index of text overlay currently being inline-edited on the preview
+    pub editing_text_overlay: Option<usize>,
+
+    /// AI generation: user prompt
+    pub ai_prompt: String,
+    /// AI generation: pasted JSON result from AI
+    pub ai_result_json: String,
+    /// AI generation: whether the AI window is open
+    pub ai_window_open: bool,
+
+    // ─── Auto-save / recovery ──────────────────────────────────────
+    /// Timestamp of last autosave (None until first autosave fires).
+    pub last_autosave: Option<std::time::Instant>,
+    /// Autosave interval in seconds.
+    pub autosave_interval: f32,
+    /// Path to a recovery scene that was found at startup, awaiting user decision.
+    pub recovery_pending: Option<std::path::PathBuf>,
+    /// Whether the recovery dialog is currently visible.
+    pub recovery_dialog_open: bool,
+    /// Time when the "Auto-saved" toast started (for fading the message after 2s).
+    pub autosave_toast_until: Option<std::time::Instant>,
+
+    // ─── Loop preview ──────────────────────────────────────────────
+    /// Whether loop-preview mode is active.
+    pub loop_mode: bool,
+    /// Optional (start, end) loop region in seconds.
+    pub loop_region: Option<(f32, f32)>,
+    /// Pending loop edit: holds the first Shift+click time until the second click.
+    pub loop_pending_start: Option<f32>,
+
+    // ─── Title templates popup ─────────────────────────────────────
+    /// Whether the "Add Title" template picker popup is open.
+    pub title_picker_open: bool,
 }
 
 #[derive(Default)]
@@ -334,6 +368,26 @@ impl EditorState {
 
         s.detected_points = Vec::new();
 
+        s.editing_text_overlay = None;
+        s.ai_prompt = String::new();
+        s.ai_result_json = String::new();
+        s.ai_window_open = false;
+
+        // Auto-save defaults
+        s.last_autosave = None;
+        s.autosave_interval = 30.0;
+        s.recovery_pending = None;
+        s.recovery_dialog_open = false;
+        s.autosave_toast_until = None;
+
+        // Loop preview defaults
+        s.loop_mode = false;
+        s.loop_region = None;
+        s.loop_pending_start = None;
+
+        // Title templates popup
+        s.title_picker_open = false;
+
         s
     }
 
@@ -343,6 +397,21 @@ impl EditorState {
 
     pub fn state_path(&self) -> PathBuf {
         self.clips_dir().join("state.json")
+    }
+
+    /// Directory used for the autosave file. Falls back to the OS temp dir
+    /// when `$HOME` is not set.
+    pub fn autosave_dir() -> PathBuf {
+        if let Some(home) = std::env::var_os("HOME") {
+            let p = PathBuf::from(home).join(".memstroy");
+            return p;
+        }
+        std::env::temp_dir().join("memstroy")
+    }
+
+    /// Path of the autosave scene file.
+    pub fn autosave_path() -> PathBuf {
+        Self::autosave_dir().join("autosave.scene.yaml")
     }
 
     /// Save undo snapshot, then apply a mutation via the closure.

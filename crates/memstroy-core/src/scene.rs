@@ -175,9 +175,22 @@ pub struct Actor {
     /// Whether this actor is visible in preview. Defaults to true.
     #[serde(default = "default_true")]
     pub visible: bool,
+    /// Color correction parameters for this actor.
+    #[serde(default)]
+    pub color_correction: ColorCorrection,
+    /// Transition applied when the actor enters its visible window.
+    #[serde(default)]
+    pub transition_in: Transition,
+    /// Transition applied when the actor leaves its visible window.
+    #[serde(default)]
+    pub transition_out: Transition,
+    /// Duration of the in/out transitions in seconds.
+    #[serde(default = "default_transition_duration")]
+    pub transition_duration: f32,
 }
 
 fn default_true() -> bool { true }
+fn default_transition_duration() -> f32 { 0.3 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct ActorState {
@@ -207,6 +220,25 @@ impl crate::keyframe::Lerp for ActorState {
             rotation_deg: self.rotation_deg.lerp(&other.rotation_deg, t),
             opacity: self.opacity.lerp(&other.opacity, t),
         }
+    }
+}
+
+/// Color correction parameters applied to an actor or overlay.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ColorCorrection {
+    #[serde(default)]
+    pub brightness: f32,
+    #[serde(default = "one")]
+    pub contrast: f32,
+    #[serde(default = "one")]
+    pub saturation: f32,
+    #[serde(default)]
+    pub temperature: f32,
+}
+
+impl Default for ColorCorrection {
+    fn default() -> Self {
+        Self { brightness: 0.0, contrast: 1.0, saturation: 1.0, temperature: 0.0 }
     }
 }
 
