@@ -116,11 +116,69 @@ pub struct AudioWaveform {
     pub duration: f32,
     /// Whether waveform extraction is complete.
     pub ready: bool,
+    /// Whether extraction is currently running.
+    pub extracting: bool,
 }
 
 impl Default for AudioWaveform {
     fn default() -> Self {
-        Self { peaks: Vec::new(), duration: 0.0, ready: false }
+        Self { peaks: Vec::new(), duration: 0.0, ready: false, extracting: false }
+    }
+}
+
+impl AudioWaveform {
+    /// Extract audio peaks from a file using ffmpeg. Returns peaks vector.
+    /// This runs synchronously and should be called from a background thread.
+    pub fn extract_peaks(audio_path: &std::path::Path, num_samples: usize) -> Option<(Vec<f32>, f32)> {
+        let ffprobe = {
+            let mut p = memstroy_render::ffmpeg_binary();
+            p.set_file_name("ffprobe");
+            if !p.exists() { std::path::PathBuf::from("ffprobe") } else { p }
+        };
+
+        // Get duration
+        let duration = match std::process::Command::new(&ffprobe)
+            .args(["-v", "error", "-show_entries", "format=duration",
+                   "-of", "default=noprint_wrappers=1:nokey=1"])
+            .arg(audio_path)
+            .output()
+        {
+            Ok(out) => String::from_utf8_lossy(&out.stdout).trim().parse::<f32>().unwrap_or(0.0),
+            Err(_) => return None,
+        };
+
+        if duration <= 0.0 { return None; }
+
+        // Extract raw PCM samples via ffmpeg, downsample to mono 8kHz
+        let ffmpeg = memstroy_render::ffmpeg_binary();
+        let output = std::process::Command::new(&ffmpeg)
+            .args(["-y", "-hide_banner", "-loglevel", "error",
+                   "-i"])
+            .arg(audio_path)
+            .args(["-ac", "1", "-ar", "8000", "-f", "s16le", "-"])
+            .output();
+
+        let raw = match output {
+            Ok(o) if o.status.success() => o.stdout,
+            _ => return None,
+        };
+
+        // Convert i16 PCM to peaks
+        let samples: Vec<i16> = raw.chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect();
+
+        if samples.is_empty() { return None; }
+
+        let chunk_size = (samples.len() / num_samples).max(1);
+        let peaks: Vec<f32> = samples.chunks(chunk_size)
+            .map(|chunk| {
+                let max_val = chunk.iter().map(|s| s.unsigned_abs() as f32).fold(0.0_f32, f32::max);
+                (max_val / 32768.0).clamp(0.0, 1.0)
+            })
+            .collect();
+
+        Some((peaks, duration))
     }
 }
 
