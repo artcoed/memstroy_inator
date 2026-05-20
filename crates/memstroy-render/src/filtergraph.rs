@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use memstroy_core::*;
+use memstroy_vision::pose::load_anchor_track;
 
 use crate::plan::{FfmpegInput, InputKind};
 
@@ -210,15 +211,13 @@ impl<'a> FilterGraphBuilder<'a> {
         for actor in &self.scene.actors {
             let path = self.resolve(&actor.source);
             let idx = self.add_input(FfmpegInput {
-                path,
+                path: path.clone(),
                 kind: InputKind::Video,
                 r#loop: actor.loop_source,
                 seek: if actor.source_start > 0.0 { Some(actor.source_start) } else { None },
                 t: None,
             });
 
-            // chromakey + despill (despill is a no-op approximation
-            // using `colorchannelmixer`; full despill comes later).
             let key = actor.chroma_key.key_color;
             let key_hex = format!("0x{:02X}{:02X}{:02X}", key[0], key[1], key[2]);
             let mut chain = format!(
@@ -232,10 +231,6 @@ impl<'a> FilterGraphBuilder<'a> {
                 chain.push_str(",hflip");
             }
 
-            // Resolve the actor's animation: position + scale at the
-            // start keyframe (full piecewise expressions are added in
-            // a follow-up). For now we emit the value at t=0 and a
-            // linear ramp toward the next keyframe if present.
             let (pos_x, pos_y, scale_expr) = position_and_scale_expr(&actor.layout, w, h);
             chain.push_str(&format!(",scale=w='iw*{scale_expr}':h='ih*{scale_expr}':eval=frame"));
 
@@ -255,6 +250,95 @@ impl<'a> FilterGraphBuilder<'a> {
                 actor = actor_label,
                 x = pos_x,
                 y = pos_y,
+                enable = enable,
+                out = composed,
+            ));
+            self.cursor = composed;
+
+            // ─── ATTACHMENTS ─────────────────────────────────────
+            if !actor.attachments.is_empty() {
+                self.emit_attachments(actor, w, h)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Emit overlay filters for each attachment on an actor.
+    /// Props are positioned based on the actor's AnchorTrack (if available)
+    /// or fall back to the actor's center position.
+    fn emit_attachments(&mut self, actor: &Actor, w: u32, h: u32) -> Result<()> {
+        // Try to load anchor track
+        let track = actor.anchors.as_ref().and_then(|p| {
+            let resolved = self.resolve(p);
+            load_anchor_track(&resolved)
+                .or_else(|| {
+                    // Also try loading from actor source path
+                    load_anchor_track(&self.resolve(&actor.source))
+                })
+        }).or_else(|| {
+            // Fallback: try to load from actor source .anchors.json
+            load_anchor_track(&self.resolve(&actor.source))
+        });
+
+        for attachment in &actor.attachments {
+            let prop_path = self.resolve(&attachment.asset);
+            let idx = self.add_input(FfmpegInput {
+                path: prop_path,
+                kind: InputKind::Image,
+                r#loop: false,
+                seek: None,
+                t: None,
+            });
+
+            // Compute position expression for this prop
+            let (prop_x, prop_y) = if let Some(ref track) = track {
+                // Build piecewise expression from anchor samples
+                let anchor_name = anchor_point_to_name(attachment.anchor);
+                build_anchor_position_expr(
+                    track,
+                    &anchor_name,
+                    attachment.offset,
+                    attachment.scale,
+                    &actor.layout,
+                    w,
+                    h,
+                )
+            } else {
+                // Fallback: position relative to actor's center
+                let (ax, ay, _) = position_and_scale_expr(&actor.layout, w, h);
+                (
+                    format!("{}+{}", ax, attachment.offset[0]),
+                    format!("{}+{}", ay, attachment.offset[1]),
+                )
+            };
+
+            // Scale expression: actor_scale * attachment.scale
+            let (_, _, actor_scale) = position_and_scale_expr(&actor.layout, w, h);
+            let prop_scale = format!("{}*{}", actor_scale, attachment.scale);
+
+            // Build filter chain for the prop
+            let chain = format!(
+                "[{idx}:v]format=yuva420p,scale=w='iw*{s}':h='ih*{s}':eval=frame",
+                idx = idx,
+                s = prop_scale,
+            );
+            let prop_label = self.alloc_label("prop");
+            self.chunks.push(format!("{chain}{out}", chain = chain, out = prop_label));
+
+            // Overlay prop on top of current composite
+            let enable = match (actor.t_in, actor.t_out) {
+                (Some(a), Some(b)) => format!(":enable='between(t,{},{})'", a, b),
+                (Some(a), None) => format!(":enable='gte(t,{})'", a),
+                (None, Some(b)) => format!(":enable='lte(t,{})'", b),
+                (None, None) => String::new(),
+            };
+            let composed = self.alloc_label("propstack");
+            self.chunks.push(format!(
+                "{cur}{prop}overlay=x='{x}':y='{y}'{enable}:eof_action=pass{out}",
+                cur = self.cursor,
+                prop = prop_label,
+                x = prop_x,
+                y = prop_y,
                 enable = enable,
                 out = composed,
             ));
@@ -518,4 +602,113 @@ fn escape_drawtext(s: &str) -> String {
         }
     }
     out
+}
+
+/// Convert an `AnchorPoint` enum to the string key used in AnchorTrack JSON.
+fn anchor_point_to_name(ap: AnchorPoint) -> String {
+    // serde serializes with snake_case, which matches our track keys
+    serde_json::to_string(&ap)
+        .unwrap_or_default()
+        .trim_matches('"')
+        .to_string()
+}
+
+/// Build FFmpeg piecewise-linear position expressions for a prop that
+/// tracks an anchor point from an AnchorTrack.
+///
+/// The anchor track provides normalised [0,1] positions per sample time.
+/// We combine these with the actor's own layout (position/scale) to get
+/// final scene-space pixel coordinates for the prop overlay.
+fn build_anchor_position_expr(
+    track: &AnchorTrack,
+    anchor_name: &str,
+    offset: [f32; 2],
+    prop_scale: f32,
+    actor_layout: &[Keyframe<ActorState>],
+    w: u32,
+    h: u32,
+) -> (String, String) {
+    // Collect samples where this anchor has data
+    let points: Vec<(f32, f32, f32)> = track
+        .samples
+        .iter()
+        .filter_map(|s| {
+            s.points.get(anchor_name).map(|kp| (s.t, kp.x, kp.y))
+        })
+        .collect();
+
+    if points.is_empty() {
+        // No anchor data — fall back to actor center + offset
+        let (ax, ay, _) = position_and_scale_expr(actor_layout, w, h);
+        return (
+            format!("{}+{}", ax, offset[0]),
+            format!("{}+{}", ay, offset[1]),
+        );
+    }
+
+    // Build piecewise if(lt(t,...)) expressions for x and y.
+    // The anchor coords are in video-normalised space [0,1].
+    // To convert to scene pixel position:
+    //   scene_x = actor_pos_x_pixels + (anchor_x - 0.5) * actor_scaled_width + offset_x
+    //
+    // Simplified approach: since the actor is already overlaid at its position,
+    // and the prop overlay is placed on the full scene canvas, we compute:
+    //   prop_scene_x = actor_scene_x + (anchor_norm_x - 0.5) * actor_width * actor_scale + offset_x
+    //
+    // For FFmpeg expressions: the overlay x/y are relative to the main canvas.
+    // We'll use the actor's position expression as base and offset by the anchor delta.
+
+    let (actor_x_expr, actor_y_expr, actor_scale_expr) =
+        position_and_scale_expr(actor_layout, w, h);
+
+    // For simplicity with many samples, we limit to at most 20 keypoints
+    // (FFmpeg expressions have practical length limits)
+    let max_samples = 20;
+    let step = (points.len() / max_samples).max(1);
+    let sampled: Vec<&(f32, f32, f32)> = points.iter().step_by(step).collect();
+
+    if sampled.len() <= 1 {
+        // Single point — static offset
+        let (_, ax, ay) = sampled.first().map(|&&p| p).unwrap_or((0.0, 0.5, 0.5));
+        let dx = (ax - 0.5) * w as f32;
+        let dy = (ay - 0.5) * h as f32;
+        return (
+            format!("({}+{}*{}+{})-w/2", actor_x_expr, dx, actor_scale_expr, offset[0]),
+            format!("({}+{}*{}+{})-h/2", actor_y_expr, dy, actor_scale_expr, offset[1]),
+        );
+    }
+
+    // Build piecewise expression for anchor offset from center
+    let build_piecewise = |sampled: &[&(f32, f32, f32)], getter: &dyn Fn(&(f32, f32, f32)) -> f32| -> String {
+        let last_val = getter(sampled.last().unwrap());
+        let mut expr = format!("{}", last_val);
+        for window in sampled.windows(2).rev() {
+            let (t0, ..) = window[0];
+            let (t1, ..) = window[1];
+            let v0 = getter(window[0]);
+            let v1 = getter(window[1]);
+            let span = (t1 - t0).max(1e-6);
+            expr = format!(
+                "if(lt(t,{}),{}+({})*((t-{})/{})  ,{})",
+                t1, v0, v1 - v0, t0, span, expr
+            );
+        }
+        expr
+    };
+
+    // anchor_x values (normalised 0..1, we want delta from 0.5 * scene_width)
+    let ax_expr = build_piecewise(&sampled, &|p| (p.1 - 0.5) * w as f32);
+    let ay_expr = build_piecewise(&sampled, &|p| (p.2 - 0.5) * h as f32);
+
+    // Final position: actor_base + anchor_delta * actor_scale + offset - prop_center
+    let prop_x = format!(
+        "({}+({})*{}+{})-w/2",
+        actor_x_expr, ax_expr, actor_scale_expr, offset[0]
+    );
+    let prop_y = format!(
+        "({}+({})*{}+{})-h/2",
+        actor_y_expr, ay_expr, actor_scale_expr, offset[1]
+    );
+
+    (prop_x, prop_y)
 }

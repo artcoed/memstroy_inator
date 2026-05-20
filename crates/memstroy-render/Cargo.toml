@@ -13,5 +13,6 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 memstroy-core = { workspace = true }
 memstroy-vision = { path = "../memstroy-vision" }
