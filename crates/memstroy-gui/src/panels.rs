@@ -919,7 +919,11 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
 
 
 /// Draw a single clip bar on the timeline. Returns Some(time) if clicked (for razor or select).
-/// NO resize handles — just a solid bar that can be clicked/dragged as a whole.
+/// Returns special sentinel values for edge-trim drags:
+/// - `f32::INFINITY` signals "trim left edge"
+/// - `f32::NEG_INFINITY` signals "trim right edge"
+/// - Negative values signal whole-clip drag (new start time encoded as `-new_start`)
+/// Shows ResizeHorizontal cursor when hovering within 5px of left/right edge.
 #[allow(clippy::too_many_arguments)]
 fn draw_clip(
     ui: &mut egui::Ui,
@@ -974,13 +978,29 @@ fn draw_clip(
             egui::FontId::proportional(10.0), Color32::WHITE);
     }
 
-    // Interaction (simple click/drag, no resize handles)
+    // Interaction (click/drag with edge-trim zones)
     let id = ui.make_persistent_id(("clip", label, clip_start as u32));
     let sense = if locked { Sense::hover() } else { Sense::click_and_drag() };
     let resp = ui.interact(bar_rect, id, sense);
 
+    // Edge-trim zone detection (5px from left/right edge)
+    const TRIM_ZONE_PX: f32 = 5.0;
+    let hover_pos = ui.input(|i| i.pointer.hover_pos());
+    let near_left_edge = hover_pos
+        .map(|p| p.x >= bar_rect.min.x && p.x <= bar_rect.min.x + TRIM_ZONE_PX && bar_rect.y_range().contains(p.y))
+        .unwrap_or(false);
+    let near_right_edge = hover_pos
+        .map(|p| p.x >= bar_rect.max.x - TRIM_ZONE_PX && p.x <= bar_rect.max.x && bar_rect.y_range().contains(p.y))
+        .unwrap_or(false);
+
     if resp.hovered() && !locked {
-        ui.ctx().set_cursor_icon(if razor_mode { egui::CursorIcon::Crosshair } else { egui::CursorIcon::Grab });
+        if razor_mode {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+        } else if near_left_edge || near_right_edge {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+        } else {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+        }
     }
 
     if resp.clicked() {
@@ -993,13 +1013,25 @@ fn draw_clip(
         return Some(clip_start); // signal selection
     }
 
-    // Drag to move clip horizontally — return negative value to signal drag delta
+    // Drag handling: edge-trim vs whole-clip move
     if resp.dragged() && !locked && !razor_mode {
         let dx = resp.drag_delta().x;
         let delta_secs = dx / pps;
-        // Encode: return -(clip_start + delta) as a signal that this is a drag
-        // We use a special sentinel: if delta != 0, return the NEW start time as negative
-        if delta_secs.abs() > 0.001 {
+
+        // Determine drag origin position from the initial press
+        let drag_origin = resp.interact_pointer_pos().unwrap_or_default();
+        let started_near_left = drag_origin.x <= bar_rect.min.x + TRIM_ZONE_PX;
+        let started_near_right = drag_origin.x >= bar_rect.max.x - TRIM_ZONE_PX;
+
+        if started_near_left && delta_secs.abs() > 0.001 {
+            // Trim left edge: encode as f32::INFINITY with delta stored in sign
+            // Convention: INFINITY signals trim-left, actual delta comes from drag
+            return Some(f32::INFINITY);
+        } else if started_near_right && delta_secs.abs() > 0.001 {
+            // Trim right edge: encode as NEG_INFINITY signals trim-right
+            return Some(f32::NEG_INFINITY);
+        } else if delta_secs.abs() > 0.001 {
+            // Normal move: return the NEW start time as negative
             return Some(-(clip_start + delta_secs));
         }
         return Some(clip_start); // just select if no movement
@@ -1197,18 +1229,68 @@ pub fn preview(ui: &mut egui::Ui, state: &mut EditorState) {
                     let ax = actor_state.pos[0];
                     let ay = actor_state.pos[1];
                     let ascale = actor_state.scale;
+                    let rotation_rad = actor_state.rotation_deg.to_radians();
 
                     // Actor rect centered at (ax, ay) in normalized coords, scaled
                     let actor_w = rect.width() * ascale * 0.5;
                     let actor_h = rect.height() * ascale * 0.5;
                     let cx = rect.min.x + ax * rect.width();
                     let cy = rect.min.y + ay * rect.height();
-                    let actor_rect = egui::Rect::from_center_size(
-                        egui::pos2(cx, cy), Vec2::new(actor_w, actor_h));
 
-                    let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
                     let tint = Color32::from_rgba_unmultiplied(255, 255, 255, (actor_state.opacity * 255.0) as u8);
-                    ui.painter().image(tex.id(), actor_rect, uv, tint);
+
+                    if rotation_rad.abs() > 0.001 {
+                        // Draw rotated: compute rotated corner positions
+                        let cos_r = rotation_rad.cos();
+                        let sin_r = rotation_rad.sin();
+                        let hw = actor_w * 0.5;
+                        let hh = actor_h * 0.5;
+
+                        // Corners relative to center (top-left, top-right, bottom-right, bottom-left)
+                        let corners_local = [
+                            [-hw, -hh],
+                            [ hw, -hh],
+                            [ hw,  hh],
+                            [-hw,  hh],
+                        ];
+
+                        // Rotate each corner and translate to screen position
+                        let rotated_positions: Vec<egui::Pos2> = corners_local.iter().map(|[lx, ly]| {
+                            let rx = lx * cos_r - ly * sin_r + cx;
+                            let ry = lx * sin_r + ly * cos_r + cy;
+                            egui::pos2(rx, ry)
+                        }).collect();
+
+                        // UV corners matching position corners (TL, TR, BR, BL)
+                        let uv_corners = [
+                            egui::pos2(0.0, 0.0),
+                            egui::pos2(1.0, 0.0),
+                            egui::pos2(1.0, 1.0),
+                            egui::pos2(0.0, 1.0),
+                        ];
+
+                        // Draw as two textured triangles via mesh
+                        let mut mesh = egui::Mesh::with_texture(tex.id());
+                        for i in 0..4 {
+                            mesh.vertices.push(egui::epaint::Vertex {
+                                pos: rotated_positions[i],
+                                uv: uv_corners[i],
+                                color: tint,
+                            });
+                        }
+                        // Triangle 1: TL, TR, BR
+                        mesh.indices.extend_from_slice(&[0, 1, 2]);
+                        // Triangle 2: TL, BR, BL
+                        mesh.indices.extend_from_slice(&[0, 2, 3]);
+
+                        ui.painter().add(egui::Shape::mesh(mesh));
+                    } else {
+                        // No rotation: draw axis-aligned image (fast path)
+                        let actor_rect = egui::Rect::from_center_size(
+                            egui::pos2(cx, cy), Vec2::new(actor_w, actor_h));
+                        let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                        ui.painter().image(tex.id(), actor_rect, uv, tint);
+                    }
                     any_frame_shown = true;
                 }
             } else if fc.extracting && !any_frame_shown {
@@ -1445,5 +1527,129 @@ fn probe_video_duration(path: &PathBuf) -> f32 {
     {
         Ok(out) => String::from_utf8_lossy(&out.stdout).trim().parse::<f32>().unwrap_or(5.0),
         Err(_) => 5.0,
+    }
+}
+
+
+// ─── KEYBOARD SHORTCUTS ──────────────────────────────────────────────
+
+/// Handle JKL/IO keyboard shortcuts for playback and clip trimming.
+///
+/// - J: decrease playback speed or play backwards
+/// - K: pause
+/// - L: increase playback speed or start playing
+/// - I: set t_in of selected clip to current playhead
+/// - O: set t_out of selected clip to current playhead
+pub fn handle_keyboard_shortcuts(ctx: &egui::Context, state: &mut EditorState) {
+    let j_pressed = ctx.input(|i| i.key_pressed(egui::Key::J));
+    let k_pressed = ctx.input(|i| i.key_pressed(egui::Key::K));
+    let l_pressed = ctx.input(|i| i.key_pressed(egui::Key::L));
+    let i_pressed = ctx.input(|i| i.key_pressed(egui::Key::I));
+    let o_pressed = ctx.input(|i| i.key_pressed(egui::Key::O));
+
+    // J: decrease speed or reverse
+    if j_pressed {
+        if !state.playing {
+            state.playing = true;
+            state.playback_speed = -1.0;
+        } else if state.playback_speed > -4.0 {
+            state.playback_speed = (state.playback_speed - 1.0).max(-4.0);
+            if state.playback_speed == 0.0 {
+                state.playback_speed = -1.0;
+            }
+        }
+    }
+
+    // K: pause
+    if k_pressed {
+        state.playing = false;
+    }
+
+    // L: increase speed or start playing
+    if l_pressed {
+        if !state.playing {
+            state.playing = true;
+            state.playback_speed = 1.0;
+        } else if state.playback_speed < 4.0 {
+            state.playback_speed = (state.playback_speed + 1.0).min(4.0);
+            if state.playback_speed == 0.0 {
+                state.playback_speed = 1.0;
+            }
+        }
+    }
+
+    // I: set t_in of selected clip to current playhead
+    if i_pressed {
+        let ph = state.playhead;
+        match state.selection {
+            Selection::Actor(idx) => {
+                if idx < state.scene.actors.len() {
+                    state.scene.actors[idx].t_in = Some(ph);
+                    state.status = format!("Set in-point to {:.2}s", ph);
+                }
+            }
+            Selection::Overlay(idx) => {
+                if idx < state.scene.overlays.len() {
+                    match &mut state.scene.overlays[idx] {
+                        Overlay::Text(t) => { t.t_in = ph; }
+                        Overlay::Image(im) => { im.t_in = ph; }
+                        Overlay::Video(v) => { v.t_in = ph; }
+                    }
+                    state.status = format!("Set in-point to {:.2}s", ph);
+                }
+            }
+            Selection::Background(idx) => {
+                if idx < state.scene.backgrounds.len() {
+                    let old_end = state.scene.backgrounds[idx].start + state.scene.backgrounds[idx].duration;
+                    state.scene.backgrounds[idx].start = ph;
+                    state.scene.backgrounds[idx].duration = (old_end - ph).max(0.01);
+                    state.status = format!("Set in-point to {:.2}s", ph);
+                }
+            }
+            Selection::Audio(idx) => {
+                if idx < state.scene.audio.len() {
+                    state.scene.audio[idx].t_in = ph;
+                    state.status = format!("Set in-point to {:.2}s", ph);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // O: set t_out of selected clip to current playhead
+    if o_pressed {
+        let ph = state.playhead;
+        match state.selection {
+            Selection::Actor(idx) => {
+                if idx < state.scene.actors.len() {
+                    state.scene.actors[idx].t_out = Some(ph);
+                    state.status = format!("Set out-point to {:.2}s", ph);
+                }
+            }
+            Selection::Overlay(idx) => {
+                if idx < state.scene.overlays.len() {
+                    match &mut state.scene.overlays[idx] {
+                        Overlay::Text(t) => { t.t_out = ph; }
+                        Overlay::Image(im) => { im.t_out = ph; }
+                        Overlay::Video(v) => { v.t_out = ph; }
+                    }
+                    state.status = format!("Set out-point to {:.2}s", ph);
+                }
+            }
+            Selection::Background(idx) => {
+                if idx < state.scene.backgrounds.len() {
+                    let start = state.scene.backgrounds[idx].start;
+                    state.scene.backgrounds[idx].duration = (ph - start).max(0.01);
+                    state.status = format!("Set out-point to {:.2}s", ph);
+                }
+            }
+            Selection::Audio(idx) => {
+                if idx < state.scene.audio.len() {
+                    state.scene.audio[idx].t_out = Some(ph);
+                    state.status = format!("Set out-point to {:.2}s", ph);
+                }
+            }
+            _ => {}
+        }
     }
 }
