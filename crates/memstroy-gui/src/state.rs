@@ -45,6 +45,8 @@ pub struct EditorState {
     pub frame_caches: Vec<crate::video_cache::FrameCache>,
     /// Eyedropper mode: when true, clicking on preview picks the pixel color for chroma-key.
     pub eyedropper_active: bool,
+    /// Whether the Assets tab is active (vs Clips tab) in the left panel.
+    pub assets_tab_active: bool,
 }
 
 #[derive(Default)]

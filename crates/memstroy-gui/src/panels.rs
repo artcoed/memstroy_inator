@@ -10,6 +10,24 @@ use crate::state::{EditorState, Selection};
 // ─── LIBRARY ─────────────────────────────────────────────────────────
 
 pub fn library(ui: &mut egui::Ui, state: &mut EditorState, _request_refresh: impl Fn()) {
+    // Tab selector
+    ui.horizontal(|ui| {
+        let clips_tab = ui.selectable_label(!state.assets_tab_active, "Clips");
+        let assets_tab = ui.selectable_label(state.assets_tab_active, "Assets");
+        if clips_tab.clicked() { state.assets_tab_active = false; }
+        if assets_tab.clicked() { state.assets_tab_active = true; }
+    });
+    ui.separator();
+    ui.add_space(4.0);
+
+    if state.assets_tab_active {
+        assets_panel(ui, state);
+    } else {
+        clips_panel(ui, state);
+    }
+}
+
+fn clips_panel(ui: &mut egui::Ui, state: &mut EditorState) {
     ui.horizontal(|ui| {
         ui.label(RichText::new("Library").size(16.0).strong());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -97,6 +115,69 @@ pub fn library(ui: &mut egui::Ui, state: &mut EditorState, _request_refresh: imp
             }
         });
     }
+}
+
+fn assets_panel(ui: &mut egui::Ui, state: &mut EditorState) {
+    ui.label(RichText::new("Props & Images").size(14.0).strong());
+    ui.add_space(4.0);
+
+    if state.library.props.is_empty() {
+        ui.label(
+            RichText::new("No props found.\nAdd PNG/WebP files to assets/props/")
+                .italics()
+                .color(Color32::from_rgb(140, 140, 160))
+                .size(12.0),
+        );
+    } else {
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for p in state.library.props.clone() {
+                let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("(?)").to_string();
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("\u{1F5BC}").size(14.0));
+                    ui.label(RichText::new(&name).size(11.0));
+                    if ui.small_button("+").on_hover_text("Add as image overlay").clicked() {
+                        add_image_overlay(state, &p);
+                    }
+                });
+            }
+        });
+    }
+
+    ui.add_space(10.0);
+    ui.label(RichText::new("Backgrounds").size(14.0).strong());
+    ui.add_space(4.0);
+
+    if state.library.backgrounds.is_empty() {
+        ui.label(
+            RichText::new("No backgrounds found.")
+                .italics()
+                .color(Color32::from_rgb(140, 140, 160))
+                .size(12.0),
+        );
+    } else {
+        for p in state.library.backgrounds.clone() {
+            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("(?)").to_string();
+            if ui.button(RichText::new(&name).size(11.0)).clicked() {
+                add_background_from_path(state, &p);
+            }
+        }
+    }
+}
+
+fn add_image_overlay(state: &mut EditorState, path: &PathBuf) {
+    let id = path.file_stem().and_then(|s| s.to_str())
+        .map(|s| format!("img_{}", s))
+        .unwrap_or_else(|| format!("img_{}", state.scene.overlays.len() + 1));
+    let overlay = Overlay::Image(memstroy_core::ImageOverlay {
+        id: id.clone(),
+        source: path.clone(),
+        t_in: 0.0,
+        t_out: state.scene.output.duration,
+        layout: vec![Keyframe::new(0.0, memstroy_core::OverlayState { pos: [0.5, 0.5], scale: 0.3, rotation_deg: 0.0, opacity: 1.0 })],
+    });
+    state.scene.overlays.push(overlay);
+    state.selection = Selection::Overlay(state.scene.overlays.len() - 1);
+    state.status = format!("Added image overlay: {}", id);
 }
 
 fn clip_card(ui: &mut egui::Ui, state: &mut EditorState, clip: &crate::state::LibraryClip) {
@@ -383,6 +464,78 @@ fn actor_editor(ui: &mut egui::Ui, a: &mut Actor) {
             let last = a.layout.last().cloned().unwrap_or_else(|| Keyframe::new(0.0, ActorState::default()));
             a.layout.push(Keyframe::new(last.t + 1.0, last.value));
         }
+    });
+
+    // Visual curve editor for selected property
+    ui.add_space(4.0);
+    egui::CollapsingHeader::new(
+        RichText::new("\u{1F4C8} Curve Editor").color(Color32::from_rgb(150, 200, 255)),
+    )
+    .show(ui, |ui| {
+        if a.layout.len() < 2 {
+            ui.label(RichText::new("Need 2+ keyframes to show curve").italics().size(11.0).color(Color32::from_rgb(140, 140, 160)));
+            return;
+        }
+
+        let avail_w = ui.available_width();
+        let graph_h = 100.0;
+        let duration = a.t_out.unwrap_or(8.0) - a.t_in.unwrap_or(0.0);
+
+        let (graph_rect, _) = ui.allocate_exact_size(egui::vec2(avail_w, graph_h), Sense::hover());
+        let painter = ui.painter_at(graph_rect);
+
+        // Background
+        painter.rect_filled(graph_rect, Rounding::same(4.0), Color32::from_rgb(20, 20, 32));
+
+        // Grid lines
+        for i in 1..4 {
+            let y = graph_rect.min.y + (i as f32 / 4.0) * graph_h;
+            painter.line_segment(
+                [egui::pos2(graph_rect.min.x, y), egui::pos2(graph_rect.max.x, y)],
+                Stroke::new(1.0, Color32::from_rgb(35, 35, 50)),
+            );
+        }
+
+        // Draw scale curve (Y axis = scale 0..2, X axis = time)
+        let scale_min = 0.0_f32;
+        let scale_max = 2.0_f32;
+
+        if a.layout.len() >= 2 {
+            let mut prev_point: Option<egui::Pos2> = None;
+            // Draw lines between keyframes
+            for kf in &a.layout {
+                let x_frac = (kf.t / duration.max(0.01)).clamp(0.0, 1.0);
+                let y_frac = 1.0 - ((kf.value.scale - scale_min) / (scale_max - scale_min)).clamp(0.0, 1.0);
+                let x = graph_rect.min.x + x_frac * avail_w;
+                let y = graph_rect.min.y + y_frac * graph_h;
+                let point = egui::pos2(x, y);
+
+                if let Some(prev) = prev_point {
+                    painter.line_segment([prev, point], Stroke::new(2.0, Color32::from_rgb(100, 200, 255)));
+                }
+                prev_point = Some(point);
+
+                // Draw point
+                painter.circle_filled(point, 4.0, Color32::from_rgb(100, 200, 255));
+                painter.circle_stroke(point, 4.0, Stroke::new(1.0, Color32::WHITE));
+            }
+        }
+
+        // Labels
+        painter.text(
+            egui::pos2(graph_rect.min.x + 4.0, graph_rect.min.y + 2.0),
+            egui::Align2::LEFT_TOP,
+            "Scale",
+            egui::FontId::proportional(9.0),
+            Color32::from_rgb(100, 200, 255),
+        );
+        painter.text(
+            egui::pos2(graph_rect.min.x + 4.0, graph_rect.max.y - 12.0),
+            egui::Align2::LEFT_TOP,
+            format!("0-{:.1}s", duration),
+            egui::FontId::proportional(9.0),
+            Color32::from_rgb(120, 120, 150),
+        );
     });
 }
 
