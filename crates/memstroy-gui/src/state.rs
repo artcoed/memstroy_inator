@@ -5,6 +5,125 @@ use memstroy_tg::model::DownloadState;
 
 use crate::undo::UndoStack;
 
+/// Fixed track in the timeline. Tracks are numbered lanes; clips sit on them.
+#[derive(Debug, Clone)]
+pub struct Track {
+    pub name: String,
+    pub kind: TrackKind,
+    pub muted: bool,
+    pub locked: bool,
+    pub visible: bool,
+    /// Height in pixels (can be resized).
+    pub height: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackKind {
+    Video,
+    Audio,
+}
+
+impl Track {
+    pub fn video(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            kind: TrackKind::Video,
+            muted: false,
+            locked: false,
+            visible: true,
+            height: 40.0,
+        }
+    }
+    pub fn audio(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            kind: TrackKind::Audio,
+            muted: false,
+            locked: false,
+            visible: true,
+            height: 48.0,
+        }
+    }
+}
+
+/// A clip placed on a track at a specific time.
+#[derive(Debug, Clone)]
+pub struct TimelineClip {
+    /// Which track index this clip is on.
+    pub track_index: usize,
+    /// What scene element this clip represents.
+    pub element: ClipElement,
+    /// Start time on the timeline (seconds).
+    pub start: f32,
+    /// Duration on the timeline (seconds).
+    pub duration: f32,
+    /// Offset into the source media (for trimmed clips).
+    pub source_offset: f32,
+    /// Color for the clip bar.
+    pub color: [u8; 3],
+}
+
+/// What scene element a timeline clip corresponds to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClipElement {
+    Actor(usize),
+    Overlay(usize),
+    Background(usize),
+    Audio(usize),
+}
+
+/// Drag-and-drop state for timeline clips.
+#[derive(Default, Clone)]
+pub struct TimelineDrag {
+    /// Which clip is being dragged (by its index in timeline_clips).
+    pub dragging_clip: Option<usize>,
+    /// Original track when drag started.
+    pub original_track: usize,
+    /// Original start time when drag started.
+    pub original_start: f32,
+    /// Accumulated drag delta in pixels.
+    pub drag_delta_x: f32,
+    pub drag_delta_y: f32,
+}
+
+/// Drag-and-drop state for asset library items.
+#[derive(Default, Clone)]
+pub struct AssetDrag {
+    /// Path of the asset being dragged from library.
+    pub dragging: Option<PathBuf>,
+    /// Kind of asset being dragged.
+    pub kind: AssetDragKind,
+    /// Current mouse position during drag.
+    pub pos: [f32; 2],
+}
+
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+pub enum AssetDragKind {
+    #[default]
+    None,
+    Clip,
+    Background,
+    Prop,
+    Audio,
+}
+
+/// Audio waveform data for visualization.
+#[derive(Debug, Clone)]
+pub struct AudioWaveform {
+    /// Peak amplitudes (0.0..1.0) sampled at regular intervals.
+    pub peaks: Vec<f32>,
+    /// Duration of the audio file in seconds.
+    pub duration: f32,
+    /// Whether waveform extraction is complete.
+    pub ready: bool,
+}
+
+impl Default for AudioWaveform {
+    fn default() -> Self {
+        Self { peaks: Vec::new(), duration: 0.0, ready: false }
+    }
+}
+
 /// Editor-side selection state.
 #[derive(Default)]
 pub struct EditorState {
@@ -19,8 +138,6 @@ pub struct EditorState {
     pub render_progress: Option<RenderProgress>,
     pub refreshing: bool,
     pub undo: UndoStack,
-    /// Drag state for timeline interactions.
-    pub _drag: DragState,
     /// Playback state
     pub playing: bool,
     /// Playback speed multiplier (1.0 = normal, 2.0 = 2x, 0.5 = half)
@@ -29,9 +146,9 @@ pub struct EditorState {
     pub last_rendered_playhead: f32,
     /// Whether a preview render is currently in-flight
     pub preview_rendering: bool,
-    /// Timeline zoom level (1.0 = full duration visible, 2.0 = zoomed 2x)
+    /// Timeline zoom level (pixels per second)
     pub timeline_zoom: f32,
-    /// Timeline scroll offset (normalised 0..1)
+    /// Timeline horizontal scroll offset in seconds
     pub timeline_scroll: f32,
     /// Whether the (scaffold) node editor window is open.
     pub node_editor_open: bool,
@@ -47,6 +164,20 @@ pub struct EditorState {
     pub eyedropper_active: bool,
     /// Whether the Assets tab is active (vs Clips tab) in the left panel.
     pub assets_tab_active: bool,
+
+    // ─── NEW: Premiere Pro-style timeline ───
+    /// Fixed tracks (lanes). Clips are placed on tracks.
+    pub tracks: Vec<Track>,
+    /// Timeline drag state for clip movement between tracks.
+    pub timeline_drag: TimelineDrag,
+    /// Asset drag from library to timeline.
+    pub asset_drag: AssetDrag,
+    /// Audio waveforms keyed by audio track index.
+    pub audio_waveforms: Vec<AudioWaveform>,
+    /// Whether snapping is enabled (clips snap to playhead, other clip edges).
+    pub snap_enabled: bool,
+    /// Inspector tab: 0=Transform, 1=Timing, 2=Effects
+    pub inspector_tab: usize,
 }
 
 #[derive(Default)]
@@ -75,6 +206,7 @@ pub enum Selection {
     Overlay(usize),
     Background(usize),
     Camera(usize),
+    Audio(usize),
 }
 
 #[derive(Debug, Clone)]
@@ -86,21 +218,16 @@ pub struct RenderProgress {
     pub error: Option<String>,
 }
 
-/// What's currently being dragged in the timeline.
+/// Legacy DragState kept for compatibility but mostly unused now.
 #[derive(Default, Clone, Copy, PartialEq)]
 #[allow(dead_code)]
 pub enum DragState {
     #[default]
     None,
-    /// Dragging a background segment's start time.
     BackgroundStart(usize),
-    /// Dragging a background segment's end (duration).
     BackgroundEnd(usize),
-    /// Moving a background segment (both start & end).
-    BackgroundMove(usize, f32), // index, original_start
-    /// Moving an actor's t_in/t_out window.
+    BackgroundMove(usize, f32),
     ActorMove(usize),
-    /// Moving an overlay's time window.
     OverlayMove(usize),
 }
 
@@ -111,10 +238,23 @@ impl EditorState {
         s.scene = Scene::default();
         s.status = "Ready".into();
         s.playback_speed = 1.0;
-        s.timeline_zoom = 1.0;
-        s.last_rendered_playhead = -1.0; // force first render
+        s.timeline_zoom = 80.0; // 80 pixels per second
+        s.timeline_scroll = 0.0;
+        s.last_rendered_playhead = -1.0;
         s.ffmpeg_available = check_ffmpeg();
         s.razor_mode = false;
+        s.snap_enabled = true;
+        s.inspector_tab = 0;
+
+        // Default tracks: 3 video + 2 audio
+        s.tracks = vec![
+            Track::video("V1"),
+            Track::video("V2"),
+            Track::video("V3"),
+            Track::audio("A1"),
+            Track::audio("A2"),
+        ];
+
         s
     }
 
@@ -146,6 +286,51 @@ impl EditorState {
             self.scene = next;
             self.status = "\u{21AA} Redo".into();
         }
+    }
+
+    /// Get the track index for a given clip element based on the current scene layout.
+    /// This is a heuristic — actors go on V1-V3, overlays on V2-V3, bgs on V1, audio on A1-A2.
+    pub fn default_track_for_element(&self, elem: &ClipElement) -> usize {
+        match elem {
+            ClipElement::Actor(i) => {
+                // Spread actors across video tracks
+                let video_tracks: Vec<usize> = self.tracks.iter().enumerate()
+                    .filter(|(_, t)| t.kind == TrackKind::Video)
+                    .map(|(i, _)| i)
+                    .collect();
+                if video_tracks.is_empty() { 0 } else { video_tracks[*i % video_tracks.len()] }
+            }
+            ClipElement::Background(_) => 0, // Always bottom video track
+            ClipElement::Overlay(i) => {
+                let video_tracks: Vec<usize> = self.tracks.iter().enumerate()
+                    .filter(|(_, t)| t.kind == TrackKind::Video)
+                    .map(|(i, _)| i)
+                    .collect();
+                if video_tracks.len() >= 2 { video_tracks[1.min(video_tracks.len() - 1)] }
+                else if !video_tracks.is_empty() { video_tracks[0] }
+                else { *i }
+            }
+            ClipElement::Audio(i) => {
+                let audio_tracks: Vec<usize> = self.tracks.iter().enumerate()
+                    .filter(|(_, t)| t.kind == TrackKind::Audio)
+                    .map(|(i, _)| i)
+                    .collect();
+                if audio_tracks.is_empty() { self.tracks.len().saturating_sub(1) }
+                else { audio_tracks[*i % audio_tracks.len()] }
+            }
+        }
+    }
+
+    /// Add a new video track.
+    pub fn add_video_track(&mut self) {
+        let n = self.tracks.iter().filter(|t| t.kind == TrackKind::Video).count() + 1;
+        self.tracks.push(Track::video(format!("V{}", n)));
+    }
+
+    /// Add a new audio track.
+    pub fn add_audio_track(&mut self) {
+        let n = self.tracks.iter().filter(|t| t.kind == TrackKind::Audio).count() + 1;
+        self.tracks.push(Track::audio(format!("A{}", n)));
     }
 
     pub fn reload_library(&mut self) {
