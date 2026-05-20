@@ -31,9 +31,11 @@ impl App {
                 JobEvent::Status(s) => self.state.status = s,
                 JobEvent::PreviewReady(p) => {
                     self.state.last_preview = Some(p);
+                    self.state.preview_rendering = false;
                     ctx.forget_all_images();
                 }
                 JobEvent::PreviewFailed(e) => {
+                    self.state.preview_rendering = false;
                     self.state.status = format!("\u{274C} Preview failed: {}", e);
                 }
                 JobEvent::RenderLog(line) => {
@@ -158,6 +160,15 @@ impl App {
         let ctrl = modifiers.ctrl || modifiers.mac_cmd;
 
         ctx.input(|i| {
+            // Space = Play/Pause
+            if i.key_pressed(egui::Key::Space) {
+                self.state.playing = !self.state.playing;
+                if self.state.playing {
+                    self.state.status = "\u{25B6} Playing".into();
+                } else {
+                    self.state.status = "\u{23F8} Paused".into();
+                }
+            }
             // Ctrl+Z = Undo
             if ctrl && i.key_pressed(egui::Key::Z) && !modifiers.shift {
                 self.state.undo();
@@ -324,6 +335,24 @@ impl eframe::App for App {
         // Keyboard shortcuts
         self.handle_shortcuts(ctx);
 
+        // Play/pause: advance playhead
+        if self.state.playing {
+            let dt = ctx.input(|i| i.stable_dt).min(0.1); // cap at 100ms
+            self.state.playhead += dt * self.state.playback_speed;
+            if self.state.playhead >= self.state.scene.output.duration {
+                self.state.playhead = 0.0; // loop
+            }
+            ctx.request_repaint(); // keep animating
+        }
+
+        // Auto-preview: if playhead moved significantly and no render in-flight, trigger
+        let playhead_delta = (self.state.playhead - self.state.last_rendered_playhead).abs();
+        if playhead_delta > 0.05 && !self.state.preview_rendering {
+            self.state.preview_rendering = true;
+            self.state.last_rendered_playhead = self.state.playhead;
+            self.run_preview();
+        }
+
         // Apply modern dark style
         apply_style(ctx);
 
@@ -418,10 +447,11 @@ impl eframe::App for App {
             });
 
         // Keep refreshing UI while jobs are running
-        if self.state.refreshing
+        if self.state.playing
+            || self.state.refreshing
             || self.state.render_progress.as_ref().is_some_and(|p| !p.done)
         {
-            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            ctx.request_repaint_after(std::time::Duration::from_millis(16)); // ~60fps during playback
         }
     }
 }

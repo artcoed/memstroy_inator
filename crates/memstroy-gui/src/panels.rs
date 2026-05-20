@@ -390,7 +390,38 @@ fn background_editor(ui: &mut egui::Ui, b: &mut Background) {
 pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     ui.horizontal(|ui| {
         ui.heading(RichText::new("\u{23F1} Timeline").size(16.0).strong());
-        ui.add_space(12.0);
+        ui.add_space(8.0);
+
+        // Play/Pause button
+        let play_label = if state.playing { "\u{23F8}" } else { "\u{25B6}" };
+        let play_btn = egui::Button::new(
+            RichText::new(play_label).size(16.0).color(Color32::WHITE),
+        )
+        .fill(if state.playing {
+            Color32::from_rgb(200, 80, 80)
+        } else {
+            Color32::from_rgb(60, 180, 80)
+        })
+        .rounding(Rounding::same(6.0))
+        .min_size(egui::vec2(32.0, 24.0));
+        if ui.add(play_btn).on_hover_text("Play/Pause (Space)").clicked() {
+            state.playing = !state.playing;
+        }
+
+        // Speed selector
+        ui.add_space(4.0);
+        egui::ComboBox::from_id_source("speed")
+            .width(50.0)
+            .selected_text(format!("{}x", state.playback_speed))
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut state.playback_speed, 0.25, "0.25x");
+                ui.selectable_value(&mut state.playback_speed, 0.5, "0.5x");
+                ui.selectable_value(&mut state.playback_speed, 1.0, "1x");
+                ui.selectable_value(&mut state.playback_speed, 2.0, "2x");
+                ui.selectable_value(&mut state.playback_speed, 4.0, "4x");
+            });
+
+        ui.add_space(8.0);
 
         // Undo/redo buttons
         let can_undo = state.undo.can_undo();
@@ -410,22 +441,39 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             state.redo();
         }
 
-        ui.add_space(12.0);
+        ui.add_space(8.0);
+
+        // Playhead time display
+        ui.label(
+            RichText::new(format!("{:.2}s / {:.1}s", state.playhead, state.scene.output.duration))
+                .size(12.0)
+                .color(Color32::from_rgb(180, 180, 220))
+                .strong(),
+        );
+
+        ui.add_space(8.0);
 
         // Playhead slider
         ui.add(
             egui::Slider::new(&mut state.playhead, 0.0..=state.scene.output.duration)
-                .text("s")
-                .show_value(true),
+                .show_value(false),
+        );
+
+        // Timeline zoom
+        ui.add_space(4.0);
+        ui.label(RichText::new("\u{1F50D}").size(12.0));
+        ui.add(
+            egui::Slider::new(&mut state.timeline_zoom, 1.0..=8.0)
+                .show_value(false)
+                .logarithmic(true),
         );
 
         // Delete / Duplicate buttons
-        ui.add_space(8.0);
-        if ui.button("\u{1F5D1}").on_hover_text("Delete selected (Del)").clicked() {
-            // Will be handled by app shortcut logic via flag
+        ui.add_space(4.0);
+        if ui.button("\u{1F5D1}").on_hover_text("Delete (Del)").clicked() {
             state.status = "__DELETE_SELECTED__".into();
         }
-        if ui.button("\u{1F4CB}").on_hover_text("Duplicate selected (Ctrl+D)").clicked() {
+        if ui.button("\u{1F4CB}").on_hover_text("Duplicate (Ctrl+D)").clicked() {
             state.status = "__DUPLICATE_SELECTED__".into();
         }
     });
@@ -530,8 +578,9 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
         state.selection = sel;
     }
 
-    // Draw playhead marker
-    // (visual only — the actual position is controlled by the slider above)
+    // Draw playhead indicator line over tracks
+    // (We need to recalculate the track area position)
+    // This is a simplified version — the playhead slider above is the primary control
 }
 
 /// Draw a single horizontal track bar. Returns true if clicked.

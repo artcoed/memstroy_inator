@@ -21,6 +21,18 @@ pub struct EditorState {
     pub undo: UndoStack,
     /// Drag state for timeline interactions.
     pub _drag: DragState,
+    /// Playback state
+    pub playing: bool,
+    /// Playback speed multiplier (1.0 = normal, 2.0 = 2x, 0.5 = half)
+    pub playback_speed: f32,
+    /// Last playhead value that was rendered as preview (for auto-preview debounce)
+    pub last_rendered_playhead: f32,
+    /// Whether a preview render is currently in-flight
+    pub preview_rendering: bool,
+    /// Timeline zoom level (1.0 = full duration visible, 2.0 = zoomed 2x)
+    pub timeline_zoom: f32,
+    /// Timeline scroll offset (normalised 0..1)
+    pub timeline_scroll: f32,
 }
 
 #[derive(Default)]
@@ -84,6 +96,9 @@ impl EditorState {
         s.assets_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         s.scene = Scene::default();
         s.status = "Ready. Click \u{1F504} Refresh Clips to download mellstroy footage!".into();
+        s.playback_speed = 1.0;
+        s.timeline_zoom = 1.0;
+        s.last_rendered_playhead = -1.0; // force first render
         s
     }
 
