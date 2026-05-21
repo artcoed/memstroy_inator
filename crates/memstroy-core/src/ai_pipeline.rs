@@ -354,6 +354,7 @@ impl MontageOutput {
                 t_out: Some(ap.t_out),
                 source_start: 0.0,
                 volume: ap.volume,
+                parent_actor: None,
             });
         }
     }
