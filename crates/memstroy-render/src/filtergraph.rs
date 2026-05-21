@@ -554,8 +554,18 @@ impl<'a> FilterGraphBuilder<'a> {
 
     /// Apply camera moves (zoom/pan/rotate) to the final composite.
     /// Uses FFmpeg's `crop` + `scale` filters with piecewise expressions
-    /// driven by `CameraState` keyframes.
+    /// driven by `CameraState` keyframes OR the new `RenderFrame` layout.
     fn emit_camera(&mut self) -> Result<()> {
+        // Prefer new render_frame if it has non-trivial keyframes
+        let use_render_frame = self.scene.render_frame.layout.len() > 1
+            || self.scene.render_frame.layout.first()
+                .map(|kf| kf.value.zoom != 1.0 || kf.value.rotation_deg != 0.0)
+                .unwrap_or(false);
+
+        if use_render_frame {
+            return self.emit_render_frame_camera();
+        }
+
         if self.scene.camera.is_empty() {
             return Ok(());
         }
@@ -630,6 +640,79 @@ impl<'a> FilterGraphBuilder<'a> {
             ));
         } else {
             // No rotation: just crop + scale
+            self.chunks.push(format!(
+                "{cur}crop=w='{cw}':h='{ch}':x='{cx}':y='{cy}',scale={w}:{h}{out}",
+                cur = self.cursor,
+                cw = crop_w, ch = crop_h, cx = crop_x, cy = crop_y,
+                w = w, h = h, out = cam_label,
+            ));
+        }
+
+        self.cursor = cam_label;
+        Ok(())
+    }
+
+    /// Emit camera based on the new RenderFrame layout (world-pixel coords).
+    /// The render frame defines a region on the canvas; we crop that region
+    /// from the composite and scale it to the output resolution.
+    fn emit_render_frame_camera(&mut self) -> Result<()> {
+        let [w, h] = self.scene.output.resolution;
+        let rf = &self.scene.render_frame;
+
+        // Build piecewise expressions for render frame zoom
+        let make_rf_expr = |getter: fn(&memstroy_core::RenderFrameState) -> f32| -> String {
+            if rf.layout.len() == 1 {
+                return format!("{}", getter(&rf.layout[0].value));
+            }
+            let mut expr = format!("{}", getter(&rf.layout.last().unwrap().value));
+            for win in rf.layout.windows(2).rev() {
+                let (a, b) = (&win[0], &win[1]);
+                let v0 = getter(&a.value);
+                let v1 = getter(&b.value);
+                let span = (b.t - a.t).max(1e-6);
+                expr = format!(
+                    "if(lt(t,{tb}),{v0}+({v1}-{v0})*((t-{ta})/{span}),{else_})",
+                    tb = b.t, v0 = v0, v1 = v1, ta = a.t, span = span, else_ = expr
+                );
+            }
+            expr
+        };
+
+        let zoom_expr = make_rf_expr(|s| s.zoom);
+        let rot_expr = make_rf_expr(|s| s.rotation_deg);
+
+        // For the render frame, crop_w = W/zoom, crop_h = H/zoom
+        // Center is at render_frame pos which is in world pixels — for now
+        // we normalise relative to output res (legacy compatibility)
+        let crop_w = format!("floor({w}/({zoom})/2)*2", w = w, zoom = zoom_expr);
+        let crop_h = format!("floor({h}/({zoom})/2)*2", h = h, zoom = zoom_expr);
+        // Center crop at 0.5,0.5 (canvas elements are already placed relative to frame)
+        let crop_x = format!(
+            "max(0,floor(({w}-floor({w}/({zoom})/2)*2)/2))",
+            w = w, zoom = zoom_expr
+        );
+        let crop_y = format!(
+            "max(0,floor(({h}-floor({h}/({zoom})/2)*2)/2))",
+            h = h, zoom = zoom_expr
+        );
+
+        let cam_label = self.alloc_label("rfcam");
+
+        let has_rotation = rf.layout.iter().any(|kf| kf.value.rotation_deg.abs() > 0.01);
+        if has_rotation {
+            let rot_rad = format!("({})*PI/180", rot_expr);
+            let rot_label = self.alloc_label("rfrot");
+            self.chunks.push(format!(
+                "{cur}rotate={rad}:c=none:ow=iw:oh=ih{out}",
+                cur = self.cursor, rad = rot_rad, out = rot_label,
+            ));
+            self.chunks.push(format!(
+                "{rot}crop=w='{cw}':h='{ch}':x='{cx}':y='{cy}',scale={w}:{h}{out}",
+                rot = rot_label,
+                cw = crop_w, ch = crop_h, cx = crop_x, cy = crop_y,
+                w = w, h = h, out = cam_label,
+            ));
+        } else {
             self.chunks.push(format!(
                 "{cur}crop=w='{cw}':h='{ch}':x='{cx}':y='{cy}',scale={w}:{h}{out}",
                 cur = self.cursor,

@@ -1255,7 +1255,7 @@ impl eframe::App for App {
                     .inner_margin(10.0),
             )
             .show(ctx, |ui| {
-                panels::preview(ui, &mut self.state);
+                crate::canvas_preview::canvas_preview(ui, &mut self.state);
             });
 
         // Node editor floating window (scaffold)

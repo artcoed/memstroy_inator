@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use crate::anchor::AnchorPoint;
+use crate::canvas::{CanvasTransform, RenderFrame};
 use crate::keyframe::Keyframe;
 
 /// Top-level scene description. Saved as `*.scene.yaml`.
@@ -12,6 +13,8 @@ pub struct Scene {
     pub output: OutputSpec,
     #[serde(default)]
     pub backgrounds: Vec<Background>,
+    /// Legacy camera keyframes. Superseded by `render_frame` in v2 scenes
+    /// but kept for backward compatibility.
     #[serde(default)]
     pub camera: Vec<Keyframe<CameraState>>,
     #[serde(default)]
@@ -20,6 +23,25 @@ pub struct Scene {
     pub overlays: Vec<Overlay>,
     #[serde(default)]
     pub audio: Vec<AudioTrack>,
+    /// **Free Canvas v2**: The output render frame — a movable/animatable
+    /// rectangle on the infinite canvas. Defines what portion of the canvas
+    /// ends up in the rendered video. Replaces the old `camera` field.
+    #[serde(default)]
+    pub render_frame: RenderFrame,
+    /// **Free Canvas v2**: Per-actor world-pixel canvas transforms.
+    /// When present, these override the legacy normalised `layout` keyframes.
+    /// Indexed by actor id → keyframe track.
+    #[serde(default)]
+    pub canvas_layouts: Vec<CanvasLayout>,
+}
+
+/// Associates an element (by id) with a canvas-space keyframe track.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CanvasLayout {
+    /// ID of the actor/overlay this layout belongs to.
+    pub element_id: String,
+    /// Keyframes in world-pixel space.
+    pub keyframes: Vec<Keyframe<CanvasTransform>>,
 }
 
 fn default_format_version() -> u32 { 1 }
@@ -34,6 +56,8 @@ impl Default for Scene {
             actors: Vec::new(),
             overlays: Vec::new(),
             audio: Vec::new(),
+            render_frame: RenderFrame::default(),
+            canvas_layouts: Vec::new(),
         }
     }
 }

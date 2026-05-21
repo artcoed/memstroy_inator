@@ -282,6 +282,12 @@ pub struct EditorState {
     // ─── Title templates popup ─────────────────────────────────────
     /// Whether the "Add Title" template picker popup is open.
     pub title_picker_open: bool,
+
+    // ─── Free Canvas viewport ──────────────────────────────────────
+    /// Editor viewport camera for the free canvas (pan/zoom).
+    pub canvas_viewport: memstroy_core::EditorViewport,
+    /// Whether the canvas is in pan mode (middle mouse or Space+drag).
+    pub canvas_panning: bool,
 }
 
 #[derive(Default)]
@@ -387,6 +393,10 @@ impl EditorState {
 
         // Title templates popup
         s.title_picker_open = false;
+
+        // Free canvas viewport
+        s.canvas_viewport = memstroy_core::EditorViewport::default();
+        s.canvas_panning = false;
 
         s
     }
