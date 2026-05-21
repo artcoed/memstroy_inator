@@ -222,5 +222,7 @@ fn starter_scene() -> Scene {
         actors: Vec::new(),
         overlays: vec![text],
         audio: Vec::new(),
+        render_frame: RenderFrame::default(),
+        canvas_layouts: Vec::new(),
     }
 }
