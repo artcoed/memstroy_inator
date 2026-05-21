@@ -52,6 +52,23 @@ impl Track {
 #[derive(Default, Clone)]
 pub struct TimelineDrag {
     pub dragging_clip: Option<usize>,
+    /// Latest "new lane requested" intent emitted by the per-frame drag
+    /// classifier. We accumulate it during the gesture and only commit
+    /// the actual `state.tracks.insert` on drag END, so passing through a
+    /// gap on the way to a real lane doesn't create spurious empty
+    /// layers. Cleared on every drag start and on drag end.
+    pub pending_new_lane: Option<NewLaneIntent>,
+}
+
+/// What the layer panel wants to do when the current drag finally ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NewLaneIntent {
+    VideoTopForActor(usize),
+    VideoBottomForActor(usize),
+    VideoTopForOverlay(usize),
+    VideoBottomForOverlay(usize),
+    AudioTopForAudio(usize),
+    AudioBottomForAudio(usize),
 }
 
 /// Drag-and-drop state for an item being dragged out of the clip library.

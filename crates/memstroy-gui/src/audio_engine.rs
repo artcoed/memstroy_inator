@@ -24,6 +24,7 @@
 
 use std::fs::File;
 use std::io::BufReader;
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
@@ -169,13 +170,44 @@ impl AudioEngine {
                     continue;
                 }
             };
+            // Reject obviously empty / tiny files outright. rodio 0.19 + symphonia
+            // 0.5 will sometimes panic on init when the underlying source is too
+            // short to probe (the panic site is `unreachable!("Seek errors should
+            // not occur during initialization")` in rodio's symphonia adapter).
+            if let Ok(meta) = file.metadata() {
+                if meta.len() < 64 {
+                    debug!(
+                        "Skipping audio file (too small to decode): {}",
+                        spec.path.display()
+                    );
+                    continue;
+                }
+            }
             let reader = BufReader::new(file);
-            let decoder = match rodio::Decoder::new(reader) {
-                Ok(d) => d,
-                Err(e) => {
+            // `rodio::Decoder::new` can panic — not just return Err — when
+            // symphonia hits an unexpected internal seek error during probe.
+            // Wrap the call in `catch_unwind` so a single bad attachment
+            // (e.g. a video file with no audio stream, a partial download,
+            // or an unsupported codec) doesn't take down the whole audio
+            // worker thread.
+            let decoder_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                rodio::Decoder::new(reader)
+            }));
+            let decoder = match decoder_result {
+                Ok(Ok(d)) => d,
+                Ok(Err(e)) => {
                     // Many image / unsupported files end up here when an
                     // "actor" path doesn't actually have an audio stream.
                     debug!("No decodable audio in {}: {}", spec.path.display(), e);
+                    continue;
+                }
+                Err(_) => {
+                    // Decoder panicked while probing the source. Skip it
+                    // gracefully instead of crashing the worker thread.
+                    warn!(
+                        "Audio decoder panicked while probing {}; skipping.",
+                        spec.path.display()
+                    );
                     continue;
                 }
             };
