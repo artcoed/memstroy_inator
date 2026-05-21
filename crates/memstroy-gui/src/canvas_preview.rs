@@ -24,6 +24,13 @@ const COL_OVERLAY_IMAGE: Color32 = Color32::from_rgb(100, 180, 255);
 const COL_OVERLAY_VIDEO: Color32 = Color32::from_rgb(200, 100, 255);
 const COL_BACKGROUND: Color32 = Color32::from_rgb(60, 130, 220);
 const COL_RENDER_FRAME_HANDLE: Color32 = Color32::from_rgb(255, 120, 120);
+const COL_ROTATION_HANDLE: Color32 = Color32::from_rgb(120, 220, 255);
+
+/// Distance from the bbox top edge at which the rotation handle floats
+/// (in screen pixels). Bigger than the resize handle radius so the
+/// hit-tests don't overlap.
+const ROTATION_HANDLE_OFFSET: f32 = 28.0;
+const ROTATION_HANDLE_RADIUS: f32 = 7.0;
 
 
 // ─── LAYER ORDER HELPERS ─────────────────────────────────────────────
@@ -473,6 +480,59 @@ fn sample_render_frame(rf: &RenderFrame, t: f32) -> RenderFrameState {
     keyframe::sample(&rf.layout, t).unwrap_or_default()
 }
 
+/// Resolve a `SkeletonAttachment` on an overlay to a WORLD position by
+/// finding the host actor and projecting the normalised point through
+/// the actor's current bounding box. Returns `None` when the host or
+/// point can't be resolved.
+fn resolve_overlay_attachment_world(
+    state: &EditorState,
+    attachment: &SkeletonAttachment,
+    t: f32,
+) -> Option<WorldPos> {
+    // Find the matching template (by name or source-clip filename).
+    let template = state.scene.skeleton_templates.iter().find(|tmpl| {
+        tmpl.name == attachment.skeleton_id
+            || tmpl.source_clip.file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s == attachment.skeleton_id)
+                .unwrap_or(false)
+    })?;
+    let point_state = template.sample_point(&attachment.point_name, t)?;
+
+    // Find the host actor that uses this template's source clip.
+    let (host_idx, host_actor) = state.scene.actors.iter().enumerate().find(|(_, a)| {
+        a.source == template.source_clip
+            || a.source.file_name() == template.source_clip.file_name()
+    })?;
+    if !host_actor.visible { return None; }
+
+    // Host actor's world center + dimensions at `t`.
+    let host_world = get_element_world_pos(state, &host_actor.id, &host_actor.layout, t);
+    let host_state = keyframe::sample(&host_actor.layout, t).unwrap_or_default();
+    let (src_w, src_h) = if let Some(fc) = state.frame_caches.get(host_idx) {
+        if fc.is_ready() && fc.frame_count > 0 {
+            (fc.source_width as f32, fc.source_height as f32)
+        } else { (1080.0_f32, 1920.0) }
+    } else { (1080.0_f32, 1920.0) };
+    let elem_w = src_w * host_state.scale;
+    let elem_h = src_h * host_state.scale * host_state.scale_y;
+
+    // Map normalised clip coords [0,1] (with offset) to world space
+    // relative to the host actor's centre. Honor host rotation so the
+    // attached element follows when the host actor is rotated.
+    let nx = (point_state.x + attachment.offset[0]) - 0.5;
+    let ny = (point_state.y + attachment.offset[1]) - 0.5;
+    let local_x = nx * elem_w;
+    let local_y = ny * elem_h;
+    let rot = host_state.rotation_deg.to_radians();
+    let cs = rot.cos();
+    let sn = rot.sin();
+    Some(WorldPos {
+        x: host_world.x + local_x * cs - local_y * sn,
+        y: host_world.y + local_x * sn + local_y * cs,
+    })
+}
+
 
 // ─── ELEMENTS ON CANVAS ──────────────────────────────────────────────
 
@@ -587,14 +647,32 @@ fn draw_canvas_elements(
             .unwrap_or_default();
         let actor_scale = actor_state.scale;
         let actor_scale_y = actor_state.scale_y;
-        let actor_rotation = actor_state.rotation_deg;
+        // Modifiers (wobble/shake/pulse/spin) layered on top of the eased
+        // sample. They are additive and only run while the clip is active
+        // — outside the clip's window we use the raw sample so the static
+        // first/last preview doesn't shake.
+        let mod_delta = if matches!(display_mode, DisplayMode::Active) {
+            keyframe::evaluate_modifiers(&actor.modifiers, t - t_in)
+        } else {
+            keyframe::ModifierDelta::default()
+        };
+        let actor_rotation = actor_state.rotation_deg + mod_delta.d_rotation_deg;
         let actor_opacity = actor_state.opacity;
+        let actor_flip_x = actor_state.flip_x_anim;
+        let actor_flip_y = actor_state.flip_y_anim;
         // Apply per-axis scale: scale_y stretches Y on top of uniform scale.
-        let elem_width = src_w * actor_scale;
-        let elem_height = src_h * actor_scale * actor_scale_y;
+        // Modifiers are added uniformly to keep the aspect ratio sensible.
+        let scale_eff = (actor_scale + mod_delta.d_scale).max(0.001);
+        let elem_width = src_w * scale_eff;
+        let elem_height = src_h * scale_eff * actor_scale_y;
 
         // Convert to screen coordinates
-        let center_screen = state.canvas_viewport.world_to_screen(world_pos, viewport_size);
+        // Modifier (shake/wobble) offsets are added in world pixels.
+        let world_pos_with_mod = WorldPos {
+            x: world_pos.x + mod_delta.dx,
+            y: world_pos.y + mod_delta.dy,
+        };
+        let center_screen = state.canvas_viewport.world_to_screen(world_pos_with_mod, viewport_size);
         let half_w = elem_width * 0.5 * state.canvas_viewport.zoom;
         let half_h = elem_height * 0.5 * state.canvas_viewport.zoom;
 
@@ -645,34 +723,41 @@ fn draw_canvas_elements(
 
                 if let Some(tex) = texture {
                     let rotation_rad = actor_rotation.to_radians();
-                    if rotation_rad.abs() > 0.001 {
-                        let center = elem_rect.center();
-                        let hw = elem_rect.width() * 0.5;
-                        let hh = elem_rect.height() * 0.5;
-                        let cos_r = rotation_rad.cos();
-                        let sin_r = rotation_rad.sin();
-                        let corners_local = [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]];
-                        let uv_corners = [
-                            Pos2::new(0.0, 0.0), Pos2::new(1.0, 0.0),
-                            Pos2::new(1.0, 1.0), Pos2::new(0.0, 1.0),
-                        ];
-                        let mut mesh = egui::Mesh::with_texture(tex.id());
-                        for ci in 0..4 {
-                            let [lx, ly] = corners_local[ci];
-                            let rx = lx * cos_r - ly * sin_r + center.x;
-                            let ry = lx * sin_r + ly * cos_r + center.y;
-                            mesh.vertices.push(egui::epaint::Vertex {
-                                pos: Pos2::new(rx, ry),
-                                uv: uv_corners[ci],
-                                color: tint,
-                            });
-                        }
-                        mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
-                        painter.add(egui::Shape::mesh(mesh));
-                    } else {
-                        let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
-                        painter.image(tex.id(), elem_rect, uv, tint);
+                    // Flip + 3D-fold: the local half-extents shrink with
+                    // |flip_x_anim| / |flip_y_anim| so a value going from 1
+                    // through 0 to −1 produces a "card-flip" silhouette.
+                    // Static `flip_horizontal` still toggles UV mirroring.
+                    let static_hflip = state.scene.actors[idx].flip_horizontal;
+                    let combined_x = if static_hflip { -actor_flip_x } else { actor_flip_x };
+                    let combined_y = actor_flip_y;
+                    let abs_fx = combined_x.abs().max(0.02);
+                    let abs_fy = combined_y.abs().max(0.02);
+                    let center = elem_rect.center();
+                    let hw = elem_rect.width() * 0.5 * abs_fx;
+                    let hh = elem_rect.height() * 0.5 * abs_fy;
+                    let cos_r = rotation_rad.cos();
+                    let sin_r = rotation_rad.sin();
+                    let corners_local = [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]];
+                    // Build UV corners that respect the sign of the flip.
+                    let (uv_l, uv_r) = if combined_x < 0.0 { (1.0, 0.0) } else { (0.0, 1.0) };
+                    let (uv_t, uv_b) = if combined_y < 0.0 { (1.0, 0.0) } else { (0.0, 1.0) };
+                    let uv_corners = [
+                        Pos2::new(uv_l, uv_t), Pos2::new(uv_r, uv_t),
+                        Pos2::new(uv_r, uv_b), Pos2::new(uv_l, uv_b),
+                    ];
+                    let mut mesh = egui::Mesh::with_texture(tex.id());
+                    for ci in 0..4 {
+                        let [lx, ly] = corners_local[ci];
+                        let rx = lx * cos_r - ly * sin_r + center.x;
+                        let ry = lx * sin_r + ly * cos_r + center.y;
+                        mesh.vertices.push(egui::epaint::Vertex {
+                            pos: Pos2::new(rx, ry),
+                            uv: uv_corners[ci],
+                            color: tint,
+                        });
                     }
+                    mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+                    painter.add(egui::Shape::mesh(mesh));
                     frame_shown = true;
                 }
             }
@@ -901,7 +986,21 @@ fn draw_canvas_overlays(
             DisplayMode::BeforeStart => 0.0,
             DisplayMode::AfterEnd => t_out - t_in,
         };
-        let ov_state = keyframe::sample(layout, sample_t).unwrap_or_default();
+        let mut ov_state = keyframe::sample(layout, sample_t).unwrap_or_default();
+
+        // Apply animation modifiers (additive on top of eased keyframe).
+        let modifiers: &[TrackModifier] = match overlay {
+            Overlay::Text(txt) => &txt.modifiers,
+            Overlay::Image(img) => &img.modifiers,
+            Overlay::Video(vid) => &vid.modifiers,
+        };
+        let mod_delta = if matches!(display_mode, DisplayMode::Active) {
+            keyframe::evaluate_modifiers(modifiers, sample_t)
+        } else {
+            keyframe::ModifierDelta::default()
+        };
+        ov_state.scale = (ov_state.scale + mod_delta.d_scale).max(0.001);
+        ov_state.rotation_deg += mod_delta.d_rotation_deg;
 
         let rf = &state.scene.render_frame;
         let rf_state = sample_render_frame(rf, t);
@@ -911,10 +1010,26 @@ fn draw_canvas_overlays(
         let frame_tl_x = rf_state.pos.x - world_w * 0.5;
         let frame_tl_y = rf_state.pos.y - world_h * 0.5;
 
-        let world_pos = WorldPos {
-            x: frame_tl_x + ov_state.pos[0] * world_w,
-            y: frame_tl_y + ov_state.pos[1] * world_h,
+        // Default world position from layout. Modifier offsets and any
+        // skeleton attachment can override / shift it.
+        let mut world_pos = WorldPos {
+            x: frame_tl_x + ov_state.pos[0] * world_w + mod_delta.dx,
+            y: frame_tl_y + ov_state.pos[1] * world_h + mod_delta.dy,
         };
+
+        // Skeleton attachment: if this overlay is bound to a host actor's
+        // skeleton point, compute the point's world position from the
+        // host's current bounding box and override `world_pos`.
+        let skel_att: Option<&SkeletonAttachment> = match overlay {
+            Overlay::Text(txt) => txt.skeleton_attachment.as_ref(),
+            Overlay::Image(img) => img.skeleton_attachment.as_ref(),
+            Overlay::Video(vid) => vid.skeleton_attachment.as_ref(),
+        };
+        if let Some(att) = skel_att {
+            if let Some(p) = resolve_overlay_attachment_world(state, att, t) {
+                world_pos = p;
+            }
+        }
         let center_screen = state.canvas_viewport.world_to_screen(world_pos, viewport_size);
         let center_pos = Pos2::new(
             full_rect.min.x + center_screen[0],
@@ -1469,6 +1584,23 @@ fn decide_drag_mode(
 ) -> crate::state::CanvasDragMode {
     use crate::state::CanvasDragMode;
 
+    // 0. Rotation handle takes priority over corner/edge handles when the
+    //    user clicks the small circle floating above the bbox.
+    if let Some(elem_rect) = selected_element_screen_rect(state, full_rect, viewport_size) {
+        let handle_pos = rotation_handle_screen_pos(elem_rect);
+        if (start - handle_pos).length() < ROTATION_HANDLE_RADIUS * 2.5 {
+            let center = elem_rect.center();
+            let initial_rot_deg = current_selection_rotation(state).unwrap_or(0.0);
+            let dx = start.x - center.x;
+            let dy = start.y - center.y;
+            return CanvasDragMode::RotateSelection {
+                initial_rot_deg,
+                center_screen: [center.x, center.y],
+                start_angle_rad: dy.atan2(dx),
+            };
+        }
+    }
+
     // 1. If a selected element is present and the click is on one of its
     //    8 resize handles → ResizeSelection.
     if let Some(elem_rect) = selected_element_screen_rect(state, full_rect, viewport_size) {
@@ -1596,7 +1728,6 @@ fn apply_drag(
 
         CanvasDragMode::MoveActorWorld { actor_idx, initial_pos } => {
             if actor_idx < state.scene.actors.len() {
-                let actor_id = state.scene.actors[actor_idx].id.clone();
                 let proposed_x = initial_pos[0] + world_dx;
                 let proposed_y = initial_pos[1] + world_dy;
                 let (snapped_x, snapped_y, guides) = snap_world_center(
@@ -1606,14 +1737,9 @@ fn apply_drag(
                     Some(SnapExclude::Actor(actor_idx)),
                 );
                 state.canvas_drag.snap_guides = guides;
-                if let Some(cl) = state.scene.canvas_layouts.iter_mut()
-                    .find(|cl| cl.element_id == actor_id)
-                {
-                    if let Some(kf) = cl.keyframes.first_mut() {
-                        kf.value.pos.x = snapped_x;
-                        kf.value.pos.y = snapped_y;
-                    }
-                }
+                // Route through the unified setter so a non-zero playhead
+                // auto-inserts a keyframe (canvas-first animation).
+                set_selection_world_center(state, [snapped_x, snapped_y]);
             }
         }
 
@@ -1625,12 +1751,8 @@ fn apply_drag(
                 let world_w = rw as f32 / rf_state.zoom;
                 let world_h = rh as f32 / rf_state.zoom;
 
-                // Convert delta to normalized space, then go via world space
-                // for snapping.
                 let proposed_norm_x = initial_pos[0] + world_dx / world_w;
                 let proposed_norm_y = initial_pos[1] + world_dy / world_h;
-                // Map to absolute world coord (legacy norm 0..1 inside render
-                // frame box).
                 let world_x = rf_state.pos.x - world_w * 0.5 + proposed_norm_x * world_w;
                 let world_y = rf_state.pos.y - world_h * 0.5 + proposed_norm_y * world_h;
                 let (snapped_world_x, snapped_world_y, guides) = snap_world_center(
@@ -1640,14 +1762,7 @@ fn apply_drag(
                     Some(SnapExclude::Actor(actor_idx)),
                 );
                 state.canvas_drag.snap_guides = guides;
-                let final_norm_x =
-                    (snapped_world_x - (rf_state.pos.x - world_w * 0.5)) / world_w.max(0.0001);
-                let final_norm_y =
-                    (snapped_world_y - (rf_state.pos.y - world_h * 0.5)) / world_h.max(0.0001);
-                if let Some(kf) = state.scene.actors[actor_idx].layout.first_mut() {
-                    kf.value.pos[0] = final_norm_x;
-                    kf.value.pos[1] = final_norm_y;
-                }
+                set_selection_world_center(state, [snapped_world_x, snapped_world_y]);
             }
         }
 
@@ -1662,7 +1777,6 @@ fn apply_drag(
                 let dy_norm = world_dy / world_h;
                 let proposed_norm_x = initial_pos[0] + dx_norm;
                 let proposed_norm_y = initial_pos[1] + dy_norm;
-                // Run snap in world space (consistent with actor handling).
                 let world_x = rf_state.pos.x - world_w * 0.5 + proposed_norm_x * world_w;
                 let world_y = rf_state.pos.y - world_h * 0.5 + proposed_norm_y * world_h;
                 let (snapped_world_x, snapped_world_y, guides) = snap_world_center(
@@ -1672,22 +1786,7 @@ fn apply_drag(
                     Some(SnapExclude::Overlay(overlay_idx)),
                 );
                 state.canvas_drag.snap_guides = guides;
-                let final_norm_x =
-                    (snapped_world_x - (rf_state.pos.x - world_w * 0.5)) / world_w.max(0.0001);
-                let final_norm_y =
-                    (snapped_world_y - (rf_state.pos.y - world_h * 0.5)) / world_h.max(0.0001);
-                let new_pos = [final_norm_x, final_norm_y];
-                match &mut state.scene.overlays[overlay_idx] {
-                    Overlay::Text(t) => {
-                        if let Some(kf) = t.layout.first_mut() { kf.value.pos = new_pos; }
-                    }
-                    Overlay::Image(im) => {
-                        if let Some(kf) = im.layout.first_mut() { kf.value.pos = new_pos; }
-                    }
-                    Overlay::Video(v) => {
-                        if let Some(kf) = v.layout.first_mut() { kf.value.pos = new_pos; }
-                    }
-                }
+                set_selection_world_center(state, [snapped_world_x, snapped_world_y]);
             }
         }
 
@@ -1780,6 +1879,27 @@ fn apply_drag(
                 // intact when the render frame is resized.
             }
         }
+
+        CanvasDragMode::RotateSelection { initial_rot_deg, center_screen, start_angle_rad } => {
+            // Map current pointer to angle around the element's centre,
+            // subtract the start angle, and add to the initial rotation.
+            // Hold Shift to snap to 15° increments.
+            let dx = cur.x - center_screen[0];
+            let dy = cur.y - center_screen[1];
+            if dx.abs() < 0.001 && dy.abs() < 0.001 { return; }
+            let cur_angle = dy.atan2(dx);
+            let mut delta_deg = (cur_angle - start_angle_rad).to_degrees();
+            // Wrap delta to (-180, 180] so spinning past the wrap stays smooth.
+            while delta_deg > 180.0 { delta_deg -= 360.0; }
+            while delta_deg < -180.0 { delta_deg += 360.0; }
+            let mut new_rot = initial_rot_deg + delta_deg;
+            if shift_held {
+                new_rot = (new_rot / 15.0).round() * 15.0;
+            }
+            // Clamp to a reasonable range to avoid runaway values.
+            new_rot = new_rot.clamp(-3600.0, 3600.0);
+            set_selection_rotation(state, new_rot);
+        }
     }
 }
 
@@ -1829,6 +1949,39 @@ fn current_selection_scale(state: &EditorState) -> Option<f32> {
     }
 }
 
+/// Sample the current rotation (in degrees) of the selected element at
+/// the playhead. Returns the eased value if the track has multiple
+/// keyframes — so dragging the rotation gizmo at a non-zero playhead
+/// starts from where the animation is right now.
+fn current_selection_rotation(state: &EditorState) -> Option<f32> {
+    let t = state.playhead;
+    match state.selection {
+        Selection::Actor(idx) if idx < state.scene.actors.len() => {
+            keyframe::sample(&state.scene.actors[idx].layout, t)
+                .map(|s| s.rotation_deg)
+                .or_else(|| state.scene.actors[idx].layout.first().map(|k| k.value.rotation_deg))
+        }
+        Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
+            let layout = match &state.scene.overlays[idx] {
+                Overlay::Text(t) => &t.layout,
+                Overlay::Image(im) => &im.layout,
+                Overlay::Video(v) => &v.layout,
+            };
+            keyframe::sample(layout, t)
+                .map(|s| s.rotation_deg)
+                .or_else(|| layout.first().map(|k| k.value.rotation_deg))
+        }
+        _ => None,
+    }
+}
+
+/// Where to draw the rotation gizmo in screen space, given the element's
+/// bounding rect. It floats above the top-mid handle, attached by a stem
+/// (drawn in `draw_selection_handles`).
+fn rotation_handle_screen_pos(elem_rect: Rect) -> Pos2 {
+    Pos2::new(elem_rect.center().x, elem_rect.min.y - ROTATION_HANDLE_OFFSET)
+}
+
 fn current_selection_scale_y(state: &EditorState) -> Option<f32> {
     match state.selection {
         Selection::Actor(idx) if idx < state.scene.actors.len() => {
@@ -1861,7 +2014,7 @@ fn current_selection_base_dims(state: &EditorState) -> Option<(f32, f32)> {
         Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
             let ov = &state.scene.overlays[idx];
             // Use the bbox at scale=1, scale_y=1 for the base dimensions.
-            let neutral = OverlayState { pos: [0.0, 0.0], scale: 1.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 1.0 };
+            let neutral = OverlayState { pos: [0.0, 0.0], scale: 1.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 1.0, flip_x_anim: 1.0, flip_y_anim: 1.0 };
             Some(overlay_bbox(ov, &neutral))
         }
         _ => None,
@@ -1901,19 +2054,25 @@ fn current_selection_world_center(state: &EditorState) -> Option<[f32; 2]> {
     }
 }
 
-/// Write the world-space center back to the selected element's first
-/// keyframe (handles both world-coord canvas_layouts and legacy normalised
-/// pos for actors and overlays).
+/// Write the world-space center back to the selected element. When the
+/// playhead is at a non-zero time and no keyframe exists at that time
+/// yet, a new keyframe is inserted (seeded with the eased current value)
+/// so dragging on the canvas at any time directly authors animation.
 fn set_selection_world_center(state: &mut EditorState, center: [f32; 2]) {
     let t = state.playhead;
     match state.selection {
         Selection::Actor(idx) if idx < state.scene.actors.len() => {
             let actor_id = state.scene.actors[idx].id.clone();
-            // Prefer canvas_layouts entry when present.
+            // Prefer canvas_layouts entry when present (free canvas v2).
             if let Some(cl) = state.scene.canvas_layouts.iter_mut()
                 .find(|cl| cl.element_id == actor_id)
             {
-                if let Some(kf) = cl.keyframes.first_mut() {
+                ensure_canvas_kf_at_playhead(&mut cl.keyframes, t);
+                let eps = 1.0e-3;
+                if let Some(kf) = cl.keyframes.iter_mut().find(|k| (k.t - t).abs() < eps) {
+                    kf.value.pos.x = center[0];
+                    kf.value.pos.y = center[1];
+                } else if let Some(kf) = cl.keyframes.first_mut() {
                     kf.value.pos.x = center[0];
                     kf.value.pos.y = center[1];
                 }
@@ -1928,10 +2087,9 @@ fn set_selection_world_center(state: &mut EditorState, center: [f32; 2]) {
             let frame_tl_x = rf_state.pos.x - world_w * 0.5;
             let frame_tl_y = rf_state.pos.y - world_h * 0.5;
             if world_w <= 0.0 || world_h <= 0.0 { return; }
-            if let Some(kf) = state.scene.actors[idx].layout.first_mut() {
-                kf.value.pos[0] = (center[0] - frame_tl_x) / world_w;
-                kf.value.pos[1] = (center[1] - frame_tl_y) / world_h;
-            }
+            let new_norm = [(center[0] - frame_tl_x) / world_w, (center[1] - frame_tl_y) / world_h];
+            ensure_actor_kf_at_playhead(&mut state.scene.actors[idx].layout, t);
+            apply_to_anim_kf(&mut state.scene.actors[idx].layout, t, |v| v.pos = new_norm);
         }
         Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
             let rf = &state.scene.render_frame;
@@ -1943,11 +2101,9 @@ fn set_selection_world_center(state: &mut EditorState, center: [f32; 2]) {
             let frame_tl_y = rf_state.pos.y - world_h * 0.5;
             if world_w <= 0.0 || world_h <= 0.0 { return; }
             let new_norm = [(center[0] - frame_tl_x) / world_w, (center[1] - frame_tl_y) / world_h];
-            match &mut state.scene.overlays[idx] {
-                Overlay::Text(t) => { if let Some(kf) = t.layout.first_mut() { kf.value.pos = new_norm; } }
-                Overlay::Image(im) => { if let Some(kf) = im.layout.first_mut() { kf.value.pos = new_norm; } }
-                Overlay::Video(v) => { if let Some(kf) = v.layout.first_mut() { kf.value.pos = new_norm; } }
-            }
+            let layout = overlay_layout_mut(&mut state.scene.overlays[idx]);
+            ensure_overlay_kf_at_playhead(layout, t);
+            apply_to_overlay_kf(layout, t, |v| v.pos = new_norm);
         }
         _ => {}
     }
@@ -1955,18 +2111,16 @@ fn set_selection_world_center(state: &mut EditorState, center: [f32; 2]) {
 
 fn set_selection_scale_y(state: &mut EditorState, new_scale_y: f32) {
     let s = new_scale_y.clamp(0.05, 20.0);
+    let t = state.playhead;
     match state.selection {
         Selection::Actor(idx) if idx < state.scene.actors.len() => {
-            if let Some(kf) = state.scene.actors[idx].layout.first_mut() {
-                kf.value.scale_y = s;
-            }
+            ensure_actor_kf_at_playhead(&mut state.scene.actors[idx].layout, t);
+            apply_to_anim_kf(&mut state.scene.actors[idx].layout, t, |v| v.scale_y = s);
         }
         Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
-            match &mut state.scene.overlays[idx] {
-                Overlay::Text(t) => { if let Some(kf) = t.layout.first_mut() { kf.value.scale_y = s; } }
-                Overlay::Image(im) => { if let Some(kf) = im.layout.first_mut() { kf.value.scale_y = s; } }
-                Overlay::Video(v) => { if let Some(kf) = v.layout.first_mut() { kf.value.scale_y = s; } }
-            }
+            let layout = overlay_layout_mut(&mut state.scene.overlays[idx]);
+            ensure_overlay_kf_at_playhead(layout, t);
+            apply_to_overlay_kf(layout, t, |v| v.scale_y = s);
         }
         _ => {}
     }
@@ -1974,18 +2128,16 @@ fn set_selection_scale_y(state: &mut EditorState, new_scale_y: f32) {
 
 fn set_selection_scale(state: &mut EditorState, new_scale: f32) {
     let s = new_scale.clamp(0.05, 20.0);
+    let t = state.playhead;
     match state.selection {
         Selection::Actor(idx) if idx < state.scene.actors.len() => {
-            if let Some(kf) = state.scene.actors[idx].layout.first_mut() {
-                kf.value.scale = s;
-            }
+            ensure_actor_kf_at_playhead(&mut state.scene.actors[idx].layout, t);
+            apply_to_anim_kf(&mut state.scene.actors[idx].layout, t, |v| v.scale = s);
         }
         Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
-            match &mut state.scene.overlays[idx] {
-                Overlay::Text(t) => { if let Some(kf) = t.layout.first_mut() { kf.value.scale = s; } }
-                Overlay::Image(im) => { if let Some(kf) = im.layout.first_mut() { kf.value.scale = s; } }
-                Overlay::Video(v) => { if let Some(kf) = v.layout.first_mut() { kf.value.scale = s; } }
-            }
+            let layout = overlay_layout_mut(&mut state.scene.overlays[idx]);
+            ensure_overlay_kf_at_playhead(layout, t);
+            apply_to_overlay_kf(layout, t, |v| v.scale = s);
         }
         _ => {}
     }
@@ -1994,6 +2146,110 @@ fn set_selection_scale(state: &mut EditorState, new_scale: f32) {
 fn apply_scale_delta(state: &mut EditorState, delta: f32) {
     if let Some(s) = current_selection_scale(state) {
         set_selection_scale(state, s + delta);
+    }
+}
+
+/// Write the rotation back to the selected element. Like
+/// `set_selection_world_center`, this auto-inserts a keyframe at the
+/// current playhead time when one is missing — giving the user a
+/// canvas-first animation workflow: drag the rotation gizmo at any
+/// time and the system records a keyframe automatically.
+fn set_selection_rotation(state: &mut EditorState, new_rot_deg: f32) {
+    let t = state.playhead;
+    match state.selection {
+        Selection::Actor(idx) if idx < state.scene.actors.len() => {
+            ensure_actor_kf_at_playhead(&mut state.scene.actors[idx].layout, t);
+            apply_to_anim_kf(&mut state.scene.actors[idx].layout, t, |v| v.rotation_deg = new_rot_deg);
+        }
+        Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
+            let layout = overlay_layout_mut(&mut state.scene.overlays[idx]);
+            ensure_overlay_kf_at_playhead(layout, t);
+            apply_to_overlay_kf(layout, t, |v| v.rotation_deg = new_rot_deg);
+        }
+        _ => {}
+    }
+}
+
+/// Insert a keyframe within ε of `t` on an actor track, seeding it with
+/// the eased current value so animation continues smoothly from the
+/// visual state.
+fn ensure_actor_kf_at_playhead(layout: &mut Vec<Keyframe<ActorState>>, t: f32) {
+    if layout.is_empty() {
+        layout.push(Keyframe::new(t, ActorState::default()));
+        return;
+    }
+    let eps = 1.0e-3;
+    if layout.iter().any(|kf| (kf.t - t).abs() < eps) {
+        return;
+    }
+    let sampled = keyframe::sample(layout, t).unwrap_or_default();
+    layout.push(Keyframe::new(t, sampled));
+    layout.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
+}
+
+fn ensure_overlay_kf_at_playhead(layout: &mut Vec<Keyframe<OverlayState>>, t: f32) {
+    if layout.is_empty() {
+        layout.push(Keyframe::new(t, OverlayState::default()));
+        return;
+    }
+    let eps = 1.0e-3;
+    if layout.iter().any(|kf| (kf.t - t).abs() < eps) {
+        return;
+    }
+    let sampled = keyframe::sample(layout, t).unwrap_or_default();
+    layout.push(Keyframe::new(t, sampled));
+    layout.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
+}
+
+fn ensure_canvas_kf_at_playhead(layout: &mut Vec<Keyframe<CanvasTransform>>, t: f32) {
+    if layout.is_empty() {
+        layout.push(Keyframe::new(t, CanvasTransform::default()));
+        return;
+    }
+    let eps = 1.0e-3;
+    if layout.iter().any(|kf| (kf.t - t).abs() < eps) {
+        return;
+    }
+    let sampled = keyframe::sample(layout, t).unwrap_or_default();
+    layout.push(Keyframe::new(t, sampled));
+    layout.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
+}
+
+fn apply_to_anim_kf<F: FnOnce(&mut ActorState)>(
+    layout: &mut Vec<Keyframe<ActorState>>,
+    t: f32,
+    f: F,
+) {
+    let eps = 1.0e-3;
+    if let Some(kf) = layout.iter_mut().find(|kf| (kf.t - t).abs() < eps) {
+        f(&mut kf.value);
+        return;
+    }
+    if let Some(kf) = layout.first_mut() {
+        f(&mut kf.value);
+    }
+}
+
+fn apply_to_overlay_kf<F: FnOnce(&mut OverlayState)>(
+    layout: &mut Vec<Keyframe<OverlayState>>,
+    t: f32,
+    f: F,
+) {
+    let eps = 1.0e-3;
+    if let Some(kf) = layout.iter_mut().find(|kf| (kf.t - t).abs() < eps) {
+        f(&mut kf.value);
+        return;
+    }
+    if let Some(kf) = layout.first_mut() {
+        f(&mut kf.value);
+    }
+}
+
+fn overlay_layout_mut(overlay: &mut Overlay) -> &mut Vec<Keyframe<OverlayState>> {
+    match overlay {
+        Overlay::Text(t) => &mut t.layout,
+        Overlay::Image(im) => &mut im.layout,
+        Overlay::Video(v) => &mut v.layout,
     }
 }
 
@@ -2159,6 +2415,13 @@ fn update_hover_cursor(
     hover: Pos2,
 ) {
     if let Some(rect) = selected_element_screen_rect(state, full_rect, viewport_size) {
+        // Rotation handle gets priority over the corners/edges so its
+        // hit-box is checked first (it's drawn outside the bbox).
+        let rot_pos = rotation_handle_screen_pos(rect);
+        if (hover - rot_pos).length() < ROTATION_HANDLE_RADIUS * 2.0 {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+            return;
+        }
         let corners = [
             (rect.left_top(), egui::CursorIcon::ResizeNwSe),
             (rect.right_top(), egui::CursorIcon::ResizeNeSw),
@@ -2381,6 +2644,28 @@ fn draw_selection_handles(
             painter.rect_filled(hr, Rounding::same(2.0), handle_color);
         }
         painter.rect_stroke(rect, Rounding::same(2.0), Stroke::new(1.5, handle_color));
+
+        // ── Rotation handle ───────────────────────────────────────
+        // Floats above the top-mid handle on a short stem so it never
+        // overlaps the resize affordances. Cyan colour distinguishes
+        // it from yellow scale handles. Drag this handle to rotate the
+        // element around its centre; hold Shift to snap to 15° steps.
+        let rot_pos = rotation_handle_screen_pos(rect);
+        let top_mid = Pos2::new(rect.center().x, rect.min.y);
+        painter.line_segment(
+            [top_mid, rot_pos],
+            Stroke::new(1.5, Color32::from_rgb(80, 160, 200)),
+        );
+        painter.circle_filled(rot_pos, ROTATION_HANDLE_RADIUS, COL_ROTATION_HANDLE);
+        painter.circle_stroke(rot_pos, ROTATION_HANDLE_RADIUS, Stroke::new(1.5, Color32::from_rgb(20, 40, 60)));
+        // Tiny "↻" hint glyph.
+        painter.text(
+            rot_pos,
+            egui::Align2::CENTER_CENTER,
+            "\u{21BB}",
+            egui::FontId::proportional(10.0),
+            Color32::from_rgb(20, 40, 60),
+        );
     }
 
     // Render frame center handle
