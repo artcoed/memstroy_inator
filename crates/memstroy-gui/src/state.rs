@@ -46,60 +46,26 @@ impl Track {
     }
 }
 
-/// A clip placed on a track at a specific time.
-#[derive(Debug, Clone)]
-pub struct TimelineClip {
-    /// Which track index this clip is on.
-    pub track_index: usize,
-    /// What scene element this clip represents.
-    pub element: ClipElement,
-    /// Start time on the timeline (seconds).
-    pub start: f32,
-    /// Duration on the timeline (seconds).
-    pub duration: f32,
-    /// Offset into the source media (for trimmed clips).
-    pub source_offset: f32,
-    /// Color for the clip bar.
-    pub color: [u8; 3],
-}
-
-/// What scene element a timeline clip corresponds to.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ClipElement {
-    Actor(usize),
-    Overlay(usize),
-    Background(usize),
-    Audio(usize),
-}
-
-/// Drag-and-drop state for timeline clips.
+/// Drag state for clips already on the timeline. Tracks only whether a
+/// timeline clip is currently being dragged, so we can take a single undo
+/// snapshot at the start of the gesture.
 #[derive(Default, Clone)]
 pub struct TimelineDrag {
-    /// Which clip is being dragged (by its index in timeline_clips).
     pub dragging_clip: Option<usize>,
-    /// Original track when drag started.
-    pub original_track: usize,
-    /// Original start time when drag started.
-    pub original_start: f32,
-    /// Accumulated drag delta in pixels.
-    pub drag_delta_x: f32,
-    pub drag_delta_y: f32,
 }
 
-/// Drag-and-drop state for asset library items.
+/// Drag-and-drop state for an item being dragged out of the clip library.
 #[derive(Default, Clone)]
 pub struct AssetDrag {
-    /// Path of the asset being dragged from library.
+    /// Path of the clip being dragged.
     pub dragging: Option<PathBuf>,
     /// Kind of asset being dragged.
     pub kind: AssetDragKind,
-    /// Current mouse position during drag.
+    /// Current pointer position during the drag (used to anchor the ghost).
     pub pos: [f32; 2],
-    /// Optional human-readable label rendered next to the drag ghost so the
-    /// user can see *what* they're dragging (clip number, file name, etc.).
+    /// Human-readable label rendered next to the drag ghost.
     pub label: String,
-    /// Optional thumbnail path (used by the drag ghost preview for clips
-    /// and image-based assets).
+    /// Optional thumbnail used by the drag ghost preview.
     pub thumbnail: Option<PathBuf>,
 }
 
@@ -108,9 +74,6 @@ pub enum AssetDragKind {
     #[default]
     None,
     Clip,
-    Background,
-    Prop,
-    Audio,
 }
 
 /// Audio waveform data for visualization.
@@ -227,11 +190,10 @@ pub struct EditorState {
     pub frame_caches: Vec<crate::video_cache::FrameCache>,
     /// Eyedropper mode: when true, clicking on preview picks the pixel color for chroma-key.
     pub eyedropper_active: bool,
-    /// Whether the Assets tab is active (vs Clips tab) in the left panel.
-    pub assets_tab_active: bool,
 
-    // ─── NEW: Premiere Pro-style timeline ───
-    /// Fixed tracks (lanes). Clips are placed on tracks.
+    // ─── Premiere Pro-style timeline ───
+    /// Fixed tracks (lanes). Video tracks are kept above audio tracks at all
+    /// times — see `enforce_track_order`.
     pub tracks: Vec<Track>,
     /// Timeline drag state for clip movement between tracks.
     pub timeline_drag: TimelineDrag,
@@ -297,11 +259,13 @@ pub struct EditorState {
     pub skeleton_editor: crate::skeleton_editor::SkeletonEditorState,
 
     // ─── Track assignment overrides ────────────────────────────────
-    /// Explicit track assignment for actors. Key = actor index, Value = track index.
-    /// When an actor is not in this map, the default round-robin assignment is used.
+    /// Explicit track assignment for actors. Key = actor index, value = track index.
     pub actor_track_assignments: std::collections::HashMap<usize, usize>,
-    /// Explicit track assignment for audio tracks. Key = audio index, Value = track index.
+    /// Explicit track assignment for audio rows. Key = audio index, value = track index.
     pub audio_track_assignments: std::collections::HashMap<usize, usize>,
+    /// Explicit track assignment for overlay rows (text/image/video overlays).
+    /// Overlays without an entry default to the second video track.
+    pub overlay_track_assignments: std::collections::HashMap<usize, usize>,
 
     // ─── Multi-tab scenes ──────────────────────────────────────────
     /// All open scene tabs. Index 0 is always the active tab's scene (synced with `self.scene`).
@@ -321,9 +285,6 @@ pub struct SceneTab {
 #[derive(Default)]
 pub struct AssetLibrary {
     pub mellstroy_clips: Vec<LibraryClip>,
-    pub backgrounds: Vec<PathBuf>,
-    pub props: Vec<PathBuf>,
-    pub audio: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -357,19 +318,6 @@ pub struct RenderProgress {
     pub error: Option<String>,
     /// Render progress as a float (0.0 - 1.0), parsed from ffmpeg output.
     pub progress: f32,
-}
-
-/// Legacy DragState kept for compatibility but mostly unused now.
-#[derive(Default, Clone, Copy, PartialEq)]
-#[allow(dead_code)]
-pub enum DragState {
-    #[default]
-    None,
-    BackgroundStart(usize),
-    BackgroundEnd(usize),
-    BackgroundMove(usize, f32),
-    ActorMove(usize),
-    OverlayMove(usize),
 }
 
 impl EditorState {
@@ -482,37 +430,112 @@ impl EditorState {
         }
     }
 
-    /// Get the track index for a given clip element based on the current scene layout.
-    /// This is a heuristic — actors go on V1-V3, overlays on V2-V3, bgs on V1, audio on A1-A2.
-    pub fn default_track_for_element(&self, elem: &ClipElement) -> usize {
-        match elem {
-            ClipElement::Actor(i) => {
-                // Spread actors across video tracks
-                let video_tracks: Vec<usize> = self.tracks.iter().enumerate()
-                    .filter(|(_, t)| t.kind == TrackKind::Video)
-                    .map(|(i, _)| i)
-                    .collect();
-                if video_tracks.is_empty() { 0 } else { video_tracks[*i % video_tracks.len()] }
-            }
-            ClipElement::Background(_) => 0, // Always bottom video track
-            ClipElement::Overlay(i) => {
-                let video_tracks: Vec<usize> = self.tracks.iter().enumerate()
-                    .filter(|(_, t)| t.kind == TrackKind::Video)
-                    .map(|(i, _)| i)
-                    .collect();
-                if video_tracks.len() >= 2 { video_tracks[1.min(video_tracks.len() - 1)] }
-                else if !video_tracks.is_empty() { video_tracks[0] }
-                else { *i }
-            }
-            ClipElement::Audio(i) => {
-                let audio_tracks: Vec<usize> = self.tracks.iter().enumerate()
-                    .filter(|(_, t)| t.kind == TrackKind::Audio)
-                    .map(|(i, _)| i)
-                    .collect();
-                if audio_tracks.is_empty() { self.tracks.len().saturating_sub(1) }
-                else { audio_tracks[*i % audio_tracks.len()] }
-            }
+    /// Indices of all video tracks in screen order (top → bottom).
+    pub fn video_track_indices(&self) -> Vec<usize> {
+        self.tracks
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.kind == TrackKind::Video)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Indices of all audio tracks in screen order (top → bottom).
+    pub fn audio_track_indices(&self) -> Vec<usize> {
+        self.tracks
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.kind == TrackKind::Audio)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Re-sort `tracks` so all `Video` lanes come before all `Audio` lanes
+    /// (video on top, audio at the bottom of the layers panel). The order
+    /// inside each kind is preserved. All track-assignment maps are
+    /// remapped through the same permutation so existing actors/overlays
+    /// keep referring to the same physical row.
+    pub fn enforce_track_order(&mut self) {
+        let n = self.tracks.len();
+        let mut perm: Vec<usize> = (0..n).collect();
+        perm.sort_by_key(|&i| match self.tracks[i].kind {
+            TrackKind::Video => 0u8,
+            TrackKind::Audio => 1u8,
+        });
+        if perm.iter().enumerate().all(|(new, &old)| new == old) {
+            return;
         }
+        let new_tracks: Vec<Track> = perm.iter().map(|&i| self.tracks[i].clone()).collect();
+        let mut old_to_new = vec![0usize; n];
+        for (new, &old) in perm.iter().enumerate() {
+            old_to_new[old] = new;
+        }
+        self.tracks = new_tracks;
+        let remap = |m: &mut std::collections::HashMap<usize, usize>| {
+            for v in m.values_mut() {
+                if *v < old_to_new.len() {
+                    *v = old_to_new[*v];
+                }
+            }
+        };
+        remap(&mut self.actor_track_assignments);
+        remap(&mut self.audio_track_assignments);
+        remap(&mut self.overlay_track_assignments);
+    }
+
+    /// Insert a new video track immediately before the first audio track
+    /// (or at the end if there are no audio tracks). Returns the new
+    /// track's index. Existing assignments are bumped by 1 wherever they
+    /// referenced a row at or after the insertion point.
+    pub fn insert_video_track_at_bottom(&mut self) -> usize {
+        let n = self.tracks.iter().filter(|t| t.kind == TrackKind::Video).count() + 1;
+        let pos = self.tracks.iter()
+            .position(|t| t.kind == TrackKind::Audio)
+            .unwrap_or(self.tracks.len());
+        self.tracks.insert(pos, Track::video(format!("V{}", n)));
+        let bump = |m: &mut std::collections::HashMap<usize, usize>, pivot: usize| {
+            for v in m.values_mut() {
+                if *v >= pivot { *v += 1; }
+            }
+        };
+        bump(&mut self.actor_track_assignments, pos);
+        bump(&mut self.audio_track_assignments, pos);
+        bump(&mut self.overlay_track_assignments, pos);
+        pos
+    }
+
+    /// Insert a new video track at index 0 (top). Returns 0. Every existing
+    /// assignment is shifted up by one so it keeps referring to the same row.
+    pub fn insert_video_track_at_top(&mut self) -> usize {
+        let n = self.tracks.iter().filter(|t| t.kind == TrackKind::Video).count() + 1;
+        self.tracks.insert(0, Track::video(format!("V{}", n)));
+        let bump = |m: &mut std::collections::HashMap<usize, usize>| {
+            for v in m.values_mut() { *v += 1; }
+        };
+        bump(&mut self.actor_track_assignments);
+        bump(&mut self.audio_track_assignments);
+        bump(&mut self.overlay_track_assignments);
+        0
+    }
+
+    /// Insert a new audio track immediately after the last video track
+    /// (i.e. at the top of the audio block). Returns the new track's index.
+    pub fn insert_audio_track_at_top(&mut self) -> usize {
+        let n = self.tracks.iter().filter(|t| t.kind == TrackKind::Audio).count() + 1;
+        let pos = self.tracks.iter()
+            .rposition(|t| t.kind == TrackKind::Video)
+            .map(|p| p + 1)
+            .unwrap_or(0);
+        self.tracks.insert(pos, Track::audio(format!("A{}", n)));
+        let bump = |m: &mut std::collections::HashMap<usize, usize>, pivot: usize| {
+            for v in m.values_mut() {
+                if *v >= pivot { *v += 1; }
+            }
+        };
+        bump(&mut self.actor_track_assignments, pos);
+        bump(&mut self.audio_track_assignments, pos);
+        bump(&mut self.overlay_track_assignments, pos);
+        pos
     }
 
     // ─── Tab management ──────────────────────────────────────────────
@@ -576,13 +599,7 @@ impl EditorState {
         }
     }
 
-    /// Add a new video track.
-    pub fn add_video_track(&mut self) {
-        let n = self.tracks.iter().filter(|t| t.kind == TrackKind::Video).count() + 1;
-        self.tracks.push(Track::video(format!("V{}", n)));
-    }
-
-    /// Add a new audio track.
+    /// Add a new audio track at the bottom of the layers panel.
     pub fn add_audio_track(&mut self) {
         let n = self.tracks.iter().filter(|t| t.kind == TrackKind::Audio).count() + 1;
         self.tracks.push(Track::audio(format!("A{}", n)));
@@ -657,29 +674,7 @@ impl EditorState {
             .collect();
 
         self.library.mellstroy_clips.sort_by_key(|c| c.id);
-
-        self.library.backgrounds =
-            scan_dir(&self.assets_root.join("assets/backgrounds"), &["mp4", "mov", "webm", "jpg", "jpeg", "png", "webp"]);
-        self.library.props =
-            scan_dir(&self.assets_root.join("assets/props"), &["png", "webp", "svg"]);
-        self.library.audio =
-            scan_dir(&self.assets_root.join("assets/audio"), &["mp3", "wav", "ogg", "flac", "aac", "m4a"]);
     }
-}
-
-fn scan_dir(dir: &std::path::Path, exts: &[&str]) -> Vec<PathBuf> {
-    let Ok(read) = std::fs::read_dir(dir) else { return Vec::new() };
-    let mut out = Vec::new();
-    for entry in read.flatten() {
-        let path = entry.path();
-        if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-            if exts.iter().any(|e| e.eq_ignore_ascii_case(ext)) {
-                out.push(path);
-            }
-        }
-    }
-    out.sort();
-    out
 }
 
 /// Check if ffmpeg binary is accessible.
@@ -703,16 +698,10 @@ pub struct CanvasDrag {
     pub mode: CanvasDragMode,
     /// Pointer position (screen px, relative to the canvas rect) at drag start.
     pub start_screen: [f32; 2],
-    /// Snapshot of canvas-layout (pos, scale) by element_id at drag start.
-    /// Currently unused — kept for layout/forward compat.
-    pub canvas_layouts_snapshot: Vec<(String, [f32; 2], f32)>,
     /// Snapshot of legacy actor WORLD positions at drag start (for actors
     /// without a canvas_layouts entry). Used to keep them visually fixed
     /// while the render frame moves/resizes.
     pub actor_legacy_snapshot: Vec<(usize, [f32; 2])>,
-    /// Snapshot of legacy actor scale at drag start. Currently unused —
-    /// kept for layout/forward compat.
-    pub actor_legacy_scale_snapshot: Vec<(usize, f32)>,
     /// Snapshot of overlay WORLD positions at drag start. Used to keep
     /// overlays visually fixed while the render frame moves/resizes.
     pub overlay_world_snapshot: Vec<(usize, [f32; 2])>,
@@ -723,8 +712,6 @@ pub enum CanvasDragMode {
     /// No drag in progress.
     #[default]
     None,
-    /// Panning the viewport.
-    Pan,
     /// Move the selected actor in canvas world-pixel space.
     /// `initial_pos` is the actor's `canvas_layouts` position at drag start.
     MoveActorWorld { actor_idx: usize, initial_pos: [f32; 2] },
