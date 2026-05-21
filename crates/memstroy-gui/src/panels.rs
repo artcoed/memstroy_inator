@@ -112,45 +112,162 @@ pub fn library(ui: &mut egui::Ui, state: &mut EditorState, _request_refresh: imp
     }
 }
 
+/// Render a "Local | Global" split inside the library panel. Both
+/// sections live inside a single vertical column with a draggable 6 px
+/// handle in the middle that adjusts `state.library_split` (0.05..=0.95).
+/// The same split ratio is reused across every tab so the user's choice
+/// persists when they hop between Clips / Videos / Sounds / etc.
+///
+/// Each section's header is rendered automatically — callers only need
+/// to push the rows / cards into the closure.
+fn library_split_panel<L, G>(
+    ui: &mut egui::Ui,
+    state: &mut EditorState,
+    id_salt: &str,
+    local_section: L,
+    global_section: G,
+) where
+    L: FnOnce(&mut egui::Ui, &mut EditorState),
+    G: FnOnce(&mut egui::Ui, &mut EditorState),
+{
+    let total_rect = ui.available_rect_before_wrap();
+    let total_h = total_rect.height().max(80.0);
+    // Reserve room for two headers + the drag handle.
+    let header_h = 18.0_f32;
+    let handle_h = 6.0_f32;
+    let inner_h = (total_h - 2.0 * header_h - handle_h).max(40.0);
+    let split = state.library_split.clamp(0.05, 0.95);
+    let local_h = (split * inner_h).max(20.0);
+    let global_h = (inner_h - local_h).max(20.0);
+
+    // ─── Local section header + body ─────────────────────────────────
+    ui.label(
+        RichText::new("Local (your imports)")
+            .size(10.0)
+            .strong()
+            .color(Color32::from_rgb(180, 220, 180)),
+    );
+    ui.allocate_ui_with_layout(
+        Vec2::new(ui.available_width(), local_h),
+        egui::Layout::top_down(egui::Align::LEFT),
+        |ui| {
+            ui.set_min_size(Vec2::new(ui.available_width(), local_h));
+            local_section(ui, state);
+        },
+    );
+
+    // ─── Draggable splitter ──────────────────────────────────────────
+    let handle_id = ui.make_persistent_id(id_salt);
+    let (handle_rect, handle_resp) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), handle_h), Sense::click_and_drag());
+    let hovered = handle_resp.hovered();
+    let dragging = handle_resp.dragged();
+    let _ = handle_id;
+
+    // Render the handle as a thin gradient bar with a centered grip,
+    // brighter when hovered/dragged so the affordance is obvious.
+    let bar_col = if dragging {
+        Color32::from_rgb(180, 140, 255)
+    } else if hovered {
+        Color32::from_rgb(120, 100, 200)
+    } else {
+        Color32::from_rgb(60, 60, 80)
+    };
+    ui.painter().rect_filled(handle_rect, Rounding::same(2.0), bar_col);
+    // Draw a small "≡" grip to make the affordance obvious without
+    // depending on font glyph coverage. Three short horizontal lines.
+    let grip_col = Color32::from_rgba_premultiplied(255, 255, 255, 180);
+    let cx = handle_rect.center().x;
+    let cy = handle_rect.center().y;
+    for dx in [-9.0_f32, 0.0, 9.0] {
+        ui.painter().line_segment(
+            [egui::pos2(cx + dx - 3.0, cy), egui::pos2(cx + dx + 3.0, cy)],
+            Stroke::new(1.0, grip_col),
+        );
+    }
+    if hovered || dragging {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+    }
+    if dragging {
+        let dy = handle_resp.drag_delta().y;
+        if inner_h > 0.0 {
+            let new_split = split + dy / inner_h;
+            state.library_split = new_split.clamp(0.05, 0.95);
+        }
+    }
+    // Double-click resets to 50/50.
+    if handle_resp.double_clicked() {
+        state.library_split = 0.5;
+    }
+
+    // ─── Global section header + body ────────────────────────────────
+    ui.label(
+        RichText::new("Global (built-in / browser)")
+            .size(10.0)
+            .strong()
+            .color(Color32::from_rgb(180, 200, 255)),
+    );
+    ui.allocate_ui_with_layout(
+        Vec2::new(ui.available_width(), global_h),
+        egui::Layout::top_down(egui::Align::LEFT),
+        |ui| {
+            ui.set_min_size(Vec2::new(ui.available_width(), global_h));
+            global_section(ui, state);
+        },
+    );
+}
+
 /// Render the original Mellstroy clip browser content (split out so the
 /// new tabs can render their own variants of the list).
 fn library_clips_tab(ui: &mut egui::Ui, state: &mut EditorState) {
-    let search_lower = state.library_search.to_lowercase();
-    let clip_count = state.library.mellstroy_clips.len();
-    ui.label(
-        RichText::new(format!("Clips ({})", clip_count))
-            .size(12.0)
-            .strong()
-            .color(Color32::from_rgb(220, 130, 50)),
-    );
-    ui.add_space(2.0);
+    library_split_panel(
+        ui,
+        state,
+        "library_split_clips",
+        |_ui, _state| {
+            // Local clips section: currently empty placeholder. Future
+            // work could let users import their own video clips into
+            // a "local clips" pool that lives outside `assets/videos/`.
+        },
+        |ui, state| {
+            let search_lower = state.library_search.to_lowercase();
+            let clip_count = state.library.mellstroy_clips.len();
+            ui.label(
+                RichText::new(format!("Clips ({})", clip_count))
+                    .size(12.0)
+                    .strong()
+                    .color(Color32::from_rgb(220, 130, 50)),
+            );
+            ui.add_space(2.0);
 
-    egui::ScrollArea::vertical()
-        .id_source("library_clips_scroll")
-        .auto_shrink([false; 2])
-        .show(ui, |ui| {
-            if state.library.mellstroy_clips.is_empty() {
-                ui.label(
-                    RichText::new("No clips. Hit Refresh to download.")
-                        .italics()
-                        .color(COL_TEXT_DIM)
-                        .size(11.0),
-                );
-                return;
-            }
-            for idx in 0..state.library.mellstroy_clips.len() {
-                let clip = &state.library.mellstroy_clips[idx];
-                if !search_lower.is_empty() {
-                    let clean = clean_clip_text(&clip.description).to_lowercase();
-                    let id_str = clip.id.to_string();
-                    if !clean.contains(&search_lower) && !id_str.contains(&search_lower) {
-                        continue;
+            egui::ScrollArea::vertical()
+                .id_source("library_clips_scroll")
+                .auto_shrink([false; 2])
+                .show(ui, |ui| {
+                    if state.library.mellstroy_clips.is_empty() {
+                        ui.label(
+                            RichText::new("No clips. Hit Refresh to download.")
+                                .italics()
+                                .color(COL_TEXT_DIM)
+                                .size(11.0),
+                        );
+                        return;
                     }
-                }
-                let clip = state.library.mellstroy_clips[idx].clone();
-                clip_card(ui, state, &clip);
-            }
-        });
+                    for idx in 0..state.library.mellstroy_clips.len() {
+                        let clip = &state.library.mellstroy_clips[idx];
+                        if !search_lower.is_empty() {
+                            let clean = clean_clip_text(&clip.description).to_lowercase();
+                            let id_str = clip.id.to_string();
+                            if !clean.contains(&search_lower) && !id_str.contains(&search_lower) {
+                                continue;
+                            }
+                        }
+                        let clip = state.library.mellstroy_clips[idx].clone();
+                        clip_card(ui, state, &clip);
+                    }
+                });
+        },
+    );
 }
 
 /// Render a generic LibraryAsset list (sounds / images / particles / videos).
@@ -182,57 +299,73 @@ fn library_assets_tab(ui: &mut egui::Ui, state: &mut EditorState, kind: AssetDra
         _ => return,
     };
 
-    let assets: &[crate::state::LibraryAsset] = match kind {
-        AssetDragKind::Sound => &state.library.sounds,
-        AssetDragKind::Image => &state.library.images,
-        AssetDragKind::Particle => &state.library.particles,
-        AssetDragKind::Video => &state.library.videos,
-        _ => return,
-    };
+    let split_id = format!("library_split_{}", title.to_lowercase());
 
-    let search_lower = state.library_search.to_lowercase();
-    let count = assets.len();
-    ui.label(
-        RichText::new(format!("{} ({})", title, count))
-            .size(12.0)
-            .strong()
-            .color(title_color),
-    );
-    ui.add_space(2.0);
+    library_split_panel(
+        ui,
+        state,
+        &split_id,
+        |ui, state| {
+            let assets: &[crate::state::LibraryAsset] = match kind {
+                AssetDragKind::Sound => &state.library.sounds,
+                AssetDragKind::Image => &state.library.images,
+                AssetDragKind::Particle => &state.library.particles,
+                AssetDragKind::Video => &state.library.videos,
+                _ => return,
+            };
 
-    if count == 0 {
-        ui.label(
-            RichText::new(format!(
-                "Empty. Drop files into:\n  {}\nthen click Refresh.",
-                dir.display()
-            ))
-            .italics()
-            .color(COL_TEXT_DIM)
-            .size(10.0),
-        );
-        return;
-    }
+            let search_lower = state.library_search.to_lowercase();
+            let count = assets.len();
+            ui.label(
+                RichText::new(format!("{} ({})", title, count))
+                    .size(12.0)
+                    .strong()
+                    .color(title_color),
+            );
+            ui.add_space(2.0);
 
-    let scroll_id = format!("library_{}_scroll", title.to_lowercase());
-    // Snapshot the row data so the borrow checker is happy with the
-    // mutable `state` we pass to `library_asset_card`.
-    let rows: Vec<crate::state::LibraryAsset> = assets.iter()
-        .filter(|a| {
-            search_lower.is_empty()
-                || a.label.to_lowercase().contains(&search_lower)
-                || a.id.to_lowercase().contains(&search_lower)
-        })
-        .cloned()
-        .collect();
-
-    egui::ScrollArea::vertical()
-        .id_source(scroll_id)
-        .auto_shrink([false; 2])
-        .show(ui, |ui| {
-            for asset in &rows {
-                library_asset_card(ui, state, asset, kind, title_color);
+            if count == 0 {
+                ui.label(
+                    RichText::new(format!(
+                        "Empty. Drop files into:\n  {}\nthen click Refresh.",
+                        dir.display()
+                    ))
+                    .italics()
+                    .color(COL_TEXT_DIM)
+                    .size(10.0),
+                );
+                return;
             }
-        });
+
+            let scroll_id = format!("library_{}_scroll", title.to_lowercase());
+            // Snapshot the row data so the borrow checker is happy with the
+            // mutable `state` we pass to `library_asset_card`.
+            let rows: Vec<crate::state::LibraryAsset> = assets
+                .iter()
+                .filter(|a| {
+                    search_lower.is_empty()
+                        || a.label.to_lowercase().contains(&search_lower)
+                        || a.id.to_lowercase().contains(&search_lower)
+                })
+                .cloned()
+                .collect();
+
+            egui::ScrollArea::vertical()
+                .id_source(scroll_id)
+                .auto_shrink([false; 2])
+                .show(ui, |ui| {
+                    for asset in &rows {
+                        library_asset_card(ui, state, asset, kind, title_color);
+                    }
+                });
+        },
+        |_ui, _state| {
+            // Global section is intentionally empty for non-Clips tabs
+            // for now — the slot exists so the splitter layout matches
+            // every tab and so future work can wire a remote/built-in
+            // library here without changing the UI shape.
+        },
+    );
 }
 
 /// Compact card for a single sound / image / particle entry. Mirrors
@@ -504,6 +637,21 @@ pub fn inspector(ui: &mut egui::Ui, state: &mut EditorState) {
     ui.separator();
     ui.add_space(4.0);
 
+    // Wrap everything below the header in a vertical scroll area so the
+    // inspector remains usable when a layer has more parameters than the
+    // panel can show in one go (long Effects lists, animated_params,
+    // etc.). `auto_shrink([false; 2])` keeps the scrollbar pinned to the
+    // panel's right edge regardless of content height.
+    egui::ScrollArea::vertical()
+        .id_source("inspector_scroll")
+        .auto_shrink([false; 2])
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            inspector_body(ui, state);
+        });
+}
+
+fn inspector_body(ui: &mut egui::Ui, state: &mut EditorState) {
     match state.selection {
         Selection::None => {
             inspector_nothing(ui, state);
@@ -671,12 +819,7 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
                 param_ids::SCALE_Y, false,
                 |s| s.scale_y = new_scale_y);
         }
-        if ui.small_button("\u{21BB}").on_hover_text("Reset to 1.0 (proportional)").clicked() {
-            kf_anim::write_actor_param(
-                &mut a.layout, &mut a.animated_params, playhead,
-                param_ids::SCALE_Y, false,
-                |s| s.scale_y = 1.0);
-        }
+        // Reset (\u{21BB}) button intentionally removed — set Stretch Y to 1.0 via the slider directly.
     });
 
     // ── Rotation (dial + numeric) ──
@@ -739,13 +882,7 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
                 param_ids::FLIP_X, false,
                 |s| s.flip_x_anim = new_fx);
         }
-        if ui.small_button("\u{21B6}").on_hover_text("Mirror (set −1)").clicked() {
-            new_fx = -1.0;
-            kf_anim::write_actor_param(
-                &mut a.layout, &mut a.animated_params, playhead,
-                param_ids::FLIP_X, false,
-                |s| s.flip_x_anim = -1.0);
-        }
+        // Mirror (\u{21B6}) shortcut button intentionally removed — drag the slider to -1 manually.
     });
     ui.horizontal(|ui| {
         kf_anim::animated_toggle(ui, &mut a.animated_params, param_ids::FLIP_Y, ("act_fy", i));
@@ -2149,13 +2286,38 @@ fn inspector_text_overlay(
                         ui.selectable_value(&mut t.style.font, fam.to_string(), *fam);
                     }
                 });
-            ui.add(
-                egui::TextEdit::singleline(&mut t.style.font)
-                    .desired_width(120.0)
-                    .hint_text("Family name"),
-            );
         });
-        ui.add(egui::Slider::new(&mut t.style.font_size, 8.0..=512.0).text("Size"));
+
+        // ── Size: compact "−  [drag value]  +" trio with quick presets.
+        // The user's #1 ask was "more intuitive sizing with fewer params"
+        // — the wide 8..=512 slider felt finicky. The drag value still
+        // covers the whole sane range, but the −/+ buttons step by a
+        // visible amount and the preset row gets you to common sizes
+        // in one click.
+        ui.horizontal(|ui| {
+            ui.label("Size:");
+            if ui.small_button("\u{2212}").on_hover_text("Decrease (-4)").clicked() {
+                t.style.font_size = (t.style.font_size - 4.0).max(8.0);
+            }
+            ui.add(
+                egui::DragValue::new(&mut t.style.font_size)
+                    .range(8.0..=512.0)
+                    .speed(0.5)
+                    .suffix(" px"),
+            );
+            if ui.small_button("+").on_hover_text("Increase (+4)").clicked() {
+                t.style.font_size = (t.style.font_size + 4.0).min(512.0);
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Preset:");
+            for (label, sz) in [("S", 24.0_f32), ("M", 48.0), ("L", 96.0), ("XL", 144.0)] {
+                if ui.small_button(label).on_hover_text(format!("{} px", sz as i32)).clicked() {
+                    t.style.font_size = sz;
+                }
+            }
+        });
+
         ui.horizontal(|ui| {
             ui.checkbox(&mut t.style.bold, "Bold");
             ui.checkbox(&mut t.style.italic, "Italic");
@@ -2555,6 +2717,46 @@ fn collect_clip_edges(state: &EditorState, exclude_actor: Option<usize>) -> Vec<
 pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     // ── Toolbar ──
     ui.horizontal(|ui| {
+        // ── Play / Pause / Stop transport ──
+        // Always-visible inline playback controls so the user doesn't have
+        // to reach for the Space shortcut. Stop returns the playhead to 0
+        // and pauses; the Play button toggles like Space does. The big
+        // glyphs render via the default font and stay legible at any
+        // zoom level.
+        let play_glyph = if state.playing { "\u{23F8}" } else { "\u{25B6}" }; // ⏸ / ▶
+        let play_label = if state.playing { "Pause (Space)" } else { "Play (Space)" };
+        let play_color = if state.playing {
+            Color32::from_rgb(255, 200, 80)
+        } else {
+            Color32::from_rgb(120, 220, 140)
+        };
+        let play_btn = egui::Button::new(
+            RichText::new(play_glyph).size(15.0).color(play_color),
+        )
+        .min_size(Vec2::new(30.0, 22.0));
+        if ui.add(play_btn).on_hover_text(play_label).clicked() {
+            state.playing = !state.playing;
+            state.status = if state.playing {
+                "\u{25B6} Playing".into()
+            } else {
+                "\u{23F8} Paused".into()
+            };
+        }
+
+        let stop_btn = egui::Button::new(
+            RichText::new("\u{23F9}")
+                .size(14.0)
+                .color(Color32::from_rgb(220, 120, 120)),
+        )
+        .min_size(Vec2::new(26.0, 22.0));
+        if ui.add(stop_btn).on_hover_text("Stop & rewind to start").clicked() {
+            state.playing = false;
+            state.playhead = 0.0;
+            state.status = "\u{23F9} Stopped".into();
+        }
+
+        ui.separator();
+
         ui.add(egui::DragValue::new(&mut state.playback_speed).range(0.1..=8.0).speed(0.05).prefix("x"));
 
         ui.separator();
@@ -3098,21 +3300,30 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                 let delta_t = dx / pps;
                                 let new_start = (clip_start + delta_t).max(0.0).min(clip_end - 0.1);
                                 let new_dur = (clip_end - new_start).max(0.1);
-                                state.scene.backgrounds[bi].start = new_start;
-                                state.scene.backgrounds[bi].duration = new_dur;
+                                let token = EditorState::drag_token("trim_bg_left", bi);
+                                state.mutate_drag(token, |s| {
+                                    s.backgrounds[bi].start = new_start;
+                                    s.backgrounds[bi].duration = new_dur;
+                                });
                                 to_select = Some(Selection::Background(bi));
                             } else if clicked == f32::NEG_INFINITY {
                                 // Trim right: stretch / shrink the duration.
                                 let dx = ui.input(|i| i.pointer.delta().x);
                                 let delta_t = dx / pps;
                                 let new_dur = (clip_end - clip_start + delta_t).max(0.1);
-                                state.scene.backgrounds[bi].duration = new_dur;
+                                let token = EditorState::drag_token("trim_bg_right", bi);
+                                state.mutate_drag(token, |s| {
+                                    s.backgrounds[bi].duration = new_dur;
+                                });
                                 to_select = Some(Selection::Background(bi));
                             } else if clicked < 0.0 {
                                 let new_start = (-clicked).max(0.0);
                                 let dur = clip_end - clip_start;
-                                state.scene.backgrounds[bi].start = new_start;
-                                state.scene.backgrounds[bi].duration = dur;
+                                let token = EditorState::drag_token("move_bg", bi);
+                                state.mutate_drag(token, |s| {
+                                    s.backgrounds[bi].start = new_start;
+                                    s.backgrounds[bi].duration = dur;
+                                });
                                 to_select = Some(Selection::Background(bi));
                             } else if state.split_tool_active {
                                 to_select = Some(Selection::Background(bi));
@@ -3164,7 +3375,18 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             let dx = ui.input(|i| i.pointer.delta().x);
                             let delta_t = dx / pps;
                             let new_in = (clip_start + delta_t).max(0.0).min(clip_end - 0.1);
-                            state.scene.actors[ai].t_in = Some(new_in);
+                            let token = EditorState::drag_token("trim_actor_left", ai);
+                            state.mutate_drag(token, |s| {
+                                s.actors[ai].t_in = Some(new_in);
+                                // Crop scene-time keyframes that fall before the new in-edge.
+                                s.actors[ai].layout.retain(|kf| kf.t >= new_in - 1.0e-3);
+                                if s.actors[ai].layout.is_empty() {
+                                    s.actors[ai].layout.push(memstroy_core::Keyframe::new(
+                                        new_in,
+                                        memstroy_core::ActorState::default(),
+                                    ));
+                                }
+                            });
                             // Bound audio: shift its in-edge by the same delta and
                             // advance source_start so the playback head doesn't slip.
                             sync_audio_to_actor(state, ai);
@@ -3174,7 +3396,19 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             let dx = ui.input(|i| i.pointer.delta().x);
                             let delta_t = dx / pps;
                             let new_out = (clip_end + delta_t).max(clip_start + 0.1);
-                            state.scene.actors[ai].t_out = Some(new_out);
+                            let token = EditorState::drag_token("trim_actor_right", ai);
+                            state.mutate_drag(token, |s| {
+                                s.actors[ai].t_out = Some(new_out);
+                                // Crop scene-time keyframes that fall after the new out-edge.
+                                s.actors[ai].layout.retain(|kf| kf.t <= new_out + 1.0e-3);
+                                if s.actors[ai].layout.is_empty() {
+                                    let t = s.actors[ai].t_in.unwrap_or(0.0);
+                                    s.actors[ai].layout.push(memstroy_core::Keyframe::new(
+                                        t,
+                                        memstroy_core::ActorState::default(),
+                                    ));
+                                }
+                            });
                             sync_audio_to_actor(state, ai);
                             to_select = Some(Selection::Actor(ai));
                         } else if clicked < 0.0 {
@@ -3182,9 +3416,9 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             let mut new_start = (-clicked).max(0.0);
                             let dur = clip_end - clip_start;
 
-                            // ── Undo snapshot on drag start ──
+                            // ── Undo snapshot is now handled by mutate_drag below.
+                            // Track the active drag for lane-routing UI hints.
                             if state.timeline_drag.dragging_clip.is_none() {
-                                state.undo.push(&state.scene);
                                 state.timeline_drag.dragging_clip = Some(ai);
                                 state.timeline_drag.pending_new_lane = None;
                                 state.timeline_drag.start_pointer_y = pointer_y;
@@ -3261,8 +3495,21 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                 }
                             }
 
-                            state.scene.actors[ai].t_in = Some(new_start);
-                            state.scene.actors[ai].t_out = Some(new_start + dur);
+                            // ── Move keyframes with the clip ──
+                            // Actor keyframes are stored in scene-time, so a
+                            // drag must shift them by the same delta to keep
+                            // them visually attached to the clip bar.
+                            let dt_kfs = new_start - clip_start;
+                            let token = EditorState::drag_token("move_actor", ai);
+                            state.mutate_drag(token, |s| {
+                                s.actors[ai].t_in = Some(new_start);
+                                s.actors[ai].t_out = Some(new_start + dur);
+                                if dt_kfs.abs() > 1.0e-6 {
+                                    for kf in s.actors[ai].layout.iter_mut() {
+                                        kf.t += dt_kfs;
+                                    }
+                                }
+                            });
                             sync_audio_to_actor(state, ai);
                             to_select = Some(Selection::Actor(ai));
                         } else if state.split_tool_active {
@@ -3313,6 +3560,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                         track_left,
                         track_right,
                         sel,
+                        true, // actor kfs are stored in scene-time
                     );
                 }
 
@@ -3357,33 +3605,70 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             let dx = ui.input(|i| i.pointer.delta().x);
                             let delta_t = dx / pps;
                             let new_in = (clip_start + delta_t).max(0.0).min(clip_end - 0.1);
-                            match &mut state.scene.overlays[oi] {
-                                Overlay::Text(t) => { t.t_in = new_in; }
-                                Overlay::Image(im) => { im.t_in = new_in; }
-                                Overlay::Video(v) => { v.t_in = new_in; }
-                            }
+                            let shift = new_in - clip_start;
+                            let token = EditorState::drag_token("trim_overlay_left", oi);
+                            state.mutate_drag(token, |s| {
+                                let layout: &mut Vec<memstroy_core::Keyframe<memstroy_core::OverlayState>> = match &mut s.overlays[oi] {
+                                    Overlay::Text(t) => { t.t_in = new_in; &mut t.layout }
+                                    Overlay::Image(im) => { im.t_in = new_in; &mut im.layout }
+                                    Overlay::Video(v) => { v.t_in = new_in; &mut v.layout }
+                                };
+                                // Overlay kfs are clip-local, so trimming
+                                // the in-edge shifts every kf's local
+                                // time by `-shift` to keep its scene-time
+                                // anchor stable. Kfs that fall before
+                                // local_t = 0 are dropped.
+                                if shift.abs() > 1.0e-6 {
+                                    for kf in layout.iter_mut() { kf.t -= shift; }
+                                    layout.retain(|kf| kf.t >= -1.0e-3);
+                                    for kf in layout.iter_mut() { kf.t = kf.t.max(0.0); }
+                                }
+                                if layout.is_empty() {
+                                    layout.push(memstroy_core::Keyframe::new(
+                                        0.0,
+                                        memstroy_core::OverlayState::default(),
+                                    ));
+                                }
+                            });
                             to_select = Some(Selection::Overlay(oi));
                         } else if clicked == f32::NEG_INFINITY {
                             // Trim right edge.
                             let dx = ui.input(|i| i.pointer.delta().x);
                             let delta_t = dx / pps;
                             let new_out = (clip_end + delta_t).max(clip_start + 0.1);
-                            match &mut state.scene.overlays[oi] {
-                                Overlay::Text(t) => { t.t_out = new_out; }
-                                Overlay::Image(im) => { im.t_out = new_out; }
-                                Overlay::Video(v) => { v.t_out = new_out; }
-                            }
+                            let token = EditorState::drag_token("trim_overlay_right", oi);
+                            state.mutate_drag(token, |s| {
+                                let (t_in_v, layout): (f32, &mut Vec<memstroy_core::Keyframe<memstroy_core::OverlayState>>) = match &mut s.overlays[oi] {
+                                    Overlay::Text(t) => { t.t_out = new_out; (t.t_in, &mut t.layout) }
+                                    Overlay::Image(im) => { im.t_out = new_out; (im.t_in, &mut im.layout) }
+                                    Overlay::Video(v) => { v.t_out = new_out; (v.t_in, &mut v.layout) }
+                                };
+                                // Drop kfs whose local time runs past the
+                                // new clip duration — they're outside the
+                                // visible window after the trim.
+                                let max_local = (new_out - t_in_v).max(0.0) + 1.0e-3;
+                                layout.retain(|kf| kf.t <= max_local);
+                                if layout.is_empty() {
+                                    layout.push(memstroy_core::Keyframe::new(
+                                        0.0,
+                                        memstroy_core::OverlayState::default(),
+                                    ));
+                                }
+                            });
                             to_select = Some(Selection::Overlay(oi));
                         } else if clicked < 0.0 {
                             // Drag: move the overlay's time window.
                             let new_start = (-clicked).max(0.0);
                             let dur = clip_end - clip_start;
                             let new_end = new_start + dur;
-                            match &mut state.scene.overlays[oi] {
-                                Overlay::Text(t) => { t.t_in = new_start; t.t_out = new_end; }
-                                Overlay::Image(im) => { im.t_in = new_start; im.t_out = new_end; }
-                                Overlay::Video(v) => { v.t_in = new_start; v.t_out = new_end; }
-                            }
+                            let token = EditorState::drag_token("move_overlay", oi);
+                            state.mutate_drag(token, |s| {
+                                match &mut s.overlays[oi] {
+                                    Overlay::Text(t) => { t.t_in = new_start; t.t_out = new_end; }
+                                    Overlay::Image(im) => { im.t_in = new_start; im.t_out = new_end; }
+                                    Overlay::Video(v) => { v.t_in = new_start; v.t_out = new_end; }
+                                }
+                            });
 
                             // Vertical: re-assign track based on pointer Y.
                             // Overlays only land on video lanes, mirroring
@@ -3435,6 +3720,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                         track_left,
                         track_right,
                         sel,
+                        false, // overlay kfs are clip-local
                     );
                 }
             }
@@ -3455,13 +3741,15 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                     let audio = &state.scene.audio[aui];
                     let clip_start = audio.t_in;
                     let clip_end = audio.t_out.unwrap_or(duration);
+                    let audio_source_start = audio.source_start;
                     if !in_viewport(clip_start, clip_end) { continue; }
                     let sel = state.selection == Selection::Audio(aui);
                     let audio_id = egui::Id::new(("timeline_clip", "audio", aui));
                     if let Some(clicked) = draw_audio_clip(ui, painter, content_rect, &audio.id, audio_id,
                         clip_start, clip_end, state.timeline_scroll, pps, track_left, track_right,
                         sel, track_h, track_locked, state.split_tool_active,
-                        state.audio_waveforms.get(aui))
+                        state.audio_waveforms.get(aui),
+                        audio_source_start)
                     {
                         if clicked == f32::INFINITY {
                             // Trim left: walk t_in forward and bump
@@ -3472,23 +3760,33 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             let delta_t = dx / pps;
                             let new_in = (clip_start + delta_t).max(0.0).min(clip_end - 0.1);
                             let actual_delta = new_in - clip_start;
-                            state.scene.audio[aui].t_in = new_in;
-                            state.scene.audio[aui].source_start =
-                                (state.scene.audio[aui].source_start + actual_delta).max(0.0);
+                            let token = EditorState::drag_token("trim_audio_left", aui);
+                            state.mutate_drag(token, |s| {
+                                let prev_src = s.audio[aui].source_start;
+                                s.audio[aui].t_in = new_in;
+                                s.audio[aui].source_start =
+                                    (prev_src + actual_delta).max(0.0);
+                            });
                             to_select = Some(Selection::Audio(aui));
                         } else if clicked == f32::NEG_INFINITY {
                             // Trim right: extend / shrink the audible window.
                             let dx = ui.input(|i| i.pointer.delta().x);
                             let delta_t = dx / pps;
                             let new_out = (clip_end + delta_t).max(clip_start + 0.1);
-                            state.scene.audio[aui].t_out = Some(new_out);
+                            let token = EditorState::drag_token("trim_audio_right", aui);
+                            state.mutate_drag(token, |s| {
+                                s.audio[aui].t_out = Some(new_out);
+                            });
                             to_select = Some(Selection::Audio(aui));
                         } else if clicked < 0.0 {
                             // Drag: move the audio clip horizontally.
                             let new_start = (-clicked).max(0.0);
                             let dur = clip_end - clip_start;
-                            state.scene.audio[aui].t_in = new_start;
-                            state.scene.audio[aui].t_out = Some(new_start + dur);
+                            let token = EditorState::drag_token("move_audio", aui);
+                            state.mutate_drag(token, |s| {
+                                s.audio[aui].t_in = new_start;
+                                s.audio[aui].t_out = Some(new_start + dur);
+                            });
 
                             // Vertical: only allow audio to land on audio
                             // lanes. Lane creation is deferred to drag-end
@@ -3534,6 +3832,24 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                     Selection::Overlay(oi) => crate::kf_anim::SelectedLayer::Overlay(oi),
                     _ => crate::kf_anim::SelectedLayer::RenderFrame,
                 };
+                // Compute the selected layer's clip range in scene-time so
+                // the param rows can attach visually to the clip bar.
+                let (clip_start_t, clip_end_t) = match sel_layer {
+                    Selection::Actor(ai) => {
+                        let a = &state.scene.actors[ai];
+                        (a.t_in.unwrap_or(0.0), a.t_out.unwrap_or(duration))
+                    }
+                    Selection::Overlay(oi) => {
+                        match &state.scene.overlays[oi] {
+                            Overlay::Text(t) => (t.t_in, t.t_out),
+                            Overlay::Image(im) => (im.t_in, im.t_out),
+                            Overlay::Video(v) => (v.t_in, v.t_out),
+                        }
+                    }
+                    _ => (0.0, duration),
+                };
+                let clip_x_start = (clip_start_t - state.timeline_scroll) * pps + track_left;
+                let clip_x_end = (clip_end_t - state.timeline_scroll) * pps + track_left;
                 let kf_pairs: Vec<(f32, f32)> = keyframe_times_for_layer(state, sel_layer)
                     .into_iter()
                     .map(|local_t| (local_t, kf_time_to_scene_time(state, sel_layer, local_t)))
@@ -3552,6 +3868,8 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                     state.timeline_scroll,
                     state.playhead,
                     &state.selected_keyframes,
+                    clip_x_start,
+                    clip_x_end,
                 );
                 for hit in outcome.click_hits {
                     param_row_clicks.push((layer_label.clone(), hit));
@@ -4449,6 +4767,14 @@ fn draw_clip_trim_handles(
 
 
 /// Draw an audio clip with waveform visualization.
+///
+/// `source_start` is the offset INTO THE SOURCE FILE that maps to
+/// `clip_start` on the timeline; `clip_dur_total` is the original
+/// (unclipped-by-viewport) clip length in scene-time seconds. The two
+/// together let us pick the right slice of the pre-computed peaks vector
+/// — when the user trims either edge of the clip, the waveform CROPS
+/// instead of stretching, because the bar pixels keep mapping to the
+/// same source-time positions.
 #[allow(clippy::too_many_arguments)]
 fn draw_audio_clip(
     ui: &mut egui::Ui,
@@ -4467,14 +4793,15 @@ fn draw_audio_clip(
     locked: bool,
     _split_mode: bool,
     waveform: Option<&crate::state::AudioWaveform>,
+    source_start: f32,
 ) -> Option<f32> {
-    let x_start = (clip_start - scroll) * pps + track_left;
-    let x_end = (clip_end - scroll) * pps + track_left;
+    let x_start_full = (clip_start - scroll) * pps + track_left;
+    let x_end_full = (clip_end - scroll) * pps + track_left;
 
-    if x_end < track_left || x_start > track_right { return None; }
+    if x_end_full < track_left || x_start_full > track_right { return None; }
 
-    let x_start = x_start.max(track_left);
-    let x_end = x_end.min(track_right);
+    let x_start = x_start_full.max(track_left);
+    let x_end = x_end_full.min(track_right);
     if x_end - x_start < 2.0 { return None; }
 
     let bar_rect = egui::Rect::from_min_max(
@@ -4488,30 +4815,48 @@ fn draw_audio_clip(
 
     // Draw waveform or fallback visualization
     if let Some(wf) = waveform {
-        if wf.ready && !wf.peaks.is_empty() {
+        if wf.ready && !wf.peaks.is_empty() && wf.duration > 0.001 {
             let bar_w = bar_rect.width();
             let bar_h = bar_rect.height();
             let center_y = bar_rect.center().y;
-            let num_samples = (bar_w as usize).min(wf.peaks.len());
+            let num_samples = (bar_w as usize).min(wf.peaks.len()).max(1);
 
             if num_samples > 1 {
-                // Draw the waveform as a single batched mesh instead of one
-                // `line_segment` per sample. With long clips this is the
-                // difference between thousands of independent shapes
-                // (re-tessellated every frame) and a single GPU mesh that
-                // egui can blast through in one call.
+                // Map each on-screen pixel x to a source-file time, then
+                // pick the corresponding peak. Because we use the FULL
+                // (unclipped) bar's left/right to compute source-time,
+                // viewport scrolling and edge-trims both crop the
+                // waveform correctly — the visible bar is the audible
+                // window, drawn at the file's natural amplitude scale.
                 use egui::epaint::{Mesh, Vertex, WHITE_UV};
                 let color = Color32::from_rgba_premultiplied(255, 255, 255, 120);
-                let step = wf.peaks.len() as f32 / num_samples as f32;
                 let bar_pixel_w = (bar_w / num_samples as f32).max(1.0);
                 let mut mesh = Mesh::default();
                 mesh.vertices.reserve(num_samples * 4);
                 mesh.indices.reserve(num_samples * 6);
+
+                let full_bar_w = (x_end_full - x_start_full).max(1.0);
+                // Source-time at the LEFT edge of the visible bar.
+                let visible_offset_pix = x_start - x_start_full;
+                let source_t_at_visible_start =
+                    source_start + (visible_offset_pix / full_bar_w) * (clip_end - clip_start);
+                let source_t_per_pixel = (clip_end - clip_start) / full_bar_w;
+                let peaks_per_sec = wf.peaks.len() as f32 / wf.duration;
+
                 for i in 0..num_samples {
-                    let sample_idx = (i as f32 * step) as usize;
-                    let peak = wf.peaks.get(sample_idx).copied().unwrap_or(0.0);
+                    let pix_in_visible = (i as f32 / num_samples as f32) * bar_w;
+                    let source_t =
+                        source_t_at_visible_start + pix_in_visible * source_t_per_pixel;
+                    let peak_idx = (source_t * peaks_per_sec) as isize;
+                    let peak = if peak_idx < 0 {
+                        0.0
+                    } else if (peak_idx as usize) < wf.peaks.len() {
+                        wf.peaks[peak_idx as usize]
+                    } else {
+                        0.0
+                    };
                     let h = peak * bar_h * 0.4;
-                    let x = bar_rect.min.x + (i as f32 / num_samples as f32) * bar_w;
+                    let x = bar_rect.min.x + pix_in_visible;
                     let i0 = mesh.vertices.len() as u32;
                     mesh.vertices.push(Vertex { pos: egui::pos2(x, center_y - h), uv: WHITE_UV, color });
                     mesh.vertices.push(Vertex { pos: egui::pos2(x + bar_pixel_w, center_y - h), uv: WHITE_UV, color });
@@ -4872,12 +5217,27 @@ fn draw_param_kf_rows(
     scroll: f32,
     state_playhead: f32,
     selected_kfs: &[crate::kf_anim::SelectedKeyframe],
+    // On-screen X range that the OWNING CLIP occupies on the timeline.
+    // The per-param rows are drawn ONLY within this range so they read
+    // as visually attached to the clip — moving or trimming the clip
+    // crops the keyframe area along with it. Labels still anchor at
+    // `track_left` so the user can read them in the layer gutter.
+    clip_x_start: f32,
+    clip_x_end: f32,
 ) -> ParamRowOutcome {
     let row_h = (expansion_height / params.len().max(1) as f32).max(10.0);
     let mut outcome = ParamRowOutcome::default();
 
+    // Visible attached strip — clamped to the timeline viewport AND to
+    // the clip's bar. When the clip is scrolled out of view this comes
+    // out empty and the function essentially no-ops.
+    let strip_x_start = clip_x_start.max(track_left);
+    let strip_x_end = clip_x_end.min(track_right);
+    let strip_visible = strip_x_end - strip_x_start > 1.0;
+
     // Track separator above the param rows so they read as a separate
-    // sub-section of the layer's row.
+    // sub-section of the layer's row. Drawn over the full row width so
+    // the gutter (label area) keeps its baseline.
     painter.line_segment(
         [
             egui::pos2(track_left, expansion_top),
@@ -4893,20 +5253,39 @@ fn draw_param_kf_rows(
         let row_top = expansion_top + (pi as f32) * row_h;
         let row_bot = row_top + row_h;
 
-        // Alternating background tint per param row.
+        // Alternating background tint per param row — drawn ONLY inside
+        // the clip's strip so the row visually attaches to the clip.
         let bg = if pi % 2 == 0 {
             Color32::from_rgba_premultiplied(255, 255, 255, 6)
         } else {
             Color32::from_rgba_premultiplied(255, 255, 255, 12)
         };
-        painter.rect_filled(
-            egui::Rect::from_min_max(
-                egui::pos2(track_left, row_top),
-                egui::pos2(track_right, row_bot),
-            ),
-            Rounding::ZERO,
-            bg,
-        );
+        if strip_visible {
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(strip_x_start, row_top),
+                    egui::pos2(strip_x_end, row_bot),
+                ),
+                Rounding::ZERO,
+                bg,
+            );
+            // Strip side accents so the boundary with the timeline is
+            // visible and the user reads the rows as "clip-bound".
+            painter.line_segment(
+                [
+                    egui::pos2(strip_x_start, row_top),
+                    egui::pos2(strip_x_start, row_bot),
+                ],
+                Stroke::new(1.0, Color32::from_rgba_premultiplied(255, 255, 255, 30)),
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(strip_x_end, row_top),
+                    egui::pos2(strip_x_end, row_bot),
+                ],
+                Stroke::new(1.0, Color32::from_rgba_premultiplied(255, 255, 255, 30)),
+            );
+        }
 
         // Label on the far-left of the row.
         let label = memstroy_core::param_ids::label(param_id);
@@ -4918,11 +5297,16 @@ fn draw_param_kf_rows(
             COL_TEXT_DIM,
         );
 
-        // Diamond per kf, hit-tested.
+        // Diamond per kf, hit-tested. Diamonds outside the clip's strip
+        // are skipped so the per-param row only carries keyframes that
+        // belong to the clip's visible range.
         let half = 4.5_f32;
         for &(local_t, scene_t) in kf_pairs {
             let x = (scene_t - scroll) * pps + track_left;
-            if x < track_left - half || x > track_right + half {
+            if !strip_visible {
+                continue;
+            }
+            if x < strip_x_start - half || x > strip_x_end + half {
                 continue;
             }
             let cy = row_top + row_h * 0.5;
@@ -5007,9 +5391,9 @@ struct ParamRowClick {
 
 
 /// Draw small diamond markers on a clip bar, one per layout keyframe.
-/// Keyframe times are LOCAL (relative to clip's t_in). Used for the
-/// "visual constructor of animations" — gives users an at-a-glance view
-/// of when in the clip's timeline parameter changes happen.
+/// `kf_t_is_scene_time` controls whether `kf.t` is interpreted as the
+/// final scene-time (true — actors) or as a clip-local offset that
+/// should be added to `clip_start` (false — overlays).
 #[allow(clippy::too_many_arguments)]
 fn draw_keyframe_diamonds<T>(
     painter: &egui::Painter,
@@ -5022,6 +5406,7 @@ fn draw_keyframe_diamonds<T>(
     track_left: f32,
     track_right: f32,
     selected: bool,
+    kf_t_is_scene_time: bool,
 ) {
     if layout.is_empty() { return; }
     // If there's only a single static keyframe, no need to draw anything —
@@ -5040,7 +5425,7 @@ fn draw_keyframe_diamonds<T>(
     let stroke = Color32::from_rgb(20, 20, 30);
 
     for kf in layout {
-        let abs_t = clip_start + kf.t;
+        let abs_t = if kf_t_is_scene_time { kf.t } else { clip_start + kf.t };
         if abs_t < clip_start - 0.001 || abs_t > clip_end + 0.001 { continue; }
         let x = (abs_t - scroll) * pps + track_left;
         if x < track_left - half || x > track_right + half { continue; }

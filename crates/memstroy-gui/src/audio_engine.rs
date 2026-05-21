@@ -25,7 +25,7 @@
 use std::fs::File;
 use std::io::BufReader;
 use std::panic::AssertUnwindSafe;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::Once;
 use std::thread;
@@ -202,10 +202,29 @@ impl AudioEngine {
             }
             if !spec.path.exists() { continue; }
 
-            let file = match File::open(&spec.path) {
+            // ── Container fallback: extract audio via ffmpeg for files
+            // that rodio's symphonia adapter can't safely probe (mp4 / mkv
+            // / mov panic at "Seek errors should not occur during
+            // initialization" on rodio 0.19). The first probe per file
+            // dumps the audio stream to a cached WAV in the system temp
+            // dir; subsequent loads of the same source mtime hit the cache
+            // and finish in microseconds. Plain audio files (mp3 / wav /
+            // ogg / ...) skip this step entirely.
+            let resolved_path = match resolve_audio_source(&spec.path) {
+                Some(p) => p,
+                None => {
+                    debug!(
+                        "Skipping audio source (no decodable stream): {}",
+                        spec.path.display()
+                    );
+                    continue;
+                }
+            };
+
+            let file = match File::open(&resolved_path) {
                 Ok(f) => f,
                 Err(e) => {
-                    warn!("Failed to open audio file {}: {}", spec.path.display(), e);
+                    warn!("Failed to open audio file {}: {}", resolved_path.display(), e);
                     continue;
                 }
             };
@@ -368,5 +387,102 @@ impl AudioEngine {
     #[allow(dead_code)]
     pub fn is_playing(&self) -> bool {
         self.playing
+    }
+}
+
+/// Resolve a scene audio path to something rodio can decode without
+/// panicking. Plain audio files are returned unchanged. Video containers
+/// (mp4 / mov / mkv / webm / avi / m4v) are pre-extracted to a temp WAV
+/// using ffmpeg the first time they're seen — rodio 0.19's symphonia
+/// adapter is known to panic during probe on some valid mp4s, and falling
+/// back to ffmpeg sidesteps that bug entirely.
+///
+/// Cache key = `<file_stem>_<size>_<mtime_secs>.wav` in the system temp
+/// dir (`memstroy_audio_cache/`). Subsequent calls with the same source
+/// hit the cache and return immediately.
+///
+/// Returns `None` only if extraction was attempted and failed (no audio
+/// stream / ffmpeg unavailable / write error). Plain audio paths always
+/// succeed.
+fn resolve_audio_source(src: &Path) -> Option<PathBuf> {
+    let ext = src
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+
+    let needs_extract = matches!(
+        ext.as_str(),
+        "mp4" | "mov" | "mkv" | "webm" | "avi" | "m4v" | "flv"
+    );
+    if !needs_extract {
+        return Some(src.to_path_buf());
+    }
+
+    let meta = std::fs::metadata(src).ok()?;
+    let size = meta.len();
+    if size < 64 {
+        return None;
+    }
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let stem = src
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("audio")
+        .replace(|c: char| !c.is_ascii_alphanumeric(), "_");
+    let cache_dir = std::env::temp_dir().join("memstroy_audio_cache");
+    let _ = std::fs::create_dir_all(&cache_dir);
+    let cache_name = format!("{}_{}_{}.wav", stem, size, mtime);
+    let cache_path = cache_dir.join(cache_name);
+
+    // Cache hit?
+    if cache_path.exists()
+        && std::fs::metadata(&cache_path)
+            .map(|m| m.len() > 1024)
+            .unwrap_or(false)
+    {
+        return Some(cache_path);
+    }
+
+    // Cache miss — invoke ffmpeg synchronously. We're already on a
+    // background worker thread so blocking here is fine; the extracted
+    // WAV is then served to subsequent load_sinks calls instantly.
+    let ffmpeg = memstroy_render::ffmpeg_binary();
+    let status = std::process::Command::new(&ffmpeg)
+        .args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
+        .arg(src)
+        .args(["-vn", "-ac", "2", "-ar", "44100", "-sn", "-dn", "-f", "wav"])
+        .arg(&cache_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {
+            // ffmpeg writes a valid header even when no audio stream was
+            // present — guard with a size sanity check.
+            let len = std::fs::metadata(&cache_path).map(|m| m.len()).unwrap_or(0);
+            if len > 1024 {
+                debug!(
+                    "Extracted audio cache for {} -> {} ({} bytes)",
+                    src.display(),
+                    cache_path.display(),
+                    len
+                );
+                Some(cache_path)
+            } else {
+                let _ = std::fs::remove_file(&cache_path);
+                None
+            }
+        }
+        Ok(_) | Err(_) => {
+            let _ = std::fs::remove_file(&cache_path);
+            None
+        }
     }
 }
