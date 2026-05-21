@@ -232,6 +232,10 @@ pub struct ActorState {
     /// scene coordinates.
     pub pos: [f32; 2],
     pub scale: f32,
+    /// Y-axis stretch factor multiplied on top of `scale`. Default 1.0 means
+    /// uniform scaling. Values != 1.0 produce a non-proportional stretch.
+    #[serde(default = "one")]
+    pub scale_y: f32,
     #[serde(default)]
     pub rotation_deg: f32,
     #[serde(default = "one")]
@@ -242,7 +246,7 @@ fn one() -> f32 { 1.0 }
 
 impl Default for ActorState {
     fn default() -> Self {
-        Self { pos: [0.5, 0.7], scale: 1.0, rotation_deg: 0.0, opacity: 1.0 }
+        Self { pos: [0.5, 0.7], scale: 1.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 1.0 }
     }
 }
 
@@ -251,6 +255,7 @@ impl crate::keyframe::Lerp for ActorState {
         Self {
             pos: self.pos.lerp(&other.pos, t),
             scale: self.scale.lerp(&other.scale, t),
+            scale_y: self.scale_y.lerp(&other.scale_y, t),
             rotation_deg: self.rotation_deg.lerp(&other.rotation_deg, t),
             opacity: self.opacity.lerp(&other.opacity, t),
         }
@@ -476,6 +481,10 @@ pub struct OverlayState {
     /// Centre position in normalised scene coordinates [0, 1].
     pub pos: [f32; 2],
     pub scale: f32,
+    /// Y-axis stretch factor multiplied on top of `scale`. Default 1.0 means
+    /// uniform scaling.
+    #[serde(default = "one")]
+    pub scale_y: f32,
     #[serde(default)]
     pub rotation_deg: f32,
     #[serde(default = "one")]
@@ -484,7 +493,7 @@ pub struct OverlayState {
 
 impl Default for OverlayState {
     fn default() -> Self {
-        Self { pos: [0.5, 0.5], scale: 1.0, rotation_deg: 0.0, opacity: 1.0 }
+        Self { pos: [0.5, 0.5], scale: 1.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 1.0 }
     }
 }
 
@@ -493,6 +502,7 @@ impl crate::keyframe::Lerp for OverlayState {
         Self {
             pos: self.pos.lerp(&other.pos, t),
             scale: self.scale.lerp(&other.scale, t),
+            scale_y: self.scale_y.lerp(&other.scale_y, t),
             rotation_deg: self.rotation_deg.lerp(&other.rotation_deg, t),
             opacity: self.opacity.lerp(&other.opacity, t),
         }

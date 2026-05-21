@@ -376,9 +376,12 @@ impl FrameCache {
             }
         }
 
-        // Miss: get the raw frame and apply effects.
+        // Miss: get the raw frame and apply effects on a downscaled copy
+        // for fast preview. Chromakey/CC quality at preview-resolution is
+        // sufficient and avoids per-pixel CPU work on full HD frames.
         let raw = self.raw_frame_at_time(t)?;
-        let processed = apply_effects_cpu(&raw, ck, cc);
+        let scaled = downscale_for_preview(&raw, 360);
+        let processed = apply_effects_cpu(&scaled, ck, cc);
         let options = TextureOptions::LINEAR;
         match self.fx_texture.as_mut() {
             Some(tex) => tex.set(processed, options),
@@ -511,6 +514,37 @@ fn hash_effect_params(
 
 #[inline]
 fn bits(f: f32) -> u32 { (f * 10_000.0).round() as i32 as u32 }
+
+/// Downscale a ColorImage to a target maximum dimension while preserving
+/// aspect ratio. Used to keep the CPU chromakey/CC fast during playback.
+/// Returns the input unchanged if it's already small enough.
+pub fn downscale_for_preview(img: &ColorImage, max_dim: usize) -> ColorImage {
+    let (sw, sh) = (img.size[0], img.size[1]);
+    if sw <= max_dim && sh <= max_dim {
+        return img.clone();
+    }
+    let aspect = sw as f32 / sh as f32;
+    let (dw, dh) = if sw >= sh {
+        let dw = max_dim;
+        let dh = ((dw as f32) / aspect).round().max(1.0) as usize;
+        (dw, dh)
+    } else {
+        let dh = max_dim;
+        let dw = ((dh as f32) * aspect).round().max(1.0) as usize;
+        (dw, dh)
+    };
+    // Nearest-neighbour is enough for chromakey input; the result is uploaded
+    // with linear filtering so the final on-screen texture stays smooth.
+    let mut out = ColorImage::new([dw, dh], egui::Color32::TRANSPARENT);
+    for y in 0..dh {
+        let sy = (y * sh) / dh;
+        for x in 0..dw {
+            let sx = (x * sw) / dw;
+            out.pixels[y * dw + x] = img.pixels[sy * sw + sx];
+        }
+    }
+    out
+}
 
 /// CPU implementation of the chroma-key + colour-correction pipeline.
 /// Mirrors what the live `apply_preview_effects` did but lives on the cache so

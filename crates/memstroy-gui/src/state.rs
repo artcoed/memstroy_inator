@@ -192,7 +192,6 @@ pub struct EditorState {
     pub selection: Selection,
     pub playhead: f32,
     pub status: String,
-    pub last_preview: Option<PathBuf>,
     pub render_progress: Option<RenderProgress>,
     pub refreshing: bool,
     pub undo: UndoStack,
@@ -200,10 +199,6 @@ pub struct EditorState {
     pub playing: bool,
     /// Playback speed multiplier (1.0 = normal, 2.0 = 2x, 0.5 = half)
     pub playback_speed: f32,
-    /// Last playhead value that was rendered as preview (for auto-preview debounce)
-    pub last_rendered_playhead: f32,
-    /// Whether a preview render is currently in-flight
-    pub preview_rendering: bool,
     /// Timeline zoom level (pixels per second)
     pub timeline_zoom: f32,
     /// Timeline horizontal scroll offset in seconds
@@ -299,6 +294,8 @@ pub struct EditorState {
     /// Explicit track assignment for actors. Key = actor index, Value = track index.
     /// When an actor is not in this map, the default round-robin assignment is used.
     pub actor_track_assignments: std::collections::HashMap<usize, usize>,
+    /// Explicit track assignment for audio tracks. Key = audio index, Value = track index.
+    pub audio_track_assignments: std::collections::HashMap<usize, usize>,
 
     // ─── Multi-tab scenes ──────────────────────────────────────────
     /// All open scene tabs. Index 0 is always the active tab's scene (synced with `self.scene`).
@@ -320,6 +317,7 @@ pub struct AssetLibrary {
     pub mellstroy_clips: Vec<LibraryClip>,
     pub backgrounds: Vec<PathBuf>,
     pub props: Vec<PathBuf>,
+    pub audio: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -380,7 +378,6 @@ impl EditorState {
         s.timeline_v_zoom = 1.0;
         s.timeline_v_scroll = 0.0;
         s.split_tool_active = false;
-        s.last_rendered_playhead = -1.0;
         s.ffmpeg_available = check_ffmpeg();
         s.razor_mode = false;
         s.snap_enabled = true;
@@ -659,6 +656,8 @@ impl EditorState {
             scan_dir(&self.assets_root.join("assets/backgrounds"), &["mp4", "mov", "webm", "jpg", "jpeg", "png", "webp"]);
         self.library.props =
             scan_dir(&self.assets_root.join("assets/props"), &["png", "webp", "svg"]);
+        self.library.audio =
+            scan_dir(&self.assets_root.join("assets/audio"), &["mp3", "wav", "ogg", "flac", "aac", "m4a"]);
     }
 }
 
@@ -698,15 +697,19 @@ pub struct CanvasDrag {
     pub mode: CanvasDragMode,
     /// Pointer position (screen px, relative to the canvas rect) at drag start.
     pub start_screen: [f32; 2],
-    /// Snapshot of canvas-layout (pos, scale) by element_id at drag
-    /// start. Used to keep contents glued to the render frame as it is moved
-    /// or resized.
+    /// Snapshot of canvas-layout (pos, scale) by element_id at drag start.
+    /// Currently unused — kept for layout/forward compat.
     pub canvas_layouts_snapshot: Vec<(String, [f32; 2], f32)>,
-    /// Snapshot of legacy normalised actor positions (by index) at drag start.
+    /// Snapshot of legacy actor WORLD positions at drag start (for actors
+    /// without a canvas_layouts entry). Used to keep them visually fixed
+    /// while the render frame moves/resizes.
     pub actor_legacy_snapshot: Vec<(usize, [f32; 2])>,
-    /// Snapshot of the legacy `scale` for each actor (used to scale them with
-    /// the render frame on resize).
+    /// Snapshot of legacy actor scale at drag start. Currently unused —
+    /// kept for layout/forward compat.
     pub actor_legacy_scale_snapshot: Vec<(usize, f32)>,
+    /// Snapshot of overlay WORLD positions at drag start. Used to keep
+    /// overlays visually fixed while the render frame moves/resizes.
+    pub overlay_world_snapshot: Vec<(usize, [f32; 2])>,
 }
 
 #[derive(Default, Clone, Copy, PartialEq)]
@@ -723,8 +726,20 @@ pub enum CanvasDragMode {
     MoveActorLegacy { actor_idx: usize, initial_pos: [f32; 2] },
     /// Move the selected overlay (normalised relative to render frame).
     MoveOverlay { overlay_idx: usize, initial_pos: [f32; 2] },
-    /// Uniformly scale the selected element from its original anchor.
-    ResizeSelection { initial_scale: f32, anchor_distance: f32 },
+    /// Resize the selected element using a specific handle. The element is
+    /// anchored at the opposite handle so it stretches in the direction of
+    /// the drag. `handle` is 0..3 = corners (TL,TR,BR,BL), 4..7 = edges
+    /// (Top,Right,Bottom,Left). Hold Shift while dragging for uniform
+    /// (proportional) scaling.
+    ResizeSelection {
+        handle: u8,
+        initial_scale: f32,
+        initial_scale_y: f32,
+        initial_pos_world: [f32; 2],
+        anchor_world: [f32; 2],
+        base_w: f32,
+        base_h: f32,
+    },
     /// Move the render frame in world space.
     MoveRenderFrame { initial_pos: [f32; 2] },
     /// Resize (zoom) the render frame.
