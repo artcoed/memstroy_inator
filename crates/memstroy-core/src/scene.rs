@@ -305,6 +305,30 @@ impl Default for ChromaKeyParams {
     }
 }
 
+impl ChromaKeyParams {
+    /// Path of the per-clip chroma sidecar file (`<clip>.chroma.json`).
+    pub fn sidecar_path(clip_path: &std::path::Path) -> std::path::PathBuf {
+        clip_path.with_extension("chroma.json")
+    }
+
+    /// Save these chroma settings as JSON next to the source clip so they
+    /// follow the asset across projects.
+    pub fn save_alongside_clip(&self, clip_path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+        let path = Self::sidecar_path(clip_path);
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        std::fs::write(&path, json)?;
+        Ok(path)
+    }
+
+    /// Load chroma settings from `<clip>.chroma.json`, if present.
+    pub fn load_for_clip(clip_path: &std::path::Path) -> Option<Self> {
+        let path = Self::sidecar_path(clip_path);
+        let raw = std::fs::read_to_string(&path).ok()?;
+        serde_json::from_str(&raw).ok()
+    }
+}
+
 /// A prop attached to an actor (cap, glasses, weapon, etc).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Attachment {
