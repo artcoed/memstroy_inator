@@ -67,15 +67,12 @@ fn handle_canvas_input(
     viewport_size: [f32; 2],
     _full_rect: Rect,
 ) {
-    // Any drag (left, middle, or right mouse button) → pan the canvas
-    // unless an element is selected and being moved (handled in gizmo)
+    // Pan ONLY with middle mouse button or Space+drag.
+    // Left click is always reserved for element interaction.
     let middle_down = ui.input(|i| i.pointer.middle_down());
-    let right_down = ui.input(|i| i.pointer.secondary_down());
+    let space_held = ui.input(|i| i.key_down(egui::Key::Space));
 
-    // Pan: middle mouse drag, right mouse drag, or left drag when nothing is selected
-    let should_pan = middle_down
-        || right_down
-        || (response.dragged() && state.selection == Selection::None);
+    let should_pan = middle_down || (space_held && response.dragged());
 
     if should_pan && response.hovered() {
         let delta = response.drag_delta();
@@ -279,20 +276,22 @@ fn draw_canvas_elements(
 
         // Get world position from canvas_layouts or legacy layout
         let world_pos = get_element_world_pos(state, &actor.id, &actor.layout, t);
-        // Use actual source dimensions from frame cache, or default 480x270 (16:9)
+        // Use actual source dimensions from frame cache (real aspect ratio)
         let (elem_width, elem_height) = if let Some(fc) = state.frame_caches.get(idx) {
             if fc.is_ready() && fc.frame_count > 0 {
-                // Frame cache extracts at 480px width, source aspect preserved
-                (480.0_f32, 480.0 * 16.0 / 9.0) // vertical video default
+                (fc.source_width as f32, fc.source_height as f32)
             } else {
-                (400.0, 400.0 * 16.0 / 9.0)
+                (480.0_f32, 270.0)
             }
         } else {
-            (400.0, 400.0 * 16.0 / 9.0)
+            (480.0_f32, 270.0)
         };
         // Apply actor scale from layout
-        let actor_scale = keyframe::sample(&actor.layout, t)
-            .map(|s| s.scale).unwrap_or(1.0);
+        let actor_state = keyframe::sample(&actor.layout, t)
+            .unwrap_or_default();
+        let actor_scale = actor_state.scale;
+        let actor_rotation = actor_state.rotation_deg;
+        let actor_opacity = actor_state.opacity;
         let elem_width = elem_width * actor_scale;
         let elem_height = elem_height * actor_scale;
 
@@ -310,10 +309,13 @@ fn draw_canvas_elements(
         if !full_rect.intersects(elem_rect) { continue; }
 
         // Draw the element placeholder (frame from cache if available)
-        let tint = match display_mode {
+        let base_tint = match display_mode {
             DisplayMode::Active => Color32::WHITE,
             _ => COL_INACTIVE_TINT,
         };
+        // Apply opacity from keyframe
+        let alpha = (actor_opacity * (base_tint.a() as f32 / 255.0)).clamp(0.0, 1.0);
+        let tint = Color32::from_rgba_unmultiplied(base_tint.r(), base_tint.g(), base_tint.b(), (alpha * 255.0) as u8);
 
         // Try to show actual frame from cache
         let local_t = match display_mode {
@@ -329,8 +331,36 @@ fn draw_canvas_elements(
         if let Some(fc) = state.frame_caches.get_mut(idx) {
             if fc.is_ready() {
                 if let Some(tex) = fc.frame_at_time(local_t, ui.ctx()) {
-                    let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
-                    painter.image(tex.id(), elem_rect, uv, tint);
+                    let rotation_rad = actor_rotation.to_radians();
+                    if rotation_rad.abs() > 0.001 {
+                        // Draw rotated via mesh
+                        let center = elem_rect.center();
+                        let hw = elem_rect.width() * 0.5;
+                        let hh = elem_rect.height() * 0.5;
+                        let cos_r = rotation_rad.cos();
+                        let sin_r = rotation_rad.sin();
+                        let corners_local = [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]];
+                        let uv_corners = [
+                            Pos2::new(0.0, 0.0), Pos2::new(1.0, 0.0),
+                            Pos2::new(1.0, 1.0), Pos2::new(0.0, 1.0),
+                        ];
+                        let mut mesh = egui::Mesh::with_texture(tex.id());
+                        for i in 0..4 {
+                            let [lx, ly] = corners_local[i];
+                            let rx = lx * cos_r - ly * sin_r + center.x;
+                            let ry = lx * sin_r + ly * cos_r + center.y;
+                            mesh.vertices.push(egui::epaint::Vertex {
+                                pos: Pos2::new(rx, ry),
+                                uv: uv_corners[i],
+                                color: tint,
+                            });
+                        }
+                        mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+                        painter.add(egui::Shape::mesh(mesh));
+                    } else {
+                        let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
+                        painter.image(tex.id(), elem_rect, uv, tint);
+                    }
                     frame_shown = true;
                 }
             }
@@ -816,8 +846,14 @@ fn draw_element_resize_handles(
             let world_pos = get_element_world_pos(state, &actor.id, &actor.layout, t);
             let actor_scale = keyframe::sample(&actor.layout, t)
                 .map(|s| s.scale).unwrap_or(1.0);
-            let elem_width = 400.0 * actor_scale;
-            let elem_height = elem_width * 16.0 / 9.0;
+            // Use real source dimensions from frame cache
+            let (base_w, base_h) = if let Some(fc) = state.frame_caches.get(idx) {
+                if fc.is_ready() && fc.frame_count > 0 {
+                    (fc.source_width as f32, fc.source_height as f32)
+                } else { (480.0, 270.0) }
+            } else { (480.0, 270.0) };
+            let elem_width = base_w * actor_scale;
+            let elem_height = base_h * actor_scale;
             let center_screen = state.canvas_viewport.world_to_screen(world_pos, viewport_size);
             let half_w = elem_width * 0.5 * state.canvas_viewport.zoom;
             let half_h = elem_height * 0.5 * state.canvas_viewport.zoom;
@@ -1092,8 +1128,14 @@ fn try_select_at(state: &mut EditorState, pos: WorldPos) {
         let world_pos = get_element_world_pos(state, &actor.id, &actor.layout, t);
         let actor_scale = keyframe::sample(&actor.layout, t)
             .map(|s| s.scale).unwrap_or(1.0);
-        let elem_width = 400.0 * actor_scale;
-        let elem_height = elem_width * 16.0 / 9.0;
+        // Use real source dimensions from frame cache
+        let (base_w, base_h) = if let Some(fc) = state.frame_caches.get(idx) {
+            if fc.is_ready() && fc.frame_count > 0 {
+                (fc.source_width as f32, fc.source_height as f32)
+            } else { (480.0, 270.0) }
+        } else { (480.0, 270.0) };
+        let elem_width = base_w * actor_scale;
+        let elem_height = base_h * actor_scale;
 
         let half_w = elem_width * 0.5;
         let half_h = elem_height * 0.5;

@@ -319,10 +319,9 @@ fn inspector_actor(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
     ).size(10.0).color(COL_TEXT_DIM));
     ui.add_space(6.0);
 
-    // Tab bar: Transform | Timing | Effects
+    // Tab bar: Transform | Effects
     ui.horizontal(|ui| {
         if ui.selectable_label(state.inspector_tab == 0, "Transform").clicked() { state.inspector_tab = 0; }
-        if ui.selectable_label(state.inspector_tab == 1, "Timing").clicked() { state.inspector_tab = 1; }
         if ui.selectable_label(state.inspector_tab == 2, "Effects").clicked() { state.inspector_tab = 2; }
     });
     ui.separator();
@@ -330,9 +329,8 @@ fn inspector_actor(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
 
     match state.inspector_tab {
         0 => inspector_actor_transform(ui, state, i),
-        1 => inspector_actor_timing(ui, state, i),
         2 => inspector_actor_effects(ui, state, i, actor_count, cache_count),
-        _ => {}
+        _ => inspector_actor_transform(ui, state, i),
     }
 }
 
@@ -967,6 +965,33 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     let available = ui.available_size();
     let header_width = 80.0_f32;
     let track_area_width = (available.x - header_width - 4.0).max(100.0);
+
+    // ── Auto-length: expand timeline to fit longest content ──
+    {
+        let mut max_end: f32 = 0.0;
+        for a in &state.scene.actors {
+            max_end = max_end.max(a.t_out.unwrap_or(0.0));
+        }
+        for bg in &state.scene.backgrounds {
+            max_end = max_end.max(bg.start + bg.duration);
+        }
+        for ov in &state.scene.overlays {
+            let end = match ov {
+                Overlay::Text(t) => t.t_out,
+                Overlay::Image(im) => im.t_out,
+                Overlay::Video(v) => v.t_out,
+            };
+            max_end = max_end.max(end);
+        }
+        for au in &state.scene.audio {
+            max_end = max_end.max(au.t_out.unwrap_or(0.0));
+        }
+        // Expand scene duration if content exceeds it (with 1s padding)
+        if max_end > state.scene.output.duration {
+            state.scene.output.duration = max_end + 1.0;
+        }
+    }
+
     let duration = state.scene.output.duration.max(0.01);
     let pps = state.timeline_zoom; // pixels per second
 
@@ -1182,18 +1207,15 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                     let vt_pos = video_tracks.iter().position(|t| *t == track_idx);
 
                     for ai in 0..state.scene.actors.len() {
-                        // Use explicit track assignment if set, otherwise fall back to round-robin
-                        let target_vt = if let Some(&assigned) = state.actor_track_assignments.get(&ai) {
-                            // Find position of assigned track among video tracks
-                            video_tracks.iter().position(|&t| t == assigned).unwrap_or(
-                                if video_tracks.is_empty() { 0 } else { ai % video_tracks.len() }
-                            )
-                        } else if video_tracks.is_empty() {
-                            0
+                        // Use explicit track assignment if set, otherwise default to first video track.
+                        // Multiple clips on the same track is allowed (free placement).
+                        let assigned_track = if let Some(&assigned) = state.actor_track_assignments.get(&ai) {
+                            assigned
                         } else {
-                            ai % video_tracks.len()
+                            // Default: first video track (index 0) for all unassigned actors
+                            video_tracks.first().copied().unwrap_or(0)
                         };
-                        if vt_pos != Some(target_vt) { continue; }
+                        if assigned_track != track_idx { continue; }
 
                         let actor = &state.scene.actors[ai];
                         let clip_start = actor.t_in.unwrap_or(0.0);
