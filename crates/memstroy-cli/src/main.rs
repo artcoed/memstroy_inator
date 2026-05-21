@@ -224,5 +224,6 @@ fn starter_scene() -> Scene {
         audio: Vec::new(),
         render_frame: RenderFrame::default(),
         canvas_layouts: Vec::new(),
+        skeleton_templates: Vec::new(),
     }
 }

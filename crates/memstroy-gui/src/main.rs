@@ -10,6 +10,7 @@ mod gpu_preview;
 mod jobs;
 mod node_editor;
 mod panels;
+mod skeleton_editor;
 mod state;
 mod title_templates;
 mod undo;

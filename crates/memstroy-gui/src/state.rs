@@ -288,6 +288,10 @@ pub struct EditorState {
     pub canvas_viewport: memstroy_core::EditorViewport,
     /// Whether the canvas is in pan mode (middle mouse or Space+drag).
     pub canvas_panning: bool,
+
+    // ─── Skeleton Editor ───────────────────────────────────────────
+    /// State for the skeleton constructor editor window.
+    pub skeleton_editor: crate::skeleton_editor::SkeletonEditorState,
 }
 
 #[derive(Default)]

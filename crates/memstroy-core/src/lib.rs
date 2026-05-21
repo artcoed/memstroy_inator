@@ -15,6 +15,7 @@ pub mod keyframe;
 pub mod anchor;
 pub mod ai_pipeline;
 pub mod canvas;
+pub mod skeleton;
 
 pub use scene::*;
 pub use easing::*;
@@ -22,6 +23,7 @@ pub use keyframe::*;
 pub use anchor::*;
 pub use ai_pipeline::*;
 pub use canvas::*;
+pub use skeleton::*;
 
 use std::path::Path;
 use thiserror::Error;

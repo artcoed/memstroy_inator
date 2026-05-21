@@ -583,6 +583,104 @@ fn inspector_actor_effects(ui: &mut egui::Ui, state: &mut EditorState, i: usize,
 
     // Transitions in/out (visible window edges)
     inspector_actor_transitions(ui, state, i);
+
+    ui.add_space(12.0);
+
+    // Skeleton Attachments
+    inspector_actor_skeleton_attachments(ui, state, i);
+}
+
+fn inspector_actor_skeleton_attachments(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
+    egui::CollapsingHeader::new(
+        RichText::new("Skeleton Attachments").size(12.0).strong().color(Color32::from_rgb(180, 120, 255))
+    ).default_open(false).show(ui, |ui| {
+        // List existing skeleton attachments on this actor
+        let num_att = state.scene.actors[i].skeleton_attachments.len();
+        if num_att == 0 {
+            ui.label(RichText::new("No skeleton attachments.").size(10.0).color(COL_TEXT_DIM).italics());
+        } else {
+            let mut to_remove: Option<usize> = None;
+            for ai in 0..num_att {
+                let att = &state.scene.actors[i].skeleton_attachments[ai];
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("{}.{}", att.skeleton_id, att.point_name)).size(11.0));
+                    ui.label(RichText::new(format!("s:{:.2}", att.scale)).size(9.0).color(COL_TEXT_DIM));
+                    if ui.small_button("x").clicked() {
+                        to_remove = Some(ai);
+                    }
+                });
+            }
+            if let Some(ri) = to_remove {
+                state.scene.actors[i].skeleton_attachments.remove(ri);
+            }
+        }
+
+        ui.add_space(4.0);
+
+        // "Attach to skeleton point" button — shows available skeletons/points
+        let available_skeletons: Vec<(String, Vec<String>)> = state.scene.skeleton_templates.iter()
+            .map(|tmpl| {
+                let names: Vec<String> = tmpl.points.keys().cloned().collect();
+                (tmpl.name.clone(), names)
+            })
+            .collect();
+
+        if available_skeletons.is_empty() {
+            ui.label(RichText::new("No skeleton templates. Use Tools > Skeleton Constructor to create one.")
+                .size(9.0).color(COL_TEXT_DIM).italics());
+        } else {
+            // Combo: pick skeleton
+            let skel_id = ui.make_persistent_id("skel_attach_combo");
+            let mut sel_skel: usize = ui.ctx().memory(|m| m.data.get_temp(skel_id).unwrap_or(0));
+            if sel_skel >= available_skeletons.len() { sel_skel = 0; }
+
+            ui.horizontal(|ui| {
+                ui.label("Skeleton:");
+                egui::ComboBox::from_id_source("attach_skel_sel")
+                    .selected_text(&available_skeletons[sel_skel].0)
+                    .show_ui(ui, |ui| {
+                        for (si, (name, _)) in available_skeletons.iter().enumerate() {
+                            ui.selectable_value(&mut sel_skel, si, name);
+                        }
+                    });
+            });
+            ui.ctx().memory_mut(|m| m.data.insert_temp(skel_id, sel_skel));
+
+            // Combo: pick point
+            let points = &available_skeletons[sel_skel].1;
+            if points.is_empty() {
+                ui.label(RichText::new("No points defined in this skeleton.").size(9.0).color(COL_TEXT_DIM));
+            } else {
+                let pt_id = ui.make_persistent_id("skel_point_combo");
+                let mut sel_pt: usize = ui.ctx().memory(|m| m.data.get_temp(pt_id).unwrap_or(0));
+                if sel_pt >= points.len() { sel_pt = 0; }
+
+                ui.horizontal(|ui| {
+                    ui.label("Point:");
+                    egui::ComboBox::from_id_source("attach_pt_sel")
+                        .selected_text(&points[sel_pt])
+                        .show_ui(ui, |ui| {
+                            for (pi, name) in points.iter().enumerate() {
+                                ui.selectable_value(&mut sel_pt, pi, name);
+                            }
+                        });
+                });
+                ui.ctx().memory_mut(|m| m.data.insert_temp(pt_id, sel_pt));
+
+                if ui.button(RichText::new("+ Attach").size(11.0).color(Color32::from_rgb(80, 200, 120))).clicked() {
+                    let attachment = memstroy_core::SkeletonAttachment {
+                        skeleton_id: available_skeletons[sel_skel].0.clone(),
+                        point_name: points[sel_pt].clone(),
+                        offset: [0.0, 0.0],
+                        scale: 1.0,
+                        follow_rotation: false,
+                    };
+                    state.scene.actors[i].skeleton_attachments.push(attachment);
+                    state.status = format!("Attached to {}.{}", available_skeletons[sel_skel].0, points[sel_pt]);
+                }
+            }
+        }
+    });
 }
 
 fn inspector_actor_transitions(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
@@ -2281,6 +2379,7 @@ pub fn add_actor_from_clip(state: &mut EditorState, path: &PathBuf) {
         loop_source: false,
         flip_horizontal: false,
         attachments: Vec::new(),
+        skeleton_attachments: Vec::new(),
         visible: true,
         color_correction: ColorCorrection::default(),
         transition_in: Transition::Cut,
@@ -2339,6 +2438,7 @@ fn add_actor_from_clip_at_time(state: &mut EditorState, path: &PathBuf, t: f32) 
         loop_source: false,
         flip_horizontal: false,
         attachments: Vec::new(),
+        skeleton_attachments: Vec::new(),
         visible: true,
         color_correction: ColorCorrection::default(),
         transition_in: Transition::Cut,

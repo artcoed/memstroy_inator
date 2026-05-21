@@ -207,6 +207,21 @@ impl App {
                             .into();
                     ui.close_menu();
                 }
+                if ui.button("\u{1F9B4} Skeleton Constructor...").clicked() {
+                    self.state.skeleton_editor.open = true;
+                    // Pre-select the current actor if one is selected
+                    if let Selection::Actor(i) = self.state.selection {
+                        if i < self.state.scene.actors.len() {
+                            self.state.skeleton_editor.actor_idx = Some(i);
+                            // Try to find existing template
+                            let source = self.state.scene.actors[i].source.clone();
+                            self.state.skeleton_editor.template_idx =
+                                self.state.scene.skeleton_templates.iter()
+                                    .position(|t| t.source_clip == source);
+                        }
+                    }
+                    ui.close_menu();
+                }
             });
 
             // AI Generate button
@@ -1298,6 +1313,9 @@ impl eframe::App for App {
         if self.state.clip_editor_open {
             self.state.clip_editor_open = clip_editor::clip_editor_window(ctx, &mut self.state);
         }
+
+        // Skeleton editor floating window
+        crate::skeleton_editor::skeleton_editor_window(ctx, &mut self.state);
 
         // AI generation floating window
         panels::ai_generate_window(ctx, &mut self.state);
