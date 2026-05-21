@@ -250,21 +250,16 @@ fn inspector_nothing(ui: &mut egui::Ui, state: &mut EditorState) {
     ui.separator();
     ui.add_space(8.0);
 
-    // Output settings — fixed 1080x1920 9:16 short format
+    // Output settings — fixed 1080x1920 9:16 short format.
+    // FPS and duration are intentionally not user-editable here: FPS is
+    // pinned by the format and the scene's duration grows automatically
+    // to fit whatever is on the timeline.
     ui.label(RichText::new("Output").size(14.0).strong().color(Color32::from_rgb(100, 200, 255)));
     ui.add_space(4.0);
     ui.label(RichText::new("1080x1920 (9:16)").size(12.0).color(COL_TEXT_DIM));
     ui.add_space(4.0);
 
-    let spec = &mut state.scene.output;
-    ui.horizontal(|ui| {
-        ui.label("FPS:");
-        ui.add(egui::DragValue::new(&mut spec.fps).range(24..=60));
-    });
-    ui.horizontal(|ui| {
-        ui.label("Duration:");
-        ui.add(egui::DragValue::new(&mut spec.duration).range(0.5..=60.0).speed(0.1).suffix("s"));
-    });
+    let _ = state; // currently unused beyond the labels
 }
 
 fn inspector_actor(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
@@ -1883,10 +1878,34 @@ fn inspector_audio(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
     });
     ui.add_space(4.0);
     ui.add(egui::Slider::new(&mut audio.volume, 0.0..=2.0).text("Volume"));
+    ui.add(egui::Slider::new(&mut audio.speed, 0.25..=4.0)
+        .logarithmic(true)
+        .text("Speed")
+        .suffix("x"));
+    if audio.speed.abs() < 0.05 {
+        audio.speed = 0.05;
+    }
     ui.horizontal(|ui| {
         ui.label("Source offset:");
         ui.add(egui::DragValue::new(&mut audio.source_start).range(0.0..=600.0).speed(0.02).suffix("s"));
     });
+    if audio.parent_actor.is_some() {
+        ui.add_space(2.0);
+        ui.label(
+            RichText::new("Bound to an actor — moves and trims with its parent clip.")
+                .size(10.0)
+                .italics()
+                .color(COL_TEXT_DIM),
+        );
+    } else {
+        ui.add_space(2.0);
+        ui.label(
+            RichText::new("Standalone music — independent of any actor.")
+                .size(10.0)
+                .italics()
+                .color(COL_TEXT_DIM),
+        );
+    }
 }
 
 
@@ -4138,6 +4157,7 @@ fn push_audio_track_for_actor(state: &mut EditorState, actor_id: &str, source: &
         t_out,
         source_start,
         volume: 1.0,
+        speed: 1.0,
         parent_actor: Some(actor_id.to_string()),
     });
     state.scene.audio.len() - 1
@@ -4250,8 +4270,16 @@ pub fn add_text_overlay(state: &mut EditorState) -> usize {
 
     state.scene.overlays.push(overlay);
     let idx = state.scene.overlays.len() - 1;
+
+    // Always create the new text on its own freshly-inserted layer. The
+    // new layer goes at the top of the video stack (so the text is on top
+    // of everything by default); the user can drag it to a different
+    // layer afterwards.
+    let new_track = state.insert_video_track_at_top();
+    state.overlay_track_assignments.insert(idx, new_track);
+
     state.selection = Selection::Overlay(idx);
-    state.status = format!("Added text: {}", id);
+    state.status = format!("Added text: {} (new layer)", id);
     idx
 }
 

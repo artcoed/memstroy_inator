@@ -363,6 +363,7 @@ impl MontageOutput {
                 t_out: Some(ap.t_out),
                 source_start: 0.0,
                 volume: ap.volume,
+                speed: 1.0,
                 parent_actor: None,
             });
         }

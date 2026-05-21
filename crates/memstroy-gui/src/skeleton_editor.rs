@@ -82,6 +82,10 @@ pub struct SkeletonEditorState {
     /// Auto-name counter; bumps every time a nameless point is added so
     /// the user doesn't need to think up a name to start placing.
     pub name_counter: u32,
+    /// Clip duration the timeline horizontal zoom was last fitted to.
+    /// When this drifts away from the current duration we re-run the
+    /// "fit to width" pass on the next paint. 0.0 = "needs fit".
+    pub fitted_for_duration: f32,
 }
 
 impl Default for SkeletonEditorState {
@@ -105,6 +109,7 @@ impl Default for SkeletonEditorState {
             last_play_tick: None,
             track_loop_point: None,
             name_counter: 0,
+            fitted_for_duration: 0.0,
         }
     }
 }
@@ -174,16 +179,20 @@ fn advance_playback(ctx: &egui::Context, state: &mut EditorState) {
     let total = state.skeleton_editor.total_frames.max(1);
     let mut t = state.skeleton_editor.current_time();
 
-    // Resolve play range: either the point's keyframe span (if tracking)
-    // or the full clip duration.
+    // Resolve play range. We always play to the end of the clip — even
+    // when a point is being "tracked" for review — and only loop back to
+    // the recorded path's start when the clip itself wraps. After the
+    // last keyframe the point's position naturally freezes at its final
+    // anchor (keyframe sampling clamps), so the user gets to watch the
+    // tail of the clip with the point holding still, instead of an
+    // immediate restart on the last keyframe.
     let (lo, hi) = if let Some(name) = state.skeleton_editor.track_loop_point.clone() {
         if let Some(idx) = state.skeleton_editor.template_idx {
             let p = state.scene.skeleton_templates[idx].points.get(&name);
             if let Some(p) = p {
                 if !p.track.is_empty() {
                     let lo = p.track.first().unwrap().t.max(0.0);
-                    let hi = p.track.last().unwrap().t.max(lo + 0.01);
-                    (lo, hi)
+                    (lo, state.skeleton_editor.duration())
                 } else {
                     (0.0, state.skeleton_editor.duration())
                 }
@@ -223,45 +232,104 @@ fn skeleton_editor_content(ui: &mut egui::Ui, state: &mut EditorState) {
         return;
     }
 
-    egui::ScrollArea::both()
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            ui.horizontal_top(|ui| {
-                let right_panel_w = 240.0_f32;
-                let separator_w = 12.0_f32;
-                let transport_h = 32.0_f32;
-                let timeline_h = 64.0_f32;
-                let easing_h = 28.0_f32;
-                let avail = ui.available_size_before_wrap();
-                let preview_max_w = (avail.x - right_panel_w - separator_w).max(220.0);
-                let preview_max_h = (avail.y - transport_h - timeline_h - easing_h - 16.0).max(200.0);
-
-                let aspect = 9.0_f32 / 16.0;
-                let by_w_h = preview_max_w / aspect;
-                let (pw, ph) = if by_w_h <= preview_max_h {
-                    (preview_max_w, by_w_h)
-                } else {
-                    (preview_max_h * aspect, preview_max_h)
-                };
-
-                ui.vertical(|ui| {
-                    frame_preview(ui, state, pw, ph);
-                    ui.add_space(4.0);
-                    transport_bar(ui, state);
-                    ui.add_space(4.0);
-                    skeleton_timeline(ui, state, pw);
-                    ui.add_space(4.0);
-                    keyframe_easing_panel(ui, state);
-                });
-
-                ui.separator();
-
-                ui.vertical(|ui| {
-                    ui.set_min_width(right_panel_w - 20.0);
+    // Right-docked settings/points panel. Stays anchored to the window's
+    // right edge regardless of how the user resizes the floating window
+    // (previous `ui.horizontal_top` layout caused the right column to
+    // "slide" because the left column claimed all extra horizontal space).
+    egui::SidePanel::right("skeleton_settings_panel")
+        .resizable(true)
+        .default_width(240.0)
+        .width_range(200.0..=400.0)
+        .show_inside(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
                     point_list_panel(ui, state);
                 });
+        });
+
+    egui::CentralPanel::default()
+        .frame(egui::Frame::none())
+        .show_inside(ui, |ui| {
+            let avail = ui.available_size_before_wrap();
+            let transport_h = 32.0_f32;
+            let timeline_h = skeleton_timeline_height(state);
+            let easing_h = 28.0_f32;
+            let preview_max_w = avail.x.max(220.0);
+            let preview_max_h =
+                (avail.y - transport_h - timeline_h - easing_h - 16.0).max(200.0);
+
+            let aspect = 9.0_f32 / 16.0;
+            let by_w_h = preview_max_w / aspect;
+            let (pw, ph) = if by_w_h <= preview_max_h {
+                (preview_max_w, by_w_h)
+            } else {
+                (preview_max_h * aspect, preview_max_h)
+            };
+
+            // Auto-fit timeline horizontal zoom on first paint / clip change so
+            // the whole clip is visible end-to-end (was getting truncated to
+            // ~3s because the default 80 px/sec at a narrow window left the
+            // right portion off-screen).
+            fit_timeline_to_clip_if_needed(state, pw);
+
+            ui.vertical(|ui| {
+                frame_preview(ui, state, pw, ph);
+                ui.add_space(4.0);
+                transport_bar(ui, state);
+                ui.add_space(4.0);
+                skeleton_timeline(ui, state, pw);
+                ui.add_space(4.0);
+                keyframe_easing_panel(ui, state);
             });
         });
+}
+
+/// Total height needed for `skeleton_timeline` given the current point set,
+/// so the central panel can leave enough room above it for the preview.
+fn skeleton_timeline_height(state: &EditorState) -> f32 {
+    let ruler_h = 22.0_f32;
+    let mut tracks_h = 0.0_f32;
+    if let Some(idx) = state.skeleton_editor.template_idx {
+        if let Some(t) = state.scene.skeleton_templates.get(idx) {
+            for (_, p) in &t.points {
+                tracks_h += point_row_height(p);
+            }
+        }
+    }
+    if tracks_h <= 0.0 {
+        tracks_h = 38.0; // empty placeholder
+    }
+    // Cap so the timeline never takes more than ~half the window height.
+    ruler_h + tracks_h.min(220.0)
+}
+
+/// Pick a row height for one point. Points with more keyframes get taller
+/// rows so the user can visually distinguish "well-defined paths" from
+/// "single-anchor" points at a glance, and the diamonds for different
+/// points don't sit at exactly the same Y.
+fn point_row_height(point: &SkeletonPoint) -> f32 {
+    let kf = point.track.len() as f32;
+    // Stepped: 1 kf → 22, 2 → 26, ... 8+ → 50, capped.
+    (20.0 + 4.0 * kf).clamp(22.0, 50.0)
+}
+
+/// Reset the timeline horizontal zoom to fit the clip when the loaded
+/// clip changes. We track the duration the zoom was last fitted to, so
+/// resizing the window doesn't keep snapping the zoom around but a clip
+/// switch (or first paint) does cause a refit.
+fn fit_timeline_to_clip_if_needed(state: &mut EditorState, available_w: f32) {
+    let dur = state.skeleton_editor.duration().max(0.01);
+    let want = state.skeleton_editor.fitted_for_duration;
+    let needs_fit = (want - dur).abs() > 0.05 || want <= 0.0;
+    if !needs_fit {
+        return;
+    }
+    let target_w = (available_w - 24.0).max(100.0);
+    let pps = (target_w / dur).clamp(8.0, 800.0);
+    state.skeleton_editor.timeline_zoom = pps;
+    state.skeleton_editor.timeline_scroll = 0.0;
+    state.skeleton_editor.fitted_for_duration = dur;
 }
 
 // ─── TOOLBAR ─────────────────────────────────────────────────────────
@@ -365,6 +433,7 @@ fn on_clip_changed(state: &mut EditorState, clip_path: &std::path::Path) {
     state.skeleton_editor.fps = 30.0;
     state.skeleton_editor.dragging_point = None;
     state.skeleton_editor.timeline_scroll = 0.0;
+    state.skeleton_editor.fitted_for_duration = 0.0; // refit on next paint
     state.skeleton_editor.playing = false;
     state.skeleton_editor.last_play_tick = None;
     state.skeleton_editor.track_loop_point = None;
@@ -823,7 +892,25 @@ fn transport_bar(ui: &mut egui::Ui, state: &mut EditorState) {
 /// shows up in the panel below.
 fn skeleton_timeline(ui: &mut egui::Ui, state: &mut EditorState, width: f32) {
     let ruler_h = 22.0_f32;
-    let track_h = 38.0_f32;
+
+    // Per-point row heights (varying so points are easy to tell apart).
+    // We snapshot the names + heights up front so the immutable borrow on
+    // `scene.skeleton_templates` released before we mutate state below.
+    let mut point_rows: Vec<(String, [u8; 3], f32)> = Vec::new();
+    if let Some(tmpl_idx) = state.skeleton_editor.template_idx {
+        if let Some(t) = state.scene.skeleton_templates.get(tmpl_idx) {
+            for (name, p) in &t.points {
+                point_rows.push((name.clone(), p.color, point_row_height(p)));
+            }
+        }
+    }
+    if point_rows.is_empty() {
+        // Keep the empty "looks like a timeline" placeholder so the UI
+        // doesn't jump in height when the user adds the first point.
+        point_rows.push(("__empty__".into(), [120, 120, 140], 38.0));
+    }
+
+    let track_h: f32 = point_rows.iter().map(|(_, _, h)| *h).sum();
     let total_h = ruler_h + track_h;
     let (rect, response) =
         ui.allocate_exact_size(Vec2::new(width, total_h), Sense::click_and_drag());
@@ -894,23 +981,7 @@ fn skeleton_timeline(ui: &mut egui::Ui, state: &mut EditorState, width: f32) {
         t_mark += step;
     }
 
-    // Alternate-row tint inside the track to give it the "main timeline" look.
-    let alt_band_count = 8;
-    for i in 0..alt_band_count {
-        let band_w = track_rect.width() / alt_band_count as f32;
-        if i % 2 == 0 {
-            let x0 = track_rect.min.x + i as f32 * band_w;
-            let x1 = (x0 + band_w).min(track_rect.max.x);
-            painter.rect_filled(
-                Rect::from_min_max(
-                    Pos2::new(x0, track_rect.min.y),
-                    Pos2::new(x1, track_rect.max.y),
-                ),
-                Rounding::ZERO,
-                COL_TRACK_BG_ALT,
-            );
-        }
-    }
+    // (Per-point row tinting is drawn below, after the loop range underlay.)
 
     // ── Loop range underlay (when tracking a point) ──
     let loop_range = state
@@ -943,20 +1014,63 @@ fn skeleton_timeline(ui: &mut egui::Ui, state: &mut EditorState, width: f32) {
         }
     }
 
-    // ── Keyframe diamonds (interactive) ──
-    let mut keyframe_hits: Vec<(String, usize, Pos2)> = Vec::new();
+    // ── Per-point row separators ──
+    {
+        let mut y = track_rect.min.y;
+        for (i, (_, _, row_h)) in point_rows.iter().enumerate() {
+            // Alternate-row tint for legibility.
+            if i % 2 == 1 {
+                painter.rect_filled(
+                    Rect::from_min_max(
+                        Pos2::new(track_rect.min.x, y),
+                        Pos2::new(track_rect.max.x, y + row_h),
+                    ),
+                    Rounding::ZERO,
+                    COL_TRACK_BG_ALT,
+                );
+            }
+            y += row_h;
+            if i + 1 < point_rows.len() {
+                painter.line_segment(
+                    [
+                        Pos2::new(track_rect.min.x, y),
+                        Pos2::new(track_rect.max.x, y),
+                    ],
+                    Stroke::new(0.5, Color32::from_rgb(50, 50, 70)),
+                );
+            }
+        }
+    }
+
+    // ── Keyframe diamonds (interactive), one row per point ──
+    let mut keyframe_hits: Vec<(String, usize, Pos2, f32)> = Vec::new();
     if let Some(tmpl_idx) = state.skeleton_editor.template_idx {
         let template = &state.scene.skeleton_templates[tmpl_idx];
         let selected = state.skeleton_editor.selected_point.clone();
-        let track_y = track_rect.center().y;
-        for (name, point) in &template.points {
+        let mut row_top = track_rect.min.y;
+        for (name, _color, row_h) in &point_rows {
+            let row_center_y = row_top + row_h * 0.5;
+            row_top += row_h;
+            // Skip the placeholder row when there are no real points.
+            let Some(point) = template.points.get(name) else { continue };
+
             let active = selected.as_deref() == Some(name) || selected.is_none();
+            // Faint label at the row's left edge so the user can tell which
+            // row belongs to which point at a glance.
+            painter.text(
+                Pos2::new(track_rect.min.x + 4.0, row_center_y),
+                egui::Align2::LEFT_CENTER,
+                name,
+                egui::FontId::proportional(9.0),
+                Color32::from_rgb(point.color[0], point.color[1], point.color[2]),
+            );
+
             for (kf_idx, kf) in point.track.iter().enumerate() {
                 let x = rect.min.x + (kf.t - scroll) * pps;
                 if x < rect.min.x - 4.0 || x > rect.max.x + 4.0 {
                     continue;
                 }
-                let center = Pos2::new(x, track_y);
+                let center = Pos2::new(x, row_center_y);
                 let is_selected_kf = state.skeleton_editor.selected_keyframe.as_ref()
                     == Some(&(name.clone(), kf_idx));
                 let col = if is_selected_kf {
@@ -966,7 +1080,13 @@ fn skeleton_timeline(ui: &mut egui::Ui, state: &mut EditorState, width: f32) {
                 } else {
                     COL_KF_DIM
                 };
-                let r = if is_selected_kf { 6.0 } else { 4.5 };
+                // Diamond size also scales with row height so taller rows
+                // get visibly bigger diamonds.
+                let r = if is_selected_kf {
+                    (row_h * 0.18).clamp(4.5, 8.0)
+                } else {
+                    (row_h * 0.14).clamp(3.5, 6.5)
+                };
                 painter.add(egui::Shape::convex_polygon(
                     vec![
                         Pos2::new(center.x, center.y - r),
@@ -977,7 +1097,7 @@ fn skeleton_timeline(ui: &mut egui::Ui, state: &mut EditorState, width: f32) {
                     col,
                     Stroke::new(0.8, Color32::BLACK),
                 ));
-                keyframe_hits.push((name.clone(), kf_idx, center));
+                keyframe_hits.push((name.clone(), kf_idx, center, r));
             }
         }
     }
@@ -1013,9 +1133,10 @@ fn skeleton_timeline(ui: &mut egui::Ui, state: &mut EditorState, width: f32) {
             // Hit-test keyframe diamonds first (only the track row).
             if track_rect.contains(p) {
                 let mut best: Option<(f32, (String, usize))> = None;
-                for (name, idx, c) in &keyframe_hits {
+                for (name, idx, c, r) in &keyframe_hits {
                     let d = ((p.x - c.x).powi(2) + (p.y - c.y).powi(2)).sqrt();
-                    if d < 8.0 && best.as_ref().map(|b| d < b.0).unwrap_or(true) {
+                    let hit_radius = (r * 1.6).max(6.0);
+                    if d < hit_radius && best.as_ref().map(|b| d < b.0).unwrap_or(true) {
                         best = Some((d, (name.clone(), *idx)));
                     }
                 }
