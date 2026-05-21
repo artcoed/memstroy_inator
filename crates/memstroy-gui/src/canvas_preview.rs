@@ -3,7 +3,7 @@
 //! Renders an infinite 2D canvas with pan/zoom, the render frame
 //! rectangle, and all scene elements positioned in world pixels.
 
-use egui::{Color32, Pos2, Rect, RichText, Rounding, Sense, Stroke, Vec2};
+use egui::{Color32, Pos2, Rect, Rounding, Sense, Stroke, Vec2};
 use memstroy_core::*;
 use std::collections::HashSet;
 
@@ -364,7 +364,10 @@ fn draw_render_frame(
     viewport_size: [f32; 2],
 ) {
     let rf = &state.scene.render_frame;
-    let rf_state = sample_render_frame(rf, state.playhead);
+    // Use the eased + modifier-aware state for display so any wobble /
+    // pulse / spin modifiers added to the frame visibly shake the
+    // outline and (transitively) the children that live inside it.
+    let rf_state = sample_render_frame_eased(rf, state.playhead);
     let [rw, rh] = rf.resolution;
 
     // The render frame covers (rw/zoom) x (rh/zoom) world pixels
@@ -440,7 +443,9 @@ fn render_frame_corners_screen(
     viewport_size: [f32; 2],
 ) -> [Pos2; 4] {
     let rf = &state.scene.render_frame;
-    let rf_state = sample_render_frame(rf, state.playhead);
+    // Modifier-aware state so the corner handles follow the visible
+    // frame outline drawn by `draw_render_frame`.
+    let rf_state = sample_render_frame_eased(rf, state.playhead);
     let [rw, rh] = rf.resolution;
     let world_w = rw as f32 / rf_state.zoom.max(1e-6);
     let world_h = rh as f32 / rf_state.zoom.max(1e-6);
@@ -476,6 +481,27 @@ fn render_frame_corners_screen(
 /// Sample the RenderFrame state at time t.
 fn sample_render_frame(rf: &RenderFrame, t: f32) -> RenderFrameState {
     keyframe::sample(&rf.layout, t).unwrap_or_default()
+}
+
+/// Sample the RenderFrame state with its animation modifiers layered on
+/// top — mirrors the additive treatment used for actors / overlays. Used
+/// for *display* (drawing the frame outline + child positioning), NOT
+/// for drag math: the user authors the underlying kf-eased value, and
+/// modifiers visually perturb the rendered output on top of that.
+fn sample_render_frame_eased(rf: &RenderFrame, t: f32) -> RenderFrameState {
+    let mut s = sample_render_frame(rf, t);
+    if rf.modifiers.is_empty() { return s; }
+    let delta = keyframe::evaluate_modifiers(&rf.modifiers, t);
+    s.pos.x += delta.dx;
+    s.pos.y += delta.dy;
+    s.rotation_deg += delta.d_rotation_deg;
+    if delta.d_scale.abs() > 1e-4 {
+        // d_scale is in linear units; the frame's "scale" is 1/zoom, so
+        // bump the zoom inversely to match a Pulse-style scale shift.
+        let scale_now = (1.0 / s.zoom.max(1e-4)) + delta.d_scale;
+        s.zoom = (1.0 / scale_now.max(1e-4)).clamp(0.001, 1000.0);
+    }
+    s
 }
 
 /// Resolve a `SkeletonAttachment` on an overlay to a WORLD position by
@@ -707,14 +733,18 @@ fn draw_canvas_elements(
                 // Apply chromakey on the raw frame data if actor has non-default settings
                 let actor_ck = &state.scene.actors[idx].chroma_key;
                 let actor_cc = &state.scene.actors[idx].color_correction;
-                // Bypass the (expensive) preview pipeline when both chroma
-                // and color correction are at neutral/identity. Any of the
-                // pro grade controls (lift/gamma/gain, curves) being touched
-                // also triggers the processed path.
-                let has_effects = actor_ck.similarity > 0.01 || !actor_cc.is_identity();
+                let actor_fx = &state.scene.actors[idx].effects;
+                // Bypass the (expensive) preview pipeline when chroma /
+                // colour correction / and the effect stack are all
+                // empty / identity. Otherwise route through the processed
+                // path which layers the user's effect stack on top.
+                let any_fx_active = actor_fx.iter().any(|e| e.enabled && e.intensity > 0.001);
+                let has_effects = actor_ck.similarity > 0.01
+                    || !actor_cc.is_identity()
+                    || any_fx_active;
 
                 let texture = if has_effects {
-                    fc.processed_frame_at_time(local_t, actor_ck, actor_cc, ui.ctx())
+                    fc.processed_frame_at_time(local_t, actor_ck, actor_cc, actor_fx, ui.ctx())
                 } else {
                     fc.frame_at_time(local_t, ui.ctx())
                 };
@@ -1849,14 +1879,19 @@ fn apply_drag(
         }
 
         CanvasDragMode::MoveRenderFrame { initial_pos } => {
-            // Only update the render frame's own keyframe. Child elements
-            // (actors / overlays) keep their existing normalised or world
-            // coordinates and naturally move with the frame in world
-            // space — that's what the user wants when they grab the frame.
-            if let Some(kf) = state.scene.render_frame.layout.first_mut() {
-                kf.value.pos.x = initial_pos[0] + world_dx;
-                kf.value.pos.y = initial_pos[1] + world_dy;
-            }
+            // Insert a keyframe at the current playhead and write the new
+            // position there — same canvas-first semantics as actors and
+            // overlays. Without this the render frame's animation could
+            // only be edited via the kf at t=0, which made it impossible
+            // to author a moving frame from the canvas.
+            let t = state.playhead;
+            let new_x = initial_pos[0] + world_dx;
+            let new_y = initial_pos[1] + world_dy;
+            ensure_render_frame_kf_at_playhead(&mut state.scene.render_frame.layout, t);
+            apply_to_render_frame_kf(&mut state.scene.render_frame.layout, t, |v| {
+                v.pos.x = new_x;
+                v.pos.y = new_y;
+            });
         }
 
         CanvasDragMode::ResizeRenderFrame { initial_zoom, anchor_distance } => {
@@ -1870,11 +1905,11 @@ fn apply_drag(
             if anchor_distance > 1.0 {
                 let factor = (cur_dist / anchor_distance).max(0.05);
                 let new_zoom = (initial_zoom / factor).clamp(0.1, 10.0);
-                if let Some(kf) = state.scene.render_frame.layout.first_mut() {
-                    kf.value.zoom = new_zoom;
-                }
-                // No child reprojection — overlays/actors keep their data
-                // intact when the render frame is resized.
+                let t = state.playhead;
+                ensure_render_frame_kf_at_playhead(&mut state.scene.render_frame.layout, t);
+                apply_to_render_frame_kf(&mut state.scene.render_frame.layout, t, |v| {
+                    v.zoom = new_zoom;
+                });
             }
         }
 
@@ -1903,45 +1938,79 @@ fn apply_drag(
 
 fn move_selection_mode(state: &EditorState) -> crate::state::CanvasDragMode {
     use crate::state::CanvasDragMode;
+    let t = state.playhead;
     match state.selection {
         Selection::Actor(idx) if idx < state.scene.actors.len() => {
             let actor_id = state.scene.actors[idx].id.clone();
+            // Prefer the canvas-layout (world-pixel) track when the actor
+            // has one. Sample at the *playhead* — using `.first()` here
+            // caused the actor to snap to the first keyframe's position
+            // on the very first frame of the drag whenever the playhead
+            // sat between keyframes.
             if let Some(cl) = state.scene.canvas_layouts.iter().find(|cl| cl.element_id == actor_id) {
-                if let Some(kf) = cl.keyframes.first() {
+                if !cl.keyframes.is_empty() {
+                    let sampled = keyframe::sample(&cl.keyframes, t).unwrap_or_default();
                     return CanvasDragMode::MoveActorWorld {
                         actor_idx: idx,
-                        initial_pos: [kf.value.pos.x, kf.value.pos.y],
+                        initial_pos: [sampled.pos.x, sampled.pos.y],
                     };
                 }
             }
-            // Fall back to legacy normalised layout.
-            let initial_pos = state.scene.actors[idx].layout.first()
-                .map(|kf| kf.value.pos).unwrap_or([0.5, 0.5]);
+            // Legacy normalised layout — sample at the playhead, same fix.
+            let initial_pos = keyframe::sample(&state.scene.actors[idx].layout, t)
+                .map(|s| s.pos)
+                .unwrap_or_else(|| state.scene.actors[idx].layout.first()
+                    .map(|kf| kf.value.pos).unwrap_or([0.5, 0.5]));
             CanvasDragMode::MoveActorLegacy { actor_idx: idx, initial_pos }
         }
         Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
-            let initial_pos = match &state.scene.overlays[idx] {
-                Overlay::Text(t) => t.layout.first().map(|k| k.value.pos).unwrap_or([0.5, 0.5]),
-                Overlay::Image(im) => im.layout.first().map(|k| k.value.pos).unwrap_or([0.5, 0.5]),
-                Overlay::Video(v) => v.layout.first().map(|k| k.value.pos).unwrap_or([0.5, 0.5]),
+            // Overlays are sampled in CLIP-LOCAL time (`t - t_in`); the
+            // drag origin must use the same time base so we read the
+            // visible position the user is grabbing.
+            let local_t = overlay_clip_local_time(state, idx);
+            let layout: &Vec<Keyframe<OverlayState>> = match &state.scene.overlays[idx] {
+                Overlay::Text(t) => &t.layout,
+                Overlay::Image(im) => &im.layout,
+                Overlay::Video(v) => &v.layout,
             };
+            let initial_pos = keyframe::sample(layout, local_t)
+                .map(|s| s.pos)
+                .unwrap_or_else(|| layout.first().map(|k| k.value.pos).unwrap_or([0.5, 0.5]));
             CanvasDragMode::MoveOverlay { overlay_idx: idx, initial_pos }
+        }
+        Selection::RenderFrame => {
+            let rf_state = sample_render_frame(&state.scene.render_frame, t);
+            CanvasDragMode::MoveRenderFrame {
+                initial_pos: [rf_state.pos.x, rf_state.pos.y],
+            }
         }
         _ => CanvasDragMode::None,
     }
 }
 
 fn current_selection_scale(state: &EditorState) -> Option<f32> {
+    let t = state.playhead;
     match state.selection {
         Selection::Actor(idx) if idx < state.scene.actors.len() => {
-            state.scene.actors[idx].layout.first().map(|k| k.value.scale)
+            keyframe::sample(&state.scene.actors[idx].layout, t)
+                .map(|s| s.scale)
+                .or_else(|| state.scene.actors[idx].layout.first().map(|k| k.value.scale))
         }
         Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
-            match &state.scene.overlays[idx] {
-                Overlay::Text(t) => t.layout.first().map(|k| k.value.scale),
-                Overlay::Image(im) => im.layout.first().map(|k| k.value.scale),
-                Overlay::Video(v) => v.layout.first().map(|k| k.value.scale),
-            }
+            let local_t = overlay_clip_local_time(state, idx);
+            let layout: &Vec<Keyframe<OverlayState>> = match &state.scene.overlays[idx] {
+                Overlay::Text(t) => &t.layout,
+                Overlay::Image(im) => &im.layout,
+                Overlay::Video(v) => &v.layout,
+            };
+            keyframe::sample(layout, local_t).map(|s| s.scale)
+                .or_else(|| layout.first().map(|k| k.value.scale))
+        }
+        Selection::RenderFrame => {
+            // Render frame uses inverse zoom as its "scale" — bigger value
+            // = larger frame on the canvas.
+            let rf_state = sample_render_frame(&state.scene.render_frame, t);
+            Some((1.0 / rf_state.zoom.max(1e-4)).clamp(0.05, 20.0))
         }
         _ => None,
     }
@@ -1960,14 +2029,19 @@ fn current_selection_rotation(state: &EditorState) -> Option<f32> {
                 .or_else(|| state.scene.actors[idx].layout.first().map(|k| k.value.rotation_deg))
         }
         Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
-            let layout = match &state.scene.overlays[idx] {
+            let local_t = overlay_clip_local_time(state, idx);
+            let layout: &Vec<Keyframe<OverlayState>> = match &state.scene.overlays[idx] {
                 Overlay::Text(t) => &t.layout,
                 Overlay::Image(im) => &im.layout,
                 Overlay::Video(v) => &v.layout,
             };
-            keyframe::sample(layout, t)
+            keyframe::sample(layout, local_t)
                 .map(|s| s.rotation_deg)
                 .or_else(|| layout.first().map(|k| k.value.rotation_deg))
+        }
+        Selection::RenderFrame => {
+            let rf_state = sample_render_frame(&state.scene.render_frame, t);
+            Some(rf_state.rotation_deg)
         }
         _ => None,
     }
@@ -1981,17 +2055,25 @@ fn rotation_handle_screen_pos(elem_rect: Rect) -> Pos2 {
 }
 
 fn current_selection_scale_y(state: &EditorState) -> Option<f32> {
+    let t = state.playhead;
     match state.selection {
         Selection::Actor(idx) if idx < state.scene.actors.len() => {
-            state.scene.actors[idx].layout.first().map(|k| k.value.scale_y)
+            keyframe::sample(&state.scene.actors[idx].layout, t)
+                .map(|s| s.scale_y)
+                .or_else(|| state.scene.actors[idx].layout.first().map(|k| k.value.scale_y))
         }
         Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
-            match &state.scene.overlays[idx] {
-                Overlay::Text(t) => t.layout.first().map(|k| k.value.scale_y),
-                Overlay::Image(im) => im.layout.first().map(|k| k.value.scale_y),
-                Overlay::Video(v) => v.layout.first().map(|k| k.value.scale_y),
-            }
+            let local_t = overlay_clip_local_time(state, idx);
+            let layout: &Vec<Keyframe<OverlayState>> = match &state.scene.overlays[idx] {
+                Overlay::Text(t) => &t.layout,
+                Overlay::Image(im) => &im.layout,
+                Overlay::Video(v) => &v.layout,
+            };
+            keyframe::sample(layout, local_t).map(|s| s.scale_y)
+                .or_else(|| layout.first().map(|k| k.value.scale_y))
         }
+        // Render frame is locked to its output aspect ratio.
+        Selection::RenderFrame => Some(1.0),
         _ => None,
     }
 }
@@ -2015,6 +2097,10 @@ fn current_selection_base_dims(state: &EditorState) -> Option<(f32, f32)> {
             let neutral = OverlayState { pos: [0.0, 0.0], scale: 1.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 1.0, flip_x_anim: 1.0, flip_y_anim: 1.0 };
             Some(overlay_bbox(ov, &neutral))
         }
+        Selection::RenderFrame => {
+            let [rw, rh] = state.scene.render_frame.resolution;
+            Some((rw as f32, rh as f32))
+        }
         _ => None,
     }
 }
@@ -2029,13 +2115,14 @@ fn current_selection_world_center(state: &EditorState) -> Option<[f32; 2]> {
             Some([wp.x, wp.y])
         }
         Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
+            let local_t = overlay_clip_local_time(state, idx);
             let ov = &state.scene.overlays[idx];
-            let layout = match ov {
+            let layout: &Vec<Keyframe<OverlayState>> = match ov {
                 Overlay::Text(t) => &t.layout,
                 Overlay::Image(im) => &im.layout,
                 Overlay::Video(v) => &v.layout,
             };
-            let ov_state = keyframe::sample(layout, t).unwrap_or_default();
+            let ov_state = keyframe::sample(layout, local_t).unwrap_or_default();
             let rf = &state.scene.render_frame;
             let rf_state = sample_render_frame(rf, t);
             let [rw, rh] = rf.resolution;
@@ -2047,6 +2134,10 @@ fn current_selection_world_center(state: &EditorState) -> Option<[f32; 2]> {
                 frame_tl_x + ov_state.pos[0] * world_w,
                 frame_tl_y + ov_state.pos[1] * world_h,
             ])
+        }
+        Selection::RenderFrame => {
+            let rf_state = sample_render_frame(&state.scene.render_frame, t);
+            Some([rf_state.pos.x, rf_state.pos.y])
         }
         _ => None,
     }
@@ -2090,6 +2181,7 @@ fn set_selection_world_center(state: &mut EditorState, center: [f32; 2]) {
             apply_to_anim_kf(&mut state.scene.actors[idx].layout, t, |v| v.pos = new_norm);
         }
         Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
+            let local_t = overlay_clip_local_time(state, idx);
             let rf = &state.scene.render_frame;
             let rf_state = sample_render_frame(rf, t);
             let [rw, rh] = rf.resolution;
@@ -2100,8 +2192,15 @@ fn set_selection_world_center(state: &mut EditorState, center: [f32; 2]) {
             if world_w <= 0.0 || world_h <= 0.0 { return; }
             let new_norm = [(center[0] - frame_tl_x) / world_w, (center[1] - frame_tl_y) / world_h];
             let layout = overlay_layout_mut(&mut state.scene.overlays[idx]);
-            ensure_overlay_kf_at_playhead(layout, t);
-            apply_to_overlay_kf(layout, t, |v| v.pos = new_norm);
+            ensure_overlay_kf_at_playhead(layout, local_t);
+            apply_to_overlay_kf(layout, local_t, |v| v.pos = new_norm);
+        }
+        Selection::RenderFrame => {
+            ensure_render_frame_kf_at_playhead(&mut state.scene.render_frame.layout, t);
+            apply_to_render_frame_kf(&mut state.scene.render_frame.layout, t, |v| {
+                v.pos.x = center[0];
+                v.pos.y = center[1];
+            });
         }
         _ => {}
     }
@@ -2116,10 +2215,13 @@ fn set_selection_scale_y(state: &mut EditorState, new_scale_y: f32) {
             apply_to_anim_kf(&mut state.scene.actors[idx].layout, t, |v| v.scale_y = s);
         }
         Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
+            let local_t = overlay_clip_local_time(state, idx);
             let layout = overlay_layout_mut(&mut state.scene.overlays[idx]);
-            ensure_overlay_kf_at_playhead(layout, t);
-            apply_to_overlay_kf(layout, t, |v| v.scale_y = s);
+            ensure_overlay_kf_at_playhead(layout, local_t);
+            apply_to_overlay_kf(layout, local_t, |v| v.scale_y = s);
         }
+        // Render frame is locked to its output aspect ratio — scale_y is
+        // ignored here, scale alone changes its size on the canvas.
         _ => {}
     }
 }
@@ -2133,9 +2235,17 @@ fn set_selection_scale(state: &mut EditorState, new_scale: f32) {
             apply_to_anim_kf(&mut state.scene.actors[idx].layout, t, |v| v.scale = s);
         }
         Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
+            let local_t = overlay_clip_local_time(state, idx);
             let layout = overlay_layout_mut(&mut state.scene.overlays[idx]);
-            ensure_overlay_kf_at_playhead(layout, t);
-            apply_to_overlay_kf(layout, t, |v| v.scale = s);
+            ensure_overlay_kf_at_playhead(layout, local_t);
+            apply_to_overlay_kf(layout, local_t, |v| v.scale = s);
+        }
+        Selection::RenderFrame => {
+            // Map scale → inverse zoom (bigger scale = bigger frame).
+            ensure_render_frame_kf_at_playhead(&mut state.scene.render_frame.layout, t);
+            apply_to_render_frame_kf(&mut state.scene.render_frame.layout, t, |v| {
+                v.zoom = (1.0 / s.max(1e-4)).clamp(0.001, 1000.0);
+            });
         }
         _ => {}
     }
@@ -2160,9 +2270,16 @@ fn set_selection_rotation(state: &mut EditorState, new_rot_deg: f32) {
             apply_to_anim_kf(&mut state.scene.actors[idx].layout, t, |v| v.rotation_deg = new_rot_deg);
         }
         Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
+            let local_t = overlay_clip_local_time(state, idx);
             let layout = overlay_layout_mut(&mut state.scene.overlays[idx]);
-            ensure_overlay_kf_at_playhead(layout, t);
-            apply_to_overlay_kf(layout, t, |v| v.rotation_deg = new_rot_deg);
+            ensure_overlay_kf_at_playhead(layout, local_t);
+            apply_to_overlay_kf(layout, local_t, |v| v.rotation_deg = new_rot_deg);
+        }
+        Selection::RenderFrame => {
+            ensure_render_frame_kf_at_playhead(&mut state.scene.render_frame.layout, t);
+            apply_to_render_frame_kf(&mut state.scene.render_frame.layout, t, |v| {
+                v.rotation_deg = new_rot_deg;
+            });
         }
         _ => {}
     }
@@ -2213,6 +2330,24 @@ fn ensure_canvas_kf_at_playhead(layout: &mut Vec<Keyframe<CanvasTransform>>, t: 
     layout.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
 }
 
+/// Insert a keyframe at `t` on the render-frame layout, seeded with the
+/// eased current value. Used so that moving / resizing / rotating the
+/// render frame on the canvas at any playhead authors animation
+/// automatically (canvas-first workflow, same as actors / overlays).
+fn ensure_render_frame_kf_at_playhead(layout: &mut Vec<Keyframe<RenderFrameState>>, t: f32) {
+    if layout.is_empty() {
+        layout.push(Keyframe::new(t, RenderFrameState::default()));
+        return;
+    }
+    let eps = 1.0e-3;
+    if layout.iter().any(|kf| (kf.t - t).abs() < eps) {
+        return;
+    }
+    let sampled = keyframe::sample(layout, t).unwrap_or_default();
+    layout.push(Keyframe::new(t, sampled));
+    layout.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
+}
+
 fn apply_to_anim_kf<F: FnOnce(&mut ActorState)>(
     layout: &mut Vec<Keyframe<ActorState>>,
     t: f32,
@@ -2243,12 +2378,45 @@ fn apply_to_overlay_kf<F: FnOnce(&mut OverlayState)>(
     }
 }
 
+/// Apply a closure to the render-frame keyframe at `t`. Falls back to the
+/// first keyframe when no exact match exists (mirrors the behaviour of
+/// `apply_to_anim_kf`).
+fn apply_to_render_frame_kf<F: FnOnce(&mut RenderFrameState)>(
+    layout: &mut Vec<Keyframe<RenderFrameState>>,
+    t: f32,
+    f: F,
+) {
+    let eps = 1.0e-3;
+    if let Some(kf) = layout.iter_mut().find(|kf| (kf.t - t).abs() < eps) {
+        f(&mut kf.value);
+        return;
+    }
+    if let Some(kf) = layout.first_mut() {
+        f(&mut kf.value);
+    }
+}
+
 fn overlay_layout_mut(overlay: &mut Overlay) -> &mut Vec<Keyframe<OverlayState>> {
     match overlay {
         Overlay::Text(t) => &mut t.layout,
         Overlay::Image(im) => &mut im.layout,
         Overlay::Video(v) => &mut v.layout,
     }
+}
+
+/// Time used to read/write keyframes on overlays. Overlays are sampled
+/// in clip-local seconds (`t - t_in`) by `draw_canvas_overlays` and the
+/// renderer, so any drag setter / inspector edit on the canvas must use
+/// the same time base — otherwise a kf inserted at the global playhead
+/// would never be visible.
+fn overlay_clip_local_time(state: &EditorState, ov_idx: usize) -> f32 {
+    if ov_idx >= state.scene.overlays.len() { return state.playhead; }
+    let t_in = match &state.scene.overlays[ov_idx] {
+        Overlay::Text(t) => t.t_in,
+        Overlay::Image(im) => im.t_in,
+        Overlay::Video(v) => v.t_in,
+    };
+    (state.playhead - t_in).max(0.0)
 }
 
 /// Lightweight hit sniffer (read-only) — returns what would be selected at a
@@ -2383,6 +2551,26 @@ fn selected_element_screen_rect(
                 Vec2::new(half_w * 2.0, half_h * 2.0),
             ))
         }
+        Selection::RenderFrame => {
+            // The render frame is selectable like any other element so the
+            // user can rotate/resize/reposition it from the canvas with
+            // the same handles + rotation gizmo as the rest. We return an
+            // axis-aligned bbox here (rotation is rendered separately by
+            // `draw_render_frame`); resizing this AABB is mapped to
+            // changing `zoom` via `set_selection_scale`.
+            let rf = &state.scene.render_frame;
+            let rf_state = sample_render_frame(rf, t);
+            let [rw, rh] = rf.resolution;
+            let world_w = rw as f32 / rf_state.zoom.max(1e-6);
+            let world_h = rh as f32 / rf_state.zoom.max(1e-6);
+            let center_screen = state.canvas_viewport.world_to_screen(rf_state.pos, viewport_size);
+            let half_w = world_w * 0.5 * state.canvas_viewport.zoom;
+            let half_h = world_h * 0.5 * state.canvas_viewport.zoom;
+            Some(Rect::from_center_size(
+                Pos2::new(full_rect.min.x + center_screen[0], full_rect.min.y + center_screen[1]),
+                Vec2::new(half_w * 2.0, half_h * 2.0),
+            ))
+        }
         _ => None,
     }
 }
@@ -2499,10 +2687,11 @@ fn actor_kf_world_pos(
 }
 
 /// Draw the keyframe trajectory for the currently selected actor or overlay.
-/// Each keyframe is shown as a numbered dot, all dots are connected by a
-/// dashed polyline, and a small callout shows the parameter values at each
-/// keyframe (position, scale, rotation, opacity). This is the on-canvas
-/// half of the "visual animation constructor".
+/// Each keyframe is shown as a small numbered dot connected by a polyline,
+/// so the user can see the motion path at a glance. Per-keyframe parameter
+/// callouts (coordinates / scale / rotation / opacity) are intentionally
+/// NOT drawn here — they cluttered the canvas during dragging. All these
+/// values remain available in the inspector and timeline curves.
 fn draw_selection_keyframe_trajectory(
     painter: &egui::Painter,
     full_rect: Rect,
@@ -2513,27 +2702,17 @@ fn draw_selection_keyframe_trajectory(
     let rf_state = sample_render_frame(rf, state.playhead);
     let rf_resolution = rf.resolution;
 
-    // Collect (world_pos, label) per keyframe for the active selection.
+    // Collect each keyframe's world position for the active selection.
     #[derive(Clone)]
-    struct KfPoint { world: WorldPos, t: f32, label: String }
+    struct KfPoint { world: WorldPos }
 
     let points: Vec<KfPoint> = match state.selection {
         Selection::Actor(idx) if idx < state.scene.actors.len() => {
             let actor = &state.scene.actors[idx];
             if actor.layout.len() < 2 { return; }
-            actor.layout.iter().enumerate().map(|(i, kf)| {
+            actor.layout.iter().map(|kf| {
                 let world = actor_kf_world_pos(state, &actor.id, &kf.value, &rf_state, rf_resolution);
-                KfPoint {
-                    world,
-                    t: kf.t,
-                    label: format!(
-                        "#{}: t={:.2}s\np=({:.0},{:.0})\ns={:.2} sy={:.2}\nr={:.0}\u{00B0}\nα={:.2}",
-                        i + 1, kf.t,
-                        world.x, world.y,
-                        kf.value.scale, kf.value.scale_y,
-                        kf.value.rotation_deg, kf.value.opacity,
-                    ),
-                }
+                KfPoint { world }
             }).collect()
         }
         Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
@@ -2547,22 +2726,12 @@ fn draw_selection_keyframe_trajectory(
             let world_h = rf_resolution[1] as f32 / rf_state.zoom;
             let frame_tl_x = rf_state.pos.x - world_w * 0.5;
             let frame_tl_y = rf_state.pos.y - world_h * 0.5;
-            layout.iter().enumerate().map(|(i, kf)| {
+            layout.iter().map(|kf| {
                 let world = WorldPos {
                     x: frame_tl_x + kf.value.pos[0] * world_w,
                     y: frame_tl_y + kf.value.pos[1] * world_h,
                 };
-                KfPoint {
-                    world,
-                    t: kf.t,
-                    label: format!(
-                        "#{}: t={:.2}s\np=({:.0},{:.0})\ns={:.2} sy={:.2}\nr={:.0}\u{00B0}\nα={:.2}",
-                        i + 1, kf.t,
-                        world.x, world.y,
-                        kf.value.scale, kf.value.scale_y,
-                        kf.value.rotation_deg, kf.value.opacity,
-                    ),
-                }
+                KfPoint { world }
             }).collect()
         }
         _ => return,
@@ -2582,33 +2751,22 @@ fn draw_selection_keyframe_trajectory(
         painter.line_segment([win[0], win[1]], Stroke::new(2.0, path_color));
     }
 
-    // Numbered dots + value callouts.
-    let dot_radius = 6.0;
+    // Compact numbered dots — no textual callouts.
+    let dot_radius = 5.0;
     let dot_fill = Color32::from_rgb(255, 180, 60);
     let dot_stroke = Color32::from_rgb(40, 30, 0);
-    for (i, (pt, kp)) in screen_pts.iter().zip(points.iter()).enumerate() {
+    for (i, pt) in screen_pts.iter().enumerate() {
         painter.circle_filled(*pt, dot_radius, dot_fill);
-        painter.circle_stroke(*pt, dot_radius, Stroke::new(1.5, dot_stroke));
-        // Number inside the dot
+        painter.circle_stroke(*pt, dot_radius, Stroke::new(1.2, dot_stroke));
+        // Number inside the dot — small enough to be unobtrusive.
         painter.text(
             *pt, egui::Align2::CENTER_CENTER,
             (i + 1).to_string(),
-            egui::FontId::proportional(10.0),
+            egui::FontId::proportional(9.0),
             Color32::from_rgb(20, 20, 20),
         );
-        // Callout label with parameter values
-        let label_pos = Pos2::new(pt.x + dot_radius + 4.0, pt.y - 4.0);
-        if full_rect.contains(label_pos) {
-            painter.text(
-                label_pos,
-                egui::Align2::LEFT_BOTTOM,
-                &kp.label,
-                egui::FontId::proportional(9.5),
-                Color32::from_rgb(255, 230, 130),
-            );
-        }
-        let _ = kp; // explicit use
     }
+    let _ = full_rect;
 }
 
 /// Render-only: draw selection border, corner handles, and render-frame
@@ -2836,7 +2994,7 @@ fn draw_element_resize_handles(
 
 #[allow(dead_code)]
 fn draw_render_frame_handles(
-    ui: &mut egui::Ui,
+    _ui: &mut egui::Ui,
     painter: &egui::Painter,
     response: &egui::Response,
     full_rect: Rect,
@@ -3129,7 +3287,7 @@ fn apply_preview_effects(
 
         // Chromakey: compute color distance to key
         let dist = ((r - key_r).powi(2) + (g - key_g).powi(2) + (b - key_b).powi(2)).sqrt();
-        let mut alpha = if dist < threshold {
+        let alpha = if dist < threshold {
             0.0
         } else if dist < threshold + blend_range {
             (dist - threshold) / blend_range.max(0.01)
@@ -3524,7 +3682,59 @@ pub fn handle_canvas_asset_drag(
             .canvas_viewport
             .screen_to_world([drag_pos.x - full_rect.min.x, drag_pos.y - full_rect.min.y], viewport_size);
         let asset_path = state.asset_drag.dragging.clone().unwrap();
-        crate::panels::add_actor_from_clip_at_canvas(state, &asset_path, [world.x, world.y]);
+        let asset_label = state.asset_drag.label.clone();
+        let kind = state.asset_drag.kind;
+        match kind {
+            crate::state::AssetDragKind::Clip => {
+                crate::panels::add_actor_from_clip_at_canvas(state, &asset_path, [world.x, world.y]);
+            }
+            crate::state::AssetDragKind::Sound
+            | crate::state::AssetDragKind::Image
+            | crate::state::AssetDragKind::Particle => {
+                // Build a temporary LibraryAsset out of the drag payload —
+                // the asset card already populated the path / label /
+                // thumbnail, and the helper picks the right scene element
+                // for the drag kind.
+                let id = asset_path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("asset")
+                    .to_string();
+                let asset = crate::state::LibraryAsset {
+                    id: id.clone(),
+                    path: asset_path.clone(),
+                    label: if asset_label.is_empty() { id } else { asset_label },
+                    thumbnail: state.asset_drag.thumbnail.clone(),
+                };
+                crate::panels::add_library_asset_at_playhead(state, &asset, kind);
+                // For images / particles, snap their normalised position
+                // so they spawn under the cursor rather than the frame
+                // centre default.
+                if matches!(kind, crate::state::AssetDragKind::Image
+                    | crate::state::AssetDragKind::Particle) {
+                    let rf = &state.scene.render_frame;
+                    let rf_state = sample_render_frame(rf, state.playhead);
+                    let [rw, rh] = rf.resolution;
+                    let world_w = rw as f32 / rf_state.zoom.max(1e-4);
+                    let world_h = rh as f32 / rf_state.zoom.max(1e-4);
+                    let frame_tl_x = rf_state.pos.x - world_w * 0.5;
+                    let frame_tl_y = rf_state.pos.y - world_h * 0.5;
+                    if let Some(last) = state.scene.overlays.last_mut() {
+                        let layout = match last {
+                            Overlay::Image(im) => &mut im.layout,
+                            Overlay::Video(v) => &mut v.layout,
+                            Overlay::Text(t) => &mut t.layout,
+                        };
+                        if let Some(kf) = layout.first_mut() {
+                            kf.value.pos = [
+                                ((world.x - frame_tl_x) / world_w).clamp(-2.0, 3.0),
+                                ((world.y - frame_tl_y) / world_h).clamp(-2.0, 3.0),
+                            ];
+                        }
+                    }
+                }
+            }
+            crate::state::AssetDragKind::None => {}
+        }
 
         state.asset_drag.dragging = None;
         state.asset_drag.kind = crate::state::AssetDragKind::None;

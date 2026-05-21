@@ -282,20 +282,22 @@ impl FrameCache {
             && frame_index < self.frame_count
     }
 
-    /// Return a cached texture for the given time AFTER applying chroma-key
-    /// and colour-correction. The processed texture is cached and only
-    /// recomputed when the frame index or effect parameters change.
+    /// Return a cached texture for the given time AFTER applying chroma-key,
+    /// colour-correction, and the post-process effect stack. The processed
+    /// texture is cached and only recomputed when the frame index or any
+    /// effect parameter changes.
     pub fn processed_frame_at_time(
         &mut self,
         t: f32,
         ck: &memstroy_core::ChromaKeyParams,
         cc: &memstroy_core::ColorCorrection,
+        effects: &[memstroy_core::Effect],
         ctx: &egui::Context,
     ) -> Option<&TextureHandle> {
         if !self.ready || self.frame_count == 0 { return None; }
         let frame_index = ((t * self.fps).floor() as usize)
             .clamp(0, self.frame_count.saturating_sub(1));
-        let new_key = (frame_index, hash_effect_params(ck, cc));
+        let new_key = (frame_index, hash_effect_params(ck, cc, effects));
 
         // Cache hit — reuse the existing processed texture.
         if let (Some(prev_key), Some(_)) = (self.fx_key, self.fx_texture.as_ref()) {
@@ -309,7 +311,11 @@ impl FrameCache {
         // sufficient and avoids per-pixel CPU work on full HD frames.
         let raw = self.raw_frame_at_time(t)?;
         let scaled = downscale_for_preview(&raw, 360);
-        let processed = apply_effects_cpu(&scaled, ck, cc);
+        let mut processed = apply_effects_cpu(&scaled, ck, cc);
+        // Stack the user's post-process effects on top, in declared order.
+        if !effects.is_empty() {
+            processed = apply_effect_stack_cpu(&processed, effects);
+        }
         let options = TextureOptions::LINEAR;
         match self.fx_texture.as_mut() {
             Some(tex) => tex.set(processed, options),
@@ -426,6 +432,7 @@ impl FrameCache {
 fn hash_effect_params(
     ck: &memstroy_core::ChromaKeyParams,
     cc: &memstroy_core::ColorCorrection,
+    effects: &[memstroy_core::Effect],
 ) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -448,7 +455,42 @@ fn hash_effect_params(
             bits(p[1]).hash(&mut h);
         }
     }
+    // Effect stack.
+    (effects.len() as u32).hash(&mut h);
+    for e in effects {
+        e.enabled.hash(&mut h);
+        bits(e.intensity).hash(&mut h);
+        hash_effect_kind(&e.kind, &mut h);
+    }
     h.finish()
+}
+
+fn hash_effect_kind<H: std::hash::Hasher>(kind: &memstroy_core::EffectKind, h: &mut H) {
+    use memstroy_core::EffectKind as K;
+    use std::hash::Hash;
+    // Discriminant plus relevant numeric bits.
+    std::mem::discriminant(kind).hash(h);
+    match kind {
+        K::Blur { radius } => bits(*radius).hash(h),
+        K::Sharpen { amount } => bits(*amount).hash(h),
+        K::Grayscale | K::Sepia | K::Invert | K::MirrorH | K::MirrorV
+            | K::OldFilm | K::Vhs => {}
+        K::HueShift { degrees } => bits(*degrees).hash(h),
+        K::Vignette { strength } => bits(*strength).hash(h),
+        K::Pixelate { block_size } => bits(*block_size).hash(h),
+        K::Posterize { levels } => levels.hash(h),
+        K::Glow { radius, intensity } => {
+            bits(*radius).hash(h); bits(*intensity).hash(h);
+        }
+        K::Brightness { amount } | K::Contrast { amount }
+            | K::Saturation { amount } | K::Glitch { strength: amount }
+            | K::Noise { amount } | K::EdgeDetect { threshold: amount } => bits(*amount).hash(h),
+        K::ChromaticAberration { offset } => bits(*offset).hash(h),
+        K::Wave { amplitude, wavelength } => {
+            bits(*amplitude).hash(h); bits(*wavelength).hash(h);
+        }
+        K::Bloom { radius } => bits(*radius).hash(h),
+    }
 }
 
 #[inline]
@@ -622,6 +664,486 @@ fn build_curve_lut(curve: &[[f32; 2]]) -> [u8; 256] {
         *slot = (y * 255.0).round() as u8;
     }
     lut
+}
+
+
+// ─── EFFECT STACK (CPU PREVIEW) ──────────────────────────────────────
+//
+// Generic per-element post-process stack applied AFTER chroma-key and
+// colour correction. Each effect is implemented as a small in-place
+// pixel transform — the simplest approach that keeps the preview snappy
+// at 360p without any GPU support, matching the rest of the preview
+// pipeline. Heavier effects (blur, bloom, glow) use a tiny separable
+// box-kernel approximation; the export pipeline (ffmpeg) gets the real
+// thing via filtergraph.
+
+/// Apply the user's effect stack to a preview frame in declared order.
+/// Disabled / zero-intensity entries are skipped.
+pub fn apply_effect_stack_cpu(
+    img: &ColorImage,
+    effects: &[memstroy_core::Effect],
+) -> ColorImage {
+    let mut current = img.clone();
+    for eff in effects {
+        if !eff.enabled { continue; }
+        let intensity = eff.intensity.clamp(0.0, 1.0);
+        if intensity <= 0.001 { continue; }
+        current = apply_single_effect(&current, &eff.kind, intensity);
+    }
+    current
+}
+
+fn apply_single_effect(
+    img: &ColorImage,
+    kind: &memstroy_core::EffectKind,
+    intensity: f32,
+) -> ColorImage {
+    use memstroy_core::EffectKind as K;
+    match kind {
+        K::Blur { radius } => box_blur(img, ((*radius) * intensity).round() as i32),
+        K::Sharpen { amount } => sharpen(img, *amount * intensity),
+        K::Grayscale => mix_pixels(img, &grayscale(img), intensity),
+        K::Sepia => mix_pixels(img, &sepia(img), intensity),
+        K::Invert => mix_pixels(img, &invert(img), intensity),
+        K::HueShift { degrees } => hue_shift(img, *degrees * intensity),
+        K::Vignette { strength } => vignette(img, (*strength * intensity).clamp(0.0, 1.0)),
+        K::Pixelate { block_size } => pixelate(img, ((*block_size).max(1.0)) as i32, intensity),
+        K::Posterize { levels } => posterize(img, *levels, intensity),
+        K::Glow { radius, intensity: i2 } => glow(img, *radius, *i2 * intensity),
+        K::Brightness { amount } => brightness(img, *amount * intensity),
+        K::Contrast { amount } => contrast(img, *amount * intensity),
+        K::Saturation { amount } => saturation(img, *amount * intensity),
+        K::EdgeDetect { threshold } => edge_detect(img, *threshold, intensity),
+        K::MirrorH => mix_pixels(img, &mirror_h(img), intensity),
+        K::MirrorV => mix_pixels(img, &mirror_v(img), intensity),
+        K::ChromaticAberration { offset } => chromatic_aberration(img, *offset * intensity),
+        K::Noise { amount } => noise(img, *amount * intensity),
+        K::Wave { amplitude, wavelength } => wave(img, *amplitude * intensity, *wavelength),
+        K::OldFilm => old_film(img, intensity),
+        K::Vhs => vhs(img, intensity),
+        K::Glitch { strength } => glitch(img, *strength * intensity),
+        K::Bloom { radius } => bloom(img, *radius, intensity),
+    }
+}
+
+fn mix_pixels(a: &ColorImage, b: &ColorImage, t: f32) -> ColorImage {
+    let t = t.clamp(0.0, 1.0);
+    let mut out = a.clone();
+    let n = a.pixels.len().min(b.pixels.len());
+    for i in 0..n {
+        let pa = a.pixels[i];
+        let pb = b.pixels[i];
+        out.pixels[i] = egui::Color32::from_rgba_unmultiplied(
+            lerp_u8(pa.r(), pb.r(), t),
+            lerp_u8(pa.g(), pb.g(), t),
+            lerp_u8(pa.b(), pb.b(), t),
+            pa.a(),
+        );
+    }
+    out
+}
+
+#[inline]
+fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
+    let af = a as f32;
+    let bf = b as f32;
+    (af + (bf - af) * t).clamp(0.0, 255.0) as u8
+}
+
+fn grayscale(img: &ColorImage) -> ColorImage {
+    let mut out = img.clone();
+    for px in out.pixels.iter_mut() {
+        let g = (0.299 * px.r() as f32 + 0.587 * px.g() as f32 + 0.114 * px.b() as f32)
+            .clamp(0.0, 255.0) as u8;
+        *px = egui::Color32::from_rgba_unmultiplied(g, g, g, px.a());
+    }
+    out
+}
+
+fn sepia(img: &ColorImage) -> ColorImage {
+    let mut out = img.clone();
+    for px in out.pixels.iter_mut() {
+        let r = px.r() as f32; let g = px.g() as f32; let b = px.b() as f32;
+        let nr = (0.393 * r + 0.769 * g + 0.189 * b).clamp(0.0, 255.0) as u8;
+        let ng = (0.349 * r + 0.686 * g + 0.168 * b).clamp(0.0, 255.0) as u8;
+        let nb = (0.272 * r + 0.534 * g + 0.131 * b).clamp(0.0, 255.0) as u8;
+        *px = egui::Color32::from_rgba_unmultiplied(nr, ng, nb, px.a());
+    }
+    out
+}
+
+fn invert(img: &ColorImage) -> ColorImage {
+    let mut out = img.clone();
+    for px in out.pixels.iter_mut() {
+        *px = egui::Color32::from_rgba_unmultiplied(255 - px.r(), 255 - px.g(), 255 - px.b(), px.a());
+    }
+    out
+}
+
+fn brightness(img: &ColorImage, amount: f32) -> ColorImage {
+    let mut out = img.clone();
+    let add = amount * 255.0;
+    for px in out.pixels.iter_mut() {
+        *px = egui::Color32::from_rgba_unmultiplied(
+            (px.r() as f32 + add).clamp(0.0, 255.0) as u8,
+            (px.g() as f32 + add).clamp(0.0, 255.0) as u8,
+            (px.b() as f32 + add).clamp(0.0, 255.0) as u8,
+            px.a(),
+        );
+    }
+    out
+}
+
+fn contrast(img: &ColorImage, amount: f32) -> ColorImage {
+    // amount in [-1, 1]: -1 = grey, 0 = neutral, 1 = strong contrast.
+    let factor = (1.0 + amount).max(0.0);
+    let mut out = img.clone();
+    for px in out.pixels.iter_mut() {
+        let r = ((px.r() as f32 - 128.0) * factor + 128.0).clamp(0.0, 255.0) as u8;
+        let g = ((px.g() as f32 - 128.0) * factor + 128.0).clamp(0.0, 255.0) as u8;
+        let b = ((px.b() as f32 - 128.0) * factor + 128.0).clamp(0.0, 255.0) as u8;
+        *px = egui::Color32::from_rgba_unmultiplied(r, g, b, px.a());
+    }
+    out
+}
+
+fn saturation(img: &ColorImage, amount: f32) -> ColorImage {
+    let factor = (1.0 + amount).max(0.0);
+    let mut out = img.clone();
+    for px in out.pixels.iter_mut() {
+        let r = px.r() as f32; let g = px.g() as f32; let b = px.b() as f32;
+        let gray = 0.299 * r + 0.587 * g + 0.114 * b;
+        let nr = (gray + (r - gray) * factor).clamp(0.0, 255.0) as u8;
+        let ng = (gray + (g - gray) * factor).clamp(0.0, 255.0) as u8;
+        let nb = (gray + (b - gray) * factor).clamp(0.0, 255.0) as u8;
+        *px = egui::Color32::from_rgba_unmultiplied(nr, ng, nb, px.a());
+    }
+    out
+}
+
+fn hue_shift(img: &ColorImage, degrees: f32) -> ColorImage {
+    let mut out = img.clone();
+    let theta = degrees.to_radians();
+    let c = theta.cos();
+    let s = theta.sin();
+    // Approximate hue rotation matrix in RGB space (Foley & van Dam).
+    let m00 = 0.213 + 0.787 * c - 0.213 * s;
+    let m01 = 0.213 - 0.213 * c + 0.413 * s;
+    let m02 = 0.213 - 0.213 * c - 0.787 * s;
+    let m10 = 0.715 - 0.715 * c - 0.715 * s;
+    let m11 = 0.715 + 0.285 * c + 0.140 * s;
+    let m12 = 0.715 - 0.715 * c + 0.715 * s;
+    let m20 = 0.072 - 0.072 * c + 0.928 * s;
+    let m21 = 0.072 - 0.072 * c - 0.283 * s;
+    let m22 = 0.072 + 0.928 * c + 0.072 * s;
+    for px in out.pixels.iter_mut() {
+        let r = px.r() as f32; let g = px.g() as f32; let b = px.b() as f32;
+        let nr = (m00 * r + m10 * g + m20 * b).clamp(0.0, 255.0) as u8;
+        let ng = (m01 * r + m11 * g + m21 * b).clamp(0.0, 255.0) as u8;
+        let nb = (m02 * r + m12 * g + m22 * b).clamp(0.0, 255.0) as u8;
+        *px = egui::Color32::from_rgba_unmultiplied(nr, ng, nb, px.a());
+    }
+    out
+}
+
+fn vignette(img: &ColorImage, strength: f32) -> ColorImage {
+    let mut out = img.clone();
+    let (w, h) = (img.size[0] as f32, img.size[1] as f32);
+    let cx = w * 0.5;
+    let cy = h * 0.5;
+    let max_d = (cx * cx + cy * cy).sqrt();
+    for y in 0..img.size[1] {
+        for x in 0..img.size[0] {
+            let dx = x as f32 - cx;
+            let dy = y as f32 - cy;
+            let d = (dx * dx + dy * dy).sqrt() / max_d;
+            // Smooth falloff toward the corners.
+            let factor = (1.0 - strength * (d * d)).clamp(0.0, 1.0);
+            let i = y * img.size[0] + x;
+            let p = out.pixels[i];
+            out.pixels[i] = egui::Color32::from_rgba_unmultiplied(
+                (p.r() as f32 * factor) as u8,
+                (p.g() as f32 * factor) as u8,
+                (p.b() as f32 * factor) as u8,
+                p.a(),
+            );
+        }
+    }
+    out
+}
+
+fn pixelate(img: &ColorImage, block: i32, intensity: f32) -> ColorImage {
+    let block = block.max(1);
+    let (w, h) = (img.size[0], img.size[1]);
+    let mut pixelated = img.clone();
+    for by in (0..h).step_by(block as usize) {
+        for bx in (0..w).step_by(block as usize) {
+            // Sample one pixel per block (top-left).
+            let p = img.pixels[by * w + bx];
+            for dy in 0..(block as usize) {
+                if by + dy >= h { break; }
+                for dx in 0..(block as usize) {
+                    if bx + dx >= w { break; }
+                    pixelated.pixels[(by + dy) * w + (bx + dx)] = p;
+                }
+            }
+        }
+    }
+    mix_pixels(img, &pixelated, intensity)
+}
+
+fn posterize(img: &ColorImage, levels: u32, intensity: f32) -> ColorImage {
+    let levels = levels.clamp(2, 64) as f32;
+    let step = 255.0 / (levels - 1.0);
+    let mut out = img.clone();
+    for px in out.pixels.iter_mut() {
+        let r = ((px.r() as f32 / step).round() * step).clamp(0.0, 255.0) as u8;
+        let g = ((px.g() as f32 / step).round() * step).clamp(0.0, 255.0) as u8;
+        let b = ((px.b() as f32 / step).round() * step).clamp(0.0, 255.0) as u8;
+        *px = egui::Color32::from_rgba_unmultiplied(r, g, b, px.a());
+    }
+    mix_pixels(img, &out, intensity)
+}
+
+fn box_blur(img: &ColorImage, radius: i32) -> ColorImage {
+    if radius <= 0 { return img.clone(); }
+    // Two-pass separable box blur — cheap and good enough for preview.
+    let pass1 = blur_pass(img, radius, true);
+    blur_pass(&pass1, radius, false)
+}
+
+fn blur_pass(img: &ColorImage, radius: i32, horizontal: bool) -> ColorImage {
+    let (w, h) = (img.size[0] as i32, img.size[1] as i32);
+    let mut out = img.clone();
+    for y in 0..h {
+        for x in 0..w {
+            let mut r = 0u32; let mut g = 0u32; let mut b = 0u32; let mut a = 0u32;
+            let mut count = 0u32;
+            for k in -radius..=radius {
+                let (sx, sy) = if horizontal { (x + k, y) } else { (x, y + k) };
+                if sx < 0 || sy < 0 || sx >= w || sy >= h { continue; }
+                let p = img.pixels[(sy * w + sx) as usize];
+                r += p.r() as u32; g += p.g() as u32; b += p.b() as u32; a += p.a() as u32;
+                count += 1;
+            }
+            if count == 0 { continue; }
+            out.pixels[(y * w + x) as usize] = egui::Color32::from_rgba_unmultiplied(
+                (r / count) as u8, (g / count) as u8, (b / count) as u8, (a / count) as u8,
+            );
+        }
+    }
+    out
+}
+
+fn sharpen(img: &ColorImage, amount: f32) -> ColorImage {
+    if amount <= 0.001 { return img.clone(); }
+    let blurred = box_blur(img, 2);
+    let mut out = img.clone();
+    for i in 0..out.pixels.len() {
+        let p = img.pixels[i];
+        let bl = blurred.pixels[i];
+        let r = (p.r() as f32 + amount * (p.r() as f32 - bl.r() as f32)).clamp(0.0, 255.0) as u8;
+        let g = (p.g() as f32 + amount * (p.g() as f32 - bl.g() as f32)).clamp(0.0, 255.0) as u8;
+        let b = (p.b() as f32 + amount * (p.b() as f32 - bl.b() as f32)).clamp(0.0, 255.0) as u8;
+        out.pixels[i] = egui::Color32::from_rgba_unmultiplied(r, g, b, p.a());
+    }
+    out
+}
+
+fn glow(img: &ColorImage, radius: f32, intensity: f32) -> ColorImage {
+    if intensity <= 0.001 || radius <= 0.5 { return img.clone(); }
+    let blurred = box_blur(img, radius.round() as i32);
+    // Additive blend of the blurred copy on top of the original.
+    let mut out = img.clone();
+    for i in 0..out.pixels.len() {
+        let p = img.pixels[i];
+        let bl = blurred.pixels[i];
+        let r = (p.r() as f32 + bl.r() as f32 * intensity).clamp(0.0, 255.0) as u8;
+        let g = (p.g() as f32 + bl.g() as f32 * intensity).clamp(0.0, 255.0) as u8;
+        let b = (p.b() as f32 + bl.b() as f32 * intensity).clamp(0.0, 255.0) as u8;
+        out.pixels[i] = egui::Color32::from_rgba_unmultiplied(r, g, b, p.a());
+    }
+    out
+}
+
+fn bloom(img: &ColorImage, radius: f32, intensity: f32) -> ColorImage {
+    // Threshold the bright pixels, blur them, add back.
+    let mut bright = img.clone();
+    for px in bright.pixels.iter_mut() {
+        let lum = 0.299 * px.r() as f32 + 0.587 * px.g() as f32 + 0.114 * px.b() as f32;
+        if lum < 200.0 {
+            *px = egui::Color32::from_rgba_unmultiplied(0, 0, 0, px.a());
+        }
+    }
+    let blurred = box_blur(&bright, radius.round() as i32);
+    let mut out = img.clone();
+    for i in 0..out.pixels.len() {
+        let p = img.pixels[i];
+        let bl = blurred.pixels[i];
+        let r = (p.r() as f32 + bl.r() as f32 * intensity).clamp(0.0, 255.0) as u8;
+        let g = (p.g() as f32 + bl.g() as f32 * intensity).clamp(0.0, 255.0) as u8;
+        let b = (p.b() as f32 + bl.b() as f32 * intensity).clamp(0.0, 255.0) as u8;
+        out.pixels[i] = egui::Color32::from_rgba_unmultiplied(r, g, b, p.a());
+    }
+    out
+}
+
+fn edge_detect(img: &ColorImage, threshold: f32, intensity: f32) -> ColorImage {
+    let (w, h) = (img.size[0] as i32, img.size[1] as i32);
+    let mut edges = img.clone();
+    let lum = |x: i32, y: i32| -> f32 {
+        let cx = x.clamp(0, w - 1);
+        let cy = y.clamp(0, h - 1);
+        let p = img.pixels[(cy * w + cx) as usize];
+        0.299 * p.r() as f32 + 0.587 * p.g() as f32 + 0.114 * p.b() as f32
+    };
+    let cutoff = threshold * 255.0;
+    for y in 0..h {
+        for x in 0..w {
+            // Sobel approximation.
+            let gx = -lum(x - 1, y - 1) - 2.0 * lum(x - 1, y) - lum(x - 1, y + 1)
+                   +  lum(x + 1, y - 1) + 2.0 * lum(x + 1, y) + lum(x + 1, y + 1);
+            let gy = -lum(x - 1, y - 1) - 2.0 * lum(x, y - 1) - lum(x + 1, y - 1)
+                   +  lum(x - 1, y + 1) + 2.0 * lum(x, y + 1) + lum(x + 1, y + 1);
+            let mag = (gx * gx + gy * gy).sqrt();
+            let v = if mag > cutoff { 255 } else { 0 };
+            let alpha = img.pixels[(y * w + x) as usize].a();
+            edges.pixels[(y * w + x) as usize] =
+                egui::Color32::from_rgba_unmultiplied(v, v, v, alpha);
+        }
+    }
+    mix_pixels(img, &edges, intensity)
+}
+
+fn mirror_h(img: &ColorImage) -> ColorImage {
+    let mut out = img.clone();
+    let (w, h) = (img.size[0], img.size[1]);
+    for y in 0..h {
+        for x in 0..w {
+            out.pixels[y * w + x] = img.pixels[y * w + (w - 1 - x)];
+        }
+    }
+    out
+}
+
+fn mirror_v(img: &ColorImage) -> ColorImage {
+    let mut out = img.clone();
+    let (w, h) = (img.size[0], img.size[1]);
+    for y in 0..h {
+        for x in 0..w {
+            out.pixels[y * w + x] = img.pixels[(h - 1 - y) * w + x];
+        }
+    }
+    out
+}
+
+fn chromatic_aberration(img: &ColorImage, offset: f32) -> ColorImage {
+    let off = offset.round() as i32;
+    if off == 0 { return img.clone(); }
+    let (w, h) = (img.size[0] as i32, img.size[1] as i32);
+    let mut out = img.clone();
+    let sample = |x: i32, y: i32| -> egui::Color32 {
+        let cx = x.clamp(0, w - 1);
+        let cy = y.clamp(0, h - 1);
+        img.pixels[(cy * w + cx) as usize]
+    };
+    for y in 0..h {
+        for x in 0..w {
+            // Shift R channel left, B channel right; G stays put.
+            let pr = sample(x - off, y);
+            let pg = sample(x, y);
+            let pb = sample(x + off, y);
+            out.pixels[(y * w + x) as usize] = egui::Color32::from_rgba_unmultiplied(
+                pr.r(), pg.g(), pb.b(), pg.a(),
+            );
+        }
+    }
+    out
+}
+
+fn noise(img: &ColorImage, amount: f32) -> ColorImage {
+    let mut out = img.clone();
+    let amp = (amount * 255.0).clamp(0.0, 255.0);
+    // Cheap deterministic hash-based noise (no rng dependency).
+    for (i, px) in out.pixels.iter_mut().enumerate() {
+        let n = ((i.wrapping_mul(2654435761) ^ 0x9E3779B9) as u32) as f32;
+        let nf = ((n / u32::MAX as f32) * 2.0 - 1.0) * amp;
+        let r = (px.r() as f32 + nf).clamp(0.0, 255.0) as u8;
+        let g = (px.g() as f32 + nf).clamp(0.0, 255.0) as u8;
+        let b = (px.b() as f32 + nf).clamp(0.0, 255.0) as u8;
+        *px = egui::Color32::from_rgba_unmultiplied(r, g, b, px.a());
+    }
+    out
+}
+
+fn wave(img: &ColorImage, amplitude: f32, wavelength: f32) -> ColorImage {
+    let (w, h) = (img.size[0] as i32, img.size[1] as i32);
+    let mut out = img.clone();
+    let lambda = wavelength.max(1.0);
+    for y in 0..h {
+        let dx = (((y as f32) / lambda) * std::f32::consts::TAU).sin() * amplitude;
+        let off = dx.round() as i32;
+        for x in 0..w {
+            let sx = (x + off).clamp(0, w - 1);
+            out.pixels[(y * w + x) as usize] = img.pixels[(y * w + sx) as usize];
+        }
+    }
+    out
+}
+
+fn old_film(img: &ColorImage, intensity: f32) -> ColorImage {
+    let s = sepia(img);
+    let v = vignette(&s, 0.7 * intensity);
+    let n = noise(&v, 0.10 * intensity);
+    mix_pixels(img, &n, intensity)
+}
+
+fn vhs(img: &ColorImage, intensity: f32) -> ColorImage {
+    let ca = chromatic_aberration(img, 4.0 * intensity);
+    let n = noise(&ca, 0.06 * intensity);
+    // Simple scanlines: dim every other row.
+    let (w, h) = (n.size[0], n.size[1]);
+    let mut out = n.clone();
+    for y in 0..h {
+        if y % 2 == 0 {
+            for x in 0..w {
+                let p = out.pixels[y * w + x];
+                let dim = (1.0 - 0.25 * intensity).clamp(0.0, 1.0);
+                out.pixels[y * w + x] = egui::Color32::from_rgba_unmultiplied(
+                    (p.r() as f32 * dim) as u8,
+                    (p.g() as f32 * dim) as u8,
+                    (p.b() as f32 * dim) as u8,
+                    p.a(),
+                );
+            }
+        }
+    }
+    out
+}
+
+fn glitch(img: &ColorImage, strength: f32) -> ColorImage {
+    if strength <= 0.001 { return img.clone(); }
+    let (w, h) = (img.size[0], img.size[1]);
+    let mut out = img.clone();
+    // Slice the image into ~12 horizontal bands and shift each by a
+    // pseudo-random offset proportional to strength.
+    let band_count = 12usize;
+    let band_h = (h / band_count).max(1);
+    for bi in 0..band_count {
+        let y0 = bi * band_h;
+        let y1 = ((bi + 1) * band_h).min(h);
+        // Hash-based "random" shift, deterministic across frames.
+        let raw = ((bi as u32).wrapping_mul(2246822519) ^ 0x9E3779B9) as f32;
+        let r = (raw / u32::MAX as f32) * 2.0 - 1.0;
+        let off = (r * strength * w as f32 * 0.15) as i32;
+        for y in y0..y1 {
+            for x in 0..w as i32 {
+                let sx = (x + off).rem_euclid(w as i32);
+                out.pixels[y * w + x as usize] = img.pixels[y * w + sx as usize];
+            }
+        }
+    }
+    out
 }
 
 
