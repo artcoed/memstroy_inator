@@ -26,6 +26,69 @@ const COL_BACKGROUND: Color32 = Color32::from_rgb(60, 130, 220);
 const COL_RENDER_FRAME_HANDLE: Color32 = Color32::from_rgb(255, 120, 120);
 
 
+// ─── LAYER ORDER HELPERS ─────────────────────────────────────────────
+//
+// The timeline panel's track row order is the single source of truth for
+// stacking. Lower track index = higher up the panel = renders on TOP. To
+// keep editor preview, click selection, and the (legacy) ffmpeg renderer
+// in sync we expose helpers that derive z-order and "behind actors" from
+// `overlay_track_assignments` instead of from the now-hidden
+// `t.z_index` / `t.behind_actors` fields.
+
+/// Default video-track index for an unassigned overlay. Mirrors the
+/// fallback used by the timeline panel: prefer the second video track,
+/// otherwise the first, otherwise 0.
+fn default_overlay_track(state: &EditorState) -> usize {
+    let video_tracks: Vec<usize> = (0..state.tracks.len())
+        .filter(|i| state.tracks[*i].kind == TrackKind::Video)
+        .collect();
+    if video_tracks.len() >= 2 {
+        video_tracks[1]
+    } else if !video_tracks.is_empty() {
+        video_tracks[0]
+    } else {
+        0
+    }
+}
+
+/// Resolve the timeline track index for a given overlay (using the same
+/// fallback rule as the timeline panel).
+fn overlay_track_index(state: &EditorState, overlay_idx: usize) -> usize {
+    state
+        .overlay_track_assignments
+        .get(&overlay_idx)
+        .copied()
+        .unwrap_or_else(|| default_overlay_track(state))
+}
+
+/// Resolve the timeline track index for a given actor (defaulting to the
+/// first video track).
+fn actor_track_index(state: &EditorState, actor_idx: usize) -> usize {
+    state
+        .actor_track_assignments
+        .get(&actor_idx)
+        .copied()
+        .unwrap_or_else(|| {
+            (0..state.tracks.len())
+                .find(|i| state.tracks[*i].kind == TrackKind::Video)
+                .unwrap_or(0)
+        })
+}
+
+/// True if any visible actor sits on a track ABOVE this overlay's row
+/// (i.e. with a smaller track index). When that is the case, the overlay
+/// must be drawn before the actors so it ends up visually behind them.
+fn overlay_is_behind_actors(state: &EditorState, overlay_idx: usize) -> bool {
+    let overlay_track = overlay_track_index(state, overlay_idx);
+    state.scene.actors.iter().enumerate().any(|(ai, actor)| {
+        if !actor.visible {
+            return false;
+        }
+        actor_track_index(state, ai) < overlay_track
+    })
+}
+
+
 // ─── MAIN ENTRY POINT ────────────────────────────────────────────────
 
 /// Render the free canvas preview panel.
@@ -729,9 +792,13 @@ fn draw_canvas_backgrounds(
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OverlayPass {
-    /// Only text overlays flagged behind_actors=true.
+    /// Overlays that should render UNDER the actors. An overlay is
+    /// classified into this pass dynamically when its timeline row sits
+    /// below at least one actor's row (smaller track index = higher on
+    /// the panel = drawn on top).
     BehindActors,
-    /// Image/video overlays + text overlays with behind_actors=false.
+    /// All remaining overlays — rendered after the actors so they end up
+    /// on top of them.
     OnTop,
 }
 
@@ -745,23 +812,29 @@ fn draw_canvas_overlays(
     let t = state.playhead;
 
     // Build a sorted list of overlay indices for this pass.
-    // Sort by z_index (asc), so higher z draws on top.
-    let mut order: Vec<(usize, i32)> = state.scene.overlays.iter().enumerate()
-        .filter(|(_, ov)| match (ov, pass) {
-            (Overlay::Text(t), OverlayPass::BehindActors) => t.behind_actors,
-            (Overlay::Text(t), OverlayPass::OnTop) => !t.behind_actors,
-            (_, OverlayPass::BehindActors) => false,
-            (_, OverlayPass::OnTop) => true,
+    // Sort key = track index, DESCENDING — i.e. the lowest row on the
+    // panel renders FIRST so the topmost row ends up on top. Within the
+    // same track, draw in scene order to keep behaviour stable.
+    //
+    // The pass split is also driven by the panel: any overlay (text or
+    // media) sitting on a row BELOW one of the actor rows renders in the
+    // BehindActors pass; everything else renders OnTop. That keeps the
+    // "below actors" semantics auto-derived from the timeline layout
+    // for every overlay kind, not just text.
+    let mut order: Vec<(usize, usize)> = state.scene.overlays.iter().enumerate()
+        .filter(|(idx, _)| {
+            let behind = overlay_is_behind_actors(state, *idx);
+            match pass {
+                OverlayPass::BehindActors => behind,
+                OverlayPass::OnTop => !behind,
+            }
         })
-        .map(|(idx, ov)| {
-            let z = match ov {
-                Overlay::Text(t) => t.z_index,
-                _ => 100,
-            };
-            (idx, z)
-        })
+        .map(|(idx, _)| (idx, overlay_track_index(state, idx)))
         .collect();
-    order.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+    // Larger track index = lower on the panel = drawn FIRST (so the
+    // smaller-index rows end up painted last and on top). Within the
+    // same row, scene order acts as the tie-breaker.
+    order.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
 
     for (idx, _) in order {
         let overlay = &state.scene.overlays[idx];
@@ -877,7 +950,8 @@ fn draw_overlay_placeholder(
 }
 
 /// Render a TextOverlay on the canvas with full styling: gradient/solid plate,
-/// rounded corners, plate border, glyph stroke, alignment, opacity, italic.
+/// rounded corners, plate border, glyph stroke, alignment, opacity, italic,
+/// and rotation around the plate centre.
 fn draw_text_overlay(
     painter: &egui::Painter,
     full_rect: Rect,
@@ -890,10 +964,17 @@ fn draw_text_overlay(
 ) {
     let style = &txt.style;
 
-    // Effective font size in screen pixels = font_size * scale * canvas_zoom
+    // Effective font size in screen pixels = font_size * scale * canvas_zoom.
+    // The inspector no longer exposes a Scale slider for text — `font_size`
+    // is the user-facing size control — but `scale` still participates so
+    // corner-drag resize keeps working without a special path. The two
+    // multiply, which means resizing by handle simply multiplies the
+    // visible size, exactly like every other element.
     let zoom = state.canvas_viewport.zoom;
     let effective_size = (style.font_size * ov_state.scale * zoom).clamp(4.0, 1024.0);
     let italic_skew = if style.italic { 0.18 } else { 0.0 };
+    let rotation_rad = ov_state.rotation_deg.to_radians();
+    let rotated = rotation_rad.abs() > 0.001;
 
     let font_id = egui::FontId::new(effective_size,
         if style.bold { egui::FontFamily::Proportional } else { egui::FontFamily::Proportional });
@@ -902,8 +983,6 @@ fn draw_text_overlay(
     let lines: Vec<&str> = if txt.text.is_empty() { vec![" "] } else { txt.text.lines().collect() };
     let line_h = effective_size * 1.2;
 
-    // Measure widths via font height heuristic; egui::TextStyle layout would be more
-    // exact, but for live preview the bounding box from `painter.text` is sufficient.
     // Build galleys for each line so we can size the plate accurately.
     let galleys: Vec<std::sync::Arc<egui::epaint::text::Galley>> = lines.iter().map(|l| {
         let job = egui::text::LayoutJob::simple_singleline(
@@ -926,11 +1005,22 @@ fn draw_text_overlay(
 
     let plate_rect = Rect::from_center_size(center_pos, Vec2::new(plate_w, plate_h));
 
-    // Skip if completely off-screen
-    if !full_rect.intersects(plate_rect.expand(50.0)) { return; }
+    // Skip if completely off-screen (use a generous rotation-aware margin)
+    let bbox_margin = if rotated { plate_w.max(plate_h) } else { 50.0 };
+    if !full_rect.intersects(plate_rect.expand(bbox_margin)) { return; }
 
     let alpha_factor = match display_mode { DisplayMode::Active => 1.0, _ => 0.5 };
     let plate_opacity = style.box_opacity.clamp(0.0, 1.0) * ov_state.opacity * alpha_factor;
+
+    // Helper: rotate a point around `center_pos` by `rotation_rad`.
+    let rotate = |p: Pos2| -> Pos2 {
+        if !rotated { return p; }
+        let dx = p.x - center_pos.x;
+        let dy = p.y - center_pos.y;
+        let c = rotation_rad.cos();
+        let s = rotation_rad.sin();
+        Pos2::new(center_pos.x + dx * c - dy * s, center_pos.y + dx * s + dy * c)
+    };
 
     // ─── Plate background ────────────────────────────────────────
     if let Some(box_color) = style.box_color {
@@ -939,37 +1029,72 @@ fn draw_text_overlay(
             (plate_opacity * 255.0) as u8,
         );
 
-        match style.box_kind {
-            TextBoxKind::None => {}
-            TextBoxKind::Solid => {
-                painter.rect_filled(plate_rect, Rounding::same(radius), primary);
+        if rotated {
+            // Rotated plate: draw as a 4-vertex convex polygon. Rounded
+            // corners and gradients are deliberately dropped here — they
+            // are not worth approximating in screen space when rotated.
+            if !matches!(style.box_kind, TextBoxKind::None | TextBoxKind::OutlineOnly) {
+                let pts = vec![
+                    rotate(plate_rect.left_top()),
+                    rotate(plate_rect.right_top()),
+                    rotate(plate_rect.right_bottom()),
+                    rotate(plate_rect.left_bottom()),
+                ];
+                painter.add(egui::Shape::convex_polygon(pts, primary, Stroke::NONE));
             }
-            TextBoxKind::Gradient => {
-                // Vertical gradient via a strip of horizontal lines.
-                let end_color_rgb = style.box_gradient_end.unwrap_or(box_color);
-                let end = Color32::from_rgba_unmultiplied(
-                    end_color_rgb[0], end_color_rgb[1], end_color_rgb[2],
+
+            // Plate border (rotated)
+            if style.box_outline_width > 0.0 || matches!(style.box_kind, TextBoxKind::OutlineOnly) {
+                let border_color_rgb = style.box_outline_color.unwrap_or([0, 0, 0]);
+                let border_color = Color32::from_rgba_unmultiplied(
+                    border_color_rgb[0], border_color_rgb[1], border_color_rgb[2],
                     (plate_opacity * 255.0) as u8,
                 );
-                draw_vertical_gradient(painter, plate_rect, radius, primary, end);
+                let bw = if style.box_outline_width > 0.0 {
+                    style.box_outline_width * zoom
+                } else {
+                    2.0
+                };
+                let pts = vec![
+                    rotate(plate_rect.left_top()),
+                    rotate(plate_rect.right_top()),
+                    rotate(plate_rect.right_bottom()),
+                    rotate(plate_rect.left_bottom()),
+                    rotate(plate_rect.left_top()),
+                ];
+                for w in pts.windows(2) {
+                    painter.line_segment([w[0], w[1]], Stroke::new(bw, border_color));
+                }
             }
-            TextBoxKind::OutlineOnly => {
-                // No fill, only border drawn below.
+        } else {
+            match style.box_kind {
+                TextBoxKind::None => {}
+                TextBoxKind::Solid => {
+                    painter.rect_filled(plate_rect, Rounding::same(radius), primary);
+                }
+                TextBoxKind::Gradient => {
+                    let end_color_rgb = style.box_gradient_end.unwrap_or(box_color);
+                    let end = Color32::from_rgba_unmultiplied(
+                        end_color_rgb[0], end_color_rgb[1], end_color_rgb[2],
+                        (plate_opacity * 255.0) as u8,
+                    );
+                    draw_vertical_gradient(painter, plate_rect, radius, primary, end);
+                }
+                TextBoxKind::OutlineOnly => {}
             }
-        }
 
-        // Plate border
-        if style.box_outline_width > 0.0 {
-            let border_color_rgb = style.box_outline_color.unwrap_or([0, 0, 0]);
-            let border_color = Color32::from_rgba_unmultiplied(
-                border_color_rgb[0], border_color_rgb[1], border_color_rgb[2],
-                (plate_opacity * 255.0) as u8,
-            );
-            painter.rect_stroke(plate_rect, Rounding::same(radius),
-                Stroke::new(style.box_outline_width * zoom, border_color));
-        } else if matches!(style.box_kind, TextBoxKind::OutlineOnly) {
-            painter.rect_stroke(plate_rect, Rounding::same(radius),
-                Stroke::new(2.0, primary));
+            if style.box_outline_width > 0.0 {
+                let border_color_rgb = style.box_outline_color.unwrap_or([0, 0, 0]);
+                let border_color = Color32::from_rgba_unmultiplied(
+                    border_color_rgb[0], border_color_rgb[1], border_color_rgb[2],
+                    (plate_opacity * 255.0) as u8,
+                );
+                painter.rect_stroke(plate_rect, Rounding::same(radius),
+                    Stroke::new(style.box_outline_width * zoom, border_color));
+            } else if matches!(style.box_kind, TextBoxKind::OutlineOnly) {
+                painter.rect_stroke(plate_rect, Rounding::same(radius),
+                    Stroke::new(2.0, primary));
+            }
         }
     }
 
@@ -1002,26 +1127,41 @@ fn draw_text_overlay(
                 for step in 0..n_steps {
                     let theta = (step as f32) / (n_steps as f32) * std::f32::consts::TAU;
                     let off = Vec2::new(theta.cos() * stroke_w, theta.sin() * stroke_w);
-                    paint_text_line(painter, pos + off, &lines[li], font_id.clone(), stroke_color, italic_skew);
+                    paint_text_line_rot(painter, pos + off, &lines[li], font_id.clone(),
+                        stroke_color, italic_skew, rotation_rad, center_pos);
                 }
             }
         }
 
-        paint_text_line(painter, pos, &lines[li], font_id.clone(), glyph_color, italic_skew);
+        paint_text_line_rot(painter, pos, &lines[li], font_id.clone(), glyph_color,
+            italic_skew, rotation_rad, center_pos);
         y += line_h;
     }
 
     // ─── Selection border ─────────────────────────────────────────
     let is_selected = state.selection == Selection::Overlay(idx);
     if is_selected {
-        painter.rect_stroke(plate_rect.expand(2.0), Rounding::same(radius + 2.0),
-            Stroke::new(2.0, COL_SELECTED_BORDER));
-    } else if display_mode == DisplayMode::Active {
+        if rotated {
+            let pts = vec![
+                rotate(plate_rect.left_top()),
+                rotate(plate_rect.right_top()),
+                rotate(plate_rect.right_bottom()),
+                rotate(plate_rect.left_bottom()),
+                rotate(plate_rect.left_top()),
+            ];
+            for w in pts.windows(2) {
+                painter.line_segment([w[0], w[1]], Stroke::new(2.0, COL_SELECTED_BORDER));
+            }
+        } else {
+            painter.rect_stroke(plate_rect.expand(2.0), Rounding::same(radius + 2.0),
+                Stroke::new(2.0, COL_SELECTED_BORDER));
+        }
+    } else if display_mode == DisplayMode::Active && !rotated {
         painter.rect_stroke(plate_rect, Rounding::same(radius),
             Stroke::new(0.5, Color32::from_rgba_unmultiplied(120, 200, 140, 60)));
     }
 
-    // Display mode badge
+    // Display mode badge (kept axis-aligned for legibility)
     if display_mode != DisplayMode::Active {
         let badge = match display_mode {
             DisplayMode::BeforeStart => "FIRST",
@@ -1037,18 +1177,37 @@ fn draw_text_overlay(
     }
 }
 
-/// Paint a single line of text (helper that ignores italic skew for now —
-/// egui can't shear text natively, so italic_skew is unused but we keep the
-/// hook for future improvement).
-fn paint_text_line(
+/// Paint a single line of text, optionally rotated around `pivot` by
+/// `rotation_rad`. When rotation is ~0 we fall back to the cheap
+/// `painter.text` call to avoid the galley/TextShape detour.
+fn paint_text_line_rot(
     painter: &egui::Painter,
     pos: Pos2,
     text: &str,
     font_id: egui::FontId,
     color: Color32,
     _italic_skew: f32,
+    rotation_rad: f32,
+    pivot: Pos2,
 ) {
-    painter.text(pos, egui::Align2::LEFT_TOP, text, font_id, color);
+    if rotation_rad.abs() < 0.001 {
+        painter.text(pos, egui::Align2::LEFT_TOP, text, font_id, color);
+        return;
+    }
+
+    // Rotate the anchor `pos` around `pivot`, then ask egui to render the
+    // glyphs themselves at that rotation via TextShape::with_angle.
+    let dx = pos.x - pivot.x;
+    let dy = pos.y - pivot.y;
+    let c = rotation_rad.cos();
+    let s = rotation_rad.sin();
+    let rotated_pos = Pos2::new(pivot.x + dx * c - dy * s, pivot.y + dx * s + dy * c);
+
+    let job = egui::text::LayoutJob::simple_singleline(text.to_string(), font_id, color);
+    let galley = painter.layout_job(job);
+    let mut shape = egui::epaint::TextShape::new(rotated_pos, galley, color);
+    shape.angle = rotation_rad;
+    painter.add(egui::Shape::Text(shape));
 }
 
 /// Apply a per-state opacity factor to a base color.
@@ -1196,6 +1355,10 @@ fn draw_selection_gizmo(
             match state.canvas_drag.mode {
                 CanvasDragMode::MoveRenderFrame { .. }
                 | CanvasDragMode::ResizeRenderFrame { .. } => {
+                    // Surface the render frame in the inspector when the
+                    // user actively grabs it — the same way clicking any
+                    // other element selects it.
+                    state.selection = Selection::RenderFrame;
                     let t = state.playhead;
                     state.canvas_drag.actor_legacy_snapshot = state
                         .scene
@@ -1920,20 +2083,22 @@ fn sniff_hit(state: &EditorState, pos: WorldPos) -> Option<Selection> {
     let frame_tl_x = rf_state.pos.x - world_w * 0.5;
     let frame_tl_y = rf_state.pos.y - world_h * 0.5;
 
-    // Overlays first (top of z-order)
+    // Overlays first (top of z-order). Sort by track index ascending — the
+    // topmost row on the timeline panel hits first. Overlays drawn BEHIND
+    // the actors are de-prioritised so a click on a stacked spot selects
+    // the on-top element first.
     let mut order: Vec<(usize, i32)> = state.scene.overlays.iter().enumerate()
-        .map(|(i, ov)| {
-            let z = match ov {
-                Overlay::Text(t) => {
-                    let bias = if t.behind_actors { -1000 } else { 0 };
-                    t.z_index + bias
-                }
-                _ => 100,
+        .map(|(i, _)| {
+            let bias = if overlay_is_behind_actors(state, i) {
+                1_000_000
+            } else {
+                0
             };
-            (i, z)
+            (i, overlay_track_index(state, i) as i32 + bias)
         })
         .collect();
-    order.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    // Smaller key = higher in panel = drawn on top = checked first.
+    order.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
 
     for (idx, _) in order {
         let overlay = &state.scene.overlays[idx];
@@ -2592,20 +2757,20 @@ fn try_select_at(state: &mut EditorState, pos: WorldPos) {
     let frame_tl_x = rf_state.pos.x - world_w * 0.5;
     let frame_tl_y = rf_state.pos.y - world_h * 0.5;
 
-    // Build z-sorted overlay list and check from top to bottom (highest z first).
+    // Build hit-test order from track positions: topmost row first. Any
+    // overlay on a row below the actor rows is biased down so a stacked
+    // click first lands on the on-top element.
     let mut order: Vec<(usize, i32)> = state.scene.overlays.iter().enumerate()
-        .map(|(i, ov)| {
-            let z = match ov {
-                Overlay::Text(t) => {
-                    let bias = if t.behind_actors { -1000 } else { 0 };
-                    t.z_index + bias
-                }
-                _ => 100,
+        .map(|(i, _)| {
+            let bias = if overlay_is_behind_actors(state, i) {
+                1_000_000
+            } else {
+                0
             };
-            (i, z)
+            (i, overlay_track_index(state, i) as i32 + bias)
         })
         .collect();
-    order.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    order.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
 
     for (idx, _) in order {
         let overlay = &state.scene.overlays[idx];
@@ -2665,6 +2830,16 @@ fn try_select_at(state: &mut EditorState, pos: WorldPos) {
                 return;
             }
         }
+    }
+
+    // Render frame fall-through: clicking inside the frame border area
+    // (when nothing else matched) selects the render frame itself so the
+    // inspector exposes its position / size / rotation.
+    if pos.x >= frame_tl_x && pos.x <= frame_tl_x + world_w
+        && pos.y >= frame_tl_y && pos.y <= frame_tl_y + world_h
+    {
+        state.selection = Selection::RenderFrame;
+        return;
     }
 
     state.selection = Selection::None;
