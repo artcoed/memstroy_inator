@@ -18,6 +18,11 @@ const COL_RENDER_FRAME_FILL: Color32 = Color32::from_rgba_premultiplied(255, 80,
 const COL_ELEMENT_BORDER: Color32 = Color32::from_rgb(180, 180, 200);
 const COL_SELECTED_BORDER: Color32 = Color32::from_rgb(255, 220, 80);
 const COL_INACTIVE_TINT: Color32 = Color32::from_rgba_premultiplied(255, 255, 255, 100);
+const COL_OVERLAY_TEXT: Color32 = Color32::from_rgb(80, 200, 120);
+const COL_OVERLAY_IMAGE: Color32 = Color32::from_rgb(100, 180, 255);
+const COL_OVERLAY_VIDEO: Color32 = Color32::from_rgb(200, 100, 255);
+const COL_BACKGROUND: Color32 = Color32::from_rgb(60, 130, 220);
+const COL_RENDER_FRAME_HANDLE: Color32 = Color32::from_rgb(255, 120, 120);
 
 
 // ─── MAIN ENTRY POINT ────────────────────────────────────────────────
@@ -264,6 +269,9 @@ fn draw_canvas_elements(
     let t = state.playhead;
     let duration = state.scene.output.duration;
 
+    // Draw backgrounds first (bottom layer)
+    draw_canvas_backgrounds(painter, full_rect, state, viewport_size);
+
     // Draw actors
     for (idx, actor) in state.scene.actors.iter().enumerate() {
         if !actor.visible { continue; }
@@ -363,6 +371,258 @@ fn draw_canvas_elements(
             );
         }
     }
+
+    // Draw overlays on top of actors
+    draw_canvas_overlays(painter, full_rect, state, viewport_size);
+}
+
+// ─── BACKGROUNDS ON CANVAS ───────────────────────────────────────────
+
+fn draw_canvas_backgrounds(
+    painter: &egui::Painter,
+    full_rect: Rect,
+    state: &EditorState,
+    viewport_size: [f32; 2],
+) {
+    let t = state.playhead;
+    let rf = &state.scene.render_frame;
+    let rf_state = sample_render_frame(rf, t);
+    let [rw, rh] = rf.resolution;
+    let world_w = rw as f32 / rf_state.zoom;
+    let world_h = rh as f32 / rf_state.zoom;
+
+    for (idx, bg) in state.scene.backgrounds.iter().enumerate() {
+        let bg_end = bg.start + bg.duration;
+        let display_mode = if t >= bg.start && t <= bg_end {
+            DisplayMode::Active
+        } else if t < bg.start {
+            DisplayMode::BeforeStart
+        } else {
+            DisplayMode::AfterEnd
+        };
+
+        // Backgrounds fill the render frame area
+        let tl_world = WorldPos {
+            x: rf_state.pos.x - world_w * 0.5,
+            y: rf_state.pos.y - world_h * 0.5,
+        };
+        let br_world = WorldPos {
+            x: rf_state.pos.x + world_w * 0.5,
+            y: rf_state.pos.y + world_h * 0.5,
+        };
+
+        let tl_screen = state.canvas_viewport.world_to_screen(tl_world, viewport_size);
+        let br_screen = state.canvas_viewport.world_to_screen(br_world, viewport_size);
+
+        let bg_rect = Rect::from_min_max(
+            Pos2::new(full_rect.min.x + tl_screen[0], full_rect.min.y + tl_screen[1]),
+            Pos2::new(full_rect.min.x + br_screen[0], full_rect.min.y + br_screen[1]),
+        );
+
+        if !full_rect.intersects(bg_rect) { continue; }
+
+        // Draw background representation
+        let (fill_color, label) = match &bg.source {
+            MediaSource::SolidColor { color } => {
+                let c = Color32::from_rgb(color[0], color[1], color[2]);
+                (c, format!("Solid #{}", bg.id))
+            }
+            MediaSource::Image { path } => {
+                let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("img");
+                (Color32::from_rgb(30, 50, 70), format!("BG: {}", name))
+            }
+            MediaSource::Video { path, .. } => {
+                let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("vid");
+                (Color32::from_rgb(25, 40, 60), format!("BG: {}", name))
+            }
+        };
+
+        let alpha = match display_mode {
+            DisplayMode::Active => 180u8,
+            _ => 80u8,
+        };
+        let fill_with_alpha = Color32::from_rgba_premultiplied(
+            (fill_color.r() as u16 * alpha as u16 / 255) as u8,
+            (fill_color.g() as u16 * alpha as u16 / 255) as u8,
+            (fill_color.b() as u16 * alpha as u16 / 255) as u8,
+            alpha,
+        );
+
+        painter.rect_filled(bg_rect, Rounding::ZERO, fill_with_alpha);
+
+        // Border if selected
+        let is_selected = state.selection == Selection::Background(idx);
+        if is_selected {
+            painter.rect_stroke(bg_rect, Rounding::ZERO, Stroke::new(2.0, COL_SELECTED_BORDER));
+        }
+
+        // Label
+        painter.text(
+            Pos2::new(bg_rect.min.x + 6.0, bg_rect.max.y - 6.0),
+            egui::Align2::LEFT_BOTTOM,
+            &label,
+            egui::FontId::proportional(9.0),
+            COL_BACKGROUND,
+        );
+
+        // Display mode badge
+        if display_mode != DisplayMode::Active {
+            let badge = match display_mode {
+                DisplayMode::BeforeStart => "FIRST",
+                DisplayMode::AfterEnd => "LAST",
+                _ => "",
+            };
+            painter.text(
+                Pos2::new(bg_rect.min.x + 6.0, bg_rect.min.y + 6.0),
+                egui::Align2::LEFT_TOP, badge,
+                egui::FontId::proportional(9.0),
+                Color32::from_rgb(100, 180, 255),
+            );
+        }
+    }
+}
+
+// ─── OVERLAYS ON CANVAS ──────────────────────────────────────────────
+
+fn draw_canvas_overlays(
+    painter: &egui::Painter,
+    full_rect: Rect,
+    state: &EditorState,
+    viewport_size: [f32; 2],
+) {
+    let t = state.playhead;
+
+    for (idx, overlay) in state.scene.overlays.iter().enumerate() {
+        let (ov_id, t_in, t_out, layout, color, type_label) = match overlay {
+            Overlay::Text(txt) => (
+                &txt.id, txt.t_in, txt.t_out, &txt.layout,
+                COL_OVERLAY_TEXT, format!("T: {}", truncate_str(&txt.text, 20)),
+            ),
+            Overlay::Image(img) => (
+                &img.id, img.t_in, img.t_out, &img.layout,
+                COL_OVERLAY_IMAGE,
+                format!("IMG: {}", img.source.file_name().and_then(|s| s.to_str()).unwrap_or("?")),
+            ),
+            Overlay::Video(vid) => (
+                &vid.id, vid.t_in, vid.t_out, &vid.layout,
+                COL_OVERLAY_VIDEO,
+                format!("VID: {}", vid.source.file_name().and_then(|s| s.to_str()).unwrap_or("?")),
+            ),
+        };
+
+        // Determine display mode
+        let display_mode = if t >= t_in && t <= t_out {
+            DisplayMode::Active
+        } else if t < t_in {
+            DisplayMode::BeforeStart
+        } else {
+            DisplayMode::AfterEnd
+        };
+
+        // Get position — use overlay layout (OverlayState has normalised coords)
+        let sample_t = match display_mode {
+            DisplayMode::Active => t - t_in,
+            DisplayMode::BeforeStart => 0.0,
+            DisplayMode::AfterEnd => t_out - t_in,
+        };
+        let ov_state = keyframe::sample(layout, sample_t).unwrap_or_default();
+
+        // Convert normalised coords to world pixels
+        let rf = &state.scene.render_frame;
+        let rf_state = sample_render_frame(rf, t);
+        let [rw, rh] = rf.resolution;
+        let world_w = rw as f32 / rf_state.zoom;
+        let world_h = rh as f32 / rf_state.zoom;
+        let frame_tl_x = rf_state.pos.x - world_w * 0.5;
+        let frame_tl_y = rf_state.pos.y - world_h * 0.5;
+
+        let world_pos = WorldPos {
+            x: frame_tl_x + ov_state.pos[0] * world_w,
+            y: frame_tl_y + ov_state.pos[1] * world_h,
+        };
+
+        // Size depends on overlay type
+        let (elem_w, elem_h) = match overlay {
+            Overlay::Text(_) => (300.0 * ov_state.scale, 60.0 * ov_state.scale),
+            Overlay::Image(_) => (200.0 * ov_state.scale, 200.0 * ov_state.scale),
+            Overlay::Video(_) => (300.0 * ov_state.scale, 300.0 * 16.0 / 9.0 * ov_state.scale),
+        };
+
+        let center_screen = state.canvas_viewport.world_to_screen(world_pos, viewport_size);
+        let half_w = elem_w * 0.5 * state.canvas_viewport.zoom;
+        let half_h = elem_h * 0.5 * state.canvas_viewport.zoom;
+
+        let elem_rect = Rect::from_center_size(
+            Pos2::new(full_rect.min.x + center_screen[0], full_rect.min.y + center_screen[1]),
+            Vec2::new(half_w * 2.0, half_h * 2.0),
+        );
+
+        if !full_rect.intersects(elem_rect) { continue; }
+
+        // Draw overlay
+        let alpha = match display_mode {
+            DisplayMode::Active => 200u8,
+            _ => 100u8,
+        };
+        let fill = Color32::from_rgba_premultiplied(
+            (color.r() as u16 * 40 / 255) as u8,
+            (color.g() as u16 * 40 / 255) as u8,
+            (color.b() as u16 * 40 / 255) as u8,
+            alpha / 3,
+        );
+        painter.rect_filled(elem_rect, Rounding::same(4.0), fill);
+
+        // For text overlays, show the text content
+        if let Overlay::Text(txt) = overlay {
+            let font_size = (12.0 * state.canvas_viewport.zoom * ov_state.scale).clamp(6.0, 48.0);
+            painter.text(
+                elem_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                truncate_str(&txt.text, 30),
+                egui::FontId::proportional(font_size),
+                if display_mode == DisplayMode::Active {
+                    Color32::WHITE
+                } else {
+                    Color32::from_rgb(180, 180, 180)
+                },
+            );
+        } else {
+            painter.text(
+                elem_rect.center(), egui::Align2::CENTER_CENTER,
+                &type_label, egui::FontId::proportional(10.0),
+                Color32::from_rgb(160, 160, 180),
+            );
+        }
+
+        // Border
+        let is_selected = state.selection == Selection::Overlay(idx);
+        let border_col = if is_selected { COL_SELECTED_BORDER } else { color };
+        let border_width = if is_selected { 2.0 } else { 1.0 };
+        painter.rect_stroke(elem_rect, Rounding::same(4.0), Stroke::new(border_width, border_col));
+
+        // Display mode badge
+        if display_mode != DisplayMode::Active {
+            let badge = match display_mode {
+                DisplayMode::BeforeStart => "FIRST",
+                DisplayMode::AfterEnd => "LAST",
+                _ => "",
+            };
+            painter.text(
+                Pos2::new(elem_rect.min.x + 4.0, elem_rect.min.y + 4.0),
+                egui::Align2::LEFT_TOP, badge,
+                egui::FontId::proportional(9.0),
+                Color32::from_rgb(255, 180, 80),
+            );
+        }
+    }
+}
+
+/// Helper: truncate a string to max_chars.
+fn truncate_str(s: &str, max_chars: usize) -> &str {
+    if s.len() <= max_chars { return s; }
+    let mut end = max_chars;
+    while end > 0 && !s.is_char_boundary(end) { end -= 1; }
+    &s[..end]
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -425,35 +685,70 @@ fn draw_selection_gizmo(
 ) {
     if state.canvas_panning { return; }
 
-    // Handle drag to move selected element on canvas
-    if let Selection::Actor(idx) = state.selection {
-        if idx < state.scene.actors.len() && response.dragged() {
-            let delta = response.drag_delta();
-            // Convert screen delta to world delta
-            let world_dx = delta.x / state.canvas_viewport.zoom;
-            let world_dy = delta.y / state.canvas_viewport.zoom;
+    // ── Render frame drag handles ──
+    draw_render_frame_handles(ui, painter, response, full_rect, state, viewport_size);
 
-            // Update canvas_layout or legacy layout
-            let actor_id = state.scene.actors[idx].id.clone();
-            if let Some(cl) = state.scene.canvas_layouts.iter_mut()
-                .find(|cl| cl.element_id == actor_id)
-            {
-                if let Some(kf) = cl.keyframes.first_mut() {
-                    kf.value.pos.x += world_dx;
-                    kf.value.pos.y += world_dy;
-                }
-            } else {
-                // Move legacy layout
-                if let Some(kf) = state.scene.actors[idx].layout.first_mut() {
-                    let rf = &state.scene.render_frame;
-                    let rf_state = sample_render_frame(rf, state.playhead);
-                    let [rw, rh] = rf.resolution;
-                    let world_w = rw as f32 / rf_state.zoom;
-                    let world_h = rh as f32 / rf_state.zoom;
-                    kf.value.pos[0] += world_dx / world_w;
-                    kf.value.pos[1] += world_dy / world_h;
+    // Handle drag to move selected element on canvas
+    if response.dragged() && !state.canvas_panning {
+        let delta = response.drag_delta();
+        let world_dx = delta.x / state.canvas_viewport.zoom;
+        let world_dy = delta.y / state.canvas_viewport.zoom;
+
+        match state.selection {
+            Selection::Actor(idx) if idx < state.scene.actors.len() => {
+                let actor_id = state.scene.actors[idx].id.clone();
+                if let Some(cl) = state.scene.canvas_layouts.iter_mut()
+                    .find(|cl| cl.element_id == actor_id)
+                {
+                    if let Some(kf) = cl.keyframes.first_mut() {
+                        kf.value.pos.x += world_dx;
+                        kf.value.pos.y += world_dy;
+                    }
+                } else {
+                    // Move legacy layout
+                    if let Some(kf) = state.scene.actors[idx].layout.first_mut() {
+                        let rf = &state.scene.render_frame;
+                        let rf_state = sample_render_frame(rf, state.playhead);
+                        let [rw, rh] = rf.resolution;
+                        let world_w = rw as f32 / rf_state.zoom;
+                        let world_h = rh as f32 / rf_state.zoom;
+                        kf.value.pos[0] += world_dx / world_w;
+                        kf.value.pos[1] += world_dy / world_h;
+                    }
                 }
             }
+            Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
+                // Move overlay in normalised coords
+                let rf = &state.scene.render_frame;
+                let rf_state = sample_render_frame(rf, state.playhead);
+                let [rw, rh] = rf.resolution;
+                let world_w = rw as f32 / rf_state.zoom;
+                let world_h = rh as f32 / rf_state.zoom;
+                let dx_norm = world_dx / world_w;
+                let dy_norm = world_dy / world_h;
+
+                match &mut state.scene.overlays[idx] {
+                    Overlay::Text(txt) => {
+                        if let Some(kf) = txt.layout.first_mut() {
+                            kf.value.pos[0] += dx_norm;
+                            kf.value.pos[1] += dy_norm;
+                        }
+                    }
+                    Overlay::Image(img) => {
+                        if let Some(kf) = img.layout.first_mut() {
+                            kf.value.pos[0] += dx_norm;
+                            kf.value.pos[1] += dy_norm;
+                        }
+                    }
+                    Overlay::Video(vid) => {
+                        if let Some(kf) = vid.layout.first_mut() {
+                            kf.value.pos[0] += dx_norm;
+                            kf.value.pos[1] += dy_norm;
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -467,10 +762,112 @@ fn draw_selection_gizmo(
     }
 }
 
+// ─── RENDER FRAME HANDLES ────────────────────────────────────────────
+
+fn draw_render_frame_handles(
+    ui: &mut egui::Ui,
+    painter: &egui::Painter,
+    response: &egui::Response,
+    full_rect: Rect,
+    state: &mut EditorState,
+    viewport_size: [f32; 2],
+) {
+    let rf = &state.scene.render_frame;
+    let rf_state = sample_render_frame(rf, state.playhead);
+    let [rw, rh] = rf.resolution;
+    let world_w = rw as f32 / rf_state.zoom;
+    let world_h = rh as f32 / rf_state.zoom;
+
+    // Compute corners of render frame in screen space
+    let tl_world = WorldPos { x: rf_state.pos.x - world_w * 0.5, y: rf_state.pos.y - world_h * 0.5 };
+    let br_world = WorldPos { x: rf_state.pos.x + world_w * 0.5, y: rf_state.pos.y + world_h * 0.5 };
+    let center_world = rf_state.pos;
+
+    let center_screen = state.canvas_viewport.world_to_screen(center_world, viewport_size);
+    let center_pos = Pos2::new(full_rect.min.x + center_screen[0], full_rect.min.y + center_screen[1]);
+
+    // Draw center handle (for moving the render frame)
+    let handle_radius = 8.0;
+    painter.circle_filled(center_pos, handle_radius, COL_RENDER_FRAME_HANDLE);
+    painter.circle_stroke(center_pos, handle_radius, Stroke::new(1.5, Color32::WHITE));
+    painter.text(
+        Pos2::new(center_pos.x, center_pos.y - handle_radius - 4.0),
+        egui::Align2::CENTER_BOTTOM,
+        "\u{2316}", // crosshair symbol
+        egui::FontId::proportional(10.0),
+        COL_RENDER_FRAME,
+    );
+
+    // Allow dragging the render frame center with Alt+drag when no element is selected
+    // or when the frame handle itself is clicked
+    if response.dragged() && !state.canvas_panning {
+        let alt_held = ui.input(|i| i.modifiers.alt);
+        if alt_held || state.selection == Selection::None {
+            // Check if drag started near the center handle
+            if let Some(origin) = response.interact_pointer_pos() {
+                let ox = origin.x - response.drag_delta().x;
+                let oy = origin.y - response.drag_delta().y;
+                let dist = ((ox - center_pos.x).powi(2) + (oy - center_pos.y).powi(2)).sqrt();
+                if dist < handle_radius * 3.0 || alt_held {
+                    let delta = response.drag_delta();
+                    let world_dx = delta.x / state.canvas_viewport.zoom;
+                    let world_dy = delta.y / state.canvas_viewport.zoom;
+
+                    // Move the render frame
+                    if let Some(kf) = state.scene.render_frame.layout.first_mut() {
+                        kf.value.pos.x += world_dx;
+                        kf.value.pos.y += world_dy;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Try to select an element at the given world position.
 fn try_select_at(state: &mut EditorState, pos: WorldPos) {
     let t = state.playhead;
     let duration = state.scene.output.duration;
+
+    // Check overlays first (top layer)
+    let rf = &state.scene.render_frame;
+    let rf_state = sample_render_frame(rf, t);
+    let [rw, rh] = rf.resolution;
+    let world_w = rw as f32 / rf_state.zoom;
+    let world_h = rh as f32 / rf_state.zoom;
+    let frame_tl_x = rf_state.pos.x - world_w * 0.5;
+    let frame_tl_y = rf_state.pos.y - world_h * 0.5;
+
+    for (idx, overlay) in state.scene.overlays.iter().enumerate().rev() {
+        let (t_in, t_out, layout, scale_factor) = match overlay {
+            Overlay::Text(txt) => (txt.t_in, txt.t_out, &txt.layout, 1.0_f32),
+            Overlay::Image(img) => (img.t_in, img.t_out, &img.layout, 1.0_f32),
+            Overlay::Video(vid) => (vid.t_in, vid.t_out, &vid.layout, 1.0_f32),
+        };
+
+        let sample_t = if t >= t_in && t <= t_out { t - t_in }
+            else if t < t_in { 0.0 }
+            else { t_out - t_in };
+        let ov_state = keyframe::sample(layout, sample_t).unwrap_or_default();
+
+        let ov_world = WorldPos {
+            x: frame_tl_x + ov_state.pos[0] * world_w,
+            y: frame_tl_y + ov_state.pos[1] * world_h,
+        };
+
+        let (ew, eh) = match overlay {
+            Overlay::Text(_) => (300.0 * ov_state.scale, 60.0 * ov_state.scale),
+            Overlay::Image(_) => (200.0 * ov_state.scale, 200.0 * ov_state.scale),
+            Overlay::Video(_) => (300.0 * ov_state.scale, 300.0 * 16.0 / 9.0 * ov_state.scale),
+        };
+
+        if pos.x >= ov_world.x - ew * 0.5 && pos.x <= ov_world.x + ew * 0.5
+            && pos.y >= ov_world.y - eh * 0.5 && pos.y <= ov_world.y + eh * 0.5
+        {
+            state.selection = Selection::Overlay(idx);
+            return;
+        }
+    }
 
     // Check actors (reverse order = top layer first)
     for (idx, actor) in state.scene.actors.iter().enumerate().rev() {
@@ -487,6 +884,21 @@ fn try_select_at(state: &mut EditorState, pos: WorldPos) {
         {
             state.selection = Selection::Actor(idx);
             return;
+        }
+    }
+
+    // Check backgrounds (click inside render frame area)
+    for (idx, bg) in state.scene.backgrounds.iter().enumerate().rev() {
+        let bg_end = bg.start + bg.duration;
+        // Background occupies the render frame area
+        if pos.x >= frame_tl_x && pos.x <= frame_tl_x + world_w
+            && pos.y >= frame_tl_y && pos.y <= frame_tl_y + world_h
+        {
+            // Only select if this bg is active or closest to current time
+            if t >= bg.start && t <= bg_end {
+                state.selection = Selection::Background(idx);
+                return;
+            }
         }
     }
 
