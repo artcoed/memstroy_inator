@@ -265,6 +265,8 @@ impl MontageOutput {
                     scale_y: 1.0,
                     rotation_deg: 0.0,
                     opacity: 1.0,
+                    flip_x_anim: 1.0,
+                    flip_y_anim: 1.0,
                 })],
                 t_in: Some(cp.timeline_start),
                 t_out: Some(cp.timeline_start + cp.duration),
@@ -273,6 +275,7 @@ impl MontageOutput {
                 flip_horizontal: false,
                 attachments: Vec::new(),
                 skeleton_attachments: Vec::new(),
+                modifiers: Vec::new(),
                 visible: true,
                 color_correction: crate::ColorCorrection::default(),
                 transition_in: crate::Transition::Cut,
@@ -293,6 +296,8 @@ impl MontageOutput {
                         scale_y: 1.0,
                         rotation_deg: kf.rotation_deg,
                         opacity: kf.opacity,
+                        flip_x_anim: 1.0,
+                        flip_y_anim: 1.0,
                     })
                 }).collect();
             }
@@ -317,7 +322,11 @@ impl MontageOutput {
                     scale_y: 1.0,
                     rotation_deg: 0.0,
                     opacity: 1.0,
+                    flip_x_anim: 1.0,
+                    flip_y_anim: 1.0,
                 })],
+                modifiers: Vec::new(),
+                skeleton_attachment: None,
                 z_index: 100,
                 behind_actors: false,
             });
