@@ -33,6 +33,9 @@ pub struct FrameCache {
     pub ready: bool,
     /// Whether extraction is currently running.
     pub extracting: bool,
+    /// Source frame dimensions (width, height) — read from first extracted frame.
+    pub source_width: u32,
+    pub source_height: u32,
     /// Single reusable texture handle — updated each frame.
     texture: Option<TextureHandle>,
     /// Pre-loaded frame images in memory (ring buffer).
@@ -67,6 +70,8 @@ impl FrameCache {
             duration: 0.0,
             ready: false,
             extracting: false,
+            source_width: 480,
+            source_height: 270,
             texture: None,
             buffer: Vec::new(),
             buffer_start: 0,
@@ -183,6 +188,13 @@ impl FrameCache {
         self.cache_dir = cache_dir;
         self.ready = true;
         self.extracting = false;
+
+        // Detect source dimensions from the first extracted frame
+        let first_frame_path = self.cache_dir.join("000001.jpg");
+        if let Ok(img) = image::open(&first_frame_path) {
+            self.source_width = img.width();
+            self.source_height = img.height();
+        }
 
         // Initialize ring buffer
         self.buffer = vec![None; self.buffer_size];
