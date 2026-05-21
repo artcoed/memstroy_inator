@@ -98,6 +98,13 @@ pub enum AssetDragKind {
     #[default]
     None,
     Clip,
+    /// An audio file — drops onto the canvas/timeline as an AudioTrack.
+    Sound,
+    /// A PNG / image asset — drops as an `Overlay::Image`.
+    Image,
+    /// A particle sprite — same as `Image` but the spawned overlay
+    /// gets a Spin + Pulse modifier preset so it feels alive on drop.
+    Particle,
 }
 
 /// Drag state for cross-panel "element-to-skeleton-point" attachment. A
@@ -229,6 +236,8 @@ pub struct EditorState {
     pub node_editor_open: bool,
     /// Library search filter text.
     pub library_search: String,
+    /// Currently visible sub-library tab (Clips / Sounds / Images / Particles).
+    pub library_tab: LibraryTab,
     /// Whether ffmpeg is available (checked once at startup).
     pub ffmpeg_available: bool,
     /// Razor tool mode: when active, clicking a track bar splits at click position.
@@ -342,6 +351,44 @@ pub struct SceneTab {
 #[derive(Default)]
 pub struct AssetLibrary {
     pub mellstroy_clips: Vec<LibraryClip>,
+    /// User-curated sound library — drag a row onto the timeline (or
+    /// canvas) to insert a new AudioTrack at the drop position.
+    pub sounds: Vec<LibraryAsset>,
+    /// PNG / image stickers — dropped overlays use the file as-is.
+    pub images: Vec<LibraryAsset>,
+    /// Particle presets — actually image overlays bundled with a few
+    /// modifier presets that give a "particle"-style motion (spin +
+    /// pulse + slight wobble). The image is the particle sprite.
+    pub particles: Vec<LibraryAsset>,
+}
+
+/// Generic library entry that's not a Mellstroy clip — a sound, an
+/// image sticker, or a particle preset. The schema is intentionally
+/// minimal so adding a new category later only needs another `Vec`
+/// in `AssetLibrary` and a tab in the panel UI.
+#[derive(Debug, Clone)]
+pub struct LibraryAsset {
+    /// Stable identifier (typically the file stem) used for the
+    /// corresponding scene element's id.
+    pub id: String,
+    /// Absolute path on disk.
+    pub path: PathBuf,
+    /// Free-form label / description shown next to the entry.
+    pub label: String,
+    /// Optional thumbnail (`.png` / `.webp`) used by the drag ghost
+    /// and the row card. Falls back to a generic icon when absent.
+    pub thumbnail: Option<PathBuf>,
+}
+
+/// Which sub-library is currently visible in the panel. Persisted on
+/// the editor state so the UI keeps the user's last tab choice.
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+pub enum LibraryTab {
+    #[default]
+    Clips,
+    Sounds,
+    Images,
+    Particles,
 }
 
 #[derive(Debug, Clone)]
@@ -769,7 +816,99 @@ impl EditorState {
             .collect();
 
         self.library.mellstroy_clips.sort_by_key(|c| c.id);
+
+        // Also rescan the user's sound / image / particle bundles so the
+        // sub-libraries pick up any new files dropped into their dirs.
+        self.library.sounds = scan_asset_dir(&self.sounds_dir(), AssetCategory::Sound);
+        self.library.images = scan_asset_dir(&self.images_dir(), AssetCategory::Image);
+        self.library.particles = scan_asset_dir(&self.particles_dir(), AssetCategory::Particle);
     }
+
+    /// Directory holding sound effects available in the library. Files
+    /// dropped in here get picked up by the next `reload_library` call.
+    pub fn sounds_dir(&self) -> PathBuf {
+        self.assets_root.join("assets").join("sounds")
+    }
+
+    /// Directory holding PNG / image stickers.
+    pub fn images_dir(&self) -> PathBuf {
+        self.assets_root.join("assets").join("images")
+    }
+
+    /// Directory holding particle sprites.
+    pub fn particles_dir(&self) -> PathBuf {
+        self.assets_root.join("assets").join("particles")
+    }
+}
+
+/// Categories used by `scan_asset_dir` to filter the file extensions
+/// it accepts. Each maps to a fixed list of recognised suffixes —
+/// anything else is ignored, so dropping non-media files into the
+/// library directory is harmless.
+enum AssetCategory {
+    Sound,
+    Image,
+    Particle,
+}
+
+impl AssetCategory {
+    fn is_supported(&self, ext: &str) -> bool {
+        let lower = ext.to_ascii_lowercase();
+        match self {
+            AssetCategory::Sound => matches!(
+                lower.as_str(),
+                "mp3" | "wav" | "ogg" | "flac" | "aac" | "m4a" | "opus"
+            ),
+            AssetCategory::Image | AssetCategory::Particle => matches!(
+                lower.as_str(),
+                "png" | "jpg" | "jpeg" | "webp" | "gif"
+            ),
+        }
+    }
+}
+
+/// Scan a directory for assets of the given category and turn each
+/// supported file into a `LibraryAsset` row. Used by `reload_library`
+/// so the user can drop files in the directory and refresh the panel.
+fn scan_asset_dir(dir: &std::path::Path, category: AssetCategory) -> Vec<LibraryAsset> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    let mut out: Vec<LibraryAsset> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() { continue; }
+        let ext = path.extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+        if ext.is_empty() || !category.is_supported(&ext) { continue; }
+        let id = path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("asset")
+            .to_string();
+        // Look for a sibling thumbnail (`<stem>.png` or `<stem>.thumb.png`).
+        let thumbnail = match category {
+            // For images / particles, the asset itself is its thumbnail.
+            AssetCategory::Image | AssetCategory::Particle => Some(path.clone()),
+            AssetCategory::Sound => {
+                let candidates = [
+                    path.with_extension("thumb.png"),
+                    path.with_extension("thumb.jpg"),
+                ];
+                candidates.into_iter().find(|p| p.exists())
+            }
+        };
+        out.push(LibraryAsset {
+            id: id.clone(),
+            path: path.clone(),
+            label: id,
+            thumbnail,
+        });
+    }
+    out.sort_by(|a, b| a.label.to_ascii_lowercase().cmp(&b.label.to_ascii_lowercase()));
+    out
 }
 
 /// Check if ffmpeg binary is accessible.

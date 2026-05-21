@@ -225,6 +225,12 @@ pub struct Actor {
     /// Duration of the in/out transitions in seconds.
     #[serde(default = "default_transition_duration")]
     pub transition_duration: f32,
+    /// **Effects stack**: ordered list of post-processing effects (blur,
+    /// glow, hue shift, …) applied on top of chroma key + colour
+    /// correction. The user can stack arbitrarily many of them and
+    /// re-order via the inspector.
+    #[serde(default)]
+    pub effects: Vec<crate::effects::Effect>,
 }
 
 fn default_true() -> bool { true }
@@ -531,6 +537,9 @@ pub struct TextOverlay {
     /// and actors). When false (default), it draws on top of actors.
     #[serde(default)]
     pub behind_actors: bool,
+    /// **Effects stack**: same layered post-processing system as actors.
+    #[serde(default)]
+    pub effects: Vec<crate::effects::Effect>,
 }
 
 fn default_text_z() -> i32 { 100 }
@@ -642,6 +651,9 @@ pub struct ImageOverlay {
     /// is locked to a named point of an actor's skeleton template.
     #[serde(default)]
     pub skeleton_attachment: Option<SkeletonAttachment>,
+    /// **Effects stack**.
+    #[serde(default)]
+    pub effects: Vec<crate::effects::Effect>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -664,6 +676,9 @@ pub struct VideoOverlay {
     /// is locked to a named point of an actor's skeleton template.
     #[serde(default)]
     pub skeleton_attachment: Option<SkeletonAttachment>,
+    /// **Effects stack**.
+    #[serde(default)]
+    pub effects: Vec<crate::effects::Effect>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]

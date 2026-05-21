@@ -193,6 +193,7 @@ fn execute_line(line: &str, scene: &mut Scene, messages: &mut Vec<String>) -> Re
                 transition_in: Transition::Cut,
                 transition_out: Transition::Cut,
                 transition_duration: 0.3,
+                effects: Vec::new(),
             };
             scene.actors.push(actor);
         }
@@ -437,6 +438,7 @@ fn cmd_add_text(args: &[String], scene: &mut Scene) -> Result<(), String> {
         skeleton_attachment: None,
         z_index: 100,
         behind_actors: false,
+        effects: Vec::new(),
     }));
     Ok(())
 }
@@ -454,6 +456,7 @@ fn cmd_add_image(args: &[String], scene: &mut Scene) -> Result<(), String> {
         layout: vec![Keyframe::new(0.0, OverlayState::default())],
         modifiers: Vec::new(),
         skeleton_attachment: None,
+        effects: Vec::new(),
     }));
     Ok(())
 }
@@ -474,6 +477,7 @@ fn cmd_add_video_overlay(args: &[String], scene: &mut Scene) -> Result<(), Strin
         layout: vec![Keyframe::new(0.0, OverlayState::default())],
         modifiers: Vec::new(),
         skeleton_attachment: None,
+        effects: Vec::new(),
     }));
     Ok(())
 }
