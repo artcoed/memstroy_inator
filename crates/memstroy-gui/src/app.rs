@@ -169,6 +169,14 @@ impl App {
                                 // Load layout alongside scene
                                 let layout_path = path.with_extension("layout.json");
                                 self.state.load_layout(&layout_path);
+                                // Update tab name
+                                let name = path.file_stem().and_then(|s| s.to_str())
+                                    .unwrap_or("Scene").to_string();
+                                if self.state.active_tab < self.state.scene_tabs.len() {
+                                    self.state.scene_tabs[self.state.active_tab].name = name;
+                                    self.state.scene_tabs[self.state.active_tab].path = Some(path.clone());
+                                    self.state.scene_tabs[self.state.active_tab].scene = self.state.scene.clone();
+                                }
                             }
                             Err(e) => self.state.status = format!("\u{274C} Open failed: {e}"),
                         }
@@ -1158,6 +1166,56 @@ impl eframe::App for App {
         egui::TopBottomPanel::top("menu")
             .frame(egui::Frame::none().fill(Color32::from_rgb(25, 25, 35)).inner_margin(6.0))
             .show(ctx, |ui| self.menu(ctx, ui));
+
+        // ── Tab bar for multiple scenes ──
+        egui::TopBottomPanel::top("tab_bar")
+            .frame(egui::Frame::none().fill(Color32::from_rgb(22, 22, 30)).inner_margin(egui::Margin::symmetric(6.0, 2.0)))
+            .exact_height(26.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let num_tabs = self.state.scene_tabs.len();
+                    let mut switch_to: Option<usize> = None;
+                    let mut close_tab: Option<usize> = None;
+
+                    for i in 0..num_tabs {
+                        let is_active = i == self.state.active_tab;
+                        let tab_name = self.state.scene_tabs[i].name.clone();
+                        let fill = if is_active { Color32::from_rgb(40, 40, 60) } else { Color32::from_rgb(28, 28, 38) };
+                        let text_col = if is_active { Color32::from_rgb(255, 255, 255) } else { Color32::from_rgb(140, 140, 160) };
+
+                        let tab_frame = egui::Frame::none()
+                            .fill(fill)
+                            .rounding(Rounding { nw: 4.0, ne: 4.0, sw: 0.0, se: 0.0 })
+                            .inner_margin(egui::Margin::symmetric(8.0, 2.0));
+
+                        tab_frame.show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                if ui.selectable_label(is_active, RichText::new(&tab_name).size(11.0).color(text_col)).clicked() {
+                                    switch_to = Some(i);
+                                }
+                                if num_tabs > 1 {
+                                    if ui.small_button("x").clicked() {
+                                        close_tab = Some(i);
+                                    }
+                                }
+                            });
+                        });
+                        ui.add_space(2.0);
+                    }
+
+                    // "+" button to add new tab
+                    if ui.button(RichText::new("+").size(12.0).color(Color32::from_rgb(100, 200, 100))).clicked() {
+                        self.state.new_tab();
+                    }
+
+                    if let Some(idx) = switch_to {
+                        self.state.switch_tab(idx);
+                    }
+                    if let Some(idx) = close_tab {
+                        self.state.close_tab(idx);
+                    }
+                });
+            });
 
         // Left panel: Library + Refresh button
         egui::SidePanel::left("library")
