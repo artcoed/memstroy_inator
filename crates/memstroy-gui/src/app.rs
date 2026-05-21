@@ -1320,15 +1320,16 @@ impl eframe::App for App {
         // Detect play/pause transitions
         if self.state.playing && !self.was_playing {
             // Transition: paused → playing
+            let playhead = self.state.playhead;
             let sources: Vec<_> = self.state.scene.audio.iter()
                 .filter(|a| {
                     let t_out = a.t_out.unwrap_or(self.state.scene.output.duration);
-                    self.state.playhead >= a.t_in && self.state.playhead <= t_out
+                    playhead >= a.t_in && playhead <= t_out
                 })
                 .map(|a| (a.source.clone(), a.t_in, a.volume))
                 .collect();
             if !sources.is_empty() {
-                self.audio_engine.play(&sources);
+                self.audio_engine.play_from(&sources, playhead);
             }
         } else if !self.state.playing && self.was_playing {
             // Transition: playing → paused

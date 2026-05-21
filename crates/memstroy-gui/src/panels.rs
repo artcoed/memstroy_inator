@@ -1504,25 +1504,16 @@ fn draw_clip(
     }
 
     // Interaction (click/drag with edge-trim zones)
-    let id = ui.make_persistent_id(("clip", label, clip_start as u32));
+    let id = ui.make_persistent_id(("clip", label, (clip_start * 1000.0) as i64));
     let sense = if locked { Sense::hover() } else { Sense::click_and_drag() };
     let resp = ui.interact(bar_rect, id, sense);
 
-    // Edge-trim zone detection (5px from left/right edge)
-    const TRIM_ZONE_PX: f32 = 5.0;
-    let hover_pos = ui.input(|i| i.pointer.hover_pos());
-    let near_left_edge = hover_pos
-        .map(|p| p.x >= bar_rect.min.x && p.x <= bar_rect.min.x + TRIM_ZONE_PX && bar_rect.y_range().contains(p.y))
-        .unwrap_or(false);
-    let near_right_edge = hover_pos
-        .map(|p| p.x >= bar_rect.max.x - TRIM_ZONE_PX && p.x <= bar_rect.max.x && bar_rect.y_range().contains(p.y))
-        .unwrap_or(false);
+    // Edge detection reserved for future use
+    let _hover_pos = ui.input(|i| i.pointer.hover_pos());
 
     if resp.hovered() && !locked {
         if razor_mode {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
-        } else if near_left_edge || near_right_edge {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
         } else {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
         }
@@ -1538,24 +1529,12 @@ fn draw_clip(
         return Some(clip_start); // signal selection
     }
 
-    // Drag handling: edge-trim vs whole-clip move
+    // Drag handling: whole-clip move (edge-trim reserved for future)
     if resp.dragged() && !locked && !razor_mode {
         let dx = resp.drag_delta().x;
         let delta_secs = dx / pps;
 
-        // Determine drag origin position from the initial press
-        let drag_origin = resp.interact_pointer_pos().unwrap_or_default();
-        let started_near_left = drag_origin.x <= bar_rect.min.x + TRIM_ZONE_PX;
-        let started_near_right = drag_origin.x >= bar_rect.max.x - TRIM_ZONE_PX;
-
-        if started_near_left && delta_secs.abs() > 0.001 {
-            // Trim left edge: encode as f32::INFINITY with delta stored in sign
-            // Convention: INFINITY signals trim-left, actual delta comes from drag
-            return Some(f32::INFINITY);
-        } else if started_near_right && delta_secs.abs() > 0.001 {
-            // Trim right edge: encode as NEG_INFINITY signals trim-right
-            return Some(f32::NEG_INFINITY);
-        } else if delta_secs.abs() > 0.001 {
+        if delta_secs.abs() > 0.001 {
             // Normal move: return the NEW start time as negative
             return Some(-(clip_start + delta_secs));
         }
@@ -1640,7 +1619,7 @@ fn draw_audio_clip(
     }
 
     // Interaction
-    let id = ui.make_persistent_id(("audio_clip", label, clip_start as u32));
+    let id = ui.make_persistent_id(("audio_clip", label, (clip_start * 1000.0) as i64));
     let resp = ui.interact(bar_rect, id, if locked { Sense::hover() } else { Sense::click() });
     if resp.clicked() { return Some(clip_start); }
 

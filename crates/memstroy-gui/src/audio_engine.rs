@@ -50,8 +50,13 @@ impl AudioEngine {
     }
 
     /// Play audio sources. Each tuple is (file_path, t_in, volume).
-    /// Opens each file, decodes it, applies volume, and adds to the sink.
+    /// Opens each file, decodes it, seeks to current position, applies volume.
     pub fn play(&mut self, sources: &[(PathBuf, f32, f32)]) {
+        self.play_from(sources, 0.0);
+    }
+
+    /// Play audio sources from a specific time offset.
+    pub fn play_from(&mut self, sources: &[(PathBuf, f32, f32)], playhead: f32) {
         // Stop any current playback first
         if let Some(sink) = &self.sink {
             sink.stop();
@@ -73,7 +78,7 @@ impl AudioEngine {
 
         sink.set_volume(self.volume);
 
-        for (path, _t_in, vol) in sources {
+        for (path, t_in, vol) in sources {
             let file = match File::open(path) {
                 Ok(f) => f,
                 Err(e) => {
@@ -85,9 +90,13 @@ impl AudioEngine {
             let reader = BufReader::new(file);
             match rodio::Decoder::new(reader) {
                 Ok(source) => {
-                    let amplified = source.amplify(*vol);
+                    // Skip to the correct position: playhead relative to track start
+                    let skip_secs = (playhead - t_in).max(0.0);
+                    let skip_duration = std::time::Duration::from_secs_f32(skip_secs);
+                    let skipped = source.skip_duration(skip_duration);
+                    let amplified = skipped.amplify(*vol);
                     sink.append(amplified);
-                    info!("Added audio source: {:?}", path);
+                    info!("Added audio source: {:?} (skip {:.2}s)", path, skip_secs);
                 }
                 Err(e) => {
                     warn!("Failed to decode audio file {:?}: {}", path, e);
