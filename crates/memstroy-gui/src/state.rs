@@ -312,6 +312,9 @@ pub enum Selection {
     Background(usize),
     Camera(usize),
     Audio(usize),
+    /// The render frame (output region rectangle) is selected and edited
+    /// like a normal element from the inspector.
+    RenderFrame,
 }
 
 #[derive(Debug, Clone)]

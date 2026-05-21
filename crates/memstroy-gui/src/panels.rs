@@ -236,6 +236,9 @@ pub fn inspector(ui: &mut egui::Ui, state: &mut EditorState) {
         Selection::Camera(_) => {
             ui.label("Camera editing coming soon.");
         }
+        Selection::RenderFrame => {
+            inspector_render_frame(ui, state);
+        }
     }
 }
 
@@ -857,100 +860,59 @@ fn inspector_actor_skeleton_attachments(ui: &mut egui::Ui, state: &mut EditorSta
 fn inspector_overlay(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
     let duration = state.scene.output.duration;
     let overlay_count = state.scene.overlays.len();
-    let mut text_action: Option<TextAction> = None;
 
-    {
-        let ov = &mut state.scene.overlays[i];
+    let ov = &mut state.scene.overlays[i];
 
-        match ov {
-            Overlay::Text(t) => {
-                text_action = inspector_text_overlay(ui, t, i, overlay_count, duration);
-            }
-            Overlay::Image(im) => {
-                ui.label(RichText::new(format!("Image: {}", im.id)).strong().size(14.0).color(COL_CLIP_OVERLAY));
+    match ov {
+        Overlay::Text(t) => {
+            // Returns Option<TextAction> for backward compat — currently
+            // unused since the layer-order buttons were removed.
+            let _ = inspector_text_overlay(ui, t, i, overlay_count, duration);
+        }
+        Overlay::Image(im) => {
+            ui.label(RichText::new(format!("Image: {}", im.id)).strong().size(14.0).color(COL_CLIP_OVERLAY));
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("In:");
+                ui.add(egui::DragValue::new(&mut im.t_in).range(0.0..=duration).speed(0.02).suffix("s"));
+                ui.label("Out:");
+                ui.add(egui::DragValue::new(&mut im.t_out).range(0.0..=duration).speed(0.02).suffix("s"));
+            });
+            if let Some(kf) = im.layout.first_mut() {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    ui.label("In:");
-                    ui.add(egui::DragValue::new(&mut im.t_in).range(0.0..=duration).speed(0.02).suffix("s"));
-                    ui.label("Out:");
-                    ui.add(egui::DragValue::new(&mut im.t_out).range(0.0..=duration).speed(0.02).suffix("s"));
+                    ui.label("X:"); ui.add(egui::DragValue::new(&mut kf.value.pos[0]).speed(0.005));
+                    ui.label("Y:"); ui.add(egui::DragValue::new(&mut kf.value.pos[1]).speed(0.005));
                 });
-                if let Some(kf) = im.layout.first_mut() {
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        ui.label("X:"); ui.add(egui::DragValue::new(&mut kf.value.pos[0]).speed(0.005));
-                        ui.label("Y:"); ui.add(egui::DragValue::new(&mut kf.value.pos[1]).speed(0.005));
-                    });
-                    ui.add(egui::Slider::new(&mut kf.value.scale, 0.05..=5.0).text("Scale").logarithmic(true));
-                    ui.add(egui::Slider::new(&mut kf.value.opacity, 0.0..=1.0).text("Opacity"));
-                }
-            }
-            Overlay::Video(v) => {
-                ui.label(RichText::new(format!("Video: {}", v.id)).strong().size(14.0).color(COL_CLIP_OVERLAY));
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label("In:");
-                    ui.add(egui::DragValue::new(&mut v.t_in).range(0.0..=duration).speed(0.02).suffix("s"));
-                    ui.label("Out:");
-                    ui.add(egui::DragValue::new(&mut v.t_out).range(0.0..=duration).speed(0.02).suffix("s"));
-                });
+                ui.add(egui::Slider::new(&mut kf.value.scale, 0.05..=5.0).text("Scale").logarithmic(true));
+                ui.add(egui::Slider::new(&mut kf.value.opacity, 0.0..=1.0).text("Opacity"));
             }
         }
-    }
-
-    if let Some(action) = text_action {
-        apply_text_action(state, i, action);
+        Overlay::Video(v) => {
+            ui.label(RichText::new(format!("Video: {}", v.id)).strong().size(14.0).color(COL_CLIP_OVERLAY));
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("In:");
+                ui.add(egui::DragValue::new(&mut v.t_in).range(0.0..=duration).speed(0.02).suffix("s"));
+                ui.label("Out:");
+                ui.add(egui::DragValue::new(&mut v.t_out).range(0.0..=duration).speed(0.02).suffix("s"));
+            });
+        }
     }
 }
 
-/// Inspector layer-order actions for a text overlay. Bound by the
-/// inspector's small "↑/↓/Top/Bot" buttons.
+/// Inspector layer-order actions for a text overlay. The buttons that
+/// produced these actions were removed when the timeline track row became
+/// the single source of truth for stacking, but the type is kept (and
+/// still returned by `inspector_text_overlay`) so any future re-introduction
+/// of explicit per-text overrides slots in without churn.
+#[allow(dead_code)]
 #[derive(Clone, Copy)]
 enum TextAction {
-    /// Bump z_index by +1.
     LayerUp,
-    /// Bump z_index by -1.
     LayerDown,
-    /// Set z_index to (max+1) across overlays.
     ToFront,
-    /// Set z_index to (min-1) across overlays.
     ToBack,
-}
-
-fn apply_text_action(state: &mut EditorState, i: usize, action: TextAction) {
-    if i >= state.scene.overlays.len() {
-        return;
-    }
-    match action {
-        TextAction::LayerUp => {
-            if let Overlay::Text(t) = &mut state.scene.overlays[i] {
-                t.z_index = t.z_index.saturating_add(1);
-            }
-        }
-        TextAction::LayerDown => {
-            if let Overlay::Text(t) = &mut state.scene.overlays[i] {
-                t.z_index = t.z_index.saturating_sub(1);
-            }
-        }
-        TextAction::ToFront => {
-            let max_z = state.scene.overlays.iter().filter_map(|o| match o {
-                Overlay::Text(t) => Some(t.z_index),
-                _ => None,
-            }).max().unwrap_or(100);
-            if let Overlay::Text(t) = &mut state.scene.overlays[i] {
-                t.z_index = max_z.saturating_add(1);
-            }
-        }
-        TextAction::ToBack => {
-            let min_z = state.scene.overlays.iter().filter_map(|o| match o {
-                Overlay::Text(t) => Some(t.z_index),
-                _ => None,
-            }).min().unwrap_or(0);
-            if let Overlay::Text(t) = &mut state.scene.overlays[i] {
-                t.z_index = min_z.saturating_sub(1);
-            }
-        }
-    }
 }
 
 fn inspector_text_overlay(
@@ -958,22 +920,13 @@ fn inspector_text_overlay(
     t: &mut TextOverlay,
     _idx: usize,
     _total: usize,
-    duration: f32,
+    _duration: f32,
 ) -> Option<TextAction> {
-    let mut action: Option<TextAction> = None;
-
     // Header (delete button removed — use Delete/Backspace shortcut or
     // right-click on the timeline clip).
     ui.horizontal(|ui| {
-        ui.label(RichText::new(format!("Text: {}", t.id))
+        ui.label(RichText::new(format!("Text: {}", ellipsis(&t.text, 16)))
             .strong().size(14.0).color(COL_CLIP_OVERLAY));
-    });
-    ui.add_space(2.0);
-
-    // ID
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("ID:").size(11.0).color(COL_TEXT_DIM));
-        ui.text_edit_singleline(&mut t.id);
     });
     ui.add_space(4.0);
 
@@ -984,49 +937,20 @@ fn inspector_text_overlay(
             .desired_rows(2)
             .desired_width(ui.available_width()),
     );
-    ui.add_space(4.0);
-
-    // Timing
-    ui.horizontal(|ui| {
-        ui.label("In:");
-        ui.add(egui::DragValue::new(&mut t.t_in)
-            .range(0.0..=duration).speed(0.02).suffix("s"));
-        ui.label("Out:");
-        ui.add(egui::DragValue::new(&mut t.t_out)
-            .range(0.0..=duration).speed(0.02).suffix("s"));
-    });
     ui.add_space(8.0);
 
-    // ─── Layer order ──────────────────────────────────────────────
-    ui.label(RichText::new("Layer").size(12.0).strong()
-        .color(Color32::from_rgb(180, 180, 220)));
-    ui.add_space(2.0);
-    ui.horizontal(|ui| {
-        if ui.small_button("\u{2B06}").on_hover_text("Bring forward").clicked() {
-            action = Some(TextAction::LayerUp);
-        }
-        if ui.small_button("\u{2B07}").on_hover_text("Send back").clicked() {
-            action = Some(TextAction::LayerDown);
-        }
-        if ui.small_button("Top").on_hover_text("Bring to front").clicked() {
-            action = Some(TextAction::ToFront);
-        }
-        if ui.small_button("Bot").on_hover_text("Send to back").clicked() {
-            action = Some(TextAction::ToBack);
-        }
-        ui.label(RichText::new(format!("z={}", t.z_index)).size(10.0).color(COL_TEXT_DIM));
-    });
-    ui.checkbox(&mut t.behind_actors, "Below actors")
-        .on_hover_text("Render this text BEHIND actors (above background, below clips)");
-    ui.add_space(8.0);
-
-    // Position from first keyframe (so it can be edited from the inspector too)
+    // ─── Position / rotation / opacity (size is driven by font_size) ───
+    // Layer order, In/Out timing, ID and "Below actors" are deliberately not
+    // exposed here — they are determined by the timeline layer panel
+    // (track row position decides z-order & whether the text is rendered
+    // behind the actors; the in/out sliders on the clip itself control
+    // timing). Scale is gone too: font_size is the single source of truth
+    // for text size.
     if let Some(kf) = t.layout.first_mut() {
         ui.horizontal(|ui| {
             ui.label("X:"); ui.add(egui::DragValue::new(&mut kf.value.pos[0]).range(-2.0..=3.0).speed(0.005));
             ui.label("Y:"); ui.add(egui::DragValue::new(&mut kf.value.pos[1]).range(-2.0..=3.0).speed(0.005));
         });
-        ui.add(egui::Slider::new(&mut kf.value.scale, 0.05..=5.0).text("Scale").logarithmic(true));
         ui.add(
             egui::Slider::new(&mut kf.value.rotation_deg, -180.0..=180.0)
                 .text("Rotation")
@@ -1170,7 +1094,9 @@ fn inspector_text_overlay(
         }
     });
 
-    action
+    // Layer/z-index actions are no longer exposed from the inspector — the
+    // timeline track row order alone determines stacking.
+    None
 }
 
 const COMMON_FONTS: &[&str] = &[
@@ -1188,6 +1114,121 @@ const COMMON_FONTS: &[&str] = &[
     "Georgia",
 ];
 
+
+/// Inspector for the render frame (output area). Exposes position,
+/// rotation, and size in world pixels just like any other element.
+fn inspector_render_frame(ui: &mut egui::Ui, state: &mut EditorState) {
+    let rf = &mut state.scene.render_frame;
+    let [rw, rh] = rf.resolution;
+
+    ui.label(
+        RichText::new("Render Frame")
+            .strong()
+            .size(14.0)
+            .color(Color32::from_rgb(255, 120, 120)),
+    );
+    ui.add_space(2.0);
+    ui.label(
+        RichText::new("The output region. Move/resize/rotate it like any element.")
+            .size(10.0)
+            .color(COL_TEXT_DIM),
+    );
+    ui.add_space(8.0);
+
+    if let Some(kf) = rf.layout.first_mut() {
+        // ─── Position (world pixels) ────────────────────────────
+        ui.horizontal(|ui| {
+            ui.label("X:");
+            ui.add(egui::DragValue::new(&mut kf.value.pos.x).speed(0.5));
+            ui.label("Y:");
+            ui.add(egui::DragValue::new(&mut kf.value.pos.y).speed(0.5));
+        });
+        ui.add_space(4.0);
+
+        // ─── Size (width × height in world pixels) ──────────────
+        // The frame's world extent = resolution / zoom. Editing the
+        // width here updates `zoom` so the displayed resolution stays
+        // fixed. The height field stays in lock-step with the aspect
+        // ratio of the output resolution (no independent height — the
+        // output resolution dictates the aspect).
+        let zoom_clamped = kf.value.zoom.max(0.0001);
+        let mut world_w = rw as f32 / zoom_clamped;
+        let mut world_h = rh as f32 / zoom_clamped;
+        let aspect = (rw as f32 / rh.max(1) as f32).max(0.0001);
+
+        ui.horizontal(|ui| {
+            ui.label("W:");
+            if ui
+                .add(egui::DragValue::new(&mut world_w).range(8.0..=200_000.0).speed(0.5))
+                .changed()
+            {
+                kf.value.zoom = (rw as f32 / world_w.max(1.0)).clamp(0.001, 1000.0);
+            }
+            ui.label("H:");
+            if ui
+                .add(egui::DragValue::new(&mut world_h).range(8.0..=200_000.0).speed(0.5))
+                .changed()
+            {
+                let new_w = world_h * aspect;
+                kf.value.zoom = (rw as f32 / new_w.max(1.0)).clamp(0.001, 1000.0);
+            }
+        });
+        ui.label(
+            RichText::new(format!("aspect locked to {}\u{00D7}{} output", rw, rh))
+                .size(10.0)
+                .color(COL_TEXT_DIM),
+        );
+        ui.add_space(4.0);
+
+        // ─── Rotation ────────────────────────────────────────────
+        ui.add(
+            egui::Slider::new(&mut kf.value.rotation_deg, -180.0..=180.0)
+                .text("Rotation")
+                .step_by(0.1)
+                .fixed_decimals(1)
+                .smart_aim(false),
+        );
+        ui.add_space(4.0);
+
+        // ─── Zoom (advanced — equivalent to width / output) ─────
+        ui.add(
+            egui::Slider::new(&mut kf.value.zoom, 0.05..=10.0)
+                .text("Zoom")
+                .logarithmic(true),
+        );
+    } else {
+        ui.label(
+            RichText::new("Render frame has no keyframes.")
+                .italics()
+                .color(COL_TEXT_DIM),
+        );
+    }
+
+    ui.add_space(8.0);
+    ui.separator();
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new("Output resolution")
+            .size(11.0)
+            .strong()
+            .color(Color32::from_rgb(180, 180, 220)),
+    );
+    ui.horizontal(|ui| {
+        let mut w = rw;
+        let mut h = rh;
+        ui.label("W:");
+        let cw = ui
+            .add(egui::DragValue::new(&mut w).range(64..=8192))
+            .changed();
+        ui.label("H:");
+        let ch = ui
+            .add(egui::DragValue::new(&mut h).range(64..=8192))
+            .changed();
+        if cw || ch {
+            rf.resolution = [w, h];
+        }
+    });
+}
 
 fn inspector_background(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
     let b = &mut state.scene.backgrounds[i];

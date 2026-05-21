@@ -1405,12 +1405,19 @@ impl eframe::App for App {
 
             // Wrap when the playhead reaches the end of the longest layer
             // (which `panels::timeline()` keeps in sync with `output.duration`).
-            // No "+1 second" buffer — once the last clip finishes we restart
-            // immediately so loop playback doesn't sit on dead air.
+            // The loop button now governs this: when loop_mode is OFF the
+            // playhead stops at the end (and playback is paused) instead of
+            // restarting; when ON it wraps to 0 (or to the loop region start
+            // handled above).
             if self.state.playhead >= self.state.scene.output.duration
                 || self.state.playhead < 0.0
             {
-                self.state.playhead = 0.0;
+                if self.state.loop_mode {
+                    self.state.playhead = 0.0;
+                } else {
+                    self.state.playhead = self.state.scene.output.duration;
+                    self.state.playing = false;
+                }
             }
             // Repaint at the scene's output FPS (capped) so we don't burn
             // CPU/GPU at 120+ Hz when the output is e.g. 30 fps.
