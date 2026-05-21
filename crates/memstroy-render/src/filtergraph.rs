@@ -60,8 +60,11 @@ impl<'a> FilterGraphBuilder<'a> {
     pub fn build(&mut self) -> Result<()> {
         self.emit_base_canvas();
         self.emit_backgrounds()?;
+        // Text overlays explicitly placed UNDER the actors render first.
+        self.emit_overlays_filtered(true)?;
         self.emit_actors()?;
-        self.emit_overlays()?;
+        // Everything else (image/video overlays + text on top) renders after.
+        self.emit_overlays_filtered(false)?;
         self.emit_camera()?;
         self.emit_audio()?;
         Ok(())
@@ -421,10 +424,47 @@ impl<'a> FilterGraphBuilder<'a> {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn emit_overlays(&mut self) -> Result<()> {
+        // Legacy single-pass emitter, kept for any callers; emits all overlays
+        // in scene order regardless of `behind_actors`.
         let [w, h] = self.scene.output.resolution;
         for ov in &self.scene.overlays {
             match ov {
+                Overlay::Text(t) => self.emit_text(t, w, h)?,
+                Overlay::Image(i) => self.emit_image_overlay(i, w, h)?,
+                Overlay::Video(v) => self.emit_video_overlay(v, w, h)?,
+            }
+        }
+        Ok(())
+    }
+
+    /// Emit overlays in z-order. `under_actors=true` selects only text overlays
+    /// flagged with `behind_actors`; otherwise emits everything else.
+    fn emit_overlays_filtered(&mut self, under_actors: bool) -> Result<()> {
+        let [w, h] = self.scene.output.resolution;
+        // Collect indices with their effective z and a stable scene-order tie.
+        let mut indexed: Vec<(usize, i32)> = self.scene.overlays.iter().enumerate()
+            .filter(|(_, ov)| {
+                match ov {
+                    Overlay::Text(t) => t.behind_actors == under_actors,
+                    // Image/video overlays are always above actors.
+                    _ => !under_actors,
+                }
+            })
+            .map(|(i, ov)| {
+                let z = match ov {
+                    Overlay::Text(t) => t.z_index,
+                    _ => 100,
+                };
+                (i, z)
+            })
+            .collect();
+        // Stable sort by z asc; FFmpeg overlays stack later=on-top so this
+        // matches the canvas rendering order.
+        indexed.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+        for (idx, _) in indexed {
+            match &self.scene.overlays[idx] {
                 Overlay::Text(t) => self.emit_text(t, w, h)?,
                 Overlay::Image(i) => self.emit_image_overlay(i, w, h)?,
                 Overlay::Video(v) => self.emit_video_overlay(v, w, h)?,
@@ -456,13 +496,43 @@ impl<'a> FilterGraphBuilder<'a> {
             let p = font_path.to_string_lossy().replace(':', "\\:");
             params.push_str(&format!(":fontfile='{}'", p));
         }
+        // Background plate. ffmpeg drawtext doesn't support rounded corners or
+        // gradients, so we approximate: Solid → boxcolor with opacity; Gradient
+        // → average of the two colors; OutlineOnly → transparent fill plus
+        // bordercolor; None → no plate.
         if let Some(box_color) = style.box_color {
-            let bc = format!(
-                "0x{:02X}{:02X}{:02X}@1",
-                box_color[0], box_color[1], box_color[2]
-            );
-            params.push_str(&format!(":box=1:boxcolor={}:boxborderw={}", bc, style.box_padding));
+            let opacity = style.box_opacity.clamp(0.0, 1.0);
+            match style.box_kind {
+                TextBoxKind::None => {}
+                TextBoxKind::Solid => {
+                    let bc = format!(
+                        "0x{:02X}{:02X}{:02X}@{:.3}",
+                        box_color[0], box_color[1], box_color[2], opacity,
+                    );
+                    params.push_str(&format!(":box=1:boxcolor={}:boxborderw={}", bc, style.box_padding));
+                }
+                TextBoxKind::Gradient => {
+                    // Approximate by averaging the two stops.
+                    let end = style.box_gradient_end.unwrap_or(box_color);
+                    let avg = [
+                        ((box_color[0] as u16 + end[0] as u16) / 2) as u8,
+                        ((box_color[1] as u16 + end[1] as u16) / 2) as u8,
+                        ((box_color[2] as u16 + end[2] as u16) / 2) as u8,
+                    ];
+                    let bc = format!(
+                        "0x{:02X}{:02X}{:02X}@{:.3}",
+                        avg[0], avg[1], avg[2], opacity,
+                    );
+                    params.push_str(&format!(":box=1:boxcolor={}:boxborderw={}", bc, style.box_padding));
+                }
+                TextBoxKind::OutlineOnly => {
+                    // No fill — ffmpeg drawtext can't really do this directly;
+                    // we set boxcolor transparent and use the outline border.
+                    params.push_str(&format!(":box=1:boxcolor=black@0:boxborderw={}", style.box_padding));
+                }
+            }
         }
+        // Glyph outline.
         if let Some(o) = style.outline {
             let oc = format!("0x{:02X}{:02X}{:02X}", o[0], o[1], o[2]);
             params.push_str(&format!(":bordercolor={}:borderw={}", oc, style.outline_width));

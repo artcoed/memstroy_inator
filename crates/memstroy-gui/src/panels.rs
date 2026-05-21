@@ -593,58 +593,340 @@ fn transition_combo(ui: &mut egui::Ui, id: &str, t: &mut Transition) {
 
 fn inspector_overlay(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
     let duration = state.scene.output.duration;
-    let ov = &mut state.scene.overlays[i];
+    let overlay_count = state.scene.overlays.len();
+    let mut text_action: Option<TextAction> = None;
 
-    match ov {
-        Overlay::Text(t) => {
-            ui.label(RichText::new(format!("Text: {}", t.id)).strong().size(14.0).color(COL_CLIP_OVERLAY));
-            ui.add_space(4.0);
-            ui.text_edit_multiline(&mut t.text);
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.label("In:");
-                ui.add(egui::DragValue::new(&mut t.t_in).range(0.0..=duration).speed(0.02).suffix("s"));
-                ui.label("Out:");
-                ui.add(egui::DragValue::new(&mut t.t_out).range(0.0..=duration).speed(0.02).suffix("s"));
-            });
-            ui.add(egui::Slider::new(&mut t.style.font_size, 16.0..=512.0).text("Font Size"));
-            ui.horizontal(|ui| { ui.label("Color:"); color_edit_u8(ui, &mut t.style.color); });
-            let mut has_box = t.style.box_color.is_some();
-            ui.checkbox(&mut has_box, "Background plate");
-            if has_box && t.style.box_color.is_none() { t.style.box_color = Some([255, 255, 255]); }
-            if !has_box { t.style.box_color = None; }
-        }
-        Overlay::Image(im) => {
-            ui.label(RichText::new(format!("Image: {}", im.id)).strong().size(14.0).color(COL_CLIP_OVERLAY));
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.label("In:");
-                ui.add(egui::DragValue::new(&mut im.t_in).range(0.0..=duration).speed(0.02).suffix("s"));
-                ui.label("Out:");
-                ui.add(egui::DragValue::new(&mut im.t_out).range(0.0..=duration).speed(0.02).suffix("s"));
-            });
-            if let Some(kf) = im.layout.first_mut() {
+    {
+        let ov = &mut state.scene.overlays[i];
+
+        match ov {
+            Overlay::Text(t) => {
+                text_action = inspector_text_overlay(ui, t, i, overlay_count, duration);
+            }
+            Overlay::Image(im) => {
+                ui.label(RichText::new(format!("Image: {}", im.id)).strong().size(14.0).color(COL_CLIP_OVERLAY));
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    ui.label("X:"); ui.add(egui::DragValue::new(&mut kf.value.pos[0]).speed(0.005));
-                    ui.label("Y:"); ui.add(egui::DragValue::new(&mut kf.value.pos[1]).speed(0.005));
+                    ui.label("In:");
+                    ui.add(egui::DragValue::new(&mut im.t_in).range(0.0..=duration).speed(0.02).suffix("s"));
+                    ui.label("Out:");
+                    ui.add(egui::DragValue::new(&mut im.t_out).range(0.0..=duration).speed(0.02).suffix("s"));
                 });
-                ui.add(egui::Slider::new(&mut kf.value.scale, 0.05..=5.0).text("Scale").logarithmic(true));
-                ui.add(egui::Slider::new(&mut kf.value.opacity, 0.0..=1.0).text("Opacity"));
+                if let Some(kf) = im.layout.first_mut() {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label("X:"); ui.add(egui::DragValue::new(&mut kf.value.pos[0]).speed(0.005));
+                        ui.label("Y:"); ui.add(egui::DragValue::new(&mut kf.value.pos[1]).speed(0.005));
+                    });
+                    ui.add(egui::Slider::new(&mut kf.value.scale, 0.05..=5.0).text("Scale").logarithmic(true));
+                    ui.add(egui::Slider::new(&mut kf.value.opacity, 0.0..=1.0).text("Opacity"));
+                }
+            }
+            Overlay::Video(v) => {
+                ui.label(RichText::new(format!("Video: {}", v.id)).strong().size(14.0).color(COL_CLIP_OVERLAY));
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("In:");
+                    ui.add(egui::DragValue::new(&mut v.t_in).range(0.0..=duration).speed(0.02).suffix("s"));
+                    ui.label("Out:");
+                    ui.add(egui::DragValue::new(&mut v.t_out).range(0.0..=duration).speed(0.02).suffix("s"));
+                });
             }
         }
-        Overlay::Video(v) => {
-            ui.label(RichText::new(format!("Video: {}", v.id)).strong().size(14.0).color(COL_CLIP_OVERLAY));
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.label("In:");
-                ui.add(egui::DragValue::new(&mut v.t_in).range(0.0..=duration).speed(0.02).suffix("s"));
-                ui.label("Out:");
-                ui.add(egui::DragValue::new(&mut v.t_out).range(0.0..=duration).speed(0.02).suffix("s"));
-            });
+    }
+
+    if let Some(action) = text_action {
+        apply_text_action(state, i, action);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TextAction {
+    /// Bump z_index by +1 (and swap with a neighbor if needed for visual order).
+    LayerUp,
+    /// Bump z_index by -1.
+    LayerDown,
+    /// Set z_index to (max+1) of all overlays.
+    ToFront,
+    /// Set z_index to (min-1) of all overlays.
+    ToBack,
+    /// Delete this overlay.
+    Delete,
+}
+
+fn apply_text_action(state: &mut EditorState, i: usize, action: TextAction) {
+    if i >= state.scene.overlays.len() {
+        return;
+    }
+    match action {
+        TextAction::LayerUp => {
+            if let Overlay::Text(t) = &mut state.scene.overlays[i] {
+                t.z_index = t.z_index.saturating_add(1);
+            }
+        }
+        TextAction::LayerDown => {
+            if let Overlay::Text(t) = &mut state.scene.overlays[i] {
+                t.z_index = t.z_index.saturating_sub(1);
+            }
+        }
+        TextAction::ToFront => {
+            let max_z = state.scene.overlays.iter().filter_map(|o| match o {
+                Overlay::Text(t) => Some(t.z_index),
+                _ => None,
+            }).max().unwrap_or(100);
+            if let Overlay::Text(t) = &mut state.scene.overlays[i] {
+                t.z_index = max_z.saturating_add(1);
+            }
+        }
+        TextAction::ToBack => {
+            let min_z = state.scene.overlays.iter().filter_map(|o| match o {
+                Overlay::Text(t) => Some(t.z_index),
+                _ => None,
+            }).min().unwrap_or(0);
+            if let Overlay::Text(t) = &mut state.scene.overlays[i] {
+                t.z_index = min_z.saturating_sub(1);
+            }
+        }
+        TextAction::Delete => {
+            state.scene.overlays.remove(i);
+            state.selection = Selection::None;
+            state.status = "\u{1F5D1} Text overlay deleted.".into();
         }
     }
 }
+
+fn inspector_text_overlay(
+    ui: &mut egui::Ui,
+    t: &mut TextOverlay,
+    _idx: usize,
+    _total: usize,
+    duration: f32,
+) -> Option<TextAction> {
+    let mut action: Option<TextAction> = None;
+
+    // Header
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(format!("Text: {}", t.id))
+            .strong().size(14.0).color(COL_CLIP_OVERLAY));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.small_button("\u{1F5D1}").on_hover_text("Delete").clicked() {
+                action = Some(TextAction::Delete);
+            }
+        });
+    });
+    ui.add_space(2.0);
+
+    // ID
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("ID:").size(11.0).color(COL_TEXT_DIM));
+        ui.text_edit_singleline(&mut t.id);
+    });
+    ui.add_space(4.0);
+
+    // Text content
+    ui.label(RichText::new("Text:").size(11.0).strong());
+    ui.add(
+        egui::TextEdit::multiline(&mut t.text)
+            .desired_rows(2)
+            .desired_width(ui.available_width()),
+    );
+    ui.add_space(4.0);
+
+    // Timing
+    ui.horizontal(|ui| {
+        ui.label("In:");
+        ui.add(egui::DragValue::new(&mut t.t_in)
+            .range(0.0..=duration).speed(0.02).suffix("s"));
+        ui.label("Out:");
+        ui.add(egui::DragValue::new(&mut t.t_out)
+            .range(0.0..=duration).speed(0.02).suffix("s"));
+    });
+    ui.add_space(8.0);
+
+    // ─── Layer order ──────────────────────────────────────────────
+    ui.label(RichText::new("Layer").size(12.0).strong()
+        .color(Color32::from_rgb(180, 180, 220)));
+    ui.add_space(2.0);
+    ui.horizontal(|ui| {
+        if ui.small_button("\u{2B06}").on_hover_text("Bring forward").clicked() {
+            action = Some(TextAction::LayerUp);
+        }
+        if ui.small_button("\u{2B07}").on_hover_text("Send back").clicked() {
+            action = Some(TextAction::LayerDown);
+        }
+        if ui.small_button("Top").on_hover_text("Bring to front").clicked() {
+            action = Some(TextAction::ToFront);
+        }
+        if ui.small_button("Bot").on_hover_text("Send to back").clicked() {
+            action = Some(TextAction::ToBack);
+        }
+        ui.label(RichText::new(format!("z={}", t.z_index)).size(10.0).color(COL_TEXT_DIM));
+    });
+    ui.checkbox(&mut t.behind_actors, "Below actors")
+        .on_hover_text("Render this text BEHIND actors (above background, below clips)");
+    ui.add_space(8.0);
+
+    // Position from first keyframe (so it can be edited from the inspector too)
+    if let Some(kf) = t.layout.first_mut() {
+        ui.horizontal(|ui| {
+            ui.label("X:"); ui.add(egui::DragValue::new(&mut kf.value.pos[0]).range(-2.0..=3.0).speed(0.005));
+            ui.label("Y:"); ui.add(egui::DragValue::new(&mut kf.value.pos[1]).range(-2.0..=3.0).speed(0.005));
+        });
+        ui.add(egui::Slider::new(&mut kf.value.scale, 0.05..=5.0).text("Scale").logarithmic(true));
+        ui.add(egui::Slider::new(&mut kf.value.rotation_deg, -180.0..=180.0).text("Rotation"));
+        ui.add(egui::Slider::new(&mut kf.value.opacity, 0.0..=1.0).text("Opacity"));
+    }
+    ui.add_space(8.0);
+
+    // ─── Font ─────────────────────────────────────────────────────
+    egui::CollapsingHeader::new(
+        RichText::new("Font").size(12.0).strong().color(Color32::from_rgb(180, 220, 255)),
+    ).default_open(true).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label("Family:");
+            egui::ComboBox::from_id_source("text_font_family")
+                .selected_text(t.style.font.clone())
+                .show_ui(ui, |ui| {
+                    for fam in COMMON_FONTS {
+                        ui.selectable_value(&mut t.style.font, fam.to_string(), *fam);
+                    }
+                });
+            ui.add(
+                egui::TextEdit::singleline(&mut t.style.font)
+                    .desired_width(120.0)
+                    .hint_text("Family name"),
+            );
+        });
+        ui.add(egui::Slider::new(&mut t.style.font_size, 8.0..=512.0).text("Size"));
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut t.style.bold, "Bold");
+            ui.checkbox(&mut t.style.italic, "Italic");
+        });
+        ui.horizontal(|ui| {
+            ui.label("Color:");
+            color_edit_u8(ui, &mut t.style.color);
+        });
+        ui.horizontal(|ui| {
+            ui.label("Align:");
+            ui.selectable_value(&mut t.style.align, TextAlign::Left, "Left");
+            ui.selectable_value(&mut t.style.align, TextAlign::Center, "Center");
+            ui.selectable_value(&mut t.style.align, TextAlign::Right, "Right");
+        });
+    });
+    ui.add_space(4.0);
+
+    // ─── Stroke (glyph outline) ───────────────────────────────────
+    egui::CollapsingHeader::new(
+        RichText::new("Stroke").size(12.0).strong().color(Color32::from_rgb(255, 200, 120)),
+    ).default_open(true).show(ui, |ui| {
+        let mut has_outline = t.style.outline.is_some();
+        ui.checkbox(&mut has_outline, "Stroke text");
+        if has_outline && t.style.outline.is_none() {
+            t.style.outline = Some([0, 0, 0]);
+            if t.style.outline_width <= 0.0 { t.style.outline_width = 4.0; }
+        }
+        if !has_outline {
+            t.style.outline = None;
+        }
+
+        if let Some(oc) = t.style.outline.as_mut() {
+            ui.horizontal(|ui| {
+                ui.label("Color:");
+                color_edit_u8(ui, oc);
+                ui.label("Width:");
+                ui.add(egui::DragValue::new(&mut t.style.outline_width)
+                    .range(0.0..=20.0).speed(0.1));
+            });
+        }
+    });
+    ui.add_space(4.0);
+
+    // ─── Background plate ─────────────────────────────────────────
+    egui::CollapsingHeader::new(
+        RichText::new("Background plate").size(12.0).strong().color(Color32::from_rgb(180, 255, 180)),
+    ).default_open(true).show(ui, |ui| {
+        let mut has_box = t.style.box_color.is_some();
+        ui.checkbox(&mut has_box, "Enable plate");
+        if has_box && t.style.box_color.is_none() {
+            t.style.box_color = Some([255, 255, 255]);
+        }
+        if !has_box {
+            t.style.box_color = None;
+        }
+
+        if t.style.box_color.is_some() {
+            ui.horizontal(|ui| {
+                ui.label("Type:");
+                egui::ComboBox::from_id_source("text_box_kind")
+                    .selected_text(format!("{:?}", t.style.box_kind))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut t.style.box_kind, TextBoxKind::Solid, "Solid");
+                        ui.selectable_value(&mut t.style.box_kind, TextBoxKind::Gradient, "Gradient");
+                        ui.selectable_value(&mut t.style.box_kind, TextBoxKind::OutlineOnly, "Outline only");
+                        ui.selectable_value(&mut t.style.box_kind, TextBoxKind::None, "None (text only)");
+                    });
+            });
+
+            if matches!(t.style.box_kind, TextBoxKind::Solid | TextBoxKind::Gradient) {
+                if let Some(bc) = t.style.box_color.as_mut() {
+                    ui.horizontal(|ui| {
+                        ui.label("Color:"); color_edit_u8(ui, bc);
+                    });
+                }
+            }
+            if matches!(t.style.box_kind, TextBoxKind::Gradient) {
+                if t.style.box_gradient_end.is_none() {
+                    t.style.box_gradient_end = Some([60, 60, 60]);
+                }
+                if let Some(end) = t.style.box_gradient_end.as_mut() {
+                    ui.horizontal(|ui| {
+                        ui.label("Gradient end:"); color_edit_u8(ui, end);
+                    });
+                }
+            }
+
+            ui.add(egui::Slider::new(&mut t.style.box_opacity, 0.0..=1.0).text("Opacity"));
+            ui.add(egui::Slider::new(&mut t.style.box_padding, 0.0..=80.0).text("Padding"));
+            ui.add(egui::Slider::new(&mut t.style.box_corner_radius, 0.0..=80.0).text("Corner radius"));
+
+            // Plate border (independent of glyph stroke)
+            let mut has_border = t.style.box_outline_color.is_some() || t.style.box_outline_width > 0.0;
+            ui.checkbox(&mut has_border, "Plate border");
+            if has_border && t.style.box_outline_color.is_none() {
+                t.style.box_outline_color = Some([0, 0, 0]);
+            }
+            if !has_border {
+                t.style.box_outline_color = None;
+                t.style.box_outline_width = 0.0;
+            }
+            if let Some(boc) = t.style.box_outline_color.as_mut() {
+                ui.horizontal(|ui| {
+                    ui.label("Color:"); color_edit_u8(ui, boc);
+                    ui.label("Width:");
+                    ui.add(egui::DragValue::new(&mut t.style.box_outline_width)
+                        .range(0.0..=20.0).speed(0.1));
+                });
+            }
+        }
+    });
+
+    action
+}
+
+const COMMON_FONTS: &[&str] = &[
+    "DejaVuSans",
+    "DejaVuSans-Bold",
+    "Arial",
+    "Helvetica",
+    "Impact",
+    "Roboto",
+    "Times",
+    "Courier",
+    "Comic Sans MS",
+    "Verdana",
+    "Tahoma",
+    "Georgia",
+];
 
 
 fn inspector_background(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
@@ -777,6 +1059,14 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
         // Tools
         if ui.button("\u{1F5D1}").on_hover_text("Delete (Del)").clicked() { state.status = "__DELETE_SELECTED__".into(); }
         if ui.button("\u{2702}").on_hover_text("Split at playhead").clicked() { state.status = "__SPLIT_AT_PLAYHEAD__".into(); }
+
+        // Add Text tool
+        if ui.button(RichText::new("\u{1F520} +T").color(Color32::from_rgb(140, 220, 255)))
+            .on_hover_text("Add text overlay at playhead")
+            .clicked()
+        {
+            add_text_overlay(state);
+        }
 
         let razor_color = if state.razor_mode { Color32::from_rgb(255, 80, 80) } else { COL_TEXT };
         if ui.button(RichText::new("\u{1FA92}").color(razor_color)).on_hover_text("Razor tool").clicked() {
@@ -2375,6 +2665,61 @@ pub fn add_actor_from_clip(state: &mut EditorState, path: &PathBuf) {
     state.status = format!("Added: {}", id);
 }
 
+/// Add a styled text overlay at the playhead and select it.
+/// Returns the index of the new overlay.
+pub fn add_text_overlay(state: &mut EditorState) -> usize {
+    let counter = state.scene.overlays.len() + 1;
+    let id = format!("text_{}", counter);
+    let t_in = state.playhead;
+    let t_out = (t_in + 3.0).min(state.scene.output.duration.max(t_in + 0.1));
+
+    let max_z = state.scene.overlays.iter().filter_map(|o| match o {
+        Overlay::Text(t) => Some(t.z_index),
+        _ => None,
+    }).max().unwrap_or(99);
+
+    let style = TextStyle {
+        font: "DejaVuSans".into(),
+        font_size: 96.0,
+        color: [255, 255, 255],
+        box_color: Some([0, 0, 0]),
+        box_padding: 24.0,
+        bold: true,
+        italic: false,
+        outline: Some([0, 0, 0]),
+        outline_width: 4.0,
+        align: TextAlign::Center,
+        box_kind: TextBoxKind::Solid,
+        box_corner_radius: 12.0,
+        box_opacity: 0.85,
+        box_gradient_end: None,
+        box_outline_color: None,
+        box_outline_width: 0.0,
+    };
+
+    let overlay = Overlay::Text(TextOverlay {
+        id: id.clone(),
+        text: "Text".into(),
+        t_in,
+        t_out,
+        style,
+        layout: vec![Keyframe::new(0.0, OverlayState {
+            pos: [0.5, 0.5],
+            scale: 1.0,
+            rotation_deg: 0.0,
+            opacity: 1.0,
+        })],
+        z_index: max_z + 1,
+        behind_actors: false,
+    });
+
+    state.scene.overlays.push(overlay);
+    let idx = state.scene.overlays.len() - 1;
+    state.selection = Selection::Overlay(idx);
+    state.status = format!("Added text: {}", id);
+    idx
+}
+
 fn add_background_from_path(state: &mut EditorState, path: &PathBuf) {
     let id = path.file_stem().and_then(|s| s.to_str())
         .map(|s| s.to_string()).unwrap_or_else(|| format!("bg_{}", state.scene.backgrounds.len() + 1));
@@ -2473,203 +2818,6 @@ fn probe_video_duration(path: &PathBuf) -> f32 {
     {
         Ok(out) => String::from_utf8_lossy(&out.stdout).trim().parse::<f32>().unwrap_or(5.0),
         Err(_) => 5.0,
-    }
-}
-
-
-// ─── AI GENERATION PANEL ─────────────────────────────────────────────
-
-/// AI meme generation floating window.
-/// Shows prompt input, generate button, result paste area, and apply button.
-pub fn ai_generate_window(ctx: &egui::Context, state: &mut EditorState) {
-    if !state.ai_window_open {
-        return;
-    }
-
-    let mut open = state.ai_window_open;
-    egui::Window::new("AI Meme Generator")
-        .open(&mut open)
-        .resizable(true)
-        .default_width(500.0)
-        .default_height(600.0)
-        .show(ctx, |ui| {
-            ui.label(RichText::new("AI-Powered Meme Montage").size(16.0).strong()
-                .color(Color32::from_rgb(180, 120, 255)));
-            ui.add_space(4.0);
-            ui.label(RichText::new("Describe the meme you want to create. The AI will generate a montage plan.")
-                .size(11.0).color(COL_TEXT_DIM));
-            ui.add_space(8.0);
-
-            // Prompt input
-            ui.label(RichText::new("Creative Prompt:").size(12.0).strong());
-            ui.add(
-                egui::TextEdit::multiline(&mut state.ai_prompt)
-                    .desired_width(ui.available_width())
-                    .desired_rows(3)
-                    .hint_text("e.g. Сделай мем где Мелстрой бьет по столу когда видит цену биткоина")
-            );
-            ui.add_space(8.0);
-
-            // Generate button - builds ProjectInput and copies to clipboard
-            ui.horizontal(|ui| {
-                let generate_btn = egui::Button::new(
-                    RichText::new("Generate (Copy to Clipboard)").color(Color32::WHITE).size(13.0)
-                ).fill(Color32::from_rgb(100, 60, 200)).rounding(Rounding::same(6.0));
-
-                if ui.add(generate_btn).clicked() && !state.ai_prompt.is_empty() {
-                    let project_input = build_project_input(state);
-                    if let Ok(json) = serde_json::to_string_pretty(&project_input) {
-                        ui.output_mut(|o| o.copied_text = json.clone());
-                        state.status = "AI ProjectInput copied to clipboard!".into();
-                    }
-                }
-            });
-
-            ui.add_space(12.0);
-            ui.separator();
-            ui.add_space(8.0);
-
-            // Result paste area
-            ui.label(RichText::new("Paste AI Response (MontageOutput JSON):").size(12.0).strong());
-            egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
-                ui.add(
-                    egui::TextEdit::multiline(&mut state.ai_result_json)
-                        .desired_width(ui.available_width())
-                        .desired_rows(8)
-                        .hint_text("Paste the AI's JSON response here...")
-                        .code_editor()
-                );
-            });
-            ui.add_space(8.0);
-
-            // Apply button
-            ui.horizontal(|ui| {
-                let apply_btn = egui::Button::new(
-                    RichText::new("Apply to Scene").color(Color32::WHITE).size(13.0)
-                ).fill(Color32::from_rgb(50, 160, 80)).rounding(Rounding::same(6.0));
-
-                if ui.add(apply_btn).clicked() && !state.ai_result_json.is_empty() {
-                    match serde_json::from_str::<memstroy_core::MontageOutput>(&state.ai_result_json) {
-                        Ok(output) => {
-                            let clips_dir = state.clips_dir();
-                            // Save undo snapshot
-                            state.undo.push(&state.scene);
-                            output.apply_to_scene(&mut state.scene, &clips_dir);
-                            state.status = "AI montage applied to scene!".into();
-                        }
-                        Err(e) => {
-                            state.status = format!("JSON parse error: {}", e);
-                        }
-                    }
-                }
-
-                if ui.button("Clear").clicked() {
-                    state.ai_result_json.clear();
-                }
-            });
-
-            ui.add_space(8.0);
-
-            // Show AI reasoning if result was applied
-            if !state.ai_result_json.is_empty() {
-                if let Ok(output) = serde_json::from_str::<memstroy_core::MontageOutput>(&state.ai_result_json) {
-                    if !output.reasoning.is_empty() {
-                        ui.separator();
-                        ui.add_space(4.0);
-                        ui.label(RichText::new("AI Reasoning:").size(12.0).strong()
-                            .color(Color32::from_rgb(100, 200, 255)));
-                        ui.label(RichText::new(&output.reasoning).size(11.0).color(COL_TEXT_DIM));
-                    }
-                }
-            }
-        });
-    state.ai_window_open = open;
-}
-
-/// Build a ProjectInput from the current editor state.
-fn build_project_input(state: &EditorState) -> memstroy_core::ProjectInput {
-    use memstroy_core::*;
-
-    let available_clips: Vec<ClipInfo> = state.library.mellstroy_clips.iter().map(|c| {
-        ClipInfo {
-            id: format!("{}", c.id),
-            description: c.description.clone(),
-            duration: 5.0, // default estimate
-            path: c.path.display().to_string(),
-            tags: Vec::new(),
-            detected_actions: Vec::new(),
-        }
-    }).collect();
-
-    let available_backgrounds: Vec<AssetInfo> = state.library.backgrounds.iter().map(|p| {
-        AssetInfo {
-            id: p.file_stem().and_then(|s| s.to_str()).unwrap_or("bg").to_string(),
-            path: p.display().to_string(),
-            description: p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string(),
-            duration: None,
-        }
-    }).collect();
-
-    let available_props: Vec<AssetInfo> = state.library.props.iter().map(|p| {
-        AssetInfo {
-            id: p.file_stem().and_then(|s| s.to_str()).unwrap_or("prop").to_string(),
-            path: p.display().to_string(),
-            description: p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string(),
-            duration: None,
-        }
-    }).collect();
-
-    let current_scene = if !state.scene.actors.is_empty() || !state.scene.overlays.is_empty() {
-        Some(SceneSnapshot {
-            actors: state.scene.actors.iter().map(|a| {
-                let pos = a.layout.first().map(|kf| kf.value.pos).unwrap_or([0.5, 0.5]);
-                let scale = a.layout.first().map(|kf| kf.value.scale).unwrap_or(1.0);
-                ActorSnapshot {
-                    clip_id: a.id.clone(),
-                    t_in: a.t_in.unwrap_or(0.0),
-                    t_out: a.t_out.unwrap_or(state.scene.output.duration),
-                    position: pos,
-                    scale,
-                }
-            }).collect(),
-            texts: state.scene.overlays.iter().filter_map(|ov| {
-                if let Overlay::Text(t) = ov {
-                    let pos = t.layout.first().map(|kf| kf.value.pos).unwrap_or([0.5, 0.5]);
-                    Some(TextSnapshot {
-                        text: t.text.clone(),
-                        t_in: t.t_in,
-                        t_out: t.t_out,
-                        position: pos,
-                    })
-                } else {
-                    None
-                }
-            }).collect(),
-            duration: state.scene.output.duration,
-        })
-    } else {
-        None
-    };
-
-    ProjectInput {
-        prompt: state.ai_prompt.clone(),
-        available_clips,
-        available_backgrounds,
-        available_props,
-        available_audio: Vec::new(),
-        canvas: CanvasConstraints {
-            resolution: state.scene.output.resolution,
-            fps: state.scene.output.fps,
-            max_duration: 60.0,
-            target_duration: state.scene.output.duration,
-        },
-        current_scene,
-        style: StyleHints {
-            text_style: "meme_impact".to_string(),
-            pacing: "fast".to_string(),
-            use_chroma_key: true,
-            transitions: vec!["cut".to_string(), "snap".to_string()],
-        },
     }
 }
 

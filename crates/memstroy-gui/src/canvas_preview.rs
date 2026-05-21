@@ -259,6 +259,9 @@ fn draw_canvas_elements(
     // Draw backgrounds first (bottom layer)
     draw_canvas_backgrounds(painter, full_rect, state, viewport_size);
 
+    // Draw text overlays explicitly placed below the actors.
+    draw_canvas_overlays(painter, full_rect, state, viewport_size, OverlayPass::BehindActors);
+
     // Draw actors
     for (idx, actor) in state.scene.actors.iter().enumerate() {
         if !actor.visible { continue; }
@@ -340,52 +343,15 @@ fn draw_canvas_elements(
                     || (actor_cc.contrast - 1.0).abs() > 0.01
                     || (actor_cc.saturation - 1.0).abs() > 0.01;
 
-                if has_effects {
-                    // Get raw frame and apply effects on CPU
-                    if let Some(raw_img) = fc.raw_frame_at_time(local_t) {
-                        let processed = apply_preview_effects(&raw_img, actor_ck, actor_cc);
-                        // Upload processed frame to texture
-                        let options = egui::TextureOptions::LINEAR;
-                        let tex_handle = ui.ctx().load_texture(
-                            format!("actor_fx_{}", idx),
-                            processed,
-                            options,
-                        );
-                        let rotation_rad = actor_rotation.to_radians();
-                        if rotation_rad.abs() > 0.001 {
-                            let center = elem_rect.center();
-                            let hw = elem_rect.width() * 0.5;
-                            let hh = elem_rect.height() * 0.5;
-                            let cos_r = rotation_rad.cos();
-                            let sin_r = rotation_rad.sin();
-                            let corners_local = [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]];
-                            let uv_corners = [
-                                Pos2::new(0.0, 0.0), Pos2::new(1.0, 0.0),
-                                Pos2::new(1.0, 1.0), Pos2::new(0.0, 1.0),
-                            ];
-                            let mut mesh = egui::Mesh::with_texture(tex_handle.id());
-                            for ci in 0..4 {
-                                let [lx, ly] = corners_local[ci];
-                                let rx = lx * cos_r - ly * sin_r + center.x;
-                                let ry = lx * sin_r + ly * cos_r + center.y;
-                                mesh.vertices.push(egui::epaint::Vertex {
-                                    pos: Pos2::new(rx, ry),
-                                    uv: uv_corners[ci],
-                                    color: tint,
-                                });
-                            }
-                            mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
-                            painter.add(egui::Shape::mesh(mesh));
-                        } else {
-                            let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
-                            painter.image(tex_handle.id(), elem_rect, uv, tint);
-                        }
-                        frame_shown = true;
-                    }
-                } else if let Some(tex) = fc.frame_at_time(local_t, ui.ctx()) {
+                let texture = if has_effects {
+                    fc.processed_frame_at_time(local_t, actor_ck, actor_cc, ui.ctx())
+                } else {
+                    fc.frame_at_time(local_t, ui.ctx())
+                };
+
+                if let Some(tex) = texture {
                     let rotation_rad = actor_rotation.to_radians();
                     if rotation_rad.abs() > 0.001 {
-                        // Draw rotated via mesh
                         let center = elem_rect.center();
                         let hw = elem_rect.width() * 0.5;
                         let hh = elem_rect.height() * 0.5;
@@ -397,13 +363,13 @@ fn draw_canvas_elements(
                             Pos2::new(1.0, 1.0), Pos2::new(0.0, 1.0),
                         ];
                         let mut mesh = egui::Mesh::with_texture(tex.id());
-                        for i in 0..4 {
-                            let [lx, ly] = corners_local[i];
+                        for ci in 0..4 {
+                            let [lx, ly] = corners_local[ci];
                             let rx = lx * cos_r - ly * sin_r + center.x;
                             let ry = lx * sin_r + ly * cos_r + center.y;
                             mesh.vertices.push(egui::epaint::Vertex {
                                 pos: Pos2::new(rx, ry),
-                                uv: uv_corners[i],
+                                uv: uv_corners[ci],
                                 color: tint,
                             });
                         }
@@ -458,7 +424,7 @@ fn draw_canvas_elements(
     }
 
     // Draw overlays on top of actors
-    draw_canvas_overlays(painter, full_rect, state, viewport_size);
+    draw_canvas_overlays(painter, full_rect, state, viewport_size, OverlayPass::OnTop);
 }
 
 // ─── BACKGROUNDS ON CANVAS ───────────────────────────────────────────
@@ -569,33 +535,50 @@ fn draw_canvas_backgrounds(
 
 // ─── OVERLAYS ON CANVAS ──────────────────────────────────────────────
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OverlayPass {
+    /// Only text overlays flagged behind_actors=true.
+    BehindActors,
+    /// Image/video overlays + text overlays with behind_actors=false.
+    OnTop,
+}
+
 fn draw_canvas_overlays(
     painter: &egui::Painter,
     full_rect: Rect,
     state: &EditorState,
     viewport_size: [f32; 2],
+    pass: OverlayPass,
 ) {
     let t = state.playhead;
 
-    for (idx, overlay) in state.scene.overlays.iter().enumerate() {
-        let (ov_id, t_in, t_out, layout, color, type_label) = match overlay {
-            Overlay::Text(txt) => (
-                &txt.id, txt.t_in, txt.t_out, &txt.layout,
-                COL_OVERLAY_TEXT, format!("T: {}", truncate_str(&txt.text, 20)),
-            ),
-            Overlay::Image(img) => (
-                &img.id, img.t_in, img.t_out, &img.layout,
-                COL_OVERLAY_IMAGE,
-                format!("IMG: {}", img.source.file_name().and_then(|s| s.to_str()).unwrap_or("?")),
-            ),
-            Overlay::Video(vid) => (
-                &vid.id, vid.t_in, vid.t_out, &vid.layout,
-                COL_OVERLAY_VIDEO,
-                format!("VID: {}", vid.source.file_name().and_then(|s| s.to_str()).unwrap_or("?")),
-            ),
+    // Build a sorted list of overlay indices for this pass.
+    // Sort by z_index (asc), so higher z draws on top.
+    let mut order: Vec<(usize, i32)> = state.scene.overlays.iter().enumerate()
+        .filter(|(_, ov)| match (ov, pass) {
+            (Overlay::Text(t), OverlayPass::BehindActors) => t.behind_actors,
+            (Overlay::Text(t), OverlayPass::OnTop) => !t.behind_actors,
+            (_, OverlayPass::BehindActors) => false,
+            (_, OverlayPass::OnTop) => true,
+        })
+        .map(|(idx, ov)| {
+            let z = match ov {
+                Overlay::Text(t) => t.z_index,
+                _ => 100,
+            };
+            (idx, z)
+        })
+        .collect();
+    order.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+
+    for (idx, _) in order {
+        let overlay = &state.scene.overlays[idx];
+        let (t_in, t_out, layout) = match overlay {
+            Overlay::Text(txt) => (txt.t_in, txt.t_out, &txt.layout),
+            Overlay::Image(img) => (img.t_in, img.t_out, &img.layout),
+            Overlay::Video(vid) => (vid.t_in, vid.t_out, &vid.layout),
         };
 
-        // Determine display mode
         let display_mode = if t >= t_in && t <= t_out {
             DisplayMode::Active
         } else if t < t_in {
@@ -604,7 +587,6 @@ fn draw_canvas_overlays(
             DisplayMode::AfterEnd
         };
 
-        // Get position — use overlay layout (OverlayState has normalised coords)
         let sample_t = match display_mode {
             DisplayMode::Active => t - t_in,
             DisplayMode::BeforeStart => 0.0,
@@ -612,7 +594,6 @@ fn draw_canvas_overlays(
         };
         let ov_state = keyframe::sample(layout, sample_t).unwrap_or_default();
 
-        // Convert normalised coords to world pixels
         let rf = &state.scene.render_frame;
         let rf_state = sample_render_frame(rf, t);
         let [rw, rh] = rf.resolution;
@@ -625,84 +606,308 @@ fn draw_canvas_overlays(
             x: frame_tl_x + ov_state.pos[0] * world_w,
             y: frame_tl_y + ov_state.pos[1] * world_h,
         };
-
-        // Size depends on overlay type
-        let (elem_w, elem_h) = match overlay {
-            Overlay::Text(_) => (300.0 * ov_state.scale, 60.0 * ov_state.scale),
-            Overlay::Image(_) => (200.0 * ov_state.scale, 200.0 * ov_state.scale),
-            Overlay::Video(_) => (300.0 * ov_state.scale, 300.0 * 16.0 / 9.0 * ov_state.scale),
-        };
-
         let center_screen = state.canvas_viewport.world_to_screen(world_pos, viewport_size);
-        let half_w = elem_w * 0.5 * state.canvas_viewport.zoom;
-        let half_h = elem_h * 0.5 * state.canvas_viewport.zoom;
-
-        let elem_rect = Rect::from_center_size(
-            Pos2::new(full_rect.min.x + center_screen[0], full_rect.min.y + center_screen[1]),
-            Vec2::new(half_w * 2.0, half_h * 2.0),
+        let center_pos = Pos2::new(
+            full_rect.min.x + center_screen[0],
+            full_rect.min.y + center_screen[1],
         );
 
-        if !full_rect.intersects(elem_rect) { continue; }
-
-        // Draw overlay
-        let alpha = match display_mode {
-            DisplayMode::Active => 200u8,
-            _ => 100u8,
-        };
-        let fill = Color32::from_rgba_premultiplied(
-            (color.r() as u16 * 40 / 255) as u8,
-            (color.g() as u16 * 40 / 255) as u8,
-            (color.b() as u16 * 40 / 255) as u8,
-            alpha / 3,
-        );
-        painter.rect_filled(elem_rect, Rounding::same(4.0), fill);
-
-        // For text overlays, show the text content
-        if let Overlay::Text(txt) = overlay {
-            let font_size = (12.0 * state.canvas_viewport.zoom * ov_state.scale).clamp(6.0, 48.0);
-            painter.text(
-                elem_rect.center(),
-                egui::Align2::CENTER_CENTER,
-                truncate_str(&txt.text, 30),
-                egui::FontId::proportional(font_size),
-                if display_mode == DisplayMode::Active {
-                    Color32::WHITE
-                } else {
-                    Color32::from_rgb(180, 180, 180)
-                },
-            );
-        } else {
-            painter.text(
-                elem_rect.center(), egui::Align2::CENTER_CENTER,
-                &type_label, egui::FontId::proportional(10.0),
-                Color32::from_rgb(160, 160, 180),
-            );
-        }
-
-        // Border
-        let is_selected = state.selection == Selection::Overlay(idx);
-        let border_col = if is_selected { COL_SELECTED_BORDER } else { color };
-        let border_width = if is_selected { 2.0 } else { 1.0 };
-        painter.rect_stroke(elem_rect, Rounding::same(4.0), Stroke::new(border_width, border_col));
-
-        // Display mode badge
-        if display_mode != DisplayMode::Active {
-            let badge = match display_mode {
-                DisplayMode::BeforeStart => "FIRST",
-                DisplayMode::AfterEnd => "LAST",
-                _ => "",
-            };
-            painter.text(
-                Pos2::new(elem_rect.min.x + 4.0, elem_rect.min.y + 4.0),
-                egui::Align2::LEFT_TOP, badge,
-                egui::FontId::proportional(9.0),
-                Color32::from_rgb(255, 180, 80),
-            );
+        match overlay {
+            Overlay::Text(txt) => {
+                draw_text_overlay(painter, full_rect, state, idx, txt, &ov_state, center_pos, display_mode);
+            }
+            Overlay::Image(img) => {
+                let elem_w = 200.0 * ov_state.scale;
+                let elem_h = 200.0 * ov_state.scale;
+                let half_w = elem_w * 0.5 * state.canvas_viewport.zoom;
+                let half_h = elem_h * 0.5 * state.canvas_viewport.zoom;
+                let elem_rect = Rect::from_center_size(center_pos, Vec2::new(half_w * 2.0, half_h * 2.0));
+                if !full_rect.intersects(elem_rect) { continue; }
+                draw_overlay_placeholder(painter, elem_rect, COL_OVERLAY_IMAGE, idx, state,
+                    &format!("IMG: {}", img.source.file_name().and_then(|s| s.to_str()).unwrap_or("?")),
+                    display_mode);
+            }
+            Overlay::Video(vid) => {
+                let elem_w = 300.0 * ov_state.scale;
+                let elem_h = 300.0 * 16.0 / 9.0 * ov_state.scale;
+                let half_w = elem_w * 0.5 * state.canvas_viewport.zoom;
+                let half_h = elem_h * 0.5 * state.canvas_viewport.zoom;
+                let elem_rect = Rect::from_center_size(center_pos, Vec2::new(half_w * 2.0, half_h * 2.0));
+                if !full_rect.intersects(elem_rect) { continue; }
+                draw_overlay_placeholder(painter, elem_rect, COL_OVERLAY_VIDEO, idx, state,
+                    &format!("VID: {}", vid.source.file_name().and_then(|s| s.to_str()).unwrap_or("?")),
+                    display_mode);
+            }
         }
     }
 }
 
+/// Draw the placeholder rectangle (used for image/video overlays in preview).
+fn draw_overlay_placeholder(
+    painter: &egui::Painter,
+    elem_rect: Rect,
+    color: Color32,
+    idx: usize,
+    state: &EditorState,
+    label: &str,
+    display_mode: DisplayMode,
+) {
+    let alpha = match display_mode { DisplayMode::Active => 200u8, _ => 100u8 };
+    let fill = Color32::from_rgba_premultiplied(
+        (color.r() as u16 * 40 / 255) as u8,
+        (color.g() as u16 * 40 / 255) as u8,
+        (color.b() as u16 * 40 / 255) as u8,
+        alpha / 3,
+    );
+    painter.rect_filled(elem_rect, Rounding::same(4.0), fill);
+    painter.text(
+        elem_rect.center(), egui::Align2::CENTER_CENTER,
+        label, egui::FontId::proportional(10.0),
+        Color32::from_rgb(160, 160, 180),
+    );
+    let is_selected = state.selection == Selection::Overlay(idx);
+    let border_col = if is_selected { COL_SELECTED_BORDER } else { color };
+    let border_width = if is_selected { 2.0 } else { 1.0 };
+    painter.rect_stroke(elem_rect, Rounding::same(4.0), Stroke::new(border_width, border_col));
+    if display_mode != DisplayMode::Active {
+        let badge = match display_mode {
+            DisplayMode::BeforeStart => "FIRST",
+            DisplayMode::AfterEnd => "LAST",
+            _ => "",
+        };
+        painter.text(
+            Pos2::new(elem_rect.min.x + 4.0, elem_rect.min.y + 4.0),
+            egui::Align2::LEFT_TOP, badge,
+            egui::FontId::proportional(9.0),
+            Color32::from_rgb(255, 180, 80),
+        );
+    }
+}
+
+/// Render a TextOverlay on the canvas with full styling: gradient/solid plate,
+/// rounded corners, plate border, glyph stroke, alignment, opacity, italic.
+fn draw_text_overlay(
+    painter: &egui::Painter,
+    full_rect: Rect,
+    state: &EditorState,
+    idx: usize,
+    txt: &TextOverlay,
+    ov_state: &OverlayState,
+    center_pos: Pos2,
+    display_mode: DisplayMode,
+) {
+    let style = &txt.style;
+
+    // Effective font size in screen pixels = font_size * scale * canvas_zoom
+    let zoom = state.canvas_viewport.zoom;
+    let effective_size = (style.font_size * ov_state.scale * zoom).clamp(4.0, 1024.0);
+    let italic_skew = if style.italic { 0.18 } else { 0.0 };
+
+    let font_id = egui::FontId::new(effective_size,
+        if style.bold { egui::FontFamily::Proportional } else { egui::FontFamily::Proportional });
+
+    // Per-line layout: split text into lines and measure each in egui.
+    let lines: Vec<&str> = if txt.text.is_empty() { vec![" "] } else { txt.text.lines().collect() };
+    let line_h = effective_size * 1.2;
+
+    // Measure widths via font height heuristic; egui::TextStyle layout would be more
+    // exact, but for live preview the bounding box from `painter.text` is sufficient.
+    // Build galleys for each line so we can size the plate accurately.
+    let galleys: Vec<std::sync::Arc<egui::epaint::text::Galley>> = lines.iter().map(|l| {
+        let job = egui::text::LayoutJob::simple_singleline(
+            l.to_string(),
+            font_id.clone(),
+            apply_alpha(Color32::from_rgb(style.color[0], style.color[1], style.color[2]),
+                        ov_state.opacity, display_mode),
+        );
+        painter.layout_job(job)
+    }).collect();
+
+    let max_line_w = galleys.iter().map(|g| g.size().x).fold(0.0_f32, f32::max);
+    let total_h = galleys.len() as f32 * line_h;
+
+    // Padding/border in screen pixels (scaled by zoom for visual consistency)
+    let padding = (style.box_padding * zoom * ov_state.scale).max(0.0);
+    let radius = (style.box_corner_radius * zoom * ov_state.scale).max(0.0);
+    let plate_w = max_line_w + padding * 2.0;
+    let plate_h = total_h + padding * 2.0;
+
+    let plate_rect = Rect::from_center_size(center_pos, Vec2::new(plate_w, plate_h));
+
+    // Skip if completely off-screen
+    if !full_rect.intersects(plate_rect.expand(50.0)) { return; }
+
+    let alpha_factor = match display_mode { DisplayMode::Active => 1.0, _ => 0.5 };
+    let plate_opacity = style.box_opacity.clamp(0.0, 1.0) * ov_state.opacity * alpha_factor;
+
+    // ─── Plate background ────────────────────────────────────────
+    if let Some(box_color) = style.box_color {
+        let primary = Color32::from_rgba_unmultiplied(
+            box_color[0], box_color[1], box_color[2],
+            (plate_opacity * 255.0) as u8,
+        );
+
+        match style.box_kind {
+            TextBoxKind::None => {}
+            TextBoxKind::Solid => {
+                painter.rect_filled(plate_rect, Rounding::same(radius), primary);
+            }
+            TextBoxKind::Gradient => {
+                // Vertical gradient via a strip of horizontal lines.
+                let end_color_rgb = style.box_gradient_end.unwrap_or(box_color);
+                let end = Color32::from_rgba_unmultiplied(
+                    end_color_rgb[0], end_color_rgb[1], end_color_rgb[2],
+                    (plate_opacity * 255.0) as u8,
+                );
+                draw_vertical_gradient(painter, plate_rect, radius, primary, end);
+            }
+            TextBoxKind::OutlineOnly => {
+                // No fill, only border drawn below.
+            }
+        }
+
+        // Plate border
+        if style.box_outline_width > 0.0 {
+            let border_color_rgb = style.box_outline_color.unwrap_or([0, 0, 0]);
+            let border_color = Color32::from_rgba_unmultiplied(
+                border_color_rgb[0], border_color_rgb[1], border_color_rgb[2],
+                (plate_opacity * 255.0) as u8,
+            );
+            painter.rect_stroke(plate_rect, Rounding::same(radius),
+                Stroke::new(style.box_outline_width * zoom, border_color));
+        } else if matches!(style.box_kind, TextBoxKind::OutlineOnly) {
+            painter.rect_stroke(plate_rect, Rounding::same(radius),
+                Stroke::new(2.0, primary));
+        }
+    }
+
+    // ─── Glyph stroke (poor man's outline) ───────────────────────
+    let stroke_w = (style.outline_width * zoom * ov_state.scale).max(0.0);
+    let glyph_color = apply_alpha(
+        Color32::from_rgb(style.color[0], style.color[1], style.color[2]),
+        ov_state.opacity, display_mode);
+
+    // Compute starting Y for vertical centering
+    let mut y = plate_rect.center().y - total_h * 0.5 + line_h * 0.5;
+    let center_x = plate_rect.center().x;
+
+    for (li, galley) in galleys.iter().enumerate() {
+        let line_w = galley.size().x;
+        let line_x_left = match style.align {
+            TextAlign::Left => plate_rect.min.x + padding,
+            TextAlign::Right => plate_rect.max.x - padding - line_w,
+            TextAlign::Center => center_x - line_w * 0.5,
+        };
+        let pos = Pos2::new(line_x_left + italic_skew * line_h * 0.5, y - line_h * 0.5);
+
+        // Glyph outline: draw text repeatedly offset around the position.
+        if stroke_w > 0.5 {
+            if let Some(stroke_rgb) = style.outline {
+                let stroke_color = apply_alpha(
+                    Color32::from_rgb(stroke_rgb[0], stroke_rgb[1], stroke_rgb[2]),
+                    ov_state.opacity, display_mode);
+                let n_steps = 8;
+                for step in 0..n_steps {
+                    let theta = (step as f32) / (n_steps as f32) * std::f32::consts::TAU;
+                    let off = Vec2::new(theta.cos() * stroke_w, theta.sin() * stroke_w);
+                    paint_text_line(painter, pos + off, &lines[li], font_id.clone(), stroke_color, italic_skew);
+                }
+            }
+        }
+
+        paint_text_line(painter, pos, &lines[li], font_id.clone(), glyph_color, italic_skew);
+        y += line_h;
+    }
+
+    // ─── Selection border ─────────────────────────────────────────
+    let is_selected = state.selection == Selection::Overlay(idx);
+    if is_selected {
+        painter.rect_stroke(plate_rect.expand(2.0), Rounding::same(radius + 2.0),
+            Stroke::new(2.0, COL_SELECTED_BORDER));
+    } else if display_mode == DisplayMode::Active {
+        painter.rect_stroke(plate_rect, Rounding::same(radius),
+            Stroke::new(0.5, Color32::from_rgba_unmultiplied(120, 200, 140, 60)));
+    }
+
+    // Display mode badge
+    if display_mode != DisplayMode::Active {
+        let badge = match display_mode {
+            DisplayMode::BeforeStart => "FIRST",
+            DisplayMode::AfterEnd => "LAST",
+            _ => "",
+        };
+        painter.text(
+            Pos2::new(plate_rect.min.x + 4.0, plate_rect.min.y + 4.0),
+            egui::Align2::LEFT_TOP, badge,
+            egui::FontId::proportional(9.0),
+            Color32::from_rgb(255, 180, 80),
+        );
+    }
+}
+
+/// Paint a single line of text (helper that ignores italic skew for now —
+/// egui can't shear text natively, so italic_skew is unused but we keep the
+/// hook for future improvement).
+fn paint_text_line(
+    painter: &egui::Painter,
+    pos: Pos2,
+    text: &str,
+    font_id: egui::FontId,
+    color: Color32,
+    _italic_skew: f32,
+) {
+    painter.text(pos, egui::Align2::LEFT_TOP, text, font_id, color);
+}
+
+/// Apply a per-state opacity factor to a base color.
+fn apply_alpha(base: Color32, ov_opacity: f32, mode: DisplayMode) -> Color32 {
+    let mode_factor = match mode { DisplayMode::Active => 1.0, _ => 0.5 };
+    let a = ((base.a() as f32) * ov_opacity * mode_factor).clamp(0.0, 255.0) as u8;
+    Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), a)
+}
+
+/// Draw a vertical gradient inside a rectangle using a strip of thin rects.
+fn draw_vertical_gradient(
+    painter: &egui::Painter,
+    rect: Rect,
+    radius: f32,
+    top: Color32,
+    bottom: Color32,
+) {
+    let n_strips = 24usize;
+    let h = rect.height();
+    if h <= 0.0 { return; }
+    let strip_h = h / n_strips as f32;
+    for i in 0..n_strips {
+        let t = (i as f32 + 0.5) / n_strips as f32;
+        let r = lerp_u8(top.r(), bottom.r(), t);
+        let g = lerp_u8(top.g(), bottom.g(), t);
+        let b = lerp_u8(top.b(), bottom.b(), t);
+        let a = lerp_u8(top.a(), bottom.a(), t);
+        let c = Color32::from_rgba_unmultiplied(r, g, b, a);
+        let strip = Rect::from_min_max(
+            Pos2::new(rect.min.x, rect.min.y + i as f32 * strip_h),
+            Pos2::new(rect.max.x, rect.min.y + (i as f32 + 1.0) * strip_h),
+        );
+        // Apply rounding only to top and bottom strips.
+        let rounding = if i == 0 {
+            Rounding { nw: radius, ne: radius, sw: 0.0, se: 0.0 }
+        } else if i == n_strips - 1 {
+            Rounding { nw: 0.0, ne: 0.0, sw: radius, se: radius }
+        } else {
+            Rounding::ZERO
+        };
+        painter.rect_filled(strip, rounding, c);
+    }
+}
+
+fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
+    let t = t.clamp(0.0, 1.0);
+    ((a as f32) * (1.0 - t) + (b as f32) * t).clamp(0.0, 255.0) as u8
+}
+
 /// Helper: truncate a string to max_chars.
+#[allow(dead_code)]
 fn truncate_str(s: &str, max_chars: usize) -> &str {
     if s.len() <= max_chars { return s; }
     let mut end = max_chars;
@@ -758,7 +963,15 @@ fn get_element_world_pos(
 }
 
 
-// ─── SELECTION GIZMO ─────────────────────────────────────────────────
+// ─── SELECTION & DRAG STATE MACHINE ──────────────────────────────────
+//
+// All canvas interaction is routed through this single handler. The active
+// drag mode is captured *once* at `drag_started()` (so the origin stays
+// stable) and applied incrementally on every frame the pointer is held.
+
+const ELEM_HANDLE_SIZE: f32 = 7.0;
+const RF_HANDLE_SIZE: f32 = 8.0;
+const RF_CENTER_RADIUS: f32 = 8.0;
 
 fn draw_selection_gizmo(
     ui: &mut egui::Ui,
@@ -768,58 +981,188 @@ fn draw_selection_gizmo(
     state: &mut EditorState,
     viewport_size: [f32; 2],
 ) {
-    if state.canvas_panning { return; }
+    if state.canvas_panning {
+        // While panning, only draw selection visuals (no input).
+        draw_selection_handles(painter, full_rect, state, viewport_size);
+        return;
+    }
 
-    // ── Render frame drag handles ──
-    draw_render_frame_handles(ui, painter, response, full_rect, state, viewport_size);
+    // Drag state machine
+    if response.drag_started() {
+        if let Some(start) = response.interact_pointer_pos() {
+            let local = [start.x - full_rect.min.x, start.y - full_rect.min.y];
+            let world = state.canvas_viewport.screen_to_world(local, viewport_size);
+            state.canvas_drag.start_screen = local;
+            state.canvas_drag.mode = decide_drag_mode(state, full_rect, viewport_size, start, world);
+        }
+    } else if response.drag_stopped() || !response.dragged() {
+        if !response.dragged() && state.canvas_drag.mode != crate::state::CanvasDragMode::None {
+            state.canvas_drag.mode = crate::state::CanvasDragMode::None;
+        }
+    }
 
-    // ── Draw resize handles on selected element ──
-    draw_element_resize_handles(ui, painter, response, full_rect, state, viewport_size);
+    if response.dragged() {
+        if let Some(cur) = response.interact_pointer_pos() {
+            let local = [cur.x - full_rect.min.x, cur.y - full_rect.min.y];
+            apply_drag(state, full_rect, viewport_size, cur, local);
+        }
+    }
 
-    // Handle drag to move selected element on canvas.
-    // Only move if the drag started ON the selected element (not on empty canvas).
-    if response.dragged() && !state.canvas_panning {
-        let delta = response.drag_delta();
-        let world_dx = delta.x / state.canvas_viewport.zoom;
-        let world_dy = delta.y / state.canvas_viewport.zoom;
-
-        // Verify drag originated on the selected element
-        let drag_on_element = if let Some(origin) = response.interact_pointer_pos() {
-            let ox = origin.x - delta.x;
-            let oy = origin.y - delta.y;
-            let local = [ox - full_rect.min.x, oy - full_rect.min.y];
+    // ── Click to select (egui distinguishes click from drag automatically) ──
+    if response.clicked() && state.canvas_drag.mode == crate::state::CanvasDragMode::None {
+        if let Some(mouse) = response.interact_pointer_pos() {
+            let local = [mouse.x - full_rect.min.x, mouse.y - full_rect.min.y];
             let click_world = state.canvas_viewport.screen_to_world(local, viewport_size);
-            is_point_on_selection(state, click_world)
-        } else {
-            false
-        };
+            try_select_at(state, click_world);
+        }
+    }
 
-        if drag_on_element {
-            match state.selection {
-            Selection::Actor(idx) if idx < state.scene.actors.len() => {
-                let actor_id = state.scene.actors[idx].id.clone();
+    // ── Ctrl+scroll to scale the selected element ──
+    if response.hovered() && !state.canvas_panning {
+        let ctrl = ui.input(|i| i.modifiers.ctrl);
+        let scroll_y = ui.input(|i| i.smooth_scroll_delta.y);
+        if ctrl && scroll_y.abs() > 0.1 {
+            let scale_delta = scroll_y * 0.002;
+            apply_scale_delta(state, scale_delta);
+        }
+    }
+
+    // Update cursor based on what's under the pointer (only when not dragging).
+    if response.hovered() && !response.dragged() {
+        if let Some(hover) = ui.input(|i| i.pointer.hover_pos()) {
+            update_hover_cursor(ui, state, full_rect, viewport_size, hover);
+        }
+    }
+
+    // ── Draw handles (visual only) ──
+    draw_selection_handles(painter, full_rect, state, viewport_size);
+}
+
+/// Decide which drag mode to enter based on what was clicked.
+fn decide_drag_mode(
+    state: &EditorState,
+    full_rect: Rect,
+    viewport_size: [f32; 2],
+    start: Pos2,
+    world: WorldPos,
+) -> crate::state::CanvasDragMode {
+    use crate::state::CanvasDragMode;
+
+    // 1. If a selected element is present and the click is on one of its corner
+    //    handles → ResizeSelection.
+    if let Some(elem_rect) = selected_element_screen_rect(state, full_rect, viewport_size) {
+        let corners = [
+            elem_rect.left_top(), elem_rect.right_top(),
+            elem_rect.left_bottom(), elem_rect.right_bottom(),
+        ];
+        for corner in &corners {
+            if (start - *corner).length() < ELEM_HANDLE_SIZE * 2.5 {
+                let initial_scale = current_selection_scale(state).unwrap_or(1.0);
+                let anchor = elem_rect.center();
+                let anchor_distance = (start - anchor).length().max(1.0);
+                return CanvasDragMode::ResizeSelection { initial_scale, anchor_distance };
+            }
+        }
+        // 2. Click inside the selected element body → MoveSelection.
+        if elem_rect.contains(start) {
+            return move_selection_mode(state);
+        }
+    }
+
+    // 3. Click on the render frame's center handle → MoveRenderFrame.
+    let rf = &state.scene.render_frame;
+    let rf_state = sample_render_frame(rf, state.playhead);
+    let center_screen = state.canvas_viewport.world_to_screen(rf_state.pos, viewport_size);
+    let rf_center = Pos2::new(full_rect.min.x + center_screen[0], full_rect.min.y + center_screen[1]);
+    if (start - rf_center).length() < RF_CENTER_RADIUS * 2.0 {
+        return CanvasDragMode::MoveRenderFrame { initial_pos: [rf_state.pos.x, rf_state.pos.y] };
+    }
+
+    // 4. Click on a render frame corner → ResizeRenderFrame.
+    let rf_rect = render_frame_screen_rect(state, full_rect, viewport_size);
+    let rf_corners = [
+        rf_rect.left_top(), rf_rect.right_top(),
+        rf_rect.left_bottom(), rf_rect.right_bottom(),
+    ];
+    for corner in &rf_corners {
+        if (start - *corner).length() < RF_HANDLE_SIZE * 2.5 {
+            let anchor_distance = (start - rf_center).length().max(1.0);
+            return CanvasDragMode::ResizeRenderFrame {
+                initial_zoom: rf_state.zoom,
+                anchor_distance,
+            };
+        }
+    }
+
+    // 5. Otherwise: try to select what's under the cursor and start moving it.
+    //    We can't mutate state here, so we just sniff: is anything hit?
+    if let Some(hit) = sniff_hit(state, world) {
+        match hit {
+            Selection::Actor(_) | Selection::Overlay(_) => {
+                // The click handler will switch selection on click; but here we
+                // don't know the click vs drag yet, so we just leave the mode
+                // None and let the click handler do the selection. Movement
+                // will start on the next press.
+                return CanvasDragMode::None;
+            }
+            _ => {}
+        }
+    }
+
+    CanvasDragMode::None
+}
+
+/// Apply the active drag mode using the current pointer position.
+fn apply_drag(
+    state: &mut EditorState,
+    full_rect: Rect,
+    viewport_size: [f32; 2],
+    cur: Pos2,
+    cur_local: [f32; 2],
+) {
+    use crate::state::CanvasDragMode;
+
+    let mode = state.canvas_drag.mode;
+    let start = state.canvas_drag.start_screen;
+    let dx_screen = cur_local[0] - start[0];
+    let dy_screen = cur_local[1] - start[1];
+    let zoom = state.canvas_viewport.zoom.max(0.0001);
+    let world_dx = dx_screen / zoom;
+    let world_dy = dy_screen / zoom;
+
+    match mode {
+        CanvasDragMode::None | CanvasDragMode::Pan => {}
+
+        CanvasDragMode::MoveActorWorld { actor_idx, initial_pos } => {
+            if actor_idx < state.scene.actors.len() {
+                let actor_id = state.scene.actors[actor_idx].id.clone();
                 if let Some(cl) = state.scene.canvas_layouts.iter_mut()
                     .find(|cl| cl.element_id == actor_id)
                 {
                     if let Some(kf) = cl.keyframes.first_mut() {
-                        kf.value.pos.x += world_dx;
-                        kf.value.pos.y += world_dy;
-                    }
-                } else {
-                    // Move legacy layout
-                    if let Some(kf) = state.scene.actors[idx].layout.first_mut() {
-                        let rf = &state.scene.render_frame;
-                        let rf_state = sample_render_frame(rf, state.playhead);
-                        let [rw, rh] = rf.resolution;
-                        let world_w = rw as f32 / rf_state.zoom;
-                        let world_h = rh as f32 / rf_state.zoom;
-                        kf.value.pos[0] += world_dx / world_w;
-                        kf.value.pos[1] += world_dy / world_h;
+                        kf.value.pos.x = initial_pos[0] + world_dx;
+                        kf.value.pos.y = initial_pos[1] + world_dy;
                     }
                 }
             }
-            Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
-                // Move overlay in normalised coords
+        }
+
+        CanvasDragMode::MoveActorLegacy { actor_idx, initial_pos } => {
+            if actor_idx < state.scene.actors.len() {
+                let rf = &state.scene.render_frame;
+                let rf_state = sample_render_frame(rf, state.playhead);
+                let [rw, rh] = rf.resolution;
+                let world_w = rw as f32 / rf_state.zoom;
+                let world_h = rh as f32 / rf_state.zoom;
+                if let Some(kf) = state.scene.actors[actor_idx].layout.first_mut() {
+                    kf.value.pos[0] = initial_pos[0] + world_dx / world_w;
+                    kf.value.pos[1] = initial_pos[1] + world_dy / world_h;
+                }
+            }
+        }
+
+        CanvasDragMode::MoveOverlay { overlay_idx, initial_pos } => {
+            if overlay_idx < state.scene.overlays.len() {
                 let rf = &state.scene.render_frame;
                 let rf_state = sample_render_frame(rf, state.playhead);
                 let [rw, rh] = rf.resolution;
@@ -827,71 +1170,370 @@ fn draw_selection_gizmo(
                 let world_h = rh as f32 / rf_state.zoom;
                 let dx_norm = world_dx / world_w;
                 let dy_norm = world_dy / world_h;
-
-                match &mut state.scene.overlays[idx] {
-                    Overlay::Text(txt) => {
-                        if let Some(kf) = txt.layout.first_mut() {
-                            kf.value.pos[0] += dx_norm;
-                            kf.value.pos[1] += dy_norm;
-                        }
+                let new_pos = [initial_pos[0] + dx_norm, initial_pos[1] + dy_norm];
+                match &mut state.scene.overlays[overlay_idx] {
+                    Overlay::Text(t) => {
+                        if let Some(kf) = t.layout.first_mut() { kf.value.pos = new_pos; }
                     }
-                    Overlay::Image(img) => {
-                        if let Some(kf) = img.layout.first_mut() {
-                            kf.value.pos[0] += dx_norm;
-                            kf.value.pos[1] += dy_norm;
-                        }
+                    Overlay::Image(im) => {
+                        if let Some(kf) = im.layout.first_mut() { kf.value.pos = new_pos; }
                     }
-                    Overlay::Video(vid) => {
-                        if let Some(kf) = vid.layout.first_mut() {
-                            kf.value.pos[0] += dx_norm;
-                            kf.value.pos[1] += dy_norm;
-                        }
+                    Overlay::Video(v) => {
+                        if let Some(kf) = v.layout.first_mut() { kf.value.pos = new_pos; }
                     }
                 }
             }
-            _ => {}
         }
-        } // end if drag_on_element
-    }
 
-    // ── Scale with Ctrl+scroll on selected element ──
-    if response.hovered() && !state.canvas_panning {
-        let ctrl = ui.input(|i| i.modifiers.ctrl);
-        let scroll_y = ui.input(|i| i.smooth_scroll_delta.y);
-        if ctrl && scroll_y.abs() > 0.1 {
-            let scale_delta = scroll_y * 0.002;
-            match state.selection {
-                Selection::Actor(idx) if idx < state.scene.actors.len() => {
-                    if let Some(kf) = state.scene.actors[idx].layout.first_mut() {
-                        kf.value.scale = (kf.value.scale + scale_delta).clamp(0.05, 10.0);
-                    }
+        CanvasDragMode::ResizeSelection { initial_scale, anchor_distance } => {
+            // Anchor is the element center (in screen space).
+            let elem_center = match selected_element_screen_rect(state, full_rect, viewport_size) {
+                Some(r) => r.center(),
+                None => return,
+            };
+            let cur_dist = (cur - elem_center).length();
+            if anchor_distance > 1.0 {
+                let factor = (cur_dist / anchor_distance).max(0.05);
+                let new_scale = (initial_scale * factor).clamp(0.05, 20.0);
+                set_selection_scale(state, new_scale);
+            }
+        }
+
+        CanvasDragMode::MoveRenderFrame { initial_pos } => {
+            if let Some(kf) = state.scene.render_frame.layout.first_mut() {
+                kf.value.pos.x = initial_pos[0] + world_dx;
+                kf.value.pos.y = initial_pos[1] + world_dy;
+            }
+        }
+
+        CanvasDragMode::ResizeRenderFrame { initial_zoom, anchor_distance } => {
+            let rf_state = sample_render_frame(&state.scene.render_frame, state.playhead);
+            let center_screen = state.canvas_viewport.world_to_screen(rf_state.pos, viewport_size);
+            let rf_center = Pos2::new(
+                full_rect.min.x + center_screen[0],
+                full_rect.min.y + center_screen[1],
+            );
+            let cur_dist = (cur - rf_center).length();
+            if anchor_distance > 1.0 {
+                let factor = (cur_dist / anchor_distance).max(0.05);
+                if let Some(kf) = state.scene.render_frame.layout.first_mut() {
+                    kf.value.zoom = (initial_zoom / factor).clamp(0.1, 10.0);
                 }
-                Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
-                    match &mut state.scene.overlays[idx] {
-                        Overlay::Text(t) => { if let Some(kf) = t.layout.first_mut() { kf.value.scale = (kf.value.scale + scale_delta).clamp(0.05, 10.0); } }
-                        Overlay::Image(i) => { if let Some(kf) = i.layout.first_mut() { kf.value.scale = (kf.value.scale + scale_delta).clamp(0.05, 10.0); } }
-                        Overlay::Video(v) => { if let Some(kf) = v.layout.first_mut() { kf.value.scale = (kf.value.scale + scale_delta).clamp(0.05, 10.0); } }
-                    }
-                }
-                _ => {}
             }
         }
     }
+}
 
-    // Click to select element
-    if response.clicked() && !state.canvas_panning {
-        if let Some(mouse) = response.interact_pointer_pos() {
-            let local = [mouse.x - full_rect.min.x, mouse.y - full_rect.min.y];
-            let click_world = state.canvas_viewport.screen_to_world(local, viewport_size);
-            try_select_at(state, click_world);
+fn move_selection_mode(state: &EditorState) -> crate::state::CanvasDragMode {
+    use crate::state::CanvasDragMode;
+    match state.selection {
+        Selection::Actor(idx) if idx < state.scene.actors.len() => {
+            let actor_id = state.scene.actors[idx].id.clone();
+            if let Some(cl) = state.scene.canvas_layouts.iter().find(|cl| cl.element_id == actor_id) {
+                if let Some(kf) = cl.keyframes.first() {
+                    return CanvasDragMode::MoveActorWorld {
+                        actor_idx: idx,
+                        initial_pos: [kf.value.pos.x, kf.value.pos.y],
+                    };
+                }
+            }
+            // Fall back to legacy normalised layout.
+            let initial_pos = state.scene.actors[idx].layout.first()
+                .map(|kf| kf.value.pos).unwrap_or([0.5, 0.5]);
+            CanvasDragMode::MoveActorLegacy { actor_idx: idx, initial_pos }
+        }
+        Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
+            let initial_pos = match &state.scene.overlays[idx] {
+                Overlay::Text(t) => t.layout.first().map(|k| k.value.pos).unwrap_or([0.5, 0.5]),
+                Overlay::Image(im) => im.layout.first().map(|k| k.value.pos).unwrap_or([0.5, 0.5]),
+                Overlay::Video(v) => v.layout.first().map(|k| k.value.pos).unwrap_or([0.5, 0.5]),
+            };
+            CanvasDragMode::MoveOverlay { overlay_idx: idx, initial_pos }
+        }
+        _ => CanvasDragMode::None,
+    }
+}
+
+fn current_selection_scale(state: &EditorState) -> Option<f32> {
+    match state.selection {
+        Selection::Actor(idx) if idx < state.scene.actors.len() => {
+            state.scene.actors[idx].layout.first().map(|k| k.value.scale)
+        }
+        Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
+            match &state.scene.overlays[idx] {
+                Overlay::Text(t) => t.layout.first().map(|k| k.value.scale),
+                Overlay::Image(im) => im.layout.first().map(|k| k.value.scale),
+                Overlay::Video(v) => v.layout.first().map(|k| k.value.scale),
+            }
+        }
+        _ => None,
+    }
+}
+
+fn set_selection_scale(state: &mut EditorState, new_scale: f32) {
+    let s = new_scale.clamp(0.05, 20.0);
+    match state.selection {
+        Selection::Actor(idx) if idx < state.scene.actors.len() => {
+            if let Some(kf) = state.scene.actors[idx].layout.first_mut() {
+                kf.value.scale = s;
+            }
+        }
+        Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
+            match &mut state.scene.overlays[idx] {
+                Overlay::Text(t) => { if let Some(kf) = t.layout.first_mut() { kf.value.scale = s; } }
+                Overlay::Image(im) => { if let Some(kf) = im.layout.first_mut() { kf.value.scale = s; } }
+                Overlay::Video(v) => { if let Some(kf) = v.layout.first_mut() { kf.value.scale = s; } }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn apply_scale_delta(state: &mut EditorState, delta: f32) {
+    if let Some(s) = current_selection_scale(state) {
+        set_selection_scale(state, s + delta);
+    }
+}
+
+/// Lightweight hit sniffer (read-only) — returns what would be selected at a
+/// given world position without mutating the editor state.
+fn sniff_hit(state: &EditorState, pos: WorldPos) -> Option<Selection> {
+    let t = state.playhead;
+    let rf = &state.scene.render_frame;
+    let rf_state = sample_render_frame(rf, t);
+    let [rw, rh] = rf.resolution;
+    let world_w = rw as f32 / rf_state.zoom;
+    let world_h = rh as f32 / rf_state.zoom;
+    let frame_tl_x = rf_state.pos.x - world_w * 0.5;
+    let frame_tl_y = rf_state.pos.y - world_h * 0.5;
+
+    // Overlays first (top of z-order)
+    let mut order: Vec<(usize, i32)> = state.scene.overlays.iter().enumerate()
+        .map(|(i, ov)| {
+            let z = match ov {
+                Overlay::Text(t) => {
+                    let bias = if t.behind_actors { -1000 } else { 0 };
+                    t.z_index + bias
+                }
+                _ => 100,
+            };
+            (i, z)
+        })
+        .collect();
+    order.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+
+    for (idx, _) in order {
+        let overlay = &state.scene.overlays[idx];
+        let (t_in, t_out, layout) = match overlay {
+            Overlay::Text(txt) => (txt.t_in, txt.t_out, &txt.layout),
+            Overlay::Image(img) => (img.t_in, img.t_out, &img.layout),
+            Overlay::Video(vid) => (vid.t_in, vid.t_out, &vid.layout),
+        };
+        let sample_t = if t >= t_in && t <= t_out { t - t_in }
+            else if t < t_in { 0.0 } else { t_out - t_in };
+        let ov_state = keyframe::sample(layout, sample_t).unwrap_or_default();
+        let ov_world = WorldPos {
+            x: frame_tl_x + ov_state.pos[0] * world_w,
+            y: frame_tl_y + ov_state.pos[1] * world_h,
+        };
+        let (ew, eh) = overlay_bbox(overlay, &ov_state);
+        if pos.x >= ov_world.x - ew * 0.5 && pos.x <= ov_world.x + ew * 0.5
+            && pos.y >= ov_world.y - eh * 0.5 && pos.y <= ov_world.y + eh * 0.5
+        {
+            return Some(Selection::Overlay(idx));
         }
     }
+
+    for (idx, actor) in state.scene.actors.iter().enumerate().rev() {
+        if !actor.visible { continue; }
+        let world_pos = get_element_world_pos(state, &actor.id, &actor.layout, t);
+        let actor_scale = keyframe::sample(&actor.layout, t).map(|s| s.scale).unwrap_or(1.0);
+        let (base_w, base_h) = if let Some(fc) = state.frame_caches.get(idx) {
+            if fc.is_ready() && fc.frame_count > 0 {
+                (fc.source_width as f32, fc.source_height as f32)
+            } else { (1080.0, 1920.0) }
+        } else { (1080.0, 1920.0) };
+        let half_w = base_w * actor_scale * 0.5;
+        let half_h = base_h * actor_scale * 0.5;
+        if pos.x >= world_pos.x - half_w && pos.x <= world_pos.x + half_w
+            && pos.y >= world_pos.y - half_h && pos.y <= world_pos.y + half_h
+        {
+            return Some(Selection::Actor(idx));
+        }
+    }
+    None
+}
+
+/// Compute the screen-space rectangle of the selected element (actor/overlay).
+fn selected_element_screen_rect(
+    state: &EditorState,
+    full_rect: Rect,
+    viewport_size: [f32; 2],
+) -> Option<Rect> {
+    let t = state.playhead;
+    match state.selection {
+        Selection::Actor(idx) if idx < state.scene.actors.len() => {
+            let actor = &state.scene.actors[idx];
+            if !actor.visible { return None; }
+            let world_pos = get_element_world_pos(state, &actor.id, &actor.layout, t);
+            let actor_scale = keyframe::sample(&actor.layout, t).map(|s| s.scale).unwrap_or(1.0);
+            let (base_w, base_h) = if let Some(fc) = state.frame_caches.get(idx) {
+                if fc.is_ready() && fc.frame_count > 0 {
+                    (fc.source_width as f32, fc.source_height as f32)
+                } else { (1080.0, 1920.0) }
+            } else { (1080.0, 1920.0) };
+            let elem_width = base_w * actor_scale;
+            let elem_height = base_h * actor_scale;
+            let center_screen = state.canvas_viewport.world_to_screen(world_pos, viewport_size);
+            let half_w = elem_width * 0.5 * state.canvas_viewport.zoom;
+            let half_h = elem_height * 0.5 * state.canvas_viewport.zoom;
+            Some(Rect::from_center_size(
+                Pos2::new(full_rect.min.x + center_screen[0], full_rect.min.y + center_screen[1]),
+                Vec2::new(half_w * 2.0, half_h * 2.0),
+            ))
+        }
+        Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
+            let overlay = &state.scene.overlays[idx];
+            let (t_in, t_out, layout) = match overlay {
+                Overlay::Text(txt) => (txt.t_in, txt.t_out, &txt.layout),
+                Overlay::Image(img) => (img.t_in, img.t_out, &img.layout),
+                Overlay::Video(vid) => (vid.t_in, vid.t_out, &vid.layout),
+            };
+            let sample_t = if t >= t_in && t <= t_out { t - t_in } else { 0.0 };
+            let ov_state = keyframe::sample(layout, sample_t).unwrap_or_default();
+            let rf = &state.scene.render_frame;
+            let rf_state = sample_render_frame(rf, t);
+            let [rw, rh] = rf.resolution;
+            let world_w = rw as f32 / rf_state.zoom;
+            let world_h = rh as f32 / rf_state.zoom;
+            let frame_tl_x = rf_state.pos.x - world_w * 0.5;
+            let frame_tl_y = rf_state.pos.y - world_h * 0.5;
+            let world_pos = WorldPos {
+                x: frame_tl_x + ov_state.pos[0] * world_w,
+                y: frame_tl_y + ov_state.pos[1] * world_h,
+            };
+            let (elem_w, elem_h) = overlay_bbox(overlay, &ov_state);
+            let center_screen = state.canvas_viewport.world_to_screen(world_pos, viewport_size);
+            let half_w = elem_w * 0.5 * state.canvas_viewport.zoom;
+            let half_h = elem_h * 0.5 * state.canvas_viewport.zoom;
+            Some(Rect::from_center_size(
+                Pos2::new(full_rect.min.x + center_screen[0], full_rect.min.y + center_screen[1]),
+                Vec2::new(half_w * 2.0, half_h * 2.0),
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn render_frame_screen_rect(state: &EditorState, full_rect: Rect, viewport_size: [f32; 2]) -> Rect {
+    let rf = &state.scene.render_frame;
+    let rf_state = sample_render_frame(rf, state.playhead);
+    let [rw, rh] = rf.resolution;
+    let world_w = rw as f32 / rf_state.zoom;
+    let world_h = rh as f32 / rf_state.zoom;
+    let tl_world = WorldPos { x: rf_state.pos.x - world_w * 0.5, y: rf_state.pos.y - world_h * 0.5 };
+    let br_world = WorldPos { x: rf_state.pos.x + world_w * 0.5, y: rf_state.pos.y + world_h * 0.5 };
+    let tl = state.canvas_viewport.world_to_screen(tl_world, viewport_size);
+    let br = state.canvas_viewport.world_to_screen(br_world, viewport_size);
+    Rect::from_min_max(
+        Pos2::new(full_rect.min.x + tl[0], full_rect.min.y + tl[1]),
+        Pos2::new(full_rect.min.x + br[0], full_rect.min.y + br[1]),
+    )
+}
+
+/// Update the cursor icon based on whatever is under the pointer.
+fn update_hover_cursor(
+    ui: &egui::Ui,
+    state: &EditorState,
+    full_rect: Rect,
+    viewport_size: [f32; 2],
+    hover: Pos2,
+) {
+    if let Some(rect) = selected_element_screen_rect(state, full_rect, viewport_size) {
+        let corners = [
+            (rect.left_top(), egui::CursorIcon::ResizeNwSe),
+            (rect.right_top(), egui::CursorIcon::ResizeNeSw),
+            (rect.left_bottom(), egui::CursorIcon::ResizeNeSw),
+            (rect.right_bottom(), egui::CursorIcon::ResizeNwSe),
+        ];
+        for (corner, cursor) in &corners {
+            if (hover - *corner).length() < ELEM_HANDLE_SIZE * 2.0 {
+                ui.ctx().set_cursor_icon(*cursor);
+                return;
+            }
+        }
+        if rect.contains(hover) {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
+            return;
+        }
+    }
+
+    // Render frame center / corners
+    let rf_rect = render_frame_screen_rect(state, full_rect, viewport_size);
+    let rf_corners = [
+        rf_rect.left_top(), rf_rect.right_top(),
+        rf_rect.left_bottom(), rf_rect.right_bottom(),
+    ];
+    for c in &rf_corners {
+        if (hover - *c).length() < RF_HANDLE_SIZE * 2.0 {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeNwSe);
+            return;
+        }
+    }
+    let rf_state = sample_render_frame(&state.scene.render_frame, state.playhead);
+    let center_screen = state.canvas_viewport.world_to_screen(rf_state.pos, viewport_size);
+    let rf_center = Pos2::new(full_rect.min.x + center_screen[0], full_rect.min.y + center_screen[1]);
+    if (hover - rf_center).length() < RF_CENTER_RADIUS * 2.0 {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
+    }
+}
+
+/// Render-only: draw selection border, corner handles, and render-frame
+/// center handle. Does NOT consume any input.
+fn draw_selection_handles(
+    painter: &egui::Painter,
+    full_rect: Rect,
+    state: &EditorState,
+    viewport_size: [f32; 2],
+) {
+    // Selected element handles
+    if let Some(rect) = selected_element_screen_rect(state, full_rect, viewport_size) {
+        let handle_color = COL_SELECTED_BORDER;
+        let corners = [
+            rect.left_top(), rect.right_top(),
+            rect.left_bottom(), rect.right_bottom(),
+        ];
+        for corner in &corners {
+            let hr = Rect::from_center_size(*corner, Vec2::splat(ELEM_HANDLE_SIZE));
+            painter.rect_filled(hr, Rounding::same(2.0), handle_color);
+            painter.rect_stroke(hr, Rounding::same(2.0), Stroke::new(1.0, Color32::from_rgb(40, 40, 40)));
+        }
+        let midpoints = [
+            Pos2::new(rect.center().x, rect.min.y),
+            Pos2::new(rect.center().x, rect.max.y),
+            Pos2::new(rect.min.x, rect.center().y),
+            Pos2::new(rect.max.x, rect.center().y),
+        ];
+        for mp in &midpoints {
+            let hr = Rect::from_center_size(*mp, Vec2::new(ELEM_HANDLE_SIZE * 1.4, ELEM_HANDLE_SIZE * 0.7));
+            painter.rect_filled(hr, Rounding::same(2.0), handle_color);
+        }
+        painter.rect_stroke(rect, Rounding::same(2.0), Stroke::new(1.5, handle_color));
+    }
+
+    // Render frame center handle
+    let rf_state = sample_render_frame(&state.scene.render_frame, state.playhead);
+    let center_screen = state.canvas_viewport.world_to_screen(rf_state.pos, viewport_size);
+    let rf_center = Pos2::new(full_rect.min.x + center_screen[0], full_rect.min.y + center_screen[1]);
+    painter.circle_filled(rf_center, RF_CENTER_RADIUS, COL_RENDER_FRAME_HANDLE);
+    painter.circle_stroke(rf_center, RF_CENTER_RADIUS, Stroke::new(1.5, Color32::WHITE));
 }
 
 // ─── ELEMENT RESIZE HANDLES ──────────────────────────────────────────
 
 /// Draw resize handles (corners + edges) on the currently selected element.
 /// Dragging a handle scales the element proportionally.
+#[allow(dead_code)]
 fn draw_element_resize_handles(
     ui: &mut egui::Ui,
     painter: &egui::Painter,
@@ -948,11 +1590,7 @@ fn draw_element_resize_handles(
                 x: frame_tl_x + ov_state.pos[0] * world_w,
                 y: frame_tl_y + ov_state.pos[1] * world_h,
             };
-            let (elem_w, elem_h) = match overlay {
-                Overlay::Text(_) => (300.0 * ov_state.scale, 60.0 * ov_state.scale),
-                Overlay::Image(_) => (200.0 * ov_state.scale, 200.0 * ov_state.scale),
-                Overlay::Video(_) => (300.0 * ov_state.scale, 300.0 * 16.0 / 9.0 * ov_state.scale),
-            };
+            let (elem_w, elem_h) = overlay_bbox(overlay, &ov_state);
             let center_screen = state.canvas_viewport.world_to_screen(world_pos, viewport_size);
             let half_w = elem_w * 0.5 * state.canvas_viewport.zoom;
             let half_h = elem_h * 0.5 * state.canvas_viewport.zoom;
@@ -1051,6 +1689,7 @@ fn draw_element_resize_handles(
 
 // ─── RENDER FRAME HANDLES ────────────────────────────────────────────
 
+#[allow(dead_code)]
 fn draw_render_frame_handles(
     ui: &mut egui::Ui,
     painter: &egui::Painter,
@@ -1143,12 +1782,32 @@ fn draw_render_frame_handles(
     }
 }
 
+/// Compute the world-pixel bounding box (width, height) of an overlay.
+/// For text this approximates the dynamic plate size from text content + style.
+fn overlay_bbox(overlay: &Overlay, ov_state: &OverlayState) -> (f32, f32) {
+    match overlay {
+        Overlay::Text(txt) => {
+            let style = &txt.style;
+            let lines: Vec<&str> = if txt.text.is_empty() { vec![" "] } else { txt.text.lines().collect() };
+            let max_chars = lines.iter().map(|l| l.chars().count()).max().unwrap_or(1) as f32;
+            let font = style.font_size;
+            // ~0.55 per glyph is a reasonable heuristic for proportional fonts.
+            let text_w = (max_chars.max(1.0)) * font * 0.55;
+            let text_h = (lines.len() as f32) * font * 1.2;
+            let pad = style.box_padding * 2.0;
+            ((text_w + pad).max(40.0) * ov_state.scale,
+             (text_h + pad).max(20.0) * ov_state.scale)
+        }
+        Overlay::Image(_) => (200.0 * ov_state.scale, 200.0 * ov_state.scale),
+        Overlay::Video(_) => (300.0 * ov_state.scale, 300.0 * 16.0 / 9.0 * ov_state.scale),
+    }
+}
+
 /// Try to select an element at the given world position.
 fn try_select_at(state: &mut EditorState, pos: WorldPos) {
     let t = state.playhead;
-    let duration = state.scene.output.duration;
 
-    // Check overlays first (top layer)
+    // Render-frame anchor for converting overlay normalised coords.
     let rf = &state.scene.render_frame;
     let rf_state = sample_render_frame(rf, t);
     let [rw, rh] = rf.resolution;
@@ -1157,29 +1816,37 @@ fn try_select_at(state: &mut EditorState, pos: WorldPos) {
     let frame_tl_x = rf_state.pos.x - world_w * 0.5;
     let frame_tl_y = rf_state.pos.y - world_h * 0.5;
 
-    for (idx, overlay) in state.scene.overlays.iter().enumerate().rev() {
-        let (t_in, t_out, layout, scale_factor) = match overlay {
-            Overlay::Text(txt) => (txt.t_in, txt.t_out, &txt.layout, 1.0_f32),
-            Overlay::Image(img) => (img.t_in, img.t_out, &img.layout, 1.0_f32),
-            Overlay::Video(vid) => (vid.t_in, vid.t_out, &vid.layout, 1.0_f32),
-        };
+    // Build z-sorted overlay list and check from top to bottom (highest z first).
+    let mut order: Vec<(usize, i32)> = state.scene.overlays.iter().enumerate()
+        .map(|(i, ov)| {
+            let z = match ov {
+                Overlay::Text(t) => {
+                    let bias = if t.behind_actors { -1000 } else { 0 };
+                    t.z_index + bias
+                }
+                _ => 100,
+            };
+            (i, z)
+        })
+        .collect();
+    order.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
 
+    for (idx, _) in order {
+        let overlay = &state.scene.overlays[idx];
+        let (t_in, t_out, layout) = match overlay {
+            Overlay::Text(txt) => (txt.t_in, txt.t_out, &txt.layout),
+            Overlay::Image(img) => (img.t_in, img.t_out, &img.layout),
+            Overlay::Video(vid) => (vid.t_in, vid.t_out, &vid.layout),
+        };
         let sample_t = if t >= t_in && t <= t_out { t - t_in }
-            else if t < t_in { 0.0 }
-            else { t_out - t_in };
+            else if t < t_in { 0.0 } else { t_out - t_in };
         let ov_state = keyframe::sample(layout, sample_t).unwrap_or_default();
 
         let ov_world = WorldPos {
             x: frame_tl_x + ov_state.pos[0] * world_w,
             y: frame_tl_y + ov_state.pos[1] * world_h,
         };
-
-        let (ew, eh) = match overlay {
-            Overlay::Text(_) => (300.0 * ov_state.scale, 60.0 * ov_state.scale),
-            Overlay::Image(_) => (200.0 * ov_state.scale, 200.0 * ov_state.scale),
-            Overlay::Video(_) => (300.0 * ov_state.scale, 300.0 * 16.0 / 9.0 * ov_state.scale),
-        };
-
+        let (ew, eh) = overlay_bbox(overlay, &ov_state);
         if pos.x >= ov_world.x - ew * 0.5 && pos.x <= ov_world.x + ew * 0.5
             && pos.y >= ov_world.y - eh * 0.5 && pos.y <= ov_world.y + eh * 0.5
         {
@@ -1194,7 +1861,6 @@ fn try_select_at(state: &mut EditorState, pos: WorldPos) {
         let world_pos = get_element_world_pos(state, &actor.id, &actor.layout, t);
         let actor_scale = keyframe::sample(&actor.layout, t)
             .map(|s| s.scale).unwrap_or(1.0);
-        // Use real source dimensions from frame cache (native aspect ratio)
         let (base_w, base_h) = if let Some(fc) = state.frame_caches.get(idx) {
             if fc.is_ready() && fc.frame_count > 0 {
                 (fc.source_width as f32, fc.source_height as f32)
@@ -1202,10 +1868,8 @@ fn try_select_at(state: &mut EditorState, pos: WorldPos) {
         } else { (1080.0, 1920.0) };
         let elem_width = base_w * actor_scale;
         let elem_height = base_h * actor_scale;
-
         let half_w = elem_width * 0.5;
         let half_h = elem_height * 0.5;
-
         if pos.x >= world_pos.x - half_w && pos.x <= world_pos.x + half_w
             && pos.y >= world_pos.y - half_h && pos.y <= world_pos.y + half_h
         {
@@ -1217,11 +1881,9 @@ fn try_select_at(state: &mut EditorState, pos: WorldPos) {
     // Check backgrounds (click inside render frame area)
     for (idx, bg) in state.scene.backgrounds.iter().enumerate().rev() {
         let bg_end = bg.start + bg.duration;
-        // Background occupies the render frame area
         if pos.x >= frame_tl_x && pos.x <= frame_tl_x + world_w
             && pos.y >= frame_tl_y && pos.y <= frame_tl_y + world_h
         {
-            // Only select if this bg is active or closest to current time
             if t >= bg.start && t <= bg_end {
                 state.selection = Selection::Background(idx);
                 return;
@@ -1229,11 +1891,11 @@ fn try_select_at(state: &mut EditorState, pos: WorldPos) {
         }
     }
 
-    // Nothing hit — deselect
     state.selection = Selection::None;
 }
 
 /// Check if a world-pixel position hits the currently selected element.
+#[allow(dead_code)]
 fn is_point_on_selection(state: &EditorState, pos: WorldPos) -> bool {
     let t = state.playhead;
     match state.selection {
@@ -1273,11 +1935,7 @@ fn is_point_on_selection(state: &EditorState, pos: WorldPos) -> bool {
                 x: frame_tl_x + ov_state.pos[0] * world_w,
                 y: frame_tl_y + ov_state.pos[1] * world_h,
             };
-            let (ew, eh) = match overlay {
-                Overlay::Text(_) => (300.0 * ov_state.scale, 60.0 * ov_state.scale),
-                Overlay::Image(_) => (200.0 * ov_state.scale, 200.0 * ov_state.scale),
-                Overlay::Video(_) => (300.0 * ov_state.scale, 300.0 * 16.0 / 9.0 * ov_state.scale),
-            };
+            let (ew, eh) = overlay_bbox(overlay, &ov_state);
             pos.x >= ov_world.x - ew * 0.5 && pos.x <= ov_world.x + ew * 0.5
                 && pos.y >= ov_world.y - eh * 0.5 && pos.y <= ov_world.y + eh * 0.5
         }
@@ -1290,6 +1948,7 @@ fn is_point_on_selection(state: &EditorState, pos: WorldPos) -> bool {
 
 /// Apply chromakey and color correction to a raw frame for preview display.
 /// This is a simplified CPU-based version for real-time preview.
+#[allow(dead_code)]
 fn apply_preview_effects(
     img: &egui::ColorImage,
     ck: &memstroy_core::ChromaKeyParams,

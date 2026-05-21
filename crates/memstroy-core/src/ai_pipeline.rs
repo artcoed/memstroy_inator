@@ -315,6 +315,8 @@ impl MontageOutput {
                     rotation_deg: 0.0,
                     opacity: 1.0,
                 })],
+                z_index: 100,
+                behind_actors: false,
             });
             scene.overlays.push(overlay);
         }
