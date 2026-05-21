@@ -308,8 +308,8 @@ impl<'a> FilterGraphBuilder<'a> {
                 chain.push_str(",hflip");
             }
 
-            let (pos_x, pos_y, scale_expr) = position_and_scale_expr(&actor.layout, w, h);
-            chain.push_str(&format!(",scale=w='iw*{scale_expr}':h='ih*{scale_expr}':eval=frame"));
+            let (pos_x, pos_y, scale_expr, scale_y_expr) = position_and_scale_expr(&actor.layout, w, h);
+            chain.push_str(&format!(",scale=w='iw*{sx}':h='ih*{sy}':eval=frame", sx = scale_expr, sy = scale_y_expr));
 
             let actor_label = self.alloc_label("actor");
             self.chunks.push(format!("{chain}{out}", chain = chain, out = actor_label));
@@ -382,7 +382,7 @@ impl<'a> FilterGraphBuilder<'a> {
                 )
             } else {
                 // Fallback: position relative to actor's center
-                let (ax, ay, _) = position_and_scale_expr(&actor.layout, w, h);
+                let (ax, ay, _, _) = position_and_scale_expr(&actor.layout, w, h);
                 (
                     format!("{}+{}", ax, attachment.offset[0]),
                     format!("{}+{}", ay, attachment.offset[1]),
@@ -390,7 +390,7 @@ impl<'a> FilterGraphBuilder<'a> {
             };
 
             // Scale expression: actor_scale * attachment.scale
-            let (_, _, actor_scale) = position_and_scale_expr(&actor.layout, w, h);
+            let (_, _, actor_scale, _) = position_and_scale_expr(&actor.layout, w, h);
             let prop_scale = format!("{}*{}", actor_scale, attachment.scale);
 
             // Build filter chain for the prop
@@ -475,7 +475,7 @@ impl<'a> FilterGraphBuilder<'a> {
 
     fn emit_text(&mut self, t: &TextOverlay, w: u32, h: u32) -> Result<()> {
         let style = &t.style;
-        let (px, py, _) = position_and_scale_expr(&t.layout, w, h);
+        let (px, py, _, _) = position_and_scale_expr(&t.layout, w, h);
         let escaped = escape_drawtext(&t.text);
         let color = format!(
             "0x{:02X}{:02X}{:02X}",
@@ -563,11 +563,12 @@ impl<'a> FilterGraphBuilder<'a> {
             seek: None,
             t: None,
         });
-        let (x, y, scale_expr) = position_and_scale_expr(&ov.layout, w, h);
+        let (x, y, scale_expr, scale_y_expr) = position_and_scale_expr(&ov.layout, w, h);
         let chain = format!(
-            "[{idx}:v]format=yuva420p,scale=w='iw*{s}':h='ih*{s}':eval=frame",
+            "[{idx}:v]format=yuva420p,scale=w='iw*{sx}':h='ih*{sy}':eval=frame",
             idx = idx,
-            s = scale_expr,
+            sx = scale_expr,
+            sy = scale_y_expr,
         );
         let img_label = self.alloc_label("img");
         self.chunks.push(format!("{chain}{out}", chain = chain, out = img_label));
@@ -595,7 +596,7 @@ impl<'a> FilterGraphBuilder<'a> {
             seek: if ov.source_start > 0.0 { Some(ov.source_start) } else { None },
             t: None,
         });
-        let (x, y, scale_expr) = position_and_scale_expr(&ov.layout, w, h);
+        let (x, y, scale_expr, scale_y_expr) = position_and_scale_expr(&ov.layout, w, h);
         let mut chain = format!("[{idx}:v]format=yuva420p", idx = idx);
         if let Some(ck) = &ov.chroma_key {
             let key_hex = format!(
@@ -604,7 +605,7 @@ impl<'a> FilterGraphBuilder<'a> {
             );
             chain.push_str(&format!(",chromakey={}:{}:{}", key_hex, ck.similarity, ck.blend));
         }
-        chain.push_str(&format!(",scale=w='iw*{s}':h='ih*{s}':eval=frame", s = scale_expr));
+        chain.push_str(&format!(",scale=w='iw*{sx}':h='ih*{sy}':eval=frame", sx = scale_expr, sy = scale_y_expr));
         let v_label = self.alloc_label("vid");
         self.chunks.push(format!("{chain}{out}", chain = chain, out = v_label));
         let next = self.alloc_label("vidstack");
@@ -837,8 +838,10 @@ impl<'a> FilterGraphBuilder<'a> {
 }
 
 /// Build piecewise-linear FFmpeg expressions for x/y position (in pixels)
-/// and scale (multiplier). Falls back to safe defaults for empty tracks.
-fn position_and_scale_expr<S>(layout: &[Keyframe<S>], w: u32, h: u32) -> (String, String, String)
+/// and scale (multiplier). Returns `(x_expr, y_expr, scale_x_expr,
+/// scale_y_expr)`. The Y axis scale is `scale * scale_y` (where `scale_y`
+/// defaults to 1.0 for proportional scaling).
+fn position_and_scale_expr<S>(layout: &[Keyframe<S>], w: u32, h: u32) -> (String, String, String, String)
 where
     S: PositionedState,
 {
@@ -847,15 +850,19 @@ where
             format!("(W-w)/2"),
             format!("(H-h)/2"),
             format!("1.0"),
+            format!("1.0"),
         );
     }
     if layout.len() == 1 {
         let s = &layout[0].value;
         let pos = s.pos();
+        let sx = s.scale();
+        let sy = s.scale() * s.scale_y();
         return (
             format!("({}*W-w/2)", pos[0]),
             format!("({}*H-h/2)", pos[1]),
-            format!("{}", s.scale()),
+            format!("{}", sx),
+            format!("{}", sy),
         );
     }
     // Multi-keyframe linear: build an `if(lt(t,t1), v0+(v1-v0)*((t-t0)/(t1-t0)), if(lt(t,t2), ...))`
@@ -882,10 +889,12 @@ where
     let nx = make(|s| s.pos()[0]);
     let ny = make(|s| s.pos()[1]);
     let ns = make(|s| s.scale());
+    let nsy_factor = make(|s| s.scale_y());
     (
         format!("({}*W-w/2)", nx),
         format!("({}*H-h/2)", ny),
-        ns,
+        ns.clone(),
+        format!("({})*({})", ns, nsy_factor),
     )
 }
 
@@ -894,14 +903,17 @@ where
 trait PositionedState {
     fn pos(&self) -> [f32; 2];
     fn scale(&self) -> f32;
+    fn scale_y(&self) -> f32;
 }
 impl PositionedState for ActorState {
     fn pos(&self) -> [f32; 2] { self.pos }
     fn scale(&self) -> f32 { self.scale }
+    fn scale_y(&self) -> f32 { self.scale_y }
 }
 impl PositionedState for OverlayState {
     fn pos(&self) -> [f32; 2] { self.pos }
     fn scale(&self) -> f32 { self.scale }
+    fn scale_y(&self) -> f32 { self.scale_y }
 }
 
 /// Escape a user string for use inside a `drawtext=text='...'` arg.
@@ -956,7 +968,7 @@ fn build_anchor_position_expr(
 
     if points.is_empty() {
         // No anchor data — fall back to actor center + offset
-        let (ax, ay, _) = position_and_scale_expr(actor_layout, w, h);
+        let (ax, ay, _, _) = position_and_scale_expr(actor_layout, w, h);
         return (
             format!("{}+{}", ax, offset[0]),
             format!("{}+{}", ay, offset[1]),
@@ -975,7 +987,7 @@ fn build_anchor_position_expr(
     // For FFmpeg expressions: the overlay x/y are relative to the main canvas.
     // We'll use the actor's position expression as base and offset by the anchor delta.
 
-    let (actor_x_expr, actor_y_expr, actor_scale_expr) =
+    let (actor_x_expr, actor_y_expr, actor_scale_expr, _actor_scale_y_expr) =
         position_and_scale_expr(actor_layout, w, h);
 
     // For simplicity with many samples, we limit to at most 20 keypoints
