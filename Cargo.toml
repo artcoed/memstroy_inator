@@ -44,7 +44,19 @@ eframe = { version = "0.28", default-features = false, features = ["glow", "defa
 egui_extras = { version = "0.28", features = ["image", "all_loaders"] }
 rfd = "0.14"
 wgpu = "22"
-rodio = "0.19"
+rodio = { version = "0.19", features = [
+    # Default codecs (mp3 / vorbis / flac / wav) plus the symphonia-backed
+    # MP4 / AAC decoder so audio rips out of `*.mp4` clips automatically.
+    # Without `symphonia-isomp4` rodio bails on MP4 containers with
+    # "Unrecognized format" even when the inner stream is a standard AAC
+    # audio track — which is what most editor-imported clips look like.
+    "symphonia-isomp4",
+    "symphonia-aac",
+    "symphonia-mp3",
+    "symphonia-vorbis",
+    "symphonia-wav",
+    "symphonia-flac",
+] }
 
 # Internal crates
 memstroy-core = { path = "crates/memstroy-core" }

@@ -524,9 +524,11 @@ fn draw_canvas_elements(
                 // Apply chromakey on the raw frame data if actor has non-default settings
                 let actor_ck = &state.scene.actors[idx].chroma_key;
                 let actor_cc = &state.scene.actors[idx].color_correction;
-                let has_effects = actor_ck.similarity > 0.01 || actor_cc.brightness.abs() > 0.01
-                    || (actor_cc.contrast - 1.0).abs() > 0.01
-                    || (actor_cc.saturation - 1.0).abs() > 0.01;
+                // Bypass the (expensive) preview pipeline when both chroma
+                // and color correction are at neutral/identity. Any of the
+                // pro grade controls (lift/gamma/gain, curves) being touched
+                // also triggers the processed path.
+                let has_effects = actor_ck.similarity > 0.01 || !actor_cc.is_identity();
 
                 let texture = if has_effects {
                     fc.processed_frame_at_time(local_t, actor_ck, actor_cc, ui.ctx())
