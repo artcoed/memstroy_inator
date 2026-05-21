@@ -281,6 +281,7 @@ impl MontageOutput {
                 transition_in: crate::Transition::Cut,
                 transition_out: crate::Transition::Cut,
                 transition_duration: 0.3,
+                effects: Vec::new(),
             };
             scene.actors.push(actor);
         }
@@ -329,6 +330,7 @@ impl MontageOutput {
                 skeleton_attachment: None,
                 z_index: 100,
                 behind_actors: false,
+                effects: Vec::new(),
             });
             scene.overlays.push(overlay);
         }

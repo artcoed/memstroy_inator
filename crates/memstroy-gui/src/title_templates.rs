@@ -156,6 +156,7 @@ pub fn add_template_to_scene(
         skeleton_attachment: None,
         z_index: 100,
         behind_actors: false,
+        effects: Vec::new(),
     });
     scene.overlays.push(overlay);
     scene.overlays.len() - 1
