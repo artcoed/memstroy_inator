@@ -1032,13 +1032,6 @@ fn collect_clip_edges(state: &EditorState, exclude_actor: Option<usize>) -> Vec<
 pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     // ── Toolbar ──
     ui.horizontal(|ui| {
-        // Play/Pause
-        let play_label = if state.playing { "\u{23F8}" } else { "\u{25B6}" };
-        let play_btn = egui::Button::new(RichText::new(play_label).size(16.0).color(Color32::WHITE))
-            .fill(if state.playing { Color32::from_rgb(200, 60, 60) } else { Color32::from_rgb(50, 170, 70) })
-            .rounding(Rounding::same(6.0)).min_size(Vec2::new(32.0, 24.0));
-        if ui.add(play_btn).clicked() { state.playing = !state.playing; }
-
         ui.add(egui::DragValue::new(&mut state.playback_speed).range(0.1..=8.0).speed(0.05).prefix("x"));
 
         ui.separator();
@@ -1050,15 +1043,14 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
 
         ui.separator();
 
-        // Undo/Redo
-        if ui.add_enabled(state.undo.can_undo(), egui::Button::new("\u{21A9}").min_size(Vec2::new(24.0, 20.0))).clicked() { state.undo(); }
-        if ui.add_enabled(state.undo.can_redo(), egui::Button::new("\u{21AA}").min_size(Vec2::new(24.0, 20.0))).clicked() { state.redo(); }
-
-        ui.separator();
-
-        // Tools
-        if ui.button("\u{1F5D1}").on_hover_text("Delete (Del)").clicked() { state.status = "__DELETE_SELECTED__".into(); }
-        if ui.button("\u{2702}").on_hover_text("Split at playhead").clicked() { state.status = "__SPLIT_AT_PLAYHEAD__".into(); }
+        // Split tool — when armed, clicking on a clip cuts it at the click position.
+        let split_color = if state.split_tool_active { Color32::from_rgb(255, 80, 80) } else { COL_TEXT };
+        if ui.button(RichText::new("\u{2702}").color(split_color))
+            .on_hover_text("Split tool: click anywhere on a clip to cut it at that position")
+            .clicked()
+        {
+            state.split_tool_active = !state.split_tool_active;
+        }
 
         // Add Text tool
         if ui.button(RichText::new("\u{1F520} +T").color(Color32::from_rgb(140, 220, 255)))
@@ -1066,11 +1058,6 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             .clicked()
         {
             add_text_overlay(state);
-        }
-
-        let razor_color = if state.razor_mode { Color32::from_rgb(255, 80, 80) } else { COL_TEXT };
-        if ui.button(RichText::new("\u{1FA92}").color(razor_color)).on_hover_text("Razor tool").clicked() {
-            state.razor_mode = !state.razor_mode;
         }
 
         // Chroma Key quick-access button
@@ -1095,12 +1082,6 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
 
         ui.separator();
 
-        // Snap toggle
-        let snap_color = if state.snap_enabled { COL_ACCENT } else { COL_TEXT_DIM };
-        if ui.button(RichText::new("S").color(snap_color)).on_hover_text("Snap to grid/edges").clicked() {
-            state.snap_enabled = !state.snap_enabled;
-        }
-
         // Loop preview toggle
         let loop_color = if state.loop_mode { Color32::from_rgb(255, 180, 80) } else { COL_TEXT_DIM };
         if ui
@@ -1117,39 +1098,31 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             }
         }
 
-        // Zoom controls + track management
+        // Zoom display (read-only — adjust via scrollbar handles)
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.button("+").on_hover_text("Zoom in").clicked() {
-                state.timeline_zoom = (state.timeline_zoom * 1.3).min(500.0);
-            }
-            if ui.button("-").on_hover_text("Zoom out").clicked() {
-                state.timeline_zoom = (state.timeline_zoom / 1.3).max(20.0);
-            }
             ui.label(RichText::new(format!("{:.0}px/s", state.timeline_zoom)).size(10.0).color(COL_TEXT_DIM));
-
-            ui.separator();
-
-            // Add track buttons
-            if ui.button(RichText::new("+V").size(10.0).color(COL_CLIP_ACTOR))
-                .on_hover_text("Add video track").clicked()
-            {
-                state.add_video_track();
-                state.status = "Added video track".into();
-            }
-            if ui.button(RichText::new("+A").size(10.0).color(COL_CLIP_AUDIO))
-                .on_hover_text("Add audio track").clicked()
-            {
-                state.add_audio_track();
-                state.status = "Added audio track".into();
-            }
         });
     });
     ui.add_space(2.0);
 
-    // ── Track area: header column + scrollable tracks ──
-    let available = ui.available_size();
+    // ── Track area: explicit layout with custom scrollbars ──
+    //
+    // Layout:
+    //   ┌─ ruler (header_w | track_area_w)        ──────┐ (top)
+    //   │ ┌──────────┬──────────────────────────┬───┐ │
+    //   │ │ track    │ tracks viewport (clipped)│ V │ │
+    //   │ │ headers  │                          │ S │ │
+    //   │ │          │                          │ B │ │
+    //   │ └──────────┴──────────────────────────┴───┘ │
+    //   │           horizontal scrollbar             │
+    //   └────────────────────────────────────────────┘
     let header_width = 80.0_f32;
-    let track_area_width = (available.x - header_width - 4.0).max(100.0);
+    let v_sb_w = 14.0_f32;
+    let h_sb_h = 14.0_f32;
+    let ruler_height = 22.0_f32;
+    let total_avail = ui.available_size_before_wrap();
+    let track_area_width = (total_avail.x - header_width - v_sb_w - 6.0).max(120.0);
+    let viewport_h = (total_avail.y - ruler_height - h_sb_h - 8.0).max(60.0);
 
     // ── Auto-length: expand/shrink timeline to fit longest content ──
     {
@@ -1177,26 +1150,102 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     }
 
     let duration = state.scene.output.duration.max(0.01);
+
+    // Reserve and compute the master rect for the whole timeline area.
+    let master_size = Vec2::new(
+        header_width + track_area_width + v_sb_w + 6.0,
+        ruler_height + viewport_h + h_sb_h + 8.0,
+    );
+    let (master_rect, _master_resp) =
+        ui.allocate_exact_size(master_size, Sense::hover());
+
+    // Sub-rects.
+    let ruler_rect = egui::Rect::from_min_max(
+        egui::pos2(master_rect.min.x, master_rect.min.y),
+        egui::pos2(
+            master_rect.min.x + header_width + track_area_width + 4.0,
+            master_rect.min.y + ruler_height,
+        ),
+    );
+    let header_col_rect = egui::Rect::from_min_max(
+        egui::pos2(master_rect.min.x, master_rect.min.y + ruler_height + 2.0),
+        egui::pos2(
+            master_rect.min.x + header_width,
+            master_rect.min.y + ruler_height + 2.0 + viewport_h,
+        ),
+    );
+    let tracks_rect = egui::Rect::from_min_max(
+        egui::pos2(
+            master_rect.min.x + header_width + 2.0,
+            master_rect.min.y + ruler_height + 2.0,
+        ),
+        egui::pos2(
+            master_rect.min.x + header_width + 2.0 + track_area_width,
+            master_rect.min.y + ruler_height + 2.0 + viewport_h,
+        ),
+    );
+    let v_sb_rect = egui::Rect::from_min_max(
+        egui::pos2(
+            tracks_rect.max.x + 2.0,
+            tracks_rect.min.y,
+        ),
+        egui::pos2(
+            tracks_rect.max.x + 2.0 + v_sb_w,
+            tracks_rect.max.y,
+        ),
+    );
+    let h_sb_rect = egui::Rect::from_min_max(
+        egui::pos2(
+            tracks_rect.min.x,
+            tracks_rect.max.y + 4.0,
+        ),
+        egui::pos2(
+            tracks_rect.max.x,
+            tracks_rect.max.y + 4.0 + h_sb_h,
+        ),
+    );
+
+    // Painters.
+    let ruler_painter = ui.painter_at(ruler_rect);
+    let header_painter = ui.painter_at(header_col_rect);
+    let tracks_painter = ui.painter_at(tracks_rect);
+
+    // Background fills.
+    header_painter.rect_filled(header_col_rect, Rounding::ZERO, Color32::from_rgb(26, 26, 36));
+    tracks_painter.rect_filled(tracks_rect, Rounding::ZERO, COL_BG_TRACK);
+
     let pps = state.timeline_zoom; // pixels per second
 
-    // Handle zoom via scroll wheel on timeline area
+    // Mouse wheel inside the tracks viewport: vertical scroll (and Shift = horizontal).
     let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
-    if scroll_delta.y.abs() > 0.1 && ui.rect_contains_pointer(ui.max_rect()) {
-        if ui.input(|i| i.modifiers.ctrl) {
-            // Ctrl+scroll = zoom
-            let factor = if scroll_delta.y > 0.0 { 1.08 } else { 1.0 / 1.08 };
-            state.timeline_zoom = (state.timeline_zoom * factor).clamp(20.0, 500.0);
+    let pointer_in_viewport = ui
+        .input(|i| i.pointer.hover_pos())
+        .map(|p| tracks_rect.contains(p) || header_col_rect.contains(p))
+        .unwrap_or(false);
+    if pointer_in_viewport && scroll_delta.y.abs() > 0.1 {
+        let shift = ui.input(|i| i.modifiers.shift);
+        if shift {
+            // Shift+wheel = horizontal pan (in seconds).
+            state.timeline_scroll =
+                (state.timeline_scroll - scroll_delta.y / pps.max(1.0)).max(0.0);
         } else {
-            // Scroll = horizontal pan
-            state.timeline_scroll = (state.timeline_scroll - scroll_delta.y / pps).max(0.0);
+            // Plain wheel = vertical pan (in pixels).
+            state.timeline_v_scroll = (state.timeline_v_scroll - scroll_delta.y).max(0.0);
         }
+    }
+    if pointer_in_viewport && scroll_delta.x.abs() > 0.1 {
+        // Horizontal wheel (touchpad) = horizontal pan in seconds.
+        state.timeline_scroll =
+            (state.timeline_scroll - scroll_delta.x / pps.max(1.0)).max(0.0);
     }
 
     // ── Ruler ──
-    let ruler_height = 22.0;
-    let (ruler_rect, ruler_resp) = ui.allocate_exact_size(
-        Vec2::new(header_width + track_area_width + 4.0, ruler_height), Sense::click_and_drag());
-    let painter = ui.painter_at(ruler_rect);
+    let ruler_resp = ui.interact(
+        ruler_rect,
+        ui.make_persistent_id("timeline_ruler"),
+        Sense::click_and_drag(),
+    );
+    let painter = ruler_painter;
 
     let track_left = ruler_rect.min.x + header_width + 2.0;
     let track_right = track_left + track_area_width;
@@ -1324,266 +1373,347 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     // ── Track rows ──
     let mut to_select: Option<Selection> = None;
 
-    egui::ScrollArea::vertical().show(ui, |ui| {
-        let num_tracks = state.tracks.len();
-        for track_idx in 0..num_tracks {
-            let track = &state.tracks[track_idx];
-            let track_h = track.height;
-            let track_kind = track.kind;
-            let track_name = track.name.clone();
-            let track_muted = track.muted;
-            let track_locked = track.locked;
+    let v_zoom = state.timeline_v_zoom.max(0.1);
+    let num_tracks = state.tracks.len();
 
-            let (row_rect, _) = ui.allocate_exact_size(
-                Vec2::new(header_width + track_area_width + 4.0, track_h), Sense::hover());
-            let painter = ui.painter_at(row_rect);
+    // Total scaled height needed to fit all tracks at the current v_zoom.
+    let total_tracks_h: f32 = state
+        .tracks
+        .iter()
+        .map(|t| t.height * v_zoom)
+        .sum();
+    let max_v_scroll = (total_tracks_h - viewport_h).max(0.0);
+    state.timeline_v_scroll = state.timeline_v_scroll.max(0.0).min(max_v_scroll);
+    let v_scroll = state.timeline_v_scroll;
 
-            // Track background (alternating)
-            let bg = if track_idx % 2 == 0 { COL_BG_TRACK } else { COL_BG_TRACK_ALT };
-            painter.rect_filled(row_rect, Rounding::ZERO, bg);
+    let mut acc_y = 0.0_f32;
+    for track_idx in 0..num_tracks {
+        let track = &state.tracks[track_idx];
+        let track_h = track.height * v_zoom;
+        let track_kind = track.kind;
+        let track_name = track.name.clone();
+        let track_muted = track.muted;
+        let track_locked = track.locked;
 
-            // Header area
-            let hdr_rect = egui::Rect::from_min_size(row_rect.min, Vec2::new(header_width, track_h));
-            painter.rect_filled(hdr_rect, Rounding::ZERO, Color32::from_rgb(30, 30, 42));
-            painter.text(hdr_rect.center(), egui::Align2::CENTER_CENTER,
-                &track_name, egui::FontId::proportional(11.0),
-                if track_muted { COL_TEXT_DIM } else { COL_TEXT });
+        let row_top = tracks_rect.min.y + acc_y - v_scroll;
+        let row_bot = row_top + track_h;
+        acc_y += track_h;
 
-            // Track content area
-            let content_left = row_rect.min.x + header_width + 2.0;
-            let content_rect = egui::Rect::from_min_max(
-                egui::pos2(content_left, row_rect.min.y + 1.0),
-                egui::pos2(row_rect.max.x, row_rect.max.y - 1.0));
+        // Cull tracks fully outside the viewport.
+        if row_bot < tracks_rect.min.y - 1.0 || row_top > tracks_rect.max.y + 1.0 {
+            continue;
+        }
 
-            // Draw clips on this track
-            match track_kind {
-                TrackKind::Video => {
-                    // Draw backgrounds on track 0
-                    if track_idx == 0 {
-                        for bi in 0..state.scene.backgrounds.len() {
-                            let bg_elem = &state.scene.backgrounds[bi];
-                            let clip_start = bg_elem.start;
-                            let clip_end = bg_elem.start + bg_elem.duration;
-                            let sel = state.selection == Selection::Background(bi);
-                            if let Some(clicked) = draw_clip(ui, &painter, content_rect, &bg_elem.id,
-                                clip_start, clip_end, state.timeline_scroll, pps, track_left, track_right,
-                                COL_CLIP_BG, sel, track_h, track_locked, state.razor_mode)
-                            {
-                                if clicked < 0.0 {
-                                    let new_start = (-clicked).max(0.0);
-                                    let dur = clip_end - clip_start;
-                                    state.scene.backgrounds[bi].start = new_start;
-                                    state.scene.backgrounds[bi].duration = dur;
-                                    to_select = Some(Selection::Background(bi));
-                                } else if state.razor_mode {
-                                    to_select = Some(Selection::Background(bi));
-                                    state.playhead = clicked;
-                                    state.status = "__SPLIT_AT_PLAYHEAD__".into();
-                                } else {
-                                    to_select = Some(Selection::Background(bi));
-                                }
-                            }
-                        }
-                    }
+        let row_rect = egui::Rect::from_min_max(
+            egui::pos2(tracks_rect.min.x, row_top),
+            egui::pos2(tracks_rect.max.x, row_bot),
+        );
+        let painter = &tracks_painter;
 
-                    // Draw actors assigned to this track (by index mod video tracks)
-                    let video_tracks: Vec<usize> = (0..num_tracks).filter(|ti| state.tracks[*ti].kind == TrackKind::Video).collect();
-                    let vt_pos = video_tracks.iter().position(|t| *t == track_idx);
+        // Track background (alternating).
+        let bg = if track_idx % 2 == 0 { COL_BG_TRACK } else { COL_BG_TRACK_ALT };
+        painter.rect_filled(row_rect, Rounding::ZERO, bg);
 
-                    for ai in 0..state.scene.actors.len() {
-                        // Use explicit track assignment if set, otherwise default to first video track.
-                        // Multiple clips on the same track is allowed (free sequential placement).
-                        let assigned_track = if let Some(&assigned) = state.actor_track_assignments.get(&ai) {
-                            assigned
-                        } else {
-                            // Default: first video track for ALL actors (free placement on same track)
-                            video_tracks.first().copied().unwrap_or(0)
-                        };
-                        if assigned_track != track_idx { continue; }
+        // Track header (left column, drawn with the header painter so it
+        // isn't clipped by the tracks viewport).
+        let hdr_rect = egui::Rect::from_min_max(
+            egui::pos2(header_col_rect.min.x, row_top),
+            egui::pos2(header_col_rect.max.x, row_bot),
+        );
+        header_painter.rect_filled(hdr_rect, Rounding::ZERO, Color32::from_rgb(30, 30, 42));
+        header_painter.text(
+            hdr_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            &track_name,
+            egui::FontId::proportional(11.0),
+            if track_muted { COL_TEXT_DIM } else { COL_TEXT },
+        );
 
-                        let actor = &state.scene.actors[ai];
-                        let clip_start = actor.t_in.unwrap_or(0.0);
-                        let clip_end = actor.t_out.unwrap_or(duration);
-                        let trans_in = actor.transition_in;
-                        let trans_out = actor.transition_out;
-                        let trans_dur = actor.transition_duration;
-                        let sel = state.selection == Selection::Actor(ai);
-                        if let Some(clicked) = draw_clip(ui, &painter, content_rect, &actor.id,
+        // Track content area = the viewport sub-rect aligned to this row.
+        let content_rect = egui::Rect::from_min_max(
+            egui::pos2(tracks_rect.min.x, row_top + 1.0),
+            egui::pos2(tracks_rect.max.x, row_bot - 1.0),
+        );
+
+        // Draw clips on this track
+        match track_kind {
+            TrackKind::Video => {
+                // Draw backgrounds on track 0
+                if track_idx == 0 {
+                    for bi in 0..state.scene.backgrounds.len() {
+                        let bg_elem = &state.scene.backgrounds[bi];
+                        let clip_start = bg_elem.start;
+                        let clip_end = bg_elem.start + bg_elem.duration;
+                        let sel = state.selection == Selection::Background(bi);
+                        if let Some(clicked) = draw_clip(ui, painter, content_rect, &bg_elem.id,
                             clip_start, clip_end, state.timeline_scroll, pps, track_left, track_right,
-                            COL_CLIP_ACTOR, sel, track_h, track_locked, state.razor_mode)
+                            COL_CLIP_BG, sel, track_h, track_locked, state.split_tool_active)
                         {
-                            if clicked == f32::INFINITY {
-                                // Trim left edge: adjust t_in
-                                let dx = ui.input(|i| i.pointer.delta().x);
-                                let delta_t = dx / pps;
-                                let new_in = (clip_start + delta_t).max(0.0).min(clip_end - 0.1);
-                                state.scene.actors[ai].t_in = Some(new_in);
-                                to_select = Some(Selection::Actor(ai));
-                            } else if clicked == f32::NEG_INFINITY {
-                                // Trim right edge: adjust t_out
-                                let dx = ui.input(|i| i.pointer.delta().x);
-                                let delta_t = dx / pps;
-                                let new_out = (clip_end + delta_t).max(clip_start + 0.1);
-                                state.scene.actors[ai].t_out = Some(new_out);
-                                to_select = Some(Selection::Actor(ai));
-                            } else if clicked < 0.0 {
-                                // Drag: move the actor's time window
-                                let mut new_start = (-clicked).max(0.0);
+                            if clicked < 0.0 {
+                                let new_start = (-clicked).max(0.0);
                                 let dur = clip_end - clip_start;
-
-                                // ── Undo snapshot on drag start ──
-                                if state.timeline_drag.dragging_clip.is_none() {
-                                    state.undo.push(&state.scene);
-                                    state.timeline_drag.dragging_clip = Some(ai);
-                                }
-
-                                // ── Assign actor to current track on drag ──
-                                // When the actor is being dragged onto this track, assign it here
-                                state.actor_track_assignments.insert(ai, track_idx);
-
-                                // ── Snap-to-edges logic ──
-                                if state.snap_enabled {
-                                    let new_end = new_start + dur;
-                                    let mut snap_targets = collect_clip_edges(state, Some(ai));
-                                    snap_targets.push(state.playhead);
-                                    let threshold = 0.1;
-
-                                    let snapped_start = snap_time(new_start, &snap_targets, threshold);
-                                    let snapped_end = snap_time(new_end, &snap_targets, threshold);
-
-                                    // Prefer start snap, fall back to end snap
-                                    if (snapped_start - new_start).abs() < threshold {
-                                        new_start = snapped_start;
-                                    } else if (snapped_end - new_end).abs() < threshold {
-                                        new_start = snapped_end - dur;
-                                    }
-                                }
-
-                                state.scene.actors[ai].t_in = Some(new_start);
-                                state.scene.actors[ai].t_out = Some(new_start + dur);
-                                to_select = Some(Selection::Actor(ai));
-                            } else if state.razor_mode {
-                                to_select = Some(Selection::Actor(ai));
+                                state.scene.backgrounds[bi].start = new_start;
+                                state.scene.backgrounds[bi].duration = dur;
+                                to_select = Some(Selection::Background(bi));
+                            } else if state.split_tool_active {
+                                to_select = Some(Selection::Background(bi));
                                 state.playhead = clicked;
                                 state.status = "__SPLIT_AT_PLAYHEAD__".into();
                             } else {
-                                // ── Ctrl+click multi-select ──
-                                let ctrl_held = ui.input(|i| i.modifiers.ctrl || i.modifiers.mac_cmd);
-                                if ctrl_held {
-                                    // Toggle in multi_select
-                                    if let Some(pos) = state.multi_select.iter().position(|&x| x == ai) {
-                                        state.multi_select.remove(pos);
-                                    } else {
-                                        state.multi_select.push(ai);
-                                    }
-                                } else {
-                                    state.multi_select.clear();
-                                }
-                                to_select = Some(Selection::Actor(ai));
-                            }
-                        }
-
-                        // Transition indicators on the clip bar (faded gradient near edges).
-                        draw_transition_indicators(
-                            &painter,
-                            content_rect,
-                            clip_start,
-                            clip_end,
-                            trans_in,
-                            trans_out,
-                            trans_dur,
-                            state.timeline_scroll,
-                            pps,
-                            track_left,
-                            track_right,
-                        );
-                    }
-
-                    // Draw overlays on video tracks (track 1+)
-                    if vt_pos.unwrap_or(0) >= 1 || video_tracks.len() <= 1 {
-                        for oi in 0..state.scene.overlays.len() {
-                            let target_vt = if video_tracks.len() >= 2 { 1 } else { 0 };
-                            if vt_pos != Some(target_vt) && video_tracks.len() > 1 { continue; }
-
-                            let ov = &state.scene.overlays[oi];
-                            let (clip_start, clip_end, label) = match ov {
-                                Overlay::Text(t) => (t.t_in, t.t_out, format!("T: {}", ellipsis(&t.text, 10))),
-                                Overlay::Image(im) => (im.t_in, im.t_out, format!("I: {}", im.id)),
-                                Overlay::Video(v) => (v.t_in, v.t_out, format!("V: {}", v.id)),
-                            };
-                            let sel = state.selection == Selection::Overlay(oi);
-                            if let Some(clicked) = draw_clip(ui, &painter, content_rect, &label,
-                                clip_start, clip_end, state.timeline_scroll, pps, track_left, track_right,
-                                COL_CLIP_OVERLAY, sel, track_h, track_locked, state.razor_mode)
-                            {
-                                if clicked < 0.0 {
-                                    let new_start = (-clicked).max(0.0);
-                                    let dur = clip_end - clip_start;
-                                    let new_end = new_start + dur;
-                                    match &mut state.scene.overlays[oi] {
-                                        Overlay::Text(t) => { t.t_in = new_start; t.t_out = new_end; }
-                                        Overlay::Image(im) => { im.t_in = new_start; im.t_out = new_end; }
-                                        Overlay::Video(v) => { v.t_in = new_start; v.t_out = new_end; }
-                                    }
-                                    to_select = Some(Selection::Overlay(oi));
-                                } else if state.razor_mode {
-                                    to_select = Some(Selection::Overlay(oi));
-                                    state.playhead = clicked;
-                                    state.status = "__SPLIT_AT_PLAYHEAD__".into();
-                                } else {
-                                    to_select = Some(Selection::Overlay(oi));
-                                }
+                                to_select = Some(Selection::Background(bi));
                             }
                         }
                     }
                 }
-                TrackKind::Audio => {
-                    let audio_tracks: Vec<usize> = (0..num_tracks).filter(|ti| state.tracks[*ti].kind == TrackKind::Audio).collect();
-                    let at_pos = audio_tracks.iter().position(|t| *t == track_idx);
 
-                    for aui in 0..state.scene.audio.len() {
-                        let target_at = if audio_tracks.is_empty() { 0 } else { aui % audio_tracks.len() };
-                        if at_pos != Some(target_at) { continue; }
+                // Draw actors assigned to this track (by index mod video tracks)
+                let video_tracks: Vec<usize> = (0..num_tracks).filter(|ti| state.tracks[*ti].kind == TrackKind::Video).collect();
+                let vt_pos = video_tracks.iter().position(|t| *t == track_idx);
 
-                        let audio = &state.scene.audio[aui];
-                        let clip_start = audio.t_in;
-                        let clip_end = audio.t_out.unwrap_or(duration);
-                        let sel = state.selection == Selection::Audio(aui);
-                        if let Some(clicked) = draw_audio_clip(ui, &painter, content_rect, &audio.id,
+                for ai in 0..state.scene.actors.len() {
+                    // Use explicit track assignment if set, otherwise default to first video track.
+                    // Multiple clips on the same track is allowed (free sequential placement).
+                    let assigned_track = if let Some(&assigned) = state.actor_track_assignments.get(&ai) {
+                        assigned
+                    } else {
+                        // Default: first video track for ALL actors (free placement on same track)
+                        video_tracks.first().copied().unwrap_or(0)
+                    };
+                    if assigned_track != track_idx { continue; }
+
+                    let actor = &state.scene.actors[ai];
+                    let clip_start = actor.t_in.unwrap_or(0.0);
+                    let clip_end = actor.t_out.unwrap_or(duration);
+                    let trans_in = actor.transition_in;
+                    let trans_out = actor.transition_out;
+                    let trans_dur = actor.transition_duration;
+                    let sel = state.selection == Selection::Actor(ai);
+                    if let Some(clicked) = draw_clip(ui, painter, content_rect, &actor.id,
+                        clip_start, clip_end, state.timeline_scroll, pps, track_left, track_right,
+                        COL_CLIP_ACTOR, sel, track_h, track_locked, state.split_tool_active)
+                    {
+                        if clicked == f32::INFINITY {
+                            // Trim left edge: adjust t_in
+                            let dx = ui.input(|i| i.pointer.delta().x);
+                            let delta_t = dx / pps;
+                            let new_in = (clip_start + delta_t).max(0.0).min(clip_end - 0.1);
+                            state.scene.actors[ai].t_in = Some(new_in);
+                            to_select = Some(Selection::Actor(ai));
+                        } else if clicked == f32::NEG_INFINITY {
+                            // Trim right edge: adjust t_out
+                            let dx = ui.input(|i| i.pointer.delta().x);
+                            let delta_t = dx / pps;
+                            let new_out = (clip_end + delta_t).max(clip_start + 0.1);
+                            state.scene.actors[ai].t_out = Some(new_out);
+                            to_select = Some(Selection::Actor(ai));
+                        } else if clicked < 0.0 {
+                            // Drag: move the actor's time window
+                            let mut new_start = (-clicked).max(0.0);
+                            let dur = clip_end - clip_start;
+
+                            // ── Undo snapshot on drag start ──
+                            if state.timeline_drag.dragging_clip.is_none() {
+                                state.undo.push(&state.scene);
+                                state.timeline_drag.dragging_clip = Some(ai);
+                            }
+
+                            // ── Assign actor to current track on drag ──
+                            // When the actor is being dragged onto this track, assign it here
+                            state.actor_track_assignments.insert(ai, track_idx);
+
+                            // ── Snap-to-edges logic ──
+                            if state.snap_enabled {
+                                let new_end = new_start + dur;
+                                let mut snap_targets = collect_clip_edges(state, Some(ai));
+                                snap_targets.push(state.playhead);
+                                let threshold = 0.1;
+
+                                let snapped_start = snap_time(new_start, &snap_targets, threshold);
+                                let snapped_end = snap_time(new_end, &snap_targets, threshold);
+
+                                // Prefer start snap, fall back to end snap
+                                if (snapped_start - new_start).abs() < threshold {
+                                    new_start = snapped_start;
+                                } else if (snapped_end - new_end).abs() < threshold {
+                                    new_start = snapped_end - dur;
+                                }
+                            }
+
+                            state.scene.actors[ai].t_in = Some(new_start);
+                            state.scene.actors[ai].t_out = Some(new_start + dur);
+                            to_select = Some(Selection::Actor(ai));
+                        } else if state.split_tool_active {
+                            to_select = Some(Selection::Actor(ai));
+                            state.playhead = clicked;
+                            state.status = "__SPLIT_AT_PLAYHEAD__".into();
+                        } else {
+                            // ── Ctrl+click multi-select ──
+                            let ctrl_held = ui.input(|i| i.modifiers.ctrl || i.modifiers.mac_cmd);
+                            if ctrl_held {
+                                // Toggle in multi_select
+                                if let Some(pos) = state.multi_select.iter().position(|&x| x == ai) {
+                                    state.multi_select.remove(pos);
+                                } else {
+                                    state.multi_select.push(ai);
+                                }
+                            } else {
+                                state.multi_select.clear();
+                            }
+                            to_select = Some(Selection::Actor(ai));
+                        }
+                    }
+
+                    // Transition indicators on the clip bar (faded gradient near edges).
+                    draw_transition_indicators(
+                        painter,
+                        content_rect,
+                        clip_start,
+                        clip_end,
+                        trans_in,
+                        trans_out,
+                        trans_dur,
+                        state.timeline_scroll,
+                        pps,
+                        track_left,
+                        track_right,
+                    );
+                }
+
+                // Draw overlays on video tracks (track 1+)
+                if vt_pos.unwrap_or(0) >= 1 || video_tracks.len() <= 1 {
+                    for oi in 0..state.scene.overlays.len() {
+                        let target_vt = if video_tracks.len() >= 2 { 1 } else { 0 };
+                        if vt_pos != Some(target_vt) && video_tracks.len() > 1 { continue; }
+
+                        let ov = &state.scene.overlays[oi];
+                        let (clip_start, clip_end, label) = match ov {
+                            Overlay::Text(t) => (t.t_in, t.t_out, format!("T: {}", ellipsis(&t.text, 10))),
+                            Overlay::Image(im) => (im.t_in, im.t_out, format!("I: {}", im.id)),
+                            Overlay::Video(v) => (v.t_in, v.t_out, format!("V: {}", v.id)),
+                        };
+                        let sel = state.selection == Selection::Overlay(oi);
+                        if let Some(clicked) = draw_clip(ui, painter, content_rect, &label,
                             clip_start, clip_end, state.timeline_scroll, pps, track_left, track_right,
-                            sel, track_h, track_locked, state.razor_mode,
-                            state.audio_waveforms.get(aui))
+                            COL_CLIP_OVERLAY, sel, track_h, track_locked, state.split_tool_active)
                         {
                             if clicked < 0.0 {
-                                // Drag: move the audio clip
                                 let new_start = (-clicked).max(0.0);
                                 let dur = clip_end - clip_start;
-                                state.scene.audio[aui].t_in = new_start;
-                                state.scene.audio[aui].t_out = Some(new_start + dur);
+                                let new_end = new_start + dur;
+                                match &mut state.scene.overlays[oi] {
+                                    Overlay::Text(t) => { t.t_in = new_start; t.t_out = new_end; }
+                                    Overlay::Image(im) => { im.t_in = new_start; im.t_out = new_end; }
+                                    Overlay::Video(v) => { v.t_in = new_start; v.t_out = new_end; }
+                                }
+                                to_select = Some(Selection::Overlay(oi));
+                            } else if state.split_tool_active {
+                                to_select = Some(Selection::Overlay(oi));
+                                state.playhead = clicked;
+                                state.status = "__SPLIT_AT_PLAYHEAD__".into();
+                            } else {
+                                to_select = Some(Selection::Overlay(oi));
                             }
-                            to_select = Some(Selection::Audio(aui));
                         }
                     }
                 }
             }
+            TrackKind::Audio => {
+                let audio_tracks: Vec<usize> = (0..num_tracks).filter(|ti| state.tracks[*ti].kind == TrackKind::Audio).collect();
+                let at_pos = audio_tracks.iter().position(|t| *t == track_idx);
 
-            // Playhead line on each track
-            let ph_x = time_to_x(state.playhead, state.timeline_scroll, pps, track_left, track_right);
-            if let Some(x) = ph_x {
-                painter.line_segment(
-                    [egui::pos2(x, row_rect.min.y), egui::pos2(x, row_rect.max.y)],
-                    Stroke::new(1.0, COL_PLAYHEAD));
+                for aui in 0..state.scene.audio.len() {
+                    let target_at = if audio_tracks.is_empty() { 0 } else { aui % audio_tracks.len() };
+                    if at_pos != Some(target_at) { continue; }
+
+                    let audio = &state.scene.audio[aui];
+                    let clip_start = audio.t_in;
+                    let clip_end = audio.t_out.unwrap_or(duration);
+                    let sel = state.selection == Selection::Audio(aui);
+                    if let Some(clicked) = draw_audio_clip(ui, painter, content_rect, &audio.id,
+                        clip_start, clip_end, state.timeline_scroll, pps, track_left, track_right,
+                        sel, track_h, track_locked, state.split_tool_active,
+                        state.audio_waveforms.get(aui))
+                    {
+                        if clicked < 0.0 {
+                            // Drag: move the audio clip
+                            let new_start = (-clicked).max(0.0);
+                            let dur = clip_end - clip_start;
+                            state.scene.audio[aui].t_in = new_start;
+                            state.scene.audio[aui].t_out = Some(new_start + dur);
+                        }
+                        to_select = Some(Selection::Audio(aui));
+                    }
+                }
             }
         }
 
-        // Empty state
-        if state.scene.actors.is_empty() && state.scene.overlays.is_empty()
-            && state.scene.backgrounds.is_empty() && state.scene.audio.is_empty() {
-            ui.add_space(20.0);
-            ui.label(RichText::new("Drag clips from the library or click + to add them here")
-                .italics().color(COL_TEXT_DIM).size(12.0));
+        // Playhead line on each track
+        let ph_x = time_to_x(state.playhead, state.timeline_scroll, pps, track_left, track_right);
+        if let Some(x) = ph_x {
+            painter.line_segment(
+                [egui::pos2(x, row_rect.min.y), egui::pos2(x, row_rect.max.y)],
+                Stroke::new(1.0, COL_PLAYHEAD));
         }
-    });
+    }
+
+    // Empty state
+    if state.scene.actors.is_empty() && state.scene.overlays.is_empty()
+        && state.scene.backgrounds.is_empty() && state.scene.audio.is_empty() {
+        tracks_painter.text(
+            tracks_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "Drag clips from the library to add them here",
+            egui::FontId::proportional(12.0),
+            COL_TEXT_DIM,
+        );
+    }
+
+    // ── Custom scrollbars ──
+    // Horizontal scrollbar drives both pan (timeline_scroll in seconds) and
+    // local zoom (timeline_zoom in pixels-per-second). The thumb edges can be
+    // dragged to resize the visible window.
+    let visible_secs_h = (track_area_width / pps.max(1.0)).max(0.0);
+    let total_h = duration.max(visible_secs_h.max(0.5));
+    let view_a_h = (state.timeline_scroll / total_h).clamp(0.0, 1.0);
+    let view_b_h = ((state.timeline_scroll + visible_secs_h) / total_h).clamp(view_a_h, 1.0);
+    let (new_a_h, new_b_h) = stretchable_scrollbar(
+        ui,
+        h_sb_rect,
+        true, // horizontal
+        view_a_h,
+        view_b_h,
+    );
+    {
+        let new_window_secs = ((new_b_h - new_a_h) * total_h).max(0.05);
+        state.timeline_scroll = (new_a_h * total_h).max(0.0);
+        state.timeline_zoom = (track_area_width / new_window_secs).clamp(2.0, 2000.0);
+    }
+
+    // Vertical scrollbar drives both pan (timeline_v_scroll in pixels) and
+    // local zoom (timeline_v_zoom multiplier on track heights).
+    let total_unscaled_h: f32 = state.tracks.iter().map(|t| t.height).sum::<f32>().max(1.0);
+    let total_v = (total_unscaled_h * v_zoom).max(viewport_h);
+    let view_a_v = (state.timeline_v_scroll / total_v).clamp(0.0, 1.0);
+    let view_b_v = ((state.timeline_v_scroll + viewport_h) / total_v).clamp(view_a_v, 1.0);
+    let (new_a_v, new_b_v) = stretchable_scrollbar(
+        ui,
+        v_sb_rect,
+        false, // vertical
+        view_a_v,
+        view_b_v,
+    );
+    {
+        let new_window_pixels = ((new_b_v - new_a_v) * total_v).max(20.0);
+        // viewport_h must equal v_zoom * total_unscaled_h * (new_b_v - new_a_v)
+        // → v_zoom = viewport_h / (total_unscaled_h * (new_b_v - new_a_v))
+        let denom = (total_unscaled_h * (new_b_v - new_a_v)).max(0.0001);
+        let new_v_zoom = (viewport_h / denom).clamp(0.25, 8.0);
+        state.timeline_v_zoom = new_v_zoom;
+        // Recompute v_scroll using the NEW total height (so position stays consistent).
+        let new_total_v = (total_unscaled_h * new_v_zoom).max(viewport_h);
+        state.timeline_v_scroll = (new_a_v * new_total_v).max(0.0);
+        let _ = new_window_pixels; // silence unused
+    }
 
     if let Some(sel) = to_select {
         state.selection = sel;
@@ -1705,7 +1835,212 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
 }
 
 
-/// Draw a single clip bar on the timeline. Returns Some(time) if clicked (for razor or select).
+/// Stretchable scrollbar widget. Shared between the horizontal time scrollbar
+/// and the vertical track scrollbar.
+///
+/// `view_a_frac`/`view_b_frac` are the start/end of the visible window as
+/// fractions of the total content (both in [0, 1], `a <= b`).
+///
+/// Returns the new (a, b) after user interaction this frame:
+///   - dragging the thumb body pans (a and b shift by the same amount);
+///   - dragging the thumb's leading/trailing edge resizes the visible window
+///     (this is the "local zoom" the user controls by stretching the scrollbar).
+fn stretchable_scrollbar(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    horizontal: bool,
+    view_a_frac: f32,
+    view_b_frac: f32,
+) -> (f32, f32) {
+    let painter = ui.painter_at(rect);
+
+    // Scrollbar track background.
+    let bg_rounding = if horizontal { rect.height() * 0.5 } else { rect.width() * 0.5 };
+    painter.rect_filled(rect, Rounding::same(bg_rounding), Color32::from_rgb(20, 20, 30));
+
+    let track_len = if horizontal { rect.width() } else { rect.height() }.max(1.0);
+    let cross = if horizontal { rect.height() } else { rect.width() };
+    let edge_zone = (cross * 0.6).max(6.0);
+    let min_window_frac = (10.0 / track_len).min(0.5);
+
+    let a = view_a_frac.clamp(0.0, 1.0);
+    let b = view_b_frac.clamp(a + min_window_frac.min(0.001), 1.0);
+
+    let id = ui.make_persistent_id((
+        "scrollbar",
+        rect.min.x as i32,
+        rect.min.y as i32,
+        horizontal,
+    ));
+    let resp = ui.interact(rect, id, Sense::click_and_drag());
+
+    // Compute thumb pixel range along the primary axis.
+    let main_min = if horizontal { rect.min.x } else { rect.min.y };
+    let thumb_l = main_min + a * track_len;
+    let thumb_r = main_min + b * track_len;
+
+    // Persist drag mode across frames.
+    let mode_key = id.with("mode");
+    #[derive(Clone, Copy, PartialEq)]
+    enum Mode { None, Pan, ResizeStart, ResizeEnd }
+    let stored_raw: Option<u8> = ui.ctx().memory(|m| m.data.get_temp(mode_key));
+    let mut mode = match stored_raw {
+        Some(0) => Mode::Pan,
+        Some(1) => Mode::ResizeStart,
+        Some(2) => Mode::ResizeEnd,
+        _ => Mode::None,
+    };
+
+    if resp.drag_started() {
+        if let Some(p) = resp.interact_pointer_pos() {
+            let coord = if horizontal { p.x } else { p.y };
+            mode = if (coord - thumb_l).abs() < edge_zone {
+                Mode::ResizeStart
+            } else if (coord - thumb_r).abs() < edge_zone {
+                Mode::ResizeEnd
+            } else {
+                Mode::Pan
+            };
+            let raw: u8 = match mode {
+                Mode::Pan => 0,
+                Mode::ResizeStart => 1,
+                Mode::ResizeEnd => 2,
+                Mode::None => 3,
+            };
+            ui.ctx().memory_mut(|m| m.data.insert_temp(mode_key, raw));
+        }
+    }
+    if !resp.dragged() && !resp.drag_started() {
+        mode = Mode::None;
+        ui.ctx().memory_mut(|m| m.data.insert_temp(mode_key, 3u8));
+    }
+
+    // Hover cursor hint.
+    if resp.hovered() {
+        if let Some(p) = ui.input(|i| i.pointer.hover_pos()) {
+            let coord = if horizontal { p.x } else { p.y };
+            if (coord - thumb_l).abs() < edge_zone || (coord - thumb_r).abs() < edge_zone {
+                ui.ctx().set_cursor_icon(if horizontal {
+                    egui::CursorIcon::ResizeHorizontal
+                } else {
+                    egui::CursorIcon::ResizeVertical
+                });
+            } else if coord >= thumb_l && coord <= thumb_r {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+            }
+        }
+    }
+
+    let mut new_a = a;
+    let mut new_b = b;
+
+    if resp.dragged() {
+        let d_pixels = if horizontal {
+            resp.drag_delta().x
+        } else {
+            resp.drag_delta().y
+        };
+        let d_frac = d_pixels / track_len;
+        match mode {
+            Mode::Pan => {
+                let w = b - a;
+                new_a = (a + d_frac).clamp(0.0, (1.0 - w).max(0.0));
+                new_b = new_a + w;
+            }
+            Mode::ResizeStart => {
+                new_a = (a + d_frac).clamp(0.0, (b - min_window_frac).max(0.0));
+            }
+            Mode::ResizeEnd => {
+                new_b = (b + d_frac).clamp((a + min_window_frac).min(1.0), 1.0);
+            }
+            Mode::None => {}
+        }
+    } else if resp.clicked() {
+        // Click on track outside thumb: jump (centre thumb at click).
+        if let Some(p) = resp.interact_pointer_pos() {
+            let coord = if horizontal { p.x } else { p.y };
+            let frac = ((coord - main_min) / track_len).clamp(0.0, 1.0);
+            let w = b - a;
+            new_a = (frac - w * 0.5).clamp(0.0, (1.0 - w).max(0.0));
+            new_b = new_a + w;
+        }
+    }
+
+    // Draw thumb at the (possibly updated) position.
+    let display_a = new_a;
+    let display_b = new_b.max(new_a + (10.0 / track_len).min(0.999));
+    let main_l = main_min + display_a * track_len;
+    let main_r = (main_min + display_b * track_len).min(if horizontal { rect.max.x } else { rect.max.y });
+
+    let thumb_rect = if horizontal {
+        egui::Rect::from_min_max(
+            egui::pos2(main_l, rect.min.y + 2.0),
+            egui::pos2(main_r, rect.max.y - 2.0),
+        )
+    } else {
+        egui::Rect::from_min_max(
+            egui::pos2(rect.min.x + 2.0, main_l),
+            egui::pos2(rect.max.x - 2.0, main_r),
+        )
+    };
+    let thumb_color = if resp.hovered() || resp.dragged() {
+        Color32::from_rgb(140, 140, 180)
+    } else {
+        Color32::from_rgb(90, 90, 130)
+    };
+    painter.rect_filled(thumb_rect, Rounding::same(bg_rounding * 0.8), thumb_color);
+
+    // Draw the two stretch grips inside the thumb edges.
+    let grip_color = Color32::from_rgba_premultiplied(255, 255, 255, 90);
+    if horizontal {
+        let grip_w = 2.0;
+        let inset_x = 3.0;
+        let y0 = thumb_rect.min.y + 2.0;
+        let y1 = thumb_rect.max.y - 2.0;
+        if thumb_rect.width() > 14.0 {
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(thumb_rect.min.x + inset_x, y0),
+                    egui::pos2(thumb_rect.min.x + inset_x + grip_w, y1),
+                ),
+                Rounding::ZERO, grip_color,
+            );
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(thumb_rect.max.x - inset_x - grip_w, y0),
+                    egui::pos2(thumb_rect.max.x - inset_x, y1),
+                ),
+                Rounding::ZERO, grip_color,
+            );
+        }
+    } else {
+        let grip_h = 2.0;
+        let inset_y = 3.0;
+        let x0 = thumb_rect.min.x + 2.0;
+        let x1 = thumb_rect.max.x - 2.0;
+        if thumb_rect.height() > 14.0 {
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(x0, thumb_rect.min.y + inset_y),
+                    egui::pos2(x1, thumb_rect.min.y + inset_y + grip_h),
+                ),
+                Rounding::ZERO, grip_color,
+            );
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(x0, thumb_rect.max.y - inset_y - grip_h),
+                    egui::pos2(x1, thumb_rect.max.y - inset_y),
+                ),
+                Rounding::ZERO, grip_color,
+            );
+        }
+    }
+
+    (new_a, new_b)
+}
+
+
+/// Draw a single clip bar on the timeline. Returns Some(time) if clicked (for split or select).
 /// Returns special sentinel values for edge-trim drags:
 /// - `f32::INFINITY` signals "trim left edge"
 /// - `f32::NEG_INFINITY` signals "trim right edge"
@@ -1727,7 +2062,7 @@ fn draw_clip(
     selected: bool,
     _track_h: f32,
     locked: bool,
-    razor_mode: bool,
+    split_mode: bool,
 ) -> Option<f32> {
     let x_start = (clip_start - scroll) * pps + track_left;
     let x_end = (clip_end - scroll) * pps + track_left;
@@ -1792,7 +2127,7 @@ fn draw_clip(
     let near_right_edge = hover_pos.map(|p| (p.x - bar_rect.max.x).abs() < 5.0).unwrap_or(false);
 
     if resp.hovered() && !locked {
-        if razor_mode {
+        if split_mode {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
         } else if near_left_edge || near_right_edge {
             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
@@ -1802,7 +2137,7 @@ fn draw_clip(
     }
 
     if resp.clicked() {
-        if razor_mode {
+        if split_mode {
             if let Some(pos) = resp.interact_pointer_pos() {
                 let t = x_to_time(pos.x, scroll, pps, track_left);
                 return Some(t);
@@ -1812,7 +2147,7 @@ fn draw_clip(
     }
 
     // Drag handling: whole-clip move or edge-trim
-    if resp.dragged() && !locked && !razor_mode {
+    if resp.dragged() && !locked && !split_mode {
         let dx = resp.drag_delta().x;
         let delta_secs = dx / pps;
 
@@ -1856,7 +2191,7 @@ fn draw_audio_clip(
     selected: bool,
     _track_h: f32,
     locked: bool,
-    _razor_mode: bool,
+    _split_mode: bool,
     waveform: Option<&crate::state::AudioWaveform>,
 ) -> Option<f32> {
     let x_start = (clip_start - scroll) * pps + track_left;

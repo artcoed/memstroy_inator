@@ -208,6 +208,12 @@ pub struct EditorState {
     pub timeline_zoom: f32,
     /// Timeline horizontal scroll offset in seconds
     pub timeline_scroll: f32,
+    /// Timeline vertical zoom multiplier (multiplies each track's height for display)
+    pub timeline_v_zoom: f32,
+    /// Timeline vertical scroll offset in pixels (top of viewport in scaled-track-space)
+    pub timeline_v_scroll: f32,
+    /// Split tool active: when true, clicking on a clip cuts it at the click position.
+    pub split_tool_active: bool,
     /// Whether the (scaffold) node editor window is open.
     pub node_editor_open: bool,
     /// Library search filter text.
@@ -371,6 +377,9 @@ impl EditorState {
         s.playback_speed = 1.0;
         s.timeline_zoom = 80.0; // 80 pixels per second
         s.timeline_scroll = 0.0;
+        s.timeline_v_zoom = 1.0;
+        s.timeline_v_scroll = 0.0;
+        s.split_tool_active = false;
         s.last_rendered_playhead = -1.0;
         s.ffmpeg_available = check_ffmpeg();
         s.razor_mode = false;
@@ -689,6 +698,15 @@ pub struct CanvasDrag {
     pub mode: CanvasDragMode,
     /// Pointer position (screen px, relative to the canvas rect) at drag start.
     pub start_screen: [f32; 2],
+    /// Snapshot of canvas-layout (pos, scale) by element_id at drag
+    /// start. Used to keep contents glued to the render frame as it is moved
+    /// or resized.
+    pub canvas_layouts_snapshot: Vec<(String, [f32; 2], f32)>,
+    /// Snapshot of legacy normalised actor positions (by index) at drag start.
+    pub actor_legacy_snapshot: Vec<(usize, [f32; 2])>,
+    /// Snapshot of the legacy `scale` for each actor (used to scale them with
+    /// the render frame on resize).
+    pub actor_legacy_scale_snapshot: Vec<(usize, f32)>,
 }
 
 #[derive(Default, Clone, Copy, PartialEq)]
