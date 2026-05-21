@@ -199,44 +199,33 @@ fn draw_render_frame(
         Pos2::new(full_rect.min.x + br_screen[0], full_rect.min.y + br_screen[1]),
     );
 
-    // Border only (no fill inside the render frame)
+    // Border only (no fill, no dimming outside)
     painter.rect_stroke(frame_rect, Rounding::ZERO, Stroke::new(2.0, COL_RENDER_FRAME));
 
-    // Dim area outside the render frame (vignette effect)
-    let dim = Color32::from_rgba_premultiplied(0, 0, 0, 120);
-    // Top band
-    if frame_rect.min.y > full_rect.min.y {
-        painter.rect_filled(
-            Rect::from_min_max(full_rect.min, Pos2::new(full_rect.max.x, frame_rect.min.y)),
-            Rounding::ZERO, dim,
-        );
+    // Corner resize handles for the render frame
+    let handle_size = 8.0;
+    let corners = [
+        frame_rect.left_top(),
+        frame_rect.right_top(),
+        frame_rect.left_bottom(),
+        frame_rect.right_bottom(),
+    ];
+    for corner in &corners {
+        let hr = Rect::from_center_size(*corner, Vec2::splat(handle_size));
+        painter.rect_filled(hr, Rounding::same(2.0), COL_RENDER_FRAME_HANDLE);
+        painter.rect_stroke(hr, Rounding::same(2.0), Stroke::new(1.0, Color32::WHITE));
     }
-    // Bottom band
-    if frame_rect.max.y < full_rect.max.y {
-        painter.rect_filled(
-            Rect::from_min_max(Pos2::new(full_rect.min.x, frame_rect.max.y), full_rect.max),
-            Rounding::ZERO, dim,
-        );
-    }
-    // Left band (between top and bottom bands)
-    if frame_rect.min.x > full_rect.min.x {
-        painter.rect_filled(
-            Rect::from_min_max(
-                Pos2::new(full_rect.min.x, frame_rect.min.y),
-                Pos2::new(frame_rect.min.x, frame_rect.max.y),
-            ),
-            Rounding::ZERO, dim,
-        );
-    }
-    // Right band
-    if frame_rect.max.x < full_rect.max.x {
-        painter.rect_filled(
-            Rect::from_min_max(
-                Pos2::new(frame_rect.max.x, frame_rect.min.y),
-                Pos2::new(full_rect.max.x, frame_rect.max.y),
-            ),
-            Rounding::ZERO, dim,
-        );
+
+    // Edge midpoint handles for the render frame
+    let midpoints = [
+        Pos2::new(frame_rect.center().x, frame_rect.min.y), // top mid
+        Pos2::new(frame_rect.center().x, frame_rect.max.y), // bottom mid
+        Pos2::new(frame_rect.min.x, frame_rect.center().y), // left mid
+        Pos2::new(frame_rect.max.x, frame_rect.center().y), // right mid
+    ];
+    for mp in &midpoints {
+        let hr = Rect::from_center_size(*mp, Vec2::new(handle_size * 1.2, handle_size * 0.6));
+        painter.rect_filled(hr, Rounding::same(2.0), COL_RENDER_FRAME_HANDLE);
     }
 
     // Label
@@ -702,6 +691,9 @@ fn draw_selection_gizmo(
     // ── Render frame drag handles ──
     draw_render_frame_handles(ui, painter, response, full_rect, state, viewport_size);
 
+    // ── Draw resize handles on selected element ──
+    draw_element_resize_handles(ui, painter, response, full_rect, state, viewport_size);
+
     // Handle drag to move selected element on canvas
     if response.dragged() && !state.canvas_panning {
         let delta = response.drag_delta();
@@ -800,6 +792,161 @@ fn draw_selection_gizmo(
     }
 }
 
+// ─── ELEMENT RESIZE HANDLES ──────────────────────────────────────────
+
+/// Draw resize handles (corners + edges) on the currently selected element.
+/// Dragging a handle scales the element proportionally.
+fn draw_element_resize_handles(
+    ui: &mut egui::Ui,
+    painter: &egui::Painter,
+    response: &egui::Response,
+    full_rect: Rect,
+    state: &mut EditorState,
+    viewport_size: [f32; 2],
+) {
+    let t = state.playhead;
+    let handle_size = 7.0;
+    let handle_color = COL_SELECTED_BORDER;
+
+    // Get the bounding rect of the selected element in screen space
+    let elem_rect = match state.selection {
+        Selection::Actor(idx) if idx < state.scene.actors.len() => {
+            let actor = &state.scene.actors[idx];
+            if !actor.visible { return; }
+            let world_pos = get_element_world_pos(state, &actor.id, &actor.layout, t);
+            let actor_scale = keyframe::sample(&actor.layout, t)
+                .map(|s| s.scale).unwrap_or(1.0);
+            let elem_width = 400.0 * actor_scale;
+            let elem_height = elem_width * 16.0 / 9.0;
+            let center_screen = state.canvas_viewport.world_to_screen(world_pos, viewport_size);
+            let half_w = elem_width * 0.5 * state.canvas_viewport.zoom;
+            let half_h = elem_height * 0.5 * state.canvas_viewport.zoom;
+            Rect::from_center_size(
+                Pos2::new(full_rect.min.x + center_screen[0], full_rect.min.y + center_screen[1]),
+                Vec2::new(half_w * 2.0, half_h * 2.0),
+            )
+        }
+        Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
+            let overlay = &state.scene.overlays[idx];
+            let (t_in, t_out, layout) = match overlay {
+                Overlay::Text(txt) => (txt.t_in, txt.t_out, &txt.layout),
+                Overlay::Image(img) => (img.t_in, img.t_out, &img.layout),
+                Overlay::Video(vid) => (vid.t_in, vid.t_out, &vid.layout),
+            };
+            let sample_t = if t >= t_in && t <= t_out { t - t_in } else { 0.0 };
+            let ov_state = keyframe::sample(layout, sample_t).unwrap_or_default();
+            let rf = &state.scene.render_frame;
+            let rf_state = sample_render_frame(rf, t);
+            let [rw, rh] = rf.resolution;
+            let world_w = rw as f32 / rf_state.zoom;
+            let world_h = rh as f32 / rf_state.zoom;
+            let frame_tl_x = rf_state.pos.x - world_w * 0.5;
+            let frame_tl_y = rf_state.pos.y - world_h * 0.5;
+            let world_pos = WorldPos {
+                x: frame_tl_x + ov_state.pos[0] * world_w,
+                y: frame_tl_y + ov_state.pos[1] * world_h,
+            };
+            let (elem_w, elem_h) = match overlay {
+                Overlay::Text(_) => (300.0 * ov_state.scale, 60.0 * ov_state.scale),
+                Overlay::Image(_) => (200.0 * ov_state.scale, 200.0 * ov_state.scale),
+                Overlay::Video(_) => (300.0 * ov_state.scale, 300.0 * 16.0 / 9.0 * ov_state.scale),
+            };
+            let center_screen = state.canvas_viewport.world_to_screen(world_pos, viewport_size);
+            let half_w = elem_w * 0.5 * state.canvas_viewport.zoom;
+            let half_h = elem_h * 0.5 * state.canvas_viewport.zoom;
+            Rect::from_center_size(
+                Pos2::new(full_rect.min.x + center_screen[0], full_rect.min.y + center_screen[1]),
+                Vec2::new(half_w * 2.0, half_h * 2.0),
+            )
+        }
+        _ => return,
+    };
+
+    // Draw corner handles
+    let corners = [
+        (elem_rect.left_top(), egui::CursorIcon::ResizeNwSe),
+        (elem_rect.right_top(), egui::CursorIcon::ResizeNeSw),
+        (elem_rect.left_bottom(), egui::CursorIcon::ResizeNeSw),
+        (elem_rect.right_bottom(), egui::CursorIcon::ResizeNwSe),
+    ];
+    for (corner, _cursor) in &corners {
+        let hr = Rect::from_center_size(*corner, Vec2::splat(handle_size));
+        painter.rect_filled(hr, Rounding::same(2.0), handle_color);
+        painter.rect_stroke(hr, Rounding::same(2.0), Stroke::new(1.0, Color32::from_rgb(40, 40, 40)));
+    }
+
+    // Draw edge midpoint handles
+    let midpoints = [
+        Pos2::new(elem_rect.center().x, elem_rect.min.y),
+        Pos2::new(elem_rect.center().x, elem_rect.max.y),
+        Pos2::new(elem_rect.min.x, elem_rect.center().y),
+        Pos2::new(elem_rect.max.x, elem_rect.center().y),
+    ];
+    for mp in &midpoints {
+        let hr = Rect::from_center_size(*mp, Vec2::new(handle_size * 1.4, handle_size * 0.7));
+        painter.rect_filled(hr, Rounding::same(2.0), handle_color);
+    }
+
+    // Draw selection border
+    painter.rect_stroke(elem_rect, Rounding::same(2.0), Stroke::new(1.5, handle_color));
+
+    // Handle corner drag for scaling
+    if response.dragged() && !state.canvas_panning {
+        if let Some(origin) = response.interact_pointer_pos() {
+            let ox = origin.x - response.drag_delta().x;
+            let oy = origin.y - response.drag_delta().y;
+
+            // Check if drag originated near a corner handle
+            let mut near_corner = false;
+            for (corner, _) in &corners {
+                let dist = ((ox - corner.x).powi(2) + (oy - corner.y).powi(2)).sqrt();
+                if dist < handle_size * 2.5 {
+                    near_corner = true;
+                    break;
+                }
+            }
+
+            if near_corner {
+                // Scale based on drag distance from center
+                let center = elem_rect.center();
+                let prev_dist = ((ox - center.x).powi(2) + (oy - center.y).powi(2)).sqrt();
+                let curr_dist = ((origin.x - center.x).powi(2) + (origin.y - center.y).powi(2)).sqrt();
+                if prev_dist > 1.0 {
+                    let scale_factor = curr_dist / prev_dist;
+                    match state.selection {
+                        Selection::Actor(idx) if idx < state.scene.actors.len() => {
+                            if let Some(kf) = state.scene.actors[idx].layout.first_mut() {
+                                kf.value.scale = (kf.value.scale * scale_factor).clamp(0.05, 10.0);
+                            }
+                        }
+                        Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
+                            match &mut state.scene.overlays[idx] {
+                                Overlay::Text(t) => { if let Some(kf) = t.layout.first_mut() { kf.value.scale = (kf.value.scale * scale_factor).clamp(0.05, 10.0); } }
+                                Overlay::Image(i) => { if let Some(kf) = i.layout.first_mut() { kf.value.scale = (kf.value.scale * scale_factor).clamp(0.05, 10.0); } }
+                                Overlay::Video(v) => { if let Some(kf) = v.layout.first_mut() { kf.value.scale = (kf.value.scale * scale_factor).clamp(0.05, 10.0); } }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    // Show resize cursor when hovering handles
+    if response.hovered() && !state.canvas_panning {
+        if let Some(hover) = ui.input(|i| i.pointer.hover_pos()) {
+            for (corner, cursor) in &corners {
+                let dist = ((hover.x - corner.x).powi(2) + (hover.y - corner.y).powi(2)).sqrt();
+                if dist < handle_size * 2.0 {
+                    ui.ctx().set_cursor_icon(*cursor);
+                    break;
+                }
+            }
+        }
+    }
+}
+
 // ─── RENDER FRAME HANDLES ────────────────────────────────────────────
 
 fn draw_render_frame_handles(
@@ -821,7 +968,14 @@ fn draw_render_frame_handles(
     let br_world = WorldPos { x: rf_state.pos.x + world_w * 0.5, y: rf_state.pos.y + world_h * 0.5 };
     let center_world = rf_state.pos;
 
+    let tl_screen = state.canvas_viewport.world_to_screen(tl_world, viewport_size);
+    let br_screen = state.canvas_viewport.world_to_screen(br_world, viewport_size);
     let center_screen = state.canvas_viewport.world_to_screen(center_world, viewport_size);
+
+    let frame_rect = Rect::from_min_max(
+        Pos2::new(full_rect.min.x + tl_screen[0], full_rect.min.y + tl_screen[1]),
+        Pos2::new(full_rect.min.x + br_screen[0], full_rect.min.y + br_screen[1]),
+    );
     let center_pos = Pos2::new(full_rect.min.x + center_screen[0], full_rect.min.y + center_screen[1]);
 
     // Draw center handle (for moving the render frame)
@@ -836,13 +990,15 @@ fn draw_render_frame_handles(
         COL_RENDER_FRAME,
     );
 
-    // Allow dragging the render frame center with left drag when nothing else is selected
+    // Allow dragging the render frame center or body
     if response.dragged() && !state.canvas_panning {
         if let Some(origin) = response.interact_pointer_pos() {
             let ox = origin.x - response.drag_delta().x;
             let oy = origin.y - response.drag_delta().y;
-            let dist = ((ox - center_pos.x).powi(2) + (oy - center_pos.y).powi(2)).sqrt();
-            if dist < handle_radius * 4.0 && state.selection == Selection::None {
+
+            // Check if near center handle → move
+            let dist_center = ((ox - center_pos.x).powi(2) + (oy - center_pos.y).powi(2)).sqrt();
+            if dist_center < handle_radius * 4.0 && state.selection == Selection::None {
                 let delta = response.drag_delta();
                 let world_dx = delta.x / state.canvas_viewport.zoom;
                 let world_dy = delta.y / state.canvas_viewport.zoom;
@@ -851,6 +1007,34 @@ fn draw_render_frame_handles(
                 if let Some(kf) = state.scene.render_frame.layout.first_mut() {
                     kf.value.pos.x += world_dx;
                     kf.value.pos.y += world_dy;
+                }
+            }
+
+            // Check if near a corner → resize (zoom)
+            let corners = [
+                frame_rect.left_top(),
+                frame_rect.right_top(),
+                frame_rect.left_bottom(),
+                frame_rect.right_bottom(),
+            ];
+            let mut near_rf_corner = false;
+            for corner in &corners {
+                let dist = ((ox - corner.x).powi(2) + (oy - corner.y).powi(2)).sqrt();
+                if dist < 14.0 {
+                    near_rf_corner = true;
+                    break;
+                }
+            }
+            if near_rf_corner && state.selection == Selection::None {
+                // Resize = change zoom of the render frame
+                let prev_dist = ((ox - center_pos.x).powi(2) + (oy - center_pos.y).powi(2)).sqrt();
+                let curr_dist = ((origin.x - center_pos.x).powi(2) + (origin.y - center_pos.y).powi(2)).sqrt();
+                if prev_dist > 1.0 {
+                    let scale_factor = curr_dist / prev_dist;
+                    if let Some(kf) = state.scene.render_frame.layout.first_mut() {
+                        // Increasing corner distance = zoom out (show more), decreasing = zoom in
+                        kf.value.zoom = (kf.value.zoom / scale_factor).clamp(0.1, 10.0);
+                    }
                 }
             }
         }

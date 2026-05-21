@@ -868,6 +868,26 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             state.razor_mode = !state.razor_mode;
         }
 
+        // Chroma Key quick-access button
+        let chroma_active = state.eyedropper_active;
+        let chroma_color = if chroma_active { Color32::from_rgb(100, 255, 100) } else { Color32::from_rgb(80, 200, 80) };
+        if ui.button(RichText::new("\u{1F4A7}").color(chroma_color))
+            .on_hover_text("Chroma Key: pick color from preview (eyedropper)")
+            .clicked()
+        {
+            if let Selection::Actor(_) = state.selection {
+                state.eyedropper_active = !state.eyedropper_active;
+                state.inspector_tab = 2; // Switch to Effects tab
+                state.status = if state.eyedropper_active {
+                    "Eyedropper active: click on preview to pick chroma key color".into()
+                } else {
+                    "Eyedropper deactivated".into()
+                };
+            } else {
+                state.status = "Select an actor first to use chroma key".into();
+            }
+        }
+
         ui.separator();
 
         // Snap toggle
@@ -914,6 +934,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
         }
 
         // Zoom controls
+        // Zoom controls + track management
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui.button("+").on_hover_text("Zoom in").clicked() {
                 state.timeline_zoom = (state.timeline_zoom * 1.3).min(500.0);
@@ -922,6 +943,22 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                 state.timeline_zoom = (state.timeline_zoom / 1.3).max(20.0);
             }
             ui.label(RichText::new(format!("{:.0}px/s", state.timeline_zoom)).size(10.0).color(COL_TEXT_DIM));
+
+            ui.separator();
+
+            // Add track buttons
+            if ui.button(RichText::new("+V").size(10.0).color(COL_CLIP_ACTOR))
+                .on_hover_text("Add video track").clicked()
+            {
+                state.add_video_track();
+                state.status = "Added video track".into();
+            }
+            if ui.button(RichText::new("+A").size(10.0).color(COL_CLIP_AUDIO))
+                .on_hover_text("Add audio track").clicked()
+            {
+                state.add_audio_track();
+                state.status = "Added audio track".into();
+            }
         });
     });
     ui.add_space(2.0);
@@ -1145,8 +1182,17 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                     let vt_pos = video_tracks.iter().position(|t| *t == track_idx);
 
                     for ai in 0..state.scene.actors.len() {
-                        // Assign actor to track by round-robin across video tracks
-                        let target_vt = if video_tracks.is_empty() { 0 } else { ai % video_tracks.len() };
+                        // Use explicit track assignment if set, otherwise fall back to round-robin
+                        let target_vt = if let Some(&assigned) = state.actor_track_assignments.get(&ai) {
+                            // Find position of assigned track among video tracks
+                            video_tracks.iter().position(|&t| t == assigned).unwrap_or(
+                                if video_tracks.is_empty() { 0 } else { ai % video_tracks.len() }
+                            )
+                        } else if video_tracks.is_empty() {
+                            0
+                        } else {
+                            ai % video_tracks.len()
+                        };
                         if vt_pos != Some(target_vt) { continue; }
 
                         let actor = &state.scene.actors[ai];
@@ -1170,6 +1216,10 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                     state.undo.push(&state.scene);
                                     state.timeline_drag.dragging_clip = Some(ai);
                                 }
+
+                                // ── Assign actor to current track on drag ──
+                                // When the actor is being dragged onto this track, assign it here
+                                state.actor_track_assignments.insert(ai, track_idx);
 
                                 // ── Snap-to-edges logic ──
                                 if state.snap_enabled {
@@ -1284,6 +1334,13 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             sel, track_h, track_locked, state.razor_mode,
                             state.audio_waveforms.get(aui))
                         {
+                            if clicked < 0.0 {
+                                // Drag: move the audio clip
+                                let new_start = (-clicked).max(0.0);
+                                let dur = clip_end - clip_start;
+                                state.scene.audio[aui].t_in = new_start;
+                                state.scene.audio[aui].t_out = Some(new_start + dur);
+                            }
                             to_select = Some(Selection::Audio(aui));
                         }
                     }
@@ -1620,8 +1677,24 @@ fn draw_audio_clip(
 
     // Interaction
     let id = ui.make_persistent_id(("audio_clip", label, (clip_start * 1000.0) as i64));
-    let resp = ui.interact(bar_rect, id, if locked { Sense::hover() } else { Sense::click() });
+    let sense = if locked { Sense::hover() } else { Sense::click_and_drag() };
+    let resp = ui.interact(bar_rect, id, sense);
+
+    if resp.hovered() && !locked {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+    }
+
     if resp.clicked() { return Some(clip_start); }
+
+    // Drag handling: whole-clip move (return negative value = new start time)
+    if resp.dragged() && !locked {
+        let dx = resp.drag_delta().x;
+        let delta_secs = dx / pps;
+        if delta_secs.abs() > 0.001 {
+            return Some(-(clip_start + delta_secs));
+        }
+        return Some(clip_start);
+    }
 
     None
 }

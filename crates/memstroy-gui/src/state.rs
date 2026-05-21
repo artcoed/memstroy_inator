@@ -293,6 +293,11 @@ pub struct EditorState {
     /// State for the skeleton constructor editor window.
     pub skeleton_editor: crate::skeleton_editor::SkeletonEditorState,
 
+    // ─── Track assignment overrides ────────────────────────────────
+    /// Explicit track assignment for actors. Key = actor index, Value = track index.
+    /// When an actor is not in this map, the default round-robin assignment is used.
+    pub actor_track_assignments: std::collections::HashMap<usize, usize>,
+
     // ─── Multi-tab scenes ──────────────────────────────────────────
     /// All open scene tabs. Index 0 is always the active tab's scene (synced with `self.scene`).
     pub scene_tabs: Vec<SceneTab>,
