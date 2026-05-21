@@ -615,6 +615,7 @@ fn cmd_add_audio(args: &[String], scene: &mut Scene) -> Result<(), String> {
         t_out,
         source_start: 0.0,
         volume,
+        parent_actor: None,
     });
     Ok(())
 }

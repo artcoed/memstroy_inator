@@ -95,6 +95,12 @@ pub struct AssetDrag {
     pub kind: AssetDragKind,
     /// Current mouse position during drag.
     pub pos: [f32; 2],
+    /// Optional human-readable label rendered next to the drag ghost so the
+    /// user can see *what* they're dragging (clip number, file name, etc.).
+    pub label: String,
+    /// Optional thumbnail path (used by the drag ghost preview for clips
+    /// and image-based assets).
+    pub thumbnail: Option<PathBuf>,
 }
 
 #[derive(Default, Clone, Copy, PartialEq, Eq)]

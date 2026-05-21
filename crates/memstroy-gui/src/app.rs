@@ -281,6 +281,12 @@ impl App {
     fn delete_selected(&mut self) {
         match self.state.selection {
             Selection::Actor(i) if i < self.state.scene.actors.len() => {
+                let actor_id = self.state.scene.actors[i].id.clone();
+                // Bound audio (the AudioTrack created when the clip was
+                // dropped) follows the actor on delete so we never leak
+                // orphaned audio rows.
+                let _removed = crate::panels::remove_audio_bound_to_actor(
+                    &mut self.state, &actor_id);
                 self.state.mutate(|s| { s.actors.remove(i); });
                 // Keep frame_caches and frame_extract_results in lock-step with actors
                 // so subsequent actors don't display the wrong cached frames.
@@ -1133,6 +1139,10 @@ impl eframe::App for App {
         self.pump_events(ctx);
         self.poll_frame_extraction();
         self.poll_waveform_extraction();
+        // Pick up sinks built on the background audio-load thread (see
+        // `audio_engine.rs`). Cheap when there's nothing pending; lets
+        // playback start without freezing the UI thread on file decode.
+        self.audio_engine.poll_pending();
 
         // Auto-start frame extraction for actors that have source files
         if !self.state.scene.actors.is_empty() {
@@ -1342,6 +1352,7 @@ impl eframe::App for App {
                             t_out: None,
                             source_start: 0.0,
                             volume: 1.0,
+                            parent_actor: None,
                         });
                         self.state.selection = Selection::Audio(self.state.scene.audio.len() - 1);
                         self.state.status = format!("Dropped audio: {}", id);
