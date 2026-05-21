@@ -32,6 +32,9 @@ pub struct App {
     was_playing: bool,
     /// Previous playhead for detecting seeks
     prev_playhead: f32,
+    /// Previous count of audio sources used by the engine, so we can rebuild
+    /// the engine when the user adds/removes a track mid-playback.
+    prev_audio_source_count: usize,
 }
 
 impl App {
@@ -74,6 +77,7 @@ impl App {
             audio_engine: AudioEngine::new(),
             was_playing: false,
             prev_playhead: 0.0,
+            prev_audio_source_count: 0,
         }
     }
 
@@ -1171,6 +1175,21 @@ impl eframe::App for App {
             }
         }
 
+        // Auto-start waveform extraction for any audio tracks that don't yet
+        // have a ready waveform — fixes "audio doesn't load from waveform"
+        // when a track is dropped on the timeline.
+        if !self.state.scene.audio.is_empty() {
+            let needs_wf = self.state.scene.audio.iter().enumerate().any(|(i, au)| {
+                au.source.exists()
+                    && self.state.audio_waveforms.get(i)
+                        .map(|wf| !wf.ready && !wf.extracting)
+                        .unwrap_or(true)
+            });
+            if needs_wf {
+                self.start_waveform_extraction();
+            }
+        }
+
         // Keyboard shortcuts
         self.handle_shortcuts(ctx);
 
@@ -1192,7 +1211,11 @@ impl eframe::App for App {
             if self.state.playhead >= self.state.scene.output.duration {
                 self.state.playhead = 0.0; // loop full scene
             }
-            ctx.request_repaint(); // keep animating
+            // Repaint at the scene's output FPS (capped) so we don't burn
+            // CPU/GPU at 120+ Hz when the output is e.g. 30 fps.
+            let target_fps = (self.state.scene.output.fps as f32).max(15.0).min(120.0);
+            let dt_target = std::time::Duration::from_secs_f32(1.0 / target_fps);
+            ctx.request_repaint_after(dt_target);
         }
 
         // Auto-preview via ffmpeg has been replaced by the canvas frame
@@ -1202,9 +1225,7 @@ impl eframe::App for App {
 
         // Only request continuous repaints while playing. When paused, repaint
         // happens on user input (mouse / keyboard / drag) automatically.
-        if self.state.playing {
-            ctx.request_repaint();
-        }
+        // (request_repaint_after above handles the scheduling.)
 
         // Apply modern dark style
         apply_style(ctx);
@@ -1403,6 +1424,7 @@ impl eframe::App for App {
         if self.state.playing && !self.was_playing {
             // Transition: paused → playing. Start playback at the current playhead.
             let sources = build_sources(&self.state);
+            self.prev_audio_source_count = sources.len();
             self.audio_engine.play_sources(&sources, self.state.playhead);
         } else if !self.state.playing && self.was_playing {
             // Transition: playing → paused.
@@ -1410,7 +1432,16 @@ impl eframe::App for App {
         } else if self.state.playing && seeked {
             // Seek while playing — restart from the new position so audio stays in sync.
             let sources = build_sources(&self.state);
+            self.prev_audio_source_count = sources.len();
             self.audio_engine.play_sources(&sources, self.state.playhead);
+        } else if self.state.playing {
+            // Detect new/removed sources mid-playback (e.g., user just dropped
+            // an audio clip on the timeline). Rebuild so the new track is heard.
+            let sources = build_sources(&self.state);
+            if sources.len() != self.prev_audio_source_count {
+                self.prev_audio_source_count = sources.len();
+                self.audio_engine.play_sources(&sources, self.state.playhead);
+            }
         }
 
         self.was_playing = self.state.playing;
