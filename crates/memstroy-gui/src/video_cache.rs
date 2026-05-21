@@ -105,92 +105,20 @@ impl FrameCache {
         rt: &Handle,
         on_done: impl FnOnce(f32, usize, PathBuf) + Send + 'static,
     ) {
-        let ffmpeg = memstroy_render::ffmpeg_binary();
-        // Derive ffprobe path from ffmpeg path (sibling binary)
-        let ffprobe = {
-            let mut p = ffmpeg.clone();
-            p.set_file_name("ffprobe");
-            if !p.exists() {
-                // Fallback: just use "ffprobe" from PATH
-                PathBuf::from("ffprobe")
-            } else {
-                p
-            }
-        };
-
         rt.spawn(async move {
-            // Create temp directory for frames
-            let cache_dir = std::env::temp_dir().join(format!(
-                "memstroy_frames_{}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis()
-            ));
-            if let Err(e) = std::fs::create_dir_all(&cache_dir) {
-                tracing::error!("Failed to create frame cache dir: {e}");
-                return;
-            }
+            extract_frames_blocking(source, on_done);
+        });
+    }
 
-            // Probe duration
-            let duration = match std::process::Command::new(&ffprobe)
-                .args([
-                    "-v", "error",
-                    "-show_entries", "format=duration",
-                    "-of", "default=noprint_wrappers=1:nokey=1",
-                ])
-                .arg(&source)
-                .output()
-            {
-                Ok(out) => {
-                    let s = String::from_utf8_lossy(&out.stdout);
-                    s.trim().parse::<f32>().unwrap_or(10.0)
-                }
-                Err(e) => {
-                    tracing::error!("ffprobe failed: {e}");
-                    10.0
-                }
-            };
-
-            // Extract frames at lower quality/smaller size for speed
-            let output_pattern = cache_dir.join("%06d.jpg");
-            let status = std::process::Command::new(&ffmpeg)
-                .args([
-                    "-y",
-                    "-hide_banner",
-                    "-loglevel", "error",
-                    "-i",
-                ])
-                .arg(&source)
-                .args([
-                    "-vf", "fps=30,scale=480:-1",
-                    "-q:v", "8",
-                ])
-                .arg(&output_pattern)
-                .status();
-
-            match status {
-                Ok(s) if s.success() => {
-                    // Count extracted frames
-                    let frame_count = std::fs::read_dir(&cache_dir)
-                        .map(|rd| rd.filter_map(|e| e.ok()).filter(|e| {
-                            e.path().extension().and_then(|s| s.to_str()) == Some("jpg")
-                        }).count())
-                        .unwrap_or(0);
-
-                    tracing::info!(
-                        "Frame extraction complete: {} frames, {:.1}s duration",
-                        frame_count, duration
-                    );
-                    on_done(duration, frame_count, cache_dir);
-                }
-                Ok(s) => {
-                    tracing::error!("ffmpeg frame extraction exited with: {}", s);
-                }
-                Err(e) => {
-                    tracing::error!("ffmpeg frame extraction failed: {e}");
-                }
-            }
+    /// Same as `start_extraction` but uses a plain OS thread instead of a
+    /// tokio runtime handle. Useful for callers that don't have access to
+    /// the App's runtime (e.g. the Skeleton Constructor side panel).
+    pub fn start_extraction_thread(
+        source: PathBuf,
+        on_done: impl FnOnce(f32, usize, PathBuf) + Send + 'static,
+    ) {
+        thread::spawn(move || {
+            extract_frames_blocking(source, on_done);
         });
     }
 
@@ -694,4 +622,96 @@ fn build_curve_lut(curve: &[[f32; 2]]) -> [u8; 256] {
         *slot = (y * 255.0).round() as u8;
     }
     lut
+}
+
+
+// ─── EXTRACTION HELPER ───────────────────────────────────────────────
+
+/// Synchronously extract frames for a clip via `ffmpeg` and `ffprobe`.
+/// Invoked from background workers (tokio task or std::thread). Calls
+/// `on_done` with the resulting (duration_secs, frame_count, cache_dir)
+/// only on success; errors are logged and the callback is skipped.
+fn extract_frames_blocking(
+    source: PathBuf,
+    on_done: impl FnOnce(f32, usize, PathBuf) + Send + 'static,
+) {
+    let ffmpeg = memstroy_render::ffmpeg_binary();
+    let ffprobe = {
+        let mut p = ffmpeg.clone();
+        p.set_file_name("ffprobe");
+        if !p.exists() {
+            PathBuf::from("ffprobe")
+        } else {
+            p
+        }
+    };
+
+    let cache_dir = std::env::temp_dir().join(format!(
+        "memstroy_frames_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    if let Err(e) = std::fs::create_dir_all(&cache_dir) {
+        tracing::error!("Failed to create frame cache dir: {e}");
+        return;
+    }
+
+    let duration = match std::process::Command::new(&ffprobe)
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+        ])
+        .arg(&source)
+        .output()
+    {
+        Ok(out) => {
+            let s = String::from_utf8_lossy(&out.stdout);
+            s.trim().parse::<f32>().unwrap_or(10.0)
+        }
+        Err(e) => {
+            tracing::error!("ffprobe failed: {e}");
+            10.0
+        }
+    };
+
+    let output_pattern = cache_dir.join("%06d.jpg");
+    let status = std::process::Command::new(&ffmpeg)
+        .args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
+        .arg(&source)
+        .args(["-vf", "fps=30,scale=480:-1", "-q:v", "8"])
+        .arg(&output_pattern)
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {
+            let frame_count = std::fs::read_dir(&cache_dir)
+                .map(|rd| {
+                    rd.filter_map(|e| e.ok())
+                        .filter(|e| {
+                            e.path().extension().and_then(|s| s.to_str()) == Some("jpg")
+                        })
+                        .count()
+                })
+                .unwrap_or(0);
+
+            tracing::info!(
+                "Frame extraction complete: {} frames, {:.1}s duration",
+                frame_count,
+                duration
+            );
+            on_done(duration, frame_count, cache_dir);
+        }
+        Ok(s) => {
+            tracing::error!("ffmpeg frame extraction exited with: {}", s);
+        }
+        Err(e) => {
+            tracing::error!("ffmpeg frame extraction failed: {e}");
+        }
+    }
 }

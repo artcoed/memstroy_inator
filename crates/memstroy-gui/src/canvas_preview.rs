@@ -70,6 +70,12 @@ pub fn canvas_preview(ui: &mut egui::Ui, state: &mut EditorState) {
 
     // ── Fit button overlay ──
     draw_viewport_controls(ui, full_rect, state, viewport_size);
+
+    // ── Snap guidelines for the active drag (drawn last so they're on top) ──
+    draw_snap_guides(&painter, full_rect, state, viewport_size);
+
+    // ── Library drag-to-canvas: visual ghost + drop accept ──
+    handle_canvas_asset_drag(ui, state, full_rect, viewport_size);
 }
 
 /// When the eyedropper is armed and the user clicks on the preview, sample
@@ -1243,6 +1249,7 @@ fn draw_selection_gizmo(
             state.canvas_drag.mode = crate::state::CanvasDragMode::None;
             state.canvas_drag.actor_legacy_snapshot.clear();
             state.canvas_drag.overlay_world_snapshot.clear();
+            state.canvas_drag.snap_guides.clear();
         }
     }
 
@@ -1426,12 +1433,21 @@ fn apply_drag(
         CanvasDragMode::MoveActorWorld { actor_idx, initial_pos } => {
             if actor_idx < state.scene.actors.len() {
                 let actor_id = state.scene.actors[actor_idx].id.clone();
+                let proposed_x = initial_pos[0] + world_dx;
+                let proposed_y = initial_pos[1] + world_dy;
+                let (snapped_x, snapped_y, guides) = snap_world_center(
+                    state,
+                    proposed_x,
+                    proposed_y,
+                    Some(SnapExclude::Actor(actor_idx)),
+                );
+                state.canvas_drag.snap_guides = guides;
                 if let Some(cl) = state.scene.canvas_layouts.iter_mut()
                     .find(|cl| cl.element_id == actor_id)
                 {
                     if let Some(kf) = cl.keyframes.first_mut() {
-                        kf.value.pos.x = initial_pos[0] + world_dx;
-                        kf.value.pos.y = initial_pos[1] + world_dy;
+                        kf.value.pos.x = snapped_x;
+                        kf.value.pos.y = snapped_y;
                     }
                 }
             }
@@ -1444,9 +1460,29 @@ fn apply_drag(
                 let [rw, rh] = rf.resolution;
                 let world_w = rw as f32 / rf_state.zoom;
                 let world_h = rh as f32 / rf_state.zoom;
+
+                // Convert delta to normalized space, then go via world space
+                // for snapping.
+                let proposed_norm_x = initial_pos[0] + world_dx / world_w;
+                let proposed_norm_y = initial_pos[1] + world_dy / world_h;
+                // Map to absolute world coord (legacy norm 0..1 inside render
+                // frame box).
+                let world_x = rf_state.pos.x - world_w * 0.5 + proposed_norm_x * world_w;
+                let world_y = rf_state.pos.y - world_h * 0.5 + proposed_norm_y * world_h;
+                let (snapped_world_x, snapped_world_y, guides) = snap_world_center(
+                    state,
+                    world_x,
+                    world_y,
+                    Some(SnapExclude::Actor(actor_idx)),
+                );
+                state.canvas_drag.snap_guides = guides;
+                let final_norm_x =
+                    (snapped_world_x - (rf_state.pos.x - world_w * 0.5)) / world_w.max(0.0001);
+                let final_norm_y =
+                    (snapped_world_y - (rf_state.pos.y - world_h * 0.5)) / world_h.max(0.0001);
                 if let Some(kf) = state.scene.actors[actor_idx].layout.first_mut() {
-                    kf.value.pos[0] = initial_pos[0] + world_dx / world_w;
-                    kf.value.pos[1] = initial_pos[1] + world_dy / world_h;
+                    kf.value.pos[0] = final_norm_x;
+                    kf.value.pos[1] = final_norm_y;
                 }
             }
         }
@@ -1460,7 +1496,23 @@ fn apply_drag(
                 let world_h = rh as f32 / rf_state.zoom;
                 let dx_norm = world_dx / world_w;
                 let dy_norm = world_dy / world_h;
-                let new_pos = [initial_pos[0] + dx_norm, initial_pos[1] + dy_norm];
+                let proposed_norm_x = initial_pos[0] + dx_norm;
+                let proposed_norm_y = initial_pos[1] + dy_norm;
+                // Run snap in world space (consistent with actor handling).
+                let world_x = rf_state.pos.x - world_w * 0.5 + proposed_norm_x * world_w;
+                let world_y = rf_state.pos.y - world_h * 0.5 + proposed_norm_y * world_h;
+                let (snapped_world_x, snapped_world_y, guides) = snap_world_center(
+                    state,
+                    world_x,
+                    world_y,
+                    Some(SnapExclude::Overlay(overlay_idx)),
+                );
+                state.canvas_drag.snap_guides = guides;
+                let final_norm_x =
+                    (snapped_world_x - (rf_state.pos.x - world_w * 0.5)) / world_w.max(0.0001);
+                let final_norm_y =
+                    (snapped_world_y - (rf_state.pos.y - world_h * 0.5)) / world_h.max(0.0001);
+                let new_pos = [final_norm_x, final_norm_y];
                 match &mut state.scene.overlays[overlay_idx] {
                     Overlay::Text(t) => {
                         if let Some(kf) = t.layout.first_mut() { kf.value.pos = new_pos; }
@@ -2797,4 +2849,305 @@ fn draw_viewport_controls(
         zoom_text, egui::FontId::proportional(9.0),
         Color32::from_rgb(100, 100, 120),
     );
+}
+
+
+
+
+// ─── SNAP HELPERS ────────────────────────────────────────────────────
+
+/// Identifies which element to exclude from the snap-target search so that an
+/// element doesn't snap to itself.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SnapExclude {
+    Actor(usize),
+    Overlay(usize),
+}
+
+/// Snap a proposed world-space CENTER position to the nearest snap target on
+/// each axis. Targets include:
+///   - the render frame's left/center/right (X) and top/center/bottom (Y);
+///   - every other element's centre (actors + overlays).
+///
+/// Threshold is fixed to ~6 screen pixels (converted to world space via the
+/// current zoom) so the snap distance feels consistent regardless of zoom.
+/// Returns the snapped (x, y) and any guides that activated for rendering.
+fn snap_world_center(
+    state: &EditorState,
+    proposed_x: f32,
+    proposed_y: f32,
+    exclude: Option<SnapExclude>,
+) -> (f32, f32, Vec<crate::state::SnapGuide>) {
+    if !state.snap_enabled {
+        return (proposed_x, proposed_y, Vec::new());
+    }
+
+    let zoom = state.canvas_viewport.zoom.max(0.0001);
+    // 6 screen pixels worth of world-space distance.
+    let thresh = 6.0 / zoom;
+
+    let (xs, ys) = collect_snap_targets(state, exclude);
+
+    let mut guides: Vec<crate::state::SnapGuide> = Vec::new();
+    let mut snapped_x = proposed_x;
+    let mut best_x = thresh;
+    for &tx in &xs {
+        let d = (proposed_x - tx).abs();
+        if d < best_x {
+            best_x = d;
+            snapped_x = tx;
+        }
+    }
+    if best_x < thresh {
+        guides.push(crate::state::SnapGuide {
+            axis: crate::state::SnapAxis::Vertical,
+            world: snapped_x,
+        });
+    }
+
+    let mut snapped_y = proposed_y;
+    let mut best_y = thresh;
+    for &ty in &ys {
+        let d = (proposed_y - ty).abs();
+        if d < best_y {
+            best_y = d;
+            snapped_y = ty;
+        }
+    }
+    if best_y < thresh {
+        guides.push(crate::state::SnapGuide {
+            axis: crate::state::SnapAxis::Horizontal,
+            world: snapped_y,
+        });
+    }
+
+    (snapped_x, snapped_y, guides)
+}
+
+/// Collect every world-space X (vertical-line) and Y (horizontal-line) snap
+/// target available in the current scene.
+fn collect_snap_targets(
+    state: &EditorState,
+    exclude: Option<SnapExclude>,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut xs = Vec::new();
+    let mut ys = Vec::new();
+
+    // Render frame edges + centre (the most commonly used alignment lines).
+    let rf = &state.scene.render_frame;
+    let rf_state = sample_render_frame(rf, state.playhead);
+    let [rw, rh] = rf.resolution;
+    let world_w = rw as f32 / rf_state.zoom.max(0.0001);
+    let world_h = rh as f32 / rf_state.zoom.max(0.0001);
+    let cx = rf_state.pos.x;
+    let cy = rf_state.pos.y;
+    xs.push(cx - world_w * 0.5);
+    xs.push(cx);
+    xs.push(cx + world_w * 0.5);
+    ys.push(cy - world_h * 0.5);
+    ys.push(cy);
+    ys.push(cy + world_h * 0.5);
+
+    // Other actors' centres.
+    let t = state.playhead;
+    for (i, actor) in state.scene.actors.iter().enumerate() {
+        if exclude == Some(SnapExclude::Actor(i)) {
+            continue;
+        }
+        let pos = get_element_world_pos(state, &actor.id, &actor.layout, t);
+        xs.push(pos.x);
+        ys.push(pos.y);
+    }
+
+    // Overlays' centres (convert from normalized to world).
+    for (i, ov) in state.scene.overlays.iter().enumerate() {
+        if exclude == Some(SnapExclude::Overlay(i)) {
+            continue;
+        }
+        let layout_first = match ov {
+            Overlay::Text(t) => t.layout.first().map(|kf| kf.value.pos),
+            Overlay::Image(im) => im.layout.first().map(|kf| kf.value.pos),
+            Overlay::Video(v) => v.layout.first().map(|kf| kf.value.pos),
+        };
+        if let Some([nx, ny]) = layout_first {
+            let world_x = cx - world_w * 0.5 + nx * world_w;
+            let world_y = cy - world_h * 0.5 + ny * world_h;
+            xs.push(world_x);
+            ys.push(world_y);
+        }
+    }
+
+    (xs, ys)
+}
+
+/// Draw active snap guidelines as thin yellow lines spanning the full canvas
+/// rect. Called at the end of `canvas_preview` so the lines sit on top of
+/// every element.
+fn draw_snap_guides(
+    painter: &egui::Painter,
+    full_rect: Rect,
+    state: &EditorState,
+    viewport_size: [f32; 2],
+) {
+    if state.canvas_drag.snap_guides.is_empty() {
+        return;
+    }
+    let col = Color32::from_rgb(255, 220, 80);
+    for guide in &state.canvas_drag.snap_guides {
+        match guide.axis {
+            crate::state::SnapAxis::Vertical => {
+                let s = state
+                    .canvas_viewport
+                    .world_to_screen(WorldPos { x: guide.world, y: 0.0 }, viewport_size);
+                let sx = full_rect.min.x + s[0];
+                if sx >= full_rect.min.x && sx <= full_rect.max.x {
+                    painter.line_segment(
+                        [
+                            Pos2::new(sx, full_rect.min.y),
+                            Pos2::new(sx, full_rect.max.y),
+                        ],
+                        Stroke::new(1.0, col),
+                    );
+                }
+            }
+            crate::state::SnapAxis::Horizontal => {
+                let s = state
+                    .canvas_viewport
+                    .world_to_screen(WorldPos { x: 0.0, y: guide.world }, viewport_size);
+                let sy = full_rect.min.y + s[1];
+                if sy >= full_rect.min.y && sy <= full_rect.max.y {
+                    painter.line_segment(
+                        [
+                            Pos2::new(full_rect.min.x, sy),
+                            Pos2::new(full_rect.max.x, sy),
+                        ],
+                        Stroke::new(1.0, col),
+                    );
+                }
+            }
+        }
+    }
+}
+
+
+// ─── LIBRARY DRAG-TO-CANVAS ──────────────────────────────────────────
+
+/// Render a floating preview card next to the cursor while a library clip
+/// is being dragged over the canvas, plus accept the drop and add the actor
+/// at the cursor's world position. Mirrors the timeline drag-ghost so the
+/// drop position can be picked freely on either panel.
+pub fn handle_canvas_asset_drag(
+    ui: &mut egui::Ui,
+    state: &mut EditorState,
+    full_rect: Rect,
+    viewport_size: [f32; 2],
+) {
+    if state.asset_drag.dragging.is_none() {
+        return;
+    }
+
+    let pointer_pos = ui.input(|i| i.pointer.hover_pos());
+    let in_canvas = pointer_pos.map(|p| full_rect.contains(p)).unwrap_or(false);
+
+    // Only render the ghost while the cursor is over the canvas (otherwise
+    // the timeline is responsible for it).
+    if !in_canvas {
+        return;
+    }
+
+    let drag_pos = pointer_pos.unwrap();
+    state.asset_drag.pos = [drag_pos.x, drag_pos.y];
+
+    // Translucent crosshair at the proposed drop point.
+    let painter = ui.painter_at(full_rect);
+    painter.circle_stroke(
+        drag_pos,
+        18.0,
+        Stroke::new(1.5, Color32::from_rgb(255, 220, 80)),
+    );
+    painter.line_segment(
+        [
+            Pos2::new(drag_pos.x - 24.0, drag_pos.y),
+            Pos2::new(drag_pos.x + 24.0, drag_pos.y),
+        ],
+        Stroke::new(1.0, Color32::from_rgba_premultiplied(255, 220, 80, 180)),
+    );
+    painter.line_segment(
+        [
+            Pos2::new(drag_pos.x, drag_pos.y - 24.0),
+            Pos2::new(drag_pos.x, drag_pos.y + 24.0),
+        ],
+        Stroke::new(1.0, Color32::from_rgba_premultiplied(255, 220, 80, 180)),
+    );
+
+    // Floating thumbnail card next to the cursor.
+    let card_w = 180.0_f32;
+    let card_h = 56.0_f32;
+    let anchor = drag_pos + egui::vec2(20.0, 16.0);
+    let card_rect = Rect::from_min_size(anchor, Vec2::new(card_w, card_h));
+    painter.rect_filled(
+        card_rect,
+        Rounding::same(6.0),
+        Color32::from_rgba_premultiplied(20, 20, 30, 230),
+    );
+    painter.rect_stroke(
+        card_rect,
+        Rounding::same(6.0),
+        Stroke::new(1.5, Color32::from_rgb(255, 200, 50)),
+    );
+    let thumb_size = Vec2::splat(48.0);
+    let thumb_rect = Rect::from_min_size(card_rect.min + egui::vec2(4.0, 4.0), thumb_size);
+    if let Some(thumb) = &state.asset_drag.thumbnail {
+        let uri = format!("file://{}", thumb.display());
+        let img = egui::Image::from_uri(uri)
+            .fit_to_exact_size(thumb_size)
+            .maintain_aspect_ratio(false)
+            .rounding(Rounding::same(3.0))
+            .tint(Color32::from_white_alpha(220));
+        img.paint_at(ui, thumb_rect);
+    } else {
+        painter.rect_filled(thumb_rect, Rounding::same(3.0), Color32::from_rgb(40, 40, 60));
+        painter.text(
+            thumb_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "\u{1F3AC}",
+            egui::FontId::proportional(24.0),
+            Color32::from_rgb(255, 200, 50),
+        );
+    }
+    let label = if state.asset_drag.label.is_empty() {
+        "Drop on canvas".to_string()
+    } else {
+        state.asset_drag.label.clone()
+    };
+    let text_anchor = thumb_rect.right_top() + egui::vec2(6.0, 4.0);
+    painter.text(
+        text_anchor,
+        egui::Align2::LEFT_TOP,
+        label,
+        egui::FontId::proportional(11.0),
+        Color32::from_rgb(220, 220, 240),
+    );
+    painter.text(
+        text_anchor + egui::vec2(0.0, 18.0),
+        egui::Align2::LEFT_TOP,
+        "drop here to place at cursor",
+        egui::FontId::proportional(9.0),
+        Color32::from_rgb(160, 160, 180),
+    );
+
+    // ── Accept drop on release ──
+    let mouse_released = ui.input(|i| i.pointer.any_released());
+    if mouse_released {
+        let world = state
+            .canvas_viewport
+            .screen_to_world([drag_pos.x - full_rect.min.x, drag_pos.y - full_rect.min.y], viewport_size);
+        let asset_path = state.asset_drag.dragging.clone().unwrap();
+        crate::panels::add_actor_from_clip_at_canvas(state, &asset_path, [world.x, world.y]);
+
+        state.asset_drag.dragging = None;
+        state.asset_drag.kind = crate::state::AssetDragKind::None;
+        state.asset_drag.label.clear();
+        state.asset_drag.thumbnail = None;
+    }
 }
