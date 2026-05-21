@@ -7,7 +7,7 @@ use egui::{Color32, RichText, ViewportCommand, Rounding, Stroke, Vec2};
 use memstroy_core::Scene;
 use tokio::runtime::Runtime;
 
-use crate::jobs::{spawn_preview, spawn_refresh, spawn_render, JobEvent};
+use crate::jobs::{spawn_refresh, spawn_render, JobEvent};
 use crate::node_editor::NodeEditor;
 use crate::panels;
 use crate::state::{EditorState, Selection};
@@ -81,19 +81,10 @@ impl App {
         }
     }
 
-    fn pump_events(&mut self, ctx: &egui::Context) {
+    fn pump_events(&mut self, _ctx: &egui::Context) {
         while let Ok(ev) = self.rx.try_recv() {
             match ev {
                 JobEvent::Status(s) => self.state.status = s,
-                JobEvent::PreviewReady(p) => {
-                    self.state.last_preview = Some(p);
-                    self.state.preview_rendering = false;
-                    ctx.forget_all_images();
-                }
-                JobEvent::PreviewFailed(e) => {
-                    self.state.preview_rendering = false;
-                    self.state.status = format!("\u{274C} Preview failed: {}", e);
-                }
                 JobEvent::RenderLog(line) => {
                     if let Some(rp) = self.state.render_progress.as_mut() {
                         rp.last_log = line.clone();
@@ -196,16 +187,34 @@ impl App {
                     ui.close_menu();
                 }
                 ui.separator();
+                if ui.button("\u{1F3B5} Add audio...").clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Audio", &["mp3", "wav", "ogg", "flac", "aac", "m4a"])
+                        .pick_file()
+                    {
+                        let id = path.file_stem().and_then(|s| s.to_str())
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| format!("audio_{}", self.state.scene.audio.len() + 1));
+                        self.state.scene.audio.push(memstroy_core::AudioTrack {
+                            id: id.clone(),
+                            source: path,
+                            t_in: self.state.playhead,
+                            t_out: None,
+                            source_start: 0.0,
+                            volume: 1.0,
+                        });
+                        self.state.selection = Selection::Audio(self.state.scene.audio.len() - 1);
+                        self.state.status = format!("\u{1F3B5} Added audio: {}", id);
+                    }
+                    ui.close_menu();
+                }
+                ui.separator();
                 if ui.button("\u{1F6AA} Exit").clicked() {
                     ctx.send_viewport_cmd(ViewportCommand::Close);
                 }
             });
 
             ui.menu_button(RichText::new("\u{1F3AC} Render").strong(), |ui| {
-                if ui.button("\u{1F5BC} Preview frame").clicked() {
-                    self.run_preview();
-                    ui.close_menu();
-                }
                 if ui.button("\u{1F3A5} Render full clip...").clicked() {
                     self.run_render();
                     ui.close_menu();
@@ -751,22 +760,6 @@ impl App {
                 Err(e) => self.state.status = format!("\u{274C} Save failed: {e}"),
             }
         }
-    }
-
-    fn run_preview(&mut self) {
-        let out = std::env::temp_dir().join(format!(
-            "memstroy_preview_{}.png",
-            chrono::Utc::now().timestamp_millis()
-        ));
-        spawn_preview(
-            self.rt.handle(),
-            self.tx.clone(),
-            self.state.scene.clone(),
-            self.state.assets_root.clone(),
-            self.state.playhead,
-            out,
-        );
-        self.state.status = "\u{1F5BC} Rendering preview...".into();
     }
 
     fn run_render(&mut self) {

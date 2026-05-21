@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 
 use memstroy_core::Scene;
-use memstroy_render::{render_preview_frame, render_scene, ffmpeg_binary};
+use memstroy_render::{render_scene, ffmpeg_binary};
 use memstroy_tg::download::incremental_refresh;
 use tokio::runtime::Handle;
 use tracing::{info, warn};
@@ -14,8 +14,6 @@ use tracing::{info, warn};
 #[allow(dead_code)]
 pub enum JobEvent {
     Status(String),
-    PreviewReady(PathBuf),
-    PreviewFailed(String),
     RenderLog(String),
     RenderFinished(Result<PathBuf, String>),
     RefreshProgress(String),
@@ -27,27 +25,6 @@ pub struct RefreshSummary {
     pub new_clips: usize,
     pub total_clips: usize,
     pub failed: usize,
-}
-
-pub fn spawn_preview(
-    rt: &Handle,
-    tx: Sender<JobEvent>,
-    scene: Scene,
-    assets: PathBuf,
-    t: f32,
-    out_png: PathBuf,
-) {
-    rt.spawn(async move {
-        match render_preview_frame(&scene, &assets, t, &out_png).await {
-            Ok(()) => {
-                let _ = tx.send(JobEvent::PreviewReady(out_png));
-            }
-            Err(e) => {
-                warn!(error = %e, "preview render failed");
-                let _ = tx.send(JobEvent::PreviewFailed(e.to_string()));
-            }
-        }
-    });
 }
 
 pub fn spawn_render(
