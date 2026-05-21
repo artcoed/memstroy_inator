@@ -218,6 +218,7 @@ fn starter_scene() -> Scene {
         z_index: 100,
         behind_actors: false,
         effects: Vec::new(),
+        animated_params: Default::default(),
     });
     Scene {
         format_version: 1,

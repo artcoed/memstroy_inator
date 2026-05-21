@@ -79,6 +79,16 @@ pub struct SkeletonEditorState {
     /// keyframe range of that point and loops back to the first keyframe
     /// at the end. Used by the "Track" toggle in the point list.
     pub track_loop_point: Option<String>,
+    /// Whether the skeleton-editor playhead loops back to start when it
+    /// reaches the end of the clip. Mirrors the main timeline's Loop
+    /// button. When `false`, playback pauses at the last frame.
+    pub loop_playback: bool,
+    /// Per-point reference image used as a visual guide on the preview.
+    /// The user picks an image from the project library so they can
+    /// align a point under a feature (e.g. the centre of a hat). The
+    /// guide is **not saved** to the skeleton template — only the
+    /// point's screen coordinates / keyframes are persisted.
+    pub point_guide_images: std::collections::HashMap<String, std::path::PathBuf>,
     /// Auto-name counter; bumps every time a nameless point is added so
     /// the user doesn't need to think up a name to start placing.
     pub name_counter: u32,
@@ -108,6 +118,8 @@ impl Default for SkeletonEditorState {
             playing: false,
             last_play_tick: None,
             track_loop_point: None,
+            loop_playback: true,
+            point_guide_images: std::collections::HashMap::new(),
             name_counter: 0,
             fitted_for_duration: 0.0,
         }
@@ -208,7 +220,13 @@ fn advance_playback(ctx: &egui::Context, state: &mut EditorState) {
 
     t += dt;
     if t >= hi {
-        t = lo;
+        if state.skeleton_editor.loop_playback {
+            t = lo;
+        } else {
+            // Stop at the last frame instead of looping.
+            t = hi.max(0.0);
+            state.skeleton_editor.playing = false;
+        }
     }
     let frame = (t * fps).round() as u32;
     state.skeleton_editor.current_frame = frame.min(total.saturating_sub(1));
@@ -745,6 +763,32 @@ fn frame_preview(ui: &mut egui::Ui, state: &mut EditorState, width: f32, height:
         ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
     }
 
+    // ── Draw the per-point guide image (if any) BEFORE the points so
+    // the markers stay on top. The image is centred on the point's
+    // current sampled position, sized at ~25% of the preview width, and
+    // drawn with reduced alpha so the underlying frame stays visible.
+    if let Some(tmpl_idx) = state.skeleton_editor.template_idx {
+        let template = &state.scene.skeleton_templates[tmpl_idx];
+        for (name, point) in &template.points {
+            if let Some(img_path) = state.skeleton_editor.point_guide_images.get(name) {
+                let ps = sample_point_at(point, t);
+                let cx = rect.min.x + ps.x * rect.width();
+                let cy = rect.min.y + ps.y * rect.height();
+                let size = (rect.width() * 0.22).clamp(40.0, 240.0);
+                let img_rect = egui::Rect::from_center_size(
+                    Pos2::new(cx, cy),
+                    Vec2::splat(size),
+                );
+                let uri = format!("file://{}", img_path.display());
+                let img = egui::Image::from_uri(uri)
+                    .fit_to_exact_size(Vec2::splat(size))
+                    .maintain_aspect_ratio(true)
+                    .tint(Color32::from_rgba_unmultiplied(255, 255, 255, 140));
+                img.paint_at(ui, img_rect);
+            }
+        }
+    }
+
     // Draw skeleton points on top of the frame.
     if let Some(tmpl_idx) = state.skeleton_editor.template_idx {
         let template = &state.scene.skeleton_templates[tmpl_idx];
@@ -881,6 +925,25 @@ fn transport_bar(ui: &mut egui::Ui, state: &mut EditorState) {
                 resp.on_hover_text(format!("Looping over '{}'", name));
             });
         }
+
+        // ── Loop toggle (mirrors the main timeline's Loop button) ──
+        // When ON the playhead wraps to 0 once it reaches the end of the
+        // clip; when OFF playback pauses at the last frame.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let on = state.skeleton_editor.loop_playback;
+            let col = if on {
+                Color32::from_rgb(255, 180, 80)
+            } else {
+                COL_TEXT_DIM
+            };
+            let btn = egui::Button::new(RichText::new("\u{1F501} Loop").size(11.0).color(col));
+            if ui.add(btn)
+                .on_hover_text("Loop playback (wrap to start at end of clip)")
+                .clicked()
+            {
+                state.skeleton_editor.loop_playback = !state.skeleton_editor.loop_playback;
+            }
+        });
     });
 }
 
@@ -1441,9 +1504,146 @@ fn point_list_panel(ui: &mut egui::Ui, state: &mut EditorState) {
         {
             state.skeleton_editor.selected_keyframe = None;
         }
+        state.skeleton_editor.point_guide_images.remove(&name);
         let _ = state.scene.skeleton_templates[tmpl_idx].save_alongside_clip();
         state.status = format!("Removed point: {}", name);
     }
+
+    // ── Guide image picker for the currently selected point ──
+    point_guide_image_panel(ui, state);
+}
+
+/// Per-point image guide UI. The chosen image is shown semi-transparently
+/// behind the point on the preview frame so the user can place the point
+/// precisely where the feature it represents (a hat, a hand, etc.) sits.
+/// The image is **not saved** to the skeleton template — it's a purely
+/// visual aid stored in the editor's session memory.
+fn point_guide_image_panel(ui: &mut egui::Ui, state: &mut EditorState) {
+    ui.add_space(8.0);
+    ui.separator();
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new("Guide image")
+            .size(12.0)
+            .strong()
+            .color(Color32::from_rgb(180, 180, 230)),
+    );
+    ui.label(
+        RichText::new(
+            "Pick a sticker from the Images library to overlay behind the selected point. \
+             Helpful for aligning a point under a feature. Not saved to the template.",
+        )
+        .size(9.0)
+        .color(COL_TEXT_DIM)
+        .italics(),
+    );
+    ui.add_space(4.0);
+
+    let Some(point_name) = state.skeleton_editor.selected_point.clone() else {
+        ui.label(
+            RichText::new("Select a point first.")
+                .size(10.0)
+                .italics()
+                .color(COL_TEXT_DIM),
+        );
+        return;
+    };
+
+    let current = state
+        .skeleton_editor
+        .point_guide_images
+        .get(&point_name)
+        .cloned();
+    if let Some(p) = &current {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!(
+                    "\u{1F5BC} {}",
+                    p.file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("image"),
+                ))
+                .size(10.0)
+                .color(COL_TEXT),
+            );
+            if ui
+                .small_button("clear")
+                .on_hover_text("Remove the guide image")
+                .clicked()
+            {
+                state
+                    .skeleton_editor
+                    .point_guide_images
+                    .remove(&point_name);
+            }
+        });
+        ui.add_space(2.0);
+    }
+
+    // Library list — clicking a row sets the guide. Scroll vertically when
+    // the library is large.
+    let images: Vec<crate::state::LibraryAsset> = state.library.images.clone();
+    if images.is_empty() {
+        ui.label(
+            RichText::new("Library has no images. Drop PNGs into assets/images/ then Refresh.")
+                .size(9.0)
+                .italics()
+                .color(COL_TEXT_DIM),
+        );
+        return;
+    }
+    egui::ScrollArea::vertical()
+        .id_source("skeleton_guide_picker")
+        .max_height(160.0)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            for asset in images.iter() {
+                let is_chosen = current.as_ref() == Some(&asset.path);
+                let row_bg = if is_chosen {
+                    Color32::from_rgb(50, 50, 80)
+                } else {
+                    Color32::TRANSPARENT
+                };
+                let resp = egui::Frame::none()
+                    .fill(row_bg)
+                    .rounding(Rounding::same(3.0))
+                    .inner_margin(egui::Margin::same(3.0))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            if let Some(thumb) = &asset.thumbnail {
+                                let uri = format!("file://{}", thumb.display());
+                                ui.add(
+                                    egui::Image::from_uri(uri)
+                                        .fit_to_exact_size(Vec2::splat(28.0))
+                                        .maintain_aspect_ratio(true)
+                                        .rounding(Rounding::same(2.0)),
+                                );
+                            } else {
+                                let (r, _) = ui.allocate_exact_size(
+                                    Vec2::splat(28.0),
+                                    Sense::hover(),
+                                );
+                                ui.painter().rect_filled(
+                                    r,
+                                    Rounding::same(2.0),
+                                    Color32::from_rgb(40, 40, 50),
+                                );
+                            }
+                            ui.label(
+                                RichText::new(&asset.label).size(10.0).color(COL_TEXT),
+                            );
+                        });
+                    })
+                    .response
+                    .interact(Sense::click());
+                if resp.clicked() {
+                    state
+                        .skeleton_editor
+                        .point_guide_images
+                        .insert(point_name.clone(), asset.path.clone());
+                }
+            }
+        });
 }
 
 /// Pick the next free `pN` name and add the point.

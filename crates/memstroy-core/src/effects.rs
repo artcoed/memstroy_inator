@@ -24,6 +24,25 @@ pub struct Effect {
     #[serde(default = "default_one")]
     pub intensity: f32,
     pub kind: EffectKind,
+
+    /// Per-effect-parameter keyframe tracks. Keyed by a string param id
+    /// such as `"intensity"`, `"radius"`, or `"amount"` so the same map
+    /// works for every `EffectKind` variant. When a key is present
+    /// AND the corresponding entry in `animated_params` is set, the
+    /// renderer should `keyframe::sample(track, t)` to obtain the
+    /// time-varying value; otherwise the static value on the variant /
+    /// the `intensity` field is used.
+    ///
+    /// NOTE: full renderer support for animated effect params is a
+    /// future extension; the inspector's per-param "Animated" toggle
+    /// stores the user's intent here so the wiring lands incrementally.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub param_kfs: std::collections::BTreeMap<String, Vec<crate::keyframe::Keyframe<f32>>>,
+
+    /// Set of effect-parameter ids the user has flagged as animatable
+    /// for this effect (mirrors the per-element `animated_params`).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub animated_params: std::collections::BTreeSet<String>,
 }
 
 fn default_true() -> bool { true }
@@ -35,6 +54,8 @@ impl Default for Effect {
             enabled: true,
             intensity: 1.0,
             kind: EffectKind::default(),
+            param_kfs: std::collections::BTreeMap::new(),
+            animated_params: std::collections::BTreeSet::new(),
         }
     }
 }
@@ -132,7 +153,13 @@ impl EffectKind {
 
 impl Effect {
     pub fn new(kind: EffectKind) -> Self {
-        Self { enabled: true, intensity: 1.0, kind }
+        Self {
+            enabled: true,
+            intensity: 1.0,
+            kind,
+            param_kfs: std::collections::BTreeMap::new(),
+            animated_params: std::collections::BTreeSet::new(),
+        }
     }
 
     /// Convenience constructors for the most-used presets. Used by the

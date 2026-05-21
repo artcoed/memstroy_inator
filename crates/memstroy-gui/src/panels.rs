@@ -44,6 +44,11 @@ const COL_SELECTED: Color32 = Color32::from_rgb(255, 220, 80);
 /// model — picking up an entry sets `state.asset_drag` and the canvas /
 /// timeline drop targets handle the rest.
 pub fn library(ui: &mut egui::Ui, state: &mut EditorState, _request_refresh: impl Fn()) {
+    // Capture the panel rect so the OS-level file-drop handler in `app.rs`
+    // can route drops onto this region into the Videos / Images / Sounds
+    // sub-folder rather than dropping straight onto the timeline.
+    state.library_panel_rect = Some(ui.max_rect());
+
     // Header
     ui.horizontal(|ui| {
         ui.label(RichText::new("Library").size(16.0).strong());
@@ -58,11 +63,12 @@ pub fn library(ui: &mut egui::Ui, state: &mut EditorState, _request_refresh: imp
     });
     ui.add_space(4.0);
 
-    // Tab bar — Clips / Sounds / Images / Particles. Sticky across
+    // Tab bar — Clips / Videos / Sounds / Images / Particles. Sticky across
     // sessions via `state.library_tab`.
     ui.horizontal_wrapped(|ui| {
         let tabs = [
             (LibraryTab::Clips,    "\u{1F3AC} Clips"),
+            (LibraryTab::Videos,   "\u{1F4FD} Videos"),
             (LibraryTab::Sounds,   "\u{1F50A} Sounds"),
             (LibraryTab::Images,   "\u{1F5BC} Images"),
             (LibraryTab::Particles, "\u{2728} Particles"),
@@ -83,9 +89,10 @@ pub fn library(ui: &mut egui::Ui, state: &mut EditorState, _request_refresh: imp
     ui.add_space(2.0);
 
     let hint_text = match state.library_tab {
-        LibraryTab::Clips => "Drag a clip onto the canvas or timeline. Files dropped from your file manager work too.",
-        LibraryTab::Sounds => "Drop a sound onto the timeline to add it as an audio track.",
-        LibraryTab::Images => "Drag a sticker onto the canvas to add it as an image overlay.",
+        LibraryTab::Clips => "Drag a clip onto the canvas or timeline. Drop video files here from your file manager to import them into the Videos tab.",
+        LibraryTab::Videos => "User-imported videos. Drop a video file from your file manager into this panel to add it. Drag a row onto the canvas or timeline to spawn an actor.",
+        LibraryTab::Sounds => "Drop a sound onto the timeline to add it as an audio track. Drop audio files from your file manager here to import.",
+        LibraryTab::Images => "Drag a sticker onto the canvas to add it as an image overlay. Drop image files from your file manager here to import.",
         LibraryTab::Particles => "Drag a particle onto the canvas — it spawns with spin + pulse modifiers.",
     };
     ui.label(
@@ -98,6 +105,7 @@ pub fn library(ui: &mut egui::Ui, state: &mut EditorState, _request_refresh: imp
 
     match state.library_tab {
         LibraryTab::Clips => library_clips_tab(ui, state),
+        LibraryTab::Videos => library_assets_tab(ui, state, AssetDragKind::Video),
         LibraryTab::Sounds => library_assets_tab(ui, state, AssetDragKind::Sound),
         LibraryTab::Images => library_assets_tab(ui, state, AssetDragKind::Image),
         LibraryTab::Particles => library_assets_tab(ui, state, AssetDragKind::Particle),
@@ -145,8 +153,8 @@ fn library_clips_tab(ui: &mut egui::Ui, state: &mut EditorState) {
         });
 }
 
-/// Render a generic LibraryAsset list (sounds / images / particles).
-/// All three share the same row layout — only the title colour and the
+/// Render a generic LibraryAsset list (sounds / images / particles / videos).
+/// All four share the same row layout — only the title colour and the
 /// drop semantics differ, which we encode via `AssetDragKind`.
 fn library_assets_tab(ui: &mut egui::Ui, state: &mut EditorState, kind: AssetDragKind) {
     let (title, dir, title_color) = match kind {
@@ -165,6 +173,11 @@ fn library_assets_tab(ui: &mut egui::Ui, state: &mut EditorState, kind: AssetDra
             state.particles_dir(),
             Color32::from_rgb(255, 220, 120),
         ),
+        AssetDragKind::Video => (
+            "Videos",
+            state.videos_dir(),
+            Color32::from_rgb(220, 130, 50),
+        ),
         // Reused for clips elsewhere; not expected here.
         _ => return,
     };
@@ -173,6 +186,7 @@ fn library_assets_tab(ui: &mut egui::Ui, state: &mut EditorState, kind: AssetDra
         AssetDragKind::Sound => &state.library.sounds,
         AssetDragKind::Image => &state.library.images,
         AssetDragKind::Particle => &state.library.particles,
+        AssetDragKind::Video => &state.library.videos,
         _ => return,
     };
 
@@ -259,6 +273,7 @@ fn library_asset_card(
                     AssetDragKind::Sound => "\u{1F50A}",
                     AssetDragKind::Image => "\u{1F5BC}",
                     AssetDragKind::Particle => "\u{2728}",
+                    AssetDragKind::Video => "\u{1F4FD}",
                     _ => "?",
                 };
                 ui.painter().text(
@@ -335,6 +350,7 @@ pub(crate) fn add_library_asset_at_playhead(
                 modifiers: Vec::new(),
                 skeleton_attachment: None,
                 effects: Vec::new(),
+                animated_params: Default::default(),
             });
             state.scene.overlays.push(overlay);
             state.selection = Selection::Overlay(state.scene.overlays.len() - 1);
@@ -374,10 +390,18 @@ pub(crate) fn add_library_asset_at_playhead(
                 modifiers,
                 skeleton_attachment: None,
                 effects: Vec::new(),
+                animated_params: Default::default(),
             });
             state.scene.overlays.push(overlay);
             state.selection = Selection::Overlay(state.scene.overlays.len() - 1);
             state.status = format!("Added particle: {}", asset.id);
+        }
+        AssetDragKind::Video => {
+            // Treat a Video drop the same way as a Clip from the
+            // Mellstroy library — spawn an actor from the path. The
+            // helper handles per-clip chroma/skeleton sidecars and
+            // creates a bound audio track.
+            add_actor_from_clip(state, &asset.path);
         }
         AssetDragKind::Clip | AssetDragKind::None => {}
     }
@@ -566,98 +590,174 @@ fn inspector_actor(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
 
 
 fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
+    use crate::kf_anim;
+    use memstroy_core::param_ids;
+
     let playhead = state.playhead;
     let a = &mut state.scene.actors[i];
 
     ui.label(RichText::new("Position & Scale").size(12.0).strong());
     ui.add_space(4.0);
 
-    // Edit the keyframe at the playhead time directly. This is the
-    // canvas-first authoring loop: scrub to a time, drag values here
-    // (or on the canvas) → animation appears. When no keyframe exists
-    // at the current playhead an interpolated one is auto-inserted on
-    // first edit so the user never has to click "+ Key" first.
-    if a.layout.is_empty() {
-        a.layout.push(Keyframe::new(0.0, ActorState::default()));
+    // Sample the eased current value at the playhead — this is read-only
+    // and never mutates `layout`. The widget below is bound to a temp
+    // copy, and only `.changed()` triggers a write through `kf_anim`.
+    let cur = kf_anim::sample_actor(&a.layout, playhead);
+
+    let kf_count = a.layout.len();
+    if kf_count <= 1 {
+        ui.label(
+            RichText::new("Static value (no keyframes yet)")
+                .size(9.0).color(COL_TEXT_DIM).italics(),
+        );
+    } else {
+        ui.label(
+            RichText::new(format!("{} keyframes \u{2022} {} animated params",
+                kf_count, a.animated_params.len()))
+                .size(9.0).color(COL_TEXT_DIM).italics(),
+        );
     }
-    let kf_idx = match ensure_actor_kf_at_playhead_inspector(&mut a.layout, playhead) {
-        Some(i) => i,
-        None => return,
-    };
-    if let Some(kf) = a.layout.get_mut(kf_idx) {
-        if (kf.t - playhead).abs() > 1.0e-3 && playhead > 0.0 {
-            ui.label(
-                RichText::new(format!("Editing keyframe @ {:.2}s", kf.t))
-                    .size(9.0).color(COL_TEXT_DIM).italics(),
-            );
-        } else {
-            ui.label(
-                RichText::new(format!("Keyframe @ {:.2}s", kf.t))
-                    .size(9.0).color(COL_TEXT_DIM).italics(),
-            );
+
+    let highlight = state.kf_highlight.clone();
+
+    // ── Position X / Y ──
+    let mut new_x = cur.pos[0];
+    let mut new_y = cur.pos[1];
+    ui.horizontal(|ui| {
+        kf_anim::animated_toggle(ui, &mut a.animated_params, param_ids::POS_X, ("act_pos_x", i));
+        ui.label(param_label(highlight.is_active(param_ids::POS_X), "X:"));
+        let r = ui.add(egui::DragValue::new(&mut new_x).range(-2.0..=3.0).speed(0.005));
+        if r.changed() {
+            kf_anim::write_actor_param(
+                &mut a.layout, &mut a.animated_params, playhead,
+                param_ids::POS_X, false,
+                |s| s.pos[0] = new_x);
         }
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("X:").size(11.0));
-            ui.add(egui::DragValue::new(&mut kf.value.pos[0]).range(-2.0..=3.0).speed(0.005));
-            ui.label(RichText::new("Y:").size(11.0));
-            ui.add(egui::DragValue::new(&mut kf.value.pos[1]).range(-2.0..=3.0).speed(0.005));
-        });
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Scale:").size(11.0));
-            ui.add(egui::Slider::new(&mut kf.value.scale, 0.05..=5.0).logarithmic(true));
-        });
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Stretch Y:").size(11.0))
-                .on_hover_text("Y-axis stretch on top of uniform scale (1.0 = proportional)");
-            ui.add(egui::Slider::new(&mut kf.value.scale_y, 0.1..=5.0).logarithmic(true));
-            if ui.small_button("\u{21BB}").on_hover_text("Reset to 1.0 (proportional)").clicked() {
-                kf.value.scale_y = 1.0;
+        kf_anim::animated_toggle(ui, &mut a.animated_params, param_ids::POS_Y, ("act_pos_y", i));
+        ui.label(param_label(highlight.is_active(param_ids::POS_Y), "Y:"));
+        let r = ui.add(egui::DragValue::new(&mut new_y).range(-2.0..=3.0).speed(0.005));
+        if r.changed() {
+            kf_anim::write_actor_param(
+                &mut a.layout, &mut a.animated_params, playhead,
+                param_ids::POS_Y, false,
+                |s| s.pos[1] = new_y);
+        }
+    });
+
+    // ── Scale ──
+    let mut new_scale = cur.scale;
+    ui.horizontal(|ui| {
+        kf_anim::animated_toggle(ui, &mut a.animated_params, param_ids::SCALE, ("act_scale", i));
+        ui.label(param_label(highlight.is_active(param_ids::SCALE), "Scale:"));
+        let r = ui.add(egui::Slider::new(&mut new_scale, 0.05..=5.0).logarithmic(true));
+        if r.changed() {
+            kf_anim::write_actor_param(
+                &mut a.layout, &mut a.animated_params, playhead,
+                param_ids::SCALE, false,
+                |s| s.scale = new_scale);
+        }
+    });
+
+    // ── Stretch Y ──
+    let mut new_scale_y = cur.scale_y;
+    ui.horizontal(|ui| {
+        kf_anim::animated_toggle(ui, &mut a.animated_params, param_ids::SCALE_Y, ("act_sy", i));
+        ui.label(param_label(highlight.is_active(param_ids::SCALE_Y), "Stretch Y:"))
+            .on_hover_text("Y-axis stretch on top of uniform scale (1.0 = proportional)");
+        let r = ui.add(egui::Slider::new(&mut new_scale_y, 0.1..=5.0).logarithmic(true));
+        if r.changed() {
+            kf_anim::write_actor_param(
+                &mut a.layout, &mut a.animated_params, playhead,
+                param_ids::SCALE_Y, false,
+                |s| s.scale_y = new_scale_y);
+        }
+        if ui.small_button("\u{21BB}").on_hover_text("Reset to 1.0 (proportional)").clicked() {
+            kf_anim::write_actor_param(
+                &mut a.layout, &mut a.animated_params, playhead,
+                param_ids::SCALE_Y, false,
+                |s| s.scale_y = 1.0);
+        }
+    });
+
+    // ── Rotation (dial + numeric) ──
+    let mut new_rot = cur.rotation_deg;
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        kf_anim::animated_toggle(ui, &mut a.animated_params, param_ids::ROTATION, ("act_rot", i));
+        ui.label(param_label(highlight.is_active(param_ids::ROTATION), "Rotation"));
+        let prev_rot = new_rot;
+        circular_rotation_widget(ui, ("actor_rot", i), &mut new_rot, 90.0);
+        let mut dial_changed = (new_rot - prev_rot).abs() > 1.0e-4;
+        ui.vertical(|ui| {
+            let r = ui.add(
+                egui::DragValue::new(&mut new_rot)
+                    .range(-3600.0..=3600.0)
+                    .speed(0.5)
+                    .suffix("\u{00B0}")
+                    .fixed_decimals(1),
+            );
+            if r.changed() { dial_changed = true; }
+            if ui.small_button("0\u{00B0}").clicked() {
+                new_rot = 0.0;
+                dial_changed = true;
             }
         });
+        if dial_changed {
+            kf_anim::write_actor_param(
+                &mut a.layout, &mut a.animated_params, playhead,
+                param_ids::ROTATION, false,
+                |s| s.rotation_deg = new_rot);
+        }
+    });
 
-        // Rotation — circular dial (replaces the old slider). Click and
-        // drag anywhere on the disk to set the angle directly; double-
-        // click resets to 0°.
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Rotation").size(11.0));
-            circular_rotation_widget(ui, ("actor_rot", i), &mut kf.value.rotation_deg, 90.0);
-            ui.vertical(|ui| {
-                ui.add(
-                    egui::DragValue::new(&mut kf.value.rotation_deg)
-                        .range(-3600.0..=3600.0)
-                        .speed(0.5)
-                        .suffix("\u{00B0}")
-                        .fixed_decimals(1),
-                );
-                if ui.small_button("0\u{00B0}").clicked() { kf.value.rotation_deg = 0.0; }
-            });
-        });
+    // ── Opacity ──
+    let mut new_op = cur.opacity;
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        kf_anim::animated_toggle(ui, &mut a.animated_params, param_ids::OPACITY, ("act_op", i));
+        ui.label(param_label(highlight.is_active(param_ids::OPACITY), "Opacity:"));
+        let r = ui.add(egui::Slider::new(&mut new_op, 0.0..=1.0));
+        if r.changed() {
+            kf_anim::write_actor_param(
+                &mut a.layout, &mut a.animated_params, playhead,
+                param_ids::OPACITY, false,
+                |s| s.opacity = new_op);
+        }
+    });
 
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Opacity:").size(11.0));
-            ui.add(egui::Slider::new(&mut kf.value.opacity, 0.0..=1.0));
-        });
-
-        // Animatable flip (continuous −1..1). Slider lets the user dial
-        // it manually; the integer button next to it sets ±1 instantly.
-        // At intermediate values the renderer applies a 3D-card-fold
-        // effect (horizontal scale shrinks toward 0 and back).
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Flip X:").size(11.0));
-            ui.add(egui::Slider::new(&mut kf.value.flip_x_anim, -1.0..=1.0));
-            if ui.small_button("\u{21B6}").on_hover_text("Mirror (set −1)").clicked() {
-                kf.value.flip_x_anim = -kf.value.flip_x_anim.signum().abs().max(1.0).copysign(-1.0);
-                if kf.value.flip_x_anim.abs() < 1e-3 { kf.value.flip_x_anim = -1.0; }
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Flip Y:").size(11.0));
-            ui.add(egui::Slider::new(&mut kf.value.flip_y_anim, -1.0..=1.0));
-        });
-    }
+    // ── Flip X / Y ──
+    let mut new_fx = cur.flip_x_anim;
+    let mut new_fy = cur.flip_y_anim;
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        kf_anim::animated_toggle(ui, &mut a.animated_params, param_ids::FLIP_X, ("act_fx", i));
+        ui.label(param_label(highlight.is_active(param_ids::FLIP_X), "Flip X:"));
+        let r = ui.add(egui::Slider::new(&mut new_fx, -1.0..=1.0));
+        if r.changed() {
+            kf_anim::write_actor_param(
+                &mut a.layout, &mut a.animated_params, playhead,
+                param_ids::FLIP_X, false,
+                |s| s.flip_x_anim = new_fx);
+        }
+        if ui.small_button("\u{21B6}").on_hover_text("Mirror (set −1)").clicked() {
+            new_fx = -1.0;
+            kf_anim::write_actor_param(
+                &mut a.layout, &mut a.animated_params, playhead,
+                param_ids::FLIP_X, false,
+                |s| s.flip_x_anim = -1.0);
+        }
+    });
+    ui.horizontal(|ui| {
+        kf_anim::animated_toggle(ui, &mut a.animated_params, param_ids::FLIP_Y, ("act_fy", i));
+        ui.label(param_label(highlight.is_active(param_ids::FLIP_Y), "Flip Y:"));
+        let r = ui.add(egui::Slider::new(&mut new_fy, -1.0..=1.0));
+        if r.changed() {
+            kf_anim::write_actor_param(
+                &mut a.layout, &mut a.animated_params, playhead,
+                param_ids::FLIP_Y, false,
+                |s| s.flip_y_anim = new_fy);
+        }
+    });
 
     ui.add_space(8.0);
     ui.checkbox(&mut a.visible, "Visible");
@@ -667,51 +767,37 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
     inspector_modifiers(ui, &mut a.modifiers, ("actor_mods", i));
 }
 
-/// Inspector-side mirror of `ensure_actor_kf_at_playhead` from canvas_preview.rs.
-/// Inserts a keyframe seeded with the eased current value when the user
-/// scrubs to a time that isn't already represented in the track.
-fn ensure_actor_kf_at_playhead_inspector(
-    layout: &mut Vec<Keyframe<ActorState>>,
-    t: f32,
-) -> Option<usize> {
-    if layout.is_empty() {
-        layout.push(Keyframe::new(t, ActorState::default()));
-        return Some(0);
+/// Color a param label gold when its kf was just clicked from the timeline.
+fn param_label(highlighted: bool, text: &str) -> RichText {
+    if highlighted {
+        RichText::new(text).size(11.0).strong()
+            .color(Color32::from_rgb(255, 220, 80))
+            .background_color(Color32::from_rgba_premultiplied(80, 60, 0, 80))
+    } else {
+        RichText::new(text).size(11.0)
     }
-    let eps = 1.0e-3;
-    if let Some(idx) = layout.iter().position(|kf| (kf.t - t).abs() < eps) {
-        return Some(idx);
-    }
-    // For playhead at t=0 (or near it) just edit the first keyframe in
-    // place to preserve "edit-the-base-pose" muscle memory.
-    if t <= 0.001 {
-        return Some(0);
-    }
-    let sampled = keyframe::sample(layout, t).unwrap_or_default();
-    layout.push(Keyframe::new(t, sampled));
-    layout.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
-    layout.iter().position(|kf| (kf.t - t).abs() < eps)
 }
 
-fn ensure_overlay_kf_at_playhead_inspector(
-    layout: &mut Vec<Keyframe<OverlayState>>,
-    t: f32,
+/// Inspector-side mirror of `ensure_actor_kf_at_playhead` from canvas_preview.rs.
+/// **NOTE:** kept as a no-op stub for now (kf insertion was the source of
+/// the infinite-keyframe bug during playback / timeline scrubbing). The
+/// new authoring path is `kf_anim::write_actor_param`, which only runs
+/// when the user actually edits a parameter. Left here so the existing
+/// callers compile until they're migrated.
+#[allow(dead_code)]
+fn ensure_actor_kf_at_playhead_inspector(
+    _layout: &mut Vec<Keyframe<ActorState>>,
+    _t: f32,
 ) -> Option<usize> {
-    if layout.is_empty() {
-        layout.push(Keyframe::new(t, OverlayState::default()));
-        return Some(0);
-    }
-    let eps = 1.0e-3;
-    if let Some(idx) = layout.iter().position(|kf| (kf.t - t).abs() < eps) {
-        return Some(idx);
-    }
-    if t <= 0.001 {
-        return Some(0);
-    }
-    let sampled = keyframe::sample(layout, t).unwrap_or_default();
-    layout.push(Keyframe::new(t, sampled));
-    layout.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
-    layout.iter().position(|kf| (kf.t - t).abs() < eps)
+    None
+}
+
+#[allow(dead_code)]
+fn ensure_overlay_kf_at_playhead_inspector(
+    _layout: &mut Vec<Keyframe<OverlayState>>,
+    _t: f32,
+) -> Option<usize> {
+    None
 }
 
 /// Compact circular rotation dial. The pointer angle relative to the
@@ -966,7 +1052,23 @@ fn inspector_effect_stack(
                                 });
                             });
                             ui.add_space(2.0);
-                            ui.add(egui::Slider::new(&mut eff.intensity, 0.0..=1.0).text("Intensity"));
+                            // Master intensity with per-effect "Animated"
+                            // toggle. The toggle marks `intensity` as
+                            // animatable on this Effect; when ON future
+                            // edits write into `eff.param_kfs["intensity"]`
+                            // at the playhead. (Renderer wiring for
+                            // animated effect params is incremental — see
+                            // memstroy_core::Effect for the data model.)
+                            ui.horizontal(|ui| {
+                                crate::kf_anim::animated_toggle(
+                                    ui,
+                                    &mut eff.animated_params,
+                                    "intensity",
+                                    ("eff_int", ei),
+                                );
+                                ui.add(egui::Slider::new(&mut eff.intensity, 0.0..=1.0)
+                                    .text("Intensity"));
+                            });
                             ui.add_space(2.0);
                             inspector_effect_kind_params(ui, &mut eff.kind, salt, ei);
                         });
@@ -1846,30 +1948,9 @@ fn inspector_overlay(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
                 ui.label("Out:");
                 ui.add(egui::DragValue::new(&mut im.t_out).range(0.0..=duration).speed(0.02).suffix("s"));
             });
-            ensure_overlay_kf_at_playhead_inspector(&mut im.layout, playhead);
-            // Edit the keyframe at the playhead so animation flows
-            // naturally on canvas drag too.
-            let eps = 1.0e-3;
-            let kf_idx = im.layout.iter().position(|kf| (kf.t - playhead).abs() < eps).unwrap_or(0);
-            if let Some(kf) = im.layout.get_mut(kf_idx) {
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label("X:"); ui.add(egui::DragValue::new(&mut kf.value.pos[0]).speed(0.005));
-                    ui.label("Y:"); ui.add(egui::DragValue::new(&mut kf.value.pos[1]).speed(0.005));
-                });
-                ui.add(egui::Slider::new(&mut kf.value.scale, 0.05..=5.0).text("Scale").logarithmic(true));
-                ui.add(egui::Slider::new(&mut kf.value.scale_y, 0.1..=5.0).text("Stretch Y").logarithmic(true));
-
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Rotation").size(11.0));
-                    circular_rotation_widget(ui, ("img_rot", i), &mut kf.value.rotation_deg, 80.0);
-                    ui.add(egui::DragValue::new(&mut kf.value.rotation_deg)
-                        .range(-3600.0..=3600.0).speed(0.5).suffix("\u{00B0}").fixed_decimals(1));
-                });
-                ui.add(egui::Slider::new(&mut kf.value.opacity, 0.0..=1.0).text("Opacity"));
-                ui.add(egui::Slider::new(&mut kf.value.flip_x_anim, -1.0..=1.0).text("Flip X"));
-                ui.add(egui::Slider::new(&mut kf.value.flip_y_anim, -1.0..=1.0).text("Flip Y"));
-            }
+            inspector_overlay_state_widgets(
+                ui, &mut im.layout, &mut im.animated_params, playhead, i, "img",
+                state.kf_highlight.clone());
             ui.add_space(8.0);
             inspector_modifiers(ui, &mut im.modifiers, ("img_mods", i));
             ui.add_space(8.0);
@@ -1884,33 +1965,126 @@ fn inspector_overlay(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
                 ui.label("Out:");
                 ui.add(egui::DragValue::new(&mut v.t_out).range(0.0..=duration).speed(0.02).suffix("s"));
             });
-            ensure_overlay_kf_at_playhead_inspector(&mut v.layout, playhead);
-            let eps = 1.0e-3;
-            let kf_idx = v.layout.iter().position(|kf| (kf.t - playhead).abs() < eps).unwrap_or(0);
-            if let Some(kf) = v.layout.get_mut(kf_idx) {
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label("X:"); ui.add(egui::DragValue::new(&mut kf.value.pos[0]).speed(0.005));
-                    ui.label("Y:"); ui.add(egui::DragValue::new(&mut kf.value.pos[1]).speed(0.005));
-                });
-                ui.add(egui::Slider::new(&mut kf.value.scale, 0.05..=5.0).text("Scale").logarithmic(true));
-                ui.add(egui::Slider::new(&mut kf.value.scale_y, 0.1..=5.0).text("Stretch Y").logarithmic(true));
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Rotation").size(11.0));
-                    circular_rotation_widget(ui, ("vid_rot", i), &mut kf.value.rotation_deg, 80.0);
-                    ui.add(egui::DragValue::new(&mut kf.value.rotation_deg)
-                        .range(-3600.0..=3600.0).speed(0.5).suffix("\u{00B0}").fixed_decimals(1));
-                });
-                ui.add(egui::Slider::new(&mut kf.value.opacity, 0.0..=1.0).text("Opacity"));
-                ui.add(egui::Slider::new(&mut kf.value.flip_x_anim, -1.0..=1.0).text("Flip X"));
-                ui.add(egui::Slider::new(&mut kf.value.flip_y_anim, -1.0..=1.0).text("Flip Y"));
-            }
+            inspector_overlay_state_widgets(
+                ui, &mut v.layout, &mut v.animated_params, playhead, i, "vid",
+                state.kf_highlight.clone());
             ui.add_space(8.0);
             inspector_modifiers(ui, &mut v.modifiers, ("vid_mods", i));
             ui.add_space(8.0);
             inspector_effect_stack(ui, &mut v.effects, ("vid_fx", i));
         }
     }
+}
+
+/// Shared "transform" widget block for the three overlay flavours
+/// (Image / Video / Text). Reads sampled values from `layout` and only
+/// writes through `kf_anim::write_overlay_param` when the user actually
+/// edits a control — this is the per-overlay equivalent of the actor's
+/// new inspector flow and the fix for the "infinite keyframes during
+/// playback / timeline scrub" bug.
+fn inspector_overlay_state_widgets(
+    ui: &mut egui::Ui,
+    layout: &mut Vec<Keyframe<OverlayState>>,
+    animated_params: &mut std::collections::BTreeSet<String>,
+    playhead: f32,
+    salt_idx: usize,
+    salt_kind: &'static str,
+    highlight: crate::kf_anim::KfHighlight,
+) {
+    use crate::kf_anim;
+    use memstroy_core::param_ids;
+
+    let cur = kf_anim::sample_overlay(layout, playhead);
+
+    let mut new_x = cur.pos[0];
+    let mut new_y = cur.pos[1];
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        kf_anim::animated_toggle(ui, animated_params, param_ids::POS_X, (salt_kind, "px", salt_idx));
+        ui.label(param_label(highlight.is_active(param_ids::POS_X), "X:"));
+        let r = ui.add(egui::DragValue::new(&mut new_x).speed(0.005));
+        if r.changed() {
+            kf_anim::write_overlay_param(layout, animated_params, playhead,
+                param_ids::POS_X, false, |s| s.pos[0] = new_x);
+        }
+        kf_anim::animated_toggle(ui, animated_params, param_ids::POS_Y, (salt_kind, "py", salt_idx));
+        ui.label(param_label(highlight.is_active(param_ids::POS_Y), "Y:"));
+        let r = ui.add(egui::DragValue::new(&mut new_y).speed(0.005));
+        if r.changed() {
+            kf_anim::write_overlay_param(layout, animated_params, playhead,
+                param_ids::POS_Y, false, |s| s.pos[1] = new_y);
+        }
+    });
+
+    let mut new_scale = cur.scale;
+    ui.horizontal(|ui| {
+        kf_anim::animated_toggle(ui, animated_params, param_ids::SCALE, (salt_kind, "sc", salt_idx));
+        ui.label(param_label(highlight.is_active(param_ids::SCALE), "Scale:"));
+        let r = ui.add(egui::Slider::new(&mut new_scale, 0.05..=5.0).logarithmic(true));
+        if r.changed() {
+            kf_anim::write_overlay_param(layout, animated_params, playhead,
+                param_ids::SCALE, false, |s| s.scale = new_scale);
+        }
+    });
+
+    let mut new_sy = cur.scale_y;
+    ui.horizontal(|ui| {
+        kf_anim::animated_toggle(ui, animated_params, param_ids::SCALE_Y, (salt_kind, "sy", salt_idx));
+        ui.label(param_label(highlight.is_active(param_ids::SCALE_Y), "Stretch Y:"));
+        let r = ui.add(egui::Slider::new(&mut new_sy, 0.1..=5.0).logarithmic(true));
+        if r.changed() {
+            kf_anim::write_overlay_param(layout, animated_params, playhead,
+                param_ids::SCALE_Y, false, |s| s.scale_y = new_sy);
+        }
+    });
+
+    let mut new_rot = cur.rotation_deg;
+    ui.horizontal(|ui| {
+        kf_anim::animated_toggle(ui, animated_params, param_ids::ROTATION, (salt_kind, "rot", salt_idx));
+        ui.label(param_label(highlight.is_active(param_ids::ROTATION), "Rotation"));
+        let prev_rot = new_rot;
+        circular_rotation_widget(ui, (salt_kind, "rot_w", salt_idx), &mut new_rot, 80.0);
+        let mut dial_changed = (new_rot - prev_rot).abs() > 1.0e-4;
+        let r = ui.add(egui::DragValue::new(&mut new_rot)
+            .range(-3600.0..=3600.0).speed(0.5).suffix("\u{00B0}").fixed_decimals(1));
+        if r.changed() { dial_changed = true; }
+        if dial_changed {
+            kf_anim::write_overlay_param(layout, animated_params, playhead,
+                param_ids::ROTATION, false, |s| s.rotation_deg = new_rot);
+        }
+    });
+
+    let mut new_op = cur.opacity;
+    ui.horizontal(|ui| {
+        kf_anim::animated_toggle(ui, animated_params, param_ids::OPACITY, (salt_kind, "op", salt_idx));
+        ui.label(param_label(highlight.is_active(param_ids::OPACITY), "Opacity:"));
+        let r = ui.add(egui::Slider::new(&mut new_op, 0.0..=1.0));
+        if r.changed() {
+            kf_anim::write_overlay_param(layout, animated_params, playhead,
+                param_ids::OPACITY, false, |s| s.opacity = new_op);
+        }
+    });
+
+    let mut new_fx = cur.flip_x_anim;
+    let mut new_fy = cur.flip_y_anim;
+    ui.horizontal(|ui| {
+        kf_anim::animated_toggle(ui, animated_params, param_ids::FLIP_X, (salt_kind, "fx", salt_idx));
+        ui.label(param_label(highlight.is_active(param_ids::FLIP_X), "Flip X:"));
+        let r = ui.add(egui::Slider::new(&mut new_fx, -1.0..=1.0));
+        if r.changed() {
+            kf_anim::write_overlay_param(layout, animated_params, playhead,
+                param_ids::FLIP_X, false, |s| s.flip_x_anim = new_fx);
+        }
+    });
+    ui.horizontal(|ui| {
+        kf_anim::animated_toggle(ui, animated_params, param_ids::FLIP_Y, (salt_kind, "fy", salt_idx));
+        ui.label(param_label(highlight.is_active(param_ids::FLIP_Y), "Flip Y:"));
+        let r = ui.add(egui::Slider::new(&mut new_fy, -1.0..=1.0));
+        if r.changed() {
+            kf_anim::write_overlay_param(layout, animated_params, playhead,
+                param_ids::FLIP_Y, false, |s| s.flip_y_anim = new_fy);
+        }
+    });
 }
 
 /// Inspector layer-order actions for a text overlay. The buttons that
@@ -1953,26 +2127,13 @@ fn inspector_text_overlay(
     ui.add_space(8.0);
 
     // ─── Position / rotation / opacity (size is driven by font_size) ───
-    // Inspector edits the keyframe at the playhead so the user can scrub
-    // and tweak per-frame values directly.
-    ensure_overlay_kf_at_playhead_inspector(&mut t.layout, playhead);
-    let eps = 1.0e-3;
-    let kf_idx = t.layout.iter().position(|kf| (kf.t - playhead).abs() < eps).unwrap_or(0);
-    if let Some(kf) = t.layout.get_mut(kf_idx) {
-        ui.horizontal(|ui| {
-            ui.label("X:"); ui.add(egui::DragValue::new(&mut kf.value.pos[0]).range(-2.0..=3.0).speed(0.005));
-            ui.label("Y:"); ui.add(egui::DragValue::new(&mut kf.value.pos[1]).range(-2.0..=3.0).speed(0.005));
-        });
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Rotation").size(11.0));
-            circular_rotation_widget(ui, ("text_rot", idx), &mut kf.value.rotation_deg, 80.0);
-            ui.add(egui::DragValue::new(&mut kf.value.rotation_deg)
-                .range(-3600.0..=3600.0).speed(0.5).suffix("\u{00B0}").fixed_decimals(1));
-        });
-        ui.add(egui::Slider::new(&mut kf.value.opacity, 0.0..=1.0).text("Opacity"));
-        ui.add(egui::Slider::new(&mut kf.value.flip_x_anim, -1.0..=1.0).text("Flip X"));
-        ui.add(egui::Slider::new(&mut kf.value.flip_y_anim, -1.0..=1.0).text("Flip Y"));
-    }
+    // Inspector reads the eased current value at the playhead and only
+    // writes through `kf_anim::write_overlay_param` on actual edits, so
+    // simply drawing the inspector during playback / scrubbing no
+    // longer auto-inserts keyframes.
+    inspector_overlay_state_widgets(
+        ui, &mut t.layout, &mut t.animated_params, playhead, idx, "text",
+        crate::kf_anim::KfHighlight::default());
     ui.add_space(8.0);
 
     // ─── Font ─────────────────────────────────────────────────────
@@ -2734,12 +2895,14 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     // (used by clip-drag handlers below to figure out which track the pointer
     // currently hovers over, and whether the user is dragging above the
     // topmost video / below the bottommost audio so we can auto-create a new
-    // layer in that direction).
+    // layer in that direction). The "expansion" added by the per-param
+    // keyframe rows of the currently-selected layer is included here so the
+    // hit-test recognises the whole row as one lane.
     let mut track_rows: Vec<(f32, f32)> = Vec::with_capacity(num_tracks);
     {
         let mut acc = 0.0_f32;
-        for tk in state.tracks.iter() {
-            let h = tk.height * v_zoom;
+        for (ti, tk) in state.tracks.iter().enumerate() {
+            let h = tk.height * v_zoom + selected_layer_expansion(state, ti, v_zoom);
             let top = tracks_rect.min.y + acc - state.timeline_v_scroll;
             let bot = top + h;
             track_rows.push((top, bot));
@@ -2842,28 +3005,34 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
         DropIntent::Outside
     };
 
-    // Total scaled height needed to fit all tracks at the current v_zoom.
-    let total_tracks_h: f32 = state
-        .tracks
-        .iter()
-        .map(|t| t.height * v_zoom)
+    // Total scaled height needed to fit all tracks at the current v_zoom,
+    // including any per-param keyframe-row expansion on the selected layer.
+    let total_tracks_h: f32 = (0..num_tracks)
+        .map(|i| state.tracks[i].height * v_zoom + selected_layer_expansion(state, i, v_zoom))
         .sum();
     let max_v_scroll = (total_tracks_h - viewport_h).max(0.0);
     state.timeline_v_scroll = state.timeline_v_scroll.max(0.0).min(max_v_scroll);
     let v_scroll = state.timeline_v_scroll;
 
+    // Aggregate the kf-row click hits into a single update step at the
+    // end of the loop. Avoids interleaving mutable borrows of state with
+    // the clip-draw / drag handlers above.
+    let mut param_row_clicks: Vec<(crate::kf_anim::SelectedLayer, ParamRowClick)> = Vec::new();
+
     let mut acc_y = 0.0_f32;
     for track_idx in 0..num_tracks {
         let track = &state.tracks[track_idx];
         let track_h = track.height * v_zoom;
+        let expansion = selected_layer_expansion(state, track_idx, v_zoom);
+        let effective_track_h = track_h + expansion;
         let track_kind = track.kind;
         let track_name = track.name.clone();
         let track_muted = track.muted;
         let track_locked = track.locked;
 
         let row_top = tracks_rect.min.y + acc_y - v_scroll;
-        let row_bot = row_top + track_h;
-        acc_y += track_h;
+        let row_bot = row_top + effective_track_h;
+        acc_y += effective_track_h;
 
         // Cull tracks fully outside the viewport.
         if row_bot < tracks_rect.min.y - 1.0 || row_top > tracks_rect.max.y + 1.0 {
@@ -2895,10 +3064,13 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             if track_muted { COL_TEXT_DIM } else { COL_TEXT },
         );
 
-        // Track content area = the viewport sub-rect aligned to this row.
+        // Clip area = top portion of the row (excludes the param-row
+        // expansion below). draw_clip / draw_keyframe_diamonds only draw
+        // inside this rect so the per-param sub-rows have a clean area
+        // beneath them.
         let content_rect = egui::Rect::from_min_max(
             egui::pos2(tracks_rect.min.x, row_top + 1.0),
-            egui::pos2(tracks_rect.max.x, row_bot - 1.0),
+            egui::pos2(tracks_rect.max.x, row_top + track_h - 1.0),
         );
 
         // Draw clips on this track
@@ -3350,12 +3522,114 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             }
         }
 
+        // ── Per-param keyframe rows (only for the currently-selected
+        // layer's track). Renders a stack of small rows below the clip
+        // bar with one diamond per keyframe time on the layer. Clicking
+        // a diamond seeks the playhead and flashes the matching control
+        // in the inspector.
+        if expansion > 4.0 {
+            if let Some((sel_layer, params)) = selected_layer_animated_params(state, track_idx) {
+                let layer_label = match sel_layer {
+                    Selection::Actor(ai) => crate::kf_anim::SelectedLayer::Actor(ai),
+                    Selection::Overlay(oi) => crate::kf_anim::SelectedLayer::Overlay(oi),
+                    _ => crate::kf_anim::SelectedLayer::RenderFrame,
+                };
+                let kf_pairs: Vec<(f32, f32)> = keyframe_times_for_layer(state, sel_layer)
+                    .into_iter()
+                    .map(|local_t| (local_t, kf_time_to_scene_time(state, sel_layer, local_t)))
+                    .collect();
+                let outcome = draw_param_kf_rows(
+                    ui,
+                    painter,
+                    &layer_label,
+                    &params,
+                    &kf_pairs,
+                    row_top + track_h,
+                    expansion,
+                    track_left,
+                    track_right,
+                    pps,
+                    state.timeline_scroll,
+                    state.playhead,
+                    &state.selected_keyframes,
+                );
+                for hit in outcome.click_hits {
+                    param_row_clicks.push((layer_label.clone(), hit));
+                }
+            }
+        }
+
         // Playhead line on each track
         let ph_x = time_to_x(state.playhead, state.timeline_scroll, pps, track_left, track_right);
         if let Some(x) = ph_x {
             painter.line_segment(
                 [egui::pos2(x, row_rect.min.y), egui::pos2(x, row_rect.max.y)],
                 Stroke::new(1.0, COL_PLAYHEAD));
+        }
+    }
+
+    // ── Per-param keyframe row click → seek + selection update ──
+    if !param_row_clicks.is_empty() {
+        // Always switch to the inspector's Transform tab so the user
+        // sees the row that owns the clicked keyframe.
+        state.inspector_tab = 0;
+        for (layer_label, hit) in &param_row_clicks {
+            // Update playhead.
+            state.playhead = hit.seek_to.clamp(0.0, state.scene.output.duration);
+            // Highlight the param row in the inspector for ~1.5 s so
+            // the user can trace the click visually.
+            state.kf_highlight.set(hit.param_id.clone());
+            let entry = crate::kf_anim::SelectedKeyframe {
+                layer: layer_label.clone(),
+                param_id: hit.param_id.clone(),
+                t: hit.t,
+            };
+            if hit.extend {
+                if !state.selected_keyframes.contains(&entry) {
+                    state.selected_keyframes.push(entry);
+                } else {
+                    state.selected_keyframes.retain(|e| e != &entry);
+                }
+            } else {
+                state.selected_keyframes.clear();
+                state.selected_keyframes.push(entry);
+            }
+        }
+    }
+
+    // ── Delete key removes selected keyframes from their layer ──
+    let delete_pressed = ui.input(|i| {
+        i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)
+    });
+    if delete_pressed && !state.selected_keyframes.is_empty() {
+        delete_selected_keyframes(state);
+    }
+
+    // ── Auto-bump vertical zoom when the selection changes to a layer
+    // with several animated parameters. Keeps the param rows readable
+    // without forcing the user to drag the v-zoom by hand. Computed
+    // once per selection change so we don't keep re-applying it every
+    // paint while the layer is selected.
+    if state.last_v_zoom_selection != Some(state.selection) {
+        state.last_v_zoom_selection = Some(state.selection);
+        let n_params = match state.selection {
+            Selection::Actor(ai) => state.scene.actors.get(ai)
+                .map(|a| a.animated_params.len()).unwrap_or(0),
+            Selection::Overlay(oi) => state.scene.overlays.get(oi).map(|ov| match ov {
+                Overlay::Text(t) => t.animated_params.len(),
+                Overlay::Image(im) => im.animated_params.len(),
+                Overlay::Video(v) => v.animated_params.len(),
+            }).unwrap_or(0),
+            _ => 0,
+        };
+        if n_params >= 3 {
+            // Keep current zoom if it's already big enough; otherwise
+            // grow proportionally to the param count so all rows fit.
+            let want_h = 60.0 + (n_params as f32) * PARAM_ROW_BASE * 1.6;
+            let target_zoom = (want_h / 40.0).clamp(1.0, 3.5);
+            if state.timeline_v_zoom < target_zoom {
+                state.timeline_v_zoom = target_zoom;
+            }
         }
     }
 
@@ -3513,7 +3787,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             let asset_path = state.asset_drag.dragging.clone().unwrap();
             let kind = state.asset_drag.kind;
 
-            if matches!(kind, AssetDragKind::Clip) {
+            if matches!(kind, AssetDragKind::Clip | AssetDragKind::Video) {
                 // Pick the destination video lane:
                 //   1. The lane under the cursor when it's an unlocked video lane.
                 //   2. Otherwise, create a new video lane just above the
@@ -3572,7 +3846,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
         // Highlight the destination video / audio lane and emit a
         // human-readable label depending on the drag kind.
         let dest_label = match state.asset_drag.kind {
-            AssetDragKind::Clip | AssetDragKind::Sound | AssetDragKind::Image | AssetDragKind::Particle => {
+            AssetDragKind::Clip | AssetDragKind::Video | AssetDragKind::Sound | AssetDragKind::Image | AssetDragKind::Particle => {
                 let want_video = !matches!(state.asset_drag.kind, AssetDragKind::Sound);
                 let target = (|| {
                     for (i, (top, bot)) in track_rows.iter().enumerate() {
@@ -3653,7 +3927,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
         } else {
             ui.painter().rect_filled(thumb_rect, Rounding::same(3.0), Color32::from_rgb(40, 40, 60));
             let icon = match state.asset_drag.kind {
-                AssetDragKind::Clip => "\u{1F3AC}",
+                AssetDragKind::Clip | AssetDragKind::Video => "\u{1F3AC}",
                 AssetDragKind::Sound => "\u{1F50A}",
                 AssetDragKind::Image => "\u{1F5BC}",
                 AssetDragKind::Particle => "\u{2728}",
@@ -4369,6 +4643,369 @@ fn draw_placeholder_waveform(painter: &egui::Painter, bar_rect: egui::Rect) {
 }
 
 
+// ─── PER-PARAM KEYFRAME ROWS (timeline expansion for selected layer) ─
+
+/// Pixels per animated param row in the timeline expansion area, before
+/// vertical zoom is applied.
+const PARAM_ROW_BASE: f32 = 14.0;
+
+/// Animated-param ids on the layer that owns a track, ordered for
+/// stable on-screen rendering. Returns empty when no animatable layer
+/// is selected on the given track.
+fn selected_layer_animated_params(
+    state: &EditorState,
+    track_idx: usize,
+) -> Option<(Selection, Vec<String>)> {
+    let video_tracks: Vec<usize> = state.video_track_indices();
+    let default_overlay_track = if video_tracks.len() >= 2 {
+        video_tracks[1]
+    } else {
+        video_tracks.first().copied().unwrap_or(0)
+    };
+
+    match state.selection {
+        Selection::Actor(ai) => {
+            let assigned = state
+                .actor_track_assignments
+                .get(&ai)
+                .copied()
+                .unwrap_or_else(|| video_tracks.first().copied().unwrap_or(0));
+            if assigned != track_idx {
+                return None;
+            }
+            let a = state.scene.actors.get(ai)?;
+            let params = ordered_animated(&a.animated_params);
+            Some((state.selection, params))
+        }
+        Selection::Overlay(oi) => {
+            let assigned = state
+                .overlay_track_assignments
+                .get(&oi)
+                .copied()
+                .unwrap_or(default_overlay_track);
+            if assigned != track_idx {
+                return None;
+            }
+            let ap = match state.scene.overlays.get(oi)? {
+                Overlay::Text(t) => &t.animated_params,
+                Overlay::Image(im) => &im.animated_params,
+                Overlay::Video(v) => &v.animated_params,
+            };
+            let params = ordered_animated(ap);
+            Some((state.selection, params))
+        }
+        _ => None,
+    }
+}
+
+/// Stable ordering for the param rows so the visual layout doesn't
+/// shuffle as the user toggles params on/off.
+fn ordered_animated(set: &std::collections::BTreeSet<String>) -> Vec<String> {
+    use memstroy_core::param_ids::*;
+    let mut out = Vec::with_capacity(set.len());
+    for known in [POS_X, POS_Y, SCALE, SCALE_Y, ROTATION, OPACITY, FLIP_X, FLIP_Y] {
+        if set.contains(known) {
+            out.push(known.to_string());
+        }
+    }
+    // Then any remaining unknown / future ids in BTreeSet order.
+    for id in set.iter() {
+        if !out.iter().any(|s| s == id) {
+            out.push(id.clone());
+        }
+    }
+    out
+}
+
+/// Extra height to add to a track row so the per-param keyframe rows of
+/// the currently-selected layer fit underneath the clip bar.
+fn selected_layer_expansion(state: &EditorState, track_idx: usize, v_zoom: f32) -> f32 {
+    let Some((_, params)) = selected_layer_animated_params(state, track_idx) else {
+        return 0.0;
+    };
+    if params.is_empty() {
+        return 0.0;
+    }
+    (params.len() as f32) * PARAM_ROW_BASE * v_zoom + 4.0
+}
+
+/// Sample-and-extract the keyframe times for a given (layer, param) so
+/// the timeline can render a diamond per kf without needing access to
+/// the typed layout. We currently use the same `Vec<Keyframe<…>>` for
+/// every param of the layer, so the times are shared — the per-param
+/// row only differs in label / colour.
+fn keyframe_times_for_layer(state: &EditorState, sel: Selection) -> Vec<f32> {
+    match sel {
+        Selection::Actor(ai) => state
+            .scene
+            .actors
+            .get(ai)
+            .map(|a| a.layout.iter().map(|kf| kf.t).collect())
+            .unwrap_or_default(),
+        Selection::Overlay(oi) => state
+            .scene
+            .overlays
+            .get(oi)
+            .map(|ov| match ov {
+                Overlay::Text(t) => t.layout.iter().map(|kf| kf.t).collect(),
+                Overlay::Image(im) => im.layout.iter().map(|kf| kf.t).collect(),
+                Overlay::Video(v) => v.layout.iter().map(|kf| kf.t).collect(),
+            })
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// Translate kf times (LOCAL for overlays / scene-time for actors) to
+/// scene-time absolute coords used by the timeline ruler.
+fn kf_time_to_scene_time(state: &EditorState, sel: Selection, kf_t: f32) -> f32 {
+    match sel {
+        Selection::Actor(_) => kf_t,
+        Selection::Overlay(oi) => {
+            let t_in = state.scene.overlays.get(oi).map(|ov| match ov {
+                Overlay::Text(t) => t.t_in,
+                Overlay::Image(im) => im.t_in,
+                Overlay::Video(v) => v.t_in,
+            }).unwrap_or(0.0);
+            t_in + kf_t
+        }
+        _ => kf_t,
+    }
+}
+
+/// Inverse of `kf_time_to_scene_time` — used when seeking the playhead
+/// from a clicked diamond. Actor kfs are stored in scene time so the
+/// playhead just becomes `kf_t`; overlay kfs are local to the clip.
+#[allow(dead_code)]
+fn kf_scene_time(state: &EditorState, sel: Selection, kf_t: f32) -> f32 {
+    kf_time_to_scene_time(state, sel, kf_t)
+}
+
+/// Remove every keyframe currently flagged in `state.selected_keyframes`
+/// from the matching layer's layout vec, then clear the selection. Used
+/// by the Delete / Backspace key handler in the timeline. Time
+/// comparison uses an ε of 1ms to absorb floating-point drift between
+/// the stored kf time and the click hit-test value.
+fn delete_selected_keyframes(state: &mut EditorState) {
+    if state.selected_keyframes.is_empty() {
+        return;
+    }
+    let to_delete = state.selected_keyframes.clone();
+    let eps = 1.0e-3;
+    let mut removed = 0usize;
+
+    // Group deletions by layer so each layout vec is mutated once.
+    let mut actor_kfs: std::collections::HashMap<usize, Vec<f32>> =
+        std::collections::HashMap::new();
+    let mut overlay_kfs: std::collections::HashMap<usize, Vec<f32>> =
+        std::collections::HashMap::new();
+    for kf in to_delete {
+        match kf.layer {
+            crate::kf_anim::SelectedLayer::Actor(ai) => {
+                actor_kfs.entry(ai).or_default().push(kf.t);
+            }
+            crate::kf_anim::SelectedLayer::Overlay(oi) => {
+                overlay_kfs.entry(oi).or_default().push(kf.t);
+            }
+            crate::kf_anim::SelectedLayer::RenderFrame => {
+                state
+                    .scene
+                    .render_frame
+                    .layout
+                    .retain(|kfx| (kfx.t - kf.t).abs() > eps);
+                removed += 1;
+            }
+        }
+    }
+    for (ai, ts) in actor_kfs {
+        if let Some(a) = state.scene.actors.get_mut(ai) {
+            let before = a.layout.len();
+            a.layout
+                .retain(|kfx| !ts.iter().any(|t| (kfx.t - t).abs() < eps));
+            removed += before - a.layout.len();
+        }
+    }
+    for (oi, ts) in overlay_kfs {
+        if let Some(ov) = state.scene.overlays.get_mut(oi) {
+            let layout: &mut Vec<Keyframe<OverlayState>> = match ov {
+                Overlay::Text(t) => &mut t.layout,
+                Overlay::Image(im) => &mut im.layout,
+                Overlay::Video(v) => &mut v.layout,
+            };
+            let before = layout.len();
+            layout
+                .retain(|kfx| !ts.iter().any(|t| (kfx.t - t).abs() < eps));
+            removed += before - layout.len();
+        }
+    }
+
+    state.selected_keyframes.clear();
+    if removed > 0 {
+        state.status = format!("Deleted {} keyframe(s)", removed);
+    }
+}
+
+/// Render the per-param keyframe rows in the bottom expansion area of
+/// the selected layer's track row. Each row has a label + a horizontal
+/// line of diamond markers — one per keyframe time on the layer.
+///
+/// `kf_pairs` carries `(local_t, scene_t)` pairs: `local_t` is what's
+/// stored in the layer's layout vec (clip-local for overlays, scene-time
+/// for actors); `scene_t` is the scene-time used to position the diamond
+/// on the timeline ruler.
+///
+/// Diamonds are clickable (seek + select). Returns the click hits the
+/// user produced this frame so the caller can fold them into the
+/// keyframe-selection list without nested borrows.
+#[allow(clippy::too_many_arguments)]
+fn draw_param_kf_rows(
+    ui: &mut egui::Ui,
+    painter: &egui::Painter,
+    sel_layer_label: &crate::kf_anim::SelectedLayer,
+    params: &[String],
+    kf_pairs: &[(f32, f32)],
+    expansion_top: f32,
+    expansion_height: f32,
+    track_left: f32,
+    track_right: f32,
+    pps: f32,
+    scroll: f32,
+    state_playhead: f32,
+    selected_kfs: &[crate::kf_anim::SelectedKeyframe],
+) -> ParamRowOutcome {
+    let row_h = (expansion_height / params.len().max(1) as f32).max(10.0);
+    let mut outcome = ParamRowOutcome::default();
+
+    // Track separator above the param rows so they read as a separate
+    // sub-section of the layer's row.
+    painter.line_segment(
+        [
+            egui::pos2(track_left, expansion_top),
+            egui::pos2(track_right, expansion_top),
+        ],
+        Stroke::new(1.0, Color32::from_rgb(70, 70, 90)),
+    );
+
+    let ctrl_held = ui.input(|i| i.modifiers.ctrl || i.modifiers.mac_cmd);
+    let shift_held = ui.input(|i| i.modifiers.shift);
+
+    for (pi, param_id) in params.iter().enumerate() {
+        let row_top = expansion_top + (pi as f32) * row_h;
+        let row_bot = row_top + row_h;
+
+        // Alternating background tint per param row.
+        let bg = if pi % 2 == 0 {
+            Color32::from_rgba_premultiplied(255, 255, 255, 6)
+        } else {
+            Color32::from_rgba_premultiplied(255, 255, 255, 12)
+        };
+        painter.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(track_left, row_top),
+                egui::pos2(track_right, row_bot),
+            ),
+            Rounding::ZERO,
+            bg,
+        );
+
+        // Label on the far-left of the row.
+        let label = memstroy_core::param_ids::label(param_id);
+        painter.text(
+            egui::pos2(track_left + 4.0, row_top + row_h * 0.5),
+            egui::Align2::LEFT_CENTER,
+            label,
+            egui::FontId::proportional(9.0),
+            COL_TEXT_DIM,
+        );
+
+        // Diamond per kf, hit-tested.
+        let half = 4.5_f32;
+        for &(local_t, scene_t) in kf_pairs {
+            let x = (scene_t - scroll) * pps + track_left;
+            if x < track_left - half || x > track_right + half {
+                continue;
+            }
+            let cy = row_top + row_h * 0.5;
+
+            let is_selected = selected_kfs.iter().any(|sk| {
+                &sk.layer == sel_layer_label
+                    && sk.param_id == *param_id
+                    && (sk.t - local_t).abs() < 1.0e-3
+            });
+            let at_playhead =
+                (scene_t - state_playhead).abs() < (0.5 / pps.max(1.0)).max(0.005);
+
+            let fill = if is_selected {
+                Color32::from_rgb(255, 230, 80)
+            } else if at_playhead {
+                Color32::from_rgb(255, 180, 80)
+            } else {
+                Color32::from_rgb(160, 200, 255)
+            };
+            let pts = vec![
+                egui::pos2(x, cy - half),
+                egui::pos2(x + half, cy),
+                egui::pos2(x, cy + half),
+                egui::pos2(x - half, cy),
+            ];
+            painter.add(egui::Shape::convex_polygon(
+                pts,
+                fill,
+                Stroke::new(1.0, Color32::from_rgb(20, 20, 30)),
+            ));
+            if at_playhead && !is_selected {
+                painter.circle_stroke(
+                    egui::pos2(x, cy),
+                    half + 2.5,
+                    Stroke::new(1.0, Color32::from_rgb(255, 180, 80)),
+                );
+            }
+
+            // Click hit-test (small rect around the diamond).
+            let hit = egui::Rect::from_center_size(
+                egui::pos2(x, cy),
+                Vec2::new(half * 2.5, row_h.min(20.0)),
+            );
+            let id = ui.id().with(("param_kf", sel_layer_label, param_id, local_t.to_bits()));
+            let r = ui.interact(hit, id, Sense::click());
+            if r.clicked() {
+                outcome.click_hits.push(ParamRowClick {
+                    param_id: param_id.clone(),
+                    t: local_t,
+                    extend: ctrl_held || shift_held,
+                    seek_to: scene_t,
+                });
+            }
+            if r.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+        }
+    }
+
+    outcome
+}
+
+/// Output of `draw_param_kf_rows` consumed by the caller to update
+/// state without nested borrow scopes.
+#[derive(Default)]
+struct ParamRowOutcome {
+    click_hits: Vec<ParamRowClick>,
+}
+
+struct ParamRowClick {
+    param_id: String,
+    /// kf time as stored in the layer (scene-time for actors; clip-local
+    /// for overlays). Used together with `Selection` when removing the
+    /// kf from the layout vector.
+    t: f32,
+    /// Whether Ctrl/Shift was held — extends the kf selection rather
+    /// than replacing it.
+    extend: bool,
+    /// Resolved scene-time for the playhead seek.
+    seek_to: f32,
+}
+
+
 /// Draw small diamond markers on a clip bar, one per layout keyframe.
 /// Keyframe times are LOCAL (relative to clip's t_in). Used for the
 /// "visual constructor of animations" — gives users an at-a-glance view
@@ -4732,6 +5369,7 @@ pub fn add_text_overlay(state: &mut EditorState) -> usize {
         z_index: max_z + 1,
         behind_actors: false,
         effects: Vec::new(),
+        animated_params: Default::default(),
     });
 
     state.scene.overlays.push(overlay);
@@ -4789,6 +5427,7 @@ pub(crate) fn add_actor_from_clip_at_time(state: &mut EditorState, path: &PathBu
         transition_out: Transition::Cut,
         transition_duration: 0.3,
         effects: Vec::new(),
+        animated_params: Default::default(),
     };
     state.scene.actors.push(actor);
     let new_actor_idx = state.scene.actors.len() - 1;
