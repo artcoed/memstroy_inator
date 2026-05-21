@@ -1,11 +1,17 @@
-//! Skeleton Editor window — frame-by-frame point placement UI.
+//! Skeleton Constructor — preview-driven point placement editor.
 //!
-//! Opens as a floating egui::Window. The user selects a clip from the
-//! library, navigates frame-by-frame on a proper time ruler with zoom,
-//! and places/drags named anchor points directly on the preview frame.
-//! Points are stored as keyframes in a SkeletonTemplate.
+//! The user picks a clip, hits Play, and drags named anchor points on the
+//! preview as the timeline plays. Every drag sample becomes a keyframe at
+//! the current playhead. Between keyframes the easing curve is selectable
+//! (linear, step, ease-in/out, cubic). Each point also has a "Track" mode
+//! that loops the playhead between the point's first and last keyframe so
+//! the user can review the recorded path.
+//!
+//! Points are stored as keyframes in a `SkeletonTemplate` and persisted as
+//! a `<clip>.skeleton.json` sidecar.
 
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use egui::{Color32, Pos2, Rect, RichText, Rounding, Sense, Stroke, Vec2};
 use memstroy_core::*;
@@ -18,10 +24,17 @@ use crate::video_cache::FrameCache;
 const COL_POINT_DEFAULT: Color32 = Color32::from_rgb(255, 100, 100);
 const COL_POINT_SELECTED: Color32 = Color32::from_rgb(255, 220, 80);
 const COL_FRAME_BG: Color32 = Color32::from_rgb(20, 20, 30);
-const COL_RULER: Color32 = Color32::from_rgb(32, 32, 44);
+const COL_RULER: Color32 = Color32::from_rgb(28, 28, 38);
+const COL_TRACK_BG: Color32 = Color32::from_rgb(34, 34, 46);
+const COL_TRACK_BG_ALT: Color32 = Color32::from_rgb(38, 38, 52);
 const COL_PLAYHEAD: Color32 = Color32::from_rgb(255, 60, 60);
 const COL_TEXT_DIM: Color32 = Color32::from_rgb(140, 140, 160);
 const COL_TEXT: Color32 = Color32::from_rgb(220, 220, 240);
+const COL_KF: Color32 = Color32::from_rgb(255, 200, 50);
+const COL_KF_SELECTED: Color32 = Color32::from_rgb(120, 220, 255);
+const COL_KF_DIM: Color32 = Color32::from_rgb(120, 120, 140);
+
+// ─── STATE ───────────────────────────────────────────────────────────
 
 /// Persistent state for the skeleton editor (lives in EditorState).
 pub struct SkeletonEditorState {
@@ -36,17 +49,15 @@ pub struct SkeletonEditorState {
     pub template_idx: Option<usize>,
     /// Currently selected point name.
     pub selected_point: Option<String>,
+    /// Currently selected keyframe (point_name, keyframe_index). Editing
+    /// the easing for that keyframe shows up below the timeline.
+    pub selected_keyframe: Option<(String, usize)>,
     /// Current frame index for navigation.
     pub current_frame: u32,
     /// Total frame count (from frame cache or clip duration * fps).
     pub total_frames: u32,
     /// FPS used for frame navigation.
     pub fps: f32,
-    /// New point name input buffer.
-    pub new_point_name: String,
-    /// Place mode — clicking on the frame creates / updates the selected
-    /// point's keyframe at the current time.
-    pub place_mode: bool,
     /// Name of the point currently being dragged on the preview frame.
     pub dragging_point: Option<String>,
     /// Per-clip frame cache used for the live preview when no scene actor
@@ -58,6 +69,19 @@ pub struct SkeletonEditorState {
     pub timeline_zoom: f32,
     /// Local time ruler scroll offset (seconds).
     pub timeline_scroll: f32,
+    /// Whether playback is currently advancing the playhead.
+    pub playing: bool,
+    /// Wall-clock time of the last play tick (for delta accumulation).
+    /// Wrapped in an Option because the timer only starts running when the
+    /// user hits Play.
+    pub last_play_tick: Option<Instant>,
+    /// When `Some(name)`, playback is restricted to the [first..last]
+    /// keyframe range of that point and loops back to the first keyframe
+    /// at the end. Used by the "Track" toggle in the point list.
+    pub track_loop_point: Option<String>,
+    /// Auto-name counter; bumps every time a nameless point is added so
+    /// the user doesn't need to think up a name to start placing.
+    pub name_counter: u32,
 }
 
 impl Default for SkeletonEditorState {
@@ -68,16 +92,19 @@ impl Default for SkeletonEditorState {
             actor_idx: None,
             template_idx: None,
             selected_point: None,
+            selected_keyframe: None,
             current_frame: 0,
             total_frames: 1,
             fps: 30.0,
-            new_point_name: String::new(),
-            place_mode: false,
             dragging_point: None,
             preview_cache: None,
             extract_slot: None,
             timeline_zoom: 80.0,
             timeline_scroll: 0.0,
+            playing: false,
+            last_play_tick: None,
+            track_loop_point: None,
+            name_counter: 0,
         }
     }
 }
@@ -100,10 +127,8 @@ pub fn skeleton_editor_window(ctx: &egui::Context, state: &mut EditorState) -> b
         return false;
     }
 
-    // Poll any in-flight frame extraction so the preview is ready as soon
-    // as ffmpeg finishes. Done outside the Window block to keep the borrow
-    // scope small.
     poll_preview_extraction(state);
+    advance_playback(ctx, state);
 
     let mut open = state.skeleton_editor.open;
     let screen_rect = ctx.input(|i| i.screen_rect());
@@ -112,7 +137,7 @@ pub fn skeleton_editor_window(ctx: &egui::Context, state: &mut EditorState) -> b
 
     egui::Window::new("Skeleton Constructor")
         .open(&mut open)
-        .default_size([900.0, 640.0])
+        .default_size([920.0, 660.0])
         .min_width(560.0)
         .min_height(420.0)
         .max_width(max_w)
@@ -125,6 +150,60 @@ pub fn skeleton_editor_window(ctx: &egui::Context, state: &mut EditorState) -> b
 
     state.skeleton_editor.open = open;
     open
+}
+
+/// Drive the playback playhead forward each frame. When `track_loop_point`
+/// is set, the playhead loops between the first and last keyframe of that
+/// point so the user can review the recorded path of just that point.
+fn advance_playback(ctx: &egui::Context, state: &mut EditorState) {
+    if !state.skeleton_editor.playing {
+        state.skeleton_editor.last_play_tick = None;
+        return;
+    }
+    let now = Instant::now();
+    let dt = match state.skeleton_editor.last_play_tick.replace(now) {
+        Some(prev) => (now - prev).as_secs_f32(),
+        None => 0.0,
+    };
+    if dt <= 0.0 {
+        ctx.request_repaint();
+        return;
+    }
+
+    let fps = state.skeleton_editor.fps.max(1.0);
+    let total = state.skeleton_editor.total_frames.max(1);
+    let mut t = state.skeleton_editor.current_time();
+
+    // Resolve play range: either the point's keyframe span (if tracking)
+    // or the full clip duration.
+    let (lo, hi) = if let Some(name) = state.skeleton_editor.track_loop_point.clone() {
+        if let Some(idx) = state.skeleton_editor.template_idx {
+            let p = state.scene.skeleton_templates[idx].points.get(&name);
+            if let Some(p) = p {
+                if !p.track.is_empty() {
+                    let lo = p.track.first().unwrap().t.max(0.0);
+                    let hi = p.track.last().unwrap().t.max(lo + 0.01);
+                    (lo, hi)
+                } else {
+                    (0.0, state.skeleton_editor.duration())
+                }
+            } else {
+                (0.0, state.skeleton_editor.duration())
+            }
+        } else {
+            (0.0, state.skeleton_editor.duration())
+        }
+    } else {
+        (0.0, state.skeleton_editor.duration())
+    };
+
+    t += dt;
+    if t >= hi {
+        t = lo;
+    }
+    let frame = (t * fps).round() as u32;
+    state.skeleton_editor.current_frame = frame.min(total.saturating_sub(1));
+    ctx.request_repaint();
 }
 
 fn skeleton_editor_content(ui: &mut egui::Ui, state: &mut EditorState) {
@@ -148,13 +227,14 @@ fn skeleton_editor_content(ui: &mut egui::Ui, state: &mut EditorState) {
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.horizontal_top(|ui| {
-                let right_panel_w = 220.0_f32;
+                let right_panel_w = 240.0_f32;
                 let separator_w = 12.0_f32;
-                let nav_height = 36.0_f32;
-                let ruler_height = 26.0_f32;
+                let transport_h = 32.0_f32;
+                let timeline_h = 64.0_f32;
+                let easing_h = 28.0_f32;
                 let avail = ui.available_size_before_wrap();
                 let preview_max_w = (avail.x - right_panel_w - separator_w).max(220.0);
-                let preview_max_h = (avail.y - nav_height - ruler_height - 8.0).max(200.0);
+                let preview_max_h = (avail.y - transport_h - timeline_h - easing_h - 16.0).max(200.0);
 
                 let aspect = 9.0_f32 / 16.0;
                 let by_w_h = preview_max_w / aspect;
@@ -167,9 +247,11 @@ fn skeleton_editor_content(ui: &mut egui::Ui, state: &mut EditorState) {
                 ui.vertical(|ui| {
                     frame_preview(ui, state, pw, ph);
                     ui.add_space(4.0);
-                    timeline_ruler(ui, state, pw);
-                    ui.add_space(2.0);
-                    frame_navigation(ui, state);
+                    transport_bar(ui, state);
+                    ui.add_space(4.0);
+                    skeleton_timeline(ui, state, pw);
+                    ui.add_space(4.0);
+                    keyframe_easing_panel(ui, state);
                 });
 
                 ui.separator();
@@ -274,16 +356,18 @@ pub fn select_clip(state: &mut EditorState, clip_path: &std::path::Path) {
     on_clip_changed(state, clip_path);
 }
 
-/// Switch the editor to a new source clip. Auto-loads any existing sidecar
-/// skeleton, otherwise leaves the user to create one. Also kicks off a
-/// preview frame extraction if no actor cache for this clip exists.
+/// Switch the editor to a new source clip.
 fn on_clip_changed(state: &mut EditorState, clip_path: &std::path::Path) {
     state.skeleton_editor.clip_path = Some(clip_path.to_path_buf());
     state.skeleton_editor.selected_point = None;
+    state.skeleton_editor.selected_keyframe = None;
     state.skeleton_editor.current_frame = 0;
     state.skeleton_editor.fps = 30.0;
     state.skeleton_editor.dragging_point = None;
     state.skeleton_editor.timeline_scroll = 0.0;
+    state.skeleton_editor.playing = false;
+    state.skeleton_editor.last_play_tick = None;
+    state.skeleton_editor.track_loop_point = None;
 
     state.skeleton_editor.actor_idx = state
         .scene
@@ -321,9 +405,20 @@ fn on_clip_changed(state: &mut EditorState, clip_path: &std::path::Path) {
     state.skeleton_editor.template_idx = tmpl_idx;
     state.skeleton_editor.total_frames = total.max(1);
 
-    // Kick off a dedicated preview cache when we don't have an actor-bound
-    // one. The user requested previews for *any* library clip, not only
-    // those already on the canvas.
+    // Reset auto-name counter to one above the highest pN in the template.
+    state.skeleton_editor.name_counter = 0;
+    if let Some(idx) = state.skeleton_editor.template_idx {
+        for name in state.scene.skeleton_templates[idx].points.keys() {
+            if let Some(rest) = name.strip_prefix('p') {
+                if let Ok(n) = rest.parse::<u32>() {
+                    if n > state.skeleton_editor.name_counter {
+                        state.skeleton_editor.name_counter = n;
+                    }
+                }
+            }
+        }
+    }
+
     let actor_cache_ready = state
         .skeleton_editor
         .actor_idx
@@ -370,10 +465,8 @@ fn poll_preview_extraction(state: &mut EditorState) {
     if let Some((duration, frame_count, cache_dir)) = result {
         if let Some(cache) = state.skeleton_editor.preview_cache.as_mut() {
             cache.set_ready(duration, frame_count, cache_dir);
-            // Update total frames using actual extracted count.
             if frame_count > 0 {
                 state.skeleton_editor.total_frames = frame_count as u32;
-                // Also update template metadata if it had an underestimate.
                 if let Some(idx) = state.skeleton_editor.template_idx {
                     if let Some(t) = state.scene.skeleton_templates.get_mut(idx) {
                         if t.clip_duration <= 0.01 {
@@ -451,14 +544,12 @@ fn frame_preview(ui: &mut egui::Ui, state: &mut EditorState, width: f32, height:
     let mut frame_shown = false;
 
     // 1) Try the dedicated preview cache (preferred — covers ANY library clip).
-    if !frame_shown {
-        if let Some(fc) = state.skeleton_editor.preview_cache.as_mut() {
-            if fc.is_ready() {
-                if let Some(tex) = fc.frame_at_time(t, ui.ctx()) {
-                    let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
-                    painter.image(tex.id(), rect, uv, Color32::WHITE);
-                    frame_shown = true;
-                }
+    if let Some(fc) = state.skeleton_editor.preview_cache.as_mut() {
+        if fc.is_ready() {
+            if let Some(tex) = fc.frame_at_time(t, ui.ctx()) {
+                let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
+                painter.image(tex.id(), rect, uv, Color32::WHITE);
+                frame_shown = true;
             }
         }
     }
@@ -501,13 +592,7 @@ fn frame_preview(ui: &mut egui::Ui, state: &mut EditorState, width: f32, height:
         );
     }
 
-    // ── Pointer interaction order ─────────────────────────────────────
-    //
-    // 1. If we're already dragging a point, update it (drag continues until
-    //    the pointer is released even if it leaves the marker hit zone).
-    // 2. Otherwise, on a fresh primary-press inside the rect, try to start
-    //    a drag on a nearby point (or in place mode, drop a keyframe).
-    // 3. On release, commit the drag.
+    // ── Pointer interaction ──────────────────────────────────────────
     let pointer_pos = response.interact_pointer_pos();
     let pointer_in_rect = pointer_pos.map(|p| rect.contains(p)).unwrap_or(false);
     let primary_down = ui.input(|i| i.pointer.primary_down());
@@ -525,7 +610,7 @@ fn frame_preview(ui: &mut egui::Ui, state: &mut EditorState, width: f32, height:
                 let sx = rect.min.x + ps.x * rect.width();
                 let sy = rect.min.y + ps.y * rect.height();
                 let dist = ((pos.x - sx).powi(2) + (pos.y - sy).powi(2)).sqrt();
-                if dist < 12.0 && best.as_ref().map(|b| dist < b.1).unwrap_or(true) {
+                if dist < 14.0 && best.as_ref().map(|b| dist < b.1).unwrap_or(true) {
                     best = Some((name.clone(), dist));
                 }
             }
@@ -537,7 +622,6 @@ fn frame_preview(ui: &mut egui::Ui, state: &mut EditorState, width: f32, height:
 
     // Continue / start drag.
     if let Some(name) = state.skeleton_editor.dragging_point.clone() {
-        // Active drag — keep updating while primary stays down.
         if primary_down {
             if let Some(pos) = pointer_pos {
                 let nx = ((pos.x - rect.min.x) / rect.width()).clamp(0.0, 1.0);
@@ -550,7 +634,6 @@ fn frame_preview(ui: &mut egui::Ui, state: &mut EditorState, width: f32, height:
             state.skeleton_editor.dragging_point = None;
         }
     } else if response.drag_started() && pointer_in_rect {
-        // Begin a drag.
         if let Some(name) = hovered_point.clone() {
             state.skeleton_editor.selected_point = Some(name.clone());
             state.skeleton_editor.dragging_point = Some(name);
@@ -561,42 +644,35 @@ fn frame_preview(ui: &mut egui::Ui, state: &mut EditorState, width: f32, height:
                 place_point_at(state, &dragging, nx, ny);
             }
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
-        } else if state.skeleton_editor.place_mode
-            && state.skeleton_editor.selected_point.is_some()
-        {
-            // In place mode without hitting a point: drop a fresh keyframe at
-            // the cursor for the currently selected point.
+        } else if let Some(name) = state.skeleton_editor.selected_point.clone() {
+            // No marker under cursor, but a point is selected — drag begins
+            // to place that point at the cursor (and onwards).
+            state.skeleton_editor.dragging_point = Some(name.clone());
             if let Some(pos) = pointer_pos {
                 let nx = ((pos.x - rect.min.x) / rect.width()).clamp(0.0, 1.0);
                 let ny = ((pos.y - rect.min.y) / rect.height()).clamp(0.0, 1.0);
-                let name = state.skeleton_editor.selected_point.clone().unwrap();
-                state.skeleton_editor.dragging_point = Some(name.clone());
                 place_point_at(state, &name, nx, ny);
             }
         }
     } else if response.clicked() && pointer_in_rect {
-        // Plain click without drag — selection or single-shot place.
         if let Some(name) = hovered_point.clone() {
             state.skeleton_editor.selected_point = Some(name);
-        } else if state.skeleton_editor.place_mode
-            && state.skeleton_editor.selected_point.is_some()
-        {
+        } else if let Some(name) = state.skeleton_editor.selected_point.clone() {
+            // Click on empty preview area with a selected point → drop a
+            // keyframe at the cursor for that point. Mirrors the old
+            // "place mode" behaviour but with no extra toggle.
             if let Some(pos) = pointer_pos {
                 let nx = ((pos.x - rect.min.x) / rect.width()).clamp(0.0, 1.0);
                 let ny = ((pos.y - rect.min.y) / rect.height()).clamp(0.0, 1.0);
-                let name = state.skeleton_editor.selected_point.clone().unwrap();
                 place_point_at(state, &name, nx, ny);
             }
         }
     }
 
-    // Hover cursor hint when hovering over a point.
+    // Hover cursor hint.
     if hovered_point.is_some() && state.skeleton_editor.dragging_point.is_none() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
-    } else if state.skeleton_editor.place_mode
-        && pointer_in_rect
-        && state.skeleton_editor.dragging_point.is_none()
-    {
+    } else if pointer_in_rect && state.skeleton_editor.dragging_point.is_none() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
     }
 
@@ -619,7 +695,6 @@ fn frame_preview(ui: &mut egui::Ui, state: &mut EditorState, width: f32, height:
             };
 
             let radius = if is_selected || is_dragging { 9.0 } else { 6.5 };
-            // Drop shadow for visibility on bright frames.
             painter.circle_filled(
                 pos + Vec2::new(0.0, 1.0),
                 radius + 0.5,
@@ -636,28 +711,33 @@ fn frame_preview(ui: &mut egui::Ui, state: &mut EditorState, width: f32, height:
                 color,
             );
 
-            let has_kf = point.track.iter().any(|kf| (kf.t - t).abs() < 0.02);
+            // Diamond indicator if there's a keyframe within ~one frame of `t`.
+            let kf_proximity = 1.0 / state.skeleton_editor.fps.max(1.0) * 0.6;
+            let has_kf = point.track.iter().any(|kf| (kf.t - t).abs() < kf_proximity);
             if has_kf {
                 painter.text(
                     Pos2::new(pos.x, pos.y - radius - 4.0),
                     egui::Align2::CENTER_BOTTOM,
                     "\u{25C6}",
                     egui::FontId::proportional(9.0),
-                    Color32::from_rgb(255, 200, 50),
+                    COL_KF,
                 );
             }
         }
     }
 
-    // Border
+    // Border.
     painter.rect_stroke(rect, Rounding::same(4.0), Stroke::new(1.0, Color32::from_rgb(60, 60, 80)));
 }
 
-/// Helper: sample a SkeletonPoint at time t (without needing &SkeletonTemplate).
+/// Helper: sample a SkeletonPoint at time t.
 pub fn sample_point_at(point: &SkeletonPoint, t: f32) -> PointState {
     keyframe::sample(&point.track, t).unwrap_or_default()
 }
 
+/// Place the named point at normalised (nx, ny) at the current playhead.
+/// Inserts a new keyframe (or updates the closest existing one within ~1
+/// frame) and re-saves the sidecar.
 fn place_point_at(state: &mut EditorState, point_name: &str, nx: f32, ny: f32) {
     let Some(tmpl_idx) = state.skeleton_editor.template_idx else {
         return;
@@ -667,25 +747,92 @@ fn place_point_at(state: &mut EditorState, point_name: &str, nx: f32, ny: f32) {
     state.scene.skeleton_templates[tmpl_idx]
         .set_point_keyframe(point_name, t, ps, Easing::Linear);
     let _ = state.scene.skeleton_templates[tmpl_idx].save_alongside_clip();
-    state.status = format!(
-        "Point '{}' set at ({:.2}, {:.2}) t={:.2}s",
-        point_name, nx, ny, t
-    );
 }
 
-// ─── TIMELINE RULER ──────────────────────────────────────────────────
+// ─── TRANSPORT BAR ───────────────────────────────────────────────────
 
-/// Scrubable time ruler with mouse-wheel zoom and keyframe ticks.
-fn timeline_ruler(ui: &mut egui::Ui, state: &mut EditorState, width: f32) {
-    let height = 26.0_f32;
+/// Compact play/pause + frame nav strip, identical-feeling to the main
+/// editor's transport buttons.
+fn transport_bar(ui: &mut egui::Ui, state: &mut EditorState) {
+    let total = state.skeleton_editor.total_frames.max(1);
+
+    ui.horizontal(|ui| {
+        if ui.button("\u{23EE}").on_hover_text("First frame").clicked() {
+            state.skeleton_editor.current_frame = 0;
+        }
+        if ui.button("\u{25C0}").on_hover_text("Previous frame").clicked()
+            && state.skeleton_editor.current_frame > 0
+        {
+            state.skeleton_editor.current_frame -= 1;
+        }
+
+        let play_label = if state.skeleton_editor.playing {
+            RichText::new("\u{23F8}").size(14.0)
+        } else {
+            RichText::new("\u{25B6}").size(14.0)
+        };
+        if ui
+            .button(play_label)
+            .on_hover_text("Play / Pause (drag a point during playback to record keyframes)")
+            .clicked()
+        {
+            state.skeleton_editor.playing = !state.skeleton_editor.playing;
+            state.skeleton_editor.last_play_tick = None;
+        }
+
+        if ui.button("\u{25B8}").on_hover_text("Next frame").clicked()
+            && state.skeleton_editor.current_frame + 1 < total
+        {
+            state.skeleton_editor.current_frame += 1;
+        }
+        if ui.button("\u{23ED}").on_hover_text("Last frame").clicked() {
+            state.skeleton_editor.current_frame = total - 1;
+        }
+
+        let t = state.skeleton_editor.current_time();
+        ui.label(
+            RichText::new(format!(
+                "{}/{}  {:.2}s / {:.2}s",
+                state.skeleton_editor.current_frame + 1,
+                total,
+                t,
+                state.skeleton_editor.duration()
+            ))
+            .size(11.0)
+            .color(COL_TEXT_DIM),
+        );
+
+        if let Some(name) = state.skeleton_editor.track_loop_point.clone() {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let resp = ui.button(RichText::new("\u{25CB} stop tracking").size(10.0).color(Color32::from_rgb(255, 160, 80)));
+                if resp.clicked() {
+                    state.skeleton_editor.track_loop_point = None;
+                    state.skeleton_editor.playing = false;
+                }
+                resp.on_hover_text(format!("Looping over '{}'", name));
+            });
+        }
+    });
+}
+
+// ─── TIMELINE ────────────────────────────────────────────────────────
+
+/// Two-row "main-style" timeline: ruler on top, keyframe track below.
+/// Click / drag the ruler or the track to scrub. Click a keyframe diamond
+/// in the track row to select it; the easing for the selected keyframe
+/// shows up in the panel below.
+fn skeleton_timeline(ui: &mut egui::Ui, state: &mut EditorState, width: f32) {
+    let ruler_h = 22.0_f32;
+    let track_h = 38.0_f32;
+    let total_h = ruler_h + track_h;
     let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(width, height), Sense::click_and_drag());
+        ui.allocate_exact_size(Vec2::new(width, total_h), Sense::click_and_drag());
     let painter = ui.painter_at(rect);
 
     let duration = state.skeleton_editor.duration().max(0.01);
     let mut pps = state.skeleton_editor.timeline_zoom;
 
-    // Mouse-wheel zoom centred on the cursor (Ctrl-not-required).
+    // Mouse-wheel zoom centred on the cursor.
     if response.hovered() {
         let scroll = ui.input(|i| i.smooth_scroll_delta);
         if scroll.y.abs() > 0.1 {
@@ -703,7 +850,6 @@ fn timeline_ruler(ui: &mut egui::Ui, state: &mut EditorState, width: f32) {
                 pps = new_pps;
             }
         }
-        // Horizontal scroll (touchpad / shift+wheel).
         if scroll.x.abs() > 0.1 {
             state.skeleton_editor.timeline_scroll =
                 (state.skeleton_editor.timeline_scroll - scroll.x / pps.max(1.0)).max(0.0);
@@ -712,10 +858,16 @@ fn timeline_ruler(ui: &mut egui::Ui, state: &mut EditorState, width: f32) {
 
     let scroll = state.skeleton_editor.timeline_scroll;
 
-    // Background.
-    painter.rect_filled(rect, Rounding::same(3.0), COL_RULER);
+    // ── Background ──
+    let ruler_rect = Rect::from_min_size(rect.min, Vec2::new(width, ruler_h));
+    let track_rect = Rect::from_min_max(
+        Pos2::new(rect.min.x, rect.min.y + ruler_h),
+        rect.max,
+    );
+    painter.rect_filled(ruler_rect, Rounding::same(2.0), COL_RULER);
+    painter.rect_filled(track_rect, Rounding::same(2.0), COL_TRACK_BG);
 
-    // Time markers (auto step).
+    // ── Ruler ticks & labels ──
     let visible_secs = (rect.width() / pps.max(1.0)).max(0.01);
     let step = pick_ruler_step(visible_secs);
     let first_mark = (scroll / step).floor() * step;
@@ -725,11 +877,14 @@ fn timeline_ruler(ui: &mut egui::Ui, state: &mut EditorState, width: f32) {
         let x = rect.min.x + (t_mark - scroll) * pps;
         if x >= rect.min.x && x <= rect.max.x {
             painter.line_segment(
-                [Pos2::new(x, rect.max.y - 6.0), Pos2::new(x, rect.max.y)],
+                [
+                    Pos2::new(x, ruler_rect.max.y - 6.0),
+                    Pos2::new(x, ruler_rect.max.y),
+                ],
                 Stroke::new(1.0, Color32::from_rgb(80, 80, 100)),
             );
             painter.text(
-                Pos2::new(x + 2.0, rect.min.y + 2.0),
+                Pos2::new(x + 2.0, ruler_rect.min.y + 1.0),
                 egui::Align2::LEFT_TOP,
                 format!("{:.2}s", t_mark),
                 egui::FontId::proportional(9.0),
@@ -739,38 +894,95 @@ fn timeline_ruler(ui: &mut egui::Ui, state: &mut EditorState, width: f32) {
         t_mark += step;
     }
 
-    // Draw keyframe ticks for the selected point (or all points if none selected).
+    // Alternate-row tint inside the track to give it the "main timeline" look.
+    let alt_band_count = 8;
+    for i in 0..alt_band_count {
+        let band_w = track_rect.width() / alt_band_count as f32;
+        if i % 2 == 0 {
+            let x0 = track_rect.min.x + i as f32 * band_w;
+            let x1 = (x0 + band_w).min(track_rect.max.x);
+            painter.rect_filled(
+                Rect::from_min_max(
+                    Pos2::new(x0, track_rect.min.y),
+                    Pos2::new(x1, track_rect.max.y),
+                ),
+                Rounding::ZERO,
+                COL_TRACK_BG_ALT,
+            );
+        }
+    }
+
+    // ── Loop range underlay (when tracking a point) ──
+    let loop_range = state
+        .skeleton_editor
+        .track_loop_point
+        .as_ref()
+        .and_then(|name| {
+            state.skeleton_editor.template_idx.and_then(|idx| {
+                let p = state.scene.skeleton_templates[idx].points.get(name)?;
+                if p.track.is_empty() {
+                    return None;
+                }
+                Some((p.track.first()?.t, p.track.last()?.t))
+            })
+        });
+    if let Some((lo, hi)) = loop_range {
+        let x0 = (rect.min.x + (lo - scroll) * pps)
+            .clamp(rect.min.x, rect.max.x);
+        let x1 = (rect.min.x + (hi - scroll) * pps)
+            .clamp(rect.min.x, rect.max.x);
+        if x1 > x0 {
+            painter.rect_filled(
+                Rect::from_min_max(
+                    Pos2::new(x0, track_rect.min.y),
+                    Pos2::new(x1, track_rect.max.y),
+                ),
+                Rounding::ZERO,
+                Color32::from_rgba_premultiplied(255, 160, 60, 22),
+            );
+        }
+    }
+
+    // ── Keyframe diamonds (interactive) ──
+    let mut keyframe_hits: Vec<(String, usize, Pos2)> = Vec::new();
     if let Some(tmpl_idx) = state.skeleton_editor.template_idx {
         let template = &state.scene.skeleton_templates[tmpl_idx];
-        let selected = state.skeleton_editor.selected_point.as_deref();
+        let selected = state.skeleton_editor.selected_point.clone();
+        let track_y = track_rect.center().y;
         for (name, point) in &template.points {
-            let active = selected == Some(name) || selected.is_none();
-            for kf in &point.track {
+            let active = selected.as_deref() == Some(name) || selected.is_none();
+            for (kf_idx, kf) in point.track.iter().enumerate() {
                 let x = rect.min.x + (kf.t - scroll) * pps;
-                if x < rect.min.x - 2.0 || x > rect.max.x + 2.0 {
+                if x < rect.min.x - 4.0 || x > rect.max.x + 4.0 {
                     continue;
                 }
-                let col = if active {
-                    Color32::from_rgb(255, 200, 50)
+                let center = Pos2::new(x, track_y);
+                let is_selected_kf = state.skeleton_editor.selected_keyframe.as_ref()
+                    == Some(&(name.clone(), kf_idx));
+                let col = if is_selected_kf {
+                    COL_KF_SELECTED
+                } else if active {
+                    Color32::from_rgb(point.color[0], point.color[1], point.color[2])
                 } else {
-                    Color32::from_rgb(100, 100, 120)
+                    COL_KF_DIM
                 };
-                let center = Pos2::new(x, rect.center().y);
+                let r = if is_selected_kf { 6.0 } else { 4.5 };
                 painter.add(egui::Shape::convex_polygon(
                     vec![
-                        Pos2::new(center.x, center.y - 4.0),
-                        Pos2::new(center.x + 3.5, center.y),
-                        Pos2::new(center.x, center.y + 4.0),
-                        Pos2::new(center.x - 3.5, center.y),
+                        Pos2::new(center.x, center.y - r),
+                        Pos2::new(center.x + r * 0.8, center.y),
+                        Pos2::new(center.x, center.y + r),
+                        Pos2::new(center.x - r * 0.8, center.y),
                     ],
                     col,
                     Stroke::new(0.8, Color32::BLACK),
                 ));
+                keyframe_hits.push((name.clone(), kf_idx, center));
             }
         }
     }
 
-    // Playhead.
+    // ── Playhead ──
     let cur_t = state.skeleton_editor.current_time();
     let ph_x = rect.min.x + (cur_t - scroll) * pps;
     if ph_x >= rect.min.x && ph_x <= rect.max.x {
@@ -790,10 +1002,47 @@ fn timeline_ruler(ui: &mut egui::Ui, state: &mut EditorState, width: f32) {
         ));
     }
 
-    // Click / drag to scrub.
-    if response.clicked() || response.dragged() {
-        if let Some(pos) = response.interact_pointer_pos() {
-            let local_x = (pos.x - rect.min.x).max(0.0);
+    // ── Interaction: keyframe selection / scrub ──
+    let pointer_pos = response.interact_pointer_pos();
+    let primary_clicked = response.clicked();
+    let primary_dragged = response.dragged();
+
+    let mut clicked_kf: Option<(String, usize)> = None;
+    if primary_clicked {
+        if let Some(p) = pointer_pos {
+            // Hit-test keyframe diamonds first (only the track row).
+            if track_rect.contains(p) {
+                let mut best: Option<(f32, (String, usize))> = None;
+                for (name, idx, c) in &keyframe_hits {
+                    let d = ((p.x - c.x).powi(2) + (p.y - c.y).powi(2)).sqrt();
+                    if d < 8.0 && best.as_ref().map(|b| d < b.0).unwrap_or(true) {
+                        best = Some((d, (name.clone(), *idx)));
+                    }
+                }
+                if let Some((_, hit)) = best {
+                    clicked_kf = Some(hit);
+                }
+            }
+        }
+    }
+
+    if let Some((name, idx)) = clicked_kf {
+        state.skeleton_editor.selected_point = Some(name.clone());
+        state.skeleton_editor.selected_keyframe = Some((name.clone(), idx));
+        // Snap playhead to the keyframe time.
+        if let Some(tmpl_idx) = state.skeleton_editor.template_idx {
+            if let Some(p) = state.scene.skeleton_templates[tmpl_idx].points.get(&name) {
+                if let Some(kf) = p.track.get(idx) {
+                    let frame = (kf.t * state.skeleton_editor.fps).round() as u32;
+                    state.skeleton_editor.current_frame =
+                        frame.min(state.skeleton_editor.total_frames.saturating_sub(1));
+                }
+            }
+        }
+    } else if primary_clicked || primary_dragged {
+        // Plain scrub.
+        if let Some(p) = pointer_pos {
+            let local_x = (p.x - rect.min.x).max(0.0);
             let new_t = (scroll + local_x / pps.max(1.0)).clamp(0.0, duration);
             let new_frame = (new_t * state.skeleton_editor.fps).round() as u32;
             state.skeleton_editor.current_frame =
@@ -804,7 +1053,7 @@ fn timeline_ruler(ui: &mut egui::Ui, state: &mut EditorState, width: f32) {
     // Border.
     painter.rect_stroke(
         rect,
-        Rounding::same(3.0),
+        Rounding::same(2.0),
         Stroke::new(1.0, Color32::from_rgb(60, 60, 80)),
     );
 }
@@ -822,76 +1071,108 @@ fn pick_ruler_step(visible_secs: f32) -> f32 {
     60.0
 }
 
-// ─── FRAME NAVIGATION ────────────────────────────────────────────────
+// ─── KEYFRAME EASING PANEL ───────────────────────────────────────────
 
-fn frame_navigation(ui: &mut egui::Ui, state: &mut EditorState) {
-    let total = state.skeleton_editor.total_frames.max(1);
+/// Tiny strip below the timeline. Visible when a keyframe is selected on
+/// the timeline; lets the user pick the easing curve used to interpolate
+/// INTO that keyframe from the previous one.
+fn keyframe_easing_panel(ui: &mut egui::Ui, state: &mut EditorState) {
+    let Some((name, idx)) = state.skeleton_editor.selected_keyframe.clone() else {
+        ui.allocate_space(Vec2::new(1.0, 24.0));
+        return;
+    };
+    let Some(tmpl_idx) = state.skeleton_editor.template_idx else {
+        return;
+    };
+
+    // Read current easing (and verify the keyframe still exists).
+    let current_easing = match state.scene.skeleton_templates[tmpl_idx]
+        .points
+        .get(&name)
+        .and_then(|p| p.track.get(idx))
+    {
+        Some(kf) => kf.easing,
+        None => {
+            state.skeleton_editor.selected_keyframe = None;
+            return;
+        }
+    };
+
+    let mut new_easing = current_easing;
+    let mut delete_kf = false;
 
     ui.horizontal(|ui| {
-        if ui.button("\u{23EE}").on_hover_text("First frame").clicked() {
-            state.skeleton_editor.current_frame = 0;
-        }
-        if ui.button("\u{25C0}").on_hover_text("Previous frame").clicked() {
-            if state.skeleton_editor.current_frame > 0 {
-                state.skeleton_editor.current_frame -= 1;
-            }
-        }
-
-        let mut frame = state.skeleton_editor.current_frame;
-        ui.add(
-            egui::Slider::new(&mut frame, 0..=total.saturating_sub(1))
-                .show_value(false)
-                .clamp_to_range(true),
-        );
-        state.skeleton_editor.current_frame = frame;
-
-        if ui.button("\u{25B6}").on_hover_text("Next frame").clicked() {
-            if state.skeleton_editor.current_frame < total - 1 {
-                state.skeleton_editor.current_frame += 1;
-            }
-        }
-        if ui.button("\u{23ED}").on_hover_text("Last frame").clicked() {
-            state.skeleton_editor.current_frame = total - 1;
-        }
-
-        let t = state.skeleton_editor.current_time();
         ui.label(
-            RichText::new(format!("{}/{} ({:.2}s)", frame + 1, total, t))
+            RichText::new(format!("KF '{}' #{}", name, idx + 1))
                 .size(11.0)
                 .color(COL_TEXT_DIM),
         );
+        ui.label(RichText::new("transition:").size(10.0).color(COL_TEXT_DIM));
+
+        for (label, value) in &[
+            ("Step", Easing::Step),
+            ("Linear", Easing::Linear),
+            ("EaseIn", Easing::EaseIn),
+            ("EaseOut", Easing::EaseOut),
+            ("EaseInOut", Easing::EaseInOut),
+            ("Bezier", Easing::Cubic),
+        ] {
+            let is_sel = current_easing == *value;
+            if ui
+                .selectable_label(is_sel, RichText::new(*label).size(10.0))
+                .clicked()
+            {
+                new_easing = *value;
+            }
+        }
+
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .small_button(RichText::new("delete kf").color(Color32::from_rgb(255, 120, 120)))
+                .clicked()
+            {
+                delete_kf = true;
+            }
+        });
     });
+
+    if new_easing != current_easing {
+        if let Some(p) = state.scene.skeleton_templates[tmpl_idx].points.get_mut(&name) {
+            if let Some(kf) = p.track.get_mut(idx) {
+                kf.easing = new_easing;
+            }
+        }
+        let _ = state.scene.skeleton_templates[tmpl_idx].save_alongside_clip();
+    }
+
+    if delete_kf {
+        if let Some(p) = state.scene.skeleton_templates[tmpl_idx].points.get_mut(&name) {
+            if idx < p.track.len() {
+                p.track.remove(idx);
+            }
+        }
+        state.skeleton_editor.selected_keyframe = None;
+        let _ = state.scene.skeleton_templates[tmpl_idx].save_alongside_clip();
+    }
 }
 
 // ─── POINT LIST PANEL ────────────────────────────────────────────────
 
+/// Compact point list. One row per point: colour dot, name (selectable),
+/// keyframe count, "Track" toggle (loop playback over this point's
+/// keyframe range), delete. The "+" button auto-generates names like
+/// `p1`, `p2`, ... so the user can immediately start placing.
 fn point_list_panel(ui: &mut egui::Ui, state: &mut EditorState) {
     ui.label(RichText::new("Points").size(14.0).strong());
     ui.add_space(4.0);
 
-    // Add new point — auto-selects + arms place mode for one-click placement.
     ui.horizontal(|ui| {
-        let resp = ui.add(
-            egui::TextEdit::singleline(&mut state.skeleton_editor.new_point_name)
-                .hint_text("Point name...")
-                .desired_width(120.0),
-        );
-        let enter = resp.lost_focus()
-            && ui.input(|i| i.key_pressed(egui::Key::Enter));
-        if ui.button("+").on_hover_text("Add point and start placing").clicked() || enter {
-            let name = state.skeleton_editor.new_point_name.trim().to_string();
-            if !name.is_empty() {
-                if let Some(tmpl_idx) = state.skeleton_editor.template_idx {
-                    state.scene.skeleton_templates[tmpl_idx].add_point(&name);
-                    state.skeleton_editor.selected_point = Some(name.clone());
-                    state.skeleton_editor.new_point_name.clear();
-                    // Auto-arm place mode so the very next click on the
-                    // frame drops the first keyframe — saves a button press.
-                    state.skeleton_editor.place_mode = true;
-                    state.status =
-                        format!("Added point: {}. Click on the frame to place it.", name);
-                }
-            }
+        if ui
+            .button(RichText::new("+ Add point").color(Color32::from_rgb(120, 220, 140)))
+            .on_hover_text("Add a new point with an auto-generated name and start placing it")
+            .clicked()
+        {
+            add_auto_point(state);
         }
     });
 
@@ -900,7 +1181,6 @@ fn point_list_panel(ui: &mut egui::Ui, state: &mut EditorState) {
     let Some(tmpl_idx) = state.skeleton_editor.template_idx else {
         return;
     };
-    let t = state.skeleton_editor.current_time();
 
     let point_names: Vec<String> = state.scene.skeleton_templates[tmpl_idx]
         .points
@@ -908,22 +1188,36 @@ fn point_list_panel(ui: &mut egui::Ui, state: &mut EditorState) {
         .cloned()
         .collect();
 
-    let mut to_remove: Option<String> = None;
+    if point_names.is_empty() {
+        ui.label(
+            RichText::new("No points yet — press \"+ Add point\".")
+                .size(11.0)
+                .color(COL_TEXT_DIM)
+                .italics(),
+        );
+        return;
+    }
 
-    egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+    let mut to_remove: Option<String> = None;
+    let mut to_select: Option<String> = None;
+    let mut toggle_track: Option<String> = None;
+
+    egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
         for name in &point_names {
             let is_selected = state.skeleton_editor.selected_point.as_deref() == Some(name);
+            let is_tracking = state.skeleton_editor.track_loop_point.as_deref() == Some(name);
             let point = &state.scene.skeleton_templates[tmpl_idx].points[name];
             let color = Color32::from_rgb(point.color[0], point.color[1], point.color[2]);
-            let has_kf = point.track.iter().any(|kf| (kf.t - t).abs() < 0.02);
             let num_kf = point.track.len();
 
+            let row_bg = if is_selected {
+                Color32::from_rgb(45, 45, 65)
+            } else {
+                Color32::TRANSPARENT
+            };
+
             let frame = egui::Frame::none()
-                .fill(if is_selected {
-                    Color32::from_rgb(40, 40, 60)
-                } else {
-                    Color32::TRANSPARENT
-                })
+                .fill(row_bg)
                 .rounding(Rounding::same(4.0))
                 .inner_margin(egui::Margin::same(4.0));
 
@@ -933,119 +1227,125 @@ fn point_list_panel(ui: &mut egui::Ui, state: &mut EditorState) {
                         ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
                     ui.painter().circle_filled(dot_rect.center(), 5.0, color);
 
-                    let resp =
-                        ui.selectable_label(is_selected, RichText::new(name).size(12.0));
-                    if resp.clicked() {
-                        state.skeleton_editor.selected_point = Some(name.clone());
-                    }
-
-                    if has_kf {
-                        ui.label(
-                            RichText::new("\u{25C6}")
-                                .size(10.0)
-                                .color(Color32::from_rgb(255, 200, 50)),
-                        );
-                    }
-
-                    ui.label(
-                        RichText::new(format!("{}kf", num_kf))
-                            .size(9.0)
-                            .color(Color32::from_rgb(100, 100, 120)),
+                    let resp = ui.selectable_label(
+                        is_selected,
+                        RichText::new(name).size(12.0).color(COL_TEXT),
                     );
-
-                    if ui.small_button("\u{1F5D1}").on_hover_text("Remove point").clicked() {
-                        to_remove = Some(name.clone());
+                    if resp.clicked() {
+                        to_select = Some(name.clone());
                     }
+
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            if ui
+                                .small_button("\u{1F5D1}")
+                                .on_hover_text("Remove point")
+                                .clicked()
+                            {
+                                to_remove = Some(name.clone());
+                            }
+
+                            let track_label = if is_tracking { "\u{25A0}" } else { "\u{25B6}" };
+                            let track_color = if is_tracking {
+                                Color32::from_rgb(255, 160, 80)
+                            } else {
+                                Color32::from_rgb(140, 200, 255)
+                            };
+                            if ui
+                                .small_button(RichText::new(track_label).color(track_color))
+                                .on_hover_text(if is_tracking {
+                                    "Stop tracking"
+                                } else {
+                                    "Track: loop playback over this point's keyframe range"
+                                })
+                                .clicked()
+                            {
+                                toggle_track = Some(name.clone());
+                            }
+
+                            ui.label(
+                                RichText::new(format!("{} kf", num_kf))
+                                    .size(9.0)
+                                    .color(COL_TEXT_DIM),
+                            );
+                        },
+                    );
                 });
             });
         }
     });
+
+    if let Some(name) = to_select {
+        state.skeleton_editor.selected_point = Some(name);
+        state.skeleton_editor.selected_keyframe = None;
+    }
+
+    if let Some(name) = toggle_track {
+        if state.skeleton_editor.track_loop_point.as_deref() == Some(&name) {
+            state.skeleton_editor.track_loop_point = None;
+            state.skeleton_editor.playing = false;
+        } else {
+            state.skeleton_editor.selected_point = Some(name.clone());
+            state.skeleton_editor.track_loop_point = Some(name.clone());
+            // Jump the playhead to the start of the loop range and start
+            // playback immediately so "Track" feels like a one-click "show
+            // me what this point does".
+            if let Some(p) = state.scene.skeleton_templates[tmpl_idx].points.get(&name) {
+                if let Some(first) = p.track.first() {
+                    let f = (first.t * state.skeleton_editor.fps).round() as u32;
+                    state.skeleton_editor.current_frame =
+                        f.min(state.skeleton_editor.total_frames.saturating_sub(1));
+                }
+            }
+            state.skeleton_editor.playing = true;
+            state.skeleton_editor.last_play_tick = None;
+        }
+    }
 
     if let Some(name) = to_remove {
         state.scene.skeleton_templates[tmpl_idx].remove_point(&name);
         if state.skeleton_editor.selected_point.as_deref() == Some(&name) {
             state.skeleton_editor.selected_point = None;
         }
+        if state.skeleton_editor.track_loop_point.as_deref() == Some(&name) {
+            state.skeleton_editor.track_loop_point = None;
+        }
+        if state
+            .skeleton_editor
+            .selected_keyframe
+            .as_ref()
+            .map(|(n, _)| n == &name)
+            .unwrap_or(false)
+        {
+            state.skeleton_editor.selected_keyframe = None;
+        }
+        let _ = state.scene.skeleton_templates[tmpl_idx].save_alongside_clip();
         state.status = format!("Removed point: {}", name);
     }
+}
 
-    ui.add_space(8.0);
-    ui.separator();
-    ui.add_space(4.0);
-
-    if let Some(ref sel_name) = state.skeleton_editor.selected_point.clone() {
-        ui.label(
-            RichText::new(format!("Selected: {}", sel_name))
-                .size(12.0)
-                .strong(),
-        );
-        ui.add_space(4.0);
-
-        // Place mode toggle (kept for clarity, but the workflow no longer
-        // requires it: drag a marker directly to move it, and "+" auto-arms
-        // place mode for new points).
-        let place_color = if state.skeleton_editor.place_mode {
-            Color32::from_rgb(255, 80, 80)
-        } else {
-            Color32::from_rgb(80, 200, 120)
-        };
-        let place_text = if state.skeleton_editor.place_mode {
-            "Placing... (click frame)"
-        } else {
-            "Place mode"
-        };
-        if ui
-            .button(RichText::new(place_text).color(place_color))
-            .on_hover_text("Toggle: when ON, clicking on the frame places a keyframe at the cursor")
-            .clicked()
+/// Pick the next free `pN` name and add the point.
+fn add_auto_point(state: &mut EditorState) {
+    let Some(tmpl_idx) = state.skeleton_editor.template_idx else {
+        return;
+    };
+    let mut n = state.skeleton_editor.name_counter + 1;
+    let name = loop {
+        let candidate = format!("p{}", n);
+        if !state.scene.skeleton_templates[tmpl_idx]
+            .points
+            .contains_key(&candidate)
         {
-            state.skeleton_editor.place_mode = !state.skeleton_editor.place_mode;
+            break candidate;
         }
-
-        ui.add_space(2.0);
-        ui.label(
-            RichText::new("Tip: drag a point on the frame to move it.")
-                .size(9.0)
-                .color(COL_TEXT_DIM)
-                .italics(),
-        );
-
-        ui.add_space(4.0);
-
-        if ui
-            .button("+ Keyframe here")
-            .on_hover_text("Add/update keyframe at current frame")
-            .clicked()
-        {
-            let current_state = state.scene.skeleton_templates[tmpl_idx]
-                .sample_point(sel_name, t)
-                .unwrap_or_default();
-            state.scene.skeleton_templates[tmpl_idx]
-                .set_point_keyframe(sel_name, t, current_state, Easing::Linear);
-            let _ = state.scene.skeleton_templates[tmpl_idx].save_alongside_clip();
-            state.status = format!("Keyframe added at {:.2}s", t);
-        }
-
-        if ui
-            .button("- Remove keyframe")
-            .on_hover_text("Remove keyframe nearest to current frame")
-            .clicked()
-        {
-            if state.scene.skeleton_templates[tmpl_idx].remove_point_keyframe(sel_name, t) {
-                let _ = state.scene.skeleton_templates[tmpl_idx].save_alongside_clip();
-                state.status = format!("Keyframe removed at {:.2}s", t);
-            }
-        }
-
-        if let Some(ps) = state.scene.skeleton_templates[tmpl_idx].sample_point(sel_name, t) {
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new(format!("Pos: ({:.3}, {:.3})", ps.x, ps.y))
-                    .size(10.0)
-                    .color(COL_TEXT_DIM),
-            );
-        }
-    }
+        n += 1;
+    };
+    state.scene.skeleton_templates[tmpl_idx].add_point(&name);
+    state.skeleton_editor.selected_point = Some(name.clone());
+    state.skeleton_editor.selected_keyframe = None;
+    state.skeleton_editor.name_counter = n;
+    state.status = format!("Added point: {}. Click on the frame to place it.", name);
 }
 
 // Suppress dead-code warning for COL_POINT_DEFAULT (kept for future use /
