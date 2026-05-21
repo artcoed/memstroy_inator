@@ -263,6 +263,21 @@ impl crate::keyframe::Lerp for ActorState {
 }
 
 /// Color correction parameters applied to an actor or overlay.
+///
+/// Two layers of controls:
+/// 1. **Quick**: brightness / contrast / saturation / temperature — for
+///    low-effort tweaks (also kept for backward compatibility with older
+///    project files).
+/// 2. **Pro** (DaVinci-style):
+///    - `lift`  — per-RGB shadow offset (neutral = 0).
+///    - `gamma` — per-RGB midtone gamma (neutral = 1).
+///    - `gain`  — per-RGB highlight gain (neutral = 1).
+///    - `curves` — master + per-channel tone curves (sorted control points).
+///
+/// Apply order (matches the resolve / NLE convention):
+///   1. brightness/contrast/saturation/temperature (legacy block)
+///   2. lift → gain → gamma per channel
+///   3. master curve, then R / G / B curves.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ColorCorrection {
     #[serde(default)]
@@ -273,11 +288,116 @@ pub struct ColorCorrection {
     pub saturation: f32,
     #[serde(default)]
     pub temperature: f32,
+
+    /// Per-RGB shadow offset. Neutral = `[0, 0, 0]`. Range typically `[-0.5, 0.5]`.
+    #[serde(default = "default_lift")]
+    pub lift: [f32; 3],
+    /// Per-RGB midtone gamma. Neutral = `[1, 1, 1]`. Range typically `[0.2, 4.0]`.
+    #[serde(default = "default_gamma")]
+    pub gamma: [f32; 3],
+    /// Per-RGB highlight gain. Neutral = `[1, 1, 1]`. Range typically `[0.0, 4.0]`.
+    #[serde(default = "default_gain")]
+    pub gain: [f32; 3],
+
+    /// Master + per-channel tone curves. Neutral curve = `[(0,0), (1,1)]`.
+    #[serde(default)]
+    pub curves: ToneCurves,
+}
+
+fn default_lift() -> [f32; 3] { [0.0, 0.0, 0.0] }
+fn default_gamma() -> [f32; 3] { [1.0, 1.0, 1.0] }
+fn default_gain() -> [f32; 3] { [1.0, 1.0, 1.0] }
+
+/// Master + per-channel tone curves. Each curve is a list of `[input, output]`
+/// control points in 0..1, sorted by input. The endpoints (`x=0` and `x=1`)
+/// are always present; intermediate points can be added/removed in the UI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToneCurves {
+    #[serde(default = "identity_curve")]
+    pub master: Vec<[f32; 2]>,
+    #[serde(default = "identity_curve")]
+    pub red: Vec<[f32; 2]>,
+    #[serde(default = "identity_curve")]
+    pub green: Vec<[f32; 2]>,
+    #[serde(default = "identity_curve")]
+    pub blue: Vec<[f32; 2]>,
+}
+
+fn identity_curve() -> Vec<[f32; 2]> { vec![[0.0, 0.0], [1.0, 1.0]] }
+
+impl Default for ToneCurves {
+    fn default() -> Self {
+        Self {
+            master: identity_curve(),
+            red: identity_curve(),
+            green: identity_curve(),
+            blue: identity_curve(),
+        }
+    }
+}
+
+impl ToneCurves {
+    /// Whether all four curves are at the identity `(0,0)–(1,1)`.
+    pub fn is_identity(&self) -> bool {
+        is_identity_curve(&self.master)
+            && is_identity_curve(&self.red)
+            && is_identity_curve(&self.green)
+            && is_identity_curve(&self.blue)
+    }
+
+    /// Sample a curve at `x` in 0..1 using piecewise-linear interpolation
+    /// across its control points. Out-of-range x clamps to the endpoint y.
+    pub fn sample(curve: &[[f32; 2]], x: f32) -> f32 {
+        if curve.is_empty() { return x; }
+        if curve.len() == 1 { return curve[0][1]; }
+        if x <= curve[0][0] { return curve[0][1]; }
+        if x >= curve[curve.len() - 1][0] { return curve[curve.len() - 1][1]; }
+        for w in curve.windows(2) {
+            if x >= w[0][0] && x <= w[1][0] {
+                let span = w[1][0] - w[0][0];
+                if span < 1e-6 { return w[0][1]; }
+                let t = (x - w[0][0]) / span;
+                return w[0][1] + (w[1][1] - w[0][1]) * t;
+            }
+        }
+        x
+    }
+}
+
+fn is_identity_curve(c: &[[f32; 2]]) -> bool {
+    c.len() == 2
+        && (c[0][0] - 0.0).abs() < 1e-4 && (c[0][1] - 0.0).abs() < 1e-4
+        && (c[1][0] - 1.0).abs() < 1e-4 && (c[1][1] - 1.0).abs() < 1e-4
 }
 
 impl Default for ColorCorrection {
     fn default() -> Self {
-        Self { brightness: 0.0, contrast: 1.0, saturation: 1.0, temperature: 0.0 }
+        Self {
+            brightness: 0.0,
+            contrast: 1.0,
+            saturation: 1.0,
+            temperature: 0.0,
+            lift: [0.0; 3],
+            gamma: [1.0; 3],
+            gain: [1.0; 3],
+            curves: ToneCurves::default(),
+        }
+    }
+}
+
+impl ColorCorrection {
+    /// Whether every parameter is at its neutral / identity value, i.e. this
+    /// correction would be a no-op. Used as a fast-path so untouched clips
+    /// skip the full CPU correction pipeline entirely.
+    pub fn is_identity(&self) -> bool {
+        self.brightness.abs() < 1e-4
+            && (self.contrast - 1.0).abs() < 1e-4
+            && (self.saturation - 1.0).abs() < 1e-4
+            && self.temperature.abs() < 1e-4
+            && self.lift.iter().all(|v| v.abs() < 1e-4)
+            && self.gamma.iter().all(|v| (v - 1.0).abs() < 1e-4)
+            && self.gain.iter().all(|v| (v - 1.0).abs() < 1e-4)
+            && self.curves.is_identity()
     }
 }
 
