@@ -94,7 +94,7 @@ fn handle_canvas_input(
 
         if scroll.y.abs() > 0.1 {
             // Zoom towards mouse position
-            let factor = if scroll.y > 0.0 { 1.1 } else { 1.0 / 1.1 };
+            let factor = if scroll.y > 0.0 { 1.03 } else { 1.0 / 1.03 };
             if let Some(mouse) = ui.input(|i| i.pointer.hover_pos()) {
                 let local = [mouse.x - _full_rect.min.x, mouse.y - _full_rect.min.y];
                 state.canvas_viewport.zoom_at(local, viewport_size, factor);
@@ -198,10 +198,7 @@ fn draw_render_frame(
         Pos2::new(full_rect.min.x + br_screen[0], full_rect.min.y + br_screen[1]),
     );
 
-    // Semi-transparent fill inside the frame
-    painter.rect_filled(frame_rect, Rounding::ZERO, COL_RENDER_FRAME_FILL);
-
-    // Dashed border (simulated with multiple short segments)
+    // Border only (no fill inside the render frame)
     painter.rect_stroke(frame_rect, Rounding::ZERO, Stroke::new(2.0, COL_RENDER_FRAME));
 
     // Dim area outside the render frame (vignette effect)
@@ -292,8 +289,22 @@ fn draw_canvas_elements(
 
         // Get world position from canvas_layouts or legacy layout
         let world_pos = get_element_world_pos(state, &actor.id, &actor.layout, t);
-        let elem_width = 400.0; // default width in world pixels
-        let elem_height = elem_width * 16.0 / 9.0; // assume 9:16 source aspect
+        // Use actual source dimensions from frame cache, or default 480x270 (16:9)
+        let (elem_width, elem_height) = if let Some(fc) = state.frame_caches.get(idx) {
+            if fc.is_ready() && fc.frame_count > 0 {
+                // Frame cache extracts at 480px width, source aspect preserved
+                (480.0_f32, 480.0 * 16.0 / 9.0) // vertical video default
+            } else {
+                (400.0, 400.0 * 16.0 / 9.0)
+            }
+        } else {
+            (400.0, 400.0 * 16.0 / 9.0)
+        };
+        // Apply actor scale from layout
+        let actor_scale = keyframe::sample(&actor.layout, t)
+            .map(|s| s.scale).unwrap_or(1.0);
+        let elem_width = elem_width * actor_scale;
+        let elem_height = elem_height * actor_scale;
 
         // Convert to screen coordinates
         let center_screen = state.canvas_viewport.world_to_screen(world_pos, viewport_size);
@@ -800,26 +811,21 @@ fn draw_render_frame_handles(
         COL_RENDER_FRAME,
     );
 
-    // Allow dragging the render frame center with Alt+drag when no element is selected
-    // or when the frame handle itself is clicked
+    // Allow dragging the render frame center with left drag when nothing else is selected
     if response.dragged() && !state.canvas_panning {
-        let alt_held = ui.input(|i| i.modifiers.alt);
-        if alt_held || state.selection == Selection::None {
-            // Check if drag started near the center handle
-            if let Some(origin) = response.interact_pointer_pos() {
-                let ox = origin.x - response.drag_delta().x;
-                let oy = origin.y - response.drag_delta().y;
-                let dist = ((ox - center_pos.x).powi(2) + (oy - center_pos.y).powi(2)).sqrt();
-                if dist < handle_radius * 3.0 || alt_held {
-                    let delta = response.drag_delta();
-                    let world_dx = delta.x / state.canvas_viewport.zoom;
-                    let world_dy = delta.y / state.canvas_viewport.zoom;
+        if let Some(origin) = response.interact_pointer_pos() {
+            let ox = origin.x - response.drag_delta().x;
+            let oy = origin.y - response.drag_delta().y;
+            let dist = ((ox - center_pos.x).powi(2) + (oy - center_pos.y).powi(2)).sqrt();
+            if dist < handle_radius * 4.0 && state.selection == Selection::None {
+                let delta = response.drag_delta();
+                let world_dx = delta.x / state.canvas_viewport.zoom;
+                let world_dy = delta.y / state.canvas_viewport.zoom;
 
-                    // Move the render frame
-                    if let Some(kf) = state.scene.render_frame.layout.first_mut() {
-                        kf.value.pos.x += world_dx;
-                        kf.value.pos.y += world_dy;
-                    }
+                // Move the render frame
+                if let Some(kf) = state.scene.render_frame.layout.first_mut() {
+                    kf.value.pos.x += world_dx;
+                    kf.value.pos.y += world_dy;
                 }
             }
         }
@@ -875,7 +881,9 @@ fn try_select_at(state: &mut EditorState, pos: WorldPos) {
     for (idx, actor) in state.scene.actors.iter().enumerate().rev() {
         if !actor.visible { continue; }
         let world_pos = get_element_world_pos(state, &actor.id, &actor.layout, t);
-        let elem_width = 400.0;
+        let actor_scale = keyframe::sample(&actor.layout, t)
+            .map(|s| s.scale).unwrap_or(1.0);
+        let elem_width = 400.0 * actor_scale;
         let elem_height = elem_width * 16.0 / 9.0;
 
         let half_w = elem_width * 0.5;

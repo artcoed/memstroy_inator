@@ -2304,9 +2304,10 @@ fn clean_clip_text(raw: &str) -> String {
 }
 
 pub fn add_actor_from_clip(state: &mut EditorState, path: &PathBuf) {
+    let counter = state.scene.actors.len() + 1;
     let id = path.file_stem().and_then(|s| s.to_str())
-        .map(|s| format!("mellstroy_{}", s))
-        .unwrap_or_else(|| format!("actor_{}", state.scene.actors.len() + 1));
+        .map(|s| format!("{}_{}", s, counter))
+        .unwrap_or_else(|| format!("actor_{}", counter));
 
     let clip_duration = probe_video_duration(path);
     let t_in = state.playhead;
@@ -2363,9 +2364,10 @@ fn add_background_from_path(state: &mut EditorState, path: &PathBuf) {
 
 /// Add an actor from a clip at a specific time (used by drag-to-track).
 fn add_actor_from_clip_at_time(state: &mut EditorState, path: &PathBuf, t: f32) {
+    let counter = state.scene.actors.len() + 1;
     let id = path.file_stem().and_then(|s| s.to_str())
-        .map(|s| format!("mellstroy_{}", s))
-        .unwrap_or_else(|| format!("actor_{}", state.scene.actors.len() + 1));
+        .map(|s| format!("{}_{}", s, counter))
+        .unwrap_or_else(|| format!("actor_{}", counter));
 
     let clip_duration = probe_video_duration(path);
     let t_in = t;
