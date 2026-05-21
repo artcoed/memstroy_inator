@@ -342,6 +342,33 @@ pub struct TextOverlay {
     pub style: TextStyle,
     /// Position keyframes; if a single keyframe is provided it stays still.
     pub layout: Vec<Keyframe<OverlayState>>,
+    /// Stacking order among overlays of the same actor-relation.
+    /// Higher values draw on top of lower ones. Default 100.
+    #[serde(default = "default_text_z")]
+    pub z_index: i32,
+    /// When true, this text is drawn UNDER the actors (between background
+    /// and actors). When false (default), it draws on top of actors.
+    #[serde(default)]
+    pub behind_actors: bool,
+}
+
+fn default_text_z() -> i32 { 100 }
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TextBoxKind {
+    /// No background plate.
+    None,
+    /// Solid filled rectangle (default).
+    Solid,
+    /// Two-color vertical gradient.
+    Gradient,
+    /// Only an outlined rectangle, no fill.
+    OutlineOnly,
+}
+
+impl Default for TextBoxKind {
+    fn default() -> Self { TextBoxKind::Solid }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -351,7 +378,7 @@ pub struct TextStyle {
     pub font: String,
     pub font_size: f32,
     pub color: [u8; 3],
-    /// White meme box behind the text. None = transparent text only.
+    /// Solid plate colour. `None` = transparent text only.
     #[serde(default)]
     pub box_color: Option<[u8; 3]>,
     /// Padding inside the box, in pixels.
@@ -359,6 +386,8 @@ pub struct TextStyle {
     pub box_padding: f32,
     #[serde(default)]
     pub bold: bool,
+    #[serde(default)]
+    pub italic: bool,
     /// Outline colour for stroke around the glyphs.
     #[serde(default)]
     pub outline: Option<[u8; 3]>,
@@ -366,6 +395,27 @@ pub struct TextStyle {
     pub outline_width: f32,
     #[serde(default)]
     pub align: TextAlign,
+
+    // ─── Background plate styling ────────────────────────────────────
+    /// What kind of background plate to draw. Only used when `box_color`
+    /// is `Some(_)` — keeps backward compatibility with legacy scenes.
+    #[serde(default)]
+    pub box_kind: TextBoxKind,
+    /// Corner radius of the background plate, in pixels.
+    #[serde(default)]
+    pub box_corner_radius: f32,
+    /// Plate opacity (0.0 .. 1.0). Defaults to 1.0.
+    #[serde(default = "one")]
+    pub box_opacity: f32,
+    /// When `box_kind = Gradient`, the second (bottom) colour of the gradient.
+    #[serde(default)]
+    pub box_gradient_end: Option<[u8; 3]>,
+    /// Plate outline colour (used by `Solid+border` and `OutlineOnly`).
+    #[serde(default)]
+    pub box_outline_color: Option<[u8; 3]>,
+    /// Plate outline width in pixels.
+    #[serde(default)]
+    pub box_outline_width: f32,
 }
 
 fn default_font() -> String { "DejaVuSans".into() }
@@ -379,9 +429,16 @@ impl Default for TextStyle {
             box_color: Some([255, 255, 255]),
             box_padding: 24.0,
             bold: true,
+            italic: false,
             outline: None,
             outline_width: 0.0,
             align: TextAlign::Center,
+            box_kind: TextBoxKind::Solid,
+            box_corner_radius: 8.0,
+            box_opacity: 1.0,
+            box_gradient_end: None,
+            box_outline_color: None,
+            box_outline_width: 0.0,
         }
     }
 }

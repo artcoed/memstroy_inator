@@ -38,6 +38,13 @@ pub struct FrameCache {
     pub source_height: u32,
     /// Single reusable texture handle — updated each frame.
     texture: Option<TextureHandle>,
+    /// Cached processed (chromakey/color-corrected) texture handle.
+    /// Reused across frames when the source frame index AND the effect
+    /// parameters are unchanged — avoids running the per-pixel CPU loop
+    /// on every repaint.
+    fx_texture: Option<TextureHandle>,
+    /// Identity of the last processed frame (frame index + parameter hash).
+    fx_key: Option<(usize, u64)>,
     /// Pre-loaded frame images in memory (ring buffer).
     buffer: Vec<Option<ColorImage>>,
     /// First frame index represented in the buffer.
@@ -73,6 +80,8 @@ impl FrameCache {
             source_width: 480,
             source_height: 270,
             texture: None,
+            fx_texture: None,
+            fx_key: None,
             buffer: Vec::new(),
             buffer_start: 0,
             buffer_size: BUFFER_SIZE,
@@ -321,6 +330,47 @@ impl FrameCache {
             && frame_index < self.frame_count
     }
 
+    /// Return a cached texture for the given time AFTER applying chroma-key
+    /// and colour-correction. The processed texture is cached and only
+    /// recomputed when the frame index or effect parameters change.
+    pub fn processed_frame_at_time(
+        &mut self,
+        t: f32,
+        ck: &memstroy_core::ChromaKeyParams,
+        cc: &memstroy_core::ColorCorrection,
+        ctx: &egui::Context,
+    ) -> Option<&TextureHandle> {
+        if !self.ready || self.frame_count == 0 { return None; }
+        let frame_index = ((t * self.fps).floor() as usize)
+            .clamp(0, self.frame_count.saturating_sub(1));
+        let new_key = (frame_index, hash_effect_params(ck, cc));
+
+        // Cache hit — reuse the existing processed texture.
+        if let (Some(prev_key), Some(_)) = (self.fx_key, self.fx_texture.as_ref()) {
+            if prev_key == new_key {
+                return self.fx_texture.as_ref();
+            }
+        }
+
+        // Miss: get the raw frame and apply effects.
+        let raw = self.raw_frame_at_time(t)?;
+        let processed = apply_effects_cpu(&raw, ck, cc);
+        let options = TextureOptions::LINEAR;
+        match self.fx_texture.as_mut() {
+            Some(tex) => tex.set(processed, options),
+            None => {
+                let tex = ctx.load_texture(
+                    format!("frame_fx_{}", self.actor_index),
+                    processed,
+                    options,
+                );
+                self.fx_texture = Some(tex);
+            }
+        }
+        self.fx_key = Some(new_key);
+        self.fx_texture.as_ref()
+    }
+
     /// Load a single frame from disk as a ColorImage.
     fn load_frame_from_disk(&self, frame_index: usize) -> Option<ColorImage> {
         let file_name = format!("{:06}.jpg", frame_index + 1); // 1-based file naming
@@ -410,4 +460,90 @@ impl FrameCache {
             self.preloading = false;
         }
     }
+}
+
+
+// ─── EFFECT CACHING HELPERS ──────────────────────────────────────────
+
+/// Hash the chroma-key + color-correction parameters with sub-millisecond
+/// precision. Two equal parameter sets yield the same hash so the processed
+/// texture cache can be reused.
+fn hash_effect_params(
+    ck: &memstroy_core::ChromaKeyParams,
+    cc: &memstroy_core::ColorCorrection,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    ck.key_color.hash(&mut h);
+    bits(ck.similarity).hash(&mut h);
+    bits(ck.blend).hash(&mut h);
+    bits(ck.spill).hash(&mut h);
+    bits(cc.brightness).hash(&mut h);
+    bits(cc.contrast).hash(&mut h);
+    bits(cc.saturation).hash(&mut h);
+    bits(cc.temperature).hash(&mut h);
+    h.finish()
+}
+
+#[inline]
+fn bits(f: f32) -> u32 { (f * 10_000.0).round() as i32 as u32 }
+
+/// CPU implementation of the chroma-key + colour-correction pipeline.
+/// Mirrors what the live `apply_preview_effects` did but lives on the cache so
+/// the result can be reused across repaints.
+pub fn apply_effects_cpu(
+    img: &ColorImage,
+    ck: &memstroy_core::ChromaKeyParams,
+    cc: &memstroy_core::ColorCorrection,
+) -> ColorImage {
+    let mut out = ColorImage::new(img.size, egui::Color32::TRANSPARENT);
+    let key_r = ck.key_color[0] as f32;
+    let key_g = ck.key_color[1] as f32;
+    let key_b = ck.key_color[2] as f32;
+    let similarity = ck.similarity.clamp(0.0, 1.0);
+    let blend = ck.blend.clamp(0.0, 1.0);
+    let spill = ck.spill.clamp(0.0, 1.0);
+    let threshold = similarity * 441.0;
+    let blend_range = (blend * 200.0).max(0.01);
+
+    for (i, pixel) in img.pixels.iter().enumerate() {
+        let r = pixel.r() as f32;
+        let g = pixel.g() as f32;
+        let b = pixel.b() as f32;
+
+        let dist = ((r - key_r).powi(2) + (g - key_g).powi(2) + (b - key_b).powi(2)).sqrt();
+        let alpha = if dist < threshold {
+            0.0
+        } else if dist < threshold + blend_range {
+            (dist - threshold) / blend_range
+        } else {
+            1.0
+        };
+
+        let (mut or_, mut og, mut ob) = (r, g, b);
+        if alpha > 0.0 && spill > 0.0 && g > (r + b) * 0.5 {
+            let avg_rb = (r + b) * 0.5;
+            og = g - (g - avg_rb) * spill;
+        }
+
+        // Brightness / contrast / saturation / temperature
+        or_ = (or_ + cc.brightness * 255.0).clamp(0.0, 255.0);
+        og  = (og  + cc.brightness * 255.0).clamp(0.0, 255.0);
+        ob  = (ob  + cc.brightness * 255.0).clamp(0.0, 255.0);
+        or_ = ((or_ - 128.0) * cc.contrast + 128.0).clamp(0.0, 255.0);
+        og  = ((og  - 128.0) * cc.contrast + 128.0).clamp(0.0, 255.0);
+        ob  = ((ob  - 128.0) * cc.contrast + 128.0).clamp(0.0, 255.0);
+        let gray = 0.299 * or_ + 0.587 * og + 0.114 * ob;
+        or_ = (gray + (or_ - gray) * cc.saturation).clamp(0.0, 255.0);
+        og  = (gray + (og  - gray) * cc.saturation).clamp(0.0, 255.0);
+        ob  = (gray + (ob  - gray) * cc.saturation).clamp(0.0, 255.0);
+        if cc.temperature != 0.0 {
+            or_ = (or_ + cc.temperature * 30.0).clamp(0.0, 255.0);
+            ob  = (ob  - cc.temperature * 30.0).clamp(0.0, 255.0);
+        }
+
+        let a = (alpha * 255.0).clamp(0.0, 255.0) as u8;
+        out.pixels[i] = egui::Color32::from_rgba_unmultiplied(or_ as u8, og as u8, ob as u8, a);
+    }
+    out
 }

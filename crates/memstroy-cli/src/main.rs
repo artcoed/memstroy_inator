@@ -213,6 +213,8 @@ fn starter_scene() -> Scene {
         t_out: 7.5,
         style: TextStyle::default(),
         layout: vec![Keyframe::new(0.0, OverlayState { pos: [0.5, 0.15], scale: 1.0, rotation_deg: 0.0, opacity: 1.0 })],
+        z_index: 100,
+        behind_actors: false,
     });
     Scene {
         format_version: 1,
