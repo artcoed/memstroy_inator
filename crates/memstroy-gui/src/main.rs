@@ -5,7 +5,7 @@ mod audio_engine;
 mod canvas_preview;
 mod clip_editor;
 mod curve_editor;
-mod export_presets;
+
 mod gpu_preview;
 mod jobs;
 mod node_editor;

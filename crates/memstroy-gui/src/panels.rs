@@ -279,77 +279,22 @@ fn inspector_nothing(ui: &mut egui::Ui, state: &mut EditorState) {
     ui.separator();
     ui.add_space(8.0);
 
-    // Output settings always visible when nothing selected
-    ui.label(RichText::new("Output Settings").size(14.0).strong().color(Color32::from_rgb(100, 200, 255)));
+    // Output settings — fixed 1080x1920 9:16 short format
+    ui.label(RichText::new("Output").size(14.0).strong().color(Color32::from_rgb(100, 200, 255)));
     ui.add_space(4.0);
-
-    // Quick Preset row (TikTok / YouTube / IG / etc.)
-    inspector_export_preset_row(ui, state);
+    ui.label(RichText::new("1080x1920 (9:16)").size(12.0).color(COL_TEXT_DIM));
+    ui.add_space(4.0);
 
     let spec = &mut state.scene.output;
     ui.horizontal(|ui| {
-        ui.label("Size:");
-        ui.add(egui::DragValue::new(&mut spec.resolution[0]).range(64..=4096).speed(1.0));
-        ui.label("x");
-        ui.add(egui::DragValue::new(&mut spec.resolution[1]).range(64..=4096).speed(1.0));
-    });
-    ui.horizontal(|ui| {
         ui.label("FPS:");
-        ui.add(egui::DragValue::new(&mut spec.fps).range(24..=120));
+        ui.add(egui::DragValue::new(&mut spec.fps).range(24..=60));
     });
     ui.horizontal(|ui| {
         ui.label("Duration:");
-        ui.add(egui::DragValue::new(&mut spec.duration).range(0.5..=600.0).speed(0.1).suffix("s"));
+        ui.add(egui::DragValue::new(&mut spec.duration).range(0.5..=60.0).speed(0.1).suffix("s"));
     });
 }
-
-/// Render the "Quick Preset" combo + Apply button used in the Output Settings.
-fn inspector_export_preset_row(ui: &mut egui::Ui, state: &mut EditorState) {
-    use crate::export_presets::{apply_preset, PRESETS};
-
-    // Selected preset index lives in egui memory so it persists across frames.
-    let mem_id = egui::Id::new("export_preset_idx");
-    let mut idx: usize = ui
-        .ctx()
-        .memory(|m| m.data.get_temp::<usize>(mem_id).unwrap_or(0));
-    if idx >= PRESETS.len() {
-        idx = 0;
-    }
-
-    ui.horizontal(|ui| {
-        ui.label("Preset:");
-        let preset = &PRESETS[idx];
-        egui::ComboBox::from_id_source("export_preset_combo")
-            .selected_text(format!("{} {}", preset.icon, preset.name))
-            .show_ui(ui, |ui| {
-                for (i, p) in PRESETS.iter().enumerate() {
-                    let label = format!(
-                        "{} {} ({}, {}x{} @ {} fps)",
-                        p.icon, p.name, p.aspect_label, p.resolution[0], p.resolution[1], p.fps
-                    );
-                    if ui.selectable_value(&mut idx, i, label).clicked() {
-                        // selection changes are persisted below
-                    }
-                }
-            });
-        if ui
-            .button(RichText::new("Apply").size(11.0))
-            .on_hover_text(PRESETS[idx].description)
-            .clicked()
-        {
-            let preset = &PRESETS[idx];
-            apply_preset(&mut state.scene.output, preset);
-            state.status = format!(
-                "\u{1F39E} Preset applied: {} ({}x{} @ {} fps)",
-                preset.name, preset.resolution[0], preset.resolution[1], preset.fps
-            );
-        }
-    });
-
-    ui.ctx().memory_mut(|m| m.data.insert_temp(mem_id, idx));
-    ui.add_space(4.0);
-}
-
 
 fn inspector_actor(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
     let actor_count = state.scene.actors.len();
