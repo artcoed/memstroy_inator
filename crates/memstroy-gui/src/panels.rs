@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use egui::{Color32, Pos2, Rect, RichText, Rounding, Sense, Stroke, Vec2};
 use memstroy_core::*;
 
-use crate::state::{AssetDragKind, EditorState, Selection, TrackKind};
+use crate::state::{AssetDragKind, EditorState, LibraryTab, Selection, TrackKind};
 
 
 // ─── DRAG MODE FOR TIMELINE CLIPS ────────────────────────────────────
@@ -39,9 +39,10 @@ const COL_SELECTED: Color32 = Color32::from_rgb(255, 220, 80);
 
 // ─── LIBRARY ─────────────────────────────────────────────────────────
 
-/// Clip library: the list of downloaded Mellstroy clips. Drag a clip to the
-/// timeline to add it as an actor, or double-click to insert at the
-/// playhead.
+/// Asset library panel: a tabbed browser over Mellstroy clips, sounds,
+/// PNG stickers, and particle presets. Each tab shares the same drag
+/// model — picking up an entry sets `state.asset_drag` and the canvas /
+/// timeline drop targets handle the rest.
 pub fn library(ui: &mut egui::Ui, state: &mut EditorState, _request_refresh: impl Fn()) {
     // Header
     ui.horizontal(|ui| {
@@ -57,23 +58,55 @@ pub fn library(ui: &mut egui::Ui, state: &mut EditorState, _request_refresh: imp
     });
     ui.add_space(4.0);
 
+    // Tab bar — Clips / Sounds / Images / Particles. Sticky across
+    // sessions via `state.library_tab`.
+    ui.horizontal_wrapped(|ui| {
+        let tabs = [
+            (LibraryTab::Clips,    "\u{1F3AC} Clips"),
+            (LibraryTab::Sounds,   "\u{1F50A} Sounds"),
+            (LibraryTab::Images,   "\u{1F5BC} Images"),
+            (LibraryTab::Particles, "\u{2728} Particles"),
+        ];
+        for (tab, label) in tabs {
+            if ui.selectable_label(state.library_tab == tab, label).clicked() {
+                state.library_tab = tab;
+            }
+        }
+    });
+    ui.add_space(4.0);
+
     ui.add(
         egui::TextEdit::singleline(&mut state.library_search)
-            .hint_text("Search clips...")
+            .hint_text("Search...")
             .desired_width(ui.available_width()),
     );
     ui.add_space(2.0);
+
+    let hint_text = match state.library_tab {
+        LibraryTab::Clips => "Drag a clip onto the canvas or timeline. Files dropped from your file manager work too.",
+        LibraryTab::Sounds => "Drop a sound onto the timeline to add it as an audio track.",
+        LibraryTab::Images => "Drag a sticker onto the canvas to add it as an image overlay.",
+        LibraryTab::Particles => "Drag a particle onto the canvas — it spawns with spin + pulse modifiers.",
+    };
     ui.label(
-        RichText::new(
-            "Tip: drag a clip onto the timeline to place it. \
-             Files dropped from your file manager work too.",
-        )
-        .size(9.0)
-        .italics()
-        .color(COL_TEXT_DIM),
+        RichText::new(hint_text)
+            .size(9.0)
+            .italics()
+            .color(COL_TEXT_DIM),
     );
     ui.add_space(6.0);
 
+    match state.library_tab {
+        LibraryTab::Clips => library_clips_tab(ui, state),
+        LibraryTab::Sounds => library_assets_tab(ui, state, AssetDragKind::Sound),
+        LibraryTab::Images => library_assets_tab(ui, state, AssetDragKind::Image),
+        LibraryTab::Particles => library_assets_tab(ui, state, AssetDragKind::Particle),
+    }
+}
+
+/// Render the original Mellstroy clip browser content (split out so the
+/// new tabs can render their own variants of the list).
+fn library_clips_tab(ui: &mut egui::Ui, state: &mut EditorState) {
     let search_lower = state.library_search.to_lowercase();
     let clip_count = state.library.mellstroy_clips.len();
     ui.label(
@@ -110,6 +143,244 @@ pub fn library(ui: &mut egui::Ui, state: &mut EditorState, _request_refresh: imp
                 clip_card(ui, state, &clip);
             }
         });
+}
+
+/// Render a generic LibraryAsset list (sounds / images / particles).
+/// All three share the same row layout — only the title colour and the
+/// drop semantics differ, which we encode via `AssetDragKind`.
+fn library_assets_tab(ui: &mut egui::Ui, state: &mut EditorState, kind: AssetDragKind) {
+    let (title, dir, title_color) = match kind {
+        AssetDragKind::Sound => (
+            "Sounds",
+            state.sounds_dir(),
+            Color32::from_rgb(120, 200, 255),
+        ),
+        AssetDragKind::Image => (
+            "Images",
+            state.images_dir(),
+            Color32::from_rgb(180, 255, 180),
+        ),
+        AssetDragKind::Particle => (
+            "Particles",
+            state.particles_dir(),
+            Color32::from_rgb(255, 220, 120),
+        ),
+        // Reused for clips elsewhere; not expected here.
+        _ => return,
+    };
+
+    let assets: &[crate::state::LibraryAsset] = match kind {
+        AssetDragKind::Sound => &state.library.sounds,
+        AssetDragKind::Image => &state.library.images,
+        AssetDragKind::Particle => &state.library.particles,
+        _ => return,
+    };
+
+    let search_lower = state.library_search.to_lowercase();
+    let count = assets.len();
+    ui.label(
+        RichText::new(format!("{} ({})", title, count))
+            .size(12.0)
+            .strong()
+            .color(title_color),
+    );
+    ui.add_space(2.0);
+
+    if count == 0 {
+        ui.label(
+            RichText::new(format!(
+                "Empty. Drop files into:\n  {}\nthen click Refresh.",
+                dir.display()
+            ))
+            .italics()
+            .color(COL_TEXT_DIM)
+            .size(10.0),
+        );
+        return;
+    }
+
+    let scroll_id = format!("library_{}_scroll", title.to_lowercase());
+    // Snapshot the row data so the borrow checker is happy with the
+    // mutable `state` we pass to `library_asset_card`.
+    let rows: Vec<crate::state::LibraryAsset> = assets.iter()
+        .filter(|a| {
+            search_lower.is_empty()
+                || a.label.to_lowercase().contains(&search_lower)
+                || a.id.to_lowercase().contains(&search_lower)
+        })
+        .cloned()
+        .collect();
+
+    egui::ScrollArea::vertical()
+        .id_source(scroll_id)
+        .auto_shrink([false; 2])
+        .show(ui, |ui| {
+            for asset in &rows {
+                library_asset_card(ui, state, asset, kind, title_color);
+            }
+        });
+}
+
+/// Compact card for a single sound / image / particle entry. Mirrors
+/// `clip_card` but uses the LibraryAsset schema and the appropriate
+/// drag kind so canvas / timeline drop targets construct the right
+/// scene element on release.
+fn library_asset_card(
+    ui: &mut egui::Ui,
+    state: &mut EditorState,
+    asset: &crate::state::LibraryAsset,
+    kind: AssetDragKind,
+    accent: Color32,
+) {
+    let avail_w = ui.available_width().max(80.0);
+
+    let frame = egui::Frame::none()
+        .fill(Color32::from_rgb(32, 32, 48))
+        .rounding(Rounding::same(4.0))
+        .inner_margin(egui::Margin::same(3.0))
+        .stroke(Stroke::new(1.0, Color32::from_rgb(50, 50, 70)));
+
+    let card_resp = frame.show(ui, |ui| {
+        ui.set_min_width(avail_w - 6.0);
+        ui.horizontal(|ui| {
+            let thumb_size = Vec2::new(48.0, 48.0);
+            if let Some(thumb) = &asset.thumbnail {
+                let uri = format!("file://{}", thumb.display());
+                ui.add(
+                    egui::Image::from_uri(uri)
+                        .fit_to_exact_size(thumb_size)
+                        .maintain_aspect_ratio(false)
+                        .rounding(Rounding::same(3.0)),
+                );
+            } else {
+                let (rect, _) = ui.allocate_exact_size(thumb_size, Sense::hover());
+                ui.painter().rect_filled(rect, Rounding::same(3.0), Color32::from_rgb(40, 40, 55));
+                let icon = match kind {
+                    AssetDragKind::Sound => "\u{1F50A}",
+                    AssetDragKind::Image => "\u{1F5BC}",
+                    AssetDragKind::Particle => "\u{2728}",
+                    _ => "?",
+                };
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    icon,
+                    egui::FontId::proportional(22.0),
+                    accent,
+                );
+            }
+            ui.allocate_ui_with_layout(
+                Vec2::new(ui.available_width(), thumb_size.y),
+                egui::Layout::top_down(egui::Align::LEFT),
+                |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.label(RichText::new(&asset.label).size(11.0).color(COL_TEXT));
+                    if let Some(name) = asset.path.file_name().and_then(|s| s.to_str()) {
+                        ui.label(RichText::new(name).size(9.0).color(COL_TEXT_DIM));
+                    }
+                },
+            );
+        });
+    }).response;
+
+    let card_resp = card_resp.interact(Sense::click_and_drag());
+    if card_resp.dragged() {
+        state.asset_drag.dragging = Some(asset.path.clone());
+        state.asset_drag.kind = kind;
+        state.asset_drag.label = asset.label.clone();
+        state.asset_drag.thumbnail = asset.thumbnail.clone();
+        if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
+            state.asset_drag.pos = [pos.x, pos.y];
+        }
+    }
+    if card_resp.double_clicked() {
+        // Convenience: double-click adds at playhead at the canvas centre.
+        add_library_asset_at_playhead(state, asset, kind);
+    }
+    ui.add_space(2.0);
+}
+
+/// Spawn a scene element from a LibraryAsset at the current playhead /
+/// canvas centre. Used by double-click — drag-drop has its own
+/// handlers in `canvas_preview` and the timeline panel.
+pub(crate) fn add_library_asset_at_playhead(
+    state: &mut EditorState,
+    asset: &crate::state::LibraryAsset,
+    kind: AssetDragKind,
+) {
+    let t = state.playhead;
+    let dur = state.scene.output.duration;
+    match kind {
+        AssetDragKind::Sound => {
+            state.scene.audio.push(memstroy_core::AudioTrack {
+                id: asset.id.clone(),
+                source: asset.path.clone(),
+                t_in: t,
+                t_out: None,
+                source_start: 0.0,
+                volume: 1.0,
+                speed: 1.0,
+                parent_actor: None,
+            });
+            state.selection = Selection::Audio(state.scene.audio.len() - 1);
+            state.status = format!("Added sound: {}", asset.id);
+        }
+        AssetDragKind::Image => {
+            let overlay = Overlay::Image(ImageOverlay {
+                id: asset.id.clone(),
+                source: asset.path.clone(),
+                t_in: t,
+                t_out: (t + 3.0).min(dur),
+                layout: vec![Keyframe::new(0.0, OverlayState::default())],
+                modifiers: Vec::new(),
+                skeleton_attachment: None,
+                effects: Vec::new(),
+            });
+            state.scene.overlays.push(overlay);
+            state.selection = Selection::Overlay(state.scene.overlays.len() - 1);
+            state.status = format!("Added image: {}", asset.id);
+        }
+        AssetDragKind::Particle => {
+            // Particle = image overlay with a spin + pulse + wobble preset
+            // baked in so it looks alive on drop. Users are free to tune
+            // or remove the modifiers from the inspector afterwards.
+            let mut modifiers = Vec::new();
+            modifiers.push(TrackModifier {
+                t_start: 0.0,
+                t_end: f32::MAX,
+                enabled: true,
+                kind: ModifierKind::Spin { speed_dps: 90.0 },
+            });
+            modifiers.push(TrackModifier {
+                t_start: 0.0,
+                t_end: f32::MAX,
+                enabled: true,
+                kind: ModifierKind::Pulse { freq_hz: 1.5, amp_scale: 0.15 },
+            });
+            modifiers.push(TrackModifier {
+                t_start: 0.0,
+                t_end: f32::MAX,
+                enabled: true,
+                kind: ModifierKind::Wobble {
+                    freq_hz: 1.0, amp_x: 12.0, amp_y: 12.0, amp_rot_deg: 0.0, phase: 0.0,
+                },
+            });
+            let overlay = Overlay::Image(ImageOverlay {
+                id: format!("particle_{}", asset.id),
+                source: asset.path.clone(),
+                t_in: t,
+                t_out: (t + 4.0).min(dur),
+                layout: vec![Keyframe::new(0.0, OverlayState::default())],
+                modifiers,
+                skeleton_attachment: None,
+                effects: Vec::new(),
+            });
+            state.scene.overlays.push(overlay);
+            state.selection = Selection::Overlay(state.scene.overlays.len() - 1);
+            state.status = format!("Added particle: {}", asset.id);
+        }
+        AssetDragKind::Clip | AssetDragKind::None => {}
+    }
 }
 
 fn clip_card(ui: &mut egui::Ui, state: &mut EditorState, clip: &crate::state::LibraryClip) {
@@ -638,6 +909,148 @@ fn inspector_modifiers(
 }
 
 
+/// Inspector for the per-element effect stack. Effects are evaluated
+/// top-down on top of chroma key and colour correction; the user can
+/// reorder them with the up/down arrows, mute individual entries, drop
+/// in any number of presets from the "+ Add" dropdown, and tune the
+/// per-effect parameters with simple sliders.
+fn inspector_effect_stack(
+    ui: &mut egui::Ui,
+    effects: &mut Vec<Effect>,
+    salt: impl std::hash::Hash + Copy,
+) {
+    let header = RichText::new(format!(
+        "Effect Stack ({})",
+        effects.len(),
+    )).size(12.0).strong().color(Color32::from_rgb(255, 180, 220));
+
+    egui::CollapsingHeader::new(header)
+        .id_source(("effect_collapse", salt))
+        .default_open(false)
+        .show(ui, |ui| {
+            if effects.is_empty() {
+                ui.label(RichText::new(
+                    "No effects. Add one with the buttons below — \
+                     stack as many as you like, in any order.",
+                ).size(10.0).color(COL_TEXT_DIM).italics());
+            } else {
+                let mut to_remove: Option<usize> = None;
+                let mut to_swap: Option<(usize, usize)> = None;
+                let count = effects.len();
+                for (ei, eff) in effects.iter_mut().enumerate() {
+                    let label = eff.kind.label();
+                    egui::Frame::none()
+                        .fill(Color32::from_rgb(34, 28, 38))
+                        .rounding(Rounding::same(4.0))
+                        .stroke(Stroke::new(1.0, Color32::from_rgb(60, 50, 70)))
+                        .inner_margin(egui::Margin::same(6.0))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut eff.enabled, "");
+                                ui.label(RichText::new(label).strong().size(11.0)
+                                    .color(Color32::from_rgb(255, 200, 240)));
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui.small_button("x").on_hover_text("Remove effect").clicked() {
+                                        to_remove = Some(ei);
+                                    }
+                                    if ei + 1 < count {
+                                        if ui.small_button("\u{2193}").on_hover_text("Move down").clicked() {
+                                            to_swap = Some((ei, ei + 1));
+                                        }
+                                    }
+                                    if ei > 0 {
+                                        if ui.small_button("\u{2191}").on_hover_text("Move up").clicked() {
+                                            to_swap = Some((ei, ei - 1));
+                                        }
+                                    }
+                                });
+                            });
+                            ui.add_space(2.0);
+                            ui.add(egui::Slider::new(&mut eff.intensity, 0.0..=1.0).text("Intensity"));
+                            ui.add_space(2.0);
+                            inspector_effect_kind_params(ui, &mut eff.kind, salt, ei);
+                        });
+                    ui.add_space(3.0);
+                }
+                if let Some((a, b)) = to_swap {
+                    effects.swap(a, b);
+                }
+                if let Some(ri) = to_remove {
+                    effects.remove(ri);
+                }
+            }
+
+            ui.add_space(6.0);
+            // Compact "+ Add effect" dropdown listing every preset. Using
+            // a ComboBox keeps the width compact even with 20+ entries —
+            // a horizontal grid of buttons would wrap awkwardly.
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("+ Add effect:").size(11.0).strong());
+                let mut to_add: Option<usize> = None;
+                let presets = memstroy_core::all_effect_presets();
+                egui::ComboBox::from_id_source(("effect_add", salt))
+                    .selected_text("choose…")
+                    .width(160.0)
+                    .show_ui(ui, |ui| {
+                        for (i, p) in presets.iter().enumerate() {
+                            if ui.selectable_label(false, p.kind.label()).clicked() {
+                                to_add = Some(i);
+                            }
+                        }
+                    });
+                if let Some(idx) = to_add {
+                    if let Some(p) = presets.get(idx) {
+                        effects.push(p.clone());
+                    }
+                }
+                if ui.small_button("clear").on_hover_text("Remove all effects").clicked() {
+                    effects.clear();
+                }
+            });
+        });
+}
+
+/// Render the per-kind parameter sliders for a single effect entry. Kept
+/// as a standalone fn so each variant has its own minimal UI without
+/// clogging up `inspector_effect_stack`.
+fn inspector_effect_kind_params(
+    ui: &mut egui::Ui,
+    kind: &mut EffectKind,
+    _salt: impl std::hash::Hash + Copy,
+    _ei: usize,
+) {
+    use memstroy_core::EffectKind as K;
+    match kind {
+        K::Blur { radius } => { ui.add(egui::Slider::new(radius, 0.0..=80.0).text("Radius (px)")); }
+        K::Sharpen { amount } => { ui.add(egui::Slider::new(amount, 0.0..=3.0).text("Amount")); }
+        K::Grayscale | K::Sepia | K::Invert | K::MirrorH | K::MirrorV
+            | K::OldFilm | K::Vhs => {
+            ui.label(RichText::new("No parameters.").size(10.0).color(COL_TEXT_DIM).italics());
+        }
+        K::HueShift { degrees } => { ui.add(egui::Slider::new(degrees, -180.0..=180.0).text("Hue \u{00B0}")); }
+        K::Vignette { strength } => { ui.add(egui::Slider::new(strength, 0.0..=1.0).text("Strength")); }
+        K::Pixelate { block_size } => { ui.add(egui::Slider::new(block_size, 2.0..=80.0).text("Block size (px)")); }
+        K::Posterize { levels } => { ui.add(egui::Slider::new(levels, 2..=32).text("Levels")); }
+        K::Glow { radius, intensity } => {
+            ui.add(egui::Slider::new(radius, 0.0..=64.0).text("Radius (px)"));
+            ui.add(egui::Slider::new(intensity, 0.0..=2.0).text("Intensity"));
+        }
+        K::Brightness { amount } => { ui.add(egui::Slider::new(amount, -1.0..=1.0).text("Amount")); }
+        K::Contrast { amount } => { ui.add(egui::Slider::new(amount, -1.0..=1.0).text("Amount")); }
+        K::Saturation { amount } => { ui.add(egui::Slider::new(amount, -1.0..=1.0).text("Amount")); }
+        K::EdgeDetect { threshold } => { ui.add(egui::Slider::new(threshold, 0.0..=1.0).text("Threshold")); }
+        K::ChromaticAberration { offset } => { ui.add(egui::Slider::new(offset, 0.0..=24.0).text("Offset (px)")); }
+        K::Noise { amount } => { ui.add(egui::Slider::new(amount, 0.0..=1.0).text("Amount")); }
+        K::Wave { amplitude, wavelength } => {
+            ui.add(egui::Slider::new(amplitude, 0.0..=40.0).text("Amplitude (px)"));
+            ui.add(egui::Slider::new(wavelength, 4.0..=400.0).text("Wavelength (px)"));
+        }
+        K::Glitch { strength } => { ui.add(egui::Slider::new(strength, 0.0..=1.0).text("Strength")); }
+        K::Bloom { radius } => { ui.add(egui::Slider::new(radius, 0.0..=80.0).text("Radius (px)")); }
+    }
+}
+
+
 fn inspector_actor_effects(ui: &mut egui::Ui, state: &mut EditorState, i: usize, _actor_count: usize, _cache_count: usize) {
     let a = &mut state.scene.actors[i];
 
@@ -690,6 +1103,11 @@ fn inspector_actor_effects(ui: &mut egui::Ui, state: &mut EditorState, i: usize,
 
     // Skeleton Attachments
     inspector_actor_skeleton_attachments(ui, state, i);
+
+    ui.add_space(12.0);
+    // Effect stack — generic post-process effects layered on top of CC.
+    let a = &mut state.scene.actors[i];
+    inspector_effect_stack(ui, &mut a.effects, ("actor_fx", i));
 }
 
 // ─── PROFESSIONAL COLOR CORRECTION INSPECTOR ─────────────────────────
@@ -1454,6 +1872,8 @@ fn inspector_overlay(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
             }
             ui.add_space(8.0);
             inspector_modifiers(ui, &mut im.modifiers, ("img_mods", i));
+            ui.add_space(8.0);
+            inspector_effect_stack(ui, &mut im.effects, ("img_fx", i));
         }
         Overlay::Video(v) => {
             ui.label(RichText::new(format!("Video: {}", v.id)).strong().size(14.0).color(COL_CLIP_OVERLAY));
@@ -1487,6 +1907,8 @@ fn inspector_overlay(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
             }
             ui.add_space(8.0);
             inspector_modifiers(ui, &mut v.modifiers, ("vid_mods", i));
+            ui.add_space(8.0);
+            inspector_effect_stack(ui, &mut v.effects, ("vid_fx", i));
         }
     }
 }
@@ -1687,6 +2109,8 @@ fn inspector_text_overlay(
 
     ui.add_space(8.0);
     inspector_modifiers(ui, &mut t.modifiers, ("text_mods", idx));
+    ui.add_space(8.0);
+    inspector_effect_stack(ui, &mut t.effects, ("text_fx", idx));
 
     // Layer/z-index actions are no longer exposed from the inspector — the
     // timeline track row order alone determines stacking.
@@ -1833,6 +2257,14 @@ fn inspector_render_frame(ui: &mut egui::Ui, state: &mut EditorState) {
             rf.resolution = [w, h];
         }
     });
+
+    // Animation modifiers (wobble/shake/pulse/spin) — perturb the
+    // render-frame's eased keyframe state at preview/export time so the
+    // user can add live camera-style motion without authoring every kf.
+    ui.add_space(10.0);
+    inspector_modifiers(ui, &mut rf.modifiers, "rf_mods");
+    ui.add_space(8.0);
+    inspector_effect_stack(ui, &mut rf.effects, "rf_fx");
 }
 
 fn inspector_background(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
@@ -3100,6 +3532,25 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                     // mirrors the actor's lane via sync_bound_audio_lanes()
                     // at the end of the frame.
                 }
+            } else if matches!(kind, AssetDragKind::Sound | AssetDragKind::Image | AssetDragKind::Particle) {
+                // Build a LibraryAsset proxy from the drag payload and
+                // delegate to the per-kind spawner. The element lands
+                // at the drop time on the playhead-default lane.
+                let id = asset_path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("asset")
+                    .to_string();
+                let asset_label = state.asset_drag.label.clone();
+                let asset = crate::state::LibraryAsset {
+                    id: id.clone(),
+                    path: asset_path.clone(),
+                    label: if asset_label.is_empty() { id } else { asset_label },
+                    thumbnail: state.asset_drag.thumbnail.clone(),
+                };
+                let saved_t = state.playhead;
+                state.playhead = drop_time;
+                add_library_asset_at_playhead(state, &asset, kind);
+                state.playhead = saved_t;
             }
 
             // Clear the drag state.
@@ -3118,39 +3569,50 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
         }
         let drag_pos = egui::pos2(state.asset_drag.pos[0], state.asset_drag.pos[1]);
 
-        // Highlight the destination video lane (under cursor) or hint at
-        // "new layer" when the cursor is in empty space.
-        let dest_label = if matches!(state.asset_drag.kind, AssetDragKind::Clip) {
-            let target = (|| {
-                for (i, (top, bot)) in track_rows.iter().enumerate() {
-                    if drag_pos.y >= *top && drag_pos.y < *bot
-                        && state.tracks[i].kind == TrackKind::Video {
-                        return Some((*top, *bot, state.tracks[i].name.clone()));
+        // Highlight the destination video / audio lane and emit a
+        // human-readable label depending on the drag kind.
+        let dest_label = match state.asset_drag.kind {
+            AssetDragKind::Clip | AssetDragKind::Sound | AssetDragKind::Image | AssetDragKind::Particle => {
+                let want_video = !matches!(state.asset_drag.kind, AssetDragKind::Sound);
+                let target = (|| {
+                    for (i, (top, bot)) in track_rows.iter().enumerate() {
+                        if drag_pos.y >= *top && drag_pos.y < *bot {
+                            let lane_kind_ok = if want_video {
+                                state.tracks[i].kind == TrackKind::Video
+                            } else {
+                                state.tracks[i].kind == TrackKind::Audio
+                            };
+                            if lane_kind_ok {
+                                return Some((*top, *bot, state.tracks[i].name.clone()));
+                            }
+                        }
                     }
+                    None
+                })();
+                if let Some((top, bot, name)) = target {
+                    let highlight = egui::Rect::from_min_max(
+                        egui::pos2(tracks_rect.min.x, top),
+                        egui::pos2(tracks_rect.max.x, bot),
+                    );
+                    let col = if want_video {
+                        Color32::from_rgba_premultiplied(120, 220, 120, 30)
+                    } else {
+                        Color32::from_rgba_premultiplied(120, 200, 240, 30)
+                    };
+                    ui.painter().rect_filled(highlight, Rounding::same(2.0), col);
+                    ui.painter().rect_stroke(
+                        highlight,
+                        Rounding::same(2.0),
+                        Stroke::new(1.5, Color32::from_rgb(120, 220, 120)),
+                    );
+                    format!("\u{2192} {}", name)
+                } else if want_video {
+                    "\u{2192} New layer".to_string()
+                } else {
+                    "\u{2192} Audio lane".to_string()
                 }
-                None
-            })();
-            if let Some((top, bot, name)) = target {
-                let highlight = egui::Rect::from_min_max(
-                    egui::pos2(tracks_rect.min.x, top),
-                    egui::pos2(tracks_rect.max.x, bot),
-                );
-                ui.painter().rect_filled(
-                    highlight,
-                    Rounding::same(2.0),
-                    Color32::from_rgba_premultiplied(120, 220, 120, 30),
-                );
-                ui.painter().rect_stroke(
-                    highlight,
-                    Rounding::same(2.0),
-                    Stroke::new(1.5, Color32::from_rgb(120, 220, 120)),
-                );
-                format!("\u{2192} {}", name)
-            } else {
-                "\u{2192} New layer".to_string()
             }
-        } else {
-            String::new()
+            AssetDragKind::None => String::new(),
         };
 
         // Floating preview card next to the cursor: thumbnail + label.
@@ -3192,7 +3654,10 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             ui.painter().rect_filled(thumb_rect, Rounding::same(3.0), Color32::from_rgb(40, 40, 60));
             let icon = match state.asset_drag.kind {
                 AssetDragKind::Clip => "\u{1F3AC}",
-                _ => "?",
+                AssetDragKind::Sound => "\u{1F50A}",
+                AssetDragKind::Image => "\u{1F5BC}",
+                AssetDragKind::Particle => "\u{2728}",
+                AssetDragKind::None => "?",
             };
             ui.painter().text(
                 thumb_rect.center(),
@@ -4266,6 +4731,7 @@ pub fn add_text_overlay(state: &mut EditorState) -> usize {
         skeleton_attachment: None,
         z_index: max_z + 1,
         behind_actors: false,
+        effects: Vec::new(),
     });
 
     state.scene.overlays.push(overlay);
@@ -4322,6 +4788,7 @@ pub(crate) fn add_actor_from_clip_at_time(state: &mut EditorState, path: &PathBu
         transition_in: Transition::Cut,
         transition_out: Transition::Cut,
         transition_duration: 0.3,
+        effects: Vec::new(),
     };
     state.scene.actors.push(actor);
     let new_actor_idx = state.scene.actors.len() - 1;
