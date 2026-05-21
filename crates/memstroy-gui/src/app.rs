@@ -1551,6 +1551,7 @@ impl eframe::App for App {
                             t_out: None,
                             source_start: 0.0,
                             volume: 1.0,
+                            speed: 1.0,
                             parent_actor: None,
                         });
                         self.state.selection = Selection::Audio(self.state.scene.audio.len() - 1);
@@ -1591,6 +1592,7 @@ impl eframe::App for App {
                     t_out: a.t_out,
                     source_start: a.source_start,
                     volume: a.volume,
+                    speed: a.speed,
                 });
                 seen.insert(a.source.clone());
             }
@@ -1603,6 +1605,7 @@ impl eframe::App for App {
                     t_out: actor.t_out,
                     source_start: actor.source_start,
                     volume: 1.0,
+                    speed: 1.0,
                 });
             }
             out
