@@ -338,65 +338,38 @@ fn inspector_actor(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
 fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
     let a = &mut state.scene.actors[i];
 
-    // Current keyframe (or interpolated) display
     ui.label(RichText::new("Position & Scale").size(12.0).strong());
-    ui.add_space(2.0);
+    ui.add_space(4.0);
 
-    // Show the keyframe closest to playhead or allow editing the interpolated state
-    let playhead = state.playhead;
-    let t_in = a.t_in.unwrap_or(0.0);
-    let local_t = playhead - t_in;
+    // Edit the first keyframe directly (simple mode)
+    if a.layout.is_empty() {
+        a.layout.push(Keyframe::new(0.0, ActorState::default()));
+    }
 
-    // Find or create nearest keyframe
-    let kf_idx = a.layout.iter().position(|kf| (kf.t - local_t).abs() < 0.05);
-
-    if let Some(ki) = kf_idx {
-        let kf = &mut a.layout[ki];
-        inspector_keyframe_editor(ui, kf);
-    } else if !a.layout.is_empty() {
-        // Show interpolated values (read-only preview)
-        ui.label(RichText::new("(interpolated at current time)").size(10.0).color(COL_TEXT_DIM));
-        if ui.button(RichText::new("+ Add Keyframe Here").size(11.0)).clicked() {
-            let val = if a.layout.len() >= 2 {
-                // Simple nearest value
-                a.layout.last().map(|k| k.value).unwrap_or_default()
-            } else {
-                a.layout.first().map(|k| k.value).unwrap_or_default()
-            };
-            a.layout.push(Keyframe::new(local_t.max(0.0), val));
-            a.layout.sort_by(|x, y| x.t.partial_cmp(&y.t).unwrap());
-        }
-        // Still show the values of the nearest keyframe for reference
-        if let Some(kf) = a.layout.first_mut() {
-            inspector_keyframe_editor(ui, kf);
-        }
-    } else {
-        ui.label(RichText::new("No keyframes").color(COL_TEXT_DIM).size(11.0));
-        if ui.button("+ Add Keyframe").clicked() {
-            a.layout.push(Keyframe::new(0.0, ActorState::default()));
-        }
+    if let Some(kf) = a.layout.first_mut() {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("X:").size(11.0));
+            ui.add(egui::DragValue::new(&mut kf.value.pos[0]).range(-2.0..=3.0).speed(0.005));
+            ui.label(RichText::new("Y:").size(11.0));
+            ui.add(egui::DragValue::new(&mut kf.value.pos[1]).range(-2.0..=3.0).speed(0.005));
+        });
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Scale:").size(11.0));
+            ui.add(egui::Slider::new(&mut kf.value.scale, 0.05..=5.0).logarithmic(true));
+        });
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Rotation:").size(11.0));
+            ui.add(egui::Slider::new(&mut kf.value.rotation_deg, -360.0..=360.0).suffix("\u{00B0}"));
+        });
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Opacity:").size(11.0));
+            ui.add(egui::Slider::new(&mut kf.value.opacity, 0.0..=1.0));
+        });
     }
 
     ui.add_space(8.0);
-
-    // Keyframe list (compact)
-    ui.label(RichText::new("All Keyframes").size(12.0).strong());
-    ui.add_space(2.0);
-
-    let mut to_remove = None;
-    egui::ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
-        for (ki, kf) in a.layout.iter_mut().enumerate() {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(format!("{:.2}s", kf.t)).size(10.0).color(COL_ACCENT));
-                ui.label(RichText::new(format!("({:.0}%, {:.0}%)", kf.value.pos[0]*100.0, kf.value.pos[1]*100.0)).size(10.0).color(COL_TEXT_DIM));
-                ui.label(RichText::new(format!("s:{:.2}", kf.value.scale)).size(10.0).color(COL_TEXT_DIM));
-                if ui.small_button("x").clicked() { to_remove = Some(ki); }
-            });
-        }
-    });
-    if let Some(ri) = to_remove {
-        state.scene.actors[i].layout.remove(ri);
-    }
+    ui.checkbox(&mut a.flip_horizontal, "Flip horizontal");
+    ui.checkbox(&mut a.visible, "Visible");
 }
 
 
@@ -422,62 +395,6 @@ fn inspector_keyframe_editor(ui: &mut egui::Ui, kf: &mut Keyframe<ActorState>) {
     ui.horizontal(|ui| {
         ui.label(RichText::new("Opacity:").size(11.0));
         ui.add(egui::Slider::new(&mut kf.value.opacity, 0.0..=1.0));
-    });
-}
-
-fn inspector_actor_timing(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
-    let duration = state.scene.output.duration;
-    let a = &mut state.scene.actors[i];
-
-    ui.label(RichText::new("Clip Timing").size(12.0).strong());
-    ui.add_space(4.0);
-
-    let mut t_in = a.t_in.unwrap_or(0.0);
-    let mut t_out = a.t_out.unwrap_or(duration);
-
-    ui.horizontal(|ui| {
-        ui.label("In:");
-        ui.add(egui::DragValue::new(&mut t_in).range(0.0..=duration).speed(0.02).suffix("s"));
-        ui.label("Out:");
-        ui.add(egui::DragValue::new(&mut t_out).range(0.0..=duration).speed(0.02).suffix("s"));
-    });
-    a.t_in = Some(t_in);
-    a.t_out = Some(t_out);
-
-    ui.horizontal(|ui| {
-        ui.label("Duration:");
-        ui.label(RichText::new(format!("{:.2}s", t_out - t_in)).color(COL_ACCENT));
-    });
-
-    ui.add_space(8.0);
-    ui.horizontal(|ui| {
-        ui.label("Source offset:");
-        ui.add(egui::DragValue::new(&mut a.source_start).range(0.0..=300.0).speed(0.02).suffix("s"));
-    });
-
-    ui.add_space(4.0);
-    ui.checkbox(&mut a.loop_source, "Loop source clip");
-    ui.checkbox(&mut a.flip_horizontal, "Flip horizontal");
-    ui.checkbox(&mut a.visible, "Visible");
-
-    ui.add_space(8.0);
-
-    // Layer order
-    let actor_count = state.scene.actors.len();
-    ui.label(RichText::new("Layer Order").size(12.0).strong());
-    ui.horizontal(|ui| {
-        if i > 0 && ui.button("\u{2191} Up").clicked() {
-            state.scene.actors.swap(i, i - 1);
-            let cc = state.frame_caches.len();
-            if cc > i { state.frame_caches.swap(i, i - 1); }
-            state.selection = Selection::Actor(i - 1);
-        }
-        if i + 1 < actor_count && ui.button("\u{2193} Down").clicked() {
-            state.scene.actors.swap(i, i + 1);
-            let cc = state.frame_caches.len();
-            if cc > i + 1 { state.frame_caches.swap(i, i + 1); }
-            state.selection = Selection::Actor(i + 1);
-        }
     });
 }
 
@@ -910,28 +827,6 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             }
         }
 
-        // Add Title (template picker)
-        if ui
-            .button(RichText::new("\u{1F4DD} Add Title").size(11.0).color(COL_ACCENT))
-            .on_hover_text("Insert a styled meme title at the playhead")
-            .clicked()
-        {
-            state.title_picker_open = true;
-        }
-
-        // Curve editor toggle
-        let curve_color = if state.curve_editor_open { COL_ACCENT } else { COL_TEXT_DIM };
-        if ui.button(RichText::new("Curve").size(11.0).color(curve_color)).on_hover_text("Toggle curve editor").clicked() {
-            state.curve_editor_open = !state.curve_editor_open;
-        }
-
-        // Clip editor toggle
-        let clip_ed_color = if state.clip_editor_open { COL_ACCENT } else { COL_TEXT_DIM };
-        if ui.button(RichText::new("Clip").size(11.0).color(clip_ed_color)).on_hover_text("Toggle clip editor").clicked() {
-            state.clip_editor_open = !state.clip_editor_open;
-        }
-
-        // Zoom controls
         // Zoom controls + track management
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui.button("+").on_hover_text("Zoom in").clicked() {
@@ -966,7 +861,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     let header_width = 80.0_f32;
     let track_area_width = (available.x - header_width - 4.0).max(100.0);
 
-    // ── Auto-length: expand timeline to fit longest content ──
+    // ── Auto-length: expand/shrink timeline to fit longest content ──
     {
         let mut max_end: f32 = 0.0;
         for a in &state.scene.actors {
@@ -986,10 +881,9 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
         for au in &state.scene.audio {
             max_end = max_end.max(au.t_out.unwrap_or(0.0));
         }
-        // Expand scene duration if content exceeds it (with 1s padding)
-        if max_end > state.scene.output.duration {
-            state.scene.output.duration = max_end + 1.0;
-        }
+        // Auto-fit: duration follows content (with 1s padding, minimum 2s)
+        let target_duration = (max_end + 1.0).max(2.0);
+        state.scene.output.duration = target_duration;
     }
 
     let duration = state.scene.output.duration.max(0.01);
@@ -1208,11 +1102,11 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
 
                     for ai in 0..state.scene.actors.len() {
                         // Use explicit track assignment if set, otherwise default to first video track.
-                        // Multiple clips on the same track is allowed (free placement).
+                        // Multiple clips on the same track is allowed (free sequential placement).
                         let assigned_track = if let Some(&assigned) = state.actor_track_assignments.get(&ai) {
                             assigned
                         } else {
-                            // Default: first video track (index 0) for all unassigned actors
+                            // Default: first video track for ALL actors (free placement on same track)
                             video_tracks.first().copied().unwrap_or(0)
                         };
                         if assigned_track != track_idx { continue; }
@@ -1228,7 +1122,21 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             clip_start, clip_end, state.timeline_scroll, pps, track_left, track_right,
                             COL_CLIP_ACTOR, sel, track_h, track_locked, state.razor_mode)
                         {
-                            if clicked < 0.0 {
+                            if clicked == f32::INFINITY {
+                                // Trim left edge: adjust t_in
+                                let dx = ui.input(|i| i.pointer.delta().x);
+                                let delta_t = dx / pps;
+                                let new_in = (clip_start + delta_t).max(0.0).min(clip_end - 0.1);
+                                state.scene.actors[ai].t_in = Some(new_in);
+                                to_select = Some(Selection::Actor(ai));
+                            } else if clicked == f32::NEG_INFINITY {
+                                // Trim right edge: adjust t_out
+                                let dx = ui.input(|i| i.pointer.delta().x);
+                                let delta_t = dx / pps;
+                                let new_out = (clip_end + delta_t).max(clip_start + 0.1);
+                                state.scene.actors[ai].t_out = Some(new_out);
+                                to_select = Some(Selection::Actor(ai));
+                            } else if clicked < 0.0 {
                                 // Drag: move the actor's time window
                                 let mut new_start = (-clicked).max(0.0);
                                 let dur = clip_end - clip_start;
@@ -1587,12 +1495,17 @@ fn draw_clip(
     let sense = if locked { Sense::hover() } else { Sense::click_and_drag() };
     let resp = ui.interact(bar_rect, id, sense);
 
-    // Edge detection reserved for future use
-    let _hover_pos = ui.input(|i| i.pointer.hover_pos());
+    // Edge detection: show resize cursor and allow trim
+    let hover_pos = ui.input(|i| i.pointer.hover_pos());
+
+    let near_left_edge = hover_pos.map(|p| (p.x - bar_rect.min.x).abs() < 5.0).unwrap_or(false);
+    let near_right_edge = hover_pos.map(|p| (p.x - bar_rect.max.x).abs() < 5.0).unwrap_or(false);
 
     if resp.hovered() && !locked {
         if razor_mode {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+        } else if near_left_edge || near_right_edge {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
         } else {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
         }
@@ -1608,14 +1521,27 @@ fn draw_clip(
         return Some(clip_start); // signal selection
     }
 
-    // Drag handling: whole-clip move (edge-trim reserved for future)
+    // Drag handling: whole-clip move or edge-trim
     if resp.dragged() && !locked && !razor_mode {
         let dx = resp.drag_delta().x;
         let delta_secs = dx / pps;
 
-        if delta_secs.abs() > 0.001 {
-            // Normal move: return the NEW start time as negative
-            return Some(-(clip_start + delta_secs));
+        // Determine if drag started on left/right edge
+        if let Some(origin) = resp.interact_pointer_pos() {
+            let start_x = origin.x - resp.drag_delta().x;
+            let on_left_edge = (start_x - bar_rect.min.x).abs() < 6.0;
+            let on_right_edge = (start_x - bar_rect.max.x).abs() < 6.0;
+
+            if on_left_edge && delta_secs.abs() > 0.001 {
+                // Trim left edge (in-point) - return positive infinity encoded
+                return Some(f32::INFINITY); // Signal: trim left
+            } else if on_right_edge && delta_secs.abs() > 0.001 {
+                // Trim right edge (out-point) - return negative infinity encoded
+                return Some(f32::NEG_INFINITY); // Signal: trim right
+            } else if delta_secs.abs() > 0.001 {
+                // Normal whole-clip move: return the NEW start time as negative
+                return Some(-(clip_start + delta_secs));
+            }
         }
         return Some(clip_start); // just select if no movement
     }
@@ -1661,7 +1587,7 @@ fn draw_audio_clip(
     let fill = if selected { Color32::from_rgb(70, 200, 200) } else { COL_CLIP_AUDIO };
     painter.rect_filled(bar_rect, Rounding::same(4.0), fill);
 
-    // Draw waveform
+    // Draw waveform or fallback visualization
     if let Some(wf) = waveform {
         if wf.ready && !wf.peaks.is_empty() {
             let bar_w = bar_rect.width();
@@ -1681,7 +1607,19 @@ fn draw_audio_clip(
                         Stroke::new(1.0, Color32::from_rgba_premultiplied(255, 255, 255, 120)));
                 }
             }
+        } else if wf.extracting {
+            // Show "loading" state
+            painter.text(
+                bar_rect.center(), egui::Align2::CENTER_CENTER,
+                "Loading...", egui::FontId::proportional(9.0),
+                Color32::from_rgba_premultiplied(255, 255, 255, 100));
+        } else {
+            // Not started yet - show placeholder bars
+            draw_placeholder_waveform(painter, bar_rect);
         }
+    } else {
+        // No waveform object yet - show placeholder
+        draw_placeholder_waveform(painter, bar_rect);
     }
 
     // Selection border
@@ -1719,6 +1657,23 @@ fn draw_audio_clip(
     }
 
     None
+}
+
+
+/// Draw placeholder waveform bars for audio clips that haven't been analyzed yet.
+fn draw_placeholder_waveform(painter: &egui::Painter, bar_rect: egui::Rect) {
+    let bar_w = bar_rect.width();
+    let bar_h = bar_rect.height();
+    let center_y = bar_rect.center().y;
+    let num_bars = ((bar_w / 4.0) as usize).max(3).min(50);
+    for i in 0..num_bars {
+        let x = bar_rect.min.x + (i as f32 / num_bars as f32) * bar_w + 2.0;
+        let h = bar_h * 0.15 * (1.0 + ((i as f32 * 0.7).sin() * 0.5));
+        painter.line_segment(
+            [egui::pos2(x, center_y - h), egui::pos2(x, center_y + h)],
+            Stroke::new(1.5, Color32::from_rgba_premultiplied(180, 220, 220, 80)),
+        );
+    }
 }
 
 
@@ -1923,9 +1878,12 @@ pub fn preview(ui: &mut egui::Ui, state: &mut EditorState) {
                     let ascale = actor_state.scale;
                     let rotation_rad = actor_state.rotation_deg.to_radians();
 
-                    // Actor rect centered at (ax, ay) in normalized coords, scaled
-                    let actor_w = rect.width() * ascale * 0.5;
+                    // Use native texture aspect ratio to prevent distortion
+                    let tex_size = tex.size_vec2();
+                    let tex_aspect = tex_size.x / tex_size.y;
+                    // Scale relative to preview rect, preserving source aspect ratio
                     let actor_h = rect.height() * ascale * 0.5;
+                    let actor_w = actor_h * tex_aspect;
                     let cx = rect.min.x + ax * rect.width();
                     let cy = rect.min.y + ay * rect.height();
 
@@ -2002,8 +1960,14 @@ pub fn preview(ui: &mut egui::Ui, state: &mut EditorState) {
                 let ay = kf.value.pos[1];
                 let ascale = kf.value.scale;
 
-                let actor_w = rect.width() * ascale * 0.5;
+                // Use source aspect ratio for gizmo too
+                let tex_aspect = if let Some(fc) = state.frame_caches.get(sel_idx) {
+                    if fc.is_ready() && fc.source_width > 0 && fc.source_height > 0 {
+                        fc.source_width as f32 / fc.source_height as f32
+                    } else { 9.0 / 16.0 }
+                } else { 9.0 / 16.0 };
                 let actor_h = rect.height() * ascale * 0.5;
+                let actor_w = actor_h * tex_aspect;
                 let cx = rect.min.x + ax * rect.width();
                 let cy = rect.min.y + ay * rect.height();
                 let gizmo_rect = egui::Rect::from_center_size(egui::pos2(cx, cy), Vec2::new(actor_w, actor_h));
