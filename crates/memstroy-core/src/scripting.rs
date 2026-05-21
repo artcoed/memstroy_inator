@@ -361,7 +361,7 @@ fn cmd_add_actor_keyframe(args: &[String], scene: &mut Scene) -> Result<(), Stri
     let actor = find_actor_mut(scene, id)?;
     let kf = Keyframe {
         t,
-        value: ActorState { pos: [x, y], scale, rotation_deg: rot, opacity },
+        value: ActorState { pos: [x, y], scale, scale_y: 1.0, rotation_deg: rot, opacity },
         easing,
     };
     actor.layout.push(kf);

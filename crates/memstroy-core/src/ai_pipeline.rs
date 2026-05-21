@@ -262,6 +262,7 @@ impl MontageOutput {
                 layout: vec![crate::Keyframe::new(0.0, crate::ActorState {
                     pos: cp.position,
                     scale: cp.scale,
+                    scale_y: 1.0,
                     rotation_deg: 0.0,
                     opacity: 1.0,
                 })],
@@ -289,6 +290,7 @@ impl MontageOutput {
                     crate::Keyframe::new(kf.t, crate::ActorState {
                         pos: kf.position,
                         scale: kf.scale,
+                        scale_y: 1.0,
                         rotation_deg: kf.rotation_deg,
                         opacity: kf.opacity,
                     })
@@ -312,6 +314,7 @@ impl MontageOutput {
                 layout: vec![crate::Keyframe::new(0.0, crate::OverlayState {
                     pos: tp.position,
                     scale: 1.0,
+                    scale_y: 1.0,
                     rotation_deg: 0.0,
                     opacity: 1.0,
                 })],

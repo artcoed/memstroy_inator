@@ -159,6 +159,51 @@ fn assets_panel(ui: &mut egui::Ui, state: &mut EditorState) {
             }
         }
     }
+
+    ui.add_space(10.0);
+    ui.label(RichText::new("Audio").size(14.0).strong());
+    ui.add_space(4.0);
+
+    if state.library.audio.is_empty() {
+        ui.label(RichText::new("No audio found.\nAdd MP3/WAV/OGG to assets/audio/")
+            .italics().color(COL_TEXT_DIM).size(12.0));
+    } else {
+        for p in state.library.audio.clone() {
+            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("(?)").to_string();
+            let resp = ui.horizontal(|ui| {
+                ui.label(RichText::new("\u{1F3B5}").size(14.0));
+                let r = ui.label(RichText::new(&name).size(11.0));
+                if ui.small_button("+").on_hover_text("Add audio at playhead").clicked() {
+                    add_audio_from_path(state, &p);
+                }
+                r
+            }).inner;
+            if resp.dragged() {
+                state.asset_drag.dragging = Some(p.clone());
+                state.asset_drag.kind = AssetDragKind::Audio;
+                if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
+                    state.asset_drag.pos = [pos.x, pos.y];
+                }
+            }
+        }
+    }
+}
+
+
+fn add_audio_from_path(state: &mut EditorState, path: &PathBuf) {
+    let id = path.file_stem().and_then(|s| s.to_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("audio_{}", state.scene.audio.len() + 1));
+    state.scene.audio.push(AudioTrack {
+        id: id.clone(),
+        source: path.clone(),
+        t_in: state.playhead,
+        t_out: None,
+        source_start: 0.0,
+        volume: 1.0,
+    });
+    state.selection = Selection::Audio(state.scene.audio.len() - 1);
+    state.status = format!("Added audio: {}", id);
 }
 
 
@@ -171,7 +216,7 @@ fn add_image_overlay(state: &mut EditorState, path: &PathBuf) {
         source: path.clone(),
         t_in: state.playhead,
         t_out: (state.playhead + 3.0).min(state.scene.output.duration),
-        layout: vec![Keyframe::new(0.0, OverlayState { pos: [0.5, 0.5], scale: 0.3, rotation_deg: 0.0, opacity: 1.0 })],
+        layout: vec![Keyframe::new(0.0, OverlayState { pos: [0.5, 0.5], scale: 0.3, scale_y: 1.0, rotation_deg: 0.0, opacity: 1.0 })],
     });
     state.scene.overlays.push(overlay);
     state.selection = Selection::Overlay(state.scene.overlays.len() - 1);
@@ -308,9 +353,6 @@ fn inspector_actor(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
             if ui.small_button("\u{1F5D1}").on_hover_text("Delete").clicked() {
                 state.status = "__DELETE_SELECTED__".into();
             }
-            if ui.small_button("\u{1F4CB}").on_hover_text("Duplicate").clicked() {
-                state.status = "__DUPLICATE_SELECTED__".into();
-            }
         });
     });
     ui.add_space(2.0);
@@ -358,6 +400,14 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
             ui.add(egui::Slider::new(&mut kf.value.scale, 0.05..=5.0).logarithmic(true));
         });
         ui.horizontal(|ui| {
+            ui.label(RichText::new("Stretch Y:").size(11.0))
+                .on_hover_text("Y-axis stretch on top of uniform scale (1.0 = proportional)");
+            ui.add(egui::Slider::new(&mut kf.value.scale_y, 0.1..=5.0).logarithmic(true));
+            if ui.small_button("\u{21BB}").on_hover_text("Reset to 1.0 (proportional)").clicked() {
+                kf.value.scale_y = 1.0;
+            }
+        });
+        ui.horizontal(|ui| {
             ui.label(RichText::new("Rotation:").size(11.0));
             ui.add(egui::Slider::new(&mut kf.value.rotation_deg, -360.0..=360.0).suffix("\u{00B0}"));
         });
@@ -368,7 +418,6 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
     }
 
     ui.add_space(8.0);
-    ui.checkbox(&mut a.flip_horizontal, "Flip horizontal");
     ui.checkbox(&mut a.visible, "Visible");
 }
 
@@ -438,11 +487,6 @@ fn inspector_actor_effects(ui: &mut egui::Ui, state: &mut EditorState, i: usize,
             *cc = memstroy_core::ColorCorrection::default();
         }
     });
-
-    ui.add_space(12.0);
-
-    // Transitions in/out (visible window edges)
-    inspector_actor_transitions(ui, state, i);
 
     ui.add_space(12.0);
 
@@ -543,6 +587,7 @@ fn inspector_actor_skeleton_attachments(ui: &mut egui::Ui, state: &mut EditorSta
     });
 }
 
+#[allow(dead_code)]
 fn inspector_actor_transitions(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
     egui::CollapsingHeader::new(
         RichText::new("Transitions").size(12.0).strong().color(Color32::from_rgb(255, 180, 100))
@@ -578,6 +623,7 @@ fn inspector_actor_transitions(ui: &mut egui::Ui, state: &mut EditorState, i: us
     });
 }
 
+#[allow(dead_code)]
 fn transition_combo(ui: &mut egui::Ui, id: &str, t: &mut Transition) {
     egui::ComboBox::from_id_source(id)
         .selected_text(format!("{:?}", t))
@@ -1060,26 +1106,6 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             add_text_overlay(state);
         }
 
-        // Chroma Key quick-access button
-        let chroma_active = state.eyedropper_active;
-        let chroma_color = if chroma_active { Color32::from_rgb(100, 255, 100) } else { Color32::from_rgb(80, 200, 80) };
-        if ui.button(RichText::new("\u{1F4A7}").color(chroma_color))
-            .on_hover_text("Chroma Key: pick color from preview (eyedropper)")
-            .clicked()
-        {
-            if let Selection::Actor(_) = state.selection {
-                state.eyedropper_active = !state.eyedropper_active;
-                state.inspector_tab = 2; // Switch to Effects tab
-                state.status = if state.eyedropper_active {
-                    "Eyedropper active: click on preview to pick chroma key color".into()
-                } else {
-                    "Eyedropper deactivated".into()
-                };
-            } else {
-                state.status = "Select an actor first to use chroma key".into();
-            }
-        }
-
         ui.separator();
 
         // Loop preview toggle
@@ -1376,6 +1402,42 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     let v_zoom = state.timeline_v_zoom.max(0.1);
     let num_tracks = state.tracks.len();
 
+    // ── Pre-compute per-track row rectangles for vertical drag-resolution ──
+    // (used by clip-drag handlers below to figure out which track the pointer
+    // currently hovers over, and whether the user is dragging above the
+    // topmost video / below the bottommost audio so we can auto-create a new
+    // layer in that direction).
+    let mut track_rows: Vec<(f32, f32)> = Vec::with_capacity(num_tracks);
+    {
+        let mut acc = 0.0_f32;
+        for tk in state.tracks.iter() {
+            let h = tk.height * v_zoom;
+            let top = tracks_rect.min.y + acc - state.timeline_v_scroll;
+            let bot = top + h;
+            track_rows.push((top, bot));
+            acc += h;
+        }
+    }
+    // Pending track-creation actions to perform AFTER the render loop, so we
+    // never invalidate iteration. Each entry is the actor or audio index that
+    // requested it; we then create a new track and re-assign that index.
+    let mut pending_new_video_top: Option<usize> = None;   // new video track at index 0; reassign actor
+    let mut pending_new_audio_bottom: Option<usize> = None; // new audio track at end; reassign audio
+    let pointer_y: Option<f32> = ui.input(|i| i.pointer.hover_pos().map(|p| p.y));
+
+    // Resolve which track index the pointer is currently over.
+    // Returns:
+    //   - Some(idx) if pointer.y falls within an existing track row;
+    //   - None otherwise (pointer outside the tracks viewport).
+    let resolve_target_track = |y: f32| -> Option<usize> {
+        for (i, (top, bot)) in track_rows.iter().enumerate() {
+            if y >= *top && y < *bot {
+                return Some(i);
+            }
+        }
+        None
+    };
+
     // Total scaled height needed to fit all tracks at the current v_zoom.
     let total_tracks_h: f32 = state
         .tracks
@@ -1517,9 +1579,26 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                 state.timeline_drag.dragging_clip = Some(ai);
                             }
 
-                            // ── Assign actor to current track on drag ──
-                            // When the actor is being dragged onto this track, assign it here
-                            state.actor_track_assignments.insert(ai, track_idx);
+                            // ── Resolve the destination track from the pointer's Y position ──
+                            // Drag inside the timeline viewport → find which track row the
+                            // cursor is over. Drag above the topmost video → schedule creation
+                            // of a new video track at index 0 (the new top).
+                            if let Some(py) = pointer_y {
+                                if let Some(target) = resolve_target_track(py) {
+                                    if state.tracks[target].kind == TrackKind::Video {
+                                        state.actor_track_assignments.insert(ai, target);
+                                    }
+                                } else {
+                                    // Pointer outside any existing row.
+                                    let topmost_y = track_rows.first().map(|(t, _)| *t)
+                                        .unwrap_or(tracks_rect.min.y);
+                                    if py < topmost_y {
+                                        pending_new_video_top = Some(ai);
+                                    }
+                                }
+                            } else {
+                                state.actor_track_assignments.insert(ai, track_idx);
+                            }
 
                             // ── Snap-to-edges logic ──
                             if state.snap_enabled {
@@ -1577,6 +1656,20 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                         track_left,
                         track_right,
                     );
+
+                    // Keyframe diamonds on the clip bar — one per layout keyframe.
+                    draw_keyframe_diamonds(
+                        painter,
+                        content_rect,
+                        clip_start,
+                        clip_end,
+                        &state.scene.actors[ai].layout,
+                        state.timeline_scroll,
+                        pps,
+                        track_left,
+                        track_right,
+                        sel,
+                    );
                 }
 
                 // Draw overlays on video tracks (track 1+)
@@ -1614,16 +1707,40 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                 to_select = Some(Selection::Overlay(oi));
                             }
                         }
+                        // Keyframe diamonds for overlays too.
+                        let layout_ref: &[Keyframe<OverlayState>] = match &state.scene.overlays[oi] {
+                            Overlay::Text(t) => &t.layout,
+                            Overlay::Image(im) => &im.layout,
+                            Overlay::Video(v) => &v.layout,
+                        };
+                        draw_keyframe_diamonds(
+                            painter,
+                            content_rect,
+                            clip_start,
+                            clip_end,
+                            layout_ref,
+                            state.timeline_scroll,
+                            pps,
+                            track_left,
+                            track_right,
+                            sel,
+                        );
                     }
                 }
             }
             TrackKind::Audio => {
                 let audio_tracks: Vec<usize> = (0..num_tracks).filter(|ti| state.tracks[*ti].kind == TrackKind::Audio).collect();
-                let at_pos = audio_tracks.iter().position(|t| *t == track_idx);
 
                 for aui in 0..state.scene.audio.len() {
-                    let target_at = if audio_tracks.is_empty() { 0 } else { aui % audio_tracks.len() };
-                    if at_pos != Some(target_at) { continue; }
+                    // Use explicit assignment if set, otherwise round-robin across audio tracks.
+                    let target_track_idx = if let Some(&t) = state.audio_track_assignments.get(&aui) {
+                        t
+                    } else if audio_tracks.is_empty() {
+                        0
+                    } else {
+                        audio_tracks[aui % audio_tracks.len()]
+                    };
+                    if target_track_idx != track_idx { continue; }
 
                     let audio = &state.scene.audio[aui];
                     let clip_start = audio.t_in;
@@ -1635,11 +1752,26 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                         state.audio_waveforms.get(aui))
                     {
                         if clicked < 0.0 {
-                            // Drag: move the audio clip
+                            // Drag: move the audio clip horizontally.
                             let new_start = (-clicked).max(0.0);
                             let dur = clip_end - clip_start;
                             state.scene.audio[aui].t_in = new_start;
                             state.scene.audio[aui].t_out = Some(new_start + dur);
+
+                            // Vertical: re-assign track based on pointer Y.
+                            if let Some(py) = pointer_y {
+                                if let Some(target) = resolve_target_track(py) {
+                                    if state.tracks[target].kind == TrackKind::Audio {
+                                        state.audio_track_assignments.insert(aui, target);
+                                    }
+                                } else {
+                                    let bottommost_y = track_rows.last().map(|(_, b)| *b)
+                                        .unwrap_or(tracks_rect.max.y);
+                                    if py >= bottommost_y {
+                                        pending_new_audio_bottom = Some(aui);
+                                    }
+                                }
+                            }
                         }
                         to_select = Some(Selection::Audio(aui));
                     }
@@ -1654,6 +1786,36 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                 [egui::pos2(x, row_rect.min.y), egui::pos2(x, row_rect.max.y)],
                 Stroke::new(1.0, COL_PLAYHEAD));
         }
+    }
+
+    // ── Apply pending new-layer creation requests from the drag handlers ──
+    // These were stashed inside the loop so we don't invalidate iteration.
+    if let Some(actor_idx) = pending_new_video_top {
+        // Insert a new video track at index 0 and shift every existing
+        // assignment up by 1 so they keep referring to the same physical row.
+        let n = state.tracks.iter().filter(|t| t.kind == TrackKind::Video).count() + 1;
+        state.tracks.insert(0, crate::state::Track::video(format!("V{}", n)));
+        let new_assignments: std::collections::HashMap<usize, usize> = state
+            .actor_track_assignments
+            .iter()
+            .map(|(k, v)| (*k, *v + 1))
+            .collect();
+        state.actor_track_assignments = new_assignments;
+        let new_audio: std::collections::HashMap<usize, usize> = state
+            .audio_track_assignments
+            .iter()
+            .map(|(k, v)| (*k, *v + 1))
+            .collect();
+        state.audio_track_assignments = new_audio;
+        state.actor_track_assignments.insert(actor_idx, 0);
+        state.status = format!("\u{2728} New video layer created on top: V{}", n);
+    }
+    if let Some(audio_idx) = pending_new_audio_bottom {
+        let n = state.tracks.iter().filter(|t| t.kind == TrackKind::Audio).count() + 1;
+        state.tracks.push(crate::state::Track::audio(format!("A{}", n)));
+        let new_track_idx = state.tracks.len() - 1;
+        state.audio_track_assignments.insert(audio_idx, new_track_idx);
+        state.status = format!("\u{2728} New audio layer created at bottom: A{}", n);
     }
 
     // Empty state
@@ -1768,7 +1930,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                         t_in: drop_time,
                         t_out: (drop_time + 3.0).min(state.scene.output.duration),
                         layout: vec![Keyframe::new(0.0, OverlayState {
-                            pos: [0.5, 0.5], scale: 0.3, rotation_deg: 0.0, opacity: 1.0
+                            pos: [0.5, 0.5], scale: 0.3, scale_y: 1.0, rotation_deg: 0.0, opacity: 1.0
                         })],
                     });
                     state.scene.overlays.push(overlay);
@@ -2302,6 +2464,57 @@ fn draw_placeholder_waveform(painter: &egui::Painter, bar_rect: egui::Rect) {
 }
 
 
+/// Draw small diamond markers on a clip bar, one per layout keyframe.
+/// Keyframe times are LOCAL (relative to clip's t_in). Used for the
+/// "visual constructor of animations" — gives users an at-a-glance view
+/// of when in the clip's timeline parameter changes happen.
+#[allow(clippy::too_many_arguments)]
+fn draw_keyframe_diamonds<T>(
+    painter: &egui::Painter,
+    content_rect: egui::Rect,
+    clip_start: f32,
+    clip_end: f32,
+    layout: &[Keyframe<T>],
+    scroll: f32,
+    pps: f32,
+    track_left: f32,
+    track_right: f32,
+    selected: bool,
+) {
+    if layout.is_empty() { return; }
+    // If there's only a single static keyframe, no need to draw anything —
+    // the clip is non-animated.
+    if layout.len() == 1 { return; }
+
+    let bar_y_top = content_rect.min.y + 2.0;
+    let bar_y_bot = content_rect.max.y - 2.0;
+    let cy = (bar_y_top + bar_y_bot) * 0.5;
+    let half = 4.0_f32;
+    let fill = if selected {
+        Color32::from_rgb(255, 230, 80)
+    } else {
+        Color32::from_rgb(200, 200, 255)
+    };
+    let stroke = Color32::from_rgb(20, 20, 30);
+
+    for kf in layout {
+        let abs_t = clip_start + kf.t;
+        if abs_t < clip_start - 0.001 || abs_t > clip_end + 0.001 { continue; }
+        let x = (abs_t - scroll) * pps + track_left;
+        if x < track_left - half || x > track_right + half { continue; }
+
+        // Diamond shape (45-degree rotated square).
+        let pts = vec![
+            egui::pos2(x, cy - half),
+            egui::pos2(x + half, cy),
+            egui::pos2(x, cy + half),
+            egui::pos2(x - half, cy),
+        ];
+        painter.add(egui::Shape::convex_polygon(pts, fill, Stroke::new(1.0, stroke)));
+    }
+}
+
+
 /// Draw a small triangle marker + faded gradient overlay representing a
 /// non-`Cut` transition at either edge of an actor clip on the timeline.
 #[allow(clippy::too_many_arguments)]
@@ -2786,13 +2999,8 @@ pub fn preview(ui: &mut egui::Ui, state: &mut EditorState) {
     }
 
     if !any_frame_shown && state.frame_caches.is_empty() {
-        if let Some(p) = &state.last_preview {
-            let uri = format!("file://{}", p.display());
-            ui.put(rect, egui::Image::from_uri(uri).fit_to_exact_size(rect.size()));
-        } else {
-            ui.put(rect, egui::Label::new(
-                RichText::new("Preview\n\nAdd clips and hit play").color(Color32::from_rgb(60, 60, 80)).size(14.0)));
-        }
+        ui.put(rect, egui::Label::new(
+            RichText::new("Preview\n\nAdd clips and hit play").color(Color32::from_rgb(60, 60, 80)).size(14.0)));
     } else if !any_frame_shown {
         ui.put(rect, egui::Label::new(
             RichText::new("No clip active at this time").color(Color32::from_rgb(60, 60, 80)).size(13.0)));
@@ -3041,6 +3249,7 @@ pub fn add_text_overlay(state: &mut EditorState) -> usize {
         layout: vec![Keyframe::new(0.0, OverlayState {
             pos: [0.5, 0.5],
             scale: 1.0,
+            scale_y: 1.0,
             rotation_deg: 0.0,
             opacity: 1.0,
         })],
