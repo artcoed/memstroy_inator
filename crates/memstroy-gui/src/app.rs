@@ -201,12 +201,6 @@ impl App {
             });
 
             ui.menu_button(RichText::new("\u{1F9E0} Tools").strong(), |ui| {
-                if ui.button("\u{1F9CD} Detect anchors (pose)...").clicked() {
-                    self.state.status =
-                        "\u{1F6A7} Pose detection: ONNX backend coming in next iteration."
-                            .into();
-                    ui.close_menu();
-                }
                 if ui.button("\u{1F9B4} Skeleton Constructor...").clicked() {
                     self.state.skeleton_editor.open = true;
                     // Pre-select the current actor if one is selected
@@ -1209,6 +1203,47 @@ impl eframe::App for App {
             self.state.status = String::new();
             self.start_frame_extraction();
             self.start_waveform_extraction();
+        }
+
+        // ── OS Drag-and-Drop: accept files from Windows Explorer ──
+        let dropped_files: Vec<_> = ctx.input(|i| i.raw.dropped_files.clone());
+        if !dropped_files.is_empty() {
+            for file in &dropped_files {
+                if let Some(path) = &file.path {
+                    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+                    if ["mp4", "mov", "webm", "avi", "mkv"].contains(&ext.as_str()) {
+                        crate::panels::add_actor_from_clip(&mut self.state, &path.to_path_buf());
+                    } else if ["jpg", "jpeg", "png", "webp", "gif"].contains(&ext.as_str()) {
+                        let id = path.file_stem().and_then(|s| s.to_str())
+                            .map(|s| format!("img_{}", s))
+                            .unwrap_or_else(|| format!("img_{}", self.state.scene.overlays.len() + 1));
+                        let overlay = memstroy_core::Overlay::Image(memstroy_core::ImageOverlay {
+                            id: id.clone(),
+                            source: path.to_path_buf(),
+                            t_in: self.state.playhead,
+                            t_out: (self.state.playhead + 3.0).min(self.state.scene.output.duration),
+                            layout: vec![memstroy_core::Keyframe::new(0.0, memstroy_core::OverlayState::default())],
+                        });
+                        self.state.scene.overlays.push(overlay);
+                        self.state.selection = Selection::Overlay(self.state.scene.overlays.len() - 1);
+                        self.state.status = format!("Dropped image: {}", id);
+                    } else if ["mp3", "wav", "ogg", "flac", "aac"].contains(&ext.as_str()) {
+                        let id = path.file_stem().and_then(|s| s.to_str())
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| format!("audio_{}", self.state.scene.audio.len() + 1));
+                        self.state.scene.audio.push(memstroy_core::AudioTrack {
+                            id: id.clone(),
+                            source: path.to_path_buf(),
+                            t_in: self.state.playhead,
+                            t_out: None,
+                            source_start: 0.0,
+                            volume: 1.0,
+                        });
+                        self.state.selection = Selection::Audio(self.state.scene.audio.len() - 1);
+                        self.state.status = format!("Dropped audio: {}", id);
+                    }
+                }
+            }
         }
 
         // Handle eyedropper activation
