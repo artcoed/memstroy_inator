@@ -187,6 +187,7 @@ fn execute_line(line: &str, scene: &mut Scene, messages: &mut Vec<String>) -> Re
                 flip_horizontal: false,
                 attachments: Vec::new(),
                 skeleton_attachments: Vec::new(),
+                modifiers: Vec::new(),
                 visible: true,
                 color_correction: ColorCorrection::default(),
                 transition_in: Transition::Cut,
@@ -361,7 +362,7 @@ fn cmd_add_actor_keyframe(args: &[String], scene: &mut Scene) -> Result<(), Stri
     let actor = find_actor_mut(scene, id)?;
     let kf = Keyframe {
         t,
-        value: ActorState { pos: [x, y], scale, scale_y: 1.0, rotation_deg: rot, opacity },
+        value: ActorState { pos: [x, y], scale, scale_y: 1.0, rotation_deg: rot, opacity, flip_x_anim: 1.0, flip_y_anim: 1.0 },
         easing,
     };
     actor.layout.push(kf);
@@ -432,6 +433,8 @@ fn cmd_add_text(args: &[String], scene: &mut Scene) -> Result<(), String> {
         t_out,
         style: TextStyle::default(),
         layout: vec![Keyframe::new(0.0, OverlayState::default())],
+        modifiers: Vec::new(),
+        skeleton_attachment: None,
         z_index: 100,
         behind_actors: false,
     }));
@@ -449,6 +452,8 @@ fn cmd_add_image(args: &[String], scene: &mut Scene) -> Result<(), String> {
         t_in,
         t_out,
         layout: vec![Keyframe::new(0.0, OverlayState::default())],
+        modifiers: Vec::new(),
+        skeleton_attachment: None,
     }));
     Ok(())
 }
@@ -467,6 +472,8 @@ fn cmd_add_video_overlay(args: &[String], scene: &mut Scene) -> Result<(), Strin
         loop_source: false,
         chroma_key: None,
         layout: vec![Keyframe::new(0.0, OverlayState::default())],
+        modifiers: Vec::new(),
+        skeleton_attachment: None,
     }));
     Ok(())
 }

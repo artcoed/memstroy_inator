@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use egui::{Color32, RichText, Rounding, Sense, Stroke, Vec2};
+use egui::{Color32, Pos2, Rect, RichText, Rounding, Sense, Stroke, Vec2};
 use memstroy_core::*;
 
 use crate::state::{AssetDragKind, EditorState, Selection, TrackKind};
@@ -300,17 +300,36 @@ fn inspector_actor(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
 
 
 fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
+    let playhead = state.playhead;
     let a = &mut state.scene.actors[i];
 
     ui.label(RichText::new("Position & Scale").size(12.0).strong());
     ui.add_space(4.0);
 
-    // Edit the first keyframe directly (simple mode)
+    // Edit the keyframe at the playhead time directly. This is the
+    // canvas-first authoring loop: scrub to a time, drag values here
+    // (or on the canvas) → animation appears. When no keyframe exists
+    // at the current playhead an interpolated one is auto-inserted on
+    // first edit so the user never has to click "+ Key" first.
     if a.layout.is_empty() {
         a.layout.push(Keyframe::new(0.0, ActorState::default()));
     }
-
-    if let Some(kf) = a.layout.first_mut() {
+    let kf_idx = match ensure_actor_kf_at_playhead_inspector(&mut a.layout, playhead) {
+        Some(i) => i,
+        None => return,
+    };
+    if let Some(kf) = a.layout.get_mut(kf_idx) {
+        if (kf.t - playhead).abs() > 1.0e-3 && playhead > 0.0 {
+            ui.label(
+                RichText::new(format!("Editing keyframe @ {:.2}s", kf.t))
+                    .size(9.0).color(COL_TEXT_DIM).italics(),
+            );
+        } else {
+            ui.label(
+                RichText::new(format!("Keyframe @ {:.2}s", kf.t))
+                    .size(9.0).color(COL_TEXT_DIM).italics(),
+            );
+        }
         ui.horizontal(|ui| {
             ui.label(RichText::new("X:").size(11.0));
             ui.add(egui::DragValue::new(&mut kf.value.pos[0]).range(-2.0..=3.0).speed(0.005));
@@ -329,24 +348,298 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
                 kf.value.scale_y = 1.0;
             }
         });
+
+        // Rotation — circular dial (replaces the old slider). Click and
+        // drag anywhere on the disk to set the angle directly; double-
+        // click resets to 0°.
+        ui.add_space(4.0);
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Rotation:").size(11.0));
-            ui.add(
-                egui::Slider::new(&mut kf.value.rotation_deg, -360.0..=360.0)
-                    .suffix("\u{00B0}")
-                    .step_by(0.1)
-                    .fixed_decimals(1)
-                    .smart_aim(false),
-            );
+            ui.label(RichText::new("Rotation").size(11.0));
+            circular_rotation_widget(ui, ("actor_rot", i), &mut kf.value.rotation_deg, 90.0);
+            ui.vertical(|ui| {
+                ui.add(
+                    egui::DragValue::new(&mut kf.value.rotation_deg)
+                        .range(-3600.0..=3600.0)
+                        .speed(0.5)
+                        .suffix("\u{00B0}")
+                        .fixed_decimals(1),
+                );
+                if ui.small_button("0\u{00B0}").clicked() { kf.value.rotation_deg = 0.0; }
+            });
         });
+
+        ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.label(RichText::new("Opacity:").size(11.0));
             ui.add(egui::Slider::new(&mut kf.value.opacity, 0.0..=1.0));
+        });
+
+        // Animatable flip (continuous −1..1). Slider lets the user dial
+        // it manually; the integer button next to it sets ±1 instantly.
+        // At intermediate values the renderer applies a 3D-card-fold
+        // effect (horizontal scale shrinks toward 0 and back).
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Flip X:").size(11.0));
+            ui.add(egui::Slider::new(&mut kf.value.flip_x_anim, -1.0..=1.0));
+            if ui.small_button("\u{21B6}").on_hover_text("Mirror (set −1)").clicked() {
+                kf.value.flip_x_anim = -kf.value.flip_x_anim.signum().abs().max(1.0).copysign(-1.0);
+                if kf.value.flip_x_anim.abs() < 1e-3 { kf.value.flip_x_anim = -1.0; }
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Flip Y:").size(11.0));
+            ui.add(egui::Slider::new(&mut kf.value.flip_y_anim, -1.0..=1.0));
         });
     }
 
     ui.add_space(8.0);
     ui.checkbox(&mut a.visible, "Visible");
+
+    // Animation modifiers — wobble / shake / pulse / spin.
+    ui.add_space(8.0);
+    inspector_modifiers(ui, &mut a.modifiers, ("actor_mods", i));
+}
+
+/// Inspector-side mirror of `ensure_actor_kf_at_playhead` from canvas_preview.rs.
+/// Inserts a keyframe seeded with the eased current value when the user
+/// scrubs to a time that isn't already represented in the track.
+fn ensure_actor_kf_at_playhead_inspector(
+    layout: &mut Vec<Keyframe<ActorState>>,
+    t: f32,
+) -> Option<usize> {
+    if layout.is_empty() {
+        layout.push(Keyframe::new(t, ActorState::default()));
+        return Some(0);
+    }
+    let eps = 1.0e-3;
+    if let Some(idx) = layout.iter().position(|kf| (kf.t - t).abs() < eps) {
+        return Some(idx);
+    }
+    // For playhead at t=0 (or near it) just edit the first keyframe in
+    // place to preserve "edit-the-base-pose" muscle memory.
+    if t <= 0.001 {
+        return Some(0);
+    }
+    let sampled = keyframe::sample(layout, t).unwrap_or_default();
+    layout.push(Keyframe::new(t, sampled));
+    layout.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
+    layout.iter().position(|kf| (kf.t - t).abs() < eps)
+}
+
+fn ensure_overlay_kf_at_playhead_inspector(
+    layout: &mut Vec<Keyframe<OverlayState>>,
+    t: f32,
+) -> Option<usize> {
+    if layout.is_empty() {
+        layout.push(Keyframe::new(t, OverlayState::default()));
+        return Some(0);
+    }
+    let eps = 1.0e-3;
+    if let Some(idx) = layout.iter().position(|kf| (kf.t - t).abs() < eps) {
+        return Some(idx);
+    }
+    if t <= 0.001 {
+        return Some(0);
+    }
+    let sampled = keyframe::sample(layout, t).unwrap_or_default();
+    layout.push(Keyframe::new(t, sampled));
+    layout.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
+    layout.iter().position(|kf| (kf.t - t).abs() < eps)
+}
+
+/// Compact circular rotation dial. The pointer angle relative to the
+/// dial centre is mapped directly to `*deg` so the user always lands on
+/// the exact value they aim at — no slider scrubbing needed. Double-
+/// clicking resets to 0°. Holding Shift snaps to 15° increments.
+fn circular_rotation_widget(
+    ui: &mut egui::Ui,
+    salt: impl std::hash::Hash + Copy,
+    deg: &mut f32,
+    size: f32,
+) {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), Sense::click_and_drag());
+    let painter = ui.painter_at(rect);
+    let center = rect.center();
+    let radius = size * 0.45;
+
+    // Background ring.
+    painter.circle_filled(center, radius, Color32::from_rgb(28, 28, 38));
+    painter.circle_stroke(center, radius, Stroke::new(1.0, Color32::from_rgb(70, 70, 90)));
+
+    // Tick marks every 30°.
+    for k in 0..12 {
+        let a = (k as f32) / 12.0 * std::f32::consts::TAU - std::f32::consts::FRAC_PI_2;
+        let p1 = center + Vec2::new(a.cos(), a.sin()) * (radius - 4.0);
+        let p2 = center + Vec2::new(a.cos(), a.sin()) * radius;
+        let stroke = if k % 3 == 0 { 1.5 } else { 0.7 };
+        painter.line_segment([p1, p2], Stroke::new(stroke, Color32::from_rgb(110, 110, 130)));
+    }
+
+    let _ = salt;
+
+    if resp.dragged() || resp.clicked() {
+        if let Some(p) = resp.interact_pointer_pos() {
+            let dx = p.x - center.x;
+            let dy = p.y - center.y;
+            if dx.abs() > 0.001 || dy.abs() > 0.001 {
+                // Convention: 0° points up; positive rotates clockwise so
+                // the dial reads like a wall clock.
+                let mut new_deg = dy.atan2(dx).to_degrees() + 90.0;
+                if new_deg > 180.0 { new_deg -= 360.0; }
+                if new_deg < -180.0 { new_deg += 360.0; }
+                let shift_held = ui.input(|i| i.modifiers.shift);
+                if shift_held {
+                    new_deg = (new_deg / 15.0).round() * 15.0;
+                }
+                *deg = new_deg;
+            }
+        }
+    }
+    if resp.double_clicked() {
+        *deg = 0.0;
+    }
+
+    // Marker line from centre to the current angle.
+    let rad = (deg.to_radians() - std::f32::consts::FRAC_PI_2);
+    let tip = center + Vec2::new(rad.cos(), rad.sin()) * (radius - 4.0);
+    painter.line_segment([center, tip], Stroke::new(2.5, Color32::from_rgb(255, 220, 80)));
+    painter.circle_filled(tip, 4.0, Color32::from_rgb(255, 220, 80));
+    painter.circle_filled(center, 3.0, Color32::from_rgb(180, 180, 200));
+
+    // Numeric readout in the centre.
+    painter.text(
+        Pos2::new(center.x, center.y + radius * 0.5),
+        egui::Align2::CENTER_CENTER,
+        format!("{:.1}\u{00B0}", deg),
+        egui::FontId::proportional(10.0),
+        Color32::from_rgb(200, 200, 220),
+    );
+}
+
+/// Modifier-stack inspector. Shows each modifier as an editable card
+/// with its parameters and an "x" remove button. The "+ Add" menu adds
+/// a new modifier of a chosen kind. Empty list shows a hint instead of
+/// a tall blank panel.
+fn inspector_modifiers(
+    ui: &mut egui::Ui,
+    modifiers: &mut Vec<TrackModifier>,
+    salt: impl std::hash::Hash + Copy,
+) {
+    egui::CollapsingHeader::new(
+        RichText::new("Animation Modifiers").size(12.0).strong()
+            .color(Color32::from_rgb(150, 200, 255)),
+    )
+    .id_source(("modifier_collapse", salt))
+    .default_open(false)
+    .show(ui, |ui| {
+        if modifiers.is_empty() {
+            ui.label(RichText::new(
+                "No modifiers. Add one to perturb the animation \
+                 (wobble/shake/pulse/spin).",
+            ).size(10.0).color(COL_TEXT_DIM).italics());
+        } else {
+            let mut to_remove: Option<usize> = None;
+            for (mi, m) in modifiers.iter_mut().enumerate() {
+                let kind_label = m.kind_label();
+                let header_color = match m.kind {
+                    ModifierKind::Wobble { .. } => Color32::from_rgb(120, 200, 255),
+                    ModifierKind::Shake { .. } => Color32::from_rgb(255, 160, 100),
+                    ModifierKind::Pulse { .. } => Color32::from_rgb(255, 220, 100),
+                    ModifierKind::Spin { .. } => Color32::from_rgb(180, 255, 150),
+                };
+                egui::Frame::none()
+                    .fill(Color32::from_rgb(28, 28, 38))
+                    .rounding(Rounding::same(4.0))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(50, 50, 70)))
+                    .inner_margin(egui::Margin::same(6.0))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut m.enabled, "");
+                            ui.label(RichText::new(kind_label).strong().size(11.0).color(header_color));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.small_button("x").on_hover_text("Remove modifier").clicked() {
+                                    to_remove = Some(mi);
+                                }
+                            });
+                        });
+                        ui.add_space(2.0);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Range").size(10.0).color(COL_TEXT_DIM));
+                            ui.add(egui::DragValue::new(&mut m.t_start)
+                                .range(0.0..=600.0).speed(0.05).suffix("s"));
+                            ui.label("\u{2192}");
+                            // Render f32::MAX as "∞".
+                            if m.t_end >= 1.0e9 {
+                                if ui.small_button("\u{221E}").clicked() {
+                                    m.t_end = (m.t_start + 1.0).max(1.0);
+                                }
+                            } else {
+                                ui.add(egui::DragValue::new(&mut m.t_end)
+                                    .range(0.0..=600.0).speed(0.05).suffix("s"));
+                                if ui.small_button("\u{221E}").on_hover_text("Always active").clicked() {
+                                    m.t_end = f32::MAX;
+                                }
+                            }
+                        });
+                        ui.add_space(2.0);
+                        match &mut m.kind {
+                            ModifierKind::Wobble { freq_hz, amp_x, amp_y, amp_rot_deg, phase } => {
+                                ui.add(egui::Slider::new(freq_hz, 0.1..=10.0).text("Freq Hz"));
+                                ui.add(egui::Slider::new(amp_x, 0.0..=120.0).text("Amp X (px)"));
+                                ui.add(egui::Slider::new(amp_y, 0.0..=120.0).text("Amp Y (px)"));
+                                ui.add(egui::Slider::new(amp_rot_deg, 0.0..=45.0).text("Amp Rot \u{00B0}"));
+                                ui.add(egui::Slider::new(phase, 0.0..=std::f32::consts::TAU).text("Phase"));
+                            }
+                            ModifierKind::Shake { freq_hz, amp_x, amp_y, seed } => {
+                                ui.add(egui::Slider::new(freq_hz, 1.0..=40.0).text("Freq Hz"));
+                                ui.add(egui::Slider::new(amp_x, 0.0..=80.0).text("Amp X (px)"));
+                                ui.add(egui::Slider::new(amp_y, 0.0..=80.0).text("Amp Y (px)"));
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new("Seed").size(10.0));
+                                    ui.add(egui::DragValue::new(seed).range(0..=u32::MAX).speed(1.0));
+                                });
+                            }
+                            ModifierKind::Pulse { freq_hz, amp_scale } => {
+                                ui.add(egui::Slider::new(freq_hz, 0.1..=10.0).text("Freq Hz"));
+                                ui.add(egui::Slider::new(amp_scale, -0.5..=0.5).text("Amp Scale"));
+                            }
+                            ModifierKind::Spin { speed_dps } => {
+                                ui.add(egui::Slider::new(speed_dps, -720.0..=720.0).text("Speed \u{00B0}/s"));
+                            }
+                        }
+                    });
+                ui.add_space(3.0);
+            }
+            if let Some(ri) = to_remove {
+                modifiers.remove(ri);
+            }
+        }
+
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            if ui.button(RichText::new("+ Wobble").size(10.0)).on_hover_text(
+                "Smooth sinusoidal sway"
+            ).clicked() {
+                modifiers.push(TrackModifier::wobble());
+            }
+            if ui.button(RichText::new("+ Shake").size(10.0)).on_hover_text(
+                "High-frequency jitter"
+            ).clicked() {
+                modifiers.push(TrackModifier::shake());
+            }
+            if ui.button(RichText::new("+ Pulse").size(10.0)).on_hover_text(
+                "Periodic scale breathing"
+            ).clicked() {
+                modifiers.push(TrackModifier::pulse());
+            }
+            if ui.button(RichText::new("+ Spin").size(10.0)).on_hover_text(
+                "Continuous rotation"
+            ).clicked() {
+                modifiers.push(TrackModifier::spin());
+            }
+        });
+    });
 }
 
 
@@ -764,102 +1057,364 @@ fn hsv_to_color32(h: f32, s: f32, v: f32) -> Color32 {
     )
 }
 
+/// Skeleton-attachments inspector. Replaces the legacy "skeleton +
+/// point" combo selector. Now shows a colored, browsable list of every
+/// point defined in every skeleton template attached to this clip's
+/// source. Each row is also a drop target: drag any chip from the
+/// "Bind elements" list at the top onto a point row to attach.
+///
+/// The chips are drag sources for both overlays and other actors. The
+/// drop zones write the binding to the *attaching* element (the chip),
+/// matching the existing `Actor.skeleton_attachments` semantics where
+/// the followee actor's id is referenced via `skeleton_id`.
 fn inspector_actor_skeleton_attachments(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
     egui::CollapsingHeader::new(
-        RichText::new("Skeleton Attachments").size(12.0).strong().color(Color32::from_rgb(180, 120, 255))
-    ).default_open(false).show(ui, |ui| {
-        // List existing skeleton attachments on this actor
-        let num_att = state.scene.actors[i].skeleton_attachments.len();
-        if num_att == 0 {
-            ui.label(RichText::new("No skeleton attachments.").size(10.0).color(COL_TEXT_DIM).italics());
-        } else {
-            let mut to_remove: Option<usize> = None;
-            for ai in 0..num_att {
-                let att = &state.scene.actors[i].skeleton_attachments[ai];
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("{}.{}", att.skeleton_id, att.point_name)).size(11.0));
-                    ui.label(RichText::new(format!("s:{:.2}", att.scale)).size(9.0).color(COL_TEXT_DIM));
-                    if ui.small_button("x").clicked() {
-                        to_remove = Some(ai);
-                    }
-                });
-            }
-            if let Some(ri) = to_remove {
-                state.scene.actors[i].skeleton_attachments.remove(ri);
-            }
-        }
-
-        ui.add_space(4.0);
-
-        // "Attach to skeleton point" button — shows available skeletons/points
-        let available_skeletons: Vec<(String, Vec<String>)> = state.scene.skeleton_templates.iter()
-            .map(|tmpl| {
-                let names: Vec<String> = tmpl.points.keys().cloned().collect();
-                (tmpl.name.clone(), names)
+        RichText::new("Skeleton Attachment Points").size(12.0).strong()
+            .color(Color32::from_rgb(180, 120, 255))
+    ).default_open(true).show(ui, |ui| {
+        // Resolve which templates apply to this actor's source clip. A
+        // skeleton may match by template name, by source-clip path or
+        // by source-clip filename — same matching rules as the renderer.
+        let actor_source = state.scene.actors[i].source.clone();
+        let actor_id = state.scene.actors[i].id.clone();
+        let templates: Vec<(usize, String)> = state
+            .scene
+            .skeleton_templates
+            .iter()
+            .enumerate()
+            .filter(|(_, tmpl)| {
+                tmpl.source_clip == actor_source
+                    || tmpl.source_clip.file_name() == actor_source.file_name()
             })
+            .map(|(idx, tmpl)| (idx, tmpl.name.clone()))
             .collect();
 
-        if available_skeletons.is_empty() {
-            ui.label(RichText::new("No skeleton templates. Use Tools > Skeleton Constructor to create one.")
-                .size(9.0).color(COL_TEXT_DIM).italics());
-        } else {
-            // Combo: pick skeleton
-            let skel_id = ui.make_persistent_id("skel_attach_combo");
-            let mut sel_skel: usize = ui.ctx().memory(|m| m.data.get_temp(skel_id).unwrap_or(0));
-            if sel_skel >= available_skeletons.len() { sel_skel = 0; }
+        if templates.is_empty() {
+            ui.label(RichText::new(
+                "No skeleton bound to this clip yet.\n\
+                 Open Tools \u{2192} Skeleton Constructor and save a \
+                 sidecar next to the source file."
+            ).size(10.0).italics().color(COL_TEXT_DIM));
+            return;
+        }
 
-            ui.horizontal(|ui| {
-                ui.label("Skeleton:");
-                egui::ComboBox::from_id_source("attach_skel_sel")
-                    .selected_text(&available_skeletons[sel_skel].0)
-                    .show_ui(ui, |ui| {
-                        for (si, (name, _)) in available_skeletons.iter().enumerate() {
-                            ui.selectable_value(&mut sel_skel, si, name);
-                        }
-                    });
-            });
-            ui.ctx().memory_mut(|m| m.data.insert_temp(skel_id, sel_skel));
-
-            // Combo: pick point
-            let points = &available_skeletons[sel_skel].1;
-            if points.is_empty() {
-                ui.label(RichText::new("No points defined in this skeleton.").size(9.0).color(COL_TEXT_DIM));
-            } else {
-                let pt_id = ui.make_persistent_id("skel_point_combo");
-                let mut sel_pt: usize = ui.ctx().memory(|m| m.data.get_temp(pt_id).unwrap_or(0));
-                if sel_pt >= points.len() { sel_pt = 0; }
-
-                ui.horizontal(|ui| {
-                    ui.label("Point:");
-                    egui::ComboBox::from_id_source("attach_pt_sel")
-                        .selected_text(&points[sel_pt])
-                        .show_ui(ui, |ui| {
-                            for (pi, name) in points.iter().enumerate() {
-                                ui.selectable_value(&mut sel_pt, pi, name);
-                            }
-                        });
-                });
-                ui.ctx().memory_mut(|m| m.data.insert_temp(pt_id, sel_pt));
-
-                if ui.button(RichText::new("+ Attach").size(11.0).color(Color32::from_rgb(80, 200, 120))).clicked() {
-                    let attachment = memstroy_core::SkeletonAttachment {
-                        skeleton_id: available_skeletons[sel_skel].0.clone(),
-                        point_name: points[sel_pt].clone(),
-                        offset: [0.0, 0.0],
-                        scale: 1.0,
-                        follow_rotation: false,
-                    };
-                    state.scene.actors[i].skeleton_attachments.push(attachment);
-                    state.status = format!("Attached to {}.{}", available_skeletons[sel_skel].0, points[sel_pt]);
+        // ── Drag sources: chips for every overlay and every OTHER actor.
+        ui.label(RichText::new("Drag an element onto a point to attach:")
+            .size(10.0).color(COL_TEXT_DIM));
+        ui.horizontal_wrapped(|ui| {
+            for oi in 0..state.scene.overlays.len() {
+                let label = match &state.scene.overlays[oi] {
+                    Overlay::Text(t) => format!("T:{}", ellipsis(&t.id, 12)),
+                    Overlay::Image(im) => format!("I:{}", ellipsis(&im.id, 12)),
+                    Overlay::Video(v) => format!("V:{}", ellipsis(&v.id, 12)),
+                };
+                let chip = element_drag_chip(
+                    ui,
+                    ("ovr_chip", oi),
+                    &label,
+                    Color32::from_rgb(80, 200, 120),
+                );
+                if chip.dragged() {
+                    state.element_drag.source = Some(crate::state::AttachableElement::Overlay(oi));
+                    state.element_drag.label = label.clone();
+                    if let Some(p) = ui.input(|i| i.pointer.hover_pos()) {
+                        state.element_drag.pos = [p.x, p.y];
+                    }
                 }
             }
+            for ai in 0..state.scene.actors.len() {
+                if ai == i { continue; }
+                let label = format!("A:{}", ellipsis(&state.scene.actors[ai].id, 12));
+                let chip = element_drag_chip(
+                    ui,
+                    ("act_chip", ai),
+                    &label,
+                    Color32::from_rgb(220, 130, 50),
+                );
+                if chip.dragged() {
+                    state.element_drag.source = Some(crate::state::AttachableElement::Actor(ai));
+                    state.element_drag.label = label.clone();
+                    if let Some(p) = ui.input(|i| i.pointer.hover_pos()) {
+                        state.element_drag.pos = [p.x, p.y];
+                    }
+                }
+            }
+        });
+        ui.add_space(6.0);
+
+        // ── Per-template point list with drop zones ──
+        let dragging_label = state.element_drag.label.clone();
+        let dragging = state.element_drag.source;
+        let pointer_released = ui.input(|i| i.pointer.any_released());
+        let pointer_pos = ui.input(|i| i.pointer.hover_pos());
+        let mut commit_attach: Option<(crate::state::AttachableElement, String, String)> = None;
+
+        for (tmpl_idx, tmpl_name) in &templates {
+            let template = &state.scene.skeleton_templates[*tmpl_idx];
+            let point_keys: Vec<(String, [u8; 3])> = template.points
+                .iter()
+                .map(|(name, p)| (name.clone(), p.color))
+                .collect();
+
+            ui.label(
+                RichText::new(format!("\u{1F9B4} {}", tmpl_name))
+                    .size(11.0).strong().color(Color32::from_rgb(220, 200, 255)),
+            );
+            if point_keys.is_empty() {
+                ui.label(RichText::new("  (no points defined)").size(9.0)
+                    .italics().color(COL_TEXT_DIM));
+                continue;
+            }
+
+            for (point_name, color) in point_keys.iter() {
+                // Existing bindings for this template+point.
+                let attached_now: Vec<(usize, usize, String)> = state
+                    .scene
+                    .actors
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(ai, a)| {
+                        a.skeleton_attachments.iter().enumerate()
+                            .filter(|(_, att)| {
+                                (att.skeleton_id == *tmpl_name
+                                    || matches_skeleton_id(&att.skeleton_id, &actor_id))
+                                    && att.point_name == *point_name
+                            })
+                            .map(move |(att_i, _)| (ai, att_i, format!("A:{}", a.id)))
+                    })
+                    .collect();
+                let overlay_attached: Vec<(usize, String)> = state
+                    .scene
+                    .overlays
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(oi, ov)| {
+                        let att = match ov {
+                            Overlay::Text(t) => t.skeleton_attachment.as_ref(),
+                            Overlay::Image(im) => im.skeleton_attachment.as_ref(),
+                            Overlay::Video(v) => v.skeleton_attachment.as_ref(),
+                        }?;
+                        if (att.skeleton_id == *tmpl_name
+                                || matches_skeleton_id(&att.skeleton_id, &actor_id))
+                            && att.point_name == *point_name
+                        {
+                            Some((oi, format!("O:{}", overlay_id(ov))))
+                        } else { None }
+                    })
+                    .collect();
+
+                let row_h = 26.0;
+                let (row_rect, row_resp) = ui.allocate_exact_size(
+                    Vec2::new(ui.available_width(), row_h),
+                    Sense::hover(),
+                );
+
+                let hovered_drop = dragging.is_some()
+                    && pointer_pos.map(|p| row_rect.contains(p)).unwrap_or(false);
+
+                let bg = if hovered_drop {
+                    Color32::from_rgb(50, 80, 100)
+                } else {
+                    Color32::from_rgb(28, 28, 38)
+                };
+                let painter = ui.painter_at(row_rect);
+                painter.rect_filled(row_rect, Rounding::same(4.0), bg);
+                let stroke_col = if hovered_drop {
+                    Color32::from_rgb(120, 200, 255)
+                } else {
+                    Color32::from_rgb(50, 50, 70)
+                };
+                painter.rect_stroke(row_rect, Rounding::same(4.0), Stroke::new(1.0, stroke_col));
+
+                let dot_pos = Pos2::new(row_rect.min.x + 12.0, row_rect.center().y);
+                painter.circle_filled(dot_pos, 5.0,
+                    Color32::from_rgb(color[0], color[1], color[2]));
+                painter.text(
+                    Pos2::new(row_rect.min.x + 24.0, row_rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    point_name,
+                    egui::FontId::proportional(11.0),
+                    COL_TEXT,
+                );
+
+                // Bound chip(s) shown on the right side of the row.
+                let mut chip_x = row_rect.max.x - 6.0;
+                for (oi, label) in overlay_attached.iter().rev() {
+                    let chip_size = Vec2::new(26.0 + (label.len() as f32) * 5.0, 18.0);
+                    let chip_rect = Rect::from_min_size(
+                        Pos2::new(chip_x - chip_size.x, row_rect.center().y - chip_size.y * 0.5),
+                        chip_size,
+                    );
+                    painter.rect_filled(chip_rect, Rounding::same(3.0),
+                        Color32::from_rgb(60, 100, 70));
+                    painter.text(chip_rect.center(), egui::Align2::CENTER_CENTER,
+                        label, egui::FontId::proportional(9.0), COL_TEXT);
+                    let resp = ui.interact(
+                        chip_rect,
+                        ui.id().with(("rm_ovr_attach", *oi, point_name)),
+                        Sense::click(),
+                    );
+                    if resp.clicked() {
+                        match &mut state.scene.overlays[*oi] {
+                            Overlay::Text(t) => t.skeleton_attachment = None,
+                            Overlay::Image(im) => im.skeleton_attachment = None,
+                            Overlay::Video(v) => v.skeleton_attachment = None,
+                        }
+                    }
+                    if resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    chip_x -= chip_size.x + 4.0;
+                }
+                for (ai, _att_i, label) in attached_now.iter().rev() {
+                    let chip_size = Vec2::new(28.0 + (label.len() as f32) * 5.0, 18.0);
+                    let chip_rect = Rect::from_min_size(
+                        Pos2::new(chip_x - chip_size.x, row_rect.center().y - chip_size.y * 0.5),
+                        chip_size,
+                    );
+                    painter.rect_filled(chip_rect, Rounding::same(3.0),
+                        Color32::from_rgb(110, 70, 40));
+                    painter.text(chip_rect.center(), egui::Align2::CENTER_CENTER,
+                        label, egui::FontId::proportional(9.0), COL_TEXT);
+                    // Click chip → remove that binding.
+                    let resp = ui.interact(
+                        chip_rect,
+                        ui.id().with(("rm_actor_attach", *ai, point_name)),
+                        Sense::click(),
+                    );
+                    if resp.clicked() {
+                        // Remove the matching attachment entry on the bound actor.
+                        state.scene.actors[*ai].skeleton_attachments.retain(|att| {
+                            !((att.skeleton_id == *tmpl_name
+                                    || matches_skeleton_id(&att.skeleton_id, &actor_id))
+                                && att.point_name == *point_name)
+                        });
+                    }
+                    if resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    chip_x -= chip_size.x + 4.0;
+                }
+
+                if hovered_drop {
+                    painter.text(
+                        row_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        format!("\u{2935} drop {} here", dragging_label),
+                        egui::FontId::proportional(10.0),
+                        Color32::from_rgb(220, 240, 255),
+                    );
+                    if pointer_released {
+                        if let Some(src) = dragging {
+                            commit_attach = Some((src, tmpl_name.clone(), point_name.clone()));
+                        }
+                    }
+                }
+                let _ = row_resp;
+                ui.add_space(2.0);
+            }
+            ui.add_space(4.0);
+        }
+
+        if let Some((src, skel_id, point_name)) = commit_attach {
+            attach_element_to_skeleton_point(state, src, &skel_id, &point_name);
+            state.element_drag.source = None;
+            state.element_drag.label.clear();
+            state.status = format!("Attached to {}.{}", skel_id, point_name);
+        }
+
+        // Clear any stale drag once the pointer is up — handles the case
+        // where the user dropped outside any drop zone.
+        if pointer_released && state.element_drag.source.is_some() {
+            state.element_drag.source = None;
+            state.element_drag.label.clear();
         }
     });
+}
+
+/// Lightweight match: accepts the bound element's stored `skeleton_id`
+/// equal to the template name (canonical case) or to the host actor's id
+/// (legacy convenience). Mirrors the existing resolver semantics.
+fn matches_skeleton_id(stored: &str, actor_id: &str) -> bool {
+    stored == actor_id
+}
+
+fn overlay_id(ov: &Overlay) -> String {
+    match ov {
+        Overlay::Text(t) => t.id.clone(),
+        Overlay::Image(im) => im.id.clone(),
+        Overlay::Video(v) => v.id.clone(),
+    }
+}
+
+/// Visual chip + drag source for the skeleton attach panel.
+fn element_drag_chip(
+    ui: &mut egui::Ui,
+    salt: impl std::hash::Hash + Copy,
+    label: &str,
+    accent: Color32,
+) -> egui::Response {
+    let id = ui.id().with(salt);
+    let pad = Vec2::new(6.0, 4.0);
+    let text_size = ui.fonts(|f| {
+        f.layout_no_wrap(label.into(), egui::FontId::proportional(10.0), Color32::WHITE)
+    });
+    let chip_size = Vec2::new(text_size.size().x + pad.x * 2.0, 20.0);
+    let (rect, resp) = ui.allocate_exact_size(chip_size, Sense::click_and_drag());
+    let painter = ui.painter_at(rect);
+    let bg = if resp.dragged() {
+        Color32::from_rgb(80, 100, 80)
+    } else {
+        Color32::from_rgb(40, 40, 55)
+    };
+    painter.rect_filled(rect, Rounding::same(3.0), bg);
+    painter.rect_stroke(rect, Rounding::same(3.0), Stroke::new(1.0, accent));
+    painter.text(rect.center(), egui::Align2::CENTER_CENTER, label,
+        egui::FontId::proportional(10.0), COL_TEXT);
+    let _ = id;
+    resp
+}
+
+/// Commit a drag-and-drop attach: write the binding into the source
+/// element's `skeleton_attachment` field (overlays) or push into the
+/// source actor's `skeleton_attachments` list.
+fn attach_element_to_skeleton_point(
+    state: &mut EditorState,
+    src: crate::state::AttachableElement,
+    skeleton_id: &str,
+    point_name: &str,
+) {
+    let attachment = memstroy_core::SkeletonAttachment {
+        skeleton_id: skeleton_id.into(),
+        point_name: point_name.into(),
+        offset: [0.0, 0.0],
+        scale: 1.0,
+        follow_rotation: false,
+    };
+    match src {
+        crate::state::AttachableElement::Overlay(oi) => {
+            if oi >= state.scene.overlays.len() { return; }
+            match &mut state.scene.overlays[oi] {
+                Overlay::Text(t) => t.skeleton_attachment = Some(attachment),
+                Overlay::Image(im) => im.skeleton_attachment = Some(attachment),
+                Overlay::Video(v) => v.skeleton_attachment = Some(attachment),
+            }
+        }
+        crate::state::AttachableElement::Actor(ai) => {
+            if ai >= state.scene.actors.len() { return; }
+            // Avoid duplicates for the same skeleton + point.
+            state.scene.actors[ai].skeleton_attachments.retain(|att| {
+                !(att.skeleton_id == skeleton_id && att.point_name == point_name)
+            });
+            state.scene.actors[ai].skeleton_attachments.push(attachment);
+        }
+    }
 }
 
 fn inspector_overlay(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
     let duration = state.scene.output.duration;
     let overlay_count = state.scene.overlays.len();
+    let playhead = state.playhead;
 
     let ov = &mut state.scene.overlays[i];
 
@@ -867,7 +1422,7 @@ fn inspector_overlay(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
         Overlay::Text(t) => {
             // Returns Option<TextAction> for backward compat — currently
             // unused since the layer-order buttons were removed.
-            let _ = inspector_text_overlay(ui, t, i, overlay_count, duration);
+            let _ = inspector_text_overlay(ui, t, i, overlay_count, duration, playhead);
         }
         Overlay::Image(im) => {
             ui.label(RichText::new(format!("Image: {}", im.id)).strong().size(14.0).color(COL_CLIP_OVERLAY));
@@ -878,15 +1433,32 @@ fn inspector_overlay(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
                 ui.label("Out:");
                 ui.add(egui::DragValue::new(&mut im.t_out).range(0.0..=duration).speed(0.02).suffix("s"));
             });
-            if let Some(kf) = im.layout.first_mut() {
+            ensure_overlay_kf_at_playhead_inspector(&mut im.layout, playhead);
+            // Edit the keyframe at the playhead so animation flows
+            // naturally on canvas drag too.
+            let eps = 1.0e-3;
+            let kf_idx = im.layout.iter().position(|kf| (kf.t - playhead).abs() < eps).unwrap_or(0);
+            if let Some(kf) = im.layout.get_mut(kf_idx) {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.label("X:"); ui.add(egui::DragValue::new(&mut kf.value.pos[0]).speed(0.005));
                     ui.label("Y:"); ui.add(egui::DragValue::new(&mut kf.value.pos[1]).speed(0.005));
                 });
                 ui.add(egui::Slider::new(&mut kf.value.scale, 0.05..=5.0).text("Scale").logarithmic(true));
+                ui.add(egui::Slider::new(&mut kf.value.scale_y, 0.1..=5.0).text("Stretch Y").logarithmic(true));
+
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Rotation").size(11.0));
+                    circular_rotation_widget(ui, ("img_rot", i), &mut kf.value.rotation_deg, 80.0);
+                    ui.add(egui::DragValue::new(&mut kf.value.rotation_deg)
+                        .range(-3600.0..=3600.0).speed(0.5).suffix("\u{00B0}").fixed_decimals(1));
+                });
                 ui.add(egui::Slider::new(&mut kf.value.opacity, 0.0..=1.0).text("Opacity"));
+                ui.add(egui::Slider::new(&mut kf.value.flip_x_anim, -1.0..=1.0).text("Flip X"));
+                ui.add(egui::Slider::new(&mut kf.value.flip_y_anim, -1.0..=1.0).text("Flip Y"));
             }
+            ui.add_space(8.0);
+            inspector_modifiers(ui, &mut im.modifiers, ("img_mods", i));
         }
         Overlay::Video(v) => {
             ui.label(RichText::new(format!("Video: {}", v.id)).strong().size(14.0).color(COL_CLIP_OVERLAY));
@@ -897,6 +1469,29 @@ fn inspector_overlay(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
                 ui.label("Out:");
                 ui.add(egui::DragValue::new(&mut v.t_out).range(0.0..=duration).speed(0.02).suffix("s"));
             });
+            ensure_overlay_kf_at_playhead_inspector(&mut v.layout, playhead);
+            let eps = 1.0e-3;
+            let kf_idx = v.layout.iter().position(|kf| (kf.t - playhead).abs() < eps).unwrap_or(0);
+            if let Some(kf) = v.layout.get_mut(kf_idx) {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("X:"); ui.add(egui::DragValue::new(&mut kf.value.pos[0]).speed(0.005));
+                    ui.label("Y:"); ui.add(egui::DragValue::new(&mut kf.value.pos[1]).speed(0.005));
+                });
+                ui.add(egui::Slider::new(&mut kf.value.scale, 0.05..=5.0).text("Scale").logarithmic(true));
+                ui.add(egui::Slider::new(&mut kf.value.scale_y, 0.1..=5.0).text("Stretch Y").logarithmic(true));
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Rotation").size(11.0));
+                    circular_rotation_widget(ui, ("vid_rot", i), &mut kf.value.rotation_deg, 80.0);
+                    ui.add(egui::DragValue::new(&mut kf.value.rotation_deg)
+                        .range(-3600.0..=3600.0).speed(0.5).suffix("\u{00B0}").fixed_decimals(1));
+                });
+                ui.add(egui::Slider::new(&mut kf.value.opacity, 0.0..=1.0).text("Opacity"));
+                ui.add(egui::Slider::new(&mut kf.value.flip_x_anim, -1.0..=1.0).text("Flip X"));
+                ui.add(egui::Slider::new(&mut kf.value.flip_y_anim, -1.0..=1.0).text("Flip Y"));
+            }
+            ui.add_space(8.0);
+            inspector_modifiers(ui, &mut v.modifiers, ("vid_mods", i));
         }
     }
 }
@@ -918,9 +1513,10 @@ enum TextAction {
 fn inspector_text_overlay(
     ui: &mut egui::Ui,
     t: &mut TextOverlay,
-    _idx: usize,
+    idx: usize,
     _total: usize,
     _duration: f32,
+    playhead: f32,
 ) -> Option<TextAction> {
     // Header (delete button removed — use Delete/Backspace shortcut or
     // right-click on the timeline clip).
@@ -940,25 +1536,25 @@ fn inspector_text_overlay(
     ui.add_space(8.0);
 
     // ─── Position / rotation / opacity (size is driven by font_size) ───
-    // Layer order, In/Out timing, ID and "Below actors" are deliberately not
-    // exposed here — they are determined by the timeline layer panel
-    // (track row position decides z-order & whether the text is rendered
-    // behind the actors; the in/out sliders on the clip itself control
-    // timing). Scale is gone too: font_size is the single source of truth
-    // for text size.
-    if let Some(kf) = t.layout.first_mut() {
+    // Inspector edits the keyframe at the playhead so the user can scrub
+    // and tweak per-frame values directly.
+    ensure_overlay_kf_at_playhead_inspector(&mut t.layout, playhead);
+    let eps = 1.0e-3;
+    let kf_idx = t.layout.iter().position(|kf| (kf.t - playhead).abs() < eps).unwrap_or(0);
+    if let Some(kf) = t.layout.get_mut(kf_idx) {
         ui.horizontal(|ui| {
             ui.label("X:"); ui.add(egui::DragValue::new(&mut kf.value.pos[0]).range(-2.0..=3.0).speed(0.005));
             ui.label("Y:"); ui.add(egui::DragValue::new(&mut kf.value.pos[1]).range(-2.0..=3.0).speed(0.005));
         });
-        ui.add(
-            egui::Slider::new(&mut kf.value.rotation_deg, -180.0..=180.0)
-                .text("Rotation")
-                .step_by(0.1)
-                .fixed_decimals(1)
-                .smart_aim(false),
-        );
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Rotation").size(11.0));
+            circular_rotation_widget(ui, ("text_rot", idx), &mut kf.value.rotation_deg, 80.0);
+            ui.add(egui::DragValue::new(&mut kf.value.rotation_deg)
+                .range(-3600.0..=3600.0).speed(0.5).suffix("\u{00B0}").fixed_decimals(1));
+        });
         ui.add(egui::Slider::new(&mut kf.value.opacity, 0.0..=1.0).text("Opacity"));
+        ui.add(egui::Slider::new(&mut kf.value.flip_x_anim, -1.0..=1.0).text("Flip X"));
+        ui.add(egui::Slider::new(&mut kf.value.flip_y_anim, -1.0..=1.0).text("Flip Y"));
     }
     ui.add_space(8.0);
 
@@ -1093,6 +1689,9 @@ fn inspector_text_overlay(
             }
         }
     });
+
+    ui.add_space(8.0);
+    inspector_modifiers(ui, &mut t.modifiers, ("text_mods", idx));
 
     // Layer/z-index actions are no longer exposed from the inspector — the
     // timeline track row order alone determines stacking.
@@ -1965,6 +2564,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                 state.undo.push(&state.scene);
                                 state.timeline_drag.dragging_clip = Some(ai);
                                 state.timeline_drag.pending_new_lane = None;
+                                state.timeline_drag.start_pointer_y = pointer_y;
                             }
 
                             // ── Resolve the destination track from the pointer's Y position ──
@@ -1973,7 +2573,23 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             // between the video and audio blocks, queues a
                             // "new lane on this side" intent that will be
                             // committed only when the drag ENDS.
-                            if let Some(py) = pointer_y {
+                            // Lane lock: if the pointer hasn't moved
+                            // vertically more than `LANE_LOCK_THRESHOLD`
+                            // pixels from the drag origin, freeze the
+                            // dragged clip on its current lane. This
+                            // kills the wobble where a horizontal drag
+                            // accidentally pops onto a neighbouring row.
+                            const LANE_LOCK_THRESHOLD: f32 = 14.0;
+                            let lane_locked = match (state.timeline_drag.start_pointer_y, pointer_y) {
+                                (Some(y0), Some(y1)) => (y1 - y0).abs() < LANE_LOCK_THRESHOLD,
+                                _ => false,
+                            };
+                            if lane_locked {
+                                // Skip lane reassignment entirely. Time
+                                // moves still apply (they came from
+                                // `total_dx` in draw_clip and are written
+                                // below in the same arm).
+                            } else if let Some(py) = pointer_y {
                                 let cur = state.actor_track_assignments.get(&ai).copied();
                                 match classify_pointer_y(py, cur) {
                                     DropIntent::ToVideoRow(idx) => {
@@ -2593,6 +3209,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     if !any_dragging {
         state.timeline_drag.dragging_clip = None;
         state.timeline_drag.pending_new_lane = None;
+        state.timeline_drag.start_pointer_y = None;
     }
 }
 
@@ -3009,34 +3626,65 @@ fn draw_clip_trim_handles(
     if bar_rect.width() < 8.0 {
         return;
     }
-    let dim = Color32::from_rgba_premultiplied(255, 255, 255, 50);
+    // Wider, higher-contrast handles than the legacy 3px slivers — the
+    // user feedback was that resize handles weren't discoverable. We
+    // also draw the classic two-bar grip glyph when the pointer is
+    // near so it's obvious the edge is interactive.
+    let handle_w = 5.0_f32;
+    let dim = Color32::from_rgba_premultiplied(255, 255, 255, 80);
     let hot = Color32::from_rgb(255, 255, 255);
+    let grip_col = Color32::from_rgb(20, 20, 30);
 
     // Left handle.
     let left = egui::Rect::from_min_max(
         bar_rect.min,
-        egui::pos2(bar_rect.min.x + 3.0, bar_rect.max.y),
+        egui::pos2(bar_rect.min.x + handle_w, bar_rect.max.y),
     );
-    painter.rect_filled(left, Rounding::same(1.5), if near_left { hot } else { dim });
+    painter.rect_filled(left, Rounding::same(2.0), if near_left { hot } else { dim });
     if near_left {
         painter.rect_stroke(
             left.expand2(Vec2::new(1.0, 0.0)),
-            Rounding::same(2.0),
+            Rounding::same(2.5),
             Stroke::new(1.0, Color32::BLACK),
+        );
+        // Two-bar grip glyph for the unambiguous "drag-edge" cursor.
+        let cy = left.center().y;
+        let g_x1 = left.center().x - 1.0;
+        let g_x2 = left.center().x + 1.0;
+        let g_h = (left.height() * 0.5).min(8.0);
+        painter.line_segment(
+            [egui::pos2(g_x1, cy - g_h * 0.5), egui::pos2(g_x1, cy + g_h * 0.5)],
+            Stroke::new(1.0, grip_col),
+        );
+        painter.line_segment(
+            [egui::pos2(g_x2, cy - g_h * 0.5), egui::pos2(g_x2, cy + g_h * 0.5)],
+            Stroke::new(1.0, grip_col),
         );
     }
 
     // Right handle.
     let right = egui::Rect::from_min_max(
-        egui::pos2(bar_rect.max.x - 3.0, bar_rect.min.y),
+        egui::pos2(bar_rect.max.x - handle_w, bar_rect.min.y),
         bar_rect.max,
     );
-    painter.rect_filled(right, Rounding::same(1.5), if near_right { hot } else { dim });
+    painter.rect_filled(right, Rounding::same(2.0), if near_right { hot } else { dim });
     if near_right {
         painter.rect_stroke(
             right.expand2(Vec2::new(1.0, 0.0)),
-            Rounding::same(2.0),
+            Rounding::same(2.5),
             Stroke::new(1.0, Color32::BLACK),
+        );
+        let cy = right.center().y;
+        let g_x1 = right.center().x - 1.0;
+        let g_x2 = right.center().x + 1.0;
+        let g_h = (right.height() * 0.5).min(8.0);
+        painter.line_segment(
+            [egui::pos2(g_x1, cy - g_h * 0.5), egui::pos2(g_x1, cy + g_h * 0.5)],
+            Stroke::new(1.0, grip_col),
+        );
+        painter.line_segment(
+            [egui::pos2(g_x2, cy - g_h * 0.5), egui::pos2(g_x2, cy + g_h * 0.5)],
+            Stroke::new(1.0, grip_col),
         );
     }
 }
@@ -3591,7 +4239,11 @@ pub fn add_text_overlay(state: &mut EditorState) -> usize {
             scale_y: 1.0,
             rotation_deg: 0.0,
             opacity: 1.0,
+            flip_x_anim: 1.0,
+            flip_y_anim: 1.0,
         })],
+        modifiers: Vec::new(),
+        skeleton_attachment: None,
         z_index: max_z + 1,
         behind_actors: false,
     });
@@ -3636,6 +4288,7 @@ pub(crate) fn add_actor_from_clip_at_time(state: &mut EditorState, path: &PathBu
         flip_horizontal: false,
         attachments: Vec::new(),
         skeleton_attachments: Vec::new(),
+        modifiers: Vec::new(),
         visible: true,
         color_correction: ColorCorrection::default(),
         transition_in: Transition::Cut,

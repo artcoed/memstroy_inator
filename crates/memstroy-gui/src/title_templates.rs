@@ -30,9 +30,9 @@ pub const TEMPLATES: &[TitleTemplate] = &[
             ..Default::default()
         },
         layout: |dur| vec![
-            Keyframe::new(0.0, OverlayState { pos: [0.5, 0.1], scale: 1.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 0.0 }),
-            Keyframe::new(0.2, OverlayState { pos: [0.5, 0.1], scale: 1.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 1.0 }),
-            Keyframe::new(dur, OverlayState { pos: [0.5, 0.1], scale: 1.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 1.0 }),
+            Keyframe::new(0.0, OverlayState { pos: [0.5, 0.1], scale: 1.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 0.0, flip_x_anim: 1.0, flip_y_anim: 1.0 }),
+            Keyframe::new(0.2, OverlayState { pos: [0.5, 0.1], scale: 1.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 1.0, flip_x_anim: 1.0, flip_y_anim: 1.0 }),
+            Keyframe::new(dur, OverlayState { pos: [0.5, 0.1], scale: 1.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 1.0, flip_x_anim: 1.0, flip_y_anim: 1.0 }),
         ],
     },
     TitleTemplate {
@@ -50,9 +50,9 @@ pub const TEMPLATES: &[TitleTemplate] = &[
             ..Default::default()
         },
         layout: |dur| vec![
-            Keyframe::new(0.0, OverlayState { pos: [0.5, 0.9], scale: 1.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 0.0 }),
-            Keyframe::new(0.2, OverlayState { pos: [0.5, 0.9], scale: 1.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 1.0 }),
-            Keyframe::new(dur, OverlayState { pos: [0.5, 0.9], scale: 1.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 1.0 }),
+            Keyframe::new(0.0, OverlayState { pos: [0.5, 0.9], scale: 1.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 0.0, flip_x_anim: 1.0, flip_y_anim: 1.0 }),
+            Keyframe::new(0.2, OverlayState { pos: [0.5, 0.9], scale: 1.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 1.0, flip_x_anim: 1.0, flip_y_anim: 1.0 }),
+            Keyframe::new(dur, OverlayState { pos: [0.5, 0.9], scale: 1.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 1.0, flip_x_anim: 1.0, flip_y_anim: 1.0 }),
         ],
     },
     TitleTemplate {
@@ -68,8 +68,8 @@ pub const TEMPLATES: &[TitleTemplate] = &[
             ..Default::default()
         },
         layout: |dur| vec![
-            Keyframe::new(0.0, OverlayState { pos: [0.5, 0.85], scale: 1.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 1.0 }),
-            Keyframe::new(dur, OverlayState { pos: [0.5, 0.85], scale: 1.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 1.0 }),
+            Keyframe::new(0.0, OverlayState { pos: [0.5, 0.85], scale: 1.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 1.0, flip_x_anim: 1.0, flip_y_anim: 1.0 }),
+            Keyframe::new(dur, OverlayState { pos: [0.5, 0.85], scale: 1.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 1.0, flip_x_anim: 1.0, flip_y_anim: 1.0 }),
         ],
     },
     TitleTemplate {
@@ -87,10 +87,10 @@ pub const TEMPLATES: &[TitleTemplate] = &[
             ..Default::default()
         },
         layout: |dur| vec![
-            Keyframe::new(0.0, OverlayState { pos: [0.5, 0.5], scale: 0.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 0.0 }),
-            Keyframe::new(0.15, OverlayState { pos: [0.5, 0.5], scale: 1.3, scale_y: 1.0, rotation_deg: 5.0, opacity: 1.0 }),
-            Keyframe::new(0.25, OverlayState { pos: [0.5, 0.5], scale: 1.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 1.0 }),
-            Keyframe::new(dur, OverlayState { pos: [0.5, 0.5], scale: 1.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 1.0 }),
+            Keyframe::new(0.0, OverlayState { pos: [0.5, 0.5], scale: 0.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 0.0, flip_x_anim: 1.0, flip_y_anim: 1.0 }),
+            Keyframe::new(0.15, OverlayState { pos: [0.5, 0.5], scale: 1.3, scale_y: 1.0, rotation_deg: 5.0, opacity: 1.0, flip_x_anim: 1.0, flip_y_anim: 1.0 }),
+            Keyframe::new(0.25, OverlayState { pos: [0.5, 0.5], scale: 1.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 1.0, flip_x_anim: 1.0, flip_y_anim: 1.0 }),
+            Keyframe::new(dur, OverlayState { pos: [0.5, 0.5], scale: 1.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 1.0, flip_x_anim: 1.0, flip_y_anim: 1.0 }),
         ],
     },
     TitleTemplate {
@@ -106,9 +106,9 @@ pub const TEMPLATES: &[TitleTemplate] = &[
             ..Default::default()
         },
         layout: |dur| vec![
-            Keyframe::new(0.0, OverlayState { pos: [0.5, 1.2], scale: 1.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 0.0 }),
-            Keyframe::new(0.4, OverlayState { pos: [0.5, 0.7], scale: 1.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 1.0 }),
-            Keyframe::new(dur, OverlayState { pos: [0.5, 0.7], scale: 1.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 1.0 }),
+            Keyframe::new(0.0, OverlayState { pos: [0.5, 1.2], scale: 1.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 0.0, flip_x_anim: 1.0, flip_y_anim: 1.0 }),
+            Keyframe::new(0.4, OverlayState { pos: [0.5, 0.7], scale: 1.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 1.0, flip_x_anim: 1.0, flip_y_anim: 1.0 }),
+            Keyframe::new(dur, OverlayState { pos: [0.5, 0.7], scale: 1.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 1.0, flip_x_anim: 1.0, flip_y_anim: 1.0 }),
         ],
     },
     TitleTemplate {
@@ -126,10 +126,10 @@ pub const TEMPLATES: &[TitleTemplate] = &[
             ..Default::default()
         },
         layout: |dur| vec![
-            Keyframe::new(0.0, OverlayState { pos: [0.5, 0.3], scale: 0.0, scale_y: 1.0, rotation_deg: -15.0, opacity: 0.0 }),
-            Keyframe::new(0.2, OverlayState { pos: [0.5, 0.3], scale: 1.2, scale_y: 1.0, rotation_deg: -8.0, opacity: 1.0 }),
-            Keyframe::new(0.4, OverlayState { pos: [0.5, 0.3], scale: 1.0, scale_y: 1.0, rotation_deg: -8.0, opacity: 1.0 }),
-            Keyframe::new(dur, OverlayState { pos: [0.5, 0.3], scale: 1.0, scale_y: 1.0, rotation_deg: -8.0, opacity: 1.0 }),
+            Keyframe::new(0.0, OverlayState { pos: [0.5, 0.3], scale: 0.0, scale_y: 1.0, rotation_deg: -15.0, opacity: 0.0, flip_x_anim: 1.0, flip_y_anim: 1.0 }),
+            Keyframe::new(0.2, OverlayState { pos: [0.5, 0.3], scale: 1.2, scale_y: 1.0, rotation_deg: -8.0, opacity: 1.0, flip_x_anim: 1.0, flip_y_anim: 1.0 }),
+            Keyframe::new(0.4, OverlayState { pos: [0.5, 0.3], scale: 1.0, scale_y: 1.0, rotation_deg: -8.0, opacity: 1.0, flip_x_anim: 1.0, flip_y_anim: 1.0 }),
+            Keyframe::new(dur, OverlayState { pos: [0.5, 0.3], scale: 1.0, scale_y: 1.0, rotation_deg: -8.0, opacity: 1.0, flip_x_anim: 1.0, flip_y_anim: 1.0 }),
         ],
     },
 ];
@@ -152,6 +152,8 @@ pub fn add_template_to_scene(
         t_out,
         style: (template.style)(),
         layout: (template.layout)(dur),
+        modifiers: Vec::new(),
+        skeleton_attachment: None,
         z_index: 100,
         behind_actors: false,
     });
