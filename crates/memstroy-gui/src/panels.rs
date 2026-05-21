@@ -388,26 +388,377 @@ fn inspector_actor_effects(ui: &mut egui::Ui, state: &mut EditorState, i: usize,
 
     ui.add_space(12.0);
 
-    // Color Correction
+    // Color Correction — pro-grade inspector.
     egui::CollapsingHeader::new(
         RichText::new("Color Correction").size(12.0).strong().color(Color32::from_rgb(200, 180, 255))
     ).default_open(true).show(ui, |ui| {
-        let cc = &mut state.scene.actors[i].color_correction;
-        ui.add(egui::Slider::new(&mut cc.brightness, -1.0..=1.0).text("Brightness"));
-        ui.add(egui::Slider::new(&mut cc.contrast, 0.0..=3.0).text("Contrast"));
-        ui.add(egui::Slider::new(&mut cc.saturation, 0.0..=3.0).text("Saturation"));
-        ui.add(egui::Slider::new(&mut cc.temperature, -1.0..=1.0).text("Temperature"));
-        ui.add_space(4.0);
-        if ui.small_button("Reset").clicked() {
-            let cc = &mut state.scene.actors[i].color_correction;
-            *cc = memstroy_core::ColorCorrection::default();
-        }
+        color_correction_inspector(ui, state, i);
     });
 
     ui.add_space(12.0);
 
     // Skeleton Attachments
     inspector_actor_skeleton_attachments(ui, state, i);
+}
+
+// ─── PROFESSIONAL COLOR CORRECTION INSPECTOR ─────────────────────────
+//
+// Three-tab grading panel:
+//   1. Basic — brightness / contrast / saturation / temperature sliders
+//      (the legacy quick-look controls).
+//   2. Wheels — Lift / Gamma / Gain colour wheels (DaVinci-style). Each wheel
+//      is a 2D pad mapped to per-RGB channel offsets. A separate slider on
+//      the right of every wheel controls the master amount applied to all
+//      three channels uniformly.
+//   3. Curves — Master + R / G / B tone curves with click-to-add and
+//      drag-to-move control points; right-click removes intermediate points.
+//
+// All three tabs feed into the same `ColorCorrection` struct and the apply
+// pipeline is shared with the export path (see `apply_effects_cpu`).
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum CcTab {
+    #[default]
+    Basic,
+    Wheels,
+    Curves,
+}
+
+fn color_correction_inspector(ui: &mut egui::Ui, state: &mut EditorState, actor_idx: usize) {
+    // Persist the active tab inside egui's per-id memory so it survives
+    // selection switches without polluting EditorState.
+    let tab_id = ui.id().with(("cc_tab", actor_idx));
+    let mut tab: CcTab = ui.data_mut(|d| *d.get_temp_mut_or_default::<CcTab>(tab_id));
+
+    ui.horizontal(|ui| {
+        if ui
+            .selectable_label(tab == CcTab::Basic, RichText::new("Basic").size(11.0))
+            .clicked()
+        {
+            tab = CcTab::Basic;
+        }
+        if ui
+            .selectable_label(tab == CcTab::Wheels, RichText::new("Wheels").size(11.0))
+            .clicked()
+        {
+            tab = CcTab::Wheels;
+        }
+        if ui
+            .selectable_label(tab == CcTab::Curves, RichText::new("Curves").size(11.0))
+            .clicked()
+        {
+            tab = CcTab::Curves;
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.small_button("Reset all").clicked() {
+                state.scene.actors[actor_idx].color_correction =
+                    memstroy_core::ColorCorrection::default();
+            }
+        });
+    });
+    ui.data_mut(|d| d.insert_temp(tab_id, tab));
+    ui.add_space(4.0);
+
+    let cc = &mut state.scene.actors[actor_idx].color_correction;
+    match tab {
+        CcTab::Basic => {
+            ui.add(egui::Slider::new(&mut cc.brightness, -1.0..=1.0).text("Brightness"));
+            ui.add(egui::Slider::new(&mut cc.contrast, 0.0..=3.0).text("Contrast"));
+            ui.add(egui::Slider::new(&mut cc.saturation, 0.0..=3.0).text("Saturation"));
+            ui.add(egui::Slider::new(&mut cc.temperature, -1.0..=1.0).text("Temperature"));
+        }
+        CcTab::Wheels => {
+            // Lift wheel: neutral 0, range ±0.5
+            color_wheel_widget(ui, "Lift",  &mut cc.lift,  [0.0; 3], 0.5, -0.5..=0.5);
+            ui.add_space(6.0);
+            color_wheel_widget(ui, "Gamma", &mut cc.gamma, [1.0; 3], 1.0,  0.2..=4.0);
+            ui.add_space(6.0);
+            color_wheel_widget(ui, "Gain",  &mut cc.gain,  [1.0; 3], 1.0,  0.0..=4.0);
+        }
+        CcTab::Curves => {
+            curve_editor_widget(ui, "Master", &mut cc.curves.master, Color32::from_rgb(220, 220, 220));
+            ui.add_space(4.0);
+            curve_editor_widget(ui, "Red",    &mut cc.curves.red,    Color32::from_rgb(255, 100, 100));
+            ui.add_space(4.0);
+            curve_editor_widget(ui, "Green",  &mut cc.curves.green,  Color32::from_rgb(100, 220, 120));
+            ui.add_space(4.0);
+            curve_editor_widget(ui, "Blue",   &mut cc.curves.blue,   Color32::from_rgb(100, 160, 255));
+            ui.add_space(2.0);
+            ui.label(RichText::new("Click empty area: add point  •  Drag: move  •  Right-click: remove")
+                .size(9.0).color(COL_TEXT_DIM));
+        }
+    }
+}
+
+/// DaVinci-style colour wheel:
+///   - 2D pad whose XY position maps to per-RGB channel deltas through a
+///     hexagonal RGB layout (R at 0°, G at 120°, B at 240°). The inverse
+///     mapping uses unit vectors (cos θ, sin θ) along each primary so a pure
+///     direction along R lifts only the red channel, etc.
+///   - A vertical slider on the right that nudges the *master* value (uniform
+///     RGB shift), with reasonable clamps so the channels stay in their
+///     valid range.
+///   - Double-click on the wheel: snap back to neutral.
+fn color_wheel_widget(
+    ui: &mut egui::Ui,
+    label: &str,
+    rgb: &mut [f32; 3],
+    neutral: [f32; 3],
+    half_extent: f32,
+    master_range: std::ops::RangeInclusive<f32>,
+) {
+    ui.label(RichText::new(label).size(11.0).strong().color(COL_TEXT));
+    ui.horizontal(|ui| {
+        let size = 110.0_f32;
+        let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), Sense::click_and_drag());
+        let painter = ui.painter_at(rect);
+
+        let center = rect.center();
+        let radius = size * 0.46;
+
+        // Hue ring background.
+        let segments = 60;
+        for k in 0..segments {
+            let a0 = (k as f32) / (segments as f32) * std::f32::consts::TAU;
+            let a1 = ((k + 1) as f32) / (segments as f32) * std::f32::consts::TAU;
+            let mid = (a0 + a1) * 0.5;
+            let hue = mid / std::f32::consts::TAU;
+            let col = hsv_to_color32(hue, 0.85, 1.0);
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    center,
+                    center + Vec2::new(a0.cos() * radius, a0.sin() * radius),
+                    center + Vec2::new(a1.cos() * radius, a1.sin() * radius),
+                ],
+                col,
+                Stroke::NONE,
+            ));
+        }
+        // Inner neutral disk (so the centre reads "no tint").
+        painter.circle_filled(center, radius * 0.40, Color32::from_rgb(40, 40, 50));
+        painter.circle_stroke(center, radius, Stroke::new(1.0, Color32::from_rgb(70, 70, 90)));
+
+        // Locate the marker from the current rgb values.
+        let dr = rgb[0] - neutral[0];
+        let dg = rgb[1] - neutral[1];
+        let db = rgb[2] - neutral[2];
+        // Inverse of the per-axis projection used in the drag handler.
+        // Each primary contributes its own unit vector at 0° / 120° / 240°.
+        let mx = (dr * 1.0 + dg * (-0.5) + db * (-0.5)) / half_extent.max(1e-4) * radius;
+        let my = -(dr * 0.0 + dg * 0.866 + db * (-0.866)) / half_extent.max(1e-4) * radius;
+        let marker = center + Vec2::new(mx.clamp(-radius, radius), my.clamp(-radius, radius));
+        painter.circle_filled(marker, 5.0, Color32::WHITE);
+        painter.circle_stroke(marker, 5.5, Stroke::new(1.5, Color32::BLACK));
+
+        // Drag handler: project pointer onto the wheel and reverse-map to RGB.
+        if resp.dragged() || resp.clicked() {
+            if let Some(pos) = resp.interact_pointer_pos() {
+                let mut delta = pos - center;
+                let dist = delta.length();
+                if dist > radius {
+                    delta *= radius / dist;
+                }
+                let dx = delta.x / radius;
+                let dy = -delta.y / radius;
+                let r_amt = dx * 1.0 + dy * 0.0;
+                let g_amt = dx * (-0.5) + dy * 0.866;
+                let b_amt = dx * (-0.5) + dy * (-0.866);
+                rgb[0] = neutral[0] + r_amt * half_extent;
+                rgb[1] = neutral[1] + g_amt * half_extent;
+                rgb[2] = neutral[2] + b_amt * half_extent;
+            }
+        }
+        if resp.double_clicked() {
+            *rgb = neutral;
+        }
+
+        ui.add_space(8.0);
+
+        // Master slider — uniform RGB nudge. Compute the current "master"
+        // value from the average of the three channels so the slider stays
+        // in sync when the user uses the wheel.
+        ui.vertical(|ui| {
+            let mut master = (rgb[0] + rgb[1] + rgb[2]) / 3.0;
+            ui.label(RichText::new("Master").size(10.0).color(COL_TEXT_DIM));
+            let resp = ui.add(
+                egui::Slider::new(&mut master, master_range.clone())
+                    .show_value(true)
+                    .vertical()
+                    .step_by(0.001),
+            );
+            if resp.changed() {
+                let avg = (rgb[0] + rgb[1] + rgb[2]) / 3.0;
+                let delta = master - avg;
+                rgb[0] += delta;
+                rgb[1] += delta;
+                rgb[2] += delta;
+            }
+            ui.label(RichText::new(format!("R {:.2}", rgb[0])).size(9.0).color(Color32::from_rgb(255, 120, 120)));
+            ui.label(RichText::new(format!("G {:.2}", rgb[1])).size(9.0).color(Color32::from_rgb(120, 220, 130)));
+            ui.label(RichText::new(format!("B {:.2}", rgb[2])).size(9.0).color(Color32::from_rgb(120, 170, 255)));
+            if ui.small_button("Reset").clicked() {
+                *rgb = neutral;
+            }
+        });
+    });
+}
+
+/// Editable tone-curve widget. Click an empty area to add a point, drag a
+/// point to move it, right-click a point to delete it (endpoints stay
+/// permanent and only move vertically). A diagonal reference is drawn behind
+/// the curve so deviations from identity are easy to read.
+fn curve_editor_widget(
+    ui: &mut egui::Ui,
+    label: &str,
+    points: &mut Vec<[f32; 2]>,
+    line_color: Color32,
+) {
+    ui.label(RichText::new(label).size(10.0).color(COL_TEXT));
+    let size = Vec2::new(ui.available_width().min(220.0), 110.0);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click_and_drag());
+    let painter = ui.painter_at(rect);
+
+    painter.rect_filled(rect, Rounding::same(2.0), Color32::from_rgb(20, 20, 28));
+    for k in 1..4 {
+        let f = k as f32 / 4.0;
+        let x = rect.min.x + rect.width() * f;
+        let y = rect.min.y + rect.height() * f;
+        painter.line_segment(
+            [egui::pos2(x, rect.min.y), egui::pos2(x, rect.max.y)],
+            Stroke::new(0.5, Color32::from_rgb(45, 45, 60)),
+        );
+        painter.line_segment(
+            [egui::pos2(rect.min.x, y), egui::pos2(rect.max.x, y)],
+            Stroke::new(0.5, Color32::from_rgb(45, 45, 60)),
+        );
+    }
+    // Diagonal identity reference.
+    painter.line_segment(
+        [egui::pos2(rect.min.x, rect.max.y), egui::pos2(rect.max.x, rect.min.y)],
+        Stroke::new(0.7, Color32::from_rgb(60, 60, 80)),
+    );
+
+    // Always keep the endpoints sorted at the front/back. The widget treats
+    // the first and last points as fixed-x endpoints; intermediate points
+    // are sorted by x so insertions stay valid.
+    points.sort_by(|a, b| a[0].partial_cmp(&b[0]).unwrap_or(std::cmp::Ordering::Equal));
+
+    let to_screen = |p: [f32; 2]| -> egui::Pos2 {
+        egui::pos2(
+            rect.min.x + p[0].clamp(0.0, 1.0) * rect.width(),
+            rect.max.y - p[1].clamp(0.0, 1.0) * rect.height(),
+        )
+    };
+    let from_screen = |p: egui::Pos2| -> [f32; 2] {
+        [
+            ((p.x - rect.min.x) / rect.width().max(1.0)).clamp(0.0, 1.0),
+            (1.0 - (p.y - rect.min.y) / rect.height().max(1.0)).clamp(0.0, 1.0),
+        ]
+    };
+
+    // Drag id stashes the index of the point currently grabbed.
+    let drag_id = ui.id().with(("curve_drag_idx", label));
+
+    if resp.drag_started() {
+        if let Some(pos) = resp.interact_pointer_pos() {
+            let mut hit: Option<usize> = None;
+            for (k, &p) in points.iter().enumerate() {
+                if (to_screen(p) - pos).length() < 8.0 {
+                    hit = Some(k);
+                    break;
+                }
+            }
+            let idx = if let Some(k) = hit {
+                k
+            } else {
+                let np = from_screen(pos);
+                points.push(np);
+                points.sort_by(|a, b| a[0].partial_cmp(&b[0]).unwrap_or(std::cmp::Ordering::Equal));
+                points
+                    .iter()
+                    .position(|p| (p[0] - np[0]).abs() < 1e-4 && (p[1] - np[1]).abs() < 1e-4)
+                    .unwrap_or(0)
+            };
+            ui.data_mut(|d| d.insert_temp(drag_id, idx));
+        }
+    }
+
+    if resp.dragged() {
+        if let Some(pos) = resp.interact_pointer_pos() {
+            let idx: Option<usize> = ui.data(|d| d.get_temp(drag_id));
+            if let Some(idx) = idx {
+                if idx < points.len() {
+                    let np = from_screen(pos);
+                    let last = points.len() - 1;
+                    let is_endpoint = idx == 0 || idx == last;
+                    if is_endpoint {
+                        points[idx][1] = np[1];
+                    } else {
+                        let xmin = points[idx - 1][0] + 0.001;
+                        let xmax = points[idx + 1][0] - 0.001;
+                        points[idx][0] = np[0].clamp(xmin, xmax);
+                        points[idx][1] = np[1];
+                    }
+                }
+            }
+        }
+    }
+
+    // Right-click removes an intermediate point (endpoints are sticky).
+    if resp.secondary_clicked() {
+        if let Some(pos) = resp.interact_pointer_pos() {
+            let mut to_remove: Option<usize> = None;
+            for (k, &p) in points.iter().enumerate() {
+                if (to_screen(p) - pos).length() < 8.0 && k != 0 && k != points.len() - 1 {
+                    to_remove = Some(k);
+                    break;
+                }
+            }
+            if let Some(k) = to_remove {
+                points.remove(k);
+            }
+        }
+    }
+
+    // Render the curve with a denser sampling so tone-curve LUT changes
+    // (256 entries) stay smooth in the inspector preview.
+    let mut samples: Vec<egui::Pos2> = Vec::with_capacity(64);
+    for i in 0..=63 {
+        let x = i as f32 / 63.0;
+        let y = memstroy_core::ToneCurves::sample(points, x);
+        samples.push(to_screen([x, y]));
+    }
+    painter.add(egui::Shape::line(samples, Stroke::new(1.5, line_color)));
+
+    for &p in points.iter() {
+        let sp = to_screen(p);
+        painter.circle_filled(sp, 4.0, line_color);
+        painter.circle_stroke(sp, 4.0, Stroke::new(1.0, Color32::BLACK));
+    }
+}
+
+/// Convert `(hue, saturation, value)` (each in 0..1) to an `egui::Color32`.
+/// Only used by the colour-wheel widget to paint its hue ring.
+fn hsv_to_color32(h: f32, s: f32, v: f32) -> Color32 {
+    let h = h.fract();
+    let i = (h * 6.0).floor() as i32;
+    let f = h * 6.0 - i as f32;
+    let p = v * (1.0 - s);
+    let q = v * (1.0 - f * s);
+    let t = v * (1.0 - (1.0 - f) * s);
+    let (r, g, b) = match i.rem_euclid(6) {
+        0 => (v, t, p),
+        1 => (q, v, p),
+        2 => (p, v, t),
+        3 => (p, q, v),
+        4 => (t, p, v),
+        _ => (v, p, q),
+    };
+    Color32::from_rgb(
+        (r * 255.0).round() as u8,
+        (g * 255.0).round() as u8,
+        (b * 255.0).round() as u8,
+    )
 }
 
 fn inspector_actor_skeleton_attachments(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
@@ -1141,6 +1492,15 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
 
     let track_left = ruler_rect.min.x + header_width + 2.0;
     let track_right = track_left + track_area_width;
+
+    // ── Viewport time range (used to cull off-screen clips before any
+    // per-clip work runs). Note `pps == timeline_zoom` and we already
+    // guard against zero in the wheel handlers above. A small slack of
+    // half a pixel either side keeps clips that are touching the edge
+    // visible while scrolling.
+    let viewport_t_min = state.timeline_scroll - 0.5 / pps.max(1.0);
+    let viewport_t_max = state.timeline_scroll + track_area_width / pps.max(1.0) + 0.5 / pps.max(1.0);
+    let in_viewport = |a: f32, b: f32| -> bool { b >= viewport_t_min && a <= viewport_t_max };
     let ruler_track_rect = egui::Rect::from_min_max(
         egui::pos2(track_left, ruler_rect.min.y),
         egui::pos2(track_right, ruler_rect.max.y),
@@ -1435,13 +1795,33 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                         let bg_elem = &state.scene.backgrounds[bi];
                         let clip_start = bg_elem.start;
                         let clip_end = bg_elem.start + bg_elem.duration;
+                        // Cull off-screen background clips before any
+                        // per-clip allocation / interaction work.
+                        if !in_viewport(clip_start, clip_end) { continue; }
                         let sel = state.selection == Selection::Background(bi);
                         let bg_id = egui::Id::new(("timeline_clip", "background", bi));
                         if let Some(clicked) = draw_clip(ui, painter, content_rect, &bg_elem.id, bg_id,
                             clip_start, clip_end, state.timeline_scroll, pps, track_left, track_right,
                             COL_CLIP_BG, sel, track_h, track_locked, state.split_tool_active)
                         {
-                            if clicked < 0.0 {
+                            if clicked == f32::INFINITY {
+                                // Trim left: pull the start forward, keep the
+                                // end fixed (Premiere "ripple-trim from in").
+                                let dx = ui.input(|i| i.pointer.delta().x);
+                                let delta_t = dx / pps;
+                                let new_start = (clip_start + delta_t).max(0.0).min(clip_end - 0.1);
+                                let new_dur = (clip_end - new_start).max(0.1);
+                                state.scene.backgrounds[bi].start = new_start;
+                                state.scene.backgrounds[bi].duration = new_dur;
+                                to_select = Some(Selection::Background(bi));
+                            } else if clicked == f32::NEG_INFINITY {
+                                // Trim right: stretch / shrink the duration.
+                                let dx = ui.input(|i| i.pointer.delta().x);
+                                let delta_t = dx / pps;
+                                let new_dur = (clip_end - clip_start + delta_t).max(0.1);
+                                state.scene.backgrounds[bi].duration = new_dur;
+                                to_select = Some(Selection::Background(bi));
+                            } else if clicked < 0.0 {
                                 let new_start = (-clicked).max(0.0);
                                 let dur = clip_end - clip_start;
                                 state.scene.backgrounds[bi].start = new_start;
@@ -1477,6 +1857,12 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                     let actor = &state.scene.actors[ai];
                     let clip_start = actor.t_in.unwrap_or(0.0);
                     let clip_end = actor.t_out.unwrap_or(duration);
+                    // Cull off-screen actor clips. The `draw_clip` call
+                    // would early-return None anyway, but we can avoid all
+                    // the surrounding bookkeeping (transition indicator,
+                    // keyframe diamond, snapshot of layout, etc.) by
+                    // skipping the iteration outright.
+                    if !in_viewport(clip_start, clip_end) { continue; }
                     let trans_in = actor.transition_in;
                     let trans_out = actor.transition_out;
                     let trans_dur = actor.transition_duration;
@@ -1642,6 +2028,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                         Overlay::Image(im) => (im.t_in, im.t_out, format!("I: {}", im.id)),
                         Overlay::Video(v) => (v.t_in, v.t_out, format!("V: {}", v.id)),
                     };
+                    if !in_viewport(clip_start, clip_end) { continue; }
                     let sel = state.selection == Selection::Overlay(oi);
                     let ov_id = egui::Id::new(("timeline_clip", "overlay", oi));
                     if let Some(clicked) = draw_clip(ui, painter, content_rect, &label, ov_id,
@@ -1744,6 +2131,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                     let audio = &state.scene.audio[aui];
                     let clip_start = audio.t_in;
                     let clip_end = audio.t_out.unwrap_or(duration);
+                    if !in_viewport(clip_start, clip_end) { continue; }
                     let sel = state.selection == Selection::Audio(aui);
                     let audio_id = egui::Id::new(("timeline_clip", "audio", aui));
                     if let Some(clicked) = draw_audio_clip(ui, painter, content_rect, &audio.id, audio_id,
@@ -1751,7 +2139,27 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                         sel, track_h, track_locked, state.split_tool_active,
                         state.audio_waveforms.get(aui))
                     {
-                        if clicked < 0.0 {
+                        if clicked == f32::INFINITY {
+                            // Trim left: walk t_in forward and bump
+                            // source_start by the same delta so the playback
+                            // offset stays consistent (the audio doesn't
+                            // appear to skip ahead under the user's hand).
+                            let dx = ui.input(|i| i.pointer.delta().x);
+                            let delta_t = dx / pps;
+                            let new_in = (clip_start + delta_t).max(0.0).min(clip_end - 0.1);
+                            let actual_delta = new_in - clip_start;
+                            state.scene.audio[aui].t_in = new_in;
+                            state.scene.audio[aui].source_start =
+                                (state.scene.audio[aui].source_start + actual_delta).max(0.0);
+                            to_select = Some(Selection::Audio(aui));
+                        } else if clicked == f32::NEG_INFINITY {
+                            // Trim right: extend / shrink the audible window.
+                            let dx = ui.input(|i| i.pointer.delta().x);
+                            let delta_t = dx / pps;
+                            let new_out = (clip_end + delta_t).max(clip_start + 0.1);
+                            state.scene.audio[aui].t_out = Some(new_out);
+                            to_select = Some(Selection::Audio(aui));
+                        } else if clicked < 0.0 {
                             // Drag: move the audio clip horizontally.
                             let new_start = (-clicked).max(0.0);
                             let dur = clip_end - clip_start;
@@ -1778,8 +2186,10 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                     _ => {}
                                 }
                             }
+                            to_select = Some(Selection::Audio(aui));
+                        } else {
+                            to_select = Some(Selection::Audio(aui));
                         }
-                        to_select = Some(Selection::Audio(aui));
                     }
                 }
             }
@@ -2388,6 +2798,16 @@ fn draw_clip(
         }
     }
 
+    // ── Visual trim handles ──
+    //
+    // Two slim white bars at the very left/right edges so the user can see
+    // where to grab to change the clip's duration. Highlighted when the
+    // pointer is near, dim when not, hidden when the bar is locked or in
+    // split mode (cosmetic; the hit-test is still active).
+    if !locked && !split_mode {
+        draw_clip_trim_handles(painter, bar_rect, near_left_edge, near_right_edge);
+    }
+
     if resp.clicked() {
         if split_mode {
             if let Some(pos) = resp.interact_pointer_pos() {
@@ -2462,6 +2882,53 @@ fn draw_clip(
 }
 
 
+/// Paint the two slim trim handles on the leading and trailing edge of a
+/// timeline clip bar. Highlighted when the pointer is currently near the
+/// corresponding edge so users get the same affordance Premiere/Resolve
+/// give them. Called for actors / overlays / backgrounds / audio — any
+/// row whose duration can be stretched on the timeline.
+fn draw_clip_trim_handles(
+    painter: &egui::Painter,
+    bar_rect: egui::Rect,
+    near_left: bool,
+    near_right: bool,
+) {
+    if bar_rect.width() < 8.0 {
+        return;
+    }
+    let dim = Color32::from_rgba_premultiplied(255, 255, 255, 50);
+    let hot = Color32::from_rgb(255, 255, 255);
+
+    // Left handle.
+    let left = egui::Rect::from_min_max(
+        bar_rect.min,
+        egui::pos2(bar_rect.min.x + 3.0, bar_rect.max.y),
+    );
+    painter.rect_filled(left, Rounding::same(1.5), if near_left { hot } else { dim });
+    if near_left {
+        painter.rect_stroke(
+            left.expand2(Vec2::new(1.0, 0.0)),
+            Rounding::same(2.0),
+            Stroke::new(1.0, Color32::BLACK),
+        );
+    }
+
+    // Right handle.
+    let right = egui::Rect::from_min_max(
+        egui::pos2(bar_rect.max.x - 3.0, bar_rect.min.y),
+        bar_rect.max,
+    );
+    painter.rect_filled(right, Rounding::same(1.5), if near_right { hot } else { dim });
+    if near_right {
+        painter.rect_stroke(
+            right.expand2(Vec2::new(1.0, 0.0)),
+            Rounding::same(2.0),
+            Stroke::new(1.0, Color32::BLACK),
+        );
+    }
+}
+
+
 /// Draw an audio clip with waveform visualization.
 #[allow(clippy::too_many_arguments)]
 fn draw_audio_clip(
@@ -2509,16 +2976,31 @@ fn draw_audio_clip(
             let num_samples = (bar_w as usize).min(wf.peaks.len());
 
             if num_samples > 1 {
+                // Draw the waveform as a single batched mesh instead of one
+                // `line_segment` per sample. With long clips this is the
+                // difference between thousands of independent shapes
+                // (re-tessellated every frame) and a single GPU mesh that
+                // egui can blast through in one call.
+                use egui::epaint::{Mesh, Vertex, WHITE_UV};
+                let color = Color32::from_rgba_premultiplied(255, 255, 255, 120);
                 let step = wf.peaks.len() as f32 / num_samples as f32;
+                let bar_pixel_w = (bar_w / num_samples as f32).max(1.0);
+                let mut mesh = Mesh::default();
+                mesh.vertices.reserve(num_samples * 4);
+                mesh.indices.reserve(num_samples * 6);
                 for i in 0..num_samples {
                     let sample_idx = (i as f32 * step) as usize;
                     let peak = wf.peaks.get(sample_idx).copied().unwrap_or(0.0);
                     let h = peak * bar_h * 0.4;
                     let x = bar_rect.min.x + (i as f32 / num_samples as f32) * bar_w;
-                    painter.line_segment(
-                        [egui::pos2(x, center_y - h), egui::pos2(x, center_y + h)],
-                        Stroke::new(1.0, Color32::from_rgba_premultiplied(255, 255, 255, 120)));
+                    let i0 = mesh.vertices.len() as u32;
+                    mesh.vertices.push(Vertex { pos: egui::pos2(x, center_y - h), uv: WHITE_UV, color });
+                    mesh.vertices.push(Vertex { pos: egui::pos2(x + bar_pixel_w, center_y - h), uv: WHITE_UV, color });
+                    mesh.vertices.push(Vertex { pos: egui::pos2(x + bar_pixel_w, center_y + h), uv: WHITE_UV, color });
+                    mesh.vertices.push(Vertex { pos: egui::pos2(x, center_y + h), uv: WHITE_UV, color });
+                    mesh.indices.extend_from_slice(&[i0, i0 + 1, i0 + 2, i0, i0 + 2, i0 + 3]);
                 }
+                painter.add(egui::Shape::Mesh(mesh));
             }
         } else if wf.extracting {
             // Show "loading" state
@@ -2551,19 +3033,33 @@ fn draw_audio_clip(
     // Interaction.
     //
     // Same stable-id + press-origin strategy as `draw_clip` — see the
-    // comment there for the rationale. Audio clips currently support only
-    // whole-clip move (no edge-trim) but use the same machinery so that
-    // future trim support is a one-liner.
+    // comment there for the rationale. Audio clips support edge-trim
+    // (left = adjust t_in + source_start, right = adjust t_out) plus
+    // whole-clip move, mirroring video-clip behaviour.
     let id = clip_id;
     let sense = if locked { Sense::hover() } else { Sense::click_and_drag() };
     let resp = ui.interact(bar_rect, id, sense);
 
+    let hover_pos = ui.input(|i| i.pointer.hover_pos());
+    let near_left_edge = hover_pos.map(|p| (p.x - bar_rect.min.x).abs() < 5.0).unwrap_or(false);
+    let near_right_edge = hover_pos.map(|p| (p.x - bar_rect.max.x).abs() < 5.0).unwrap_or(false);
+
     if resp.hovered() && !locked {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+        if near_left_edge || near_right_edge {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+        } else {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+        }
+    }
+
+    // Trim affordance bars on the audio clip's edges.
+    if !locked {
+        draw_clip_trim_handles(painter, bar_rect, near_left_edge, near_right_edge);
     }
 
     if resp.clicked() { return Some(clip_start); }
 
+    let mode_id = id.with("drag_mode");
     let origin_id = id.with("press_origin_x");
     let original_start_id = id.with("original_start");
 
@@ -2572,22 +3068,37 @@ fn draw_audio_clip(
             .input(|i| i.pointer.press_origin())
             .map(|p| p.x)
             .unwrap_or(bar_rect.center().x);
+        let mode = if (press_x - bar_rect.min.x).abs() < 6.0 {
+            ClipDragMode::TrimLeft
+        } else if (press_x - bar_rect.max.x).abs() < 6.0 {
+            ClipDragMode::TrimRight
+        } else {
+            ClipDragMode::Move
+        };
         ui.data_mut(|d| {
+            d.insert_temp(mode_id, mode);
             d.insert_temp(origin_id, press_x);
             d.insert_temp(original_start_id, clip_start);
         });
     }
 
     if resp.dragged() && !locked {
+        let mode: Option<ClipDragMode> = ui.data(|d| d.get_temp(mode_id));
         let press_x: Option<f32> = ui.data(|d| d.get_temp(origin_id));
         let original_start: Option<f32> = ui.data(|d| d.get_temp(original_start_id));
         let cur_x = ui
             .input(|i| i.pointer.interact_pos().or_else(|| i.pointer.hover_pos()))
             .map(|p| p.x);
 
-        if let (Some(px), Some(os), Some(cx)) = (press_x, original_start, cur_x) {
+        if let (Some(mode), Some(px), Some(os), Some(cx)) =
+            (mode, press_x, original_start, cur_x)
+        {
             let total_dt = (cx - px) / pps;
-            return Some(-(os + total_dt));
+            return match mode {
+                ClipDragMode::TrimLeft => Some(f32::INFINITY),
+                ClipDragMode::TrimRight => Some(f32::NEG_INFINITY),
+                ClipDragMode::Move => Some(-(os + total_dt)),
+            };
         }
         return Some(clip_start);
     }

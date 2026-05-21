@@ -509,6 +509,17 @@ fn hash_effect_params(
     bits(cc.contrast).hash(&mut h);
     bits(cc.saturation).hash(&mut h);
     bits(cc.temperature).hash(&mut h);
+    // Pro grade controls.
+    for v in cc.lift.iter().chain(cc.gamma.iter()).chain(cc.gain.iter()) {
+        bits(*v).hash(&mut h);
+    }
+    for curve in [&cc.curves.master, &cc.curves.red, &cc.curves.green, &cc.curves.blue] {
+        (curve.len() as u32).hash(&mut h);
+        for p in curve {
+            bits(p[0]).hash(&mut h);
+            bits(p[1]).hash(&mut h);
+        }
+    }
     h.finish()
 }
 
@@ -549,6 +560,15 @@ pub fn downscale_for_preview(img: &ColorImage, max_dim: usize) -> ColorImage {
 /// CPU implementation of the chroma-key + colour-correction pipeline.
 /// Mirrors what the live `apply_preview_effects` did but lives on the cache so
 /// the result can be reused across repaints.
+///
+/// Pipeline order (per pixel):
+///   1. chromakey + spill suppression
+///   2. legacy brightness / contrast / saturation / temperature
+///   3. lift → gain → gamma per RGB channel (DaVinci-style)
+///   4. master curve, then per-channel curves (R / G / B)
+///
+/// To keep this fast on full-HD frames the four tone curves are pre-baked
+/// into 256-entry LUTs once per call instead of re-sampled per pixel.
 pub fn apply_effects_cpu(
     img: &ColorImage,
     ck: &memstroy_core::ChromaKeyParams,
@@ -563,6 +583,30 @@ pub fn apply_effects_cpu(
     let spill = ck.spill.clamp(0.0, 1.0);
     let threshold = similarity * 441.0;
     let blend_range = (blend * 200.0).max(0.01);
+
+    // Pre-bake tone curves into LUTs for cache-friendly per-pixel lookup.
+    let lut_master = build_curve_lut(&cc.curves.master);
+    let lut_r = build_curve_lut(&cc.curves.red);
+    let lut_g = build_curve_lut(&cc.curves.green);
+    let lut_b = build_curve_lut(&cc.curves.blue);
+    let curves_active = !cc.curves.is_identity();
+
+    // Pre-clamp the LGG parameters so degenerate values (e.g. gamma = 0)
+    // can't blow up the per-pixel pow().
+    let gain = [
+        cc.gain[0].max(0.0),
+        cc.gain[1].max(0.0),
+        cc.gain[2].max(0.0),
+    ];
+    let inv_gamma = [
+        1.0 / cc.gamma[0].max(0.05),
+        1.0 / cc.gamma[1].max(0.05),
+        1.0 / cc.gamma[2].max(0.05),
+    ];
+    let lift = cc.lift;
+    let lgg_active = lift.iter().any(|v| v.abs() > 1e-4)
+        || gain.iter().any(|v| (v - 1.0).abs() > 1e-4)
+        || inv_gamma.iter().any(|v| (v - 1.0).abs() > 1e-4);
 
     for (i, pixel) in img.pixels.iter().enumerate() {
         let r = pixel.r() as f32;
@@ -600,8 +644,54 @@ pub fn apply_effects_cpu(
             ob  = (ob  - cc.temperature * 30.0).clamp(0.0, 255.0);
         }
 
+        // ── DaVinci-style lift / gain / gamma per channel ──
+        // Work in normalised 0..1 space and apply:
+        //   out = pow((in + lift*(1-in)) * gain, 1/gamma)
+        // which means lift pushes shadows up, gain scales highlights, and
+        // gamma reshapes midtones — each independently per RGB channel.
+        if lgg_active {
+            let mut nr = or_ / 255.0;
+            let mut ng = og / 255.0;
+            let mut nb = ob / 255.0;
+            nr = nr + lift[0] * (1.0 - nr);
+            ng = ng + lift[1] * (1.0 - ng);
+            nb = nb + lift[2] * (1.0 - nb);
+            nr = (nr * gain[0]).max(0.0);
+            ng = (ng * gain[1]).max(0.0);
+            nb = (nb * gain[2]).max(0.0);
+            nr = nr.powf(inv_gamma[0]);
+            ng = ng.powf(inv_gamma[1]);
+            nb = nb.powf(inv_gamma[2]);
+            or_ = (nr * 255.0).clamp(0.0, 255.0);
+            og  = (ng * 255.0).clamp(0.0, 255.0);
+            ob  = (nb * 255.0).clamp(0.0, 255.0);
+        }
+
+        // ── Tone curves: master first, then per-channel ──
+        if curves_active {
+            or_ = lut_master[or_ as usize] as f32;
+            og  = lut_master[og  as usize] as f32;
+            ob  = lut_master[ob  as usize] as f32;
+            or_ = lut_r[or_ as usize] as f32;
+            og  = lut_g[og  as usize] as f32;
+            ob  = lut_b[ob  as usize] as f32;
+        }
+
         let a = (alpha * 255.0).clamp(0.0, 255.0) as u8;
         out.pixels[i] = egui::Color32::from_rgba_unmultiplied(or_ as u8, og as u8, ob as u8, a);
     }
     out
+}
+
+/// Build a 256-entry LUT from a piecewise-linear tone curve. Each LUT entry
+/// is the curve's output for the corresponding 8-bit input clamped to 0..255.
+/// Identity curves are detected up-front and produce an identity table.
+fn build_curve_lut(curve: &[[f32; 2]]) -> [u8; 256] {
+    let mut lut = [0u8; 256];
+    for (i, slot) in lut.iter_mut().enumerate() {
+        let x = i as f32 / 255.0;
+        let y = memstroy_core::ToneCurves::sample(curve, x).clamp(0.0, 1.0);
+        *slot = (y * 255.0).round() as u8;
+    }
+    lut
 }
