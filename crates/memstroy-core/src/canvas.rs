@@ -103,6 +103,14 @@ pub struct RenderFrame {
     /// `scale` acts as inverse zoom: scale=2 means the frame covers
     /// a 2x larger area of the canvas (zoom out).
     pub layout: Vec<Keyframe<RenderFrameState>>,
+    /// **Animation modifiers** affecting position / rotation / scale of
+    /// the frame on top of the eased keyframe sample. Same kinds the
+    /// rest of the editor uses (wobble / shake / pulse / spin).
+    #[serde(default)]
+    pub modifiers: Vec<crate::keyframe::TrackModifier>,
+    /// **Effects stack** applied to the rendered output.
+    #[serde(default)]
+    pub effects: Vec<crate::effects::Effect>,
 }
 
 impl Default for RenderFrame {
@@ -110,6 +118,8 @@ impl Default for RenderFrame {
         Self {
             resolution: [1080, 1920],
             layout: vec![Keyframe::new(0.0, RenderFrameState::default())],
+            modifiers: Vec::new(),
+            effects: Vec::new(),
         }
     }
 }

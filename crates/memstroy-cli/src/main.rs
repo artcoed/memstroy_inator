@@ -217,6 +217,7 @@ fn starter_scene() -> Scene {
         skeleton_attachment: None,
         z_index: 100,
         behind_actors: false,
+        effects: Vec::new(),
     });
     Scene {
         format_version: 1,
