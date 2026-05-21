@@ -15,7 +15,6 @@ const COL_CANVAS_BG: Color32 = Color32::from_rgb(28, 28, 24);
 const COL_GRID_MINOR: Color32 = Color32::from_rgb(58, 56, 40);
 const COL_GRID_MAJOR: Color32 = Color32::from_rgb(90, 85, 50);
 const COL_RENDER_FRAME: Color32 = Color32::from_rgb(255, 80, 80);
-const COL_RENDER_FRAME_FILL: Color32 = Color32::from_rgba_premultiplied(255, 80, 80, 8);
 const COL_ELEMENT_BORDER: Color32 = Color32::from_rgb(180, 180, 200);
 const COL_SELECTED_BORDER: Color32 = Color32::from_rgb(255, 220, 80);
 const COL_INACTIVE_TINT: Color32 = Color32::from_rgba_premultiplied(255, 255, 255, 100);
@@ -379,13 +378,12 @@ fn draw_render_frame(
     let corners_screen = render_frame_corners_screen(state, full_rect, viewport_size);
     let [tl, tr, br, bl] = corners_screen;
 
-    // Filled rect (very faint) to make the output region readable on
-    // empty canvases.
+    // Outline only — interior stays fully transparent so canvas content
+    // (background, actors) is never tinted by the render-area marker.
     let rotation_rad = rf_state.rotation_deg.to_radians();
     let is_rotated = rotation_rad.abs() > 0.001;
     if !is_rotated {
         let aabb = Rect::from_min_max(tl, br);
-        painter.rect_filled(aabb, Rounding::ZERO, COL_RENDER_FRAME_FILL);
         painter.rect_stroke(
             aabb,
             Rounding::ZERO,
@@ -394,7 +392,7 @@ fn draw_render_frame(
     } else {
         painter.add(egui::Shape::convex_polygon(
             vec![tl, tr, br, bl],
-            COL_RENDER_FRAME_FILL,
+            Color32::TRANSPARENT,
             Stroke::new(2.0, COL_RENDER_FRAME),
         ));
     }

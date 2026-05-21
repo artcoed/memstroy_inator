@@ -728,6 +728,11 @@ pub struct AudioTrack {
     pub source_start: f32,
     #[serde(default = "one")]
     pub volume: f32,
+    /// Playback rate multiplier (1.0 = normal). Applied via rodio's
+    /// `Source::speed` when the sink is built. Affects pitch as well as
+    /// duration (i.e. classic "scrub speed", not time-stretch).
+    #[serde(default = "one")]
+    pub speed: f32,
     /// If set, this audio track belongs to the actor with this `id`. The
     /// editor uses this to keep clip & audio in lock-step: moving / trimming
     /// / deleting the actor mirrors the same change on the bound audio so
