@@ -27,11 +27,44 @@ use std::io::BufReader;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::mpsc;
+use std::sync::Once;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use rodio::Source;
 use tracing::{debug, info, warn};
+
+/// Global one-shot panic-hook installer. Suppresses the stderr "thread
+/// 'memstroy-audio-load-N' panicked at ..." spam that rodio 0.19's
+/// symphonia adapter emits when probing some MP4s with no/short audio.
+/// We already `catch_unwind` those panics in the worker, but the default
+/// hook still prints the panic message to stderr before the unwind starts.
+/// Filter those out (route them through `tracing::debug!` instead) while
+/// leaving every other panic untouched.
+static AUDIO_PANIC_HOOK: Once = Once::new();
+
+fn install_audio_panic_hook() {
+    AUDIO_PANIC_HOOK.call_once(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let on_audio_thread = thread::current()
+                .name()
+                .map(|n| n.starts_with("memstroy-audio-load-"))
+                .unwrap_or(false);
+            if on_audio_thread {
+                // Audio worker hit a decoder panic — already handled by
+                // catch_unwind in load_sinks, no need to scare the user.
+                debug!(
+                    "Suppressed audio-worker panic ({}): {}",
+                    thread::current().name().unwrap_or("?"),
+                    info
+                );
+                return;
+            }
+            prev(info);
+        }));
+    });
+}
 
 /// One scheduled audio source on the timeline. Used by the editor to
 /// describe scene-level audio tracks AND actor video soundtracks.
@@ -46,6 +79,9 @@ pub struct AudioSourceSpec {
     pub source_start: f32,
     /// Per-track linear gain (0.0..N).
     pub volume: f32,
+    /// Per-track playback rate (1.0 = normal, 2.0 = double speed +
+    /// octave-up pitch). Applied via `Source::speed`.
+    pub speed: f32,
 }
 
 /// A pre-built sink that the worker thread hands back, ready to be
@@ -78,6 +114,9 @@ pub struct AudioEngine {
 impl AudioEngine {
     /// Create a new audio engine. Initialises the output stream.
     pub fn new() -> Self {
+        // Quiet down the rodio/symphonia decoder panics that we already
+        // catch_unwind on the worker thread.
+        install_audio_panic_hook();
         let (stream, handle) = match rodio::OutputStream::try_default() {
             Ok((stream, handle)) => {
                 info!("Audio engine initialised");
@@ -213,10 +252,20 @@ impl AudioEngine {
             };
 
             let stream = decoder.convert_samples::<f32>();
+            // Apply per-track speed at the source level. `speed` divides
+            // every internal duration we hand the source (skip, take,
+            // delay) so time still maps to the user's scene timeline:
+            // the audio plays N× faster but starts/ends at the same
+            // visible scene-times.
+            let speed = spec.speed.max(0.05);
+            let stream = stream.speed(speed);
             let skip_secs = (spec.source_start
                 + (live_playhead - spec.t_in).max(0.0))
                 .max(0.0);
-            let stream = stream.skip_duration(Duration::from_secs_f32(skip_secs));
+            // skip / take / delay are all stated in *scene-time* seconds
+            // by the caller; multiply by `speed` to recover the
+            // wall-clock seconds the now-faster source needs to consume.
+            let stream = stream.skip_duration(Duration::from_secs_f32(skip_secs * speed));
             let stream = stream.amplify(spec.volume.max(0.0));
             let take_secs = spec.t_out.map(|end| {
                 let visible_start = live_playhead.max(spec.t_in);
@@ -237,11 +286,11 @@ impl AudioEngine {
             match (take_secs, delay_secs > 0.0) {
                 (Some(td), true) => sink.append(
                     stream
-                        .take_duration(Duration::from_secs_f32(td))
+                        .take_duration(Duration::from_secs_f32(td * speed))
                         .delay(Duration::from_secs_f32(delay_secs)),
                 ),
                 (Some(td), false) => sink.append(
-                    stream.take_duration(Duration::from_secs_f32(td)),
+                    stream.take_duration(Duration::from_secs_f32(td * speed)),
                 ),
                 (None, true) => sink.append(
                     stream.delay(Duration::from_secs_f32(delay_secs)),
