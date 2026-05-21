@@ -10,9 +10,9 @@ use crate::state::{EditorState, Selection};
 
 // ─── COLORS ──────────────────────────────────────────────────────────
 
-const COL_CANVAS_BG: Color32 = Color32::from_rgb(12, 12, 18);
-const COL_GRID_MINOR: Color32 = Color32::from_rgb(25, 25, 35);
-const COL_GRID_MAJOR: Color32 = Color32::from_rgb(35, 35, 48);
+const COL_CANVAS_BG: Color32 = Color32::from_rgb(28, 28, 24);
+const COL_GRID_MINOR: Color32 = Color32::from_rgb(58, 56, 40);
+const COL_GRID_MAJOR: Color32 = Color32::from_rgb(90, 85, 50);
 const COL_RENDER_FRAME: Color32 = Color32::from_rgb(255, 80, 80);
 const COL_RENDER_FRAME_FILL: Color32 = Color32::from_rgba_premultiplied(255, 80, 80, 8);
 const COL_ELEMENT_BORDER: Color32 = Color32::from_rgb(180, 180, 200);
@@ -67,36 +67,38 @@ fn handle_canvas_input(
     viewport_size: [f32; 2],
     _full_rect: Rect,
 ) {
-    // Middle mouse drag or Space+drag → pan
+    // Any drag (left, middle, or right mouse button) → pan the canvas
+    // unless an element is selected and being moved (handled in gizmo)
     let middle_down = ui.input(|i| i.pointer.middle_down());
-    let space_held = ui.input(|i| i.key_down(egui::Key::Space));
+    let right_down = ui.input(|i| i.pointer.secondary_down());
 
-    if (middle_down || (space_held && response.dragged()))
-        && response.hovered()
-    {
+    // Pan: middle mouse drag, right mouse drag, or left drag when nothing is selected
+    let should_pan = middle_down
+        || right_down
+        || (response.dragged() && state.selection == Selection::None);
+
+    if should_pan && response.hovered() {
         let delta = response.drag_delta();
-        state.canvas_viewport.pan([delta.x, delta.y]);
-        state.canvas_panning = true;
-        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        if delta.length_sq() > 0.0 {
+            state.canvas_viewport.pan([delta.x, delta.y]);
+            state.canvas_panning = true;
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        }
     } else {
         state.canvas_panning = false;
     }
 
-    // Scroll wheel → zoom (Ctrl+scroll) or pan (plain scroll)
+    // Scroll wheel → zoom only (always, Ctrl not required for scroll-to-zoom)
     if response.hovered() {
         let scroll = ui.input(|i| i.smooth_scroll_delta);
-        let ctrl = ui.input(|i| i.modifiers.ctrl);
 
-        if ctrl && scroll.y.abs() > 0.1 {
+        if scroll.y.abs() > 0.1 {
             // Zoom towards mouse position
             let factor = if scroll.y > 0.0 { 1.1 } else { 1.0 / 1.1 };
             if let Some(mouse) = ui.input(|i| i.pointer.hover_pos()) {
                 let local = [mouse.x - _full_rect.min.x, mouse.y - _full_rect.min.y];
                 state.canvas_viewport.zoom_at(local, viewport_size, factor);
             }
-        } else if scroll.y.abs() > 0.1 || scroll.x.abs() > 0.1 {
-            // Pan
-            state.canvas_viewport.pan([scroll.x, scroll.y]);
         }
     }
 }
