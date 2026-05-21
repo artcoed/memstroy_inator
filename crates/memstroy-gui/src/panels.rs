@@ -24,12 +24,10 @@ enum ClipDragMode {
 
 // ─── COLORS ──────────────────────────────────────────────────────────
 
-const COL_BG_DARK: Color32 = Color32::from_rgb(18, 18, 26);
 const COL_BG_TRACK: Color32 = Color32::from_rgb(24, 24, 34);
 const COL_BG_TRACK_ALT: Color32 = Color32::from_rgb(28, 28, 38);
 const COL_RULER: Color32 = Color32::from_rgb(32, 32, 44);
 const COL_PLAYHEAD: Color32 = Color32::from_rgb(255, 60, 60);
-const COL_ACCENT: Color32 = Color32::from_rgb(100, 80, 220);
 const COL_TEXT_DIM: Color32 = Color32::from_rgb(140, 140, 160);
 const COL_TEXT: Color32 = Color32::from_rgb(220, 220, 240);
 const COL_CLIP_ACTOR: Color32 = Color32::from_rgb(220, 130, 50);
@@ -41,10 +39,9 @@ const COL_SELECTED: Color32 = Color32::from_rgb(255, 220, 80);
 
 // ─── LIBRARY ─────────────────────────────────────────────────────────
 
-/// Asset library — top half is the Mellstroy clips list (drag to add as
-/// actor), bottom half is a uniform grid of every other asset
-/// (backgrounds / props / audio) where the asset *type* is conveyed only
-/// through the cell icon.
+/// Clip library: the list of downloaded Mellstroy clips. Drag a clip to the
+/// timeline to add it as an actor, or double-click to insert at the
+/// playhead.
 pub fn library(ui: &mut egui::Ui, state: &mut EditorState, _request_refresh: impl Fn()) {
     // Header
     ui.horizontal(|ui| {
@@ -62,279 +59,57 @@ pub fn library(ui: &mut egui::Ui, state: &mut EditorState, _request_refresh: imp
 
     ui.add(
         egui::TextEdit::singleline(&mut state.library_search)
-            .hint_text("Search assets...")
+            .hint_text("Search clips...")
             .desired_width(ui.available_width()),
     );
     ui.add_space(2.0);
-    ui.label(RichText::new("Tip: drag from here to the timeline. You can also drop files directly from your file manager.")
-        .size(9.0).italics().color(COL_TEXT_DIM));
+    ui.label(
+        RichText::new(
+            "Tip: drag a clip onto the timeline to place it. \
+             Files dropped from your file manager work too.",
+        )
+        .size(9.0)
+        .italics()
+        .color(COL_TEXT_DIM),
+    );
     ui.add_space(6.0);
-
-    let avail = ui.available_size_before_wrap();
-    let clips_h = (avail.y * 0.45).clamp(140.0, 480.0);
-    let assets_h = (avail.y - clips_h - 12.0).max(120.0);
 
     let search_lower = state.library_search.to_lowercase();
-
-    // ── TOP: Clips panel ──
-    ui.allocate_ui_with_layout(
-        Vec2::new(avail.x, clips_h),
-        egui::Layout::top_down(egui::Align::LEFT),
-        |ui| {
-            ui.set_min_width(ui.available_width());
-            let clip_count = state.library.mellstroy_clips.len();
-            ui.label(RichText::new(format!("Clips ({})", clip_count)).size(12.0).strong()
-                .color(Color32::from_rgb(220, 130, 50)));
-            ui.add_space(2.0);
-            egui::ScrollArea::vertical()
-                .id_source("library_clips_scroll")
-                .auto_shrink([false; 2])
-                .show(ui, |ui| {
-                    if state.library.mellstroy_clips.is_empty() {
-                        ui.label(RichText::new("No clips. Hit Refresh to download.")
-                            .italics().color(COL_TEXT_DIM).size(11.0));
-                    } else {
-                        for idx in 0..state.library.mellstroy_clips.len() {
-                            let clip = &state.library.mellstroy_clips[idx];
-                            if !search_lower.is_empty() {
-                                let clean = clean_clip_text(&clip.description).to_lowercase();
-                                let id_str = clip.id.to_string();
-                                if !clean.contains(&search_lower) && !id_str.contains(&search_lower) {
-                                    continue;
-                                }
-                            }
-                            let clip = state.library.mellstroy_clips[idx].clone();
-                            clip_card(ui, state, &clip);
-                        }
-                    }
-                });
-        },
+    let clip_count = state.library.mellstroy_clips.len();
+    ui.label(
+        RichText::new(format!("Clips ({})", clip_count))
+            .size(12.0)
+            .strong()
+            .color(Color32::from_rgb(220, 130, 50)),
     );
+    ui.add_space(2.0);
 
-    ui.add_space(6.0);
-    ui.separator();
-    ui.add_space(6.0);
-
-    // ── BOTTOM: unified asset grid (no per-type sections) ──
-    ui.allocate_ui_with_layout(
-        Vec2::new(avail.x, assets_h),
-        egui::Layout::top_down(egui::Align::LEFT),
-        |ui| {
-            ui.set_min_width(ui.available_width());
-            let asset_count = state.library.backgrounds.len()
-                + state.library.props.len()
-                + state.library.audio.len();
-            ui.label(RichText::new(format!("Assets ({})", asset_count)).size(12.0).strong()
-                .color(Color32::from_rgb(160, 200, 255)));
-            ui.add_space(2.0);
-
-            egui::ScrollArea::vertical()
-                .id_source("library_assets_scroll")
-                .auto_shrink([false; 2])
-                .show(ui, |ui| {
-                    if asset_count == 0 {
-                        ui.label(RichText::new(
-                            "Drop files into assets/backgrounds, assets/props or assets/audio.")
-                            .italics().color(COL_TEXT_DIM).size(11.0));
-                        return;
-                    }
-                    asset_grid(ui, state, &search_lower);
-                });
-        },
-    );
-}
-
-/// Render every non-clip library asset (backgrounds + props + audio) in a
-/// single fluid grid. Asset type is signalled exclusively by the corner
-/// icon on each cell.
-fn asset_grid(ui: &mut egui::Ui, state: &mut EditorState, search_lower: &str) {
-    // Build a unified, ordered list of (kind, path) so the grid is one flat list.
-    let mut items: Vec<(AssetDragKind, PathBuf)> =
-        Vec::with_capacity(state.library.backgrounds.len()
-            + state.library.props.len()
-            + state.library.audio.len());
-    for p in state.library.backgrounds.iter().cloned() {
-        items.push((AssetDragKind::Background, p));
-    }
-    for p in state.library.props.iter().cloned() {
-        items.push((AssetDragKind::Prop, p));
-    }
-    for p in state.library.audio.iter().cloned() {
-        items.push((AssetDragKind::Audio, p));
-    }
-
-    // Cell sizing — driven by available width so the grid auto-flows.
-    let cell_w: f32 = 86.0;
-    let cell_h: f32 = 92.0;
-    let gap: f32 = 4.0;
-    let cols = ((ui.available_width() + gap) / (cell_w + gap))
-        .floor()
-        .max(1.0) as usize;
-
-    // egui::Grid handles the row/column wiring; we only render cells.
-    egui::Grid::new("asset_grid_table")
-        .num_columns(cols)
-        .spacing(egui::vec2(gap, gap))
+    egui::ScrollArea::vertical()
+        .id_source("library_clips_scroll")
+        .auto_shrink([false; 2])
         .show(ui, |ui| {
-            let mut col_count = 0usize;
-            for (kind, path) in items {
-                let name = path.file_name().and_then(|s| s.to_str())
-                    .unwrap_or("(?)").to_string();
-                if !search_lower.is_empty()
-                    && !name.to_lowercase().contains(search_lower) {
-                    continue;
+            if state.library.mellstroy_clips.is_empty() {
+                ui.label(
+                    RichText::new("No clips. Hit Refresh to download.")
+                        .italics()
+                        .color(COL_TEXT_DIM)
+                        .size(11.0),
+                );
+                return;
+            }
+            for idx in 0..state.library.mellstroy_clips.len() {
+                let clip = &state.library.mellstroy_clips[idx];
+                if !search_lower.is_empty() {
+                    let clean = clean_clip_text(&clip.description).to_lowercase();
+                    let id_str = clip.id.to_string();
+                    if !clean.contains(&search_lower) && !id_str.contains(&search_lower) {
+                        continue;
+                    }
                 }
-                asset_grid_cell(ui, state, kind, &path, &name, cell_w, cell_h);
-                col_count += 1;
-                if col_count % cols == 0 { ui.end_row(); }
+                let clip = state.library.mellstroy_clips[idx].clone();
+                clip_card(ui, state, &clip);
             }
         });
-}
-
-/// Single grid cell: thumbnail (or generic icon for non-image types) + tiny
-/// type badge + truncated filename. The whole cell is the drag source.
-fn asset_grid_cell(
-    ui: &mut egui::Ui,
-    state: &mut EditorState,
-    kind: AssetDragKind,
-    path: &PathBuf,
-    name: &str,
-    cell_w: f32,
-    cell_h: f32,
-) {
-    // (icon, accent color, tooltip)
-    let (icon, accent) = match kind {
-        AssetDragKind::Background => ("\u{1F5BC}", Color32::from_rgb(100, 180, 255)),
-        AssetDragKind::Prop       => ("\u{1F4CC}", Color32::from_rgb(220, 200, 100)),
-        AssetDragKind::Audio      => ("\u{1F3B5}", Color32::from_rgb(50, 180, 180)),
-        _                         => ("\u{2753}", Color32::from_rgb(180, 180, 180)),
-    };
-
-    // Pre-compute file metadata once — used both inside the cell paint
-    // closure and by the drag handler below.
-    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
-    let is_image = ["jpg", "jpeg", "png", "webp"].contains(&ext.as_str());
-
-    let frame = egui::Frame::none()
-        .fill(Color32::from_rgb(28, 28, 40))
-        .rounding(Rounding::same(4.0))
-        .inner_margin(egui::Margin::same(3.0))
-        .stroke(Stroke::new(1.0, Color32::from_rgb(50, 50, 70)));
-
-    let cell_resp = frame.show(ui, |ui| {
-        ui.set_min_size(Vec2::new(cell_w, cell_h));
-        ui.set_max_size(Vec2::new(cell_w, cell_h));
-
-        let thumb_size = Vec2::new(cell_w - 8.0, cell_h - 30.0);
-        // Thumbnail (image assets only) — fall back to a coloured placeholder.
-        if matches!(kind, AssetDragKind::Background | AssetDragKind::Prop) && is_image {
-            let uri = format!("file://{}", path.display());
-            ui.add(
-                egui::Image::from_uri(uri)
-                    .fit_to_exact_size(thumb_size)
-                    .maintain_aspect_ratio(false)
-                    .rounding(Rounding::same(3.0)),
-            );
-        } else {
-            let (rect, _) = ui.allocate_exact_size(thumb_size, Sense::hover());
-            ui.painter().rect_filled(rect, Rounding::same(3.0), Color32::from_rgb(38, 38, 56));
-            ui.painter().text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                icon,
-                egui::FontId::proportional(28.0),
-                accent,
-            );
-        }
-
-        // Type badge in the top-left corner of the thumbnail.
-        let badge_rect = egui::Rect::from_min_size(
-            ui.min_rect().min + egui::vec2(2.0, 2.0),
-            Vec2::new(16.0, 16.0),
-        );
-        ui.painter().rect_filled(
-            badge_rect,
-            Rounding::same(3.0),
-            Color32::from_rgba_premultiplied(0, 0, 0, 180),
-        );
-        ui.painter().text(
-            badge_rect.center(),
-            egui::Align2::CENTER_CENTER,
-            icon,
-            egui::FontId::proportional(11.0),
-            accent,
-        );
-
-        // Filename (truncated to 1 line).
-        ui.add_space(2.0);
-        ui.add(
-            egui::Label::new(RichText::new(name).size(10.0).color(COL_TEXT))
-                .truncate(),
-        );
-    }).response;
-
-    let cell_resp = cell_resp.interact(Sense::click_and_drag());
-    let cell_resp = cell_resp.on_hover_text(name);
-
-    if cell_resp.dragged() {
-        state.asset_drag.dragging = Some(path.clone());
-        state.asset_drag.kind = kind;
-        state.asset_drag.label = name.to_string();
-        // Use the asset path itself as the thumbnail for image-typed assets;
-        // others fall back to the generic icon at preview time.
-        state.asset_drag.thumbnail = if matches!(kind,
-            AssetDragKind::Background | AssetDragKind::Prop) && is_image {
-            Some(path.clone())
-        } else {
-            None
-        };
-        if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
-            state.asset_drag.pos = [pos.x, pos.y];
-        }
-    }
-    if cell_resp.double_clicked() {
-        match kind {
-            AssetDragKind::Background => add_background_from_path(state, path),
-            AssetDragKind::Prop       => add_image_overlay(state, path),
-            AssetDragKind::Audio      => add_audio_from_path(state, path),
-            _                         => {}
-        }
-    }
-}
-
-
-fn add_audio_from_path(state: &mut EditorState, path: &PathBuf) {
-    let id = path.file_stem().and_then(|s| s.to_str())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| format!("audio_{}", state.scene.audio.len() + 1));
-    state.scene.audio.push(AudioTrack {
-        id: id.clone(),
-        source: path.clone(),
-        t_in: state.playhead,
-        t_out: None,
-        source_start: 0.0,
-        volume: 1.0,
-        parent_actor: None,
-    });
-    state.selection = Selection::Audio(state.scene.audio.len() - 1);
-    state.status = format!("Added audio: {}", id);
-}
-
-
-fn add_image_overlay(state: &mut EditorState, path: &PathBuf) {
-    let id = path.file_stem().and_then(|s| s.to_str())
-        .map(|s| format!("img_{}", s))
-        .unwrap_or_else(|| format!("img_{}", state.scene.overlays.len() + 1));
-    let overlay = Overlay::Image(ImageOverlay {
-        id: id.clone(),
-        source: path.clone(),
-        t_in: state.playhead,
-        t_out: (state.playhead + 3.0).min(state.scene.output.duration),
-        layout: vec![Keyframe::new(0.0, OverlayState { pos: [0.5, 0.5], scale: 0.3, scale_y: 1.0, rotation_deg: 0.0, opacity: 1.0 })],
-    });
-    state.scene.overlays.push(overlay);
-    state.selection = Selection::Overlay(state.scene.overlays.len() - 1);
-    state.status = format!("Added overlay: {}", id);
 }
 
 fn clip_card(ui: &mut egui::Ui, state: &mut EditorState, clip: &crate::state::LibraryClip) {
@@ -572,38 +347,6 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
 }
 
 
-fn inspector_keyframe_editor(ui: &mut egui::Ui, kf: &mut Keyframe<ActorState>) {
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("Time:").size(11.0));
-        ui.add(egui::DragValue::new(&mut kf.t).range(0.0..=600.0).speed(0.02).suffix("s"));
-    });
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("X:").size(11.0));
-        ui.add(egui::DragValue::new(&mut kf.value.pos[0]).range(-2.0..=3.0).speed(0.005));
-        ui.label(RichText::new("Y:").size(11.0));
-        ui.add(egui::DragValue::new(&mut kf.value.pos[1]).range(-2.0..=3.0).speed(0.005));
-    });
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("Scale:").size(11.0));
-        ui.add(egui::Slider::new(&mut kf.value.scale, 0.05..=5.0).logarithmic(true));
-    });
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("Rotation:").size(11.0));
-        ui.add(
-            egui::Slider::new(&mut kf.value.rotation_deg, -360.0..=360.0)
-                .suffix("\u{00B0}")
-                .step_by(0.1)
-                .fixed_decimals(1)
-                .smart_aim(false),
-        );
-    });
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("Opacity:").size(11.0));
-        ui.add(egui::Slider::new(&mut kf.value.opacity, 0.0..=1.0));
-    });
-}
-
-
 fn inspector_actor_effects(ui: &mut egui::Ui, state: &mut EditorState, i: usize, _actor_count: usize, _cache_count: usize) {
     let a = &mut state.scene.actors[i];
 
@@ -760,56 +503,6 @@ fn inspector_actor_skeleton_attachments(ui: &mut egui::Ui, state: &mut EditorSta
     });
 }
 
-#[allow(dead_code)]
-fn inspector_actor_transitions(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
-    egui::CollapsingHeader::new(
-        RichText::new("Transitions").size(12.0).strong().color(Color32::from_rgb(255, 180, 100))
-    ).default_open(true).show(ui, |ui| {
-        let a = &mut state.scene.actors[i];
-
-        ui.horizontal(|ui| {
-            ui.label("In:");
-            transition_combo(ui, "transition_in", &mut a.transition_in);
-        });
-        ui.horizontal(|ui| {
-            ui.label("Out:");
-            transition_combo(ui, "transition_out", &mut a.transition_out);
-        });
-        ui.horizontal(|ui| {
-            ui.label("Duration:");
-            ui.add(
-                egui::DragValue::new(&mut a.transition_duration)
-                    .range(0.0..=5.0)
-                    .speed(0.02)
-                    .suffix("s"),
-            );
-        });
-        ui.add_space(2.0);
-        ui.label(
-            RichText::new(
-                "Cut = no effect. Fade = opacity. Slide* = enter/exit by sliding off-screen.",
-            )
-            .size(10.0)
-            .color(COL_TEXT_DIM)
-            .italics(),
-        );
-    });
-}
-
-#[allow(dead_code)]
-fn transition_combo(ui: &mut egui::Ui, id: &str, t: &mut Transition) {
-    egui::ComboBox::from_id_source(id)
-        .selected_text(format!("{:?}", t))
-        .show_ui(ui, |ui| {
-            ui.selectable_value(t, Transition::Cut, "Cut");
-            ui.selectable_value(t, Transition::Fade, "Fade");
-            ui.selectable_value(t, Transition::SlideLeft, "SlideLeft");
-            ui.selectable_value(t, Transition::SlideRight, "SlideRight");
-            ui.selectable_value(t, Transition::SlideUp, "SlideUp");
-            ui.selectable_value(t, Transition::SlideDown, "SlideDown");
-        });
-}
-
 fn inspector_overlay(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
     let duration = state.scene.output.duration;
     let overlay_count = state.scene.overlays.len();
@@ -859,18 +552,18 @@ fn inspector_overlay(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
     }
 }
 
+/// Inspector layer-order actions for a text overlay. Bound by the
+/// inspector's small "↑/↓/Top/Bot" buttons.
 #[derive(Clone, Copy)]
 enum TextAction {
-    /// Bump z_index by +1 (and swap with a neighbor if needed for visual order).
+    /// Bump z_index by +1.
     LayerUp,
     /// Bump z_index by -1.
     LayerDown,
-    /// Set z_index to (max+1) of all overlays.
+    /// Set z_index to (max+1) across overlays.
     ToFront,
-    /// Set z_index to (min-1) of all overlays.
+    /// Set z_index to (min-1) across overlays.
     ToBack,
-    /// Delete this overlay.
-    Delete,
 }
 
 fn apply_text_action(state: &mut EditorState, i: usize, action: TextAction) {
@@ -905,11 +598,6 @@ fn apply_text_action(state: &mut EditorState, i: usize, action: TextAction) {
             if let Overlay::Text(t) = &mut state.scene.overlays[i] {
                 t.z_index = min_z.saturating_sub(1);
             }
-        }
-        TextAction::Delete => {
-            state.scene.overlays.remove(i);
-            state.selection = Selection::None;
-            state.status = "\u{1F5D1} Text overlay deleted.".into();
         }
     }
 }
@@ -1596,24 +1284,87 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             acc += h;
         }
     }
-    // Pending track-creation actions to perform AFTER the render loop, so we
-    // never invalidate iteration. Each entry is the actor or audio index that
-    // requested it; we then create a new track and re-assign that index.
-    let mut pending_new_video_top: Option<usize> = None;   // new video track at index 0; reassign actor
-    let mut pending_new_audio_bottom: Option<usize> = None; // new audio track at end; reassign audio
+    // Pending track-creation actions to apply AFTER the render loop, so we
+    // never invalidate iteration. Each variant carries the index of the
+    // element that asked for the new lane.
+    let mut pending_new_video_top_for_actor: Option<usize> = None;
+    let mut pending_new_video_bottom_for_actor: Option<usize> = None;
+    let mut pending_new_video_top_for_overlay: Option<usize> = None;
+    let mut pending_new_video_bottom_for_overlay: Option<usize> = None;
+    let mut pending_new_audio_top: Option<usize> = None;
+    let mut pending_new_audio_bottom: Option<usize> = None;
     let pointer_y: Option<f32> = ui.input(|i| i.pointer.hover_pos().map(|p| p.y));
 
-    // Resolve which track index the pointer is currently over.
-    // Returns:
-    //   - Some(idx) if pointer.y falls within an existing track row;
-    //   - None otherwise (pointer outside the tracks viewport).
-    let resolve_target_track = |y: f32| -> Option<usize> {
-        for (i, (top, bot)) in track_rows.iter().enumerate() {
-            if y >= *top && y < *bot {
-                return Some(i);
+    // Classify a pointer Y into a drop target relative to the current
+    // track layout. Used by every per-clip vertical drag handler so that
+    // actors/overlays land on video lanes, audio lands on audio lanes, and
+    // dragging into the gap between blocks creates a new lane on the
+    // appropriate side of the divider.
+    #[derive(Clone, Copy)]
+    enum DropIntent {
+        ToVideoRow(usize),
+        ToAudioRow(usize),
+        NewVideoTop,
+        NewVideoBottom,
+        NewAudioTop,
+        NewAudioBottom,
+        Outside,
+    }
+    let video_indices: Vec<usize> = state.video_track_indices();
+    let audio_indices: Vec<usize> = state.audio_track_indices();
+    let classify_pointer_y = |py: f32| -> DropIntent {
+        for &i in &video_indices {
+            let (top, bot) = track_rows[i];
+            if py >= top && py < bot {
+                return DropIntent::ToVideoRow(i);
             }
         }
-        None
+        for &i in &audio_indices {
+            let (top, bot) = track_rows[i];
+            if py >= top && py < bot {
+                return DropIntent::ToAudioRow(i);
+            }
+        }
+        let first_video_top = video_indices.first().map(|&i| track_rows[i].0);
+        let last_video_bot = video_indices.last().map(|&i| track_rows[i].1);
+        let first_audio_top = audio_indices.first().map(|&i| track_rows[i].0);
+        let last_audio_bot = audio_indices.last().map(|&i| track_rows[i].1);
+
+        if let Some(t) = first_video_top {
+            if py < t {
+                return DropIntent::NewVideoTop;
+            }
+        } else if let Some(at) = first_audio_top {
+            // No video at all — anywhere above the first audio lane creates
+            // a brand-new top video lane.
+            if py < at {
+                return DropIntent::NewVideoTop;
+            }
+        }
+
+        if let (Some(vb), Some(at)) = (last_video_bot, first_audio_top) {
+            if py >= vb && py < at {
+                let mid = (vb + at) * 0.5;
+                return if py < mid {
+                    DropIntent::NewVideoBottom
+                } else {
+                    DropIntent::NewAudioTop
+                };
+            }
+        }
+        if let (Some(vb), None) = (last_video_bot, first_audio_top) {
+            if py >= vb {
+                return DropIntent::NewVideoBottom;
+            }
+        }
+
+        if let Some(b) = last_audio_bot {
+            if py >= b {
+                return DropIntent::NewAudioBottom;
+            }
+        }
+
+        DropIntent::Outside
     };
 
     // Total scaled height needed to fit all tracks at the current v_zoom.
@@ -1707,17 +1458,18 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                     }
                 }
 
-                // Draw actors assigned to this track (by index mod video tracks)
-                let video_tracks: Vec<usize> = (0..num_tracks).filter(|ti| state.tracks[*ti].kind == TrackKind::Video).collect();
-                let vt_pos = video_tracks.iter().position(|t| *t == track_idx);
+                // Draw actors assigned to this video lane. The default
+                // assignment for actors without an explicit entry in
+                // `actor_track_assignments` is the topmost video lane, so
+                // freshly dropped clips show up immediately.
+                let video_tracks: Vec<usize> = (0..num_tracks)
+                    .filter(|ti| state.tracks[*ti].kind == TrackKind::Video)
+                    .collect();
 
                 for ai in 0..state.scene.actors.len() {
-                    // Use explicit track assignment if set, otherwise default to first video track.
-                    // Multiple clips on the same track is allowed (free sequential placement).
                     let assigned_track = if let Some(&assigned) = state.actor_track_assignments.get(&ai) {
                         assigned
                     } else {
-                        // Default: first video track for ALL actors (free placement on same track)
                         video_tracks.first().copied().unwrap_or(0)
                     };
                     if assigned_track != track_idx { continue; }
@@ -1764,21 +1516,22 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             }
 
                             // ── Resolve the destination track from the pointer's Y position ──
-                            // Drag inside the timeline viewport → find which track row the
-                            // cursor is over. Drag above the topmost video → schedule creation
-                            // of a new video track at index 0 (the new top).
+                            // Actors only ever land on video lanes. Dropping
+                            // into the gap above the topmost video row, or
+                            // between the video and audio blocks, creates a
+                            // new video lane on the appropriate side.
                             if let Some(py) = pointer_y {
-                                if let Some(target) = resolve_target_track(py) {
-                                    if state.tracks[target].kind == TrackKind::Video {
-                                        state.actor_track_assignments.insert(ai, target);
+                                match classify_pointer_y(py) {
+                                    DropIntent::ToVideoRow(idx) => {
+                                        state.actor_track_assignments.insert(ai, idx);
                                     }
-                                } else {
-                                    // Pointer outside any existing row.
-                                    let topmost_y = track_rows.first().map(|(t, _)| *t)
-                                        .unwrap_or(tracks_rect.min.y);
-                                    if py < topmost_y {
-                                        pending_new_video_top = Some(ai);
+                                    DropIntent::NewVideoTop => {
+                                        pending_new_video_top_for_actor = Some(ai);
                                     }
+                                    DropIntent::NewVideoBottom => {
+                                        pending_new_video_bottom_for_actor = Some(ai);
+                                    }
+                                    _ => {}
                                 }
                             } else {
                                 state.actor_track_assignments.insert(ai, track_idx);
@@ -1860,61 +1613,118 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                     );
                 }
 
-                // Draw overlays on video tracks (track 1+)
-                if vt_pos.unwrap_or(0) >= 1 || video_tracks.len() <= 1 {
-                    for oi in 0..state.scene.overlays.len() {
-                        let target_vt = if video_tracks.len() >= 2 { 1 } else { 0 };
-                        if vt_pos != Some(target_vt) && video_tracks.len() > 1 { continue; }
+                // Draw overlays assigned to this video track. Overlays
+                // without an explicit assignment fall back to the second
+                // video lane (or the first when only one exists), which
+                // keeps newly added text/image/video overlays visible
+                // without a manual placement step.
+                let video_tracks_local: Vec<usize> = (0..num_tracks)
+                    .filter(|ti| state.tracks[*ti].kind == TrackKind::Video)
+                    .collect();
+                let default_overlay_track = if video_tracks_local.len() >= 2 {
+                    video_tracks_local[1]
+                } else if !video_tracks_local.is_empty() {
+                    video_tracks_local[0]
+                } else {
+                    0
+                };
+                for oi in 0..state.scene.overlays.len() {
+                    let assigned = state
+                        .overlay_track_assignments
+                        .get(&oi)
+                        .copied()
+                        .unwrap_or(default_overlay_track);
+                    if assigned != track_idx { continue; }
 
-                        let ov = &state.scene.overlays[oi];
-                        let (clip_start, clip_end, label) = match ov {
-                            Overlay::Text(t) => (t.t_in, t.t_out, format!("T: {}", ellipsis(&t.text, 10))),
-                            Overlay::Image(im) => (im.t_in, im.t_out, format!("I: {}", im.id)),
-                            Overlay::Video(v) => (v.t_in, v.t_out, format!("V: {}", v.id)),
-                        };
-                        let sel = state.selection == Selection::Overlay(oi);
-                        let ov_id = egui::Id::new(("timeline_clip", "overlay", oi));
-                        if let Some(clicked) = draw_clip(ui, painter, content_rect, &label, ov_id,
-                            clip_start, clip_end, state.timeline_scroll, pps, track_left, track_right,
-                            COL_CLIP_OVERLAY, sel, track_h, track_locked, state.split_tool_active)
-                        {
-                            if clicked < 0.0 {
-                                let new_start = (-clicked).max(0.0);
-                                let dur = clip_end - clip_start;
-                                let new_end = new_start + dur;
-                                match &mut state.scene.overlays[oi] {
-                                    Overlay::Text(t) => { t.t_in = new_start; t.t_out = new_end; }
-                                    Overlay::Image(im) => { im.t_in = new_start; im.t_out = new_end; }
-                                    Overlay::Video(v) => { v.t_in = new_start; v.t_out = new_end; }
-                                }
-                                to_select = Some(Selection::Overlay(oi));
-                            } else if state.split_tool_active {
-                                to_select = Some(Selection::Overlay(oi));
-                                state.playhead = clicked;
-                                state.status = "__SPLIT_AT_PLAYHEAD__".into();
-                            } else {
-                                to_select = Some(Selection::Overlay(oi));
+                    let ov = &state.scene.overlays[oi];
+                    let (clip_start, clip_end, label) = match ov {
+                        Overlay::Text(t) => (t.t_in, t.t_out, format!("T: {}", ellipsis(&t.text, 10))),
+                        Overlay::Image(im) => (im.t_in, im.t_out, format!("I: {}", im.id)),
+                        Overlay::Video(v) => (v.t_in, v.t_out, format!("V: {}", v.id)),
+                    };
+                    let sel = state.selection == Selection::Overlay(oi);
+                    let ov_id = egui::Id::new(("timeline_clip", "overlay", oi));
+                    if let Some(clicked) = draw_clip(ui, painter, content_rect, &label, ov_id,
+                        clip_start, clip_end, state.timeline_scroll, pps, track_left, track_right,
+                        COL_CLIP_OVERLAY, sel, track_h, track_locked, state.split_tool_active)
+                    {
+                        if clicked == f32::INFINITY {
+                            // Trim left edge.
+                            let dx = ui.input(|i| i.pointer.delta().x);
+                            let delta_t = dx / pps;
+                            let new_in = (clip_start + delta_t).max(0.0).min(clip_end - 0.1);
+                            match &mut state.scene.overlays[oi] {
+                                Overlay::Text(t) => { t.t_in = new_in; }
+                                Overlay::Image(im) => { im.t_in = new_in; }
+                                Overlay::Video(v) => { v.t_in = new_in; }
                             }
+                            to_select = Some(Selection::Overlay(oi));
+                        } else if clicked == f32::NEG_INFINITY {
+                            // Trim right edge.
+                            let dx = ui.input(|i| i.pointer.delta().x);
+                            let delta_t = dx / pps;
+                            let new_out = (clip_end + delta_t).max(clip_start + 0.1);
+                            match &mut state.scene.overlays[oi] {
+                                Overlay::Text(t) => { t.t_out = new_out; }
+                                Overlay::Image(im) => { im.t_out = new_out; }
+                                Overlay::Video(v) => { v.t_out = new_out; }
+                            }
+                            to_select = Some(Selection::Overlay(oi));
+                        } else if clicked < 0.0 {
+                            // Drag: move the overlay's time window.
+                            let new_start = (-clicked).max(0.0);
+                            let dur = clip_end - clip_start;
+                            let new_end = new_start + dur;
+                            match &mut state.scene.overlays[oi] {
+                                Overlay::Text(t) => { t.t_in = new_start; t.t_out = new_end; }
+                                Overlay::Image(im) => { im.t_in = new_start; im.t_out = new_end; }
+                                Overlay::Video(v) => { v.t_in = new_start; v.t_out = new_end; }
+                            }
+
+                            // Vertical: re-assign track based on pointer Y.
+                            // Overlays only land on video lanes, mirroring
+                            // the actor drag rules.
+                            if let Some(py) = pointer_y {
+                                match classify_pointer_y(py) {
+                                    DropIntent::ToVideoRow(idx) => {
+                                        state.overlay_track_assignments.insert(oi, idx);
+                                    }
+                                    DropIntent::NewVideoTop => {
+                                        pending_new_video_top_for_overlay = Some(oi);
+                                    }
+                                    DropIntent::NewVideoBottom => {
+                                        pending_new_video_bottom_for_overlay = Some(oi);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            to_select = Some(Selection::Overlay(oi));
+                        } else if state.split_tool_active {
+                            to_select = Some(Selection::Overlay(oi));
+                            state.playhead = clicked;
+                            state.status = "__SPLIT_AT_PLAYHEAD__".into();
+                        } else {
+                            to_select = Some(Selection::Overlay(oi));
                         }
-                        // Keyframe diamonds for overlays too.
-                        let layout_ref: &[Keyframe<OverlayState>] = match &state.scene.overlays[oi] {
-                            Overlay::Text(t) => &t.layout,
-                            Overlay::Image(im) => &im.layout,
-                            Overlay::Video(v) => &v.layout,
-                        };
-                        draw_keyframe_diamonds(
-                            painter,
-                            content_rect,
-                            clip_start,
-                            clip_end,
-                            layout_ref,
-                            state.timeline_scroll,
-                            pps,
-                            track_left,
-                            track_right,
-                            sel,
-                        );
                     }
+                    // Keyframe diamonds for overlays too.
+                    let layout_ref: &[Keyframe<OverlayState>] = match &state.scene.overlays[oi] {
+                        Overlay::Text(t) => &t.layout,
+                        Overlay::Image(im) => &im.layout,
+                        Overlay::Video(v) => &v.layout,
+                    };
+                    draw_keyframe_diamonds(
+                        painter,
+                        content_rect,
+                        clip_start,
+                        clip_end,
+                        layout_ref,
+                        state.timeline_scroll,
+                        pps,
+                        track_left,
+                        track_right,
+                        sel,
+                    );
                 }
             }
             TrackKind::Audio => {
@@ -1948,18 +1758,24 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             state.scene.audio[aui].t_in = new_start;
                             state.scene.audio[aui].t_out = Some(new_start + dur);
 
-                            // Vertical: re-assign track based on pointer Y.
+                            // Vertical: only allow audio to land on audio
+                            // lanes. Dragging into the gap between video
+                            // and audio creates a new audio lane at the
+                            // top of the audio block; dragging below the
+                            // bottommost row appends a new lane at the
+                            // very bottom.
                             if let Some(py) = pointer_y {
-                                if let Some(target) = resolve_target_track(py) {
-                                    if state.tracks[target].kind == TrackKind::Audio {
-                                        state.audio_track_assignments.insert(aui, target);
+                                match classify_pointer_y(py) {
+                                    DropIntent::ToAudioRow(idx) => {
+                                        state.audio_track_assignments.insert(aui, idx);
                                     }
-                                } else {
-                                    let bottommost_y = track_rows.last().map(|(_, b)| *b)
-                                        .unwrap_or(tracks_rect.max.y);
-                                    if py >= bottommost_y {
+                                    DropIntent::NewAudioTop => {
+                                        pending_new_audio_top = Some(aui);
+                                    }
+                                    DropIntent::NewAudioBottom => {
                                         pending_new_audio_bottom = Some(aui);
                                     }
+                                    _ => {}
                                 }
                             }
                         }
@@ -1980,33 +1796,43 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
 
     // ── Apply pending new-layer creation requests from the drag handlers ──
     // These were stashed inside the loop so we don't invalidate iteration.
-    if let Some(actor_idx) = pending_new_video_top {
-        // Insert a new video track at index 0 and shift every existing
-        // assignment up by 1 so they keep referring to the same physical row.
-        let n = state.tracks.iter().filter(|t| t.kind == TrackKind::Video).count() + 1;
-        state.tracks.insert(0, crate::state::Track::video(format!("V{}", n)));
-        let new_assignments: std::collections::HashMap<usize, usize> = state
-            .actor_track_assignments
-            .iter()
-            .map(|(k, v)| (*k, *v + 1))
-            .collect();
-        state.actor_track_assignments = new_assignments;
-        let new_audio: std::collections::HashMap<usize, usize> = state
-            .audio_track_assignments
-            .iter()
-            .map(|(k, v)| (*k, *v + 1))
-            .collect();
-        state.audio_track_assignments = new_audio;
-        state.actor_track_assignments.insert(actor_idx, 0);
-        state.status = format!("\u{2728} New video layer created on top: V{}", n);
-    }
-    if let Some(audio_idx) = pending_new_audio_bottom {
-        let n = state.tracks.iter().filter(|t| t.kind == TrackKind::Audio).count() + 1;
-        state.tracks.push(crate::state::Track::audio(format!("A{}", n)));
+    // Each branch creates the lane via an EditorState helper that already
+    // shifts dependent assignments through the same permutation.
+    if let Some(actor_idx) = pending_new_video_top_for_actor {
+        let new_idx = state.insert_video_track_at_top();
+        state.actor_track_assignments.insert(actor_idx, new_idx);
+        state.status = "\u{2728} New video layer created on top.".into();
+    } else if let Some(actor_idx) = pending_new_video_bottom_for_actor {
+        let new_idx = state.insert_video_track_at_bottom();
+        state.actor_track_assignments.insert(actor_idx, new_idx);
+        state.status = "\u{2728} New video layer created.".into();
+    } else if let Some(overlay_idx) = pending_new_video_top_for_overlay {
+        let new_idx = state.insert_video_track_at_top();
+        state.overlay_track_assignments.insert(overlay_idx, new_idx);
+        state.status = "\u{2728} New video layer created on top.".into();
+    } else if let Some(overlay_idx) = pending_new_video_bottom_for_overlay {
+        let new_idx = state.insert_video_track_at_bottom();
+        state.overlay_track_assignments.insert(overlay_idx, new_idx);
+        state.status = "\u{2728} New video layer created.".into();
+    } else if let Some(audio_idx) = pending_new_audio_top {
+        let new_idx = state.insert_audio_track_at_top();
+        state.audio_track_assignments.insert(audio_idx, new_idx);
+        state.status = "\u{2728} New audio layer created.".into();
+    } else if let Some(audio_idx) = pending_new_audio_bottom {
+        state.add_audio_track();
         let new_track_idx = state.tracks.len() - 1;
         state.audio_track_assignments.insert(audio_idx, new_track_idx);
-        state.status = format!("\u{2728} New audio layer created at bottom: A{}", n);
+        state.status = "\u{2728} New audio layer created at bottom.".into();
     }
+
+    // ── Mirror bound audio onto the audio lane that matches the parent
+    // actor's video lane. Standalone audio (parent_actor = None) keeps the
+    // user's own placement. New audio lanes are appended on demand.
+    sync_bound_audio_lanes(state);
+
+    // ── Keep the global ordering invariant: video tracks above audio
+    // tracks. Cheap when already sorted.
+    state.enforce_track_order();
 
     // Empty state
     if state.scene.actors.is_empty() && state.scene.overlays.is_empty()
@@ -2071,9 +1897,9 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
         state.selection = sel;
     }
 
-    // ── Library asset drag-to-track: drop handling ──
-    // When an asset is being dragged from the library and mouse is released over timeline,
-    // determine which track row and time position to drop it on.
+    // ── Library clip drag-to-track: drop handling ──
+    // When the user releases a clip dragged from the library, decide which
+    // video lane it lands on and at what time, then add it as an actor.
     let mouse_released = ui.input(|i| i.pointer.any_released());
     if state.asset_drag.dragging.is_some() && mouse_released {
         let mouse_pos = ui.input(|i| i.pointer.hover_pos());
@@ -2090,11 +1916,6 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                 }
                 None
             })();
-            // Whether the cursor is inside the timeline's content rect at all.
-            let inside_tracks = pos.x >= track_left
-                && pos.x <= tracks_rect.max.x
-                && pos.y >= tracks_rect.min.y
-                && pos.y <= tracks_rect.max.y;
 
             // Determine time position from X
             let drop_time = x_to_time(pos.x, state.timeline_scroll, pps, track_left)
@@ -2103,90 +1924,28 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             let asset_path = state.asset_drag.dragging.clone().unwrap();
             let kind = state.asset_drag.kind;
 
-            match kind {
-                AssetDragKind::Clip => {
-                    // Decide what track the new actor lands on:
-                    //   1. The exact video track under the cursor, when present
-                    //      and unlocked.
-                    //   2. Otherwise, append a brand-new video track at the end
-                    //      and assign the actor to it (so dropping into empty
-                    //      space still creates a *new layer*).
-                    let target = drop_track
-                        .filter(|i| state.tracks[*i].kind == TrackKind::Video
-                            && !state.tracks[*i].locked);
-                    let assigned = match target {
-                        Some(t) => t,
-                        None => {
-                            // Append new video track at the end.
-                            state.add_video_track();
-                            state.tracks.len() - 1
-                        }
-                    };
-                    add_actor_from_clip_at_time(state, &asset_path, drop_time);
-                    if let Some(new_idx) = state.scene.actors.len().checked_sub(1) {
-                        state.actor_track_assignments.insert(new_idx, assigned);
-                    }
+            if matches!(kind, AssetDragKind::Clip) {
+                // Pick the destination video lane:
+                //   1. The lane under the cursor when it's an unlocked video lane.
+                //   2. Otherwise, create a new video lane just above the
+                //      audio block so the dropped clip gets its own layer.
+                let target = drop_track
+                    .filter(|i| state.tracks[*i].kind == TrackKind::Video
+                        && !state.tracks[*i].locked);
+                let assigned = match target {
+                    Some(t) => t,
+                    None => state.insert_video_track_at_bottom(),
+                };
+                add_actor_from_clip_at_time(state, &asset_path, drop_time);
+                if let Some(new_idx) = state.scene.actors.len().checked_sub(1) {
+                    state.actor_track_assignments.insert(new_idx, assigned);
+                    // The bound audio (added by add_actor_from_clip_at_time)
+                    // mirrors the actor's lane via sync_bound_audio_lanes()
+                    // at the end of the frame.
                 }
-                AssetDragKind::Background => {
-                    // Add background starting at that time
-                    add_background_from_path_at_time(state, &asset_path, drop_time);
-                }
-                AssetDragKind::Prop => {
-                    // Add as image overlay at drop time
-                    let id = asset_path.file_stem().and_then(|s| s.to_str())
-                        .map(|s| format!("img_{}", s))
-                        .unwrap_or_else(|| format!("img_{}", state.scene.overlays.len() + 1));
-                    let overlay = Overlay::Image(ImageOverlay {
-                        id: id.clone(),
-                        source: asset_path.clone(),
-                        t_in: drop_time,
-                        t_out: (drop_time + 3.0).min(state.scene.output.duration),
-                        layout: vec![Keyframe::new(0.0, OverlayState {
-                            pos: [0.5, 0.5], scale: 0.3, scale_y: 1.0, rotation_deg: 0.0, opacity: 1.0
-                        })],
-                    });
-                    state.scene.overlays.push(overlay);
-                    state.selection = Selection::Overlay(state.scene.overlays.len() - 1);
-                    state.status = format!("Dropped overlay: {}", id);
-                }
-                AssetDragKind::Audio => {
-                    // Add audio track at drop time
-                    let id = asset_path.file_stem().and_then(|s| s.to_str())
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| format!("audio_{}", state.scene.audio.len() + 1));
-                    state.scene.audio.push(AudioTrack {
-                        id,
-                        source: asset_path.clone(),
-                        t_in: drop_time,
-                        t_out: None,
-                        source_start: 0.0,
-                        volume: 1.0,
-                        parent_actor: None,
-                    });
-                    let new_idx = state.scene.audio.len() - 1;
-                    // Resolve audio target lane the same way as clips: under
-                    // the cursor → that audio track; otherwise → append a new
-                    // audio lane.
-                    let target = drop_track
-                        .filter(|i| state.tracks[*i].kind == TrackKind::Audio
-                            && !state.tracks[*i].locked);
-                    let assigned = match target {
-                        Some(t) => t,
-                        None => {
-                            state.add_audio_track();
-                            state.tracks.len() - 1
-                        }
-                    };
-                    state.audio_track_assignments.insert(new_idx, assigned);
-                    state.selection = Selection::Audio(new_idx);
-                    state.status = "Dropped audio track.".into();
-                }
-                AssetDragKind::None => {}
             }
 
-            let _ = inside_tracks; // currently informational only
-
-            // Clear the drag state
+            // Clear the drag state.
             state.asset_drag.dragging = None;
             state.asset_drag.kind = AssetDragKind::None;
             state.asset_drag.label.clear();
@@ -2202,69 +1961,39 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
         }
         let drag_pos = egui::pos2(state.asset_drag.pos[0], state.asset_drag.pos[1]);
 
-        // Highlight the destination track (under cursor or "new layer").
-        let dest_label = match state.asset_drag.kind {
-            AssetDragKind::Clip => {
-                let target = (|| {
-                    for (i, (top, bot)) in track_rows.iter().enumerate() {
-                        if drag_pos.y >= *top && drag_pos.y < *bot
-                            && state.tracks[i].kind == TrackKind::Video {
-                            return Some((*top, *bot, state.tracks[i].name.clone()));
-                        }
+        // Highlight the destination video lane (under cursor) or hint at
+        // "new layer" when the cursor is in empty space.
+        let dest_label = if matches!(state.asset_drag.kind, AssetDragKind::Clip) {
+            let target = (|| {
+                for (i, (top, bot)) in track_rows.iter().enumerate() {
+                    if drag_pos.y >= *top && drag_pos.y < *bot
+                        && state.tracks[i].kind == TrackKind::Video {
+                        return Some((*top, *bot, state.tracks[i].name.clone()));
                     }
-                    None
-                })();
-                if let Some((top, bot, name)) = target {
-                    let highlight = egui::Rect::from_min_max(
-                        egui::pos2(tracks_rect.min.x, top),
-                        egui::pos2(tracks_rect.max.x, bot),
-                    );
-                    ui.painter().rect_filled(
-                        highlight,
-                        Rounding::same(2.0),
-                        Color32::from_rgba_premultiplied(120, 220, 120, 30),
-                    );
-                    ui.painter().rect_stroke(
-                        highlight,
-                        Rounding::same(2.0),
-                        Stroke::new(1.5, Color32::from_rgb(120, 220, 120)),
-                    );
-                    format!("\u{2192} {}", name)
-                } else {
-                    "\u{2192} New layer".to_string()
                 }
+                None
+            })();
+            if let Some((top, bot, name)) = target {
+                let highlight = egui::Rect::from_min_max(
+                    egui::pos2(tracks_rect.min.x, top),
+                    egui::pos2(tracks_rect.max.x, bot),
+                );
+                ui.painter().rect_filled(
+                    highlight,
+                    Rounding::same(2.0),
+                    Color32::from_rgba_premultiplied(120, 220, 120, 30),
+                );
+                ui.painter().rect_stroke(
+                    highlight,
+                    Rounding::same(2.0),
+                    Stroke::new(1.5, Color32::from_rgb(120, 220, 120)),
+                );
+                format!("\u{2192} {}", name)
+            } else {
+                "\u{2192} New layer".to_string()
             }
-            AssetDragKind::Audio => {
-                let target = (|| {
-                    for (i, (top, bot)) in track_rows.iter().enumerate() {
-                        if drag_pos.y >= *top && drag_pos.y < *bot
-                            && state.tracks[i].kind == TrackKind::Audio {
-                            return Some((*top, *bot, state.tracks[i].name.clone()));
-                        }
-                    }
-                    None
-                })();
-                if let Some((top, bot, name)) = target {
-                    let highlight = egui::Rect::from_min_max(
-                        egui::pos2(tracks_rect.min.x, top),
-                        egui::pos2(tracks_rect.max.x, bot),
-                    );
-                    ui.painter().rect_filled(
-                        highlight,
-                        Rounding::same(2.0),
-                        Color32::from_rgba_premultiplied(120, 200, 220, 30),
-                    );
-                    ui.painter().rect_stroke(
-                        highlight,
-                        Rounding::same(2.0),
-                        Stroke::new(1.5, Color32::from_rgb(120, 200, 220)),
-                    );
-                    format!("\u{2192} {}", name)
-                } else {
-                    "\u{2192} New audio lane".to_string()
-                }
-            }
-            _ => String::new(),
+        } else {
+            String::new()
         };
 
         // Floating preview card next to the cursor: thumbnail + label.
@@ -2305,11 +2034,8 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
         } else {
             ui.painter().rect_filled(thumb_rect, Rounding::same(3.0), Color32::from_rgb(40, 40, 60));
             let icon = match state.asset_drag.kind {
-                AssetDragKind::Clip       => "\u{1F3AC}",
-                AssetDragKind::Background => "\u{1F5BC}",
-                AssetDragKind::Prop       => "\u{1F4CC}",
-                AssetDragKind::Audio      => "\u{1F3B5}",
-                _                         => "?",
+                AssetDragKind::Clip => "\u{1F3AC}",
+                _ => "?",
             };
             ui.painter().text(
                 thumb_rect.center(),
@@ -3087,490 +2813,6 @@ fn format_time(t: f32) -> String {
 }
 
 
-// ─── PREVIEW ─────────────────────────────────────────────────────────
-
-pub fn preview(ui: &mut egui::Ui, state: &mut EditorState) {
-    let avail = ui.available_size_before_wrap();
-    let target_aspect = state.scene.output.resolution[0] as f32 / state.scene.output.resolution[1] as f32;
-    let mut h = avail.y.min(800.0);
-    let mut w = h * target_aspect;
-    if w > avail.x { w = avail.x; h = w / target_aspect; }
-
-    let offset_x = (avail.x - w) * 0.5;
-    let offset_y = (avail.y - h) * 0.5;
-
-    // Preview needs click+drag for gizmo manipulation
-    let (full_rect, preview_resp) = ui.allocate_exact_size(avail, Sense::click_and_drag());
-    let rect = egui::Rect::from_min_size(
-        egui::pos2(full_rect.min.x + offset_x, full_rect.min.y + offset_y), Vec2::new(w, h));
-
-    ui.painter().rect_filled(rect, Rounding::same(6.0), Color32::from_rgb(10, 10, 16));
-
-    // Render ALL visible actors (composited bottom-to-top) using frame_at_time for texture reuse
-    let t = state.playhead;
-    let mut any_frame_shown = false;
-
-    // Collect actor info to avoid borrow conflicts
-    let actor_data: Vec<_> = state.scene.actors.iter().enumerate().map(|(idx, actor)| {
-        (idx, actor.visible, actor.t_in.unwrap_or(0.0), actor.t_out.unwrap_or(f32::MAX),
-         actor.source_start, actor.chroma_key.clone(),
-         actor.layout.first().map(|kf| kf.value).unwrap_or_default(),
-         actor.transition_in, actor.transition_out, actor.transition_duration)
-    }).collect();
-
-    for (actor_idx, visible, t_in, t_out, source_start, ref chroma_key,
-         actor_state, trans_in, trans_out, trans_dur) in actor_data.iter() {
-        if !visible { continue; }
-        if t < *t_in || t > *t_out { continue; }
-
-        let local_t = t - t_in + source_start;
-
-        // Compute transition modulation (opacity + slide offset, normalized).
-        let (trans_alpha, trans_offset) =
-            compute_actor_transition(t, *t_in, *t_out, *trans_in, *trans_out, *trans_dur);
-
-        if let Some(fc) = state.frame_caches.get_mut(*actor_idx) {
-            if fc.is_ready() {
-                // Use frame_at_time which reuses a single TextureHandle per actor (no allocation per frame)
-                if let Some(tex) = fc.frame_at_time(local_t, ui.ctx()) {
-                    // Compute actor rect based on layout state (position/scale)
-                    let ax = actor_state.pos[0] + trans_offset[0];
-                    let ay = actor_state.pos[1] + trans_offset[1];
-                    let ascale = actor_state.scale;
-                    let rotation_rad = actor_state.rotation_deg.to_radians();
-
-                    // Use native texture aspect ratio to prevent distortion
-                    let tex_size = tex.size_vec2();
-                    let tex_aspect = tex_size.x / tex_size.y;
-                    // Scale relative to preview rect, preserving source aspect ratio
-                    let actor_h = rect.height() * ascale * 0.5;
-                    let actor_w = actor_h * tex_aspect;
-                    let cx = rect.min.x + ax * rect.width();
-                    let cy = rect.min.y + ay * rect.height();
-
-                    let final_alpha = (actor_state.opacity * trans_alpha).clamp(0.0, 1.0);
-                    let tint = Color32::from_rgba_unmultiplied(255, 255, 255, (final_alpha * 255.0) as u8);
-
-                    if rotation_rad.abs() > 0.001 {
-                        // Draw rotated: compute rotated corner positions
-                        let cos_r = rotation_rad.cos();
-                        let sin_r = rotation_rad.sin();
-                        let hw = actor_w * 0.5;
-                        let hh = actor_h * 0.5;
-
-                        // Corners relative to center (top-left, top-right, bottom-right, bottom-left)
-                        let corners_local = [
-                            [-hw, -hh],
-                            [ hw, -hh],
-                            [ hw,  hh],
-                            [-hw,  hh],
-                        ];
-
-                        // Rotate each corner and translate to screen position
-                        let rotated_positions: Vec<egui::Pos2> = corners_local.iter().map(|[lx, ly]| {
-                            let rx = lx * cos_r - ly * sin_r + cx;
-                            let ry = lx * sin_r + ly * cos_r + cy;
-                            egui::pos2(rx, ry)
-                        }).collect();
-
-                        // UV corners matching position corners (TL, TR, BR, BL)
-                        let uv_corners = [
-                            egui::pos2(0.0, 0.0),
-                            egui::pos2(1.0, 0.0),
-                            egui::pos2(1.0, 1.0),
-                            egui::pos2(0.0, 1.0),
-                        ];
-
-                        // Draw as two textured triangles via mesh
-                        let mut mesh = egui::Mesh::with_texture(tex.id());
-                        for i in 0..4 {
-                            mesh.vertices.push(egui::epaint::Vertex {
-                                pos: rotated_positions[i],
-                                uv: uv_corners[i],
-                                color: tint,
-                            });
-                        }
-                        // Triangle 1: TL, TR, BR
-                        mesh.indices.extend_from_slice(&[0, 1, 2]);
-                        // Triangle 2: TL, BR, BL
-                        mesh.indices.extend_from_slice(&[0, 2, 3]);
-
-                        ui.painter().add(egui::Shape::mesh(mesh));
-                    } else {
-                        // No rotation: draw axis-aligned image (fast path)
-                        let actor_rect = egui::Rect::from_center_size(
-                            egui::pos2(cx, cy), Vec2::new(actor_w, actor_h));
-                        let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-                        ui.painter().image(tex.id(), actor_rect, uv, tint);
-                    }
-                    any_frame_shown = true;
-                }
-            } else if fc.extracting && !any_frame_shown {
-                ui.put(rect, egui::Label::new(
-                    RichText::new("Extracting frames...").color(Color32::from_rgb(180, 150, 60)).size(14.0)));
-            }
-        }
-    }
-
-    // ─── GIZMO: Interactive transform on selected actor ───
-    if let Selection::Actor(sel_idx) = state.selection {
-        if sel_idx < state.scene.actors.len() {
-            let a = &state.scene.actors[sel_idx];
-            if let Some(kf) = a.layout.first() {
-                let ax = kf.value.pos[0];
-                let ay = kf.value.pos[1];
-                let ascale = kf.value.scale;
-
-                // Use source aspect ratio for gizmo too
-                let tex_aspect = if let Some(fc) = state.frame_caches.get(sel_idx) {
-                    if fc.is_ready() && fc.source_width > 0 && fc.source_height > 0 {
-                        fc.source_width as f32 / fc.source_height as f32
-                    } else { 9.0 / 16.0 }
-                } else { 9.0 / 16.0 };
-                let actor_h = rect.height() * ascale * 0.5;
-                let actor_w = actor_h * tex_aspect;
-                let cx = rect.min.x + ax * rect.width();
-                let cy = rect.min.y + ay * rect.height();
-                let gizmo_rect = egui::Rect::from_center_size(egui::pos2(cx, cy), Vec2::new(actor_w, actor_h));
-
-                // Draw selection frame
-                ui.painter().rect_stroke(gizmo_rect, Rounding::same(2.0),
-                    Stroke::new(2.0, Color32::from_rgb(255, 220, 80)));
-
-                // Corner handles
-                let handle_size = 8.0;
-                let corners = [gizmo_rect.left_top(), gizmo_rect.right_top(),
-                               gizmo_rect.left_bottom(), gizmo_rect.right_bottom()];
-                for corner in &corners {
-                    let hr = egui::Rect::from_center_size(*corner, Vec2::splat(handle_size));
-                    ui.painter().rect_filled(hr, Rounding::same(2.0), Color32::from_rgb(255, 220, 80));
-                }
-
-                // Center crosshair
-                ui.painter().circle_stroke(egui::pos2(cx, cy), 6.0,
-                    Stroke::new(1.5, Color32::from_rgb(255, 220, 80)));
-            }
-
-            // Handle drag on preview to move actor position
-            if preview_resp.dragged() && !state.eyedropper_active {
-                let delta = preview_resp.drag_delta();
-                let dx_norm = delta.x / rect.width();
-                let dy_norm = delta.y / rect.height();
-
-                if let Some(kf) = state.scene.actors[sel_idx].layout.first_mut() {
-                    kf.value.pos[0] = (kf.value.pos[0] + dx_norm).clamp(-0.5, 1.5);
-                    kf.value.pos[1] = (kf.value.pos[1] + dy_norm).clamp(-0.5, 1.5);
-                }
-            }
-
-            // Handle scroll wheel on preview to scale actor
-            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-            if scroll.abs() > 0.5 && preview_resp.hovered() {
-                let scale_delta = scroll * 0.002;
-                if let Some(kf) = state.scene.actors[sel_idx].layout.first_mut() {
-                    kf.value.scale = (kf.value.scale + scale_delta).clamp(0.05, 5.0);
-                }
-            }
-        }
-    }
-
-    // ─── TEXT OVERLAY RENDERING & INLINE EDITING ───
-    {
-        let playhead = state.playhead;
-        let mut clicked_overlay: Option<usize> = None;
-
-        for (ov_idx, ov) in state.scene.overlays.iter().enumerate() {
-            if let Overlay::Text(text_ov) = ov {
-                // Check if overlay is active at current playhead
-                if playhead >= text_ov.t_in && playhead <= text_ov.t_out {
-                    // Calculate position on preview rect
-                    let ov_state = text_ov.layout.first()
-                        .map(|kf| kf.value)
-                        .unwrap_or_default();
-                    let ox = rect.min.x + ov_state.pos[0] * rect.width();
-                    let oy = rect.min.y + ov_state.pos[1] * rect.height();
-                    let scale_factor = ov_state.scale * (rect.width() / 1080.0);
-                    let font_size = text_ov.style.font_size * scale_factor * 0.3;
-
-                    // Draw the text at that position
-                    let text_color = Color32::from_rgb(
-                        text_ov.style.color[0],
-                        text_ov.style.color[1],
-                        text_ov.style.color[2],
-                    );
-
-                    let galley = ui.painter().layout_no_wrap(
-                        text_ov.text.clone(),
-                        egui::FontId::proportional(font_size.max(8.0)),
-                        text_color,
-                    );
-                    let text_rect = egui::Rect::from_center_size(
-                        egui::pos2(ox, oy),
-                        galley.size(),
-                    );
-
-                    // Draw background plate if configured
-                    if let Some(box_col) = text_ov.style.box_color {
-                        let pad = 4.0;
-                        let bg_rect = text_rect.expand(pad);
-                        ui.painter().rect_filled(
-                            bg_rect,
-                            Rounding::same(2.0),
-                            Color32::from_rgb(box_col[0], box_col[1], box_col[2]),
-                        );
-                    }
-
-                    ui.painter().galley(text_rect.min, galley, text_color);
-
-                    // Check if user clicked on this text overlay region
-                    if preview_resp.clicked() && !state.eyedropper_active {
-                        if let Some(pos) = preview_resp.interact_pointer_pos() {
-                            if text_rect.expand(6.0).contains(pos) {
-                                clicked_overlay = Some(ov_idx);
-                            }
-                        }
-                    }
-
-                    // Draw selection indicator if this overlay is selected
-                    if state.selection == Selection::Overlay(ov_idx) {
-                        ui.painter().rect_stroke(
-                            text_rect.expand(3.0),
-                            Rounding::same(2.0),
-                            Stroke::new(1.5, Color32::from_rgb(80, 200, 120)),
-                        );
-                    }
-                }
-            }
-        }
-
-        // Handle click selection
-        if let Some(ov_idx) = clicked_overlay {
-            state.selection = Selection::Overlay(ov_idx);
-            state.editing_text_overlay = Some(ov_idx);
-        }
-
-        // Handle Escape to stop editing
-        let escape_pressed = ui.input(|i| i.key_pressed(egui::Key::Escape));
-        if escape_pressed {
-            state.editing_text_overlay = None;
-        }
-
-        // If clicked outside overlays on preview (and not eyedropper), stop editing
-        if preview_resp.clicked() && !state.eyedropper_active && clicked_overlay.is_none() {
-            state.editing_text_overlay = None;
-        }
-
-        // Show floating TextEdit when editing_text_overlay is Some
-        if let Some(edit_idx) = state.editing_text_overlay {
-            if edit_idx < state.scene.overlays.len() {
-                if let Overlay::Text(text_ov) = &state.scene.overlays[edit_idx] {
-                    let ov_state = text_ov.layout.first()
-                        .map(|kf| kf.value)
-                        .unwrap_or_default();
-                    let ox = rect.min.x + ov_state.pos[0] * rect.width();
-                    let oy = rect.min.y + ov_state.pos[1] * rect.height();
-
-                    let area_id = ui.id().with("text_edit_overlay");
-                    egui::Area::new(area_id)
-                        .fixed_pos(egui::pos2(ox - 80.0, oy + 15.0))
-                        .show(ui.ctx(), |ui| {
-                            egui::Frame::popup(ui.style()).show(ui, |ui| {
-                                if let Overlay::Text(ref mut t) = &mut state.scene.overlays[edit_idx] {
-                                    let response = ui.add(
-                                        egui::TextEdit::multiline(&mut t.text)
-                                            .desired_width(200.0)
-                                            .desired_rows(2)
-                                            .hint_text("Enter text...")
-                                    );
-                                    if response.lost_focus() {
-                                        state.editing_text_overlay = None;
-                                    }
-                                }
-                            });
-                        });
-                }
-            }
-        }
-    }
-
-    // Eyedropper handling
-    if state.eyedropper_active && preview_resp.clicked() {
-        if let Some(pos) = preview_resp.interact_pointer_pos() {
-            let u = ((pos.x - rect.min.x) / rect.width()).clamp(0.0, 1.0);
-            let v = ((pos.y - rect.min.y) / rect.height()).clamp(0.0, 1.0);
-            if let Selection::Actor(idx) = state.selection {
-                if idx < state.scene.actors.len() {
-                    let t_in = state.scene.actors[idx].t_in.unwrap_or(0.0);
-                    let src_start = state.scene.actors[idx].source_start;
-                    let local_t = state.playhead - t_in + src_start;
-                    if let Some(fc) = state.frame_caches.get_mut(idx) {
-                        if let Some(img) = fc.raw_frame_at_time(local_t) {
-                            let px = ((u * img.size[0] as f32) as usize).min(img.size[0].saturating_sub(1));
-                            let py = ((v * img.size[1] as f32) as usize).min(img.size[1].saturating_sub(1));
-                            let pixel = img.pixels[py * img.size[0] + px];
-                            state.scene.actors[idx].chroma_key.key_color = [pixel.r(), pixel.g(), pixel.b()];
-                            state.status = format!("Picked: ({}, {}, {})", pixel.r(), pixel.g(), pixel.b());
-                        }
-                    }
-                }
-            }
-            state.eyedropper_active = false;
-        }
-    }
-    if state.eyedropper_active && preview_resp.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
-    }
-
-    if !any_frame_shown && state.frame_caches.is_empty() {
-        ui.put(rect, egui::Label::new(
-            RichText::new("Preview\n\nAdd clips and hit play").color(Color32::from_rgb(60, 60, 80)).size(14.0)));
-    } else if !any_frame_shown {
-        ui.put(rect, egui::Label::new(
-            RichText::new("No clip active at this time").color(Color32::from_rgb(60, 60, 80)).size(13.0)));
-    }
-}
-
-
-/// Compute the visual modulation produced by `transition_in` / `transition_out`
-/// at scene time `t` for an actor whose visible window is `[t_in, t_out]`.
-///
-/// Returns `(alpha, [dx, dy])` where `alpha` is multiplied with the actor's
-/// existing opacity and `[dx, dy]` is a normalised position offset (scene
-/// space, [0, 1] coordinates).
-fn compute_actor_transition(
-    t: f32,
-    t_in: f32,
-    t_out: f32,
-    trans_in: Transition,
-    trans_out: Transition,
-    duration: f32,
-) -> (f32, [f32; 2]) {
-    if duration <= 0.0 {
-        return (1.0, [0.0, 0.0]);
-    }
-    let mut alpha = 1.0_f32;
-    let mut offset = [0.0_f32, 0.0_f32];
-
-    // In transition: progress from 0 → 1 across the first `duration` seconds.
-    if t >= t_in && t <= t_in + duration && !matches!(trans_in, Transition::Cut) {
-        let p = ((t - t_in) / duration).clamp(0.0, 1.0);
-        match trans_in {
-            Transition::Fade | Transition::Snap => alpha = p,
-            Transition::SlideLeft => offset[0] = -(1.0 - p),
-            Transition::SlideRight => offset[0] = 1.0 - p,
-            Transition::SlideUp => offset[1] = -(1.0 - p),
-            Transition::SlideDown => offset[1] = 1.0 - p,
-            Transition::Cut => {}
-        }
-    }
-
-    // Out transition: progress from 0 → 1 across the last `duration` seconds.
-    if t <= t_out && t >= t_out - duration && !matches!(trans_out, Transition::Cut) {
-        let p = ((t_out - t) / duration).clamp(0.0, 1.0);
-        // p == 1 at t_out - duration (start of out), 0 at t_out (full out)
-        match trans_out {
-            Transition::Fade | Transition::Snap => alpha = alpha.min(p),
-            Transition::SlideLeft => offset[0] += -(1.0 - p),
-            Transition::SlideRight => offset[0] += 1.0 - p,
-            Transition::SlideUp => offset[1] += -(1.0 - p),
-            Transition::SlideDown => offset[1] += 1.0 - p,
-            Transition::Cut => {}
-        }
-    }
-
-    (alpha.clamp(0.0, 1.0), offset)
-}
-
-
-/// Apply chroma-key processing to a ColorImage.
-fn apply_chroma_key(image: &mut egui::ColorImage, params: &ChromaKeyParams) {
-    let kr = params.key_color[0] as f32 / 255.0;
-    let kg = params.key_color[1] as f32 / 255.0;
-    let kb = params.key_color[2] as f32 / 255.0;
-    let similarity = params.similarity;
-    let blend = params.blend;
-    let spill = params.spill;
-
-    for pixel in image.pixels.iter_mut() {
-        let r = pixel.r() as f32 / 255.0;
-        let g = pixel.g() as f32 / 255.0;
-        let b = pixel.b() as f32 / 255.0;
-
-        let dr = r - kr;
-        let dg = g - kg;
-        let db = b - kb;
-        let distance = (dr * dr + dg * dg + db * db).sqrt() / 1.732_050_8;
-
-        if distance < similarity {
-            *pixel = Color32::from_rgba_unmultiplied(pixel.r(), pixel.g(), pixel.b(), 0);
-        } else if distance < similarity + blend {
-            let t = (distance - similarity) / blend.max(0.001);
-            let alpha = (t * 255.0).round() as u8;
-            let mut new_g = pixel.g() as f32;
-            let spill_factor = spill * (1.0 - distance);
-            new_g = (new_g - new_g * spill_factor).max(0.0);
-            *pixel = Color32::from_rgba_unmultiplied(pixel.r(), new_g.round() as u8, pixel.b(), alpha);
-        } else if distance < similarity + blend + 0.15 {
-            let proximity = 1.0 - ((distance - similarity - blend) / 0.15).clamp(0.0, 1.0);
-            let spill_factor = spill * proximity;
-            let new_g = (pixel.g() as f32 * (1.0 - spill_factor)).round() as u8;
-            *pixel = Color32::from_rgba_unmultiplied(pixel.r(), new_g, pixel.b(), pixel.a());
-        }
-    }
-}
-
-/// Apply color correction (brightness, contrast, saturation, temperature) to a ColorImage.
-pub fn apply_color_correction(image: &mut egui::ColorImage, params: &memstroy_core::ColorCorrection) {
-    // Early exit if parameters are all defaults
-    if (params.brightness - 0.0).abs() < 0.001
-        && (params.contrast - 1.0).abs() < 0.001
-        && (params.saturation - 1.0).abs() < 0.001
-        && (params.temperature - 0.0).abs() < 0.001
-    {
-        return;
-    }
-
-    for pixel in image.pixels.iter_mut() {
-        let mut r = pixel.r() as f32 / 255.0;
-        let mut g = pixel.g() as f32 / 255.0;
-        let mut b = pixel.b() as f32 / 255.0;
-
-        // Brightness: add offset
-        r += params.brightness;
-        g += params.brightness;
-        b += params.brightness;
-
-        // Contrast: multiply around midpoint 0.5
-        r = (r - 0.5) * params.contrast + 0.5;
-        g = (g - 0.5) * params.contrast + 0.5;
-        b = (b - 0.5) * params.contrast + 0.5;
-
-        // Saturation: lerp toward luminance
-        let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-        r = luma + (r - luma) * params.saturation;
-        g = luma + (g - luma) * params.saturation;
-        b = luma + (b - luma) * params.saturation;
-
-        // Temperature: shift warm (positive) / cool (negative)
-        // Positive temperature: add red, subtract blue
-        // Negative temperature: add blue, subtract red
-        r += params.temperature * 0.1;
-        b -= params.temperature * 0.1;
-
-        // Clamp
-        r = r.clamp(0.0, 1.0);
-        g = g.clamp(0.0, 1.0);
-        b = b.clamp(0.0, 1.0);
-
-        *pixel = Color32::from_rgba_unmultiplied(
-            (r * 255.0).round() as u8,
-            (g * 255.0).round() as u8,
-            (b * 255.0).round() as u8,
-            pixel.a(),
-        );
-    }
-}
-
 // ─── HELPERS ─────────────────────────────────────────────────────────
 
 fn color_edit_u8(ui: &mut egui::Ui, c: &mut [u8; 3]) -> bool {
@@ -3737,31 +2979,6 @@ pub fn add_text_overlay(state: &mut EditorState) -> usize {
     idx
 }
 
-fn add_background_from_path(state: &mut EditorState, path: &PathBuf) {
-    let id = path.file_stem().and_then(|s| s.to_str())
-        .map(|s| s.to_string()).unwrap_or_else(|| format!("bg_{}", state.scene.backgrounds.len() + 1));
-
-    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-    let source = if ["jpg", "jpeg", "png", "webp"].iter().any(|e| e.eq_ignore_ascii_case(ext)) {
-        MediaSource::Image { path: path.clone() }
-    } else {
-        MediaSource::Video { path: path.clone(), r#loop: true, start_at: 0.0 }
-    };
-
-    let dur = if ["mp4", "mov", "webm"].iter().any(|e| e.eq_ignore_ascii_case(ext)) {
-        probe_video_duration(path)
-    } else { state.scene.output.duration };
-
-    let bg = Background {
-        id, source, start: state.playhead,
-        duration: dur.min(state.scene.output.duration - state.playhead),
-        fit: Fit::Cover, transition: Transition::Cut,
-    };
-    state.scene.backgrounds.push(bg);
-    state.selection = Selection::Background(state.scene.backgrounds.len() - 1);
-    state.status = "Background added".into();
-}
-
 /// Add an actor from a clip at a specific time (used by drag-to-track).
 fn add_actor_from_clip_at_time(state: &mut EditorState, path: &PathBuf, t: f32) {
     let counter = state.scene.actors.len() + 1;
@@ -3813,32 +3030,8 @@ fn add_actor_from_clip_at_time(state: &mut EditorState, path: &PathBuf, t: f32) 
     state.status = format!("Dropped actor: {}", id);
 }
 
-/// Add a background at a specific time (used by drag-to-track).
-fn add_background_from_path_at_time(state: &mut EditorState, path: &PathBuf, t: f32) {
-    let id = path.file_stem().and_then(|s| s.to_str())
-        .map(|s| s.to_string()).unwrap_or_else(|| format!("bg_{}", state.scene.backgrounds.len() + 1));
-
-    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-    let source = if ["jpg", "jpeg", "png", "webp"].iter().any(|e| e.eq_ignore_ascii_case(ext)) {
-        MediaSource::Image { path: path.clone() }
-    } else {
-        MediaSource::Video { path: path.clone(), r#loop: true, start_at: 0.0 }
-    };
-
-    let dur = if ["mp4", "mov", "webm"].iter().any(|e| e.eq_ignore_ascii_case(ext)) {
-        probe_video_duration(path)
-    } else { state.scene.output.duration };
-
-    let bg = Background {
-        id, source, start: t,
-        duration: dur.min(state.scene.output.duration - t),
-        fit: Fit::Cover, transition: Transition::Cut,
-    };
-    state.scene.backgrounds.push(bg);
-    state.selection = Selection::Background(state.scene.backgrounds.len() - 1);
-    state.status = "Background dropped".into();
-}
-
+/// Probe a media file and return its duration in seconds (5.0s fallback
+/// when ffprobe isn't available or the file can't be opened).
 fn probe_video_duration(path: &PathBuf) -> f32 {
     let ffprobe = {
         let mut p = memstroy_render::ffmpeg_binary();
@@ -3855,127 +3048,54 @@ fn probe_video_duration(path: &PathBuf) -> f32 {
 }
 
 
-// ─── KEYBOARD SHORTCUTS ──────────────────────────────────────────────
 
-/// Handle JKL/IO keyboard shortcuts for playback and clip trimming.
-///
-/// - J: decrease playback speed or play backwards
-/// - K: pause
-/// - L: increase playback speed or start playing
-/// - I: set t_in of selected clip to current playhead
-/// - O: set t_out of selected clip to current playhead
-pub fn handle_keyboard_shortcuts(ctx: &egui::Context, state: &mut EditorState) {
-    let j_pressed = ctx.input(|i| i.key_pressed(egui::Key::J));
-    let k_pressed = ctx.input(|i| i.key_pressed(egui::Key::K));
-    let l_pressed = ctx.input(|i| i.key_pressed(egui::Key::L));
-    let i_pressed = ctx.input(|i| i.key_pressed(egui::Key::I));
-    let o_pressed = ctx.input(|i| i.key_pressed(egui::Key::O));
 
-    // J: decrease speed or reverse
-    if j_pressed {
-        if !state.playing {
-            state.playing = true;
-            state.playback_speed = -1.0;
-        } else if state.playback_speed > -4.0 {
-            state.playback_speed = (state.playback_speed - 1.0).max(-4.0);
-            if state.playback_speed == 0.0 {
-                state.playback_speed = -1.0;
-            }
+// ─── BOUND-AUDIO LANE MIRRORING ──────────────────────────────────────
+
+/// Make sure every audio row that has a `parent_actor` lives on the audio
+/// lane that mirrors its parent's video lane (actor on the i-th video lane
+/// → bound audio on the i-th audio lane). Standalone audio rows keep the
+/// user's own placement. New audio lanes are appended on demand if there
+/// aren't enough to cover the deepest video lane in use.
+pub(crate) fn sync_bound_audio_lanes(state: &mut EditorState) {
+    let videos = state.video_track_indices();
+    if videos.is_empty() {
+        return;
+    }
+
+    // Resolve each actor's video-lane index, by id.
+    let mut actor_track_for_id: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for (ai, a) in state.scene.actors.iter().enumerate() {
+        let track = state
+            .actor_track_assignments
+            .get(&ai)
+            .copied()
+            .unwrap_or_else(|| videos.first().copied().unwrap_or(0));
+        actor_track_for_id.insert(a.id.clone(), track);
+    }
+
+    // Compute (audio_idx, vt_pos) targets for every bound audio row.
+    let mut targets: Vec<(usize, usize)> = Vec::new();
+    for (au_idx, au) in state.scene.audio.iter().enumerate() {
+        let Some(parent_id) = au.parent_actor.as_deref() else { continue };
+        let Some(&video_track) = actor_track_for_id.get(parent_id) else { continue };
+        let Some(vt_pos) = videos.iter().position(|&t| t == video_track) else { continue };
+        targets.push((au_idx, vt_pos));
+    }
+
+    // Append new audio lanes if any actor's video position exceeds the
+    // current audio-lane count.
+    if let Some(&max_pos) = targets.iter().map(|(_, p)| p).max() {
+        while state.audio_track_indices().len() <= max_pos {
+            state.add_audio_track();
         }
     }
 
-    // K: pause
-    if k_pressed {
-        state.playing = false;
-    }
-
-    // L: increase speed or start playing
-    if l_pressed {
-        if !state.playing {
-            state.playing = true;
-            state.playback_speed = 1.0;
-        } else if state.playback_speed < 4.0 {
-            state.playback_speed = (state.playback_speed + 1.0).min(4.0);
-            if state.playback_speed == 0.0 {
-                state.playback_speed = 1.0;
-            }
-        }
-    }
-
-    // I: set t_in of selected clip to current playhead
-    if i_pressed {
-        let ph = state.playhead;
-        match state.selection {
-            Selection::Actor(idx) => {
-                if idx < state.scene.actors.len() {
-                    state.scene.actors[idx].t_in = Some(ph);
-                    sync_audio_to_actor(state, idx);
-                    state.status = format!("Set in-point to {:.2}s", ph);
-                }
-            }
-            Selection::Overlay(idx) => {
-                if idx < state.scene.overlays.len() {
-                    match &mut state.scene.overlays[idx] {
-                        Overlay::Text(t) => { t.t_in = ph; }
-                        Overlay::Image(im) => { im.t_in = ph; }
-                        Overlay::Video(v) => { v.t_in = ph; }
-                    }
-                    state.status = format!("Set in-point to {:.2}s", ph);
-                }
-            }
-            Selection::Background(idx) => {
-                if idx < state.scene.backgrounds.len() {
-                    let old_end = state.scene.backgrounds[idx].start + state.scene.backgrounds[idx].duration;
-                    state.scene.backgrounds[idx].start = ph;
-                    state.scene.backgrounds[idx].duration = (old_end - ph).max(0.01);
-                    state.status = format!("Set in-point to {:.2}s", ph);
-                }
-            }
-            Selection::Audio(idx) => {
-                if idx < state.scene.audio.len() {
-                    state.scene.audio[idx].t_in = ph;
-                    state.status = format!("Set in-point to {:.2}s", ph);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    // O: set t_out of selected clip to current playhead
-    if o_pressed {
-        let ph = state.playhead;
-        match state.selection {
-            Selection::Actor(idx) => {
-                if idx < state.scene.actors.len() {
-                    state.scene.actors[idx].t_out = Some(ph);
-                    sync_audio_to_actor(state, idx);
-                    state.status = format!("Set out-point to {:.2}s", ph);
-                }
-            }
-            Selection::Overlay(idx) => {
-                if idx < state.scene.overlays.len() {
-                    match &mut state.scene.overlays[idx] {
-                        Overlay::Text(t) => { t.t_out = ph; }
-                        Overlay::Image(im) => { im.t_out = ph; }
-                        Overlay::Video(v) => { v.t_out = ph; }
-                    }
-                    state.status = format!("Set out-point to {:.2}s", ph);
-                }
-            }
-            Selection::Background(idx) => {
-                if idx < state.scene.backgrounds.len() {
-                    let start = state.scene.backgrounds[idx].start;
-                    state.scene.backgrounds[idx].duration = (ph - start).max(0.01);
-                    state.status = format!("Set out-point to {:.2}s", ph);
-                }
-            }
-            Selection::Audio(idx) => {
-                if idx < state.scene.audio.len() {
-                    state.scene.audio[idx].t_out = Some(ph);
-                    state.status = format!("Set out-point to {:.2}s", ph);
-                }
-            }
-            _ => {}
+    let audios = state.audio_track_indices();
+    for (au_idx, vt_pos) in targets {
+        if let Some(&target) = audios.get(vt_pos) {
+            state.audio_track_assignments.insert(au_idx, target);
         }
     }
 }
