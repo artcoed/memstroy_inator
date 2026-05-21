@@ -194,6 +194,7 @@ fn execute_line(line: &str, scene: &mut Scene, messages: &mut Vec<String>) -> Re
                 transition_out: Transition::Cut,
                 transition_duration: 0.3,
                 effects: Vec::new(),
+                animated_params: Default::default(),
             };
             scene.actors.push(actor);
         }
@@ -439,6 +440,7 @@ fn cmd_add_text(args: &[String], scene: &mut Scene) -> Result<(), String> {
         z_index: 100,
         behind_actors: false,
         effects: Vec::new(),
+        animated_params: Default::default(),
     }));
     Ok(())
 }
@@ -457,6 +459,7 @@ fn cmd_add_image(args: &[String], scene: &mut Scene) -> Result<(), String> {
         modifiers: Vec::new(),
         skeleton_attachment: None,
         effects: Vec::new(),
+        animated_params: Default::default(),
     }));
     Ok(())
 }
@@ -478,6 +481,7 @@ fn cmd_add_video_overlay(args: &[String], scene: &mut Scene) -> Result<(), Strin
         modifiers: Vec::new(),
         skeleton_attachment: None,
         effects: Vec::new(),
+        animated_params: Default::default(),
     }));
     Ok(())
 }
