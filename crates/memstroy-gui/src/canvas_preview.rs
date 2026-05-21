@@ -1,4 +1,4 @@
-//! Free Canvas preview panel — replaces the old fixed 9:16 preview.
+//! Free Canvas preview panel.
 //!
 //! Renders an infinite 2D canvas with pan/zoom, the render frame
 //! rectangle, and all scene elements positioned in world pixels.
@@ -28,7 +28,7 @@ const COL_RENDER_FRAME_HANDLE: Color32 = Color32::from_rgb(255, 120, 120);
 
 // ─── MAIN ENTRY POINT ────────────────────────────────────────────────
 
-/// Render the free canvas preview panel. Replaces `panels::preview()`.
+/// Render the free canvas preview panel.
 pub fn canvas_preview(ui: &mut egui::Ui, state: &mut EditorState) {
     let avail = ui.available_size_before_wrap();
     let (full_rect, response) = ui.allocate_exact_size(avail, Sense::click_and_drag());
@@ -1231,9 +1231,7 @@ fn draw_selection_gizmo(
                         .collect();
                 }
                 _ => {
-                    state.canvas_drag.canvas_layouts_snapshot.clear();
                     state.canvas_drag.actor_legacy_snapshot.clear();
-                    state.canvas_drag.actor_legacy_scale_snapshot.clear();
                     state.canvas_drag.overlay_world_snapshot.clear();
                 }
             }
@@ -1241,9 +1239,7 @@ fn draw_selection_gizmo(
     } else if response.drag_stopped() || !response.dragged() {
         if !response.dragged() && state.canvas_drag.mode != crate::state::CanvasDragMode::None {
             state.canvas_drag.mode = crate::state::CanvasDragMode::None;
-            state.canvas_drag.canvas_layouts_snapshot.clear();
             state.canvas_drag.actor_legacy_snapshot.clear();
-            state.canvas_drag.actor_legacy_scale_snapshot.clear();
             state.canvas_drag.overlay_world_snapshot.clear();
         }
     }
@@ -1423,7 +1419,7 @@ fn apply_drag(
     let world_dy = dy_screen / zoom;
 
     match mode {
-        CanvasDragMode::None | CanvasDragMode::Pan => {}
+        CanvasDragMode::None => {}
 
         CanvasDragMode::MoveActorWorld { actor_idx, initial_pos } => {
             if actor_idx < state.scene.actors.len() {

@@ -550,15 +550,6 @@ impl App {
         }
     }
 
-    // ─── AUDIO PLAYBACK (TODO) ────────────────────────────────────────
-    // Architecture:
-    // 1. Add `rodio` or `cpal` dependency
-    // 2. Create AudioEngine struct with output stream + sink
-    // 3. On play: decode audio tracks active at playhead, mix, send to sink
-    // 4. On seek: flush sink, re-decode from new position
-    // 5. On pause: pause sink
-    // Integration point: in the `update()` method after playhead advance
-
     /// Start waveform extraction for all audio tracks that don't yet have waveform data.
     /// Spawns background tasks (similar to frame extraction pattern) that call
     /// `AudioWaveform::extract_peaks()` and store results in shared slots.
