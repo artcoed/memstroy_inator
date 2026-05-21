@@ -994,10 +994,55 @@ fn draw_selection_gizmo(
             let world = state.canvas_viewport.screen_to_world(local, viewport_size);
             state.canvas_drag.start_screen = local;
             state.canvas_drag.mode = decide_drag_mode(state, full_rect, viewport_size, start, world);
+
+            // ── Snapshot element positions when starting a render-frame drag ──
+            // so we can keep contents glued to the frame as it moves/resizes.
+            use crate::state::CanvasDragMode;
+            match state.canvas_drag.mode {
+                CanvasDragMode::MoveRenderFrame { .. }
+                | CanvasDragMode::ResizeRenderFrame { .. } => {
+                    state.canvas_drag.canvas_layouts_snapshot = state
+                        .scene
+                        .canvas_layouts
+                        .iter()
+                        .filter_map(|cl| {
+                            cl.keyframes
+                                .first()
+                                .map(|kf| (
+                                    cl.element_id.clone(),
+                                    [kf.value.pos.x, kf.value.pos.y],
+                                    kf.value.scale,
+                                ))
+                        })
+                        .collect();
+                    state.canvas_drag.actor_legacy_snapshot = state
+                        .scene
+                        .actors
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, a)| a.layout.first().map(|kf| (i, kf.value.pos)))
+                        .collect();
+                    state.canvas_drag.actor_legacy_scale_snapshot = state
+                        .scene
+                        .actors
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, a)| a.layout.first().map(|kf| (i, kf.value.scale)))
+                        .collect();
+                }
+                _ => {
+                    state.canvas_drag.canvas_layouts_snapshot.clear();
+                    state.canvas_drag.actor_legacy_snapshot.clear();
+                    state.canvas_drag.actor_legacy_scale_snapshot.clear();
+                }
+            }
         }
     } else if response.drag_stopped() || !response.dragged() {
         if !response.dragged() && state.canvas_drag.mode != crate::state::CanvasDragMode::None {
             state.canvas_drag.mode = crate::state::CanvasDragMode::None;
+            state.canvas_drag.canvas_layouts_snapshot.clear();
+            state.canvas_drag.actor_legacy_snapshot.clear();
+            state.canvas_drag.actor_legacy_scale_snapshot.clear();
         }
     }
 
@@ -1200,10 +1245,28 @@ fn apply_drag(
         }
 
         CanvasDragMode::MoveRenderFrame { initial_pos } => {
+            // Move the render frame, AND keep all elements glued to it by
+            // translating their world-space positions by the same delta.
             if let Some(kf) = state.scene.render_frame.layout.first_mut() {
                 kf.value.pos.x = initial_pos[0] + world_dx;
                 kf.value.pos.y = initial_pos[1] + world_dy;
             }
+
+            // Apply the same delta to the snapshotted element positions so
+            // they stay visually fixed within the frame.
+            for (id, init_pos, _init_scale) in &state.canvas_drag.canvas_layouts_snapshot {
+                if let Some(cl) = state.scene.canvas_layouts.iter_mut()
+                    .find(|cl| &cl.element_id == id)
+                {
+                    if let Some(kf) = cl.keyframes.first_mut() {
+                        kf.value.pos.x = init_pos[0] + world_dx;
+                        kf.value.pos.y = init_pos[1] + world_dy;
+                    }
+                }
+            }
+            // Legacy normalised actor positions are already render-frame-
+            // relative, so they don't need translation when the frame moves —
+            // they automatically follow it. Same for overlays.
         }
 
         CanvasDragMode::ResizeRenderFrame { initial_zoom, anchor_distance } => {
@@ -1216,8 +1279,30 @@ fn apply_drag(
             let cur_dist = (cur - rf_center).length();
             if anchor_distance > 1.0 {
                 let factor = (cur_dist / anchor_distance).max(0.05);
+                let new_zoom = (initial_zoom / factor).clamp(0.1, 10.0);
                 if let Some(kf) = state.scene.render_frame.layout.first_mut() {
-                    kf.value.zoom = (initial_zoom / factor).clamp(0.1, 10.0);
+                    kf.value.zoom = new_zoom;
+                }
+                // Keep canvas-laid-out elements glued to the frame by scaling
+                // their offset from the frame centre by the same factor as the
+                // frame's world extent. The render frame's world extent grows
+                // when zoom shrinks (extent = resolution / zoom), so the
+                // multiplier is initial_zoom / new_zoom.
+                let pos_factor = initial_zoom / new_zoom;
+                let cx = rf_state.pos.x;
+                let cy = rf_state.pos.y;
+                for (id, init_pos, init_scale) in &state.canvas_drag.canvas_layouts_snapshot {
+                    if let Some(cl) = state.scene.canvas_layouts.iter_mut()
+                        .find(|cl| &cl.element_id == id)
+                    {
+                        if let Some(kf) = cl.keyframes.first_mut() {
+                            kf.value.pos.x = cx + (init_pos[0] - cx) * pos_factor;
+                            kf.value.pos.y = cy + (init_pos[1] - cy) * pos_factor;
+                            // Scale visually with the frame too (use snapshot
+                            // so the value doesn't compound across frames).
+                            kf.value.scale = (init_scale * pos_factor).clamp(0.05, 20.0);
+                        }
+                    }
                 }
             }
         }
