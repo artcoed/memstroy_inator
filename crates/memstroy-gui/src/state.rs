@@ -252,13 +252,6 @@ pub struct EditorState {
     /// Index of text overlay currently being inline-edited on the preview
     pub editing_text_overlay: Option<usize>,
 
-    /// AI generation: user prompt
-    pub ai_prompt: String,
-    /// AI generation: pasted JSON result from AI
-    pub ai_result_json: String,
-    /// AI generation: whether the AI window is open
-    pub ai_window_open: bool,
-
     // ─── Auto-save / recovery ──────────────────────────────────────
     /// Timestamp of last autosave (None until first autosave fires).
     pub last_autosave: Option<std::time::Instant>,
@@ -288,6 +281,9 @@ pub struct EditorState {
     pub canvas_viewport: memstroy_core::EditorViewport,
     /// Whether the canvas is in pan mode (middle mouse or Space+drag).
     pub canvas_panning: bool,
+    /// Active drag interaction on the canvas. Persists across frames so the
+    /// drag origin stays stable.
+    pub canvas_drag: CanvasDrag,
 
     // ─── Skeleton Editor ───────────────────────────────────────────
     /// State for the skeleton constructor editor window.
@@ -398,9 +394,6 @@ impl EditorState {
         s.detected_points = Vec::new();
 
         s.editing_text_overlay = None;
-        s.ai_prompt = String::new();
-        s.ai_result_json = String::new();
-        s.ai_window_open = false;
 
         // Auto-save defaults
         s.last_autosave = None;
@@ -683,4 +676,39 @@ fn check_ffmpeg() -> bool {
         .stderr(std::process::Stdio::null())
         .status()
         .is_ok()
+}
+
+
+// ─── CANVAS INTERACTION STATE ────────────────────────────────────────
+
+/// Active interaction with the free canvas. Captured once at the start of a
+/// drag and persisted until the pointer is released, so the origin doesn't
+/// drift between frames.
+#[derive(Default, Clone)]
+pub struct CanvasDrag {
+    pub mode: CanvasDragMode,
+    /// Pointer position (screen px, relative to the canvas rect) at drag start.
+    pub start_screen: [f32; 2],
+}
+
+#[derive(Default, Clone, Copy, PartialEq)]
+pub enum CanvasDragMode {
+    /// No drag in progress.
+    #[default]
+    None,
+    /// Panning the viewport.
+    Pan,
+    /// Move the selected actor in canvas world-pixel space.
+    /// `initial_pos` is the actor's `canvas_layouts` position at drag start.
+    MoveActorWorld { actor_idx: usize, initial_pos: [f32; 2] },
+    /// Move the selected actor using the legacy normalised layout.
+    MoveActorLegacy { actor_idx: usize, initial_pos: [f32; 2] },
+    /// Move the selected overlay (normalised relative to render frame).
+    MoveOverlay { overlay_idx: usize, initial_pos: [f32; 2] },
+    /// Uniformly scale the selected element from its original anchor.
+    ResizeSelection { initial_scale: f32, anchor_distance: f32 },
+    /// Move the render frame in world space.
+    MoveRenderFrame { initial_pos: [f32; 2] },
+    /// Resize (zoom) the render frame.
+    ResizeRenderFrame { initial_zoom: f32, anchor_distance: f32 },
 }

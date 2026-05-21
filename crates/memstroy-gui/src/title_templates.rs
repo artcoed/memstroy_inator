@@ -152,6 +152,8 @@ pub fn add_template_to_scene(
         t_out,
         style: (template.style)(),
         layout: (template.layout)(dur),
+        z_index: 100,
+        behind_actors: false,
     });
     scene.overlays.push(overlay);
     scene.overlays.len() - 1

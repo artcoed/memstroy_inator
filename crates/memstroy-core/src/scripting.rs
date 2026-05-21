@@ -432,6 +432,8 @@ fn cmd_add_text(args: &[String], scene: &mut Scene) -> Result<(), String> {
         t_out,
         style: TextStyle::default(),
         layout: vec![Keyframe::new(0.0, OverlayState::default())],
+        z_index: 100,
+        behind_actors: false,
     }));
     Ok(())
 }

@@ -226,11 +226,6 @@ impl App {
                 }
             });
 
-            // AI Generate button
-            if ui.button(RichText::new("\u{1F916} AI Generate").strong().color(Color32::from_rgb(180, 120, 255))).clicked() {
-                self.state.ai_window_open = !self.state.ai_window_open;
-            }
-
             // Status indicator on the right
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if self.state.refreshing {
@@ -297,6 +292,14 @@ impl App {
         match self.state.selection {
             Selection::Actor(i) if i < self.state.scene.actors.len() => {
                 self.state.mutate(|s| { s.actors.remove(i); });
+                // Keep frame_caches and frame_extract_results in lock-step with actors
+                // so subsequent actors don't display the wrong cached frames.
+                if i < self.state.frame_caches.len() {
+                    self.state.frame_caches.remove(i);
+                }
+                if i < self.frame_extract_results.len() {
+                    self.frame_extract_results.remove(i);
+                }
                 self.state.selection = Selection::None;
                 self.state.status = "\u{1F5D1} Actor deleted.".into();
             }
@@ -309,6 +312,17 @@ impl App {
                 self.state.mutate(|s| { s.backgrounds.remove(i); });
                 self.state.selection = Selection::None;
                 self.state.status = "\u{1F5D1} Background deleted.".into();
+            }
+            Selection::Audio(i) if i < self.state.scene.audio.len() => {
+                self.state.mutate(|s| { s.audio.remove(i); });
+                if i < self.state.audio_waveforms.len() {
+                    self.state.audio_waveforms.remove(i);
+                }
+                if i < self.waveform_extract_results.len() {
+                    self.waveform_extract_results.remove(i);
+                }
+                self.state.selection = Selection::None;
+                self.state.status = "\u{1F5D1} Audio deleted.".into();
             }
             _ => {}
         }
@@ -1181,20 +1195,14 @@ impl eframe::App for App {
             ctx.request_repaint(); // keep animating
         }
 
-        // Auto-preview: only if ffmpeg available, not playing, playhead was manually moved,
-        // and frame cache is NOT active (frame cache provides real-time preview instead).
-        let frame_cache_active = self.state.frame_caches.iter().any(|fc| fc.is_ready());
-        if self.state.ffmpeg_available && !self.state.playing && !frame_cache_active {
-            let playhead_delta = (self.state.playhead - self.state.last_rendered_playhead).abs();
-            if playhead_delta > 0.1 && !self.state.preview_rendering {
-                self.state.preview_rendering = true;
-                self.state.last_rendered_playhead = self.state.playhead;
-                self.run_preview();
-            }
-        }
+        // Auto-preview via ffmpeg has been replaced by the canvas frame
+        // caches, which give a much faster preview. We deliberately keep the
+        // pipeline disabled here to avoid spawning ffmpeg every time the
+        // playhead moves — that was the dominant source of editor lag.
 
-        // Request repaint when frame caches are ready (for smooth video preview on canvas)
-        if frame_cache_active && !self.state.playing {
+        // Only request continuous repaints while playing. When paused, repaint
+        // happens on user input (mouse / keyboard / drag) automatically.
+        if self.state.playing {
             ctx.request_repaint();
         }
 
@@ -1355,31 +1363,54 @@ impl eframe::App for App {
             self.run_pose_detection();
         }
 
-        // ── Audio engine synchronization ──
-        // Detect play/pause transitions
-        if self.state.playing && !self.was_playing {
-            // Transition: paused → playing
-            let playhead = self.state.playhead;
-            let sources: Vec<_> = self.state.scene.audio.iter()
-                .filter(|a| {
-                    let t_out = a.t_out.unwrap_or(self.state.scene.output.duration);
-                    playhead >= a.t_in && playhead <= t_out
-                })
-                .map(|a| (a.source.clone(), a.t_in, a.volume))
-                .collect();
-            if !sources.is_empty() {
-                self.audio_engine.play_from(&sources, playhead);
+        // ── Audio engine synchronisation ──
+        // Build the list of audio sources currently scheduled in the scene:
+        //   - explicit AudioTrack entries (state.scene.audio)
+        //   - actor video clips (their embedded audio streams)
+        // The engine ignores anything without a decodable audio stream, so
+        // including every actor unconditionally is safe.
+        let build_sources = |state: &EditorState| -> Vec<crate::audio_engine::AudioSourceSpec> {
+            let mut out = Vec::new();
+            for a in &state.scene.audio {
+                out.push(crate::audio_engine::AudioSourceSpec {
+                    path: a.source.clone(),
+                    t_in: a.t_in,
+                    t_out: a.t_out,
+                    source_start: a.source_start,
+                    volume: a.volume,
+                });
             }
-        } else if !self.state.playing && self.was_playing {
-            // Transition: playing → paused
-            self.audio_engine.pause();
-        }
+            for actor in &state.scene.actors {
+                if !actor.visible { continue; }
+                out.push(crate::audio_engine::AudioSourceSpec {
+                    path: actor.source.clone(),
+                    t_in: actor.t_in.unwrap_or(0.0),
+                    t_out: actor.t_out,
+                    source_start: actor.source_start,
+                    volume: 1.0,
+                });
+            }
+            out
+        };
 
-        // Detect seeks (playhead jumped by more than expected)
-        let expected_delta = if self.state.playing { 0.2 } else { 0.0 };
-        let actual_delta = (self.state.playhead - self.prev_playhead).abs();
-        if actual_delta > expected_delta && actual_delta > 0.5 {
-            self.audio_engine.seek(self.state.playhead);
+        // Detect a seek (playhead jumped further than a sane frame's worth).
+        let dt = ctx.input(|i| i.stable_dt).min(0.1);
+        let expected_step = if self.state.playing { dt * self.state.playback_speed.abs() } else { 0.0 };
+        let actual_delta = self.state.playhead - self.prev_playhead;
+        let seeked = (actual_delta - expected_step).abs() > 0.15
+            || actual_delta < -0.05;
+
+        if self.state.playing && !self.was_playing {
+            // Transition: paused → playing. Start playback at the current playhead.
+            let sources = build_sources(&self.state);
+            self.audio_engine.play_sources(&sources, self.state.playhead);
+        } else if !self.state.playing && self.was_playing {
+            // Transition: playing → paused.
+            self.audio_engine.pause();
+        } else if self.state.playing && seeked {
+            // Seek while playing — restart from the new position so audio stays in sync.
+            let sources = build_sources(&self.state);
+            self.audio_engine.play_sources(&sources, self.state.playhead);
         }
 
         self.was_playing = self.state.playing;
@@ -1465,9 +1496,6 @@ impl eframe::App for App {
 
         // Skeleton editor floating window
         crate::skeleton_editor::skeleton_editor_window(ctx, &mut self.state);
-
-        // AI generation floating window
-        panels::ai_generate_window(ctx, &mut self.state);
 
         // Title-templates picker (popup grid of preset captions)
         self.show_title_picker(ctx);
