@@ -38,6 +38,9 @@ pub struct FrameCache {
     pub source_height: u32,
     /// Single reusable texture handle — updated each frame.
     texture: Option<TextureHandle>,
+    /// Frame index that was last uploaded to the `texture` handle. Used to
+    /// skip GPU re-uploads when the playhead is on the same frame.
+    texture_uploaded_frame: Option<usize>,
     /// Cached processed (chromakey/color-corrected) texture handle.
     /// Reused across frames when the source frame index AND the effect
     /// parameters are unchanged — avoids running the per-pixel CPU loop
@@ -80,6 +83,7 @@ impl FrameCache {
             source_width: 480,
             source_height: 270,
             texture: None,
+            texture_uploaded_frame: None,
             fx_texture: None,
             fx_key: None,
             buffer: Vec::new(),
@@ -296,6 +300,25 @@ impl FrameCache {
 
         let image = image?;
 
+        // Skip the GPU re-upload when we're still on the same frame as last
+        // time — this is the dominant cost when the playhead isn't advancing
+        // (e.g., paused, or before the next video frame is due) and avoids
+        // playback lag with multiple actors / overlays on screen.
+        if self.texture.is_some()
+            && self.texture_uploaded_frame == Some(frame_index)
+        {
+            // Update read-ahead bookkeeping below as before but no upload.
+            if frame_index != self.last_displayed_frame {
+                self.last_displayed_frame = frame_index;
+                let buffer_end = self.buffer_start + self.buffer_size;
+                let frames_remaining = buffer_end.saturating_sub(frame_index);
+                if frames_remaining < self.buffer_size / 3 && !self.preloading {
+                    self.trigger_preload(frame_index);
+                }
+            }
+            return self.texture.as_ref();
+        }
+
         // Update the single TextureHandle with the new image data
         let options = TextureOptions::LINEAR;
         match self.texture.as_mut() {
@@ -307,6 +330,7 @@ impl FrameCache {
                 self.texture = Some(tex);
             }
         }
+        self.texture_uploaded_frame = Some(frame_index);
 
         // Trigger read-ahead if playhead advanced
         if frame_index != self.last_displayed_frame {
