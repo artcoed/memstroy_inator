@@ -142,6 +142,192 @@ impl App {
         }
     }
 
+    /// Modern scrolling tab strip. Each tab is a rounded pill with hover &
+    /// active states, an inline rename mode (double-click), and a compact
+    /// close button. Wraps in a horizontal scroll area so many tabs stay
+    /// usable without breaking the toolbar layout.
+    fn scene_tab_bar(&mut self, ui: &mut egui::Ui) {
+        let num_tabs = self.state.scene_tabs.len();
+        let mut switch_to: Option<usize> = None;
+        let mut close_tab: Option<usize> = None;
+        let mut commit_rename: Option<(usize, String)> = None;
+        let mut start_rename: Option<(usize, String)> = None;
+        let active = self.state.active_tab;
+        let editing = self.state.editing_tab_idx;
+
+        let avail_w = ui.available_width();
+        let plus_w = 30.0_f32;
+        let scroll_w = (avail_w - plus_w - 8.0).max(120.0);
+
+        ui.horizontal(|ui| {
+            egui::ScrollArea::horizontal()
+                .id_source("scene_tabs_scroll")
+                .max_width(scroll_w)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+
+                    for i in 0..num_tabs {
+                        let is_active = i == active;
+                        let is_editing = editing == Some(i);
+                        let tab_name = self.state.scene_tabs[i].name.clone();
+                        // "Dirty" = tab has content but no save path yet.
+                        let dirty = self
+                            .state
+                            .scene_tabs
+                            .get(i)
+                            .map(|t| t.path.is_none() && !t.scene.actors.is_empty())
+                            .unwrap_or(false);
+
+                        let (fill, stroke_col, text_col, accent) = if is_active {
+                            (
+                                Color32::from_rgb(40, 40, 58),
+                                Color32::from_rgb(120, 100, 220),
+                                Color32::from_rgb(255, 255, 255),
+                                Some(Color32::from_rgb(140, 100, 255)),
+                            )
+                        } else {
+                            (
+                                Color32::from_rgb(26, 26, 36),
+                                Color32::from_rgb(50, 50, 70),
+                                Color32::from_rgb(160, 160, 180),
+                                None,
+                            )
+                        };
+
+                        let frame = egui::Frame::none()
+                            .fill(fill)
+                            .rounding(Rounding::same(7.0))
+                            .stroke(Stroke::new(1.0, stroke_col))
+                            .inner_margin(egui::Margin {
+                                left: 10.0,
+                                right: 6.0,
+                                top: 4.0,
+                                bottom: 4.0,
+                            });
+
+                        let inner = frame.show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                if let Some(col) = accent {
+                                    let (dot_rect, _) = ui.allocate_exact_size(
+                                        Vec2::splat(7.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    ui.painter().circle_filled(dot_rect.center(), 3.5, col);
+                                }
+
+                                if is_editing {
+                                    let resp = ui.add(
+                                        egui::TextEdit::singleline(
+                                            &mut self.state.editing_tab_buf,
+                                        )
+                                        .desired_width(120.0)
+                                        .font(egui::TextStyle::Body),
+                                    );
+                                    resp.request_focus();
+                                    let lost_focus = resp.lost_focus();
+                                    let enter_pressed =
+                                        ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                    let escape_pressed =
+                                        ui.input(|i| i.key_pressed(egui::Key::Escape));
+                                    if escape_pressed {
+                                        commit_rename = Some((usize::MAX, String::new()));
+                                    } else if enter_pressed || lost_focus {
+                                        commit_rename = Some((
+                                            i,
+                                            self.state.editing_tab_buf.clone(),
+                                        ));
+                                    }
+                                } else {
+                                    let label = if dirty {
+                                        format!("\u{2022} {}", tab_name)
+                                    } else {
+                                        tab_name.clone()
+                                    };
+                                    let resp = ui.add(
+                                        egui::Label::new(
+                                            RichText::new(label).size(12.0).color(text_col),
+                                        )
+                                        .selectable(false)
+                                        .sense(egui::Sense::click()),
+                                    );
+                                    if resp.clicked() && !is_active {
+                                        switch_to = Some(i);
+                                    }
+                                    if resp.double_clicked() {
+                                        start_rename = Some((i, tab_name.clone()));
+                                    }
+                                }
+
+                                if num_tabs > 1 {
+                                    let close_btn = egui::Button::new(
+                                        RichText::new("\u{00D7}")
+                                            .size(13.0)
+                                            .color(if is_active {
+                                                Color32::from_rgb(220, 220, 240)
+                                            } else {
+                                                Color32::from_rgb(120, 120, 140)
+                                            }),
+                                    )
+                                    .frame(false)
+                                    .min_size(Vec2::new(16.0, 16.0));
+                                    if ui.add(close_btn).on_hover_text("Close tab").clicked() {
+                                        close_tab = Some(i);
+                                    }
+                                }
+                            });
+                        });
+
+                        let tab_resp = inner.response.interact(egui::Sense::click());
+                        if tab_resp.clicked() && !is_active && !is_editing {
+                            switch_to = Some(i);
+                        }
+                        if tab_resp.double_clicked() {
+                            start_rename = Some((i, tab_name));
+                        }
+                    }
+                });
+
+            ui.add_space(4.0);
+
+            let plus_btn = egui::Button::new(
+                RichText::new("+")
+                    .size(15.0)
+                    .strong()
+                    .color(Color32::from_rgb(160, 220, 160)),
+            )
+            .fill(Color32::from_rgb(28, 36, 28))
+            .rounding(Rounding::same(7.0))
+            .stroke(Stroke::new(1.0, Color32::from_rgb(50, 80, 50)))
+            .min_size(Vec2::new(26.0, 22.0));
+            if ui.add(plus_btn).on_hover_text("New scene tab").clicked() {
+                self.state.new_tab();
+            }
+        });
+
+        if let Some((idx, name)) = start_rename {
+            self.state.editing_tab_idx = Some(idx);
+            self.state.editing_tab_buf = name;
+        }
+        if let Some((idx, new_name)) = commit_rename {
+            if idx != usize::MAX
+                && idx < self.state.scene_tabs.len()
+                && !new_name.trim().is_empty()
+            {
+                self.state.scene_tabs[idx].name = new_name.trim().to_string();
+            }
+            self.state.editing_tab_idx = None;
+            self.state.editing_tab_buf.clear();
+        }
+        if let Some(idx) = switch_to {
+            self.state.switch_tab(idx);
+        }
+        if let Some(idx) = close_tab {
+            self.state.close_tab(idx);
+        }
+    }
+
     fn menu(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         egui::menu::bar(ui, |ui| {
             ui.menu_button(RichText::new("\u{1F4C1} File").strong(), |ui| {
@@ -409,6 +595,10 @@ impl App {
                     right.layout.push(memstroy_core::Keyframe::new(0.0, last_state));
                 }
                 let local_split_for_left = local_split;
+                // Capture the original lane so the right half stays on the
+                // same track (otherwise the new index falls back to "first
+                // video lane" and the user perceives it as a layer jump).
+                let original_lane = self.state.actor_track_assignments.get(&i).copied();
                 self.state.mutate(move |s| {
                     s.actors[i].t_out = Some(t);
                     // Left half: keep keyframes at or before the split point
@@ -419,6 +609,22 @@ impl App {
                     }
                     s.actors.insert(i + 1, right);
                 });
+                // Shift every actor_track_assignments entry >= i+1 by +1 to
+                // account for the insertion, then bind the new right half
+                // to the original lane.
+                let pivot = i + 1;
+                let mut shifted: std::collections::HashMap<usize, usize> =
+                    std::collections::HashMap::with_capacity(
+                        self.state.actor_track_assignments.len() + 1,
+                    );
+                for (k, v) in self.state.actor_track_assignments.iter() {
+                    let new_k = if *k >= pivot { *k + 1 } else { *k };
+                    shifted.insert(new_k, *v);
+                }
+                if let Some(lane) = original_lane {
+                    shifted.insert(pivot, lane);
+                }
+                self.state.actor_track_assignments = shifted;
                 self.state.status = "\u{2702} Actor split at playhead.".into();
             }
             Selection::Overlay(i) if i < self.state.scene.overlays.len() => {
@@ -464,6 +670,9 @@ impl App {
                     }
                 }
                 let local_split_left = local_split;
+                // Preserve the overlay's lane assignment for the right half.
+                let original_overlay_lane =
+                    self.state.overlay_track_assignments.get(&i).copied();
                 self.state.mutate(move |s| {
                     match &mut s.overlays[i] {
                         memstroy_core::Overlay::Text(txt) => {
@@ -490,6 +699,21 @@ impl App {
                     }
                     s.overlays.insert(i + 1, right);
                 });
+                // Shift overlay_track_assignments to account for the insert
+                // and bind the right half to the original lane.
+                let pivot = i + 1;
+                let mut shifted: std::collections::HashMap<usize, usize> =
+                    std::collections::HashMap::with_capacity(
+                        self.state.overlay_track_assignments.len() + 1,
+                    );
+                for (k, v) in self.state.overlay_track_assignments.iter() {
+                    let new_k = if *k >= pivot { *k + 1 } else { *k };
+                    shifted.insert(new_k, *v);
+                }
+                if let Some(lane) = original_overlay_lane {
+                    shifted.insert(pivot, lane);
+                }
+                self.state.overlay_track_assignments = shifted;
                 self.state.status = "\u{2702} Overlay split at playhead.".into();
             }
             _ => {
@@ -1214,58 +1438,26 @@ impl eframe::App for App {
 
         // ── Tab bar for multiple scenes ──
         egui::TopBottomPanel::top("tab_bar")
-            .frame(egui::Frame::none().fill(Color32::from_rgb(22, 22, 30)).inner_margin(egui::Margin::symmetric(6.0, 2.0)))
-            .exact_height(26.0)
+            .frame(
+                egui::Frame::none()
+                    .fill(Color32::from_rgb(18, 18, 26))
+                    .inner_margin(egui::Margin {
+                        left: 8.0,
+                        right: 8.0,
+                        top: 4.0,
+                        bottom: 0.0,
+                    }),
+            )
+            .exact_height(34.0)
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    let num_tabs = self.state.scene_tabs.len();
-                    let mut switch_to: Option<usize> = None;
-                    let mut close_tab: Option<usize> = None;
-
-                    for i in 0..num_tabs {
-                        let is_active = i == self.state.active_tab;
-                        let tab_name = self.state.scene_tabs[i].name.clone();
-                        let fill = if is_active { Color32::from_rgb(40, 40, 60) } else { Color32::from_rgb(28, 28, 38) };
-                        let text_col = if is_active { Color32::from_rgb(255, 255, 255) } else { Color32::from_rgb(140, 140, 160) };
-
-                        let tab_frame = egui::Frame::none()
-                            .fill(fill)
-                            .rounding(Rounding { nw: 4.0, ne: 4.0, sw: 0.0, se: 0.0 })
-                            .inner_margin(egui::Margin::symmetric(8.0, 2.0));
-
-                        tab_frame.show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                if ui.selectable_label(is_active, RichText::new(&tab_name).size(11.0).color(text_col)).clicked() {
-                                    switch_to = Some(i);
-                                }
-                                if num_tabs > 1 {
-                                    if ui.small_button("x").clicked() {
-                                        close_tab = Some(i);
-                                    }
-                                }
-                            });
-                        });
-                        ui.add_space(2.0);
-                    }
-
-                    // "+" button to add new tab
-                    if ui.button(RichText::new("+").size(12.0).color(Color32::from_rgb(100, 200, 100))).clicked() {
-                        self.state.new_tab();
-                    }
-
-                    if let Some(idx) = switch_to {
-                        self.state.switch_tab(idx);
-                    }
-                    if let Some(idx) = close_tab {
-                        self.state.close_tab(idx);
-                    }
-                });
+                self.scene_tab_bar(ui);
             });
 
         // Left panel: Library + Refresh button
         egui::SidePanel::left("library")
-            .resizable(false)
+            .resizable(true)
             .default_width(300.0)
+            .width_range(180.0..=560.0)
             .frame(
                 egui::Frame::none()
                     .fill(Color32::from_rgb(22, 22, 32))
@@ -1435,8 +1627,9 @@ impl eframe::App for App {
 
         // Right panel: Inspector
         egui::SidePanel::right("inspector")
-            .resizable(false)
+            .resizable(true)
             .default_width(350.0)
+            .width_range(220.0..=620.0)
             .frame(
                 egui::Frame::none()
                     .fill(Color32::from_rgb(22, 22, 32))
@@ -1448,8 +1641,9 @@ impl eframe::App for App {
 
         // Bottom panel: Timeline
         egui::TopBottomPanel::bottom("timeline_panel")
-            .resizable(false)
-            .exact_height(280.0)
+            .resizable(true)
+            .default_height(280.0)
+            .height_range(140.0..=720.0)
             .frame(
                 egui::Frame::none()
                     .fill(Color32::from_rgb(18, 18, 28))

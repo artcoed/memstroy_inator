@@ -272,6 +272,11 @@ pub struct EditorState {
     pub scene_tabs: Vec<SceneTab>,
     /// Index of the currently active tab.
     pub active_tab: usize,
+    /// Index of the tab whose name is currently being edited inline (via
+    /// double-click on the tab title). Cleared on Enter / focus loss.
+    pub editing_tab_idx: Option<usize>,
+    /// Buffer used by the inline tab-name editor.
+    pub editing_tab_buf: String,
 }
 
 /// A single scene tab with its own file path and name.
@@ -705,6 +710,28 @@ pub struct CanvasDrag {
     /// Snapshot of overlay WORLD positions at drag start. Used to keep
     /// overlays visually fixed while the render frame moves/resizes.
     pub overlay_world_snapshot: Vec<(usize, [f32; 2])>,
+    /// Currently active snap guidelines in world space — drawn on top of
+    /// the canvas while a move/resize drag is in flight to give the user
+    /// visual feedback about which edge/center the element snapped to.
+    /// Each entry is (axis, world_coordinate). Reset to empty whenever no
+    /// snap is active.
+    pub snap_guides: Vec<SnapGuide>,
+}
+
+/// One active snap guideline.
+#[derive(Clone, Copy, PartialEq)]
+pub struct SnapGuide {
+    pub axis: SnapAxis,
+    /// World coord (X for Vertical guides, Y for Horizontal guides).
+    pub world: f32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SnapAxis {
+    /// Vertical line at world X = `world` — used to snap horizontal positions.
+    Vertical,
+    /// Horizontal line at world Y = `world` — used to snap vertical positions.
+    Horizontal,
 }
 
 #[derive(Default, Clone, Copy, PartialEq)]
