@@ -39,6 +39,20 @@ pub fn canvas_preview(ui: &mut egui::Ui, state: &mut EditorState) {
     // ── Background ──
     painter.rect_filled(full_rect, Rounding::ZERO, COL_CANVAS_BG);
 
+    // ── Eyedropper: when armed, the next click picks a pixel from the
+    //    selected actor's preview frame and writes it to the actor's
+    //    chroma_key.key_color. We handle this BEFORE the regular drag/click
+    //    pipeline so it pre-empts selection and gizmo interactions.
+    if state.eyedropper_active && response.clicked() {
+        if let Some(click_pos) = response.interact_pointer_pos() {
+            handle_eyedropper_click(ui, state, full_rect, viewport_size, click_pos);
+        }
+        // The click is consumed regardless of success — the user expects
+        // one click to either commit or exit eyedropper mode.
+        state.eyedropper_active = false;
+        return;
+    }
+
     // ── Handle pan/zoom input ──
     handle_canvas_input(ui, &response, state, viewport_size, full_rect);
 
@@ -56,6 +70,108 @@ pub fn canvas_preview(ui: &mut egui::Ui, state: &mut EditorState) {
 
     // ── Fit button overlay ──
     draw_viewport_controls(ui, full_rect, state, viewport_size);
+}
+
+/// When the eyedropper is armed and the user clicks on the preview, sample
+/// the selected actor's source frame at the click's UV coordinate and store
+/// the colour as the actor's chroma key. The chroma sidecar is updated so
+/// the change persists across projects.
+fn handle_eyedropper_click(
+    ui: &mut egui::Ui,
+    state: &mut EditorState,
+    full_rect: Rect,
+    viewport_size: [f32; 2],
+    click_pos: Pos2,
+) {
+    let Selection::Actor(idx) = state.selection else {
+        state.status = "Eyedropper: no actor selected.".into();
+        return;
+    };
+    if idx >= state.scene.actors.len() { return; }
+
+    // Compute the actor's on-screen rectangle (mirror of the math used in
+    // draw_canvas_elements).
+    let elem_rect = match actor_screen_rect(state, full_rect, viewport_size, idx) {
+        Some(r) => r,
+        None => {
+            state.status = "Eyedropper: cannot resolve actor rect.".into();
+            return;
+        }
+    };
+
+    // Click must be inside the actor's rect — otherwise we have no UV.
+    if !elem_rect.contains(click_pos) {
+        state.status = "Eyedropper: click on the actor's image.".into();
+        return;
+    }
+
+    let u = ((click_pos.x - elem_rect.min.x) / elem_rect.width().max(0.001)).clamp(0.0, 1.0);
+    let v = ((click_pos.y - elem_rect.min.y) / elem_rect.height().max(0.001)).clamp(0.0, 1.0);
+
+    // Time inside the source clip, mirroring draw_canvas_elements.
+    let actor = &state.scene.actors[idx];
+    let t = state.playhead;
+    let t_in = actor.t_in.unwrap_or(0.0);
+    let t_out = actor.t_out.unwrap_or(state.scene.output.duration);
+    let local_t = if t >= t_in && t <= t_out {
+        t - t_in + actor.source_start
+    } else if t < t_in {
+        actor.source_start
+    } else {
+        actor.source_start + (t_out - t_in)
+    };
+
+    if let Some(fc) = state.frame_caches.get_mut(idx) {
+        if let Some(img) = fc.raw_frame_at_time(local_t) {
+            let px = ((u * img.size[0] as f32) as usize).min(img.size[0].saturating_sub(1));
+            let py = ((v * img.size[1] as f32) as usize).min(img.size[1].saturating_sub(1));
+            let pixel = img.pixels[py * img.size[0] + px];
+            let key = [pixel.r(), pixel.g(), pixel.b()];
+
+            state.scene.actors[idx].chroma_key.key_color = key;
+            // Persist the new key colour as part of the per-clip sidecar.
+            let src = state.scene.actors[idx].source.clone();
+            let chroma = state.scene.actors[idx].chroma_key.clone();
+            let _ = chroma.save_alongside_clip(&src);
+            state.status = format!("Picked chroma key #{:02X}{:02X}{:02X}", key[0], key[1], key[2]);
+            ui.ctx().request_repaint();
+            return;
+        }
+    }
+    state.status = "Eyedropper: frame not yet decoded — try again in a moment.".into();
+}
+
+/// Compute the screen-space rectangle of an actor on the canvas, replicating
+/// the math in `draw_canvas_elements`. Returns `None` when the actor has no
+/// usable layout/size info yet.
+fn actor_screen_rect(
+    state: &EditorState,
+    full_rect: Rect,
+    viewport_size: [f32; 2],
+    idx: usize,
+) -> Option<Rect> {
+    let actor = state.scene.actors.get(idx)?;
+    let t = state.playhead;
+
+    let world_pos = get_element_world_pos(state, &actor.id, &actor.layout, t);
+    let (src_w, src_h) = if let Some(fc) = state.frame_caches.get(idx) {
+        if fc.is_ready() && fc.frame_count > 0 {
+            (fc.source_width as f32, fc.source_height as f32)
+        } else { (1080.0_f32, 1920.0) }
+    } else { (1080.0_f32, 1920.0) };
+
+    let actor_state = keyframe::sample(&actor.layout, t).unwrap_or_default();
+    let elem_w = src_w * actor_state.scale;
+    let elem_h = src_h * actor_state.scale * actor_state.scale_y;
+
+    let center_screen = state.canvas_viewport.world_to_screen(world_pos, viewport_size);
+    let half_w = elem_w * 0.5 * state.canvas_viewport.zoom;
+    let half_h = elem_h * 0.5 * state.canvas_viewport.zoom;
+
+    Some(Rect::from_center_size(
+        Pos2::new(full_rect.min.x + center_screen[0], full_rect.min.y + center_screen[1]),
+        Vec2::new(half_w * 2.0, half_h * 2.0),
+    ))
 }
 
 

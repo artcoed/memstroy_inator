@@ -22,7 +22,14 @@ const COL_TOOLBAR_BG: Color32 = Color32::from_rgb(28, 28, 40);
 pub struct SkeletonEditorState {
     /// Whether the skeleton editor window is open.
     pub open: bool,
-    /// Index of the actor whose skeleton is being edited.
+    /// Path of the source clip currently being edited. The skeleton template
+    /// is keyed off this path (sidecar `<clip>.skeleton.json`), so it follows
+    /// the asset across projects.
+    pub clip_path: Option<std::path::PathBuf>,
+    /// Index of the actor whose skeleton is being edited. Optional — when
+    /// the user opens the editor for a library clip without a corresponding
+    /// actor in the scene, this stays `None` and `clip_path` is the source
+    /// of truth. Used as a hint to find an associated frame cache.
     pub actor_idx: Option<usize>,
     /// Index of the skeleton template being edited (in scene.skeleton_templates).
     pub template_idx: Option<usize>,
@@ -55,10 +62,21 @@ pub fn skeleton_editor_window(ctx: &egui::Context, state: &mut EditorState) -> b
     }
 
     let mut open = state.skeleton_editor.open;
+    let screen_rect = ctx.input(|i| i.screen_rect());
+    // Cap the window so it never grows past the host viewport — without
+    // this, the resizable Window kept inflating each frame because the
+    // 9:16 preview demanded more height than the default 700×550 size,
+    // creating a feedback loop.
+    let max_w = (screen_rect.width() - 40.0).max(400.0).min(1100.0);
+    let max_h = (screen_rect.height() - 60.0).max(360.0).min(900.0);
 
     egui::Window::new("Skeleton Constructor")
         .open(&mut open)
         .default_size([700.0, 550.0])
+        .min_width(420.0)
+        .min_height(320.0)
+        .max_width(max_w)
+        .max_height(max_h)
         .resizable(true)
         .collapsible(true)
         .show(ctx, |ui| {
@@ -70,15 +88,15 @@ pub fn skeleton_editor_window(ctx: &egui::Context, state: &mut EditorState) -> b
 }
 
 fn skeleton_editor_content(ui: &mut egui::Ui, state: &mut EditorState) {
-    // ── Top toolbar: actor selection + template management ──
+    // ── Top toolbar: clip selector + template management ──
     skeleton_toolbar(ui, state);
     ui.separator();
 
-    // If no actor/template selected, show help
+    // If no clip/template selected, show help
     if state.skeleton_editor.template_idx.is_none() {
         ui.add_space(20.0);
         ui.label(
-            RichText::new("Select an actor above and create or load a skeleton template.")
+            RichText::new("Pick a clip from the library above and create or load a skeleton template.\n\nSkeletons are saved alongside the source clip as <name>.skeleton.json so they follow the asset into every future project automatically.")
                 .italics()
                 .color(Color32::from_rgb(140, 140, 160)),
         );
@@ -86,50 +104,74 @@ fn skeleton_editor_content(ui: &mut egui::Ui, state: &mut EditorState) {
     }
 
     // ── Main content: frame preview + point list ──
-    ui.horizontal(|ui| {
-        // Left: frame preview with point overlay
-        let preview_width = (ui.available_width() - 200.0).max(300.0);
-        ui.vertical(|ui| {
-            frame_preview(ui, state, preview_width);
-            ui.add_space(4.0);
-            frame_navigation(ui, state);
-        });
+    // ScrollArea is critical: it absorbs any "preview wants to be taller than
+    // the window" pressure so the Window itself doesn't keep growing each
+    // frame.
+    egui::ScrollArea::both()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.horizontal_top(|ui| {
+                // Reserve space for the right side panel and the separator,
+                // then size the preview to fit the rest.
+                let right_panel_w = 200.0_f32;
+                let separator_w = 12.0_f32;
+                let nav_height = 36.0_f32;
+                let avail = ui.available_size_before_wrap();
+                let preview_max_w = (avail.x - right_panel_w - separator_w).max(180.0);
+                let preview_max_h = (avail.y - nav_height).max(160.0);
 
-        ui.separator();
+                // Vertical 9:16 aspect; fit into the available area without
+                // demanding more height than we have.
+                let aspect = 9.0_f32 / 16.0;
+                let by_w_h = preview_max_w / aspect;
+                let (pw, ph) = if by_w_h <= preview_max_h {
+                    (preview_max_w, by_w_h)
+                } else {
+                    (preview_max_h * aspect, preview_max_h)
+                };
 
-        // Right: point list + properties
-        ui.vertical(|ui| {
-            ui.set_min_width(180.0);
-            point_list_panel(ui, state);
+                ui.vertical(|ui| {
+                    frame_preview(ui, state, pw, ph);
+                    ui.add_space(4.0);
+                    frame_navigation(ui, state);
+                });
+
+                ui.separator();
+
+                ui.vertical(|ui| {
+                    ui.set_min_width(right_panel_w - 20.0);
+                    point_list_panel(ui, state);
+                });
+            });
         });
-    });
 }
 
 // ─── TOOLBAR ─────────────────────────────────────────────────────────
 
 fn skeleton_toolbar(ui: &mut egui::Ui, state: &mut EditorState) {
     ui.horizontal(|ui| {
-        ui.label(RichText::new("Actor:").size(12.0).strong());
+        ui.label(RichText::new("Clip:").size(12.0).strong());
 
-        // Actor selector combo
-        let actor_names: Vec<String> = state.scene.actors.iter()
-            .map(|a| a.id.clone())
-            .collect();
-        let current_label = state.skeleton_editor.actor_idx
-            .and_then(|i| actor_names.get(i).cloned())
+        // Library-clip selector. The skeleton is bound to the clip on disk,
+        // not to a specific actor instance, so a single skeleton template
+        // can be reused across projects.
+        let current_label = state.skeleton_editor.clip_path
+            .as_ref()
+            .and_then(|p| p.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string()))
             .unwrap_or_else(|| "(none)".into());
 
-        egui::ComboBox::from_id_source("skel_actor_select")
+        let lib_paths: Vec<std::path::PathBuf> = state.library.mellstroy_clips.iter()
+            .map(|c| c.path.clone())
+            .collect();
+
+        egui::ComboBox::from_id_source("skel_clip_select")
             .selected_text(&current_label)
             .show_ui(ui, |ui| {
-                for (i, name) in actor_names.iter().enumerate() {
-                    if ui.selectable_value(
-                        &mut state.skeleton_editor.actor_idx,
-                        Some(i),
-                        name,
-                    ).clicked() {
-                        // When actor changes, try to find/create matching template
-                        on_actor_changed(state, i);
+                for path in &lib_paths {
+                    let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("(?)").to_string();
+                    let chosen = state.skeleton_editor.clip_path.as_ref() == Some(path);
+                    if ui.selectable_label(chosen, &name).clicked() {
+                        on_clip_changed(state, path);
                     }
                 }
             });
@@ -137,70 +179,106 @@ fn skeleton_toolbar(ui: &mut egui::Ui, state: &mut EditorState) {
         ui.separator();
 
         // Template actions
-        if state.skeleton_editor.actor_idx.is_some() {
+        if state.skeleton_editor.clip_path.is_some() {
             if state.skeleton_editor.template_idx.is_none() {
                 if ui.button(RichText::new("+ Create Skeleton").color(Color32::from_rgb(80, 200, 120)))
                     .clicked()
                 {
-                    create_template_for_current_actor(state);
+                    create_template_for_current_clip(state);
                 }
                 if ui.button("Load from file").clicked() {
-                    load_template_for_current_actor(state);
+                    load_template_for_current_clip(state);
                 }
-            } else {
-                if ui.button("Save").on_hover_text("Save skeleton to .skeleton.json").clicked() {
-                    save_current_template(state);
-                }
+            } else if ui.button("Save").on_hover_text("Save skeleton to <clip>.skeleton.json").clicked() {
+                save_current_template(state);
             }
         }
     });
 }
 
-fn on_actor_changed(state: &mut EditorState, actor_idx: usize) {
-    state.skeleton_editor.actor_idx = Some(actor_idx);
-    state.skeleton_editor.selected_point = None;
-    state.skeleton_editor.current_frame = 0;
-
-    let actor = &state.scene.actors[actor_idx];
-
-    // Calculate total frames
-    let t_in = actor.t_in.unwrap_or(0.0);
-    let t_out = actor.t_out.unwrap_or(state.scene.output.duration);
-    let duration = t_out - t_in;
-    state.skeleton_editor.fps = 30.0;
-    state.skeleton_editor.total_frames = (duration * 30.0).ceil() as u32;
-
-    // Try to find existing template for this actor's source
-    let source = actor.source.clone();
-    state.skeleton_editor.template_idx = state.scene.skeleton_templates.iter()
-        .position(|t| t.source_clip == source);
+/// Public entry point used by `Tools → Skeleton Constructor` menu so the
+/// editor opens with a sensible source clip pre-selected.
+pub fn select_clip(state: &mut EditorState, clip_path: &std::path::Path) {
+    on_clip_changed(state, clip_path);
 }
 
-fn create_template_for_current_actor(state: &mut EditorState) {
-    let Some(actor_idx) = state.skeleton_editor.actor_idx else { return };
-    let actor = &state.scene.actors[actor_idx];
+/// Switch the editor to a new source clip. Auto-loads any existing sidecar
+/// skeleton, otherwise leaves the user to create one.
+fn on_clip_changed(state: &mut EditorState, clip_path: &std::path::Path) {
+    state.skeleton_editor.clip_path = Some(clip_path.to_path_buf());
+    state.skeleton_editor.selected_point = None;
+    state.skeleton_editor.current_frame = 0;
+    state.skeleton_editor.fps = 30.0;
 
-    let t_in = actor.t_in.unwrap_or(0.0);
-    let t_out = actor.t_out.unwrap_or(state.scene.output.duration);
+    // Find a related actor (if the clip is in the current scene), so we
+    // can use its frame cache for the live preview.
+    state.skeleton_editor.actor_idx = state.scene.actors.iter()
+        .position(|a| a.source == *clip_path);
+
+    // Estimate total_frames from any existing actor; default to a clip-length
+    // sidecar if available; otherwise fall back to 90 frames (3s @ 30fps).
+    let mut total = 0u32;
+    if let Some(ai) = state.skeleton_editor.actor_idx {
+        let actor = &state.scene.actors[ai];
+        let dur = actor.t_out.unwrap_or(state.scene.output.duration)
+            - actor.t_in.unwrap_or(0.0);
+        total = (dur * 30.0).ceil() as u32;
+    }
+
+    // Try to find the existing template in the scene; if not present,
+    // attempt to load the sidecar so the skeleton "follows" the clip
+    // across projects automatically.
+    let mut tmpl_idx = state.scene.skeleton_templates.iter()
+        .position(|t| t.source_clip == *clip_path);
+    if tmpl_idx.is_none() {
+        if let Some(template) = SkeletonTemplate::load_for_clip(clip_path) {
+            if total == 0 && template.clip_duration > 0.0 {
+                total = (template.clip_duration * template.fps).ceil() as u32;
+            }
+            state.scene.skeleton_templates.push(template);
+            tmpl_idx = Some(state.scene.skeleton_templates.len() - 1);
+        }
+    } else if let Some(idx) = tmpl_idx {
+        if total == 0 {
+            let t = &state.scene.skeleton_templates[idx];
+            total = (t.clip_duration * t.fps).ceil() as u32;
+        }
+    }
+    state.skeleton_editor.template_idx = tmpl_idx;
+    state.skeleton_editor.total_frames = total.max(1);
+}
+
+fn create_template_for_current_clip(state: &mut EditorState) {
+    let Some(ref clip_path) = state.skeleton_editor.clip_path.clone() else { return };
+    // Estimate duration from any actor that uses this clip.
+    let clip_duration = state.scene.actors.iter()
+        .find(|a| a.source == *clip_path)
+        .map(|a| a.t_out.unwrap_or(state.scene.output.duration) - a.t_in.unwrap_or(0.0))
+        .unwrap_or(3.0);
+
+    let name = clip_path.file_stem().and_then(|s| s.to_str())
+        .map(|s| format!("{}_skeleton", s))
+        .unwrap_or_else(|| "skeleton".into());
 
     let template = SkeletonTemplate {
-        name: format!("{}_skeleton", actor.id),
-        source_clip: actor.source.clone(),
+        name,
+        source_clip: clip_path.clone(),
         fps: 30.0,
-        clip_duration: t_out - t_in,
+        clip_duration,
         points: Default::default(),
     };
 
     state.scene.skeleton_templates.push(template);
     state.skeleton_editor.template_idx = Some(state.scene.skeleton_templates.len() - 1);
+    state.skeleton_editor.total_frames = (clip_duration * 30.0).ceil() as u32;
+    // Persist immediately so subsequent project loads see the new template.
+    save_current_template(state);
     state.status = "Skeleton template created.".into();
 }
 
-fn load_template_for_current_actor(state: &mut EditorState) {
-    let Some(actor_idx) = state.skeleton_editor.actor_idx else { return };
-    let actor = &state.scene.actors[actor_idx];
-
-    if let Some(template) = SkeletonTemplate::load_for_clip(&actor.source) {
+fn load_template_for_current_clip(state: &mut EditorState) {
+    let Some(ref clip_path) = state.skeleton_editor.clip_path.clone() else { return };
+    if let Some(template) = SkeletonTemplate::load_for_clip(clip_path) {
         state.scene.skeleton_templates.push(template);
         state.skeleton_editor.template_idx = Some(state.scene.skeleton_templates.len() - 1);
         state.status = "Skeleton loaded from file.".into();
@@ -220,28 +298,28 @@ fn save_current_template(state: &mut EditorState) {
 
 // ─── FRAME PREVIEW ───────────────────────────────────────────────────
 
-fn frame_preview(ui: &mut egui::Ui, state: &mut EditorState, width: f32) {
-    let aspect = 9.0 / 16.0; // vertical video
-    let height = width / aspect;
+fn frame_preview(ui: &mut egui::Ui, state: &mut EditorState, width: f32, height: f32) {
     let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), Sense::click());
     let painter = ui.painter_at(rect);
 
     // Background
     painter.rect_filled(rect, Rounding::same(4.0), COL_FRAME_BG);
 
-    // Try to show the actual frame from the actor's cache
-    let actor_idx = state.skeleton_editor.actor_idx.unwrap_or(0);
+    // Try to show the actual frame from the actor's cache (if there's a
+    // matching actor instance in the current scene).
     let t = state.skeleton_editor.current_time();
     let mut frame_shown = false;
 
-    if let Some(fc) = state.frame_caches.get_mut(actor_idx) {
-        if fc.is_ready() {
-            let actor = &state.scene.actors[actor_idx];
-            let local_t = t + actor.source_start;
-            if let Some(tex) = fc.frame_at_time(local_t, ui.ctx()) {
-                let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
-                painter.image(tex.id(), rect, uv, Color32::WHITE);
-                frame_shown = true;
+    if let Some(actor_idx) = state.skeleton_editor.actor_idx {
+        if let Some(fc) = state.frame_caches.get_mut(actor_idx) {
+            if fc.is_ready() {
+                let actor = &state.scene.actors[actor_idx];
+                let local_t = t + actor.source_start;
+                if let Some(tex) = fc.frame_at_time(local_t, ui.ctx()) {
+                    let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
+                    painter.image(tex.id(), rect, uv, Color32::WHITE);
+                    frame_shown = true;
+                }
             }
         }
     }
@@ -353,6 +431,9 @@ fn place_point_at(state: &mut EditorState, nx: f32, ny: f32) {
     state.scene.skeleton_templates[tmpl_idx].set_point_keyframe(
         point_name, t, ps, Easing::Linear,
     );
+    // Persist to <clip>.skeleton.json so the work follows the clip across
+    // future projects without an explicit save click.
+    let _ = state.scene.skeleton_templates[tmpl_idx].save_alongside_clip();
     state.status = format!("Point '{}' set at ({:.2}, {:.2}) t={:.2}s", point_name, nx, ny, t);
 }
 
