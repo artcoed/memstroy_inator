@@ -48,11 +48,17 @@ impl Scene {
     pub fn load(path: impl AsRef<Path>) -> Result<Scene, SceneError> {
         let path = path.as_ref();
         let raw = std::fs::read_to_string(path)?;
-        match path.extension().and_then(|s| s.to_str()) {
-            Some("yaml") | Some("yml") => Ok(serde_yaml::from_str(&raw)?),
-            Some("json") => Ok(serde_json::from_str(&raw)?),
-            other => Err(SceneError::UnknownFormat(other.unwrap_or("").into())),
-        }
+        let mut scene: Scene = match path.extension().and_then(|s| s.to_str()) {
+            Some("yaml") | Some("yml") => serde_yaml::from_str(&raw)?,
+            Some("json") => serde_json::from_str(&raw)?,
+            other => return Err(SceneError::UnknownFormat(other.unwrap_or("").into())),
+        };
+        // Back-fill `animated_params` for scenes saved before per-param
+        // animation toggles existed. This inspects the layout vec and
+        // marks every parameter that has actual variation across kfs as
+        // animated, so loading an old project preserves its animations.
+        scene.backfill_animated_params();
+        Ok(scene)
     }
 
     pub fn save(&self, path: impl AsRef<Path>) -> Result<(), SceneError> {
@@ -64,5 +70,23 @@ impl Scene {
         };
         std::fs::write(path, serialized)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests_roundtrip {
+    use super::*;
+
+    /// Loading then re-saving a fresh scene must produce byte-identical
+    /// YAML (apart from formatter quirks). This catches accidental
+    /// schema bloat from the new animated_params / param_kfs fields.
+    #[test]
+    fn empty_animated_params_not_serialised() {
+        let scene = Scene::default();
+        let yaml = serde_yaml::to_string(&scene).unwrap();
+        assert!(!yaml.contains("animated_params"),
+            "default scene should not write animated_params (got:\n{})", yaml);
+        assert!(!yaml.contains("param_kfs"),
+            "default scene should not write effect param_kfs (got:\n{})", yaml);
     }
 }

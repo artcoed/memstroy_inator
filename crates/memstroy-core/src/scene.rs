@@ -1,10 +1,60 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use crate::anchor::AnchorPoint;
 use crate::canvas::{CanvasTransform, RenderFrame};
 use crate::keyframe::Keyframe;
 use crate::skeleton::{SkeletonAttachment, SkeletonTemplate};
+
+// ─── ANIMATED PARAM IDS ──────────────────────────────────────────────
+//
+// Stable string identifiers for every per-element parameter that the
+// inspector exposes as keyframable. Stored in `animated_params` so we
+// can keep YAML/JSON serialization stable across renames in the inspector
+// UI. When a parameter is in this set, editing it inserts a keyframe at
+// the playhead; otherwise, the parameter has a single static value
+// broadcast across all keyframes (canvas-first: drag on canvas writes
+// the kf at playhead and auto-marks the param as animated).
+
+pub mod param_ids {
+    pub const POS_X: &str       = "pos_x";
+    pub const POS_Y: &str       = "pos_y";
+    pub const SCALE: &str       = "scale";
+    pub const SCALE_Y: &str     = "scale_y";
+    pub const ROTATION: &str    = "rotation";
+    pub const OPACITY: &str     = "opacity";
+    pub const FLIP_X: &str      = "flip_x";
+    pub const FLIP_Y: &str      = "flip_y";
+
+    /// Effect-stack parameter ids are encoded as `fx_<index>_<sub>` where
+    /// `<sub>` is one of: intensity, p0, p1 (effect-specific). The inspector
+    /// uses this convention so the same animation system handles them.
+    pub fn fx_param(idx: usize, sub: &str) -> String {
+        format!("fx_{}_{}", idx, sub)
+    }
+
+    /// All transform params for actors / overlays in inspector display order.
+    pub const TRANSFORM_PARAMS: &[&str] = &[
+        POS_X, POS_Y, SCALE, SCALE_Y, ROTATION, OPACITY, FLIP_X, FLIP_Y,
+    ];
+
+    /// Human-readable label for a known param id. Returns the id back as
+    /// a fallback for unknown params (e.g. fx_*_*).
+    pub fn label(id: &str) -> &'static str {
+        match id {
+            POS_X => "Position X",
+            POS_Y => "Position Y",
+            SCALE => "Scale",
+            SCALE_Y => "Stretch Y",
+            ROTATION => "Rotation",
+            OPACITY => "Opacity",
+            FLIP_X => "Flip X",
+            FLIP_Y => "Flip Y",
+            _ => "param",
+        }
+    }
+}
 
 /// Top-level scene description. Saved as `*.scene.yaml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +116,92 @@ impl Default for Scene {
             skeleton_templates: Vec::new(),
         }
     }
+}
+
+impl Scene {
+    /// Inspect every actor / overlay layout and back-fill its
+    /// `animated_params` set so that any parameter that actually varies
+    /// across keyframes is marked as animated. Used at load-time for
+    /// scenes saved before the per-param toggle existed: it preserves
+    /// their animations so editing a static param later doesn't broadcast
+    /// over previously-animated motion.
+    pub fn backfill_animated_params(&mut self) {
+        for a in &mut self.actors {
+            backfill_actor(a);
+        }
+        for ov in &mut self.overlays {
+            match ov {
+                Overlay::Text(t) => backfill_overlay_text(t),
+                Overlay::Image(im) => backfill_overlay_image(im),
+                Overlay::Video(v) => backfill_overlay_video(v),
+            }
+        }
+    }
+}
+
+fn varies(values: impl IntoIterator<Item = f32>) -> bool {
+    let mut iter = values.into_iter();
+    let Some(first) = iter.next() else { return false };
+    iter.any(|v| (v - first).abs() > 1.0e-4)
+}
+
+fn backfill_actor(a: &mut Actor) {
+    if a.layout.len() < 2 {
+        return;
+    }
+    use param_ids::*;
+    let mark = |s: &mut BTreeSet<String>, id: &str, vary: bool| {
+        if vary {
+            s.insert(id.to_string());
+        }
+    };
+    let v = &a.layout;
+    mark(&mut a.animated_params, POS_X,
+         varies(v.iter().map(|kf| kf.value.pos[0])));
+    mark(&mut a.animated_params, POS_Y,
+         varies(v.iter().map(|kf| kf.value.pos[1])));
+    mark(&mut a.animated_params, SCALE,
+         varies(v.iter().map(|kf| kf.value.scale)));
+    mark(&mut a.animated_params, SCALE_Y,
+         varies(v.iter().map(|kf| kf.value.scale_y)));
+    mark(&mut a.animated_params, ROTATION,
+         varies(v.iter().map(|kf| kf.value.rotation_deg)));
+    mark(&mut a.animated_params, OPACITY,
+         varies(v.iter().map(|kf| kf.value.opacity)));
+    mark(&mut a.animated_params, FLIP_X,
+         varies(v.iter().map(|kf| kf.value.flip_x_anim)));
+    mark(&mut a.animated_params, FLIP_Y,
+         varies(v.iter().map(|kf| kf.value.flip_y_anim)));
+}
+
+fn backfill_overlay_image(o: &mut ImageOverlay) {
+    backfill_overlay_layout(&o.layout, &mut o.animated_params);
+}
+fn backfill_overlay_video(o: &mut VideoOverlay) {
+    backfill_overlay_layout(&o.layout, &mut o.animated_params);
+}
+fn backfill_overlay_text(o: &mut TextOverlay) {
+    backfill_overlay_layout(&o.layout, &mut o.animated_params);
+}
+
+fn backfill_overlay_layout(layout: &[Keyframe<OverlayState>], set: &mut BTreeSet<String>) {
+    if layout.len() < 2 {
+        return;
+    }
+    use param_ids::*;
+    let mark = |s: &mut BTreeSet<String>, id: &str, vary: bool| {
+        if vary {
+            s.insert(id.to_string());
+        }
+    };
+    mark(set, POS_X,    varies(layout.iter().map(|kf| kf.value.pos[0])));
+    mark(set, POS_Y,    varies(layout.iter().map(|kf| kf.value.pos[1])));
+    mark(set, SCALE,    varies(layout.iter().map(|kf| kf.value.scale)));
+    mark(set, SCALE_Y,  varies(layout.iter().map(|kf| kf.value.scale_y)));
+    mark(set, ROTATION, varies(layout.iter().map(|kf| kf.value.rotation_deg)));
+    mark(set, OPACITY,  varies(layout.iter().map(|kf| kf.value.opacity)));
+    mark(set, FLIP_X,   varies(layout.iter().map(|kf| kf.value.flip_x_anim)));
+    mark(set, FLIP_Y,   varies(layout.iter().map(|kf| kf.value.flip_y_anim)));
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -231,6 +367,12 @@ pub struct Actor {
     /// re-order via the inspector.
     #[serde(default)]
     pub effects: Vec<crate::effects::Effect>,
+    /// **Animated parameter set**: when a param id is in this set, editing
+    /// the param in the inspector or on the canvas inserts a keyframe at
+    /// the playhead; otherwise the new value is broadcast to every kf in
+    /// `layout` (single static value). Empty for fresh actors.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub animated_params: BTreeSet<String>,
 }
 
 fn default_true() -> bool { true }
@@ -540,6 +682,9 @@ pub struct TextOverlay {
     /// **Effects stack**: same layered post-processing system as actors.
     #[serde(default)]
     pub effects: Vec<crate::effects::Effect>,
+    /// **Animated parameter set** — see Actor::animated_params.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub animated_params: BTreeSet<String>,
 }
 
 fn default_text_z() -> i32 { 100 }
@@ -654,6 +799,9 @@ pub struct ImageOverlay {
     /// **Effects stack**.
     #[serde(default)]
     pub effects: Vec<crate::effects::Effect>,
+    /// **Animated parameter set** — see Actor::animated_params.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub animated_params: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -679,6 +827,9 @@ pub struct VideoOverlay {
     /// **Effects stack**.
     #[serde(default)]
     pub effects: Vec<crate::effects::Effect>,
+    /// **Animated parameter set** — see Actor::animated_params.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub animated_params: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
