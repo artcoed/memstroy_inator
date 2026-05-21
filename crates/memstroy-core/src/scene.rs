@@ -206,6 +206,10 @@ pub struct Actor {
     /// Each entry binds an external element to a named point from a SkeletonTemplate.
     #[serde(default)]
     pub skeleton_attachments: Vec<SkeletonAttachment>,
+    /// **Animation modifiers**: layered perturbations (wobble/shake/pulse/spin)
+    /// applied on top of the keyframe-sampled state. Empty by default.
+    #[serde(default)]
+    pub modifiers: Vec<crate::keyframe::TrackModifier>,
     /// Whether this actor is visible in preview. Defaults to true.
     #[serde(default = "default_true")]
     pub visible: bool,
@@ -240,13 +244,32 @@ pub struct ActorState {
     pub rotation_deg: f32,
     #[serde(default = "one")]
     pub opacity: f32,
+    /// Animatable horizontal flip. Range −1.0..=1.0 (default 1.0).
+    /// At 1 the element is upright; at −1 it is fully mirrored. Values
+    /// in between produce a 3D-like "card-fold" effect because the
+    /// renderer squashes horizontal scale by `|flip_x_anim|` so the
+    /// element appears to rotate around the Y axis.
+    #[serde(default = "one")]
+    pub flip_x_anim: f32,
+    /// Animatable vertical flip. Same semantics as `flip_x_anim` but
+    /// around the X axis.
+    #[serde(default = "one")]
+    pub flip_y_anim: f32,
 }
 
 fn one() -> f32 { 1.0 }
 
 impl Default for ActorState {
     fn default() -> Self {
-        Self { pos: [0.5, 0.7], scale: 1.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 1.0 }
+        Self {
+            pos: [0.5, 0.7],
+            scale: 1.0,
+            scale_y: 1.0,
+            rotation_deg: 0.0,
+            opacity: 1.0,
+            flip_x_anim: 1.0,
+            flip_y_anim: 1.0,
+        }
     }
 }
 
@@ -258,6 +281,8 @@ impl crate::keyframe::Lerp for ActorState {
             scale_y: self.scale_y.lerp(&other.scale_y, t),
             rotation_deg: self.rotation_deg.lerp(&other.rotation_deg, t),
             opacity: self.opacity.lerp(&other.opacity, t),
+            flip_x_anim: self.flip_x_anim.lerp(&other.flip_x_anim, t),
+            flip_y_anim: self.flip_y_anim.lerp(&other.flip_y_anim, t),
         }
     }
 }
@@ -491,6 +516,13 @@ pub struct TextOverlay {
     pub style: TextStyle,
     /// Position keyframes; if a single keyframe is provided it stays still.
     pub layout: Vec<Keyframe<OverlayState>>,
+    /// **Animation modifiers**: layered perturbations.
+    #[serde(default)]
+    pub modifiers: Vec<crate::keyframe::TrackModifier>,
+    /// **Skeleton attachment**: when set, this overlay's screen position
+    /// is locked to a named point of an actor's skeleton template.
+    #[serde(default)]
+    pub skeleton_attachment: Option<SkeletonAttachment>,
     /// Stacking order among overlays of the same actor-relation.
     /// Higher values draw on top of lower ones. Default 100.
     #[serde(default = "default_text_z")]
@@ -603,6 +635,13 @@ pub struct ImageOverlay {
     pub t_in: f32,
     pub t_out: f32,
     pub layout: Vec<Keyframe<OverlayState>>,
+    /// **Animation modifiers**: layered perturbations.
+    #[serde(default)]
+    pub modifiers: Vec<crate::keyframe::TrackModifier>,
+    /// **Skeleton attachment**: when set, this overlay's screen position
+    /// is locked to a named point of an actor's skeleton template.
+    #[serde(default)]
+    pub skeleton_attachment: Option<SkeletonAttachment>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -618,6 +657,13 @@ pub struct VideoOverlay {
     #[serde(default)]
     pub chroma_key: Option<ChromaKeyParams>,
     pub layout: Vec<Keyframe<OverlayState>>,
+    /// **Animation modifiers**: layered perturbations.
+    #[serde(default)]
+    pub modifiers: Vec<crate::keyframe::TrackModifier>,
+    /// **Skeleton attachment**: when set, this overlay's screen position
+    /// is locked to a named point of an actor's skeleton template.
+    #[serde(default)]
+    pub skeleton_attachment: Option<SkeletonAttachment>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -633,11 +679,25 @@ pub struct OverlayState {
     pub rotation_deg: f32,
     #[serde(default = "one")]
     pub opacity: f32,
+    /// Animatable horizontal flip (3D fold). See `ActorState::flip_x_anim`.
+    #[serde(default = "one")]
+    pub flip_x_anim: f32,
+    /// Animatable vertical flip (3D fold). See `ActorState::flip_y_anim`.
+    #[serde(default = "one")]
+    pub flip_y_anim: f32,
 }
 
 impl Default for OverlayState {
     fn default() -> Self {
-        Self { pos: [0.5, 0.5], scale: 1.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 1.0 }
+        Self {
+            pos: [0.5, 0.5],
+            scale: 1.0,
+            scale_y: 1.0,
+            rotation_deg: 0.0,
+            opacity: 1.0,
+            flip_x_anim: 1.0,
+            flip_y_anim: 1.0,
+        }
     }
 }
 
@@ -649,6 +709,8 @@ impl crate::keyframe::Lerp for OverlayState {
             scale_y: self.scale_y.lerp(&other.scale_y, t),
             rotation_deg: self.rotation_deg.lerp(&other.rotation_deg, t),
             opacity: self.opacity.lerp(&other.opacity, t),
+            flip_x_anim: self.flip_x_anim.lerp(&other.flip_x_anim, t),
+            flip_y_anim: self.flip_y_anim.lerp(&other.flip_y_anim, t),
         }
     }
 }

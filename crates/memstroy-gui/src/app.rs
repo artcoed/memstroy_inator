@@ -260,21 +260,28 @@ impl App {
                                     }
                                 }
 
-                                if num_tabs > 1 {
-                                    let close_btn = egui::Button::new(
-                                        RichText::new("\u{00D7}")
-                                            .size(13.0)
-                                            .color(if is_active {
-                                                Color32::from_rgb(220, 220, 240)
-                                            } else {
-                                                Color32::from_rgb(120, 120, 140)
-                                            }),
-                                    )
-                                    .frame(false)
-                                    .min_size(Vec2::new(16.0, 16.0));
-                                    if ui.add(close_btn).on_hover_text("Close tab").clicked() {
-                                        close_tab = Some(i);
-                                    }
+                                // Close button is always rendered — closing the
+                                // last tab resets it to a fresh "Untitled" so
+                                // the user always has a working scene.
+                                let close_btn = egui::Button::new(
+                                    RichText::new("\u{00D7}")
+                                        .size(13.0)
+                                        .color(if is_active {
+                                            Color32::from_rgb(220, 220, 240)
+                                        } else {
+                                            Color32::from_rgb(120, 120, 140)
+                                        }),
+                                )
+                                .frame(false)
+                                .min_size(Vec2::new(16.0, 16.0));
+                                let close_resp = ui.add(close_btn);
+                                let close_resp = if num_tabs > 1 {
+                                    close_resp.on_hover_text("Close tab")
+                                } else {
+                                    close_resp.on_hover_text("Reset to a fresh untitled scene")
+                                };
+                                if close_resp.clicked() {
+                                    close_tab = Some(i);
                                 }
                             });
                         });
@@ -1527,6 +1534,8 @@ impl eframe::App for App {
                             t_in: self.state.playhead,
                             t_out: (self.state.playhead + 3.0).min(self.state.scene.output.duration),
                             layout: vec![memstroy_core::Keyframe::new(0.0, memstroy_core::OverlayState::default())],
+                            modifiers: Vec::new(),
+                            skeleton_attachment: None,
                         });
                         self.state.scene.overlays.push(overlay);
                         self.state.selection = Selection::Overlay(self.state.scene.overlays.len() - 1);

@@ -58,6 +58,13 @@ pub struct TimelineDrag {
     /// gap on the way to a real lane doesn't create spurious empty
     /// layers. Cleared on every drag start and on drag end.
     pub pending_new_lane: Option<NewLaneIntent>,
+    /// Pointer Y at drag start. Used to gate vertical lane changes:
+    /// while the pointer is within `lane_lock_threshold_px` of this Y,
+    /// the dragged clip stays on its original row even if the pointer
+    /// briefly enters a neighbouring row. This kills the "wobble" feel
+    /// where a horizontal drag accidentally pops the clip onto another
+    /// lane mid-motion.
+    pub start_pointer_y: Option<f32>,
 }
 
 /// What the layer panel wants to do when the current drag finally ends.
@@ -91,6 +98,29 @@ pub enum AssetDragKind {
     #[default]
     None,
     Clip,
+}
+
+/// Drag state for cross-panel "element-to-skeleton-point" attachment. A
+/// chip in the inspector is the drag source; the per-skeleton-point rows
+/// are the drop targets. Both source and drop logic live in the inspector
+/// today, so this is just shared state for the duration of the gesture.
+#[derive(Default, Clone)]
+pub struct ElementDrag {
+    /// What's being dragged — either an overlay or an actor that should
+    /// follow a skeleton point.
+    pub source: Option<AttachableElement>,
+    /// Latest pointer position (screen px) for the drag-ghost preview.
+    pub pos: [f32; 2],
+    /// Human-readable label for the drag-ghost.
+    pub label: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AttachableElement {
+    /// An overlay (text/image/video) being attached to a skeleton point.
+    Overlay(usize),
+    /// Another actor being attached to a skeleton point of *this* actor.
+    Actor(usize),
 }
 
 /// Audio waveform data for visualization.
@@ -216,6 +246,11 @@ pub struct EditorState {
     pub timeline_drag: TimelineDrag,
     /// Asset drag from library to timeline.
     pub asset_drag: AssetDrag,
+    /// Element drag-and-drop: while a chip in the inspector is being
+    /// dragged, this holds the source selection (overlay or actor)
+    /// being attached. Drop zones (skeleton point rows) check this on
+    /// pointer release to commit the binding.
+    pub element_drag: ElementDrag,
     /// Audio waveforms keyed by audio track index.
     pub audio_waveforms: Vec<AudioWaveform>,
     /// Whether snapping is enabled (clips snap to playhead, other clip edges).
@@ -587,19 +622,54 @@ impl EditorState {
         self.sync_tab_to_scene();
     }
 
-    /// Close tab at index. If it's the last tab, create a new empty one.
+    /// Close tab at index. If it's the last tab, reset it to a fresh
+    /// "Untitled" scene in place. Otherwise removes the tab and shifts
+    /// `active_tab` so the focused selection lines up with the new
+    /// indices (left-shift when closing a tab to the left of active,
+    /// clamp to last when closing the rightmost active tab).
     pub fn close_tab(&mut self, idx: usize) {
+        if idx >= self.scene_tabs.len() { return; }
+
+        // Always sync the active tab's working scene back to its slot
+        // first, so closing a different tab doesn't lose unsaved edits.
+        self.sync_scene_to_tab();
+
         if self.scene_tabs.len() <= 1 {
-            // Can't close last tab — just reset it
+            // Last tab: reset to fresh untitled state. Clear the loaded
+            // scene buffer too so the canvas/inspector pick up a blank
+            // slate without requiring a tab switch.
+            self.scene_tabs[0] = SceneTab {
+                name: "Untitled".into(),
+                path: None,
+                scene: Scene::default(),
+            };
+            self.active_tab = 0;
             self.scene = Scene::default();
             self.scene_path = None;
-            self.scene_tabs[0] = SceneTab { name: "Untitled".into(), path: None, scene: Scene::default() };
+            self.frame_caches.clear();
+            self.selection = Selection::None;
+            self.playhead = 0.0;
+            self.status = "Closed last tab — created fresh Untitled.".into();
             return;
         }
+
+        let was_active = idx == self.active_tab;
         self.scene_tabs.remove(idx);
-        if self.active_tab >= self.scene_tabs.len() {
-            self.active_tab = self.scene_tabs.len() - 1;
+
+        // Adjust active_tab so it still refers to the same logical tab.
+        if was_active {
+            // Closed the focused tab: prefer the one that took its slot,
+            // falling back to the last one.
+            if self.active_tab >= self.scene_tabs.len() {
+                self.active_tab = self.scene_tabs.len() - 1;
+            }
+        } else if idx < self.active_tab {
+            // Closed a tab to the LEFT of the focused one: indices
+            // shift left by one — keep the same logical tab focused.
+            self.active_tab -= 1;
         }
+        // (idx > self.active_tab → no change needed.)
+
         self.sync_tab_to_scene();
     }
 
@@ -784,4 +854,12 @@ pub enum CanvasDragMode {
     MoveRenderFrame { initial_pos: [f32; 2] },
     /// Resize (zoom) the render frame.
     ResizeRenderFrame { initial_zoom: f32, anchor_distance: f32 },
+    /// Rotate the selected element around its centre. `start_angle_rad`
+    /// is the angle from element-centre to pointer at drag start (radians).
+    /// `initial_rot_deg` is the element's rotation at drag start.
+    RotateSelection {
+        initial_rot_deg: f32,
+        center_screen: [f32; 2],
+        start_angle_rad: f32,
+    },
 }
