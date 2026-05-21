@@ -365,63 +365,107 @@ fn draw_render_frame(
     let world_w = rw as f32 / rf_state.zoom;
     let world_h = rh as f32 / rf_state.zoom;
 
-    // Top-left and bottom-right in world coords
-    let tl_world = WorldPos {
-        x: rf_state.pos.x - world_w * 0.5,
-        y: rf_state.pos.y - world_h * 0.5,
-    };
-    let br_world = WorldPos {
-        x: rf_state.pos.x + world_w * 0.5,
-        y: rf_state.pos.y + world_h * 0.5,
-    };
+    // Compute the four corners in screen-space, applying the frame's
+    // own rotation around its centre. We never bake the rotation into the
+    // child elements — they keep their normalised positions and naturally
+    // ride along inside the frame.
+    let corners_screen = render_frame_corners_screen(state, full_rect, viewport_size);
+    let [tl, tr, br, bl] = corners_screen;
 
-    let tl_screen = state.canvas_viewport.world_to_screen(tl_world, viewport_size);
-    let br_screen = state.canvas_viewport.world_to_screen(br_world, viewport_size);
+    // Filled rect (very faint) to make the output region readable on
+    // empty canvases.
+    let rotation_rad = rf_state.rotation_deg.to_radians();
+    let is_rotated = rotation_rad.abs() > 0.001;
+    if !is_rotated {
+        let aabb = Rect::from_min_max(tl, br);
+        painter.rect_filled(aabb, Rounding::ZERO, COL_RENDER_FRAME_FILL);
+        painter.rect_stroke(
+            aabb,
+            Rounding::ZERO,
+            Stroke::new(2.0, COL_RENDER_FRAME),
+        );
+    } else {
+        painter.add(egui::Shape::convex_polygon(
+            vec![tl, tr, br, bl],
+            COL_RENDER_FRAME_FILL,
+            Stroke::new(2.0, COL_RENDER_FRAME),
+        ));
+    }
 
-    let frame_rect = Rect::from_min_max(
-        Pos2::new(full_rect.min.x + tl_screen[0], full_rect.min.y + tl_screen[1]),
-        Pos2::new(full_rect.min.x + br_screen[0], full_rect.min.y + br_screen[1]),
-    );
-
-    // Border only (no fill, no dimming outside)
-    painter.rect_stroke(frame_rect, Rounding::ZERO, Stroke::new(2.0, COL_RENDER_FRAME));
-
-    // Corner resize handles for the render frame
+    // Corner resize handles for the render frame (rotated to follow the frame).
     let handle_size = 8.0;
-    let corners = [
-        frame_rect.left_top(),
-        frame_rect.right_top(),
-        frame_rect.left_bottom(),
-        frame_rect.right_bottom(),
-    ];
-    for corner in &corners {
+    for corner in &corners_screen {
         let hr = Rect::from_center_size(*corner, Vec2::splat(handle_size));
         painter.rect_filled(hr, Rounding::same(2.0), COL_RENDER_FRAME_HANDLE);
         painter.rect_stroke(hr, Rounding::same(2.0), Stroke::new(1.0, Color32::WHITE));
     }
 
-    // Edge midpoint handles for the render frame
+    // Edge midpoint handles for the render frame (also rotated).
     let midpoints = [
-        Pos2::new(frame_rect.center().x, frame_rect.min.y), // top mid
-        Pos2::new(frame_rect.center().x, frame_rect.max.y), // bottom mid
-        Pos2::new(frame_rect.min.x, frame_rect.center().y), // left mid
-        Pos2::new(frame_rect.max.x, frame_rect.center().y), // right mid
+        Pos2::new((tl.x + tr.x) * 0.5, (tl.y + tr.y) * 0.5),
+        Pos2::new((bl.x + br.x) * 0.5, (bl.y + br.y) * 0.5),
+        Pos2::new((tl.x + bl.x) * 0.5, (tl.y + bl.y) * 0.5),
+        Pos2::new((tr.x + br.x) * 0.5, (tr.y + br.y) * 0.5),
     ];
     for mp in &midpoints {
-        let hr = Rect::from_center_size(*mp, Vec2::new(handle_size * 1.2, handle_size * 0.6));
+        let hr = Rect::from_center_size(*mp, Vec2::splat(handle_size * 0.9));
         painter.rect_filled(hr, Rounding::same(2.0), COL_RENDER_FRAME_HANDLE);
     }
 
-    // Label
-    let label_pos = Pos2::new(frame_rect.min.x + 4.0, frame_rect.min.y - 16.0);
+    // Label anchored to the (rotated) top-left corner.
+    let label_pos = Pos2::new(tl.x + 4.0, tl.y - 16.0);
     if label_pos.y > full_rect.min.y {
+        let _ = world_w;
+        let _ = world_h;
         painter.text(
-            label_pos, egui::Align2::LEFT_BOTTOM,
+            label_pos,
+            egui::Align2::LEFT_BOTTOM,
             format!("{}x{}", rw, rh),
             egui::FontId::proportional(10.0),
             COL_RENDER_FRAME,
         );
     }
+}
+
+/// Compute the four screen-space corners of the render frame (TL, TR, BR, BL).
+/// Applies the frame's `rotation_deg` around its centre.
+fn render_frame_corners_screen(
+    state: &EditorState,
+    full_rect: Rect,
+    viewport_size: [f32; 2],
+) -> [Pos2; 4] {
+    let rf = &state.scene.render_frame;
+    let rf_state = sample_render_frame(rf, state.playhead);
+    let [rw, rh] = rf.resolution;
+    let world_w = rw as f32 / rf_state.zoom.max(1e-6);
+    let world_h = rh as f32 / rf_state.zoom.max(1e-6);
+
+    let cx = rf_state.pos.x;
+    let cy = rf_state.pos.y;
+    let half_w = world_w * 0.5;
+    let half_h = world_h * 0.5;
+    let rad = rf_state.rotation_deg.to_radians();
+    let cs = rad.cos();
+    let sn = rad.sin();
+
+    let corner_world = |dx: f32, dy: f32| -> WorldPos {
+        WorldPos {
+            x: cx + dx * cs - dy * sn,
+            y: cy + dx * sn + dy * cs,
+        }
+    };
+
+    let tl_w = corner_world(-half_w, -half_h);
+    let tr_w = corner_world( half_w, -half_h);
+    let br_w = corner_world( half_w,  half_h);
+    let bl_w = corner_world(-half_w,  half_h);
+
+    let to_screen = |w: WorldPos| -> Pos2 {
+        let s = state.canvas_viewport.world_to_screen(w, viewport_size);
+        Pos2::new(full_rect.min.x + s[0], full_rect.min.y + s[1])
+    };
+
+    [to_screen(tl_w), to_screen(tr_w), to_screen(br_w), to_screen(bl_w)]
 }
 
 /// Sample the RenderFrame state at time t.
@@ -1346,60 +1390,21 @@ fn draw_selection_gizmo(
             state.canvas_drag.start_screen = local;
             state.canvas_drag.mode = decide_drag_mode(state, full_rect, viewport_size, start, world);
 
-            // ── Snapshot world positions for render-frame drag ──
-            // The render frame must move/resize independently, so we record the
-            // current world positions of every legacy-positioned actor & overlay
-            // and recompute their normalised coords on each drag step to keep
-            // them visually fixed.
+            // ── Render-frame drags must NOT touch other elements ──
+            // Previously we snapshotted child positions and re-projected
+            // them to keep their world coordinate fixed; that caused the
+            // contents to shift inside the frame and edited unrelated
+            // element data on every frame-move. We now leave children
+            // alone — they keep their normalised positions and ride along
+            // inside the frame, which is what the user expects when they
+            // grab the frame.
             use crate::state::CanvasDragMode;
             match state.canvas_drag.mode {
                 CanvasDragMode::MoveRenderFrame { .. }
                 | CanvasDragMode::ResizeRenderFrame { .. } => {
-                    // Surface the render frame in the inspector when the
-                    // user actively grabs it — the same way clicking any
-                    // other element selects it.
                     state.selection = Selection::RenderFrame;
-                    let t = state.playhead;
-                    state.canvas_drag.actor_legacy_snapshot = state
-                        .scene
-                        .actors
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(i, a)| {
-                            // Skip actors that have a canvas_layouts entry — their
-                            // position is already in world coords.
-                            if state.scene.canvas_layouts.iter().any(|cl| cl.element_id == a.id) {
-                                return None;
-                            }
-                            let wp = get_element_world_pos(state, &a.id, &a.layout, t);
-                            Some((i, [wp.x, wp.y]))
-                        })
-                        .collect();
-
-                    let rf_state = sample_render_frame(&state.scene.render_frame, t);
-                    let [rw, rh] = state.scene.render_frame.resolution;
-                    let world_w = rw as f32 / rf_state.zoom;
-                    let world_h = rh as f32 / rf_state.zoom;
-                    let frame_tl_x = rf_state.pos.x - world_w * 0.5;
-                    let frame_tl_y = rf_state.pos.y - world_h * 0.5;
-
-                    state.canvas_drag.overlay_world_snapshot = state
-                        .scene
-                        .overlays
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(i, ov)| {
-                            let layout = match ov {
-                                Overlay::Text(t) => &t.layout,
-                                Overlay::Image(im) => &im.layout,
-                                Overlay::Video(v) => &v.layout,
-                            };
-                            let ov_state = keyframe::sample(layout, t).unwrap_or_default();
-                            let wx = frame_tl_x + ov_state.pos[0] * world_w;
-                            let wy = frame_tl_y + ov_state.pos[1] * world_h;
-                            Some((i, [wx, wy]))
-                        })
-                        .collect();
+                    state.canvas_drag.actor_legacy_snapshot.clear();
+                    state.canvas_drag.overlay_world_snapshot.clear();
                 }
                 _ => {
                     state.canvas_drag.actor_legacy_snapshot.clear();
@@ -1538,11 +1543,7 @@ fn decide_drag_mode(
     }
 
     // 4. Click on a render frame corner → ResizeRenderFrame.
-    let rf_rect = render_frame_screen_rect(state, full_rect, viewport_size);
-    let rf_corners = [
-        rf_rect.left_top(), rf_rect.right_top(),
-        rf_rect.left_bottom(), rf_rect.right_bottom(),
-    ];
+    let rf_corners = render_frame_corners_screen(state, full_rect, viewport_size);
     for corner in &rf_corners {
         if (start - *corner).length() < RF_HANDLE_SIZE * 2.5 {
             let anchor_distance = (start - rf_center).length().max(1.0);
@@ -1751,51 +1752,13 @@ fn apply_drag(
         }
 
         CanvasDragMode::MoveRenderFrame { initial_pos } => {
-            // Move the render frame; recompute legacy actor & overlay
-            // positions so they stay visually fixed in world space.
+            // Only update the render frame's own keyframe. Child elements
+            // (actors / overlays) keep their existing normalised or world
+            // coordinates and naturally move with the frame in world
+            // space — that's what the user wants when they grab the frame.
             if let Some(kf) = state.scene.render_frame.layout.first_mut() {
                 kf.value.pos.x = initial_pos[0] + world_dx;
                 kf.value.pos.y = initial_pos[1] + world_dy;
-            }
-
-            let rf_state_after = sample_render_frame(&state.scene.render_frame, state.playhead);
-            let [rw, rh] = state.scene.render_frame.resolution;
-            let world_w = rw as f32 / rf_state_after.zoom;
-            let world_h = rh as f32 / rf_state_after.zoom;
-            let frame_tl_x = rf_state_after.pos.x - world_w * 0.5;
-            let frame_tl_y = rf_state_after.pos.y - world_h * 0.5;
-
-            // Legacy actors: rewrite normalised pos to keep world pos.
-            for (idx, world_p) in &state.canvas_drag.actor_legacy_snapshot {
-                if *idx >= state.scene.actors.len() { continue; }
-                let actor_id = state.scene.actors[*idx].id.clone();
-                if state.scene.canvas_layouts.iter().any(|cl| cl.element_id == actor_id) {
-                    continue;
-                }
-                if let Some(kf) = state.scene.actors[*idx].layout.first_mut() {
-                    if world_w > 0.0 && world_h > 0.0 {
-                        kf.value.pos[0] = (world_p[0] - frame_tl_x) / world_w;
-                        kf.value.pos[1] = (world_p[1] - frame_tl_y) / world_h;
-                    }
-                }
-            }
-            // Overlays: same recomputation.
-            for (idx, world_p) in &state.canvas_drag.overlay_world_snapshot {
-                if *idx >= state.scene.overlays.len() { continue; }
-                let new_norm = if world_w > 0.0 && world_h > 0.0 {
-                    [(world_p[0] - frame_tl_x) / world_w, (world_p[1] - frame_tl_y) / world_h]
-                } else { continue; };
-                match &mut state.scene.overlays[*idx] {
-                    Overlay::Text(t) => {
-                        if let Some(kf) = t.layout.first_mut() { kf.value.pos = new_norm; }
-                    }
-                    Overlay::Image(im) => {
-                        if let Some(kf) = im.layout.first_mut() { kf.value.pos = new_norm; }
-                    }
-                    Overlay::Video(v) => {
-                        if let Some(kf) = v.layout.first_mut() { kf.value.pos = new_norm; }
-                    }
-                }
             }
         }
 
@@ -1813,45 +1776,8 @@ fn apply_drag(
                 if let Some(kf) = state.scene.render_frame.layout.first_mut() {
                     kf.value.zoom = new_zoom;
                 }
-
-                // Recompute legacy positions to preserve world coordinates.
-                let rf_state_after = sample_render_frame(&state.scene.render_frame, state.playhead);
-                let [rw, rh] = state.scene.render_frame.resolution;
-                let world_w = rw as f32 / rf_state_after.zoom;
-                let world_h = rh as f32 / rf_state_after.zoom;
-                let frame_tl_x = rf_state_after.pos.x - world_w * 0.5;
-                let frame_tl_y = rf_state_after.pos.y - world_h * 0.5;
-
-                for (idx, world_p) in &state.canvas_drag.actor_legacy_snapshot {
-                    if *idx >= state.scene.actors.len() { continue; }
-                    let actor_id = state.scene.actors[*idx].id.clone();
-                    if state.scene.canvas_layouts.iter().any(|cl| cl.element_id == actor_id) {
-                        continue;
-                    }
-                    if let Some(kf) = state.scene.actors[*idx].layout.first_mut() {
-                        if world_w > 0.0 && world_h > 0.0 {
-                            kf.value.pos[0] = (world_p[0] - frame_tl_x) / world_w;
-                            kf.value.pos[1] = (world_p[1] - frame_tl_y) / world_h;
-                        }
-                    }
-                }
-                for (idx, world_p) in &state.canvas_drag.overlay_world_snapshot {
-                    if *idx >= state.scene.overlays.len() { continue; }
-                    let new_norm = if world_w > 0.0 && world_h > 0.0 {
-                        [(world_p[0] - frame_tl_x) / world_w, (world_p[1] - frame_tl_y) / world_h]
-                    } else { continue; };
-                    match &mut state.scene.overlays[*idx] {
-                        Overlay::Text(t) => {
-                            if let Some(kf) = t.layout.first_mut() { kf.value.pos = new_norm; }
-                        }
-                        Overlay::Image(im) => {
-                            if let Some(kf) = im.layout.first_mut() { kf.value.pos = new_norm; }
-                        }
-                        Overlay::Video(v) => {
-                            if let Some(kf) = v.layout.first_mut() { kf.value.pos = new_norm; }
-                        }
-                    }
-                }
+                // No child reprojection — overlays/actors keep their data
+                // intact when the render frame is resized.
             }
         }
     }
@@ -2207,6 +2133,7 @@ fn selected_element_screen_rect(
     }
 }
 
+#[allow(dead_code)]
 fn render_frame_screen_rect(state: &EditorState, full_rect: Rect, viewport_size: [f32; 2]) -> Rect {
     let rf = &state.scene.render_frame;
     let rf_state = sample_render_frame(rf, state.playhead);
@@ -2264,11 +2191,7 @@ fn update_hover_cursor(
     }
 
     // Render frame center / corners
-    let rf_rect = render_frame_screen_rect(state, full_rect, viewport_size);
-    let rf_corners = [
-        rf_rect.left_top(), rf_rect.right_top(),
-        rf_rect.left_bottom(), rf_rect.right_bottom(),
-    ];
+    let rf_corners = render_frame_corners_screen(state, full_rect, viewport_size);
     for c in &rf_corners {
         if (hover - *c).length() < RF_HANDLE_SIZE * 2.0 {
             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeNwSe);

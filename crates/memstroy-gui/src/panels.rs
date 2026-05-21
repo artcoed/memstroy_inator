@@ -1146,11 +1146,10 @@ fn inspector_render_frame(ui: &mut egui::Ui, state: &mut EditorState) {
         ui.add_space(4.0);
 
         // ─── Size (width × height in world pixels) ──────────────
-        // The frame's world extent = resolution / zoom. Editing the
-        // width here updates `zoom` so the displayed resolution stays
+        // The frame's world extent = resolution * scale. Editing the
+        // width here updates `scale` so the displayed resolution stays
         // fixed. The height field stays in lock-step with the aspect
-        // ratio of the output resolution (no independent height — the
-        // output resolution dictates the aspect).
+        // ratio of the output resolution.
         let zoom_clamped = kf.value.zoom.max(0.0001);
         let mut world_w = rw as f32 / zoom_clamped;
         let mut world_h = rh as f32 / zoom_clamped;
@@ -1190,12 +1189,24 @@ fn inspector_render_frame(ui: &mut egui::Ui, state: &mut EditorState) {
         );
         ui.add_space(4.0);
 
-        // ─── Zoom (advanced — equivalent to width / output) ─────
-        ui.add(
-            egui::Slider::new(&mut kf.value.zoom, 0.05..=10.0)
-                .text("Zoom")
-                .logarithmic(true),
-        );
+        // ─── Scale ──────────────────────────────────────────────
+        // Scale here is the inverse of the legacy `zoom` field: scale = 1
+        // means the frame's world size matches the output resolution 1:1;
+        // scale > 1 enlarges the frame on the canvas; scale < 1 shrinks
+        // it. We expose this as the user-facing concept because
+        // "scale" reads more intuitively for an animatable element than
+        // "zoom" did.
+        let mut scale = 1.0 / kf.value.zoom.max(1e-4);
+        if ui
+            .add(
+                egui::Slider::new(&mut scale, 0.1..=20.0)
+                    .text("Scale")
+                    .logarithmic(true),
+            )
+            .changed()
+        {
+            kf.value.zoom = (1.0 / scale.max(1e-4)).clamp(0.001, 1000.0);
+        }
     } else {
         ui.label(
             RichText::new("Render frame has no keyframes.")
@@ -1685,22 +1696,16 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             acc += h;
         }
     }
-    // Pending track-creation actions to apply AFTER the render loop, so we
-    // never invalidate iteration. Each variant carries the index of the
-    // element that asked for the new lane.
-    let mut pending_new_video_top_for_actor: Option<usize> = None;
-    let mut pending_new_video_bottom_for_actor: Option<usize> = None;
-    let mut pending_new_video_top_for_overlay: Option<usize> = None;
-    let mut pending_new_video_bottom_for_overlay: Option<usize> = None;
-    let mut pending_new_audio_top: Option<usize> = None;
-    let mut pending_new_audio_bottom: Option<usize> = None;
     let pointer_y: Option<f32> = ui.input(|i| i.pointer.hover_pos().map(|p| p.y));
+    let any_pointer_down = ui.input(|i| i.pointer.any_down());
 
     // Classify a pointer Y into a drop target relative to the current
-    // track layout. Used by every per-clip vertical drag handler so that
-    // actors/overlays land on video lanes, audio lands on audio lanes, and
-    // dragging into the gap between blocks creates a new lane on the
-    // appropriate side of the divider.
+    // track layout. `current_assigned` is the row the dragged clip is
+    // already on; we add a hysteresis band around its centre line so a
+    // small Y wobble during a horizontal drag doesn't pop the clip onto
+    // a neighbouring lane. Lanes only switch once the pointer travels
+    // visibly into a different row, and "new lane" intents only fire
+    // when the pointer is well past the topmost / bottommost row.
     #[derive(Clone, Copy)]
     enum DropIntent {
         ToVideoRow(usize),
@@ -1713,7 +1718,27 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     }
     let video_indices: Vec<usize> = state.video_track_indices();
     let audio_indices: Vec<usize> = state.audio_track_indices();
-    let classify_pointer_y = |py: f32| -> DropIntent {
+    let track_kinds: Vec<TrackKind> =
+        state.tracks.iter().map(|t| t.kind).collect();
+    let new_lane_margin = 16.0_f32;
+
+    let classify_pointer_y = |py: f32, current_assigned: Option<usize>| -> DropIntent {
+        // Hysteresis: if the pointer is still within the dragged clip's
+        // own row, keep it there. Generous bounds (3 px overshoot) avoid
+        // jumpy hand-offs at the row borders.
+        if let Some(cur) = current_assigned {
+            if cur < track_rows.len() && cur < track_kinds.len() {
+                let (top, bot) = track_rows[cur];
+                if py >= top - 3.0 && py < bot + 3.0 {
+                    return match track_kinds[cur] {
+                        TrackKind::Video => DropIntent::ToVideoRow(cur),
+                        TrackKind::Audio => DropIntent::ToAudioRow(cur),
+                    };
+                }
+            }
+        }
+
+        // Otherwise pick whichever row the pointer is currently inside.
         for &i in &video_indices {
             let (top, bot) = track_rows[i];
             if py >= top && py < bot {
@@ -1726,25 +1751,24 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                 return DropIntent::ToAudioRow(i);
             }
         }
+
         let first_video_top = video_indices.first().map(|&i| track_rows[i].0);
         let last_video_bot = video_indices.last().map(|&i| track_rows[i].1);
         let first_audio_top = audio_indices.first().map(|&i| track_rows[i].0);
         let last_audio_bot = audio_indices.last().map(|&i| track_rows[i].1);
 
         if let Some(t) = first_video_top {
-            if py < t {
+            if py < t - new_lane_margin {
                 return DropIntent::NewVideoTop;
             }
         } else if let Some(at) = first_audio_top {
-            // No video at all — anywhere above the first audio lane creates
-            // a brand-new top video lane.
-            if py < at {
+            if py < at - new_lane_margin {
                 return DropIntent::NewVideoTop;
             }
         }
 
         if let (Some(vb), Some(at)) = (last_video_bot, first_audio_top) {
-            if py >= vb && py < at {
+            if py >= vb + new_lane_margin && py < at - new_lane_margin {
                 let mid = (vb + at) * 0.5;
                 return if py < mid {
                     DropIntent::NewVideoBottom
@@ -1754,13 +1778,13 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             }
         }
         if let (Some(vb), None) = (last_video_bot, first_audio_top) {
-            if py >= vb {
+            if py >= vb + new_lane_margin {
                 return DropIntent::NewVideoBottom;
             }
         }
 
         if let Some(b) = last_audio_bot {
-            if py >= b {
+            if py >= b + new_lane_margin {
                 return DropIntent::NewAudioBottom;
             }
         }
@@ -1940,25 +1964,38 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             if state.timeline_drag.dragging_clip.is_none() {
                                 state.undo.push(&state.scene);
                                 state.timeline_drag.dragging_clip = Some(ai);
+                                state.timeline_drag.pending_new_lane = None;
                             }
 
                             // ── Resolve the destination track from the pointer's Y position ──
                             // Actors only ever land on video lanes. Dropping
                             // into the gap above the topmost video row, or
-                            // between the video and audio blocks, creates a
-                            // new video lane on the appropriate side.
+                            // between the video and audio blocks, queues a
+                            // "new lane on this side" intent that will be
+                            // committed only when the drag ENDS.
                             if let Some(py) = pointer_y {
-                                match classify_pointer_y(py) {
+                                let cur = state.actor_track_assignments.get(&ai).copied();
+                                match classify_pointer_y(py, cur) {
                                     DropIntent::ToVideoRow(idx) => {
                                         state.actor_track_assignments.insert(ai, idx);
+                                        state.timeline_drag.pending_new_lane = None;
                                     }
                                     DropIntent::NewVideoTop => {
-                                        pending_new_video_top_for_actor = Some(ai);
+                                        state.timeline_drag.pending_new_lane =
+                                            Some(crate::state::NewLaneIntent::VideoTopForActor(ai));
                                     }
                                     DropIntent::NewVideoBottom => {
-                                        pending_new_video_bottom_for_actor = Some(ai);
+                                        state.timeline_drag.pending_new_lane =
+                                            Some(crate::state::NewLaneIntent::VideoBottomForActor(ai));
                                     }
-                                    _ => {}
+                                    _ => {
+                                        // Pointer is over an audio lane or
+                                        // outside the panel — keep the
+                                        // current assignment, drop the
+                                        // queued intent so we don't create
+                                        // a stray lane on release.
+                                        state.timeline_drag.pending_new_lane = None;
+                                    }
                                 }
                             } else {
                                 state.actor_track_assignments.insert(ai, track_idx);
@@ -2111,19 +2148,26 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
 
                             // Vertical: re-assign track based on pointer Y.
                             // Overlays only land on video lanes, mirroring
-                            // the actor drag rules.
+                            // the actor drag rules. Layer creation is
+                            // deferred to drag-end.
                             if let Some(py) = pointer_y {
-                                match classify_pointer_y(py) {
+                                let cur = state.overlay_track_assignments.get(&oi).copied();
+                                match classify_pointer_y(py, cur) {
                                     DropIntent::ToVideoRow(idx) => {
                                         state.overlay_track_assignments.insert(oi, idx);
+                                        state.timeline_drag.pending_new_lane = None;
                                     }
                                     DropIntent::NewVideoTop => {
-                                        pending_new_video_top_for_overlay = Some(oi);
+                                        state.timeline_drag.pending_new_lane =
+                                            Some(crate::state::NewLaneIntent::VideoTopForOverlay(oi));
                                     }
                                     DropIntent::NewVideoBottom => {
-                                        pending_new_video_bottom_for_overlay = Some(oi);
+                                        state.timeline_drag.pending_new_lane =
+                                            Some(crate::state::NewLaneIntent::VideoBottomForOverlay(oi));
                                     }
-                                    _ => {}
+                                    _ => {
+                                        state.timeline_drag.pending_new_lane = None;
+                                    }
                                 }
                             }
                             to_select = Some(Selection::Overlay(oi));
@@ -2208,23 +2252,26 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             state.scene.audio[aui].t_out = Some(new_start + dur);
 
                             // Vertical: only allow audio to land on audio
-                            // lanes. Dragging into the gap between video
-                            // and audio creates a new audio lane at the
-                            // top of the audio block; dragging below the
-                            // bottommost row appends a new lane at the
-                            // very bottom.
+                            // lanes. Lane creation is deferred to drag-end
+                            // via state.timeline_drag.pending_new_lane.
                             if let Some(py) = pointer_y {
-                                match classify_pointer_y(py) {
+                                let cur = state.audio_track_assignments.get(&aui).copied();
+                                match classify_pointer_y(py, cur) {
                                     DropIntent::ToAudioRow(idx) => {
                                         state.audio_track_assignments.insert(aui, idx);
+                                        state.timeline_drag.pending_new_lane = None;
                                     }
                                     DropIntent::NewAudioTop => {
-                                        pending_new_audio_top = Some(aui);
+                                        state.timeline_drag.pending_new_lane =
+                                            Some(crate::state::NewLaneIntent::AudioTopForAudio(aui));
                                     }
                                     DropIntent::NewAudioBottom => {
-                                        pending_new_audio_bottom = Some(aui);
+                                        state.timeline_drag.pending_new_lane =
+                                            Some(crate::state::NewLaneIntent::AudioBottomForAudio(aui));
                                     }
-                                    _ => {}
+                                    _ => {
+                                        state.timeline_drag.pending_new_lane = None;
+                                    }
                                 }
                             }
                             to_select = Some(Selection::Audio(aui));
@@ -2245,35 +2292,50 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
         }
     }
 
-    // ── Apply pending new-layer creation requests from the drag handlers ──
-    // These were stashed inside the loop so we don't invalidate iteration.
-    // Each branch creates the lane via an EditorState helper that already
-    // shifts dependent assignments through the same permutation.
-    if let Some(actor_idx) = pending_new_video_top_for_actor {
-        let new_idx = state.insert_video_track_at_top();
-        state.actor_track_assignments.insert(actor_idx, new_idx);
-        state.status = "\u{2728} New video layer created on top.".into();
-    } else if let Some(actor_idx) = pending_new_video_bottom_for_actor {
-        let new_idx = state.insert_video_track_at_bottom();
-        state.actor_track_assignments.insert(actor_idx, new_idx);
-        state.status = "\u{2728} New video layer created.".into();
-    } else if let Some(overlay_idx) = pending_new_video_top_for_overlay {
-        let new_idx = state.insert_video_track_at_top();
-        state.overlay_track_assignments.insert(overlay_idx, new_idx);
-        state.status = "\u{2728} New video layer created on top.".into();
-    } else if let Some(overlay_idx) = pending_new_video_bottom_for_overlay {
-        let new_idx = state.insert_video_track_at_bottom();
-        state.overlay_track_assignments.insert(overlay_idx, new_idx);
-        state.status = "\u{2728} New video layer created.".into();
-    } else if let Some(audio_idx) = pending_new_audio_top {
-        let new_idx = state.insert_audio_track_at_top();
-        state.audio_track_assignments.insert(audio_idx, new_idx);
-        state.status = "\u{2728} New audio layer created.".into();
-    } else if let Some(audio_idx) = pending_new_audio_bottom {
-        state.add_audio_track();
-        let new_track_idx = state.tracks.len() - 1;
-        state.audio_track_assignments.insert(audio_idx, new_track_idx);
-        state.status = "\u{2728} New audio layer created at bottom.".into();
+    // ── Apply pending new-layer creation ONLY on drag end ──
+    // During the drag we just stored the intent in `pending_new_lane`;
+    // committing it would create stray empty lanes every time the
+    // pointer crossed a gap on its way somewhere else. Now that the
+    // mouse is up we can safely create the lane and snap the dragged
+    // clip onto it. The intent is taken (cleared) regardless of
+    // outcome so the next drag starts from a clean slate.
+    if !any_pointer_down && state.timeline_drag.dragging_clip.is_some() {
+        if let Some(intent) = state.timeline_drag.pending_new_lane.take() {
+            use crate::state::NewLaneIntent;
+            match intent {
+                NewLaneIntent::VideoTopForActor(actor_idx) => {
+                    let new_idx = state.insert_video_track_at_top();
+                    state.actor_track_assignments.insert(actor_idx, new_idx);
+                    state.status = "\u{2728} New video layer created on top.".into();
+                }
+                NewLaneIntent::VideoBottomForActor(actor_idx) => {
+                    let new_idx = state.insert_video_track_at_bottom();
+                    state.actor_track_assignments.insert(actor_idx, new_idx);
+                    state.status = "\u{2728} New video layer created.".into();
+                }
+                NewLaneIntent::VideoTopForOverlay(overlay_idx) => {
+                    let new_idx = state.insert_video_track_at_top();
+                    state.overlay_track_assignments.insert(overlay_idx, new_idx);
+                    state.status = "\u{2728} New video layer created on top.".into();
+                }
+                NewLaneIntent::VideoBottomForOverlay(overlay_idx) => {
+                    let new_idx = state.insert_video_track_at_bottom();
+                    state.overlay_track_assignments.insert(overlay_idx, new_idx);
+                    state.status = "\u{2728} New video layer created.".into();
+                }
+                NewLaneIntent::AudioTopForAudio(audio_idx) => {
+                    let new_idx = state.insert_audio_track_at_top();
+                    state.audio_track_assignments.insert(audio_idx, new_idx);
+                    state.status = "\u{2728} New audio layer created.".into();
+                }
+                NewLaneIntent::AudioBottomForAudio(audio_idx) => {
+                    state.add_audio_track();
+                    let new_track_idx = state.tracks.len() - 1;
+                    state.audio_track_assignments.insert(audio_idx, new_track_idx);
+                    state.status = "\u{2728} New audio layer created at bottom.".into();
+                }
+            }
+        }
     }
 
     // ── Mirror bound audio onto the audio lane that matches the parent
@@ -2530,6 +2592,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     let any_dragging = ui.input(|i| i.pointer.any_down());
     if !any_dragging {
         state.timeline_drag.dragging_clip = None;
+        state.timeline_drag.pending_new_lane = None;
     }
 }
 
