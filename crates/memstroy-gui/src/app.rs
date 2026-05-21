@@ -386,11 +386,27 @@ impl App {
                 right.t_out = Some(end);
                 // Correct source_start for the right half
                 right.source_start = a.source_start + (t - start);
-                // Keep only keyframes in each half (by time).
-                right.layout.retain(|kf| kf.t >= t);
+                // Keep only keyframes in each half (by LOCAL time relative to actor start).
+                let local_split = t - start;
+                // Right half: keep keyframes at or after the split point, shift them to start from 0
+                right.layout.retain(|kf| kf.t >= local_split);
+                for kf in right.layout.iter_mut() {
+                    kf.t -= local_split;
+                }
+                // If right half has no keyframes, add one at t=0 with the last known state
+                if right.layout.is_empty() {
+                    let last_state = a.layout.last().map(|k| k.value).unwrap_or_default();
+                    right.layout.push(memstroy_core::Keyframe::new(0.0, last_state));
+                }
+                let local_split_for_left = local_split;
                 self.state.mutate(move |s| {
                     s.actors[i].t_out = Some(t);
-                    s.actors[i].layout.retain(|kf| kf.t <= t);
+                    // Left half: keep keyframes at or before the split point
+                    s.actors[i].layout.retain(|kf| kf.t <= local_split_for_left);
+                    // If left half has no keyframes, add one at t=0 with default state
+                    if s.actors[i].layout.is_empty() {
+                        s.actors[i].layout.push(memstroy_core::Keyframe::new(0.0, memstroy_core::ActorState::default()));
+                    }
                     s.actors.insert(i + 1, right);
                 });
                 self.state.status = "\u{2702} Actor split at playhead.".into();
@@ -407,36 +423,59 @@ impl App {
                     return;
                 }
                 let mut right = ov.clone();
+                let local_split = t - start;
                 match &mut right {
                     memstroy_core::Overlay::Text(txt) => {
                         txt.id = format!("{}_R", txt.id);
                         txt.t_in = t;
-                        txt.layout.retain(|kf| kf.t >= t);
+                        txt.layout.retain(|kf| kf.t >= local_split);
+                        for kf in txt.layout.iter_mut() { kf.t -= local_split; }
+                        if txt.layout.is_empty() {
+                            txt.layout.push(memstroy_core::Keyframe::new(0.0, memstroy_core::OverlayState::default()));
+                        }
                     }
                     memstroy_core::Overlay::Image(im) => {
                         im.id = format!("{}_R", im.id);
                         im.t_in = t;
-                        im.layout.retain(|kf| kf.t >= t);
+                        im.layout.retain(|kf| kf.t >= local_split);
+                        for kf in im.layout.iter_mut() { kf.t -= local_split; }
+                        if im.layout.is_empty() {
+                            im.layout.push(memstroy_core::Keyframe::new(0.0, memstroy_core::OverlayState::default()));
+                        }
                     }
                     memstroy_core::Overlay::Video(v) => {
                         v.id = format!("{}_R", v.id);
                         v.t_in = t;
-                        v.layout.retain(|kf| kf.t >= t);
+                        v.layout.retain(|kf| kf.t >= local_split);
+                        for kf in v.layout.iter_mut() { kf.t -= local_split; }
+                        if v.layout.is_empty() {
+                            v.layout.push(memstroy_core::Keyframe::new(0.0, memstroy_core::OverlayState::default()));
+                        }
                     }
                 }
+                let local_split_left = local_split;
                 self.state.mutate(move |s| {
                     match &mut s.overlays[i] {
                         memstroy_core::Overlay::Text(txt) => {
                             txt.t_out = t;
-                            txt.layout.retain(|kf| kf.t <= t);
+                            txt.layout.retain(|kf| kf.t <= local_split_left);
+                            if txt.layout.is_empty() {
+                                txt.layout.push(memstroy_core::Keyframe::new(0.0, memstroy_core::OverlayState::default()));
+                            }
                         }
                         memstroy_core::Overlay::Image(im) => {
                             im.t_out = t;
-                            im.layout.retain(|kf| kf.t <= t);
+                            im.layout.retain(|kf| kf.t <= local_split_left);
+                            if im.layout.is_empty() {
+                                im.layout.push(memstroy_core::Keyframe::new(0.0, memstroy_core::OverlayState::default()));
+                            }
                         }
                         memstroy_core::Overlay::Video(v) => {
                             v.t_out = t;
-                            v.layout.retain(|kf| kf.t <= t);
+                            v.layout.retain(|kf| kf.t <= local_split_left);
+                            if v.layout.is_empty() {
+                                v.layout.push(memstroy_core::Keyframe::new(0.0, memstroy_core::OverlayState::default()));
+                            }
                         }
                     }
                     s.overlays.insert(i + 1, right);
