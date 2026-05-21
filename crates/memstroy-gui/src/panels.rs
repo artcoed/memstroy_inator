@@ -27,25 +27,12 @@ const COL_SELECTED: Color32 = Color32::from_rgb(255, 220, 80);
 
 // ─── LIBRARY ─────────────────────────────────────────────────────────
 
+/// Unified asset library: a single scrollable column listing every asset
+/// in the project (clips, backgrounds, props, audio). Every row is a drag
+/// source — drop on the timeline to add. OS Explorer drops are also routed
+/// into this library implicitly via `App::update`.
 pub fn library(ui: &mut egui::Ui, state: &mut EditorState, _request_refresh: impl Fn()) {
-    ui.horizontal(|ui| {
-        let clips_tab = ui.selectable_label(!state.assets_tab_active, "Clips");
-        let assets_tab = ui.selectable_label(state.assets_tab_active, "Assets");
-        if clips_tab.clicked() { state.assets_tab_active = false; }
-        if assets_tab.clicked() { state.assets_tab_active = true; }
-    });
-    ui.separator();
-    ui.add_space(4.0);
-
-    if state.assets_tab_active {
-        assets_panel(ui, state);
-    } else {
-        clips_panel(ui, state);
-    }
-}
-
-
-fn clips_panel(ui: &mut egui::Ui, state: &mut EditorState) {
+    // Header
     ui.horizontal(|ui| {
         ui.label(RichText::new("Library").size(16.0).strong());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -58,22 +45,29 @@ fn clips_panel(ui: &mut egui::Ui, state: &mut EditorState) {
         });
     });
     ui.add_space(4.0);
+
     ui.add(
         egui::TextEdit::singleline(&mut state.library_search)
-            .hint_text("Search clips...")
+            .hint_text("Search assets...")
             .desired_width(ui.available_width()),
     );
-    ui.add_space(4.0);
+    ui.add_space(2.0);
+    ui.label(RichText::new("Tip: drag from here to the timeline. You can also drop files directly from your file manager.")
+        .size(9.0).italics().color(COL_TEXT_DIM));
+    ui.add_space(6.0);
 
-    let clip_count = state.library.mellstroy_clips.len();
     let search_lower = state.library_search.to_lowercase();
-    ui.label(RichText::new(format!("Clips ({})", clip_count)).size(12.0).color(COL_TEXT_DIM));
 
-    if state.library.mellstroy_clips.is_empty() {
-        ui.add_space(8.0);
-        ui.label(RichText::new("No clips. Hit Refresh to download.").italics().color(COL_TEXT_DIM).size(12.0));
-    } else {
-        egui::ScrollArea::vertical().max_height(ui.available_height() - 60.0).show(ui, |ui| {
+    egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+        // ── Clips section ──
+        let clip_count = state.library.mellstroy_clips.len();
+        ui.label(RichText::new(format!("Clips ({})", clip_count)).size(12.0).strong()
+            .color(Color32::from_rgb(220, 130, 50)));
+        ui.add_space(2.0);
+        if state.library.mellstroy_clips.is_empty() {
+            ui.label(RichText::new("No clips. Hit Refresh to download.")
+                .italics().color(COL_TEXT_DIM).size(11.0));
+        } else {
             for idx in 0..state.library.mellstroy_clips.len() {
                 let clip = &state.library.mellstroy_clips[idx];
                 if !search_lower.is_empty() {
@@ -86,19 +80,26 @@ fn clips_panel(ui: &mut egui::Ui, state: &mut EditorState) {
                 let clip = state.library.mellstroy_clips[idx].clone();
                 clip_card(ui, state, &clip);
             }
-        });
-    }
+        }
+        ui.add_space(8.0);
 
-    ui.add_space(6.0);
-    if !state.library.backgrounds.is_empty() {
-        egui::CollapsingHeader::new(
-            RichText::new(format!("Backgrounds ({})", state.library.backgrounds.len()))
-                .size(12.0).color(Color32::from_rgb(100, 180, 255)),
-        ).show(ui, |ui| {
+        // ── Backgrounds ──
+        ui.label(RichText::new(format!("Backgrounds ({})", state.library.backgrounds.len()))
+            .size(12.0).strong().color(Color32::from_rgb(100, 180, 255)));
+        ui.add_space(2.0);
+        if state.library.backgrounds.is_empty() {
+            ui.label(RichText::new("Drop videos/images into assets/backgrounds/")
+                .italics().color(COL_TEXT_DIM).size(11.0));
+        } else {
             for p in state.library.backgrounds.clone() {
                 let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("(?)").to_string();
-                let resp = ui.button(RichText::new(&name).size(11.0));
-                // Drag support: start drag on press+move
+                if !search_lower.is_empty() && !name.to_lowercase().contains(&search_lower) {
+                    continue;
+                }
+                let resp = ui.add(
+                    egui::Label::new(RichText::new(format!("\u{1F5BC} {}", name)).size(11.0))
+                        .sense(Sense::click_and_drag()),
+                );
                 if resp.dragged() {
                     state.asset_drag.dragging = Some(p.clone());
                     state.asset_drag.kind = AssetDragKind::Background;
@@ -106,34 +107,30 @@ fn clips_panel(ui: &mut egui::Ui, state: &mut EditorState) {
                         state.asset_drag.pos = [pos.x, pos.y];
                     }
                 }
-                if resp.clicked() {
+                if resp.double_clicked() {
                     add_background_from_path(state, &p);
                 }
             }
-        });
-    }
-}
+        }
+        ui.add_space(8.0);
 
-
-fn assets_panel(ui: &mut egui::Ui, state: &mut EditorState) {
-    ui.label(RichText::new("Props & Images").size(14.0).strong());
-    ui.add_space(4.0);
-
-    if state.library.props.is_empty() {
-        ui.label(RichText::new("No props found.\nAdd PNG/WebP to assets/props/").italics().color(COL_TEXT_DIM).size(12.0));
-    } else {
-        egui::ScrollArea::vertical().show(ui, |ui| {
+        // ── Props (image overlays) ──
+        ui.label(RichText::new(format!("Props ({})", state.library.props.len()))
+            .size(12.0).strong().color(Color32::from_rgb(200, 200, 100)));
+        ui.add_space(2.0);
+        if state.library.props.is_empty() {
+            ui.label(RichText::new("Drop PNG/WebP into assets/props/")
+                .italics().color(COL_TEXT_DIM).size(11.0));
+        } else {
             for p in state.library.props.clone() {
                 let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("(?)").to_string();
-                let resp = ui.horizontal(|ui| {
-                    ui.label(RichText::new("\u{1F5BC}").size(14.0));
-                    let r = ui.label(RichText::new(&name).size(11.0));
-                    if ui.small_button("+").on_hover_text("Add as image overlay").clicked() {
-                        add_image_overlay(state, &p);
-                    }
-                    r
-                }).inner;
-                // Drag support
+                if !search_lower.is_empty() && !name.to_lowercase().contains(&search_lower) {
+                    continue;
+                }
+                let resp = ui.add(
+                    egui::Label::new(RichText::new(format!("\u{1F5BC} {}", name)).size(11.0))
+                        .sense(Sense::click_and_drag()),
+                );
                 if resp.dragged() {
                     state.asset_drag.dragging = Some(p.clone());
                     state.asset_drag.kind = AssetDragKind::Prop;
@@ -141,52 +138,43 @@ fn assets_panel(ui: &mut egui::Ui, state: &mut EditorState) {
                         state.asset_drag.pos = [pos.x, pos.y];
                     }
                 }
-            }
-        });
-    }
-
-    ui.add_space(10.0);
-    ui.label(RichText::new("Backgrounds").size(14.0).strong());
-    ui.add_space(4.0);
-
-    if state.library.backgrounds.is_empty() {
-        ui.label(RichText::new("No backgrounds found.").italics().color(COL_TEXT_DIM).size(12.0));
-    } else {
-        for p in state.library.backgrounds.clone() {
-            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("(?)").to_string();
-            if ui.button(RichText::new(&name).size(11.0)).clicked() {
-                add_background_from_path(state, &p);
+                if resp.double_clicked() {
+                    add_image_overlay(state, &p);
+                }
             }
         }
-    }
+        ui.add_space(8.0);
 
-    ui.add_space(10.0);
-    ui.label(RichText::new("Audio").size(14.0).strong());
-    ui.add_space(4.0);
-
-    if state.library.audio.is_empty() {
-        ui.label(RichText::new("No audio found.\nAdd MP3/WAV/OGG to assets/audio/")
-            .italics().color(COL_TEXT_DIM).size(12.0));
-    } else {
-        for p in state.library.audio.clone() {
-            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("(?)").to_string();
-            let resp = ui.horizontal(|ui| {
-                ui.label(RichText::new("\u{1F3B5}").size(14.0));
-                let r = ui.label(RichText::new(&name).size(11.0));
-                if ui.small_button("+").on_hover_text("Add audio at playhead").clicked() {
+        // ── Audio ──
+        ui.label(RichText::new(format!("Audio ({})", state.library.audio.len()))
+            .size(12.0).strong().color(Color32::from_rgb(50, 180, 180)));
+        ui.add_space(2.0);
+        if state.library.audio.is_empty() {
+            ui.label(RichText::new("Drop MP3/WAV/OGG into assets/audio/")
+                .italics().color(COL_TEXT_DIM).size(11.0));
+        } else {
+            for p in state.library.audio.clone() {
+                let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("(?)").to_string();
+                if !search_lower.is_empty() && !name.to_lowercase().contains(&search_lower) {
+                    continue;
+                }
+                let resp = ui.add(
+                    egui::Label::new(RichText::new(format!("\u{1F3B5} {}", name)).size(11.0))
+                        .sense(Sense::click_and_drag()),
+                );
+                if resp.dragged() {
+                    state.asset_drag.dragging = Some(p.clone());
+                    state.asset_drag.kind = AssetDragKind::Audio;
+                    if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
+                        state.asset_drag.pos = [pos.x, pos.y];
+                    }
+                }
+                if resp.double_clicked() {
                     add_audio_from_path(state, &p);
                 }
-                r
-            }).inner;
-            if resp.dragged() {
-                state.asset_drag.dragging = Some(p.clone());
-                state.asset_drag.kind = AssetDragKind::Audio;
-                if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
-                    state.asset_drag.pos = [pos.x, pos.y];
-                }
             }
         }
-    }
+    });
 }
 
 
@@ -230,7 +218,7 @@ fn clip_card(ui: &mut egui::Ui, state: &mut EditorState, clip: &crate::state::Li
         .inner_margin(egui::Margin::same(3.0))
         .stroke(Stroke::new(1.0, Color32::from_rgb(50, 50, 70)));
 
-    frame.show(ui, |ui| {
+    let card_resp = frame.show(ui, |ui| {
         ui.horizontal(|ui| {
             let thumb_size = Vec2::new(48.0, 48.0);
             if let Some(thumb) = &clip.thumbnail {
@@ -256,18 +244,23 @@ fn clip_card(ui: &mut egui::Ui, state: &mut EditorState, clip: &crate::state::Li
                 ui.label(RichText::new(format!("#{}", clip.id)).size(9.0).color(Color32::from_rgb(120, 100, 200)));
                 ui.label(RichText::new(display).size(11.0).color(COL_TEXT));
             });
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let add_btn = egui::Button::new(RichText::new("+").size(13.0).color(Color32::WHITE))
-                    .fill(Color32::from_rgb(60, 160, 80))
-                    .rounding(Rounding::same(8.0))
-                    .min_size(Vec2::new(22.0, 22.0));
-                if ui.add(add_btn).on_hover_text("Add to scene (or drag to timeline)").clicked() {
-                    add_actor_from_clip(state, &clip.path);
-                }
-            });
         });
-    });
+    }).response;
+
+    // Whole-card click + drag handling. The card is the drag source for the
+    // timeline (drop target inside the timeline area decides what happens).
+    let card_resp = card_resp.interact(Sense::click_and_drag());
+    if card_resp.dragged() {
+        state.asset_drag.dragging = Some(clip.path.clone());
+        state.asset_drag.kind = AssetDragKind::Clip;
+        if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
+            state.asset_drag.pos = [pos.x, pos.y];
+        }
+    }
+    if card_resp.double_clicked() {
+        // Convenience: double-click adds at playhead without needing to drag.
+        add_actor_from_clip(state, &clip.path);
+    }
     ui.add_space(2.0);
 }
 
@@ -345,15 +338,11 @@ fn inspector_actor(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
     let actor_count = state.scene.actors.len();
     let cache_count = state.frame_caches.len();
 
-    // Header with name and quick actions
+    // Header with name (delete button removed — use Delete/Backspace shortcut
+    // or right-click on the timeline clip instead).
     ui.horizontal(|ui| {
         ui.label(RichText::new(format!("Actor: {}", state.scene.actors[i].id))
             .strong().size(14.0).color(COL_CLIP_ACTOR));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.small_button("\u{1F5D1}").on_hover_text("Delete").clicked() {
-                state.status = "__DELETE_SELECTED__".into();
-            }
-        });
     });
     ui.add_space(2.0);
     ui.label(RichText::new(
@@ -455,6 +444,7 @@ fn inspector_actor_effects(ui: &mut egui::Ui, state: &mut EditorState, i: usize,
     ui.add_space(4.0);
 
     // Eyedropper
+    let mut chroma_changed = false;
     ui.horizontal(|ui| {
         if state.eyedropper_active {
             ui.label(RichText::new("Click preview to pick color...").color(Color32::from_rgb(255, 200, 50)).size(11.0));
@@ -462,13 +452,29 @@ fn inspector_actor_effects(ui: &mut egui::Ui, state: &mut EditorState, i: usize,
             state.eyedropper_active = true;
         }
         ui.label("Key:");
-        color_edit_u8(ui, &mut a.chroma_key.key_color);
+        if color_edit_u8(ui, &mut a.chroma_key.key_color) {
+            chroma_changed = true;
+        }
     });
 
     ui.add_space(4.0);
-    ui.add(egui::Slider::new(&mut a.chroma_key.similarity, 0.0..=1.0).text("Similarity"));
-    ui.add(egui::Slider::new(&mut a.chroma_key.blend, 0.0..=1.0).text("Blend"));
-    ui.add(egui::Slider::new(&mut a.chroma_key.spill, 0.0..=1.0).text("Spill"));
+    if ui.add(egui::Slider::new(&mut a.chroma_key.similarity, 0.0..=1.0).text("Similarity")).changed() {
+        chroma_changed = true;
+    }
+    if ui.add(egui::Slider::new(&mut a.chroma_key.blend, 0.0..=1.0).text("Blend")).changed() {
+        chroma_changed = true;
+    }
+    if ui.add(egui::Slider::new(&mut a.chroma_key.spill, 0.0..=1.0).text("Spill")).changed() {
+        chroma_changed = true;
+    }
+
+    // Persist chroma settings as a sidecar next to the source clip so they
+    // follow the asset across projects.
+    if chroma_changed {
+        let src = state.scene.actors[i].source.clone();
+        let chroma = state.scene.actors[i].chroma_key.clone();
+        let _ = chroma.save_alongside_clip(&src);
+    }
 
     ui.add_space(12.0);
 
@@ -750,15 +756,11 @@ fn inspector_text_overlay(
 ) -> Option<TextAction> {
     let mut action: Option<TextAction> = None;
 
-    // Header
+    // Header (delete button removed — use Delete/Backspace shortcut or
+    // right-click on the timeline clip).
     ui.horizontal(|ui| {
         ui.label(RichText::new(format!("Text: {}", t.id))
             .strong().size(14.0).color(COL_CLIP_OVERLAY));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.small_button("\u{1F5D1}").on_hover_text("Delete").clicked() {
-                action = Some(TextAction::Delete);
-            }
-        });
     });
     ui.add_space(2.0);
 
@@ -1170,8 +1172,11 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
         for au in &state.scene.audio {
             max_end = max_end.max(au.t_out.unwrap_or(0.0));
         }
-        // Auto-fit: duration follows content (with 1s padding, minimum 2s)
-        let target_duration = (max_end + 1.0).max(2.0);
+        // Auto-fit: timeline length is the end of the longest layer.
+        // No padding — when the playhead reaches the last clip's end the
+        // loop wraps immediately back to 0 instead of running through dead
+        // air.
+        let target_duration = max_end.max(2.0);
         state.scene.output.duration = target_duration;
     }
 
@@ -1605,7 +1610,10 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                 let new_end = new_start + dur;
                                 let mut snap_targets = collect_clip_edges(state, Some(ai));
                                 snap_targets.push(state.playhead);
-                                let threshold = 0.1;
+                                // Pixel-aware snap window: ~3 px on screen so the
+                                // clip glides smoothly under the cursor instead of
+                                // jumping in 0.1 s (≈ 8 px) chunks.
+                                let threshold = (3.0 / state.timeline_zoom.max(1.0)).max(0.001);
 
                                 let snapped_start = snap_time(new_start, &snap_targets, threshold);
                                 let snapped_end = snap_time(new_end, &snap_targets, threshold);
@@ -3150,12 +3158,15 @@ pub fn apply_color_correction(image: &mut egui::ColorImage, params: &memstroy_co
 
 // ─── HELPERS ─────────────────────────────────────────────────────────
 
-fn color_edit_u8(ui: &mut egui::Ui, c: &mut [u8; 3]) {
+fn color_edit_u8(ui: &mut egui::Ui, c: &mut [u8; 3]) -> bool {
     let mut rgb = [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0];
     if ui.color_edit_button_rgb(&mut rgb).changed() {
         c[0] = (rgb[0] * 255.0).round() as u8;
         c[1] = (rgb[1] * 255.0).round() as u8;
         c[2] = (rgb[2] * 255.0).round() as u8;
+        true
+    } else {
+        false
     }
 }
 
@@ -3175,37 +3186,40 @@ fn clean_clip_text(raw: &str) -> String {
 }
 
 pub fn add_actor_from_clip(state: &mut EditorState, path: &PathBuf) {
-    let counter = state.scene.actors.len() + 1;
-    let id = path.file_stem().and_then(|s| s.to_str())
-        .map(|s| format!("{}_{}", s, counter))
-        .unwrap_or_else(|| format!("actor_{}", counter));
+    let t = state.playhead;
+    add_actor_from_clip_at_time(state, path, t);
+}
 
-    let clip_duration = probe_video_duration(path);
-    let t_in = state.playhead;
-    let t_out = (t_in + clip_duration).min(state.scene.output.duration);
+/// Load chroma sidecar for `path`, falling back to default when absent.
+fn load_chroma_for_clip(path: &PathBuf) -> ChromaKeyParams {
+    ChromaKeyParams::load_for_clip(path).unwrap_or_default()
+}
 
-    let actor = Actor {
-        id: id.clone(),
-        source: path.clone(),
-        anchors: None,
-        chroma_key: ChromaKeyParams::default(),
-        layout: vec![Keyframe::new(0.0, ActorState::default())],
-        t_in: Some(t_in),
-        t_out: Some(t_out),
-        source_start: 0.0,
-        loop_source: false,
-        flip_horizontal: false,
-        attachments: Vec::new(),
-        skeleton_attachments: Vec::new(),
-        visible: true,
-        color_correction: ColorCorrection::default(),
-        transition_in: Transition::Cut,
-        transition_out: Transition::Cut,
-        transition_duration: 0.3,
-    };
-    state.scene.actors.push(actor);
-    state.selection = Selection::Actor(state.scene.actors.len() - 1);
-    state.status = format!("Added: {}", id);
+/// Push an `AudioTrack` matching `actor` so the embedded audio shows up as
+/// its own row on the audio lanes. Returns the new index.
+fn push_audio_track_for_actor(state: &mut EditorState, actor_id: &str, source: &PathBuf,
+                              t_in: f32, t_out: Option<f32>, source_start: f32) -> usize {
+    let id = format!("{}_audio", actor_id);
+    state.scene.audio.push(AudioTrack {
+        id,
+        source: source.clone(),
+        t_in,
+        t_out,
+        source_start,
+        volume: 1.0,
+    });
+    state.scene.audio.len() - 1
+}
+
+/// Auto-attach a skeleton template for `path` if a sidecar exists and we
+/// haven't already loaded it into the scene.
+fn ensure_skeleton_template_for_clip(state: &mut EditorState, path: &PathBuf) {
+    let already = state.scene.skeleton_templates.iter()
+        .any(|t| t.source_clip == *path);
+    if already { return; }
+    if let Some(template) = SkeletonTemplate::load_for_clip(path) {
+        state.scene.skeleton_templates.push(template);
+    }
 }
 
 /// Add a styled text overlay at the playhead and select it.
@@ -3297,14 +3311,23 @@ fn add_actor_from_clip_at_time(state: &mut EditorState, path: &PathBuf, t: f32) 
         .unwrap_or_else(|| format!("actor_{}", counter));
 
     let clip_duration = probe_video_duration(path);
-    let t_in = t;
-    let t_out = (t_in + clip_duration).min(state.scene.output.duration);
+    // The timeline auto-grows to fit content (see timeline()'s auto-length
+    // pass), so don't clamp the right edge to the current `output.duration`.
+    let t_in = t.max(0.0);
+    let t_out = t_in + clip_duration.max(0.1);
+
+    // Per-clip chroma settings live next to the source file (`<clip>.chroma.json`).
+    // This is independent of the project, so re-using the same Mellstroy clip
+    // in another scene starts pre-tuned.
+    let chroma = load_chroma_for_clip(path);
+    // Likewise, auto-attach a skeleton template if one was saved for this clip.
+    ensure_skeleton_template_for_clip(state, path);
 
     let actor = Actor {
         id: id.clone(),
         source: path.clone(),
         anchors: None,
-        chroma_key: ChromaKeyParams::default(),
+        chroma_key: chroma,
         layout: vec![Keyframe::new(0.0, ActorState::default())],
         t_in: Some(t_in),
         t_out: Some(t_out),
@@ -3320,7 +3343,14 @@ fn add_actor_from_clip_at_time(state: &mut EditorState, path: &PathBuf, t: f32) 
         transition_duration: 0.3,
     };
     state.scene.actors.push(actor);
-    state.selection = Selection::Actor(state.scene.actors.len() - 1);
+    let new_actor_idx = state.scene.actors.len() - 1;
+
+    // Also push an AudioTrack referencing the same source so the embedded
+    // audio appears as its own row on the audio lanes (and gains a waveform,
+    // volume slider, etc. on the inspector).
+    push_audio_track_for_actor(state, &id, path, t_in, Some(t_out), 0.0);
+
+    state.selection = Selection::Actor(new_actor_idx);
     state.status = format!("Dropped actor: {}", id);
 }
 

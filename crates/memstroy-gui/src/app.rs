@@ -187,28 +187,6 @@ impl App {
                     ui.close_menu();
                 }
                 ui.separator();
-                if ui.button("\u{1F3B5} Add audio...").clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("Audio", &["mp3", "wav", "ogg", "flac", "aac", "m4a"])
-                        .pick_file()
-                    {
-                        let id = path.file_stem().and_then(|s| s.to_str())
-                            .map(|s| s.to_string())
-                            .unwrap_or_else(|| format!("audio_{}", self.state.scene.audio.len() + 1));
-                        self.state.scene.audio.push(memstroy_core::AudioTrack {
-                            id: id.clone(),
-                            source: path,
-                            t_in: self.state.playhead,
-                            t_out: None,
-                            source_start: 0.0,
-                            volume: 1.0,
-                        });
-                        self.state.selection = Selection::Audio(self.state.scene.audio.len() - 1);
-                        self.state.status = format!("\u{1F3B5} Added audio: {}", id);
-                    }
-                    ui.close_menu();
-                }
-                ui.separator();
                 if ui.button("\u{1F6AA} Exit").clicked() {
                     ctx.send_viewport_cmd(ViewportCommand::Close);
                 }
@@ -224,15 +202,14 @@ impl App {
             ui.menu_button(RichText::new("\u{1F9E0} Tools").strong(), |ui| {
                 if ui.button("\u{1F9B4} Skeleton Constructor...").clicked() {
                     self.state.skeleton_editor.open = true;
-                    // Pre-select the current actor if one is selected
+                    // Pre-select the source clip from the currently selected
+                    // actor (so the editor is ready to edit a familiar clip),
+                    // but the editor itself is now clip-centric — see
+                    // `skeleton_editor::on_clip_changed`.
                     if let Selection::Actor(i) = self.state.selection {
                         if i < self.state.scene.actors.len() {
-                            self.state.skeleton_editor.actor_idx = Some(i);
-                            // Try to find existing template
-                            let source = self.state.scene.actors[i].source.clone();
-                            self.state.skeleton_editor.template_idx =
-                                self.state.scene.skeleton_templates.iter()
-                                    .position(|t| t.source_clip == source);
+                            let path = self.state.scene.actors[i].source.clone();
+                            crate::skeleton_editor::select_clip(&mut self.state, &path);
                         }
                     }
                     ui.close_menu();
@@ -1201,8 +1178,14 @@ impl eframe::App for App {
                 }
             }
 
-            if self.state.playhead >= self.state.scene.output.duration {
-                self.state.playhead = 0.0; // loop full scene
+            // Wrap when the playhead reaches the end of the longest layer
+            // (which `panels::timeline()` keeps in sync with `output.duration`).
+            // No "+1 second" buffer — once the last clip finishes we restart
+            // immediately so loop playback doesn't sit on dead air.
+            if self.state.playhead >= self.state.scene.output.duration
+                || self.state.playhead < 0.0
+            {
+                self.state.playhead = 0.0;
             }
             // Repaint at the scene's output FPS (capped) so we don't burn
             // CPU/GPU at 120+ Hz when the output is e.g. 30 fps.
@@ -1331,6 +1314,8 @@ impl eframe::App for App {
                 if let Some(path) = &file.path {
                     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
                     if ["mp4", "mov", "webm", "avi", "mkv"].contains(&ext.as_str()) {
+                        // `add_actor_from_clip` already creates a matching AudioTrack
+                        // and pre-loads any per-clip chroma/skeleton sidecars.
                         crate::panels::add_actor_from_clip(&mut self.state, &path.to_path_buf());
                     } else if ["jpg", "jpeg", "png", "webp", "gif"].contains(&ext.as_str()) {
                         let id = path.file_stem().and_then(|s| s.to_str())
@@ -1346,7 +1331,7 @@ impl eframe::App for App {
                         self.state.scene.overlays.push(overlay);
                         self.state.selection = Selection::Overlay(self.state.scene.overlays.len() - 1);
                         self.state.status = format!("Dropped image: {}", id);
-                    } else if ["mp3", "wav", "ogg", "flac", "aac"].contains(&ext.as_str()) {
+                    } else if ["mp3", "wav", "ogg", "flac", "aac", "m4a"].contains(&ext.as_str()) {
                         let id = path.file_stem().and_then(|s| s.to_str())
                             .map(|s| s.to_string())
                             .unwrap_or_else(|| format!("audio_{}", self.state.scene.audio.len() + 1));
@@ -1380,11 +1365,15 @@ impl eframe::App for App {
         // ── Audio engine synchronisation ──
         // Build the list of audio sources currently scheduled in the scene:
         //   - explicit AudioTrack entries (state.scene.audio)
-        //   - actor video clips (their embedded audio streams)
+        //   - actor video clips (their embedded audio streams) — but only
+        //     when no AudioTrack already references the same source path,
+        //     because otherwise we'd hear the clip's audio twice.
         // The engine ignores anything without a decodable audio stream, so
         // including every actor unconditionally is safe.
         let build_sources = |state: &EditorState| -> Vec<crate::audio_engine::AudioSourceSpec> {
             let mut out = Vec::new();
+            let mut seen: std::collections::HashSet<std::path::PathBuf> =
+                std::collections::HashSet::new();
             for a in &state.scene.audio {
                 out.push(crate::audio_engine::AudioSourceSpec {
                     path: a.source.clone(),
@@ -1393,9 +1382,11 @@ impl eframe::App for App {
                     source_start: a.source_start,
                     volume: a.volume,
                 });
+                seen.insert(a.source.clone());
             }
             for actor in &state.scene.actors {
                 if !actor.visible { continue; }
+                if seen.contains(&actor.source) { continue; }
                 out.push(crate::audio_engine::AudioSourceSpec {
                     path: actor.source.clone(),
                     t_in: actor.t_in.unwrap_or(0.0),
