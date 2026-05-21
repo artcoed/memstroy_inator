@@ -1105,6 +1105,17 @@ impl eframe::App for App {
         self.poll_frame_extraction();
         self.poll_waveform_extraction();
 
+        // Auto-start frame extraction for actors that have source files
+        if !self.state.scene.actors.is_empty() {
+            let needs_extraction = self.state.scene.actors.iter().enumerate().any(|(i, actor)| {
+                actor.source.exists()
+                    && self.state.frame_caches.get(i).map(|fc| !fc.is_ready() && !fc.extracting).unwrap_or(true)
+            });
+            if needs_extraction {
+                self.start_frame_extraction();
+            }
+        }
+
         // Keyboard shortcuts
         self.handle_shortcuts(ctx);
 
@@ -1139,6 +1150,11 @@ impl eframe::App for App {
                 self.state.last_rendered_playhead = self.state.playhead;
                 self.run_preview();
             }
+        }
+
+        // Request repaint when frame caches are ready (for smooth video preview on canvas)
+        if frame_cache_active && !self.state.playing {
+            ctx.request_repaint();
         }
 
         // Apply modern dark style
