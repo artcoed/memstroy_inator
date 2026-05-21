@@ -2179,6 +2179,10 @@ fn set_selection_world_center(state: &mut EditorState, center: [f32; 2]) {
             let new_norm = [(center[0] - frame_tl_x) / world_w, (center[1] - frame_tl_y) / world_h];
             ensure_actor_kf_at_playhead(&mut state.scene.actors[idx].layout, t);
             apply_to_anim_kf(&mut state.scene.actors[idx].layout, t, |v| v.pos = new_norm);
+            mark_actor_canvas_animated(state, idx, t, &[
+                memstroy_core::param_ids::POS_X,
+                memstroy_core::param_ids::POS_Y,
+            ]);
         }
         Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
             let local_t = overlay_clip_local_time(state, idx);
@@ -2194,6 +2198,10 @@ fn set_selection_world_center(state: &mut EditorState, center: [f32; 2]) {
             let layout = overlay_layout_mut(&mut state.scene.overlays[idx]);
             ensure_overlay_kf_at_playhead(layout, local_t);
             apply_to_overlay_kf(layout, local_t, |v| v.pos = new_norm);
+            mark_overlay_canvas_animated(state, idx, local_t, &[
+                memstroy_core::param_ids::POS_X,
+                memstroy_core::param_ids::POS_Y,
+            ]);
         }
         Selection::RenderFrame => {
             ensure_render_frame_kf_at_playhead(&mut state.scene.render_frame.layout, t);
@@ -2206,6 +2214,43 @@ fn set_selection_world_center(state: &mut EditorState, center: [f32; 2]) {
     }
 }
 
+/// Insert the named animated-param ids on the targeted actor when the
+/// edit happens at a time past 0. At t≈0 the canvas drag is interpreted
+/// as setting the base pose so the parameter stays static.
+fn mark_actor_canvas_animated(
+    state: &mut EditorState,
+    idx: usize,
+    t: f32,
+    params: &[&str],
+) {
+    if t <= 1.0e-3 { return; }
+    if let Some(a) = state.scene.actors.get_mut(idx) {
+        for p in params {
+            a.animated_params.insert((*p).to_string());
+        }
+    }
+}
+
+/// Per-overlay equivalent of `mark_actor_canvas_animated`.
+fn mark_overlay_canvas_animated(
+    state: &mut EditorState,
+    idx: usize,
+    local_t: f32,
+    params: &[&str],
+) {
+    if local_t <= 1.0e-3 { return; }
+    if let Some(ov) = state.scene.overlays.get_mut(idx) {
+        let set: &mut std::collections::BTreeSet<String> = match ov {
+            memstroy_core::Overlay::Text(t) => &mut t.animated_params,
+            memstroy_core::Overlay::Image(im) => &mut im.animated_params,
+            memstroy_core::Overlay::Video(v) => &mut v.animated_params,
+        };
+        for p in params {
+            set.insert((*p).to_string());
+        }
+    }
+}
+
 fn set_selection_scale_y(state: &mut EditorState, new_scale_y: f32) {
     let s = new_scale_y.clamp(0.05, 20.0);
     let t = state.playhead;
@@ -2213,12 +2258,14 @@ fn set_selection_scale_y(state: &mut EditorState, new_scale_y: f32) {
         Selection::Actor(idx) if idx < state.scene.actors.len() => {
             ensure_actor_kf_at_playhead(&mut state.scene.actors[idx].layout, t);
             apply_to_anim_kf(&mut state.scene.actors[idx].layout, t, |v| v.scale_y = s);
+            mark_actor_canvas_animated(state, idx, t, &[memstroy_core::param_ids::SCALE_Y]);
         }
         Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
             let local_t = overlay_clip_local_time(state, idx);
             let layout = overlay_layout_mut(&mut state.scene.overlays[idx]);
             ensure_overlay_kf_at_playhead(layout, local_t);
             apply_to_overlay_kf(layout, local_t, |v| v.scale_y = s);
+            mark_overlay_canvas_animated(state, idx, local_t, &[memstroy_core::param_ids::SCALE_Y]);
         }
         // Render frame is locked to its output aspect ratio — scale_y is
         // ignored here, scale alone changes its size on the canvas.
@@ -2233,12 +2280,14 @@ fn set_selection_scale(state: &mut EditorState, new_scale: f32) {
         Selection::Actor(idx) if idx < state.scene.actors.len() => {
             ensure_actor_kf_at_playhead(&mut state.scene.actors[idx].layout, t);
             apply_to_anim_kf(&mut state.scene.actors[idx].layout, t, |v| v.scale = s);
+            mark_actor_canvas_animated(state, idx, t, &[memstroy_core::param_ids::SCALE]);
         }
         Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
             let local_t = overlay_clip_local_time(state, idx);
             let layout = overlay_layout_mut(&mut state.scene.overlays[idx]);
             ensure_overlay_kf_at_playhead(layout, local_t);
             apply_to_overlay_kf(layout, local_t, |v| v.scale = s);
+            mark_overlay_canvas_animated(state, idx, local_t, &[memstroy_core::param_ids::SCALE]);
         }
         Selection::RenderFrame => {
             // Map scale → inverse zoom (bigger scale = bigger frame).
@@ -2268,12 +2317,14 @@ fn set_selection_rotation(state: &mut EditorState, new_rot_deg: f32) {
         Selection::Actor(idx) if idx < state.scene.actors.len() => {
             ensure_actor_kf_at_playhead(&mut state.scene.actors[idx].layout, t);
             apply_to_anim_kf(&mut state.scene.actors[idx].layout, t, |v| v.rotation_deg = new_rot_deg);
+            mark_actor_canvas_animated(state, idx, t, &[memstroy_core::param_ids::ROTATION]);
         }
         Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
             let local_t = overlay_clip_local_time(state, idx);
             let layout = overlay_layout_mut(&mut state.scene.overlays[idx]);
             ensure_overlay_kf_at_playhead(layout, local_t);
             apply_to_overlay_kf(layout, local_t, |v| v.rotation_deg = new_rot_deg);
+            mark_overlay_canvas_animated(state, idx, local_t, &[memstroy_core::param_ids::ROTATION]);
         }
         Selection::RenderFrame => {
             ensure_render_frame_kf_at_playhead(&mut state.scene.render_frame.layout, t);
@@ -3685,7 +3736,7 @@ pub fn handle_canvas_asset_drag(
         let asset_label = state.asset_drag.label.clone();
         let kind = state.asset_drag.kind;
         match kind {
-            crate::state::AssetDragKind::Clip => {
+            crate::state::AssetDragKind::Clip | crate::state::AssetDragKind::Video => {
                 crate::panels::add_actor_from_clip_at_canvas(state, &asset_path, [world.x, world.y]);
             }
             crate::state::AssetDragKind::Sound
