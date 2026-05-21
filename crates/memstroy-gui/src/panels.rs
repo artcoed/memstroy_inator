@@ -41,10 +41,10 @@ const COL_SELECTED: Color32 = Color32::from_rgb(255, 220, 80);
 
 // ─── LIBRARY ─────────────────────────────────────────────────────────
 
-/// Unified asset library: a single scrollable column listing every asset
-/// in the project (clips, backgrounds, props, audio). Every row is a drag
-/// source — drop on the timeline to add. OS Explorer drops are also routed
-/// into this library implicitly via `App::update`.
+/// Asset library — top half is the Mellstroy clips list (drag to add as
+/// actor), bottom half is a uniform grid of every other asset
+/// (backgrounds / props / audio) where the asset *type* is conveyed only
+/// through the cell icon.
 pub fn library(ui: &mut egui::Ui, state: &mut EditorState, _request_refresh: impl Fn()) {
     // Header
     ui.horizontal(|ui| {
@@ -70,125 +70,236 @@ pub fn library(ui: &mut egui::Ui, state: &mut EditorState, _request_refresh: imp
         .size(9.0).italics().color(COL_TEXT_DIM));
     ui.add_space(6.0);
 
+    let avail = ui.available_size_before_wrap();
+    let clips_h = (avail.y * 0.45).clamp(140.0, 480.0);
+    let assets_h = (avail.y - clips_h - 12.0).max(120.0);
+
     let search_lower = state.library_search.to_lowercase();
 
-    egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
-        // ── Clips section ──
-        let clip_count = state.library.mellstroy_clips.len();
-        ui.label(RichText::new(format!("Clips ({})", clip_count)).size(12.0).strong()
-            .color(Color32::from_rgb(220, 130, 50)));
-        ui.add_space(2.0);
-        if state.library.mellstroy_clips.is_empty() {
-            ui.label(RichText::new("No clips. Hit Refresh to download.")
-                .italics().color(COL_TEXT_DIM).size(11.0));
-        } else {
-            for idx in 0..state.library.mellstroy_clips.len() {
-                let clip = &state.library.mellstroy_clips[idx];
-                if !search_lower.is_empty() {
-                    let clean = clean_clip_text(&clip.description).to_lowercase();
-                    let id_str = clip.id.to_string();
-                    if !clean.contains(&search_lower) && !id_str.contains(&search_lower) {
-                        continue;
+    // ── TOP: Clips panel ──
+    ui.allocate_ui_with_layout(
+        Vec2::new(avail.x, clips_h),
+        egui::Layout::top_down(egui::Align::LEFT),
+        |ui| {
+            ui.set_min_width(ui.available_width());
+            let clip_count = state.library.mellstroy_clips.len();
+            ui.label(RichText::new(format!("Clips ({})", clip_count)).size(12.0).strong()
+                .color(Color32::from_rgb(220, 130, 50)));
+            ui.add_space(2.0);
+            egui::ScrollArea::vertical()
+                .id_source("library_clips_scroll")
+                .auto_shrink([false; 2])
+                .show(ui, |ui| {
+                    if state.library.mellstroy_clips.is_empty() {
+                        ui.label(RichText::new("No clips. Hit Refresh to download.")
+                            .italics().color(COL_TEXT_DIM).size(11.0));
+                    } else {
+                        for idx in 0..state.library.mellstroy_clips.len() {
+                            let clip = &state.library.mellstroy_clips[idx];
+                            if !search_lower.is_empty() {
+                                let clean = clean_clip_text(&clip.description).to_lowercase();
+                                let id_str = clip.id.to_string();
+                                if !clean.contains(&search_lower) && !id_str.contains(&search_lower) {
+                                    continue;
+                                }
+                            }
+                            let clip = state.library.mellstroy_clips[idx].clone();
+                            clip_card(ui, state, &clip);
+                        }
                     }
-                }
-                let clip = state.library.mellstroy_clips[idx].clone();
-                clip_card(ui, state, &clip);
-            }
-        }
-        ui.add_space(8.0);
+                });
+        },
+    );
 
-        // ── Backgrounds ──
-        ui.label(RichText::new(format!("Backgrounds ({})", state.library.backgrounds.len()))
-            .size(12.0).strong().color(Color32::from_rgb(100, 180, 255)));
-        ui.add_space(2.0);
-        if state.library.backgrounds.is_empty() {
-            ui.label(RichText::new("Drop videos/images into assets/backgrounds/")
-                .italics().color(COL_TEXT_DIM).size(11.0));
-        } else {
-            for p in state.library.backgrounds.clone() {
-                let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("(?)").to_string();
-                if !search_lower.is_empty() && !name.to_lowercase().contains(&search_lower) {
+    ui.add_space(6.0);
+    ui.separator();
+    ui.add_space(6.0);
+
+    // ── BOTTOM: unified asset grid (no per-type sections) ──
+    ui.allocate_ui_with_layout(
+        Vec2::new(avail.x, assets_h),
+        egui::Layout::top_down(egui::Align::LEFT),
+        |ui| {
+            ui.set_min_width(ui.available_width());
+            let asset_count = state.library.backgrounds.len()
+                + state.library.props.len()
+                + state.library.audio.len();
+            ui.label(RichText::new(format!("Assets ({})", asset_count)).size(12.0).strong()
+                .color(Color32::from_rgb(160, 200, 255)));
+            ui.add_space(2.0);
+
+            egui::ScrollArea::vertical()
+                .id_source("library_assets_scroll")
+                .auto_shrink([false; 2])
+                .show(ui, |ui| {
+                    if asset_count == 0 {
+                        ui.label(RichText::new(
+                            "Drop files into assets/backgrounds, assets/props or assets/audio.")
+                            .italics().color(COL_TEXT_DIM).size(11.0));
+                        return;
+                    }
+                    asset_grid(ui, state, &search_lower);
+                });
+        },
+    );
+}
+
+/// Render every non-clip library asset (backgrounds + props + audio) in a
+/// single fluid grid. Asset type is signalled exclusively by the corner
+/// icon on each cell.
+fn asset_grid(ui: &mut egui::Ui, state: &mut EditorState, search_lower: &str) {
+    // Build a unified, ordered list of (kind, path) so the grid is one flat list.
+    let mut items: Vec<(AssetDragKind, PathBuf)> =
+        Vec::with_capacity(state.library.backgrounds.len()
+            + state.library.props.len()
+            + state.library.audio.len());
+    for p in state.library.backgrounds.iter().cloned() {
+        items.push((AssetDragKind::Background, p));
+    }
+    for p in state.library.props.iter().cloned() {
+        items.push((AssetDragKind::Prop, p));
+    }
+    for p in state.library.audio.iter().cloned() {
+        items.push((AssetDragKind::Audio, p));
+    }
+
+    // Cell sizing — driven by available width so the grid auto-flows.
+    let cell_w: f32 = 86.0;
+    let cell_h: f32 = 92.0;
+    let gap: f32 = 4.0;
+    let cols = ((ui.available_width() + gap) / (cell_w + gap))
+        .floor()
+        .max(1.0) as usize;
+
+    // egui::Grid handles the row/column wiring; we only render cells.
+    egui::Grid::new("asset_grid_table")
+        .num_columns(cols)
+        .spacing(egui::vec2(gap, gap))
+        .show(ui, |ui| {
+            let mut col_count = 0usize;
+            for (kind, path) in items {
+                let name = path.file_name().and_then(|s| s.to_str())
+                    .unwrap_or("(?)").to_string();
+                if !search_lower.is_empty()
+                    && !name.to_lowercase().contains(search_lower) {
                     continue;
                 }
-                let resp = ui.add(
-                    egui::Label::new(RichText::new(format!("\u{1F5BC} {}", name)).size(11.0))
-                        .sense(Sense::click_and_drag()),
-                );
-                if resp.dragged() {
-                    state.asset_drag.dragging = Some(p.clone());
-                    state.asset_drag.kind = AssetDragKind::Background;
-                    if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
-                        state.asset_drag.pos = [pos.x, pos.y];
-                    }
-                }
-                if resp.double_clicked() {
-                    add_background_from_path(state, &p);
-                }
+                asset_grid_cell(ui, state, kind, &path, &name, cell_w, cell_h);
+                col_count += 1;
+                if col_count % cols == 0 { ui.end_row(); }
             }
-        }
-        ui.add_space(8.0);
+        });
+}
 
-        // ── Props (image overlays) ──
-        ui.label(RichText::new(format!("Props ({})", state.library.props.len()))
-            .size(12.0).strong().color(Color32::from_rgb(200, 200, 100)));
-        ui.add_space(2.0);
-        if state.library.props.is_empty() {
-            ui.label(RichText::new("Drop PNG/WebP into assets/props/")
-                .italics().color(COL_TEXT_DIM).size(11.0));
-        } else {
-            for p in state.library.props.clone() {
-                let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("(?)").to_string();
-                if !search_lower.is_empty() && !name.to_lowercase().contains(&search_lower) {
-                    continue;
-                }
-                let resp = ui.add(
-                    egui::Label::new(RichText::new(format!("\u{1F5BC} {}", name)).size(11.0))
-                        .sense(Sense::click_and_drag()),
-                );
-                if resp.dragged() {
-                    state.asset_drag.dragging = Some(p.clone());
-                    state.asset_drag.kind = AssetDragKind::Prop;
-                    if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
-                        state.asset_drag.pos = [pos.x, pos.y];
-                    }
-                }
-                if resp.double_clicked() {
-                    add_image_overlay(state, &p);
-                }
-            }
-        }
-        ui.add_space(8.0);
+/// Single grid cell: thumbnail (or generic icon for non-image types) + tiny
+/// type badge + truncated filename. The whole cell is the drag source.
+fn asset_grid_cell(
+    ui: &mut egui::Ui,
+    state: &mut EditorState,
+    kind: AssetDragKind,
+    path: &PathBuf,
+    name: &str,
+    cell_w: f32,
+    cell_h: f32,
+) {
+    // (icon, accent color, tooltip)
+    let (icon, accent) = match kind {
+        AssetDragKind::Background => ("\u{1F5BC}", Color32::from_rgb(100, 180, 255)),
+        AssetDragKind::Prop       => ("\u{1F4CC}", Color32::from_rgb(220, 200, 100)),
+        AssetDragKind::Audio      => ("\u{1F3B5}", Color32::from_rgb(50, 180, 180)),
+        _                         => ("\u{2753}", Color32::from_rgb(180, 180, 180)),
+    };
 
-        // ── Audio ──
-        ui.label(RichText::new(format!("Audio ({})", state.library.audio.len()))
-            .size(12.0).strong().color(Color32::from_rgb(50, 180, 180)));
-        ui.add_space(2.0);
-        if state.library.audio.is_empty() {
-            ui.label(RichText::new("Drop MP3/WAV/OGG into assets/audio/")
-                .italics().color(COL_TEXT_DIM).size(11.0));
+    // Pre-compute file metadata once — used both inside the cell paint
+    // closure and by the drag handler below.
+    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+    let is_image = ["jpg", "jpeg", "png", "webp"].contains(&ext.as_str());
+
+    let frame = egui::Frame::none()
+        .fill(Color32::from_rgb(28, 28, 40))
+        .rounding(Rounding::same(4.0))
+        .inner_margin(egui::Margin::same(3.0))
+        .stroke(Stroke::new(1.0, Color32::from_rgb(50, 50, 70)));
+
+    let cell_resp = frame.show(ui, |ui| {
+        ui.set_min_size(Vec2::new(cell_w, cell_h));
+        ui.set_max_size(Vec2::new(cell_w, cell_h));
+
+        let thumb_size = Vec2::new(cell_w - 8.0, cell_h - 30.0);
+        // Thumbnail (image assets only) — fall back to a coloured placeholder.
+        if matches!(kind, AssetDragKind::Background | AssetDragKind::Prop) && is_image {
+            let uri = format!("file://{}", path.display());
+            ui.add(
+                egui::Image::from_uri(uri)
+                    .fit_to_exact_size(thumb_size)
+                    .maintain_aspect_ratio(false)
+                    .rounding(Rounding::same(3.0)),
+            );
         } else {
-            for p in state.library.audio.clone() {
-                let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("(?)").to_string();
-                if !search_lower.is_empty() && !name.to_lowercase().contains(&search_lower) {
-                    continue;
-                }
-                let resp = ui.add(
-                    egui::Label::new(RichText::new(format!("\u{1F3B5} {}", name)).size(11.0))
-                        .sense(Sense::click_and_drag()),
-                );
-                if resp.dragged() {
-                    state.asset_drag.dragging = Some(p.clone());
-                    state.asset_drag.kind = AssetDragKind::Audio;
-                    if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
-                        state.asset_drag.pos = [pos.x, pos.y];
-                    }
-                }
-                if resp.double_clicked() {
-                    add_audio_from_path(state, &p);
-                }
-            }
+            let (rect, _) = ui.allocate_exact_size(thumb_size, Sense::hover());
+            ui.painter().rect_filled(rect, Rounding::same(3.0), Color32::from_rgb(38, 38, 56));
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                icon,
+                egui::FontId::proportional(28.0),
+                accent,
+            );
         }
-    });
+
+        // Type badge in the top-left corner of the thumbnail.
+        let badge_rect = egui::Rect::from_min_size(
+            ui.min_rect().min + egui::vec2(2.0, 2.0),
+            Vec2::new(16.0, 16.0),
+        );
+        ui.painter().rect_filled(
+            badge_rect,
+            Rounding::same(3.0),
+            Color32::from_rgba_premultiplied(0, 0, 0, 180),
+        );
+        ui.painter().text(
+            badge_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            icon,
+            egui::FontId::proportional(11.0),
+            accent,
+        );
+
+        // Filename (truncated to 1 line).
+        ui.add_space(2.0);
+        ui.add(
+            egui::Label::new(RichText::new(name).size(10.0).color(COL_TEXT))
+                .truncate(),
+        );
+    }).response;
+
+    let cell_resp = cell_resp.interact(Sense::click_and_drag());
+    let cell_resp = cell_resp.on_hover_text(name);
+
+    if cell_resp.dragged() {
+        state.asset_drag.dragging = Some(path.clone());
+        state.asset_drag.kind = kind;
+        state.asset_drag.label = name.to_string();
+        // Use the asset path itself as the thumbnail for image-typed assets;
+        // others fall back to the generic icon at preview time.
+        state.asset_drag.thumbnail = if matches!(kind,
+            AssetDragKind::Background | AssetDragKind::Prop) && is_image {
+            Some(path.clone())
+        } else {
+            None
+        };
+        if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
+            state.asset_drag.pos = [pos.x, pos.y];
+        }
+    }
+    if cell_resp.double_clicked() {
+        match kind {
+            AssetDragKind::Background => add_background_from_path(state, path),
+            AssetDragKind::Prop       => add_image_overlay(state, path),
+            AssetDragKind::Audio      => add_audio_from_path(state, path),
+            _                         => {}
+        }
+    }
 }
 
 
@@ -203,6 +314,7 @@ fn add_audio_from_path(state: &mut EditorState, path: &PathBuf) {
         t_out: None,
         source_start: 0.0,
         volume: 1.0,
+        parent_actor: None,
     });
     state.selection = Selection::Audio(state.scene.audio.len() - 1);
     state.status = format!("Added audio: {}", id);
@@ -226,6 +338,10 @@ fn add_image_overlay(state: &mut EditorState, path: &PathBuf) {
 }
 
 fn clip_card(ui: &mut egui::Ui, state: &mut EditorState, clip: &crate::state::LibraryClip) {
+    // Stretch to the full available width of the library column rather than
+    // sizing to the inner row's content.
+    let avail_w = ui.available_width().max(80.0);
+
     let frame = egui::Frame::none()
         .fill(Color32::from_rgb(32, 32, 48))
         .rounding(Rounding::same(4.0))
@@ -233,6 +349,8 @@ fn clip_card(ui: &mut egui::Ui, state: &mut EditorState, clip: &crate::state::Li
         .stroke(Stroke::new(1.0, Color32::from_rgb(50, 50, 70)));
 
     let card_resp = frame.show(ui, |ui| {
+        ui.set_min_width(avail_w - 6.0); // account for inner_margin
+
         ui.horizontal(|ui| {
             let thumb_size = Vec2::new(48.0, 48.0);
             if let Some(thumb) = &clip.thumbnail {
@@ -250,14 +368,23 @@ fn clip_card(ui: &mut egui::Ui, state: &mut EditorState, clip: &crate::state::Li
                     format!("{}", clip.id), egui::FontId::proportional(11.0), COL_TEXT_DIM);
             }
 
-            ui.vertical(|ui| {
-                let desc = clean_clip_text(&clip.description);
-                let display = if desc.is_empty() { format!("Clip #{}", clip.id) }
-                    else if desc.chars().count() > 35 { format!("{}...", desc.chars().take(32).collect::<String>()) }
-                    else { desc };
-                ui.label(RichText::new(format!("#{}", clip.id)).size(9.0).color(Color32::from_rgb(120, 100, 200)));
-                ui.label(RichText::new(display).size(11.0).color(COL_TEXT));
-            });
+            // Vertical text column claims the rest of the available width
+            // so that even short labels don't shrink the card.
+            ui.allocate_ui_with_layout(
+                Vec2::new(ui.available_width(), thumb_size.y),
+                egui::Layout::top_down(egui::Align::LEFT),
+                |ui| {
+                    ui.set_min_width(ui.available_width());
+                    let desc = clean_clip_text(&clip.description);
+                    let display = if desc.is_empty() { format!("Clip #{}", clip.id) } else { desc };
+                    ui.label(RichText::new(format!("#{}", clip.id)).size(9.0)
+                        .color(Color32::from_rgb(120, 100, 200)));
+                    ui.add(
+                        egui::Label::new(RichText::new(display).size(11.0).color(COL_TEXT))
+                            .truncate(),
+                    );
+                },
+            );
         });
     }).response;
 
@@ -267,6 +394,8 @@ fn clip_card(ui: &mut egui::Ui, state: &mut EditorState, clip: &crate::state::Li
     if card_resp.dragged() {
         state.asset_drag.dragging = Some(clip.path.clone());
         state.asset_drag.kind = AssetDragKind::Clip;
+        state.asset_drag.label = clip_drag_label(clip);
+        state.asset_drag.thumbnail = clip.thumbnail.clone();
         if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
             state.asset_drag.pos = [pos.x, pos.y];
         }
@@ -276,6 +405,18 @@ fn clip_card(ui: &mut egui::Ui, state: &mut EditorState, clip: &crate::state::Li
         add_actor_from_clip(state, &clip.path);
     }
     ui.add_space(2.0);
+}
+
+/// Compact human-readable label for a clip (used by the drag preview).
+fn clip_drag_label(clip: &crate::state::LibraryClip) -> String {
+    let desc = clean_clip_text(&clip.description);
+    if desc.is_empty() {
+        format!("Clip #{}", clip.id)
+    } else if desc.chars().count() > 28 {
+        format!("#{}  {}\u{2026}", clip.id, desc.chars().take(26).collect::<String>())
+    } else {
+        format!("#{}  {}", clip.id, desc)
+    }
 }
 
 
@@ -412,7 +553,13 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
         });
         ui.horizontal(|ui| {
             ui.label(RichText::new("Rotation:").size(11.0));
-            ui.add(egui::Slider::new(&mut kf.value.rotation_deg, -360.0..=360.0).suffix("\u{00B0}"));
+            ui.add(
+                egui::Slider::new(&mut kf.value.rotation_deg, -360.0..=360.0)
+                    .suffix("\u{00B0}")
+                    .step_by(0.1)
+                    .fixed_decimals(1)
+                    .smart_aim(false),
+            );
         });
         ui.horizontal(|ui| {
             ui.label(RichText::new("Opacity:").size(11.0));
@@ -442,7 +589,13 @@ fn inspector_keyframe_editor(ui: &mut egui::Ui, kf: &mut Keyframe<ActorState>) {
     });
     ui.horizontal(|ui| {
         ui.label(RichText::new("Rotation:").size(11.0));
-        ui.add(egui::Slider::new(&mut kf.value.rotation_deg, -360.0..=360.0).suffix("\u{00B0}"));
+        ui.add(
+            egui::Slider::new(&mut kf.value.rotation_deg, -360.0..=360.0)
+                .suffix("\u{00B0}")
+                .step_by(0.1)
+                .fixed_decimals(1)
+                .smart_aim(false),
+        );
     });
     ui.horizontal(|ui| {
         ui.label(RichText::new("Opacity:").size(11.0));
@@ -835,7 +988,13 @@ fn inspector_text_overlay(
             ui.label("Y:"); ui.add(egui::DragValue::new(&mut kf.value.pos[1]).range(-2.0..=3.0).speed(0.005));
         });
         ui.add(egui::Slider::new(&mut kf.value.scale, 0.05..=5.0).text("Scale").logarithmic(true));
-        ui.add(egui::Slider::new(&mut kf.value.rotation_deg, -180.0..=180.0).text("Rotation"));
+        ui.add(
+            egui::Slider::new(&mut kf.value.rotation_deg, -180.0..=180.0)
+                .text("Rotation")
+                .step_by(0.1)
+                .fixed_decimals(1)
+                .smart_aim(false),
+        );
         ui.add(egui::Slider::new(&mut kf.value.opacity, 0.0..=1.0).text("Opacity"));
     }
     ui.add_space(8.0);
@@ -1581,6 +1740,9 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             let delta_t = dx / pps;
                             let new_in = (clip_start + delta_t).max(0.0).min(clip_end - 0.1);
                             state.scene.actors[ai].t_in = Some(new_in);
+                            // Bound audio: shift its in-edge by the same delta and
+                            // advance source_start so the playback head doesn't slip.
+                            sync_audio_to_actor(state, ai);
                             to_select = Some(Selection::Actor(ai));
                         } else if clicked == f32::NEG_INFINITY {
                             // Trim right edge: adjust t_out
@@ -1588,6 +1750,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             let delta_t = dx / pps;
                             let new_out = (clip_end + delta_t).max(clip_start + 0.1);
                             state.scene.actors[ai].t_out = Some(new_out);
+                            sync_audio_to_actor(state, ai);
                             to_select = Some(Selection::Actor(ai));
                         } else if clicked < 0.0 {
                             // Drag: move the actor's time window
@@ -1644,6 +1807,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
 
                             state.scene.actors[ai].t_in = Some(new_start);
                             state.scene.actors[ai].t_out = Some(new_start + dur);
+                            sync_audio_to_actor(state, ai);
                             to_select = Some(Selection::Actor(ai));
                         } else if state.split_tool_active {
                             to_select = Some(Selection::Actor(ai));
@@ -1914,20 +2078,23 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     if state.asset_drag.dragging.is_some() && mouse_released {
         let mouse_pos = ui.input(|i| i.pointer.hover_pos());
         if let Some(pos) = mouse_pos {
-            // Calculate which track the mouse is over by Y position
-            // Track rows start after the ruler (approx offset)
-            let track_y_start = ui.min_rect().min.y; // approximate top of tracks area
-            let mut accumulated_y = track_y_start;
-            let mut _drop_track: Option<usize> = None;
-
-            for (tidx, track) in state.tracks.iter().enumerate() {
-                let track_bottom = accumulated_y + track.height;
-                if pos.y >= accumulated_y && pos.y < track_bottom {
-                    _drop_track = Some(tidx);
-                    break;
+            // Resolve which track the drop is over using the same row-rect
+            // table the clip-drag handlers use, so a clip lands on the
+            // exact lane the user pointed at. Returns None if the cursor is
+            // outside any existing row (we then create a new layer).
+            let drop_track: Option<usize> = (|| {
+                for (i, (top, bot)) in track_rows.iter().enumerate() {
+                    if pos.y >= *top && pos.y < *bot {
+                        return Some(i);
+                    }
                 }
-                accumulated_y = track_bottom;
-            }
+                None
+            })();
+            // Whether the cursor is inside the timeline's content rect at all.
+            let inside_tracks = pos.x >= track_left
+                && pos.x <= tracks_rect.max.x
+                && pos.y >= tracks_rect.min.y
+                && pos.y <= tracks_rect.max.y;
 
             // Determine time position from X
             let drop_time = x_to_time(pos.x, state.timeline_scroll, pps, track_left)
@@ -1938,8 +2105,27 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
 
             match kind {
                 AssetDragKind::Clip => {
-                    // Create actor at that time on that track
+                    // Decide what track the new actor lands on:
+                    //   1. The exact video track under the cursor, when present
+                    //      and unlocked.
+                    //   2. Otherwise, append a brand-new video track at the end
+                    //      and assign the actor to it (so dropping into empty
+                    //      space still creates a *new layer*).
+                    let target = drop_track
+                        .filter(|i| state.tracks[*i].kind == TrackKind::Video
+                            && !state.tracks[*i].locked);
+                    let assigned = match target {
+                        Some(t) => t,
+                        None => {
+                            // Append new video track at the end.
+                            state.add_video_track();
+                            state.tracks.len() - 1
+                        }
+                    };
                     add_actor_from_clip_at_time(state, &asset_path, drop_time);
+                    if let Some(new_idx) = state.scene.actors.len().checked_sub(1) {
+                        state.actor_track_assignments.insert(new_idx, assigned);
+                    }
                 }
                 AssetDragKind::Background => {
                     // Add background starting at that time
@@ -1975,43 +2161,182 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                         t_out: None,
                         source_start: 0.0,
                         volume: 1.0,
+                        parent_actor: None,
                     });
-                    state.selection = Selection::Audio(state.scene.audio.len() - 1);
+                    let new_idx = state.scene.audio.len() - 1;
+                    // Resolve audio target lane the same way as clips: under
+                    // the cursor → that audio track; otherwise → append a new
+                    // audio lane.
+                    let target = drop_track
+                        .filter(|i| state.tracks[*i].kind == TrackKind::Audio
+                            && !state.tracks[*i].locked);
+                    let assigned = match target {
+                        Some(t) => t,
+                        None => {
+                            state.add_audio_track();
+                            state.tracks.len() - 1
+                        }
+                    };
+                    state.audio_track_assignments.insert(new_idx, assigned);
+                    state.selection = Selection::Audio(new_idx);
                     state.status = "Dropped audio track.".into();
                 }
                 AssetDragKind::None => {}
             }
 
+            let _ = inside_tracks; // currently informational only
+
             // Clear the drag state
             state.asset_drag.dragging = None;
             state.asset_drag.kind = AssetDragKind::None;
+            state.asset_drag.label.clear();
+            state.asset_drag.thumbnail = None;
         }
     }
 
     // ── Draw visual indicator while dragging from library ──
     if let Some(ref _dragged_path) = state.asset_drag.dragging {
+        // Follow the cursor live so the preview tracks the drop intent.
+        if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
+            state.asset_drag.pos = [pos.x, pos.y];
+        }
         let drag_pos = egui::pos2(state.asset_drag.pos[0], state.asset_drag.pos[1]);
-        // Draw a ghost indicator at the drop position
-        let ghost_w = 80.0;
-        let ghost_h = 20.0;
-        let ghost_rect = egui::Rect::from_center_size(drag_pos, Vec2::new(ghost_w, ghost_h));
-        let painter = ui.painter();
-        painter.rect_stroke(
-            ghost_rect,
-            Rounding::same(3.0),
-            Stroke::new(2.0, Color32::from_rgba_premultiplied(255, 200, 50, 180)),
+
+        // Highlight the destination track (under cursor or "new layer").
+        let dest_label = match state.asset_drag.kind {
+            AssetDragKind::Clip => {
+                let target = (|| {
+                    for (i, (top, bot)) in track_rows.iter().enumerate() {
+                        if drag_pos.y >= *top && drag_pos.y < *bot
+                            && state.tracks[i].kind == TrackKind::Video {
+                            return Some((*top, *bot, state.tracks[i].name.clone()));
+                        }
+                    }
+                    None
+                })();
+                if let Some((top, bot, name)) = target {
+                    let highlight = egui::Rect::from_min_max(
+                        egui::pos2(tracks_rect.min.x, top),
+                        egui::pos2(tracks_rect.max.x, bot),
+                    );
+                    ui.painter().rect_filled(
+                        highlight,
+                        Rounding::same(2.0),
+                        Color32::from_rgba_premultiplied(120, 220, 120, 30),
+                    );
+                    ui.painter().rect_stroke(
+                        highlight,
+                        Rounding::same(2.0),
+                        Stroke::new(1.5, Color32::from_rgb(120, 220, 120)),
+                    );
+                    format!("\u{2192} {}", name)
+                } else {
+                    "\u{2192} New layer".to_string()
+                }
+            }
+            AssetDragKind::Audio => {
+                let target = (|| {
+                    for (i, (top, bot)) in track_rows.iter().enumerate() {
+                        if drag_pos.y >= *top && drag_pos.y < *bot
+                            && state.tracks[i].kind == TrackKind::Audio {
+                            return Some((*top, *bot, state.tracks[i].name.clone()));
+                        }
+                    }
+                    None
+                })();
+                if let Some((top, bot, name)) = target {
+                    let highlight = egui::Rect::from_min_max(
+                        egui::pos2(tracks_rect.min.x, top),
+                        egui::pos2(tracks_rect.max.x, bot),
+                    );
+                    ui.painter().rect_filled(
+                        highlight,
+                        Rounding::same(2.0),
+                        Color32::from_rgba_premultiplied(120, 200, 220, 30),
+                    );
+                    ui.painter().rect_stroke(
+                        highlight,
+                        Rounding::same(2.0),
+                        Stroke::new(1.5, Color32::from_rgb(120, 200, 220)),
+                    );
+                    format!("\u{2192} {}", name)
+                } else {
+                    "\u{2192} New audio lane".to_string()
+                }
+            }
+            _ => String::new(),
+        };
+
+        // Floating preview card next to the cursor: thumbnail + label.
+        let label = if state.asset_drag.label.is_empty() {
+            "Drop here".to_string()
+        } else {
+            state.asset_drag.label.clone()
+        };
+        let label_text = if dest_label.is_empty() { label.clone() }
+            else { format!("{}    {}", label, dest_label) };
+
+        let card_w = 180.0_f32;
+        let card_h = 56.0_f32;
+        // Anchor the preview slightly below-right of the cursor.
+        let anchor = drag_pos + egui::vec2(14.0, 10.0);
+        let card_rect = egui::Rect::from_min_size(anchor, Vec2::new(card_w, card_h));
+        ui.painter().rect_filled(
+            card_rect,
+            Rounding::same(6.0),
+            Color32::from_rgba_premultiplied(20, 20, 30, 230),
         );
-        painter.rect_filled(
-            ghost_rect,
-            Rounding::same(3.0),
-            Color32::from_rgba_premultiplied(255, 200, 50, 40),
+        ui.painter().rect_stroke(
+            card_rect,
+            Rounding::same(6.0),
+            Stroke::new(1.5, Color32::from_rgb(255, 200, 50)),
         );
-        painter.text(
-            ghost_rect.center(),
-            egui::Align2::CENTER_CENTER,
-            "Drop here",
-            egui::FontId::proportional(9.0),
-            Color32::from_rgb(255, 220, 80),
+        let thumb_size = Vec2::splat(48.0);
+        let thumb_rect = egui::Rect::from_min_size(card_rect.min + egui::vec2(4.0, 4.0), thumb_size);
+        if let Some(thumb) = &state.asset_drag.thumbnail {
+            // Use a real image (egui's image-loaders are already installed).
+            let uri = format!("file://{}", thumb.display());
+            let img = egui::Image::from_uri(uri)
+                .fit_to_exact_size(thumb_size)
+                .maintain_aspect_ratio(false)
+                .rounding(Rounding::same(3.0))
+                .tint(Color32::from_white_alpha(220));
+            img.paint_at(ui, thumb_rect);
+        } else {
+            ui.painter().rect_filled(thumb_rect, Rounding::same(3.0), Color32::from_rgb(40, 40, 60));
+            let icon = match state.asset_drag.kind {
+                AssetDragKind::Clip       => "\u{1F3AC}",
+                AssetDragKind::Background => "\u{1F5BC}",
+                AssetDragKind::Prop       => "\u{1F4CC}",
+                AssetDragKind::Audio      => "\u{1F3B5}",
+                _                         => "?",
+            };
+            ui.painter().text(
+                thumb_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                icon,
+                egui::FontId::proportional(24.0),
+                Color32::from_rgb(255, 200, 50),
+            );
+        }
+        // Two-line label: name + destination hint.
+        let text_anchor = thumb_rect.right_top() + egui::vec2(6.0, 2.0);
+        ui.painter().text(
+            text_anchor,
+            egui::Align2::LEFT_TOP,
+            &label_text,
+            egui::FontId::proportional(11.0),
+            Color32::from_rgb(240, 240, 255),
+        );
+        // Drop-time pill at the bottom of the card.
+        let drop_t_secs = x_to_time(drag_pos.x, state.timeline_scroll, pps, track_left)
+            .clamp(0.0, duration);
+        ui.painter().text(
+            card_rect.left_bottom() + egui::vec2(6.0, -4.0),
+            egui::Align2::LEFT_BOTTOM,
+            format!("@ {:.2}s", drop_t_secs),
+            egui::FontId::proportional(10.0),
+            COL_TEXT_DIM,
         );
     }
 
@@ -3286,7 +3611,9 @@ fn load_chroma_for_clip(path: &PathBuf) -> ChromaKeyParams {
 }
 
 /// Push an `AudioTrack` matching `actor` so the embedded audio shows up as
-/// its own row on the audio lanes. Returns the new index.
+/// its own row on the audio lanes. Returns the new index. The audio track is
+/// linked to its parent actor via `parent_actor` so we can keep them in sync
+/// (move / trim / delete together).
 fn push_audio_track_for_actor(state: &mut EditorState, actor_id: &str, source: &PathBuf,
                               t_in: f32, t_out: Option<f32>, source_start: f32) -> usize {
     let id = format!("{}_audio", actor_id);
@@ -3297,8 +3624,50 @@ fn push_audio_track_for_actor(state: &mut EditorState, actor_id: &str, source: &
         t_out,
         source_start,
         volume: 1.0,
+        parent_actor: Some(actor_id.to_string()),
     });
     state.scene.audio.len() - 1
+}
+
+/// Find the index of the audio track bound to a given actor id, if any.
+fn find_audio_for_actor(state: &EditorState, actor_id: &str) -> Option<usize> {
+    state.scene.audio.iter().position(|au| {
+        au.parent_actor.as_deref() == Some(actor_id)
+    })
+}
+
+/// Sync the bound audio track's timing with its parent actor. Call this after
+/// every actor t_in/t_out/source_start change so the audio follows the clip.
+pub(crate) fn sync_audio_to_actor(state: &mut EditorState, actor_idx: usize) {
+    if actor_idx >= state.scene.actors.len() { return; }
+    let (actor_id, t_in, t_out, source_start) = {
+        let a = &state.scene.actors[actor_idx];
+        (a.id.clone(), a.t_in.unwrap_or(0.0), a.t_out, a.source_start)
+    };
+    if let Some(au_idx) = find_audio_for_actor(state, &actor_id) {
+        let au = &mut state.scene.audio[au_idx];
+        au.t_in = t_in;
+        au.t_out = t_out;
+        au.source_start = source_start;
+    }
+}
+
+/// Remove every audio track bound to the actor at `actor_idx` (called by the
+/// actor delete path so we never leave orphaned audio).
+pub(crate) fn remove_audio_bound_to_actor(state: &mut EditorState, actor_id: &str)
+    -> Vec<usize>
+{
+    let mut removed = Vec::new();
+    let mut i = 0;
+    while i < state.scene.audio.len() {
+        if state.scene.audio[i].parent_actor.as_deref() == Some(actor_id) {
+            state.scene.audio.remove(i);
+            removed.push(i);
+        } else {
+            i += 1;
+        }
+    }
+    removed
 }
 
 /// Auto-attach a skeleton template for `path` if a sidecar exists and we
@@ -3540,6 +3909,7 @@ pub fn handle_keyboard_shortcuts(ctx: &egui::Context, state: &mut EditorState) {
             Selection::Actor(idx) => {
                 if idx < state.scene.actors.len() {
                     state.scene.actors[idx].t_in = Some(ph);
+                    sync_audio_to_actor(state, idx);
                     state.status = format!("Set in-point to {:.2}s", ph);
                 }
             }
@@ -3578,6 +3948,7 @@ pub fn handle_keyboard_shortcuts(ctx: &egui::Context, state: &mut EditorState) {
             Selection::Actor(idx) => {
                 if idx < state.scene.actors.len() {
                     state.scene.actors[idx].t_out = Some(ph);
+                    sync_audio_to_actor(state, idx);
                     state.status = format!("Set out-point to {:.2}s", ph);
                 }
             }

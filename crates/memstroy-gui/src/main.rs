@@ -23,7 +23,22 @@ fn main() -> Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info,memstroy_gui=debug")),
+                .unwrap_or_else(|_| EnvFilter::new(
+                    // Default: app at debug, everything else at info, but
+                    // silence the symphonia container/codec parsers since they
+                    // spam "skipping junk" / "invalid mpeg audio header" warnings
+                    // for clips that simply have no decodable audio stream.
+                    "info,memstroy_gui=debug,\
+                     symphonia=error,\
+                     symphonia_core=error,\
+                     symphonia_format_mp3=error,\
+                     symphonia_format_wav=error,\
+                     symphonia_format_isomp4=error,\
+                     symphonia_codec_pcm=error,\
+                     symphonia_bundle_mp3=error,\
+                     symphonia_bundle_flac=error,\
+                     lewton=error"
+                )),
         )
         .with_target(false)
         .try_init();
