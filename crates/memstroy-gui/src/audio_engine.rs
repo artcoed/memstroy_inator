@@ -9,14 +9,28 @@
 //!
 //! On play-start or after a seek, the engine tears down all current sinks
 //! and rebuilds them from scratch at the new playhead.
+//!
+//! ## Background loading
+//!
+//! Decoding into MP3 / AAC / WAV containers and `skip_duration`-ing into
+//! mid-clip is **expensive** and was previously done synchronously on the
+//! UI thread, which froze the editor for hundreds of ms (sometimes seconds
+//! with multiple clips) every time the user hit Play. We now offload the
+//! whole pipeline to a worker thread; sinks are constructed there and
+//! shipped back to the UI through an mpsc channel. The UI calls
+//! `poll_pending()` every frame to attach freshly-built sinks. A
+//! `generation` counter lets stale loads (e.g. user hit Play, seeked, then
+//! Play again before the first load finished) be discarded automatically.
 
 use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use rodio::Source;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// One scheduled audio source on the timeline. Used by the editor to
 /// describe scene-level audio tracks AND actor video soundtracks.
@@ -33,6 +47,13 @@ pub struct AudioSourceSpec {
     pub volume: f32,
 }
 
+/// A pre-built sink that the worker thread hands back, ready to be
+/// `play()`-ed by the UI thread. Wrapped so we can ferry through a
+/// `mpsc::Sender` on a thread with no `Sync` requirements.
+struct ReadySink {
+    sink: rodio::Sink,
+}
+
 /// Audio playback engine. Owns the rodio output stream + a fleet of sinks.
 pub struct AudioEngine {
     /// Whether playback is currently running.
@@ -45,6 +66,12 @@ pub struct AudioEngine {
     stream_handle: Option<rodio::OutputStreamHandle>,
     /// One sink per currently scheduled source (so they play in parallel).
     sinks: Vec<rodio::Sink>,
+    /// Bumped on every `play_sources`/`stop`/`pause` so background workers
+    /// know whether their results are still wanted.
+    generation: u64,
+    /// Receiver for sinks built on the worker thread. Tagged with the
+    /// generation that started the load so we can discard stale sinks.
+    pending: Option<(u64, mpsc::Receiver<ReadySink>)>,
 }
 
 impl AudioEngine {
@@ -66,6 +93,8 @@ impl AudioEngine {
             _stream: stream,
             stream_handle: handle,
             sinks: Vec::new(),
+            generation: 0,
+            pending: None,
         }
     }
 
@@ -78,23 +107,60 @@ impl AudioEngine {
 
     /// Start (or restart) playback from `playhead` mixing every source in
     /// `sources` whose timing window overlaps the future timeline.
+    ///
+    /// **This call returns immediately.** The actual decode + sink
+    /// construction happens on a worker thread; sinks are attached
+    /// progressively as they become ready (see [`Self::poll_pending`]).
     pub fn play_sources(&mut self, sources: &[AudioSourceSpec], playhead: f32) {
+        // Tear down whatever was playing instantly so the user perceives
+        // the seek/restart as snappy.
         self.stop_all_sinks();
+        self.generation = self.generation.wrapping_add(1);
+        let gen = self.generation;
+        self.pending = None;
 
         let Some(handle) = self.stream_handle.clone() else {
             warn!("No audio stream handle available");
             return;
         };
+        let master_volume = self.volume;
+        let specs: Vec<AudioSourceSpec> = sources.to_vec();
+        let any_specs = !specs.is_empty();
 
-        for spec in sources {
-            // Skip sources that have already ended.
+        let (tx, rx) = mpsc::channel::<ReadySink>();
+        let started_at = Instant::now();
+        let _ = thread::Builder::new()
+            .name(format!("memstroy-audio-load-{}", gen))
+            .spawn(move || {
+                Self::load_sinks(&handle, &specs, playhead, master_volume, started_at, tx);
+            });
+
+        self.pending = Some((gen, rx));
+        self.playing = any_specs;
+    }
+
+    /// Background worker entry: build each spec's sink in turn and send it
+    /// back through `tx`. We send sinks one-by-one so the *first* track
+    /// becomes audible as soon as it's ready instead of waiting for the
+    /// whole batch.
+    fn load_sinks(
+        handle: &rodio::OutputStreamHandle,
+        specs: &[AudioSourceSpec],
+        playhead: f32,
+        master_volume: f32,
+        started_at: Instant,
+        tx: mpsc::Sender<ReadySink>,
+    ) {
+        for spec in specs {
+            // Compensate for time elapsed during background decode so the
+            // already-running visual playhead doesn't drift away from audio.
+            let elapsed = started_at.elapsed().as_secs_f32();
+            let live_playhead = playhead + elapsed;
+
             if let Some(t_out) = spec.t_out {
-                if playhead >= t_out { continue; }
+                if live_playhead >= t_out { continue; }
             }
-            // Skip nonexistent files cleanly.
-            if !spec.path.exists() {
-                continue;
-            }
+            if !spec.path.exists() { continue; }
 
             let file = match File::open(&spec.path) {
                 Ok(f) => f,
@@ -109,62 +175,86 @@ impl AudioEngine {
                 Err(e) => {
                     // Many image / unsupported files end up here when an
                     // "actor" path doesn't actually have an audio stream.
-                    // Log at debug level and skip silently.
-                    info!("No decodable audio in {}: {}", spec.path.display(), e);
+                    debug!("No decodable audio in {}: {}", spec.path.display(), e);
                     continue;
                 }
             };
 
-            // Convert to f32 samples so adapters compose uniformly.
             let stream = decoder.convert_samples::<f32>();
-
-            // Skip into the source: source_start + (how much of t_in we missed).
-            let skip_secs = (spec.source_start + (playhead - spec.t_in).max(0.0)).max(0.0);
+            let skip_secs = (spec.source_start
+                + (live_playhead - spec.t_in).max(0.0))
+                .max(0.0);
             let stream = stream.skip_duration(Duration::from_secs_f32(skip_secs));
-
-            // Per-track gain. Engine master volume is applied at the sink level.
             let stream = stream.amplify(spec.volume.max(0.0));
-
-            // Trim to the visible window if `t_out` is set.
             let take_secs = spec.t_out.map(|end| {
-                let visible_start = playhead.max(spec.t_in);
+                let visible_start = live_playhead.max(spec.t_in);
                 (end - visible_start).max(0.0)
             });
+            let delay_secs = (spec.t_in - live_playhead).max(0.0);
 
-            // Delay if the source begins later than the current playhead.
-            let delay_secs = (spec.t_in - playhead).max(0.0);
-
-            let sink = match rodio::Sink::try_new(&handle) {
+            let sink = match rodio::Sink::try_new(handle) {
                 Ok(s) => s,
                 Err(e) => {
                     warn!("Failed to create audio sink: {}", e);
                     continue;
                 }
             };
-            sink.set_volume(self.volume);
+            sink.set_volume(master_volume);
+            sink.pause(); // start paused so the UI thread starts us at the right moment
 
-            // Compose the optional adapters; each branch ends with a single
-            // `sink.append(...)` call so type inference stays simple.
             match (take_secs, delay_secs > 0.0) {
                 (Some(td), true) => sink.append(
                     stream
                         .take_duration(Duration::from_secs_f32(td))
-                        .delay(Duration::from_secs_f32(delay_secs))
+                        .delay(Duration::from_secs_f32(delay_secs)),
                 ),
                 (Some(td), false) => sink.append(
-                    stream.take_duration(Duration::from_secs_f32(td))
+                    stream.take_duration(Duration::from_secs_f32(td)),
                 ),
                 (None, true) => sink.append(
-                    stream.delay(Duration::from_secs_f32(delay_secs))
+                    stream.delay(Duration::from_secs_f32(delay_secs)),
                 ),
                 (None, false) => sink.append(stream),
             }
 
-            sink.play();
-            self.sinks.push(sink);
+            // If the receiver was dropped (next play_sources arrived), bail.
+            if tx.send(ReadySink { sink }).is_err() {
+                return;
+            }
         }
+    }
 
-        self.playing = !self.sinks.is_empty();
+    /// Drain any sinks the worker thread has finished building and start
+    /// them. Call this every UI frame.
+    pub fn poll_pending(&mut self) {
+        // Snapshot the current generation up front so we don't hold a borrow
+        // on `self.pending` while we mutate `self.sinks`.
+        let cur_gen = self.generation;
+        let Some((gen, rx)) = self.pending.take() else { return };
+        if gen != cur_gen {
+            // A newer play_sources call superseded this one: drop everything.
+            for ready in rx.try_iter() {
+                ready.sink.stop();
+            }
+            return;
+        }
+        let mut still_open = true;
+        loop {
+            match rx.try_recv() {
+                Ok(ready) => {
+                    ready.sink.play();
+                    self.sinks.push(ready.sink);
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    still_open = false;
+                    break;
+                }
+            }
+        }
+        if still_open {
+            self.pending = Some((gen, rx));
+        }
     }
 
     /// Pause every sink without dropping it (so resume picks up where it left off).
@@ -175,8 +265,11 @@ impl AudioEngine {
         self.playing = false;
     }
 
-    /// Stop all playback and release every sink.
+    /// Stop all playback and release every sink, including any background
+    /// load that hasn't yet attached.
     pub fn stop(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.pending = None;
         self.stop_all_sinks();
         self.playing = false;
     }

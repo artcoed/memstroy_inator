@@ -546,4 +546,10 @@ pub struct AudioTrack {
     pub source_start: f32,
     #[serde(default = "one")]
     pub volume: f32,
+    /// If set, this audio track belongs to the actor with this `id`. The
+    /// editor uses this to keep clip & audio in lock-step: moving / trimming
+    /// / deleting the actor mirrors the same change on the bound audio so
+    /// they always export together.
+    #[serde(default)]
+    pub parent_actor: Option<String>,
 }
