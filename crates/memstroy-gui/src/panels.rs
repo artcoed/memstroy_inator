@@ -1900,10 +1900,19 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     // ── Library clip drag-to-track: drop handling ──
     // When the user releases a clip dragged from the library, decide which
     // video lane it lands on and at what time, then add it as an actor.
+    // Skip when the release point is outside this timeline panel's master
+    // rect, so a drop on the canvas can be handled by the canvas-preview
+    // panel instead of being absorbed here as a "new layer".
     let mouse_released = ui.input(|i| i.pointer.any_released());
     if state.asset_drag.dragging.is_some() && mouse_released {
         let mouse_pos = ui.input(|i| i.pointer.hover_pos());
         if let Some(pos) = mouse_pos {
+            // Only consume the drop when the cursor is over the timeline.
+            if !master_rect.contains(pos) {
+                // Leave asset_drag intact; the canvas (or whoever else
+                // owns the cursor) gets a chance to accept it.
+                return;
+            }
             // Resolve which track the drop is over using the same row-rect
             // table the clip-drag handlers use, so a clip lands on the
             // exact lane the user pointed at. Returns None if the cursor is
@@ -2980,7 +2989,7 @@ pub fn add_text_overlay(state: &mut EditorState) -> usize {
 }
 
 /// Add an actor from a clip at a specific time (used by drag-to-track).
-fn add_actor_from_clip_at_time(state: &mut EditorState, path: &PathBuf, t: f32) {
+pub(crate) fn add_actor_from_clip_at_time(state: &mut EditorState, path: &PathBuf, t: f32) {
     let counter = state.scene.actors.len() + 1;
     let id = path.file_stem().and_then(|s| s.to_str())
         .map(|s| format!("{}_{}", s, counter))
@@ -3048,9 +3057,53 @@ fn probe_video_duration(path: &PathBuf) -> f32 {
 }
 
 
+/// Add an actor from a clip dropped onto the free canvas. Inserts an entry
+/// in `canvas_layouts` so the clip is centred at the supplied world
+/// position immediately, instead of falling back to the legacy normalised
+/// layout (which would otherwise put it at the render frame centre).
+pub(crate) fn add_actor_from_clip_at_canvas(
+    state: &mut EditorState,
+    path: &PathBuf,
+    world_pos: [f32; 2],
+) {
+    let t = state.playhead;
+    add_actor_from_clip_at_time(state, path, t);
+    let new_actor_idx = match state.scene.actors.len().checked_sub(1) {
+        Some(i) => i,
+        None => return,
+    };
+    let actor_id = state.scene.actors[new_actor_idx].id.clone();
+
+    // Drop the actor onto the topmost video lane by default — same default
+    // as the timeline drop-handler when no specific lane is targeted.
+    let assigned = state
+        .video_track_indices()
+        .first()
+        .copied()
+        .unwrap_or_else(|| state.insert_video_track_at_bottom());
+    state.actor_track_assignments.insert(new_actor_idx, assigned);
+
+    use memstroy_core::{CanvasLayout, Keyframe, CanvasTransform, WorldPos};
+    let canvas_kf = Keyframe::new(
+        0.0,
+        CanvasTransform {
+            pos: WorldPos { x: world_pos[0], y: world_pos[1] },
+            ..Default::default()
+        },
+    );
+    state.scene.canvas_layouts.push(CanvasLayout {
+        element_id: actor_id,
+        keyframes: vec![canvas_kf],
+    });
+
+    state.selection = Selection::Actor(new_actor_idx);
+    state.status = format!(
+        "Dropped on canvas at ({:.0}, {:.0})",
+        world_pos[0], world_pos[1]
+    );
+}
 
 
-// ─── BOUND-AUDIO LANE MIRRORING ──────────────────────────────────────
 
 /// Make sure every audio row that has a `parent_actor` lives on the audio
 /// lane that mirrors its parent's video lane (actor on the i-th video lane
