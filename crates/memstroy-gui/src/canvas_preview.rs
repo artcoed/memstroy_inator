@@ -67,12 +67,13 @@ fn handle_canvas_input(
     viewport_size: [f32; 2],
     _full_rect: Rect,
 ) {
-    // Pan ONLY with middle mouse button or Space+drag.
-    // Left click is always reserved for element interaction.
+    // Pan with middle mouse button OR Space+left-drag OR right-drag.
+    // Left click/drag is ONLY for element interaction (select/move).
     let middle_down = ui.input(|i| i.pointer.middle_down());
     let space_held = ui.input(|i| i.key_down(egui::Key::Space));
+    let right_down = ui.input(|i| i.pointer.secondary_down());
 
-    let should_pan = middle_down || (space_held && response.dragged());
+    let should_pan = middle_down || right_down || (space_held && response.dragged());
 
     if should_pan && response.hovered() {
         let delta = response.drag_delta();
@@ -81,18 +82,18 @@ fn handle_canvas_input(
             state.canvas_panning = true;
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
         }
-    } else {
+    } else if !ui.input(|i| i.pointer.primary_down()) {
+        // Only clear panning state when primary isn't held (avoid conflict)
         state.canvas_panning = false;
     }
 
-    // Scroll wheel → zoom viewport (skip if Ctrl held — Ctrl+scroll = scale element)
+    // Scroll wheel → zoom viewport
     if response.hovered() {
         let scroll = ui.input(|i| i.smooth_scroll_delta);
-        let ctrl = ui.input(|i| i.modifiers.ctrl);
 
-        if !ctrl && scroll.y.abs() > 0.1 {
+        if scroll.y.abs() > 0.1 {
             // Zoom towards mouse position
-            let factor = if scroll.y > 0.0 { 1.03 } else { 1.0 / 1.03 };
+            let factor = if scroll.y > 0.0 { 1.05 } else { 1.0 / 1.05 };
             if let Some(mouse) = ui.input(|i| i.pointer.hover_pos()) {
                 let local = [mouse.x - _full_rect.min.x, mouse.y - _full_rect.min.y];
                 state.canvas_viewport.zoom_at(local, viewport_size, factor);
@@ -276,15 +277,16 @@ fn draw_canvas_elements(
 
         // Get world position from canvas_layouts or legacy layout
         let world_pos = get_element_world_pos(state, &actor.id, &actor.layout, t);
-        // Use actual source dimensions from frame cache (real aspect ratio)
-        let (elem_width, elem_height) = if let Some(fc) = state.frame_caches.get(idx) {
+        // Use actual source dimensions from frame cache (native aspect ratio preserved)
+        let (src_w, src_h) = if let Some(fc) = state.frame_caches.get(idx) {
             if fc.is_ready() && fc.frame_count > 0 {
                 (fc.source_width as f32, fc.source_height as f32)
             } else {
-                (480.0_f32, 270.0)
+                // Default to 9:16 vertical video (common for mellstroy clips)
+                (1080.0_f32, 1920.0)
             }
         } else {
-            (480.0_f32, 270.0)
+            (1080.0_f32, 1920.0)
         };
         // Apply actor scale from layout
         let actor_state = keyframe::sample(&actor.layout, t)
@@ -292,8 +294,9 @@ fn draw_canvas_elements(
         let actor_scale = actor_state.scale;
         let actor_rotation = actor_state.rotation_deg;
         let actor_opacity = actor_state.opacity;
-        let elem_width = elem_width * actor_scale;
-        let elem_height = elem_height * actor_scale;
+        // Preserve native aspect ratio - scale both dimensions uniformly
+        let elem_width = src_w * actor_scale;
+        let elem_height = src_h * actor_scale;
 
         // Convert to screen coordinates
         let center_screen = state.canvas_viewport.world_to_screen(world_pos, viewport_size);
@@ -330,7 +333,56 @@ fn draw_canvas_elements(
         let mut frame_shown = false;
         if let Some(fc) = state.frame_caches.get_mut(idx) {
             if fc.is_ready() {
-                if let Some(tex) = fc.frame_at_time(local_t, ui.ctx()) {
+                // Apply chromakey on the raw frame data if actor has non-default settings
+                let actor_ck = &state.scene.actors[idx].chroma_key;
+                let actor_cc = &state.scene.actors[idx].color_correction;
+                let has_effects = actor_ck.similarity > 0.01 || actor_cc.brightness.abs() > 0.01
+                    || (actor_cc.contrast - 1.0).abs() > 0.01
+                    || (actor_cc.saturation - 1.0).abs() > 0.01;
+
+                if has_effects {
+                    // Get raw frame and apply effects on CPU
+                    if let Some(raw_img) = fc.raw_frame_at_time(local_t) {
+                        let processed = apply_preview_effects(&raw_img, actor_ck, actor_cc);
+                        // Upload processed frame to texture
+                        let options = egui::TextureOptions::LINEAR;
+                        let tex_handle = ui.ctx().load_texture(
+                            format!("actor_fx_{}", idx),
+                            processed,
+                            options,
+                        );
+                        let rotation_rad = actor_rotation.to_radians();
+                        if rotation_rad.abs() > 0.001 {
+                            let center = elem_rect.center();
+                            let hw = elem_rect.width() * 0.5;
+                            let hh = elem_rect.height() * 0.5;
+                            let cos_r = rotation_rad.cos();
+                            let sin_r = rotation_rad.sin();
+                            let corners_local = [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]];
+                            let uv_corners = [
+                                Pos2::new(0.0, 0.0), Pos2::new(1.0, 0.0),
+                                Pos2::new(1.0, 1.0), Pos2::new(0.0, 1.0),
+                            ];
+                            let mut mesh = egui::Mesh::with_texture(tex_handle.id());
+                            for ci in 0..4 {
+                                let [lx, ly] = corners_local[ci];
+                                let rx = lx * cos_r - ly * sin_r + center.x;
+                                let ry = lx * sin_r + ly * cos_r + center.y;
+                                mesh.vertices.push(egui::epaint::Vertex {
+                                    pos: Pos2::new(rx, ry),
+                                    uv: uv_corners[ci],
+                                    color: tint,
+                                });
+                            }
+                            mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+                            painter.add(egui::Shape::mesh(mesh));
+                        } else {
+                            let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
+                            painter.image(tex_handle.id(), elem_rect, uv, tint);
+                        }
+                        frame_shown = true;
+                    }
+                } else if let Some(tex) = fc.frame_at_time(local_t, ui.ctx()) {
                     let rotation_rad = actor_rotation.to_radians();
                     if rotation_rad.abs() > 0.001 {
                         // Draw rotated via mesh
@@ -724,13 +776,26 @@ fn draw_selection_gizmo(
     // ── Draw resize handles on selected element ──
     draw_element_resize_handles(ui, painter, response, full_rect, state, viewport_size);
 
-    // Handle drag to move selected element on canvas
+    // Handle drag to move selected element on canvas.
+    // Only move if the drag started ON the selected element (not on empty canvas).
     if response.dragged() && !state.canvas_panning {
         let delta = response.drag_delta();
         let world_dx = delta.x / state.canvas_viewport.zoom;
         let world_dy = delta.y / state.canvas_viewport.zoom;
 
-        match state.selection {
+        // Verify drag originated on the selected element
+        let drag_on_element = if let Some(origin) = response.interact_pointer_pos() {
+            let ox = origin.x - delta.x;
+            let oy = origin.y - delta.y;
+            let local = [ox - full_rect.min.x, oy - full_rect.min.y];
+            let click_world = state.canvas_viewport.screen_to_world(local, viewport_size);
+            is_point_on_selection(state, click_world)
+        } else {
+            false
+        };
+
+        if drag_on_element {
+            match state.selection {
             Selection::Actor(idx) if idx < state.scene.actors.len() => {
                 let actor_id = state.scene.actors[idx].id.clone();
                 if let Some(cl) = state.scene.canvas_layouts.iter_mut()
@@ -786,6 +851,7 @@ fn draw_selection_gizmo(
             }
             _ => {}
         }
+        } // end if drag_on_element
     }
 
     // ── Scale with Ctrl+scroll on selected element ──
@@ -850,8 +916,8 @@ fn draw_element_resize_handles(
             let (base_w, base_h) = if let Some(fc) = state.frame_caches.get(idx) {
                 if fc.is_ready() && fc.frame_count > 0 {
                     (fc.source_width as f32, fc.source_height as f32)
-                } else { (480.0, 270.0) }
-            } else { (480.0, 270.0) };
+                } else { (1080.0, 1920.0) }
+            } else { (1080.0, 1920.0) };
             let elem_width = base_w * actor_scale;
             let elem_height = base_h * actor_scale;
             let center_screen = state.canvas_viewport.world_to_screen(world_pos, viewport_size);
@@ -1128,12 +1194,12 @@ fn try_select_at(state: &mut EditorState, pos: WorldPos) {
         let world_pos = get_element_world_pos(state, &actor.id, &actor.layout, t);
         let actor_scale = keyframe::sample(&actor.layout, t)
             .map(|s| s.scale).unwrap_or(1.0);
-        // Use real source dimensions from frame cache
+        // Use real source dimensions from frame cache (native aspect ratio)
         let (base_w, base_h) = if let Some(fc) = state.frame_caches.get(idx) {
             if fc.is_ready() && fc.frame_count > 0 {
                 (fc.source_width as f32, fc.source_height as f32)
-            } else { (480.0, 270.0) }
-        } else { (480.0, 270.0) };
+            } else { (1080.0, 1920.0) }
+        } else { (1080.0, 1920.0) };
         let elem_width = base_w * actor_scale;
         let elem_height = base_h * actor_scale;
 
@@ -1165,6 +1231,130 @@ fn try_select_at(state: &mut EditorState, pos: WorldPos) {
 
     // Nothing hit — deselect
     state.selection = Selection::None;
+}
+
+/// Check if a world-pixel position hits the currently selected element.
+fn is_point_on_selection(state: &EditorState, pos: WorldPos) -> bool {
+    let t = state.playhead;
+    match state.selection {
+        Selection::Actor(idx) if idx < state.scene.actors.len() => {
+            let actor = &state.scene.actors[idx];
+            if !actor.visible { return false; }
+            let world_pos = get_element_world_pos(state, &actor.id, &actor.layout, t);
+            let actor_scale = keyframe::sample(&actor.layout, t)
+                .map(|s| s.scale).unwrap_or(1.0);
+            let (base_w, base_h) = if let Some(fc) = state.frame_caches.get(idx) {
+                if fc.is_ready() && fc.frame_count > 0 {
+                    (fc.source_width as f32, fc.source_height as f32)
+                } else { (1080.0, 1920.0) }
+            } else { (1080.0, 1920.0) };
+            let half_w = base_w * actor_scale * 0.5;
+            let half_h = base_h * actor_scale * 0.5;
+            pos.x >= world_pos.x - half_w && pos.x <= world_pos.x + half_w
+                && pos.y >= world_pos.y - half_h && pos.y <= world_pos.y + half_h
+        }
+        Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
+            let overlay = &state.scene.overlays[idx];
+            let rf = &state.scene.render_frame;
+            let rf_state = sample_render_frame(rf, t);
+            let [rw, rh] = rf.resolution;
+            let world_w = rw as f32 / rf_state.zoom;
+            let world_h = rh as f32 / rf_state.zoom;
+            let frame_tl_x = rf_state.pos.x - world_w * 0.5;
+            let frame_tl_y = rf_state.pos.y - world_h * 0.5;
+            let (t_in, t_out, layout) = match overlay {
+                Overlay::Text(txt) => (txt.t_in, txt.t_out, &txt.layout),
+                Overlay::Image(img) => (img.t_in, img.t_out, &img.layout),
+                Overlay::Video(vid) => (vid.t_in, vid.t_out, &vid.layout),
+            };
+            let sample_t = if t >= t_in && t <= t_out { t - t_in } else { 0.0 };
+            let ov_state = keyframe::sample(layout, sample_t).unwrap_or_default();
+            let ov_world = WorldPos {
+                x: frame_tl_x + ov_state.pos[0] * world_w,
+                y: frame_tl_y + ov_state.pos[1] * world_h,
+            };
+            let (ew, eh) = match overlay {
+                Overlay::Text(_) => (300.0 * ov_state.scale, 60.0 * ov_state.scale),
+                Overlay::Image(_) => (200.0 * ov_state.scale, 200.0 * ov_state.scale),
+                Overlay::Video(_) => (300.0 * ov_state.scale, 300.0 * 16.0 / 9.0 * ov_state.scale),
+            };
+            pos.x >= ov_world.x - ew * 0.5 && pos.x <= ov_world.x + ew * 0.5
+                && pos.y >= ov_world.y - eh * 0.5 && pos.y <= ov_world.y + eh * 0.5
+        }
+        _ => false,
+    }
+}
+
+
+// ─── PREVIEW EFFECTS (CHROMAKEY + COLOR CORRECTION) ──────────────────
+
+/// Apply chromakey and color correction to a raw frame for preview display.
+/// This is a simplified CPU-based version for real-time preview.
+fn apply_preview_effects(
+    img: &egui::ColorImage,
+    ck: &memstroy_core::ChromaKeyParams,
+    cc: &memstroy_core::ColorCorrection,
+) -> egui::ColorImage {
+    let mut out = egui::ColorImage::new(img.size, Color32::TRANSPARENT);
+    let key_r = ck.key_color[0] as f32;
+    let key_g = ck.key_color[1] as f32;
+    let key_b = ck.key_color[2] as f32;
+    let similarity = ck.similarity.clamp(0.0, 1.0);
+    let blend = ck.blend.clamp(0.0, 1.0);
+    let spill = ck.spill.clamp(0.0, 1.0);
+    // Color distance threshold
+    let threshold = similarity * 441.0; // max RGB distance = sqrt(3*255^2) ≈ 441
+    let blend_range = blend * 200.0;
+
+    for (i, pixel) in img.pixels.iter().enumerate() {
+        let r = pixel.r() as f32;
+        let g = pixel.g() as f32;
+        let b = pixel.b() as f32;
+
+        // Chromakey: compute color distance to key
+        let dist = ((r - key_r).powi(2) + (g - key_g).powi(2) + (b - key_b).powi(2)).sqrt();
+        let mut alpha = if dist < threshold {
+            0.0
+        } else if dist < threshold + blend_range {
+            (dist - threshold) / blend_range.max(0.01)
+        } else {
+            1.0
+        };
+
+        // Spill suppression
+        let (mut out_r, mut out_g, mut out_b) = (r, g, b);
+        if alpha > 0.0 && spill > 0.0 && g > ((r + b) * 0.5) as f32 {
+            let avg_rb = (r + b) * 0.5;
+            out_g = g - (g - avg_rb) * spill;
+        }
+
+        // Color correction
+        // Brightness
+        out_r = (out_r + cc.brightness * 255.0).clamp(0.0, 255.0);
+        out_g = (out_g + cc.brightness * 255.0).clamp(0.0, 255.0);
+        out_b = (out_b + cc.brightness * 255.0).clamp(0.0, 255.0);
+        // Contrast
+        out_r = ((out_r - 128.0) * cc.contrast + 128.0).clamp(0.0, 255.0);
+        out_g = ((out_g - 128.0) * cc.contrast + 128.0).clamp(0.0, 255.0);
+        out_b = ((out_b - 128.0) * cc.contrast + 128.0).clamp(0.0, 255.0);
+        // Saturation
+        let gray = 0.299 * out_r + 0.587 * out_g + 0.114 * out_b;
+        out_r = (gray + (out_r - gray) * cc.saturation).clamp(0.0, 255.0);
+        out_g = (gray + (out_g - gray) * cc.saturation).clamp(0.0, 255.0);
+        out_b = (gray + (out_b - gray) * cc.saturation).clamp(0.0, 255.0);
+        // Temperature (warm/cool shift)
+        if cc.temperature > 0.0 {
+            out_r = (out_r + cc.temperature * 30.0).clamp(0.0, 255.0);
+            out_b = (out_b - cc.temperature * 30.0).clamp(0.0, 255.0);
+        } else if cc.temperature < 0.0 {
+            out_r = (out_r + cc.temperature * 30.0).clamp(0.0, 255.0);
+            out_b = (out_b - cc.temperature * 30.0).clamp(0.0, 255.0);
+        }
+
+        let a = (alpha * 255.0) as u8;
+        out.pixels[i] = Color32::from_rgba_unmultiplied(out_r as u8, out_g as u8, out_b as u8, a);
+    }
+    out
 }
 
 
