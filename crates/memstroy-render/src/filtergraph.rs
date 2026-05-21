@@ -307,6 +307,13 @@ impl<'a> FilterGraphBuilder<'a> {
             if actor.flip_horizontal {
                 chain.push_str(",hflip");
             }
+            // Append the user-defined effect stack BEFORE the layout
+            // scale so geometry-changing effects (mirror, etc.) operate
+            // in the actor's own pixel space.
+            for snippet in effect_stack_filters(&actor.effects) {
+                chain.push(',');
+                chain.push_str(&snippet);
+            }
 
             let (pos_x, pos_y, scale_expr, scale_y_expr) = position_and_scale_expr(&actor.layout, w, h);
             chain.push_str(&format!(",scale=w='iw*{sx}':h='ih*{sy}':eval=frame", sx = scale_expr, sy = scale_y_expr));
@@ -1040,4 +1047,122 @@ fn build_anchor_position_expr(
     );
 
     (prop_x, prop_y)
+}
+
+
+
+// ─── EFFECT STACK FILTERS ────────────────────────────────────────────
+//
+// Translate the per-element effect stack (`Vec<Effect>`) into a list of
+// filtergraph snippets that can be appended to an actor / overlay's
+// existing chain. Each entry returns one or more comma-separated
+// filters; the caller joins them with the rest of the chain. Effects
+// that we cannot reasonably express in ffmpeg are emitted as a no-op
+// (`null`) with a comment-style snippet so the chain remains valid.
+//
+// The intensity slider is folded into each snippet so the user gets a
+// continuous "fade in / out" of every effect — a 0.0 intensity always
+// renders as a no-op.
+
+fn effect_stack_filters(effects: &[Effect]) -> Vec<String> {
+    let mut out = Vec::with_capacity(effects.len());
+    for eff in effects {
+        if !eff.enabled { continue; }
+        let i = eff.intensity.clamp(0.0, 1.0);
+        if i <= 0.001 { continue; }
+        if let Some(s) = effect_to_filter(&eff.kind, i) {
+            out.push(s);
+        }
+    }
+    out
+}
+
+fn effect_to_filter(kind: &EffectKind, i: f32) -> Option<String> {
+    use EffectKind as K;
+    Some(match kind {
+        K::Blur { radius } => format!("boxblur=luma_radius={r}:luma_power=1", r = (radius * i).max(0.5) as i32),
+        K::Sharpen { amount } => format!("unsharp=5:5:{}:5:5:0", (amount * i).clamp(0.0, 3.0)),
+        K::Grayscale => format!(
+            "colorchannelmixer=.299*{i}+1-{i}:.587*{i}:.114*{i}:0:.299*{i}:.587*{i}+1-{i}:.114*{i}:0:.299*{i}:.587*{i}:.114*{i}+1-{i}",
+            i = i,
+        ),
+        K::Sepia => format!(
+            "colorchannelmixer={a}:{b}:{c}:0:{d}:{e}:{f}:0:{g}:{h}:{j}:0",
+            a = 0.393 * i + (1.0 - i), b = 0.769 * i, c = 0.189 * i,
+            d = 0.349 * i, e = 0.686 * i + (1.0 - i), f = 0.168 * i,
+            g = 0.272 * i, h = 0.534 * i, j = 0.131 * i + (1.0 - i),
+        ),
+        K::Invert => {
+            // Mix between source and negate via a per-pixel subtraction.
+            // ffmpeg has `negate` which is full-strength only; use lutrgb
+            // for an intensity-aware version.
+            format!(
+                "lutrgb=r='val+(255-2*val)*{i}':g='val+(255-2*val)*{i}':b='val+(255-2*val)*{i}'",
+                i = i,
+            )
+        }
+        K::HueShift { degrees } => format!("hue=h={}", degrees * i),
+        K::Vignette { strength } => format!("vignette=PI/3*{}:mode=forward", (strength * i).clamp(0.0, 1.0)),
+        K::Pixelate { block_size } => {
+            // Down/up scale via neighbour sampling for the pixelation look.
+            let bs = (block_size * i).max(1.0) as i32;
+            format!(
+                "scale=iw/{bs}:ih/{bs}:flags=neighbor,scale=iw*{bs}:ih*{bs}:flags=neighbor",
+                bs = bs.max(1)
+            )
+        }
+        K::Posterize { levels } => format!(
+            "lutrgb=r='floor(val/(255/{l}))*255/({l}-1)':g='floor(val/(255/{l}))*255/({l}-1)':b='floor(val/(255/{l}))*255/({l}-1)'",
+            l = (*levels).max(2),
+        ),
+        K::Glow { radius, intensity } => {
+            let r = (radius * i).max(1.0) as i32;
+            // Approximate via gblur + blend:add at a reduced intensity.
+            // We can't easily express both sides of a blend in a chain
+            // without splitting; the simpler `eq=brightness` bumps light
+            // pixels enough for a reasonable approximation in single-pass.
+            format!(
+                "gblur=sigma={r},eq=brightness={b}",
+                r = r,
+                b = (intensity * i * 0.15).clamp(0.0, 0.5),
+            )
+        }
+        K::Brightness { amount } => format!("eq=brightness={}", amount * i),
+        K::Contrast { amount } => format!("eq=contrast={}", 1.0 + amount * i),
+        K::Saturation { amount } => format!("eq=saturation={}", 1.0 + amount * i),
+        K::EdgeDetect { threshold: _ } => "edgedetect=mode=colormix".to_string(),
+        K::MirrorH => "hflip".to_string(),
+        K::MirrorV => "vflip".to_string(),
+        K::ChromaticAberration { offset } => {
+            // `rgbashift` separates the per-channel offsets: keep G centered,
+            // shift R left and B right by `offset` pixels.
+            let o = (offset * i).round() as i32;
+            format!("rgbashift=rh={l}:bh={r}", l = -o, r = o)
+        }
+        K::Noise { amount } => {
+            let strength = (amount * i * 80.0).clamp(0.0, 100.0) as i32;
+            format!("noise=alls={}:allf=t", strength)
+        }
+        K::Wave { amplitude: _, wavelength: _ } => {
+            // Time/space-varying displacement is awkward in ffmpeg without
+            // GLSL — skip cleanly to keep the export stable.
+            return None;
+        }
+        K::OldFilm => format!(
+            "colorchannelmixer=.393:.769:.189:0:.349:.686:.168:0:.272:.534:.131:0,vignette=PI/3*0.7,noise=alls={}:allf=t",
+            (i * 12.0) as i32,
+        ),
+        K::Vhs => format!(
+            "rgbashift=rh=-{o}:bh={o},noise=alls={n}:allf=t",
+            o = (4.0 * i).round() as i32,
+            n = (i * 8.0) as i32,
+        ),
+        K::Glitch { strength: _ } => {
+            // Real per-frame glitching needs an enable expression and is
+            // out of scope for the static stack — emit a low-frequency
+            // chromatic shift as a stand-in so the user sees something.
+            format!("rgbashift=rh=-{o}:bh={o}", o = (i * 6.0).round() as i32)
+        }
+        K::Bloom { radius } => format!("gblur=sigma={}", (radius * i).max(1.0)),
+    })
 }

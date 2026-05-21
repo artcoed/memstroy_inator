@@ -1536,6 +1536,7 @@ impl eframe::App for App {
                             layout: vec![memstroy_core::Keyframe::new(0.0, memstroy_core::OverlayState::default())],
                             modifiers: Vec::new(),
                             skeleton_attachment: None,
+                            effects: Vec::new(),
                         });
                         self.state.scene.overlays.push(overlay);
                         self.state.selection = Selection::Overlay(self.state.scene.overlays.len() - 1);
