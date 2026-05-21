@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use crate::anchor::AnchorPoint;
 use crate::canvas::{CanvasTransform, RenderFrame};
 use crate::keyframe::Keyframe;
+use crate::skeleton::{SkeletonAttachment, SkeletonTemplate};
 
 /// Top-level scene description. Saved as `*.scene.yaml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,6 +34,10 @@ pub struct Scene {
     /// Indexed by actor id → keyframe track.
     #[serde(default)]
     pub canvas_layouts: Vec<CanvasLayout>,
+    /// **Skeleton Constructor**: User-defined skeleton templates for clips.
+    /// Each template defines named anchor points with per-frame positions.
+    #[serde(default)]
+    pub skeleton_templates: Vec<SkeletonTemplate>,
 }
 
 /// Associates an element (by id) with a canvas-space keyframe track.
@@ -58,6 +63,7 @@ impl Default for Scene {
             audio: Vec::new(),
             render_frame: RenderFrame::default(),
             canvas_layouts: Vec::new(),
+            skeleton_templates: Vec::new(),
         }
     }
 }
@@ -196,6 +202,10 @@ pub struct Actor {
     pub flip_horizontal: bool,
     #[serde(default)]
     pub attachments: Vec<Attachment>,
+    /// **Skeleton Constructor**: Elements attached to skeleton points on this actor.
+    /// Each entry binds an external element to a named point from a SkeletonTemplate.
+    #[serde(default)]
+    pub skeleton_attachments: Vec<SkeletonAttachment>,
     /// Whether this actor is visible in preview. Defaults to true.
     #[serde(default = "default_true")]
     pub visible: bool,

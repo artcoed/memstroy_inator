@@ -271,6 +271,7 @@ impl MontageOutput {
                 loop_source: false,
                 flip_horizontal: false,
                 attachments: Vec::new(),
+                skeleton_attachments: Vec::new(),
                 visible: true,
                 color_correction: crate::ColorCorrection::default(),
                 transition_in: crate::Transition::Cut,
