@@ -292,6 +292,20 @@ pub struct EditorState {
     // ─── Skeleton Editor ───────────────────────────────────────────
     /// State for the skeleton constructor editor window.
     pub skeleton_editor: crate::skeleton_editor::SkeletonEditorState,
+
+    // ─── Multi-tab scenes ──────────────────────────────────────────
+    /// All open scene tabs. Index 0 is always the active tab's scene (synced with `self.scene`).
+    pub scene_tabs: Vec<SceneTab>,
+    /// Index of the currently active tab.
+    pub active_tab: usize,
+}
+
+/// A single scene tab with its own file path and name.
+#[derive(Clone)]
+pub struct SceneTab {
+    pub name: String,
+    pub path: Option<PathBuf>,
+    pub scene: Scene,
 }
 
 #[derive(Default)]
@@ -402,6 +416,14 @@ impl EditorState {
         s.canvas_viewport = memstroy_core::EditorViewport::default();
         s.canvas_panning = false;
 
+        // Multi-tab: start with one untitled tab
+        s.scene_tabs = vec![SceneTab {
+            name: "Untitled".into(),
+            path: None,
+            scene: Scene::default(),
+        }];
+        s.active_tab = 0;
+
         s
     }
 
@@ -480,6 +502,67 @@ impl EditorState {
                 if audio_tracks.is_empty() { self.tracks.len().saturating_sub(1) }
                 else { audio_tracks[*i % audio_tracks.len()] }
             }
+        }
+    }
+
+    // ─── Tab management ──────────────────────────────────────────────
+
+    /// Create a new empty tab and switch to it.
+    pub fn new_tab(&mut self) {
+        // Save current scene into its tab before switching
+        self.sync_scene_to_tab();
+        let name = format!("Scene {}", self.scene_tabs.len() + 1);
+        self.scene_tabs.push(SceneTab {
+            name,
+            path: None,
+            scene: Scene::default(),
+        });
+        self.active_tab = self.scene_tabs.len() - 1;
+        self.sync_tab_to_scene();
+    }
+
+    /// Switch to tab at index.
+    pub fn switch_tab(&mut self, idx: usize) {
+        if idx >= self.scene_tabs.len() || idx == self.active_tab { return; }
+        self.sync_scene_to_tab();
+        self.active_tab = idx;
+        self.sync_tab_to_scene();
+    }
+
+    /// Close tab at index. If it's the last tab, create a new empty one.
+    pub fn close_tab(&mut self, idx: usize) {
+        if self.scene_tabs.len() <= 1 {
+            // Can't close last tab — just reset it
+            self.scene = Scene::default();
+            self.scene_path = None;
+            self.scene_tabs[0] = SceneTab { name: "Untitled".into(), path: None, scene: Scene::default() };
+            return;
+        }
+        self.scene_tabs.remove(idx);
+        if self.active_tab >= self.scene_tabs.len() {
+            self.active_tab = self.scene_tabs.len() - 1;
+        }
+        self.sync_tab_to_scene();
+    }
+
+    /// Sync `self.scene` into the active tab's stored scene.
+    pub fn sync_scene_to_tab(&mut self) {
+        if self.active_tab < self.scene_tabs.len() {
+            self.scene_tabs[self.active_tab].scene = self.scene.clone();
+            self.scene_tabs[self.active_tab].path = self.scene_path.clone();
+        }
+    }
+
+    /// Load the active tab's scene into `self.scene`.
+    pub fn sync_tab_to_scene(&mut self) {
+        if self.active_tab < self.scene_tabs.len() {
+            let tab = &self.scene_tabs[self.active_tab];
+            self.scene = tab.scene.clone();
+            self.scene_path = tab.path.clone();
+            // Clear caches when switching
+            self.frame_caches.clear();
+            self.selection = Selection::None;
+            self.playhead = 0.0;
         }
     }
 

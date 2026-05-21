@@ -88,11 +88,12 @@ fn handle_canvas_input(
         state.canvas_panning = false;
     }
 
-    // Scroll wheel → zoom only (always, Ctrl not required for scroll-to-zoom)
+    // Scroll wheel → zoom viewport (skip if Ctrl held — Ctrl+scroll = scale element)
     if response.hovered() {
         let scroll = ui.input(|i| i.smooth_scroll_delta);
+        let ctrl = ui.input(|i| i.modifiers.ctrl);
 
-        if scroll.y.abs() > 0.1 {
+        if !ctrl && scroll.y.abs() > 0.1 {
             // Zoom towards mouse position
             let factor = if scroll.y > 0.0 { 1.03 } else { 1.0 / 1.03 };
             if let Some(mouse) = ui.input(|i| i.pointer.hover_pos()) {
@@ -762,6 +763,30 @@ fn draw_selection_gizmo(
                 }
             }
             _ => {}
+        }
+    }
+
+    // ── Scale with Ctrl+scroll on selected element ──
+    if response.hovered() && !state.canvas_panning {
+        let ctrl = ui.input(|i| i.modifiers.ctrl);
+        let scroll_y = ui.input(|i| i.smooth_scroll_delta.y);
+        if ctrl && scroll_y.abs() > 0.1 {
+            let scale_delta = scroll_y * 0.002;
+            match state.selection {
+                Selection::Actor(idx) if idx < state.scene.actors.len() => {
+                    if let Some(kf) = state.scene.actors[idx].layout.first_mut() {
+                        kf.value.scale = (kf.value.scale + scale_delta).clamp(0.05, 10.0);
+                    }
+                }
+                Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
+                    match &mut state.scene.overlays[idx] {
+                        Overlay::Text(t) => { if let Some(kf) = t.layout.first_mut() { kf.value.scale = (kf.value.scale + scale_delta).clamp(0.05, 10.0); } }
+                        Overlay::Image(i) => { if let Some(kf) = i.layout.first_mut() { kf.value.scale = (kf.value.scale + scale_delta).clamp(0.05, 10.0); } }
+                        Overlay::Video(v) => { if let Some(kf) = v.layout.first_mut() { kf.value.scale = (kf.value.scale + scale_delta).clamp(0.05, 10.0); } }
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
