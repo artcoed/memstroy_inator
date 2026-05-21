@@ -105,6 +105,11 @@ pub enum AssetDragKind {
     /// A particle sprite — same as `Image` but the spawned overlay
     /// gets a Spin + Pulse modifier preset so it feels alive on drop.
     Particle,
+    /// A user-imported video file from the project library.
+    /// Behaves identically to a `Clip` drop (creates an actor + audio
+    /// track) but is sourced from `assets/videos/` instead of the
+    /// downloaded mellstroy clip pool.
+    Video,
 }
 
 /// Drag state for cross-panel "element-to-skeleton-point" attachment. A
@@ -338,6 +343,25 @@ pub struct EditorState {
     pub editing_tab_idx: Option<usize>,
     /// Buffer used by the inline tab-name editor.
     pub editing_tab_buf: String,
+
+    // ─── Per-param keyframe selection (timeline → inspector) ───────
+    /// Currently selected keyframes inside the focused layer. Cleared
+    /// when the layer changes; mutated by clicking diamonds in the
+    /// per-param keyframe rows. Shift / Ctrl+click extends the selection.
+    /// Pressing Delete removes every selected keyframe.
+    pub selected_keyframes: Vec<crate::kf_anim::SelectedKeyframe>,
+    /// Brief "this param row was just clicked from a kf" highlight, used
+    /// by the inspector to flash the matching control so the user can
+    /// follow the connection visually.
+    pub kf_highlight: crate::kf_anim::KfHighlight,
+    /// Library panel screen rect, captured during library() so the
+    /// app's external file-drop handler can route OS drops to the right
+    /// asset directory based on which tab is visible.
+    pub library_panel_rect: Option<egui::Rect>,
+    /// Tracks which selection most recently caused us to auto-bump the
+    /// timeline's vertical zoom. Comparing per-frame ensures we don't
+    /// keep re-applying the bump every paint while a layer is selected.
+    pub last_v_zoom_selection: Option<Selection>,
 }
 
 /// A single scene tab with its own file path and name.
@@ -360,6 +384,10 @@ pub struct AssetLibrary {
     /// modifier presets that give a "particle"-style motion (spin +
     /// pulse + slight wobble). The image is the particle sprite.
     pub particles: Vec<LibraryAsset>,
+    /// User-imported videos. Same drag-to-canvas semantics as the
+    /// downloaded mellstroy `Clip` tab — these come from the project's
+    /// `assets/videos/` directory instead.
+    pub videos: Vec<LibraryAsset>,
 }
 
 /// Generic library entry that's not a Mellstroy clip — a sound, an
@@ -389,6 +417,7 @@ pub enum LibraryTab {
     Sounds,
     Images,
     Particles,
+    Videos,
 }
 
 #[derive(Debug, Clone)]
@@ -822,6 +851,7 @@ impl EditorState {
         self.library.sounds = scan_asset_dir(&self.sounds_dir(), AssetCategory::Sound);
         self.library.images = scan_asset_dir(&self.images_dir(), AssetCategory::Image);
         self.library.particles = scan_asset_dir(&self.particles_dir(), AssetCategory::Particle);
+        self.library.videos = scan_asset_dir(&self.videos_dir(), AssetCategory::Video);
     }
 
     /// Directory holding sound effects available in the library. Files
@@ -839,6 +869,13 @@ impl EditorState {
     pub fn particles_dir(&self) -> PathBuf {
         self.assets_root.join("assets").join("particles")
     }
+
+    /// Directory holding user-imported videos. Drops onto the Videos tab
+    /// from the OS file manager copy here; drags from the tab spawn
+    /// actor clips on the canvas / timeline.
+    pub fn videos_dir(&self) -> PathBuf {
+        self.assets_root.join("assets").join("videos")
+    }
 }
 
 /// Categories used by `scan_asset_dir` to filter the file extensions
@@ -849,6 +886,7 @@ enum AssetCategory {
     Sound,
     Image,
     Particle,
+    Video,
 }
 
 impl AssetCategory {
@@ -862,6 +900,10 @@ impl AssetCategory {
             AssetCategory::Image | AssetCategory::Particle => matches!(
                 lower.as_str(),
                 "png" | "jpg" | "jpeg" | "webp" | "gif"
+            ),
+            AssetCategory::Video => matches!(
+                lower.as_str(),
+                "mp4" | "mov" | "webm" | "avi" | "mkv" | "m4v"
             ),
         }
     }
@@ -892,7 +934,7 @@ fn scan_asset_dir(dir: &std::path::Path, category: AssetCategory) -> Vec<Library
         let thumbnail = match category {
             // For images / particles, the asset itself is its thumbnail.
             AssetCategory::Image | AssetCategory::Particle => Some(path.clone()),
-            AssetCategory::Sound => {
+            AssetCategory::Sound | AssetCategory::Video => {
                 let candidates = [
                     path.with_extension("thumb.png"),
                     path.with_extension("thumb.jpg"),

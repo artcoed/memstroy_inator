@@ -282,17 +282,22 @@ impl App {
                                 };
                                 if close_resp.clicked() {
                                     close_tab = Some(i);
+                                    // Make sure a same-frame click on the
+                                    // surrounding frame (which used to fall
+                                    // through to switch_to) doesn't override
+                                    // the close request.
+                                    switch_to = None;
                                 }
                             });
                         });
-
-                        let tab_resp = inner.response.interact(egui::Sense::click());
-                        if tab_resp.clicked() && !is_active && !is_editing {
-                            switch_to = Some(i);
-                        }
-                        if tab_resp.double_clicked() {
-                            start_rename = Some((i, tab_name));
-                        }
+                        // The close button and the label both have their own
+                        // click handling above. Re-interacting on the whole
+                        // frame here used to swallow the close button's click
+                        // (the frame's hit-rect overlaps the button), which is
+                        // why the X "did nothing" on inactive tabs. Suppressed
+                        // entirely now — clicking dead space inside the tab
+                        // pill no longer switches; click the label instead.
+                        let _ = inner;
                     }
                 });
 
@@ -1515,16 +1520,115 @@ impl eframe::App for App {
         }
 
         // ── OS Drag-and-Drop: accept files from Windows Explorer ──
+        // When dropped over the library panel, files are imported into
+        // the matching `assets/<sub>/` directory and the library is
+        // refreshed. Drops anywhere else continue to add the file
+        // straight to the scene (legacy behaviour).
         let dropped_files: Vec<_> = ctx.input(|i| i.raw.dropped_files.clone());
+        let drop_pointer = ctx.input(|i| i.pointer.hover_pos());
+        let lib_rect = self.state.library_panel_rect;
+        let into_library = match (drop_pointer, lib_rect) {
+            (Some(p), Some(r)) => r.contains(p),
+            _ => false,
+        };
         if !dropped_files.is_empty() {
             for file in &dropped_files {
                 if let Some(path) = &file.path {
-                    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-                    if ["mp4", "mov", "webm", "avi", "mkv"].contains(&ext.as_str()) {
+                    let ext = path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("")
+                        .to_lowercase();
+                    let is_video = ["mp4", "mov", "webm", "avi", "mkv", "m4v"]
+                        .contains(&ext.as_str());
+                    let is_image =
+                        ["jpg", "jpeg", "png", "webp", "gif"].contains(&ext.as_str());
+                    let is_audio = ["mp3", "wav", "ogg", "flac", "aac", "m4a", "opus"]
+                        .contains(&ext.as_str());
+
+                    if into_library && (is_video || is_image || is_audio) {
+                        // Import the file into the matching library
+                        // directory, copy it on disk, and refresh.
+                        let dest_dir = if is_video {
+                            self.state.videos_dir()
+                        } else if is_image {
+                            // Default to Images. Particles share the same
+                            // file extensions but live in a separate
+                            // folder; route to Particles only when that
+                            // tab is currently visible so the user has
+                            // an explicit way to pick between them.
+                            if self.state.library_tab
+                                == crate::state::LibraryTab::Particles
+                            {
+                                self.state.particles_dir()
+                            } else {
+                                self.state.images_dir()
+                            }
+                        } else {
+                            self.state.sounds_dir()
+                        };
+                        if let Err(err) = std::fs::create_dir_all(&dest_dir) {
+                            self.state.status =
+                                format!("Couldn't create {}: {}", dest_dir.display(), err);
+                            continue;
+                        }
+                        let file_name = path
+                            .file_name()
+                            .map(|s| s.to_owned())
+                            .unwrap_or_else(|| std::ffi::OsString::from("import"));
+                        let mut dest = dest_dir.join(&file_name);
+                        // Avoid clobbering an existing file with the same
+                        // name — append a numeric suffix until we find a
+                        // free slot.
+                        let mut suffix = 1;
+                        while dest.exists() {
+                            let stem = path
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("import");
+                            let new_name = format!("{}_{}.{}", stem, suffix, ext);
+                            dest = dest_dir.join(new_name);
+                            suffix += 1;
+                            if suffix > 1000 {
+                                break;
+                            }
+                        }
+                        match std::fs::copy(path, &dest) {
+                            Ok(_) => {
+                                self.state.status = format!(
+                                    "Imported into library: {}",
+                                    dest.display()
+                                );
+                                // Switch the visible tab to the kind we
+                                // just imported so the user sees the new
+                                // entry without manual navigation.
+                                self.state.library_tab = if is_video {
+                                    crate::state::LibraryTab::Videos
+                                } else if is_image
+                                    && self.state.library_tab
+                                        != crate::state::LibraryTab::Particles
+                                {
+                                    crate::state::LibraryTab::Images
+                                } else if is_audio {
+                                    crate::state::LibraryTab::Sounds
+                                } else {
+                                    self.state.library_tab
+                                };
+                                self.state.reload_library();
+                            }
+                            Err(err) => {
+                                self.state.status =
+                                    format!("Couldn't import {}: {}", path.display(), err);
+                            }
+                        }
+                        continue;
+                    }
+
+                    if is_video {
                         // `add_actor_from_clip` already creates a matching AudioTrack
                         // and pre-loads any per-clip chroma/skeleton sidecars.
                         crate::panels::add_actor_from_clip(&mut self.state, &path.to_path_buf());
-                    } else if ["jpg", "jpeg", "png", "webp", "gif"].contains(&ext.as_str()) {
+                    } else if is_image {
                         let id = path.file_stem().and_then(|s| s.to_str())
                             .map(|s| format!("img_{}", s))
                             .unwrap_or_else(|| format!("img_{}", self.state.scene.overlays.len() + 1));
@@ -1537,11 +1641,12 @@ impl eframe::App for App {
                             modifiers: Vec::new(),
                             skeleton_attachment: None,
                             effects: Vec::new(),
+                            animated_params: Default::default(),
                         });
                         self.state.scene.overlays.push(overlay);
                         self.state.selection = Selection::Overlay(self.state.scene.overlays.len() - 1);
                         self.state.status = format!("Dropped image: {}", id);
-                    } else if ["mp3", "wav", "ogg", "flac", "aac", "m4a"].contains(&ext.as_str()) {
+                    } else if is_audio {
                         let id = path.file_stem().and_then(|s| s.to_str())
                             .map(|s| s.to_string())
                             .unwrap_or_else(|| format!("audio_{}", self.state.scene.audio.len() + 1));
