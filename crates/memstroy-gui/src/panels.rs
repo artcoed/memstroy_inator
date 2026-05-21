@@ -8,6 +8,20 @@ use memstroy_core::*;
 use crate::state::{AssetDragKind, EditorState, Selection, TrackKind};
 
 
+// ─── DRAG MODE FOR TIMELINE CLIPS ────────────────────────────────────
+//
+// Captured once at `drag_started` and stashed in egui's per-id temp memory
+// for the duration of the drag, so the mode never flips mid-drag (which
+// previously happened when the clip moved out from under the pointer's
+// initial edge zone).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClipDragMode {
+    Move,
+    TrimLeft,
+    TrimRight,
+}
+
+
 // ─── COLORS ──────────────────────────────────────────────────────────
 
 const COL_BG_DARK: Color32 = Color32::from_rgb(18, 18, 26);
@@ -1512,7 +1526,8 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                         let clip_start = bg_elem.start;
                         let clip_end = bg_elem.start + bg_elem.duration;
                         let sel = state.selection == Selection::Background(bi);
-                        if let Some(clicked) = draw_clip(ui, painter, content_rect, &bg_elem.id,
+                        let bg_id = egui::Id::new(("timeline_clip", "background", bi));
+                        if let Some(clicked) = draw_clip(ui, painter, content_rect, &bg_elem.id, bg_id,
                             clip_start, clip_end, state.timeline_scroll, pps, track_left, track_right,
                             COL_CLIP_BG, sel, track_h, track_locked, state.split_tool_active)
                         {
@@ -1555,7 +1570,8 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                     let trans_out = actor.transition_out;
                     let trans_dur = actor.transition_duration;
                     let sel = state.selection == Selection::Actor(ai);
-                    if let Some(clicked) = draw_clip(ui, painter, content_rect, &actor.id,
+                    let actor_id = egui::Id::new(("timeline_clip", "actor", ai));
+                    if let Some(clicked) = draw_clip(ui, painter, content_rect, &actor.id, actor_id,
                         clip_start, clip_end, state.timeline_scroll, pps, track_left, track_right,
                         COL_CLIP_ACTOR, sel, track_h, track_locked, state.split_tool_active)
                     {
@@ -1693,7 +1709,8 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             Overlay::Video(v) => (v.t_in, v.t_out, format!("V: {}", v.id)),
                         };
                         let sel = state.selection == Selection::Overlay(oi);
-                        if let Some(clicked) = draw_clip(ui, painter, content_rect, &label,
+                        let ov_id = egui::Id::new(("timeline_clip", "overlay", oi));
+                        if let Some(clicked) = draw_clip(ui, painter, content_rect, &label, ov_id,
                             clip_start, clip_end, state.timeline_scroll, pps, track_left, track_right,
                             COL_CLIP_OVERLAY, sel, track_h, track_locked, state.split_tool_active)
                         {
@@ -1754,7 +1771,8 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                     let clip_start = audio.t_in;
                     let clip_end = audio.t_out.unwrap_or(duration);
                     let sel = state.selection == Selection::Audio(aui);
-                    if let Some(clicked) = draw_audio_clip(ui, painter, content_rect, &audio.id,
+                    let audio_id = egui::Id::new(("timeline_clip", "audio", aui));
+                    if let Some(clicked) = draw_audio_clip(ui, painter, content_rect, &audio.id, audio_id,
                         clip_start, clip_end, state.timeline_scroll, pps, track_left, track_right,
                         sel, track_h, track_locked, state.split_tool_active,
                         state.audio_waveforms.get(aui))
@@ -2216,12 +2234,17 @@ fn stretchable_scrollbar(
 /// - `f32::NEG_INFINITY` signals "trim right edge"
 /// - Negative values signal whole-clip drag (new start time encoded as `-new_start`)
 /// Shows ResizeHorizontal cursor when hovering within 5px of left/right edge.
+///
+/// `clip_id` MUST be stable across frames for the same clip (do not include the
+/// clip's time in the id, or egui's drag tracking breaks the moment the clip
+/// position changes — the user has to release and re-click on every frame).
 #[allow(clippy::too_many_arguments)]
 fn draw_clip(
     ui: &mut egui::Ui,
     painter: &egui::Painter,
     content_rect: egui::Rect,
     label: &str,
+    clip_id: egui::Id,
     clip_start: f32,
     clip_end: f32,
     scroll: f32,
@@ -2285,12 +2308,20 @@ fn draw_clip(
             egui::FontId::proportional(10.0), Color32::WHITE);
     }
 
-    // Interaction (click/drag with edge-trim zones)
-    let id = ui.make_persistent_id(("clip", label, (clip_start * 1000.0) as i64));
+    // Interaction (click/drag with edge-trim zones).
+    //
+    // The id MUST be stable across frames for the same clip. Hashing the
+    // clip's time into the id (as we used to) caused the id to change every
+    // frame during a drag — egui then dropped its drag state and the user
+    // had to release and re-press for each pixel of motion. The caller now
+    // supplies a stable per-clip id.
+    let id = clip_id;
     let sense = if locked { Sense::hover() } else { Sense::click_and_drag() };
     let resp = ui.interact(bar_rect, id, sense);
 
-    // Edge detection: show resize cursor and allow trim
+    // Edge detection for hover cursor (purely cosmetic; the actual drag mode
+    // is captured once at drag_started below and locked for the rest of the
+    // drag, so the cursor flicker doesn't affect behaviour).
     let hover_pos = ui.input(|i| i.pointer.hover_pos());
 
     let near_left_edge = hover_pos.map(|p| (p.x - bar_rect.min.x).abs() < 5.0).unwrap_or(false);
@@ -2316,29 +2347,64 @@ fn draw_clip(
         return Some(clip_start); // signal selection
     }
 
-    // Drag handling: whole-clip move or edge-trim
+    // ── Drag handling ────────────────────────────────────────────────
+    //
+    // Strategy:
+    //   * On `drag_started`, freeze the drag mode (Move / TrimLeft /
+    //     TrimRight) and snapshot the clip's original start time and the
+    //     pointer's press origin. We stash these in egui's per-id temp
+    //     memory so they survive across frames.
+    //   * On every subsequent `dragged` frame, recompute the proposed new
+    //     position from the *total* pointer displacement since press origin,
+    //     not from per-frame deltas applied on top of an already-mutated
+    //     value. This avoids feedback loops with snapping (where a snapped
+    //     position would re-feed itself and cause jitter or sticking) and
+    //     keeps motion 1:1 with the cursor.
+    let mode_id = id.with("drag_mode");
+    let origin_id = id.with("press_origin_x");
+    let original_start_id = id.with("original_start");
+
+    if resp.drag_started() && !locked && !split_mode {
+        let press_x = ui
+            .input(|i| i.pointer.press_origin())
+            .map(|p| p.x)
+            .unwrap_or(bar_rect.center().x);
+        let mode = if (press_x - bar_rect.min.x).abs() < 6.0 {
+            ClipDragMode::TrimLeft
+        } else if (press_x - bar_rect.max.x).abs() < 6.0 {
+            ClipDragMode::TrimRight
+        } else {
+            ClipDragMode::Move
+        };
+        ui.data_mut(|d| {
+            d.insert_temp(mode_id, mode);
+            d.insert_temp(origin_id, press_x);
+            d.insert_temp(original_start_id, clip_start);
+        });
+    }
+
     if resp.dragged() && !locked && !split_mode {
-        let dx = resp.drag_delta().x;
-        let delta_secs = dx / pps;
+        let mode: Option<ClipDragMode> = ui.data(|d| d.get_temp(mode_id));
+        let press_x: Option<f32> = ui.data(|d| d.get_temp(origin_id));
+        let original_start: Option<f32> = ui.data(|d| d.get_temp(original_start_id));
+        let cur_x = ui
+            .input(|i| i.pointer.interact_pos().or_else(|| i.pointer.hover_pos()))
+            .map(|p| p.x);
 
-        // Determine if drag started on left/right edge
-        if let Some(origin) = resp.interact_pointer_pos() {
-            let start_x = origin.x - resp.drag_delta().x;
-            let on_left_edge = (start_x - bar_rect.min.x).abs() < 6.0;
-            let on_right_edge = (start_x - bar_rect.max.x).abs() < 6.0;
-
-            if on_left_edge && delta_secs.abs() > 0.001 {
-                // Trim left edge (in-point) - return positive infinity encoded
-                return Some(f32::INFINITY); // Signal: trim left
-            } else if on_right_edge && delta_secs.abs() > 0.001 {
-                // Trim right edge (out-point) - return negative infinity encoded
-                return Some(f32::NEG_INFINITY); // Signal: trim right
-            } else if delta_secs.abs() > 0.001 {
-                // Normal whole-clip move: return the NEW start time as negative
-                return Some(-(clip_start + delta_secs));
+        if let (Some(mode), Some(px), Some(os), Some(cx)) =
+            (mode, press_x, original_start, cur_x)
+        {
+            let total_dx = cx - px;
+            match mode {
+                ClipDragMode::TrimLeft => return Some(f32::INFINITY),
+                ClipDragMode::TrimRight => return Some(f32::NEG_INFINITY),
+                ClipDragMode::Move => {
+                    let total_dt = total_dx / pps;
+                    return Some(-(os + total_dt));
+                }
             }
         }
-        return Some(clip_start); // just select if no movement
+        return Some(clip_start); // fall back to bare select
     }
 
     None
@@ -2352,6 +2418,7 @@ fn draw_audio_clip(
     painter: &egui::Painter,
     content_rect: egui::Rect,
     label: &str,
+    clip_id: egui::Id,
     clip_start: f32,
     clip_end: f32,
     scroll: f32,
@@ -2430,8 +2497,13 @@ fn draw_audio_clip(
             egui::FontId::proportional(9.0), Color32::WHITE);
     }
 
-    // Interaction
-    let id = ui.make_persistent_id(("audio_clip", label, (clip_start * 1000.0) as i64));
+    // Interaction.
+    //
+    // Same stable-id + press-origin strategy as `draw_clip` — see the
+    // comment there for the rationale. Audio clips currently support only
+    // whole-clip move (no edge-trim) but use the same machinery so that
+    // future trim support is a one-liner.
+    let id = clip_id;
     let sense = if locked { Sense::hover() } else { Sense::click_and_drag() };
     let resp = ui.interact(bar_rect, id, sense);
 
@@ -2441,12 +2513,30 @@ fn draw_audio_clip(
 
     if resp.clicked() { return Some(clip_start); }
 
-    // Drag handling: whole-clip move (return negative value = new start time)
+    let origin_id = id.with("press_origin_x");
+    let original_start_id = id.with("original_start");
+
+    if resp.drag_started() && !locked {
+        let press_x = ui
+            .input(|i| i.pointer.press_origin())
+            .map(|p| p.x)
+            .unwrap_or(bar_rect.center().x);
+        ui.data_mut(|d| {
+            d.insert_temp(origin_id, press_x);
+            d.insert_temp(original_start_id, clip_start);
+        });
+    }
+
     if resp.dragged() && !locked {
-        let dx = resp.drag_delta().x;
-        let delta_secs = dx / pps;
-        if delta_secs.abs() > 0.001 {
-            return Some(-(clip_start + delta_secs));
+        let press_x: Option<f32> = ui.data(|d| d.get_temp(origin_id));
+        let original_start: Option<f32> = ui.data(|d| d.get_temp(original_start_id));
+        let cur_x = ui
+            .input(|i| i.pointer.interact_pos().or_else(|| i.pointer.hover_pos()))
+            .map(|p| p.x);
+
+        if let (Some(px), Some(os), Some(cx)) = (press_x, original_start, cur_x) {
+            let total_dt = (cx - px) / pps;
+            return Some(-(os + total_dt));
         }
         return Some(clip_start);
     }
