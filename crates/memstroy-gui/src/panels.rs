@@ -901,6 +901,130 @@ fn inspector_actor(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
 }
 
 
+// ─── Per-parameter keyframe strip helpers (transform layouts) ────────
+//
+// Two thin helpers that adapt the generic `kf_anim::keyframe_strip`
+// widget to the actor / overlay shared layout vector. They only
+// render when the param is in `animated_params` AND the layout
+// actually has multiple kfs whose value for THIS param differs.
+// Drag horizontal moves the kf time; right-click opens the easing
+// menu. Click is a no-op (the timeline ruler is the place to
+// navigate; the inspector strip is for editing).
+
+fn inspector_actor_param_strip<F>(
+    ui: &mut egui::Ui,
+    layout: &mut Vec<Keyframe<memstroy_core::ActorState>>,
+    is_animated: bool,
+    t_in_scene: f32,
+    playhead_scene: f32,
+    get: F,
+    salt: impl std::hash::Hash + Copy,
+) where
+    F: Fn(&memstroy_core::ActorState) -> f32,
+{
+    if !is_animated || layout.len() < 2 {
+        return;
+    }
+    const EPS: f32 = 1.0e-4;
+    // Pick the kf indices where the param's value actually changes.
+    // The first kf is always shown so the user has an anchor at t=0.
+    let mut indices: Vec<usize> = Vec::with_capacity(layout.len());
+    indices.push(0);
+    for i in 1..layout.len() {
+        if (get(&layout[i].value) - get(&layout[i - 1].value)).abs() > EPS {
+            indices.push(i);
+        }
+    }
+
+    // Convert scene-time → clip-local for display so every transform
+    // strip starts at 0 like the audio param strips do. The drag path
+    // converts back when writing.
+    let times_local: Vec<f32> = indices
+        .iter()
+        .map(|&i| (layout[i].t - t_in_scene).max(0.0))
+        .collect();
+    let easings: Vec<memstroy_core::Easing> =
+        indices.iter().map(|&i| layout[i].easing).collect();
+
+    let playhead_local = (playhead_scene - t_in_scene).max(0.0);
+    let max_kf_t = times_local.iter().cloned().fold(0.0_f32, f32::max);
+    let dur = max_kf_t.max(playhead_local).max(1.0);
+
+    let interaction = crate::kf_anim::keyframe_strip(
+        ui,
+        &times_local,
+        &easings,
+        dur,
+        Some(playhead_local),
+        salt,
+    );
+
+    if let Some((strip_idx, new_t_local)) = interaction.dragged_idx_to {
+        if let Some(&kf_idx) = indices.get(strip_idx) {
+            layout[kf_idx].t = (new_t_local + t_in_scene).max(0.0);
+            layout
+                .sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
+        }
+    }
+    if let Some((strip_idx, easing)) = interaction.easing_changed {
+        if let Some(&kf_idx) = indices.get(strip_idx) {
+            layout[kf_idx].easing = easing;
+        }
+    }
+}
+
+fn inspector_overlay_param_strip<F>(
+    ui: &mut egui::Ui,
+    layout: &mut Vec<Keyframe<memstroy_core::OverlayState>>,
+    is_animated: bool,
+    playhead_local: f32,
+    get: F,
+    salt: impl std::hash::Hash + Copy,
+) where
+    F: Fn(&memstroy_core::OverlayState) -> f32,
+{
+    if !is_animated || layout.len() < 2 {
+        return;
+    }
+    const EPS: f32 = 1.0e-4;
+    let mut indices: Vec<usize> = Vec::with_capacity(layout.len());
+    indices.push(0);
+    for i in 1..layout.len() {
+        if (get(&layout[i].value) - get(&layout[i - 1].value)).abs() > EPS {
+            indices.push(i);
+        }
+    }
+    let times: Vec<f32> = indices.iter().map(|&i| layout[i].t.max(0.0)).collect();
+    let easings: Vec<memstroy_core::Easing> =
+        indices.iter().map(|&i| layout[i].easing).collect();
+
+    let max_kf_t = times.iter().cloned().fold(0.0_f32, f32::max);
+    let dur = max_kf_t.max(playhead_local).max(1.0);
+
+    let interaction = crate::kf_anim::keyframe_strip(
+        ui,
+        &times,
+        &easings,
+        dur,
+        Some(playhead_local.max(0.0)),
+        salt,
+    );
+
+    if let Some((strip_idx, new_t)) = interaction.dragged_idx_to {
+        if let Some(&kf_idx) = indices.get(strip_idx) {
+            layout[kf_idx].t = new_t.max(0.0);
+            layout
+                .sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
+        }
+    }
+    if let Some((strip_idx, easing)) = interaction.easing_changed {
+        if let Some(&kf_idx) = indices.get(strip_idx) {
+            layout[kf_idx].easing = easing;
+        }
+    }
+}
+
+
 fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
     use crate::kf_anim;
     use memstroy_core::param_ids;
@@ -932,6 +1056,12 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
 
     let highlight = state.kf_highlight.clone();
 
+    // Scene-time anchor for strip-time → scene-time conversions. Actor
+    // kfs are stored in scene-time, but the strip displays clip-local
+    // for consistency with the audio param strips and the timeline
+    // ruler beneath the layer.
+    let t_in_scene = a.t_in.unwrap_or(0.0);
+
     // ── Position X / Y ──
     let mut new_x = cur.pos[0];
     let mut new_y = cur.pos[1];
@@ -955,6 +1085,16 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
                 |s| s.pos[1] = new_y);
         }
     });
+    let pos_x_anim = a.animated_params.contains(param_ids::POS_X);
+    let pos_y_anim = a.animated_params.contains(param_ids::POS_Y);
+    inspector_actor_param_strip(
+        ui, &mut a.layout, pos_x_anim, t_in_scene, playhead,
+        |s| s.pos[0], ("act_strip_pos_x", i),
+    );
+    inspector_actor_param_strip(
+        ui, &mut a.layout, pos_y_anim, t_in_scene, playhead,
+        |s| s.pos[1], ("act_strip_pos_y", i),
+    );
 
     // ── Scale ──
     let mut new_scale = cur.scale;
@@ -1028,6 +1168,16 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
             }
         }
     });
+    let scale_anim = a.animated_params.contains(param_ids::SCALE);
+    let scale_y_anim = a.animated_params.contains(param_ids::SCALE_Y);
+    inspector_actor_param_strip(
+        ui, &mut a.layout, scale_anim, t_in_scene, playhead,
+        |s| s.scale, ("act_strip_scale", i),
+    );
+    inspector_actor_param_strip(
+        ui, &mut a.layout, scale_y_anim, t_in_scene, playhead,
+        |s| s.scale_y, ("act_strip_scale_y", i),
+    );
 
     // ── Rotation (dial + numeric) ──
     let mut new_rot = cur.rotation_deg;
@@ -1059,6 +1209,11 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
                 |s| s.rotation_deg = new_rot);
         }
     });
+    let rot_anim = a.animated_params.contains(param_ids::ROTATION);
+    inspector_actor_param_strip(
+        ui, &mut a.layout, rot_anim, t_in_scene, playhead,
+        |s| s.rotation_deg, ("act_strip_rot", i),
+    );
 
     // ── Opacity ──
     let mut new_op = cur.opacity;
@@ -1074,6 +1229,11 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
                 |s| s.opacity = new_op);
         }
     });
+    let op_anim = a.animated_params.contains(param_ids::OPACITY);
+    inspector_actor_param_strip(
+        ui, &mut a.layout, op_anim, t_in_scene, playhead,
+        |s| s.opacity, ("act_strip_op", i),
+    );
 
     // ── Flip X / Y ──
     let mut new_fx = cur.flip_x_anim;
@@ -1091,6 +1251,11 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
         }
         // Mirror (\u{21B6}) shortcut button intentionally removed — drag the slider to -1 manually.
     });
+    let flip_x_anim = a.animated_params.contains(param_ids::FLIP_X);
+    inspector_actor_param_strip(
+        ui, &mut a.layout, flip_x_anim, t_in_scene, playhead,
+        |s| s.flip_x_anim, ("act_strip_flip_x", i),
+    );
     ui.horizontal(|ui| {
         kf_anim::animated_toggle(ui, &mut a.animated_params, param_ids::FLIP_Y, ("act_fy", i));
         ui.label(param_label(highlight.is_active(param_ids::FLIP_Y), "Flip Y:"));
@@ -1102,6 +1267,11 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
                 |s| s.flip_y_anim = new_fy);
         }
     });
+    let flip_y_anim = a.animated_params.contains(param_ids::FLIP_Y);
+    inspector_actor_param_strip(
+        ui, &mut a.layout, flip_y_anim, t_in_scene, playhead,
+        |s| s.flip_y_anim, ("act_strip_flip_y", i),
+    );
 
     ui.add_space(8.0);
     ui.checkbox(&mut a.visible, "Visible");
@@ -1710,30 +1880,28 @@ fn inspector_effect_anim_slider(
     });
 
     if is_animated {
-        ui.horizontal(|ui| {
-            ui.add_space(20.0);
-            if ui
-                .small_button("+ kf at playhead")
-                .on_hover_text("Add a keyframe at the current playhead")
-                .clicked()
-            {
-                let entry = eff.param_kfs.entry(key.to_string()).or_default();
-                if entry.is_empty() {
-                    entry.push(memstroy_core::Keyframe::new(t_local.max(0.0), display));
-                } else {
-                    memstroy_core::upsert_keyframe(entry, t_local.max(0.0), display);
-                }
+        // Per-param keyframe strip — replaces the old "+ kf at playhead"
+        // / "Clear kfs" buttons. Drag a diamond to move it; right-click
+        // for the interpolation menu. The strip self-sizes to the
+        // largest kf time.
+        if let Some(kf_vec) = eff.param_kfs.get_mut(key) {
+            if !kf_vec.is_empty() {
+                let max_t = kf_vec.iter().map(|k| k.t).fold(0.0_f32, f32::max);
+                let dur = max_t.max(t_local).max(1.0);
+                let times: Vec<f32> = kf_vec.iter().map(|k| k.t).collect();
+                let easings: Vec<memstroy_core::Easing> =
+                    kf_vec.iter().map(|k| k.easing).collect();
+                let interaction = crate::kf_anim::keyframe_strip(
+                    ui,
+                    &times,
+                    &easings,
+                    dur,
+                    Some(t_local.max(0.0)),
+                    ("effect_kf_strip", key, salt),
+                );
+                crate::kf_anim::apply_strip_to_f32_kfs(kf_vec, &interaction);
             }
-            let kf_count = eff.param_kfs.get(key).map(|v| v.len()).unwrap_or(0);
-            if kf_count > 0 && ui.small_button("Clear kfs").clicked() {
-                eff.param_kfs.remove(key);
-            }
-            ui.label(
-                RichText::new(format!("({} kf)", kf_count))
-                    .size(9.0)
-                    .color(COL_TEXT_DIM),
-            );
-        });
+        }
     }
 }
 
@@ -1990,30 +2158,26 @@ fn inspector_cc_anim_slider(
         }
     });
     if is_animated {
-        ui.horizontal(|ui| {
-            ui.add_space(20.0);
-            if ui
-                .small_button("+ kf at playhead")
-                .on_hover_text("Add a keyframe at the current playhead")
-                .clicked()
-            {
-                let entry = cc.kfs.entry(key.to_string()).or_default();
-                if entry.is_empty() {
-                    entry.push(memstroy_core::Keyframe::new(t_local.max(0.0), display));
-                } else {
-                    memstroy_core::upsert_keyframe(entry, t_local.max(0.0), display);
-                }
+        // Per-param keyframe strip — replaces the old buttons. Drag to
+        // move kfs in time; right-click for the easing menu.
+        if let Some(kf_vec) = cc.kfs.get_mut(key) {
+            if !kf_vec.is_empty() {
+                let max_t = kf_vec.iter().map(|k| k.t).fold(0.0_f32, f32::max);
+                let dur = max_t.max(t_local).max(1.0);
+                let times: Vec<f32> = kf_vec.iter().map(|k| k.t).collect();
+                let easings: Vec<memstroy_core::Easing> =
+                    kf_vec.iter().map(|k| k.easing).collect();
+                let interaction = crate::kf_anim::keyframe_strip(
+                    ui,
+                    &times,
+                    &easings,
+                    dur,
+                    Some(t_local.max(0.0)),
+                    ("cc_kf_strip", key, salt),
+                );
+                crate::kf_anim::apply_strip_to_f32_kfs(kf_vec, &interaction);
             }
-            let kf_count = cc.kfs.get(key).map(|v| v.len()).unwrap_or(0);
-            if kf_count > 0 && ui.small_button("Clear kfs").clicked() {
-                cc.kfs.remove(key);
-            }
-            ui.label(
-                RichText::new(format!("({} kf)", kf_count))
-                    .size(9.0)
-                    .color(COL_TEXT_DIM),
-            );
-        });
+        }
     }
 }
 
@@ -2959,6 +3123,16 @@ fn inspector_overlay_state_widgets(
                 param_ids::POS_Y, false, |s| s.pos[1] = new_y);
         }
     });
+    let pos_x_anim = animated_params.contains(param_ids::POS_X);
+    let pos_y_anim = animated_params.contains(param_ids::POS_Y);
+    inspector_overlay_param_strip(
+        ui, layout, pos_x_anim, playhead,
+        |s| s.pos[0], (salt_kind, "strip_px", salt_idx),
+    );
+    inspector_overlay_param_strip(
+        ui, layout, pos_y_anim, playhead,
+        |s| s.pos[1], (salt_kind, "strip_py", salt_idx),
+    );
 
     let mut new_scale = cur.scale;
     let mut new_sy = cur.scale_y;
@@ -3032,6 +3206,16 @@ fn inspector_overlay_state_widgets(
             }
         }
     });
+    let scale_anim = animated_params.contains(param_ids::SCALE);
+    let scale_y_anim = animated_params.contains(param_ids::SCALE_Y);
+    inspector_overlay_param_strip(
+        ui, layout, scale_anim, playhead,
+        |s| s.scale, (salt_kind, "strip_sc", salt_idx),
+    );
+    inspector_overlay_param_strip(
+        ui, layout, scale_y_anim, playhead,
+        |s| s.scale_y, (salt_kind, "strip_sy", salt_idx),
+    );
 
     let mut new_rot = cur.rotation_deg;
     ui.horizontal(|ui| {
@@ -3048,6 +3232,11 @@ fn inspector_overlay_state_widgets(
                 param_ids::ROTATION, false, |s| s.rotation_deg = new_rot);
         }
     });
+    let rot_anim = animated_params.contains(param_ids::ROTATION);
+    inspector_overlay_param_strip(
+        ui, layout, rot_anim, playhead,
+        |s| s.rotation_deg, (salt_kind, "strip_rot", salt_idx),
+    );
 
     let mut new_op = cur.opacity;
     ui.horizontal(|ui| {
@@ -3059,6 +3248,11 @@ fn inspector_overlay_state_widgets(
                 param_ids::OPACITY, false, |s| s.opacity = new_op);
         }
     });
+    let op_anim = animated_params.contains(param_ids::OPACITY);
+    inspector_overlay_param_strip(
+        ui, layout, op_anim, playhead,
+        |s| s.opacity, (salt_kind, "strip_op", salt_idx),
+    );
 
     let mut new_fx = cur.flip_x_anim;
     let mut new_fy = cur.flip_y_anim;
@@ -3071,6 +3265,11 @@ fn inspector_overlay_state_widgets(
                 param_ids::FLIP_X, false, |s| s.flip_x_anim = new_fx);
         }
     });
+    let flip_x_anim = animated_params.contains(param_ids::FLIP_X);
+    inspector_overlay_param_strip(
+        ui, layout, flip_x_anim, playhead,
+        |s| s.flip_x_anim, (salt_kind, "strip_fx", salt_idx),
+    );
     ui.horizontal(|ui| {
         kf_anim::animated_toggle(ui, animated_params, param_ids::FLIP_Y, (salt_kind, "fy", salt_idx));
         ui.label(param_label(highlight.is_active(param_ids::FLIP_Y), "Flip Y:"));
@@ -3080,6 +3279,11 @@ fn inspector_overlay_state_widgets(
                 param_ids::FLIP_Y, false, |s| s.flip_y_anim = new_fy);
         }
     });
+    let flip_y_anim = animated_params.contains(param_ids::FLIP_Y);
+    inspector_overlay_param_strip(
+        ui, layout, flip_y_anim, playhead,
+        |s| s.flip_y_anim, (salt_kind, "strip_fy", salt_idx),
+    );
 }
 
 /// Inspector layer-order actions for a text overlay. The buttons that
@@ -3547,10 +3751,44 @@ fn inspector_audio(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
         let one_x_dur = cur_dur * old_speed;
         let mut new_speed = audio.speed;
         let mut speed_dirty = false;
+        let speed_animated = audio.animated_params.contains("speed");
         ui.horizontal(|ui| {
+            // Diamond toggle for keyframing speed. When ON the cascade
+            // below still operates on the STATIC `audio.speed`, but
+            // edits while animated upsert a kf at the playhead like
+            // every other animatable param.
+            let marker = if speed_animated { "\u{25C6}" } else { "\u{25C7}" };
+            let col = if speed_animated { Color32::from_rgb(255, 180, 80) } else { COL_TEXT_DIM };
+            let toggle = ui
+                .add(
+                    egui::Button::new(RichText::new(marker).size(11.0).color(col))
+                        .frame(false)
+                        .min_size(Vec2::new(14.0, 14.0)),
+                )
+                .on_hover_text(crate::i18n::t("Toggle animation for this parameter"));
+            if toggle.clicked() {
+                if speed_animated {
+                    audio.animated_params.remove("speed");
+                } else {
+                    audio.animated_params.insert("speed".to_string());
+                    if audio.speed_kfs.is_empty() {
+                        audio.speed_kfs.push(memstroy_core::Keyframe::new(0.0, audio.speed));
+                    }
+                }
+            }
+
             ui.label(t("Speed"));
+            // When animated, sample the kf track at the playhead so the
+            // displayed value tracks the animation curve like the other
+            // audio params do; otherwise show the static value.
+            let mut display = if speed_animated && !audio.speed_kfs.is_empty() {
+                memstroy_core::keyframe::sample(&audio.speed_kfs, t_local)
+                    .unwrap_or(audio.speed)
+            } else {
+                new_speed
+            };
             let resp = ui.add(
-                egui::DragValue::new(&mut new_speed)
+                egui::DragValue::new(&mut display)
                     .speed(0.01)
                     .range(0.05..=16.0)
                     .fixed_decimals(3)
@@ -3559,15 +3797,48 @@ fn inspector_audio(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
             .on_hover_text(t(
                 "Numeric playback speed. The clip bar on the timeline shrinks when speeding up and stretches when slowing down. If this audio is bound to a video clip, both update together.",
             ));
-            if resp.changed() && new_speed.is_finite() && new_speed > 0.0 {
-                audio.speed = new_speed.max(0.05);
-                speed_dirty = true;
+            if resp.changed() && display.is_finite() && display > 0.0 {
+                if speed_animated {
+                    if audio.speed_kfs.is_empty() {
+                        audio.speed_kfs.push(memstroy_core::Keyframe::new(0.0, audio.speed));
+                    }
+                    memstroy_core::upsert_keyframe(&mut audio.speed_kfs, t_local, display);
+                    // The static field still drives the timeline's
+                    // visible duration; treat the keyframe edit as
+                    // "set the static to whatever the user just typed
+                    // at the playhead" so the bar resizes too.
+                    audio.speed = display.max(0.05);
+                    new_speed = audio.speed;
+                    speed_dirty = true;
+                } else {
+                    audio.speed = display.max(0.05);
+                    new_speed = audio.speed;
+                    speed_dirty = true;
+                }
             }
             if ui.small_button("1\u{00D7}").on_hover_text(t("Reset to 1.0x")).clicked() {
                 audio.speed = 1.0;
+                new_speed = 1.0;
                 speed_dirty = true;
             }
         });
+        // Per-param strip for speed kfs.
+        if speed_animated && !audio.speed_kfs.is_empty() {
+            let max_kf_t = audio.speed_kfs.iter().map(|k| k.t).fold(0.0_f32, f32::max);
+            let dur = max_kf_t.max(t_local).max(1.0);
+            let times: Vec<f32> = audio.speed_kfs.iter().map(|k| k.t).collect();
+            let easings: Vec<memstroy_core::Easing> =
+                audio.speed_kfs.iter().map(|k| k.easing).collect();
+            let interaction = crate::kf_anim::keyframe_strip(
+                ui,
+                &times,
+                &easings,
+                dur,
+                Some(t_local.max(0.0)),
+                ("audio_kf_strip", "speed"),
+            );
+            crate::kf_anim::apply_strip_to_f32_kfs(&mut audio.speed_kfs, &interaction);
+        }
         if speed_dirty && cur_dur > 0.0 {
             // Resize the visible window to match the new speed using
             // the cached "1× length" reference so the math is symmetric.
@@ -3611,98 +3882,111 @@ fn inspector_audio(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
     }
 
     let audio = &mut state.scene.audio[i];
+    let t_local = (state.playhead - audio.t_in).max(0.0);
 
-    // ── Pitch (semitones) + Pan + Mute ───────────────────────────────
-    // Note: pitch / pan / reverb / filter cutoffs are not keyframable
-    // today (the audio engine snapshots them at sink-build time). Adding
-    // a per-param animation toggle here is tracked separately — the
-    // existing rows already follow the new "left-aligned compact" style
-    // used by the video inspector. See TODO at the top of this fn.
+    // ── Pitch / Pan / Mute (animatable) ──────────────────────────────
+    // Pitch / pan / reverb / filter cutoffs go through the same
+    // `inspector_audio_param` pipeline as volume so the user gets the
+    // diamond toggle, animated playhead-tracking, and per-param kf
+    // strip out of the box.
     ui.add_space(6.0);
+    inspector_audio_param(
+        ui,
+        &crate::i18n::t("Pitch (semitones)"),
+        "pitch",
+        -24.0..=24.0,
+        false,
+        t_local,
+        &mut audio.pitch_semitones,
+        &mut audio.pitch_kfs,
+        &mut audio.animated_params,
+    );
+    inspector_audio_param(
+        ui,
+        &crate::i18n::t("Pan"),
+        "pan",
+        -1.0..=1.0,
+        false,
+        t_local,
+        &mut audio.pan,
+        &mut audio.pan_kfs,
+        &mut audio.animated_params,
+    );
     ui.horizontal(|ui| {
-        ui.label(t("Pitch (semitones)"));
-        ui.add(
-            egui::Slider::new(&mut audio.pitch_semitones, -24.0..=24.0)
-                .fixed_decimals(1)
-                .suffix(" st"),
-        )
-        .on_hover_text(t(
-            "Pitch shifts the sound up or down without changing the timeline placement.",
-        ));
-    });
-    ui.horizontal(|ui| {
-        ui.label(t("Pan"));
-        ui.add(egui::Slider::new(&mut audio.pan, -1.0..=1.0).fixed_decimals(2))
-            .on_hover_text(t("Pan: -1 = full left, 0 = centre, +1 = full right."));
-    });
-    ui.horizontal(|ui| {
-        ui.checkbox(&mut audio.mute, t("Mute"));
-        ui.add_space(8.0);
-        ui.checkbox(&mut audio.loop_source, t("Loop source"));
+        ui.checkbox(&mut audio.mute, crate::i18n::t("Mute"));
     });
 
-    // ── Reverb ───────────────────────────────────────────────────────
-    // (Fade in / fade out controls were removed — author them via
-    // keyframes on volume instead, which is the same workflow as video.)
+    // ── Reverb (animatable) ──────────────────────────────────────────
     ui.add_space(6.0);
-    ui.label(RichText::new(t("Audio effects")).strong().size(12.0).color(COL_TEXT_DIM));
-    ui.horizontal(|ui| {
-        ui.label(t("Reverb"));
-        ui.add(egui::Slider::new(&mut audio.reverb, 0.0..=1.0).fixed_decimals(2));
-    });
+    ui.label(RichText::new(crate::i18n::t("Audio effects")).strong().size(12.0).color(COL_TEXT_DIM));
+    inspector_audio_param(
+        ui,
+        &crate::i18n::t("Reverb"),
+        "reverb",
+        0.0..=1.0,
+        false,
+        t_local,
+        &mut audio.reverb,
+        &mut audio.reverb_kfs,
+        &mut audio.animated_params,
+    );
 
-    // ── Filters ──────────────────────────────────────────────────────
+    // ── Filters (animatable cutoffs) ─────────────────────────────────
     ui.add_space(6.0);
-    ui.label(RichText::new(t("Filters")).strong().size(12.0).color(COL_TEXT_DIM));
+    ui.label(RichText::new(crate::i18n::t("Filters")).strong().size(12.0).color(COL_TEXT_DIM));
 
-    // Low-pass: a checkbox that owns whether the filter is active, plus
-    // a frequency slider that's only enabled when the box is ticked.
+    // Low-pass: a checkbox owns whether the filter is enabled. When ON
+    // the cutoff Hz row is keyframable through the same widget as the
+    // other params; we mirror the slider's value into the `Option<u32>`
+    // static field so disabling the filter still reads the user's last
+    // chosen cutoff back.
     ui.horizontal(|ui| {
         let mut lp_on = audio.low_pass_hz.is_some();
-        if ui.checkbox(&mut lp_on, t("Enable low-pass filter")).changed() {
+        if ui.checkbox(&mut lp_on, crate::i18n::t("Enable low-pass filter")).changed() {
             audio.low_pass_hz = if lp_on { Some(8000) } else { None };
         }
     });
-    if let Some(lp) = audio.low_pass_hz.as_mut() {
-        ui.horizontal(|ui| {
-            ui.label(t("Low-pass cutoff (Hz)"));
-            let mut v = *lp as f32;
-            if ui
-                .add(
-                    egui::Slider::new(&mut v, 100.0..=20000.0)
-                        .logarithmic(true)
-                        .fixed_decimals(0)
-                        .suffix(" Hz"),
-                )
-                .changed()
-            {
-                *lp = v.clamp(100.0, 20000.0) as u32;
-            }
-        });
+    if audio.low_pass_hz.is_some() {
+        // Pull the Option<u32> static value into a dedicated f32 mirror
+        // so `inspector_audio_param` can treat it like every other
+        // animatable knob. The slider edit writes back to the option
+        // when not animated; the kf path stores the f32 value.
+        let mut lp_static_f32 = audio.low_pass_hz.map(|v| v as f32).unwrap_or(8000.0);
+        inspector_audio_param(
+            ui,
+            &crate::i18n::t("Low-pass cutoff (Hz)"),
+            "low_pass",
+            100.0..=20000.0,
+            true, // logarithmic — wide audible-range scale
+            t_local,
+            &mut lp_static_f32,
+            &mut audio.low_pass_kfs,
+            &mut audio.animated_params,
+        );
+        // Persist the (possibly edited) static value back as u32.
+        audio.low_pass_hz = Some(lp_static_f32.clamp(20.0, 22000.0) as u32);
     }
 
     ui.horizontal(|ui| {
         let mut hp_on = audio.high_pass_hz.is_some();
-        if ui.checkbox(&mut hp_on, t("Enable high-pass filter")).changed() {
+        if ui.checkbox(&mut hp_on, crate::i18n::t("Enable high-pass filter")).changed() {
             audio.high_pass_hz = if hp_on { Some(120) } else { None };
         }
     });
-    if let Some(hp) = audio.high_pass_hz.as_mut() {
-        ui.horizontal(|ui| {
-            ui.label(t("High-pass cutoff (Hz)"));
-            let mut v = *hp as f32;
-            if ui
-                .add(
-                    egui::Slider::new(&mut v, 20.0..=8000.0)
-                        .logarithmic(true)
-                        .fixed_decimals(0)
-                        .suffix(" Hz"),
-                )
-                .changed()
-            {
-                *hp = v.clamp(20.0, 8000.0) as u32;
-            }
-        });
+    if audio.high_pass_hz.is_some() {
+        let mut hp_static_f32 = audio.high_pass_hz.map(|v| v as f32).unwrap_or(120.0);
+        inspector_audio_param(
+            ui,
+            &crate::i18n::t("High-pass cutoff (Hz)"),
+            "high_pass",
+            20.0..=8000.0,
+            true,
+            t_local,
+            &mut hp_static_f32,
+            &mut audio.high_pass_kfs,
+            &mut audio.animated_params,
+        );
+        audio.high_pass_hz = Some(hp_static_f32.clamp(20.0, 22000.0) as u32);
     }
 
     // (Reset audio effects button removed — destructive bulk edits are
@@ -3817,9 +4101,12 @@ fn inspector_audio(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
 /// toggle (matching the per-param diamond used in the video inspector).
 /// When the toggle is ON, edits to the slider write a keyframe at the
 /// playhead's clip-local time; otherwise edits change the static value.
-/// The "+ kf" / "Clear kfs" helpers are no longer rendered separately —
-/// the row is now a single line so the inspector stays scannable when a
-/// scene has lots of audio tracks.
+/// A horizontal keyframe strip is rendered directly under the slider
+/// when the param is animated — drag a diamond to move its time, or
+/// right-click for the interpolation menu. The "+ kf at playhead" /
+/// "Clear kfs" buttons were removed: editing the slider while a kf is
+/// at the playhead already upserts (so the button was redundant), and
+/// clearing all kfs is reachable through Delete on the timeline.
 #[allow(clippy::too_many_arguments)]
 fn inspector_audio_param(
     ui: &mut egui::Ui,
@@ -3890,28 +4177,28 @@ fn inspector_audio_param(
         }
     });
 
-    if is_animated {
-        ui.horizontal(|ui| {
-            ui.add_space(20.0); // align under the slider
-            if ui
-                .small_button(crate::i18n::t("+ kf at playhead"))
-                .on_hover_text(crate::i18n::t("Add a keyframe at the current playhead"))
-                .clicked()
-            {
-                if kfs.is_empty() {
-                    kfs.push(memstroy_core::Keyframe::new(0.0, *static_value));
-                }
-                memstroy_core::upsert_keyframe(kfs, t_local, display);
-            }
-            if !kfs.is_empty() && ui.small_button(crate::i18n::t("Clear kfs")).clicked() {
-                kfs.clear();
-            }
-            ui.label(
-                RichText::new(format!("({} kf)", kfs.len()))
-                    .size(9.0)
-                    .color(COL_TEXT_DIM),
-            );
-        });
+    // Per-parameter keyframe strip — drawn ONLY when the param is
+    // animated. When the user toggles animation on without entering any
+    // edits yet, the strip will show a single seed kf at t=0 (placed
+    // by the toggle handler above) so they have something to drag.
+    if is_animated && !kfs.is_empty() {
+        // Use the larger of the clip's local playhead and the largest
+        // kf time as the strip's right edge so the user can always see
+        // every kf they've authored, even when the playhead is at 0.
+        let max_kf_t = kfs.iter().map(|k| k.t).fold(0.0_f32, f32::max);
+        let dur = max_kf_t.max(t_local).max(1.0).max(0.1);
+        let times: Vec<f32> = kfs.iter().map(|k| k.t).collect();
+        let easings: Vec<memstroy_core::Easing> =
+            kfs.iter().map(|k| k.easing).collect();
+        let interaction = crate::kf_anim::keyframe_strip(
+            ui,
+            &times,
+            &easings,
+            dur,
+            Some(t_local.max(0.0)),
+            ("audio_kf_strip", param_id),
+        );
+        crate::kf_anim::apply_strip_to_f32_kfs(kfs, &interaction);
     }
 }
 
@@ -6076,6 +6363,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                     let clip_start = audio.t_in;
                     let clip_end = audio.t_out.unwrap_or(duration);
                     let audio_source_start = audio.source_start;
+                    let audio_speed = audio.speed;
                     if !in_viewport(clip_start, clip_end) { continue; }
                     let sel = state.selection == Selection::Audio(aui);
                     let audio_id = egui::Id::new(("timeline_clip", "audio", aui));
@@ -6083,7 +6371,8 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                         clip_start, clip_end, state.timeline_scroll, pps, track_left, track_right,
                         sel, track_h, track_locked, state.split_tool_active,
                         state.audio_waveforms.get(aui),
-                        audio_source_start)
+                        audio_source_start,
+                        audio_speed)
                     {
                         if clicked == f32::INFINITY {
                             // Trim left: walk t_in forward and bump
@@ -6185,27 +6474,87 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             // Vertical: only allow audio to land on audio
                             // lanes. Lane creation is deferred to drag-end
                             // via state.timeline_drag.pending_new_lane.
-                            // Lane-lock hysteresis kills the inter-lane
-                            // wobble during a primarily-horizontal drag.
-                            const LANE_LOCK_THRESHOLD: f32 = 14.0;
-                            let lane_locked = match (state.timeline_drag.start_pointer_y, pointer_y) {
-                                (Some(y0), Some(y1)) => (y1 - y0).abs() < LANE_LOCK_THRESHOLD,
-                                _ => false,
-                            };
-                            if lane_locked {
-                                // Skip lane reassignment entirely.
-                            } else if let Some(py) = pointer_y {
+                            // Lane-lock hysteresis used to skip lane
+                            // reassignment for primarily-horizontal drags
+                            // — but the user explicitly asked for sound
+                            // to move freely between layers, so we now
+                            // honour every Y-direction motion as soon as
+                            // the pointer crosses into a new row.
+                            if let Some(py) = pointer_y {
                                 let cur = state.audio_track_assignments.get(&aui).copied();
                                 match classify_pointer_y(py, cur) {
                                     DropIntent::ToAudioRow(idx) => {
+                                        // Detach from parent_actor when
+                                        // the user drops the audio onto
+                                        // an audio lane that does NOT
+                                        // mirror the parent actor's
+                                        // video lane. Without this the
+                                        // sync_bound_audio_lanes pass
+                                        // (running on the next frame
+                                        // that the pointer is up) would
+                                        // immediately yank the audio
+                                        // back onto the parent's mirror
+                                        // lane, defeating the move.
+                                        let was_bound = state
+                                            .scene
+                                            .audio
+                                            .get(aui)
+                                            .map(|a| a.parent_actor.is_some())
+                                            .unwrap_or(false);
+                                        if was_bound {
+                                            // Resolve the parent's mirror lane:
+                                            // same vt_pos in audio_track_indices
+                                            // as the parent's vt_pos in video_track_indices.
+                                            let parent_id = state
+                                                .scene
+                                                .audio[aui]
+                                                .parent_actor
+                                                .clone();
+                                            let mirror_lane =
+                                                parent_id.as_ref().and_then(|id| {
+                                                    state
+                                                        .scene
+                                                        .actors
+                                                        .iter()
+                                                        .position(|a| &a.id == id)
+                                                        .and_then(|ai| {
+                                                            let videos =
+                                                                state.video_track_indices();
+                                                            let parent_lane = state
+                                                                .actor_track_assignments
+                                                                .get(&ai)
+                                                                .copied()
+                                                                .or_else(|| {
+                                                                    videos.first().copied()
+                                                                })?;
+                                                            let pos = videos
+                                                                .iter()
+                                                                .position(|&t| t == parent_lane)?;
+                                                            state
+                                                                .audio_track_indices()
+                                                                .get(pos)
+                                                                .copied()
+                                                        })
+                                                });
+                                            if mirror_lane != Some(idx) {
+                                                state.scene.audio[aui].parent_actor = None;
+                                            }
+                                        }
                                         state.audio_track_assignments.insert(aui, idx);
                                         state.timeline_drag.pending_new_lane = None;
                                     }
                                     DropIntent::NewAudioTop => {
+                                        // Detach so the new lane sticks.
+                                        if let Some(au) = state.scene.audio.get_mut(aui) {
+                                            au.parent_actor = None;
+                                        }
                                         state.timeline_drag.pending_new_lane =
                                             Some(crate::state::NewLaneIntent::AudioTopForAudio(aui));
                                     }
                                     DropIntent::NewAudioBottom => {
+                                        if let Some(au) = state.scene.audio.get_mut(aui) {
+                                            au.parent_actor = None;
+                                        }
                                         state.timeline_drag.pending_new_lane =
                                             Some(crate::state::NewLaneIntent::AudioBottomForAudio(aui));
                                     }
@@ -6417,7 +6766,20 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     // ── Mirror bound audio onto the audio lane that matches the parent
     // actor's video lane. Standalone audio (parent_actor = None) keeps the
     // user's own placement. New audio lanes are appended on demand.
-    sync_bound_audio_lanes(state);
+    //
+    // SKIPPED while the user is actively dragging a clip — the sync
+    // would otherwise immediately overwrite a hand-driven cross-lane
+    // move and the user would see the bar snap back the instant they
+    // release the mouse. The audio drag handler clears `parent_actor`
+    // when a bound audio is dropped on a non-parent lane, so once the
+    // drag ends `sync_bound_audio_lanes` is only applied to audio
+    // rows the user actually chose to keep bound.
+    let pointer_down = ui.input(|i| i.pointer.any_down());
+    let timeline_drag_active =
+        pointer_down && state.timeline_drag.dragging_clip.is_some();
+    if !timeline_drag_active {
+        sync_bound_audio_lanes(state);
+    }
 
     // ── Keep the global ordering invariant: video tracks above audio
     // tracks. Cheap when already sorted.
@@ -7273,6 +7635,14 @@ fn draw_audio_clip(
     _split_mode: bool,
     waveform: Option<&crate::state::AudioWaveform>,
     source_start: f32,
+    // Audio playback speed multiplier — `1.0` = neutral, `2.0` = the
+    // source plays twice as fast (so each visible bar pixel maps to
+    // twice as many source-time seconds), `0.5` = half-speed (each
+    // pixel maps to half as many). Without this the waveform would
+    // keep showing the source at native rate while the bar shrinks /
+    // stretches with speed, leaving the peaks visually misaligned
+    // with what the user hears.
+    speed: f32,
 ) -> Option<f32> {
     let x_start_full = (clip_start - scroll) * pps + track_left;
     let x_end_full = (clip_end - scroll) * pps + track_left;
@@ -7316,10 +7686,14 @@ fn draw_audio_clip(
 
                 let full_bar_w = (x_end_full - x_start_full).max(1.0);
                 // Source-time at the LEFT edge of the visible bar.
+                // `speed` converts scene-time → source-time so the
+                // waveform compresses or stretches in lock-step with
+                // the audio you actually hear.
+                let speed_clamped = speed.max(0.0001);
                 let visible_offset_pix = x_start - x_start_full;
-                let source_t_at_visible_start =
-                    source_start + (visible_offset_pix / full_bar_w) * (clip_end - clip_start);
-                let source_t_per_pixel = (clip_end - clip_start) / full_bar_w;
+                let source_t_at_visible_start = source_start
+                    + (visible_offset_pix / full_bar_w) * (clip_end - clip_start) * speed_clamped;
+                let source_t_per_pixel = (clip_end - clip_start) * speed_clamped / full_bar_w;
                 let peaks_per_sec = wf.peaks.len() as f32 / wf.duration;
 
                 for i in 0..num_samples {
