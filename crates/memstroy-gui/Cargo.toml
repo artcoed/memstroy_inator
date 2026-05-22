@@ -31,3 +31,8 @@ memstroy-render = { workspace = true }
 memstroy-vision = { workspace = true }
 wgpu = { workspace = true }
 rodio = { workspace = true }
+# HTTP client for the shared asset server. Keep the same TLS backend
+# the rest of the workspace uses so we don't pull a second one in.
+# `json` is enabled here (only in the GUI crate) for the shared library
+# panel — the rest of the workspace doesn't pay for serde_json wiring.
+reqwest = { workspace = true, features = ["json"] }
