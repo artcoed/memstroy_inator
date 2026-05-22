@@ -112,6 +112,13 @@ pub enum EffectKind {
     Glitch { strength: f32 },
     /// Bloom — soft bright halo around highlights.
     Bloom { radius: f32 },
+    /// Crop the source to a rectangular sub-region. Each value is a
+    /// normalised inset from the corresponding edge in 0..0.49 — e.g.
+    /// `left=0.1` discards the leftmost 10% of pixels. The visible
+    /// rectangle is therefore `[left .. 1.0 - right]` × `[top .. 1.0 - bottom]`.
+    /// Acts as a Photoshop-style "Crop" tool when applied to images
+    /// AND a coarse-grained mask when applied to videos / actors.
+    Crop { left: f32, top: f32, right: f32, bottom: f32 },
 }
 
 impl Default for EffectKind {
@@ -147,6 +154,7 @@ impl EffectKind {
             EffectKind::Vhs => "VHS",
             EffectKind::Glitch { .. } => "Glitch",
             EffectKind::Bloom { .. } => "Bloom",
+            EffectKind::Crop { .. } => "Crop",
         }
     }
 }
@@ -187,6 +195,14 @@ impl Effect {
     pub fn vhs() -> Self { Self::new(EffectKind::Vhs) }
     pub fn glitch() -> Self { Self::new(EffectKind::Glitch { strength: 0.5 }) }
     pub fn bloom() -> Self { Self::new(EffectKind::Bloom { radius: 18.0 }) }
+    pub fn crop() -> Self {
+        Self::new(EffectKind::Crop {
+            left: 0.0,
+            top: 0.0,
+            right: 0.0,
+            bottom: 0.0,
+        })
+    }
 
     /// Sample a single named parameter at clip-local time `t_local`.
     ///
@@ -274,6 +290,12 @@ impl Effect {
             K::Bloom { radius } => K::Bloom {
                 radius: self.sample_param_at(t_local, "p0", *radius),
             },
+            K::Crop { left, top, right, bottom } => K::Crop {
+                left: self.sample_param_at(t_local, "p0", *left).clamp(0.0, 0.49),
+                top: self.sample_param_at(t_local, "p1", *top).clamp(0.0, 0.49),
+                right: self.sample_param_at(t_local, "p2", *right).clamp(0.0, 0.49),
+                bottom: self.sample_param_at(t_local, "p3", *bottom).clamp(0.0, 0.49),
+            },
             // Kinds without numeric parameters pass through unchanged.
             K::Grayscale | K::Sepia | K::Invert | K::MirrorH | K::MirrorV
                 | K::OldFilm | K::Vhs => self.kind.clone(),
@@ -310,5 +332,6 @@ pub fn all_effect_presets() -> Vec<Effect> {
         Effect::vhs(),
         Effect::glitch(),
         Effect::bloom(),
+        Effect::crop(),
     ]
 }

@@ -367,6 +367,15 @@ pub struct Actor {
     /// re-order via the inspector.
     #[serde(default)]
     pub effects: Vec<crate::effects::Effect>,
+    /// **Playback speed multiplier** for the source clip. `1.0` is
+    /// normal speed, `2.0` plays twice as fast (clip occupies HALF the
+    /// timeline width because the source consumed per scene-second
+    /// doubles), `0.5` plays at half speed (clip occupies double the
+    /// width). The inspector exposes this through a `DragValue` (not a
+    /// slider) so the user can dial in arbitrary values without being
+    /// pinned to a fixed range. Defaults to `1.0` for backward compat.
+    #[serde(default = "one")]
+    pub speed: f32,
     /// **Animated parameter set**: when a param id is in this set, editing
     /// the param in the inspector or on the canvas inserts a keyframe at
     /// the playhead; otherwise the new value is broadcast to every kf in
@@ -884,6 +893,11 @@ pub struct VideoOverlay {
     /// **Effects stack**.
     #[serde(default)]
     pub effects: Vec<crate::effects::Effect>,
+    /// **Playback speed multiplier**. See `Actor::speed` for the full
+    /// contract — `1.0` neutral, `<1.0` slows down (clip stretches on
+    /// the timeline), `>1.0` speeds up (clip shrinks).
+    #[serde(default = "one")]
+    pub speed: f32,
     /// **Animated parameter set** — see Actor::animated_params.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub animated_params: BTreeSet<String>,

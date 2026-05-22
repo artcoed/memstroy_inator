@@ -194,6 +194,7 @@ fn execute_line(line: &str, scene: &mut Scene, messages: &mut Vec<String>) -> Re
                 transition_out: Transition::Cut,
                 transition_duration: 0.3,
                 effects: Vec::new(),
+                speed: 1.0,
                 animated_params: Default::default(),
             };
             scene.actors.push(actor);
@@ -481,6 +482,7 @@ fn cmd_add_video_overlay(args: &[String], scene: &mut Scene) -> Result<(), Strin
         modifiers: Vec::new(),
         skeleton_attachment: None,
         effects: Vec::new(),
+        speed: 1.0,
         animated_params: Default::default(),
     }));
     Ok(())

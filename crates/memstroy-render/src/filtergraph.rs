@@ -314,6 +314,14 @@ impl<'a> FilterGraphBuilder<'a> {
                 chain.push(',');
                 chain.push_str(&snippet);
             }
+            // Speed multiplier: divide PTS by `speed` so the source
+            // plays back faster (`speed > 1`) or slower (`speed < 1`)
+            // while the visible window on the timeline is sized
+            // accordingly. Skip when neutral so the chain stays clean.
+            let speed = actor.speed.max(0.0001);
+            if (speed - 1.0).abs() > 1.0e-4 {
+                chain.push_str(&format!(",setpts=PTS/{:.6}", speed));
+            }
 
             let (pos_x, pos_y, scale_expr, scale_y_expr) = position_and_scale_expr(&actor.layout, w, h);
             chain.push_str(&format!(",scale=w='iw*{sx}':h='ih*{sy}':eval=frame", sx = scale_expr, sy = scale_y_expr));
@@ -571,12 +579,19 @@ impl<'a> FilterGraphBuilder<'a> {
             t: None,
         });
         let (x, y, scale_expr, scale_y_expr) = position_and_scale_expr(&ov.layout, w, h);
-        let chain = format!(
-            "[{idx}:v]format=yuva420p,scale=w='iw*{sx}':h='ih*{sy}':eval=frame",
-            idx = idx,
+        let mut chain = format!("[{idx}:v]format=yuva420p", idx = idx);
+        // Apply the user-defined effect stack before the layout scale,
+        // matching the actor pipeline so e.g. blur / hue shift work in
+        // the image's native pixel space (before the on-canvas resize).
+        for snippet in effect_stack_filters(&ov.effects) {
+            chain.push(',');
+            chain.push_str(&snippet);
+        }
+        chain.push_str(&format!(
+            ",scale=w='iw*{sx}':h='ih*{sy}':eval=frame",
             sx = scale_expr,
             sy = scale_y_expr,
-        );
+        ));
         let img_label = self.alloc_label("img");
         self.chunks.push(format!("{chain}{out}", chain = chain, out = img_label));
         let next = self.alloc_label("imgstack");
@@ -611,6 +626,17 @@ impl<'a> FilterGraphBuilder<'a> {
                 ck.key_color[0], ck.key_color[1], ck.key_color[2]
             );
             chain.push_str(&format!(",chromakey={}:{}:{}", key_hex, ck.similarity, ck.blend));
+        }
+        // Apply the user-defined effect stack — same convention as
+        // images / actors so the export matches what the canvas previews.
+        for snippet in effect_stack_filters(&ov.effects) {
+            chain.push(',');
+            chain.push_str(&snippet);
+        }
+        // Speed multiplier — see `emit_actors` for the math.
+        let speed = ov.speed.max(0.0001);
+        if (speed - 1.0).abs() > 1.0e-4 {
+            chain.push_str(&format!(",setpts=PTS/{:.6}", speed));
         }
         chain.push_str(&format!(",scale=w='iw*{sx}':h='ih*{sy}':eval=frame", sx = scale_expr, sy = scale_y_expr));
         let v_label = self.alloc_label("vid");
@@ -1164,5 +1190,25 @@ fn effect_to_filter(kind: &EffectKind, i: f32) -> Option<String> {
             format!("rgbashift=rh=-{o}:bh={o}", o = (i * 6.0).round() as i32)
         }
         K::Bloom { radius } => format!("gblur=sigma={}", (radius * i).max(1.0)),
+        K::Crop { left, top, right, bottom } => {
+            // Express the visible window as a `crop=w:h:x:y` filter using
+            // ffmpeg's `iw` / `ih` source dimensions. The sub-image is then
+            // padded back to the source size so the surrounding pipeline
+            // (scale/overlay) keeps working with the same dimensions —
+            // padded pixels are transparent so the crop reads as a mask
+            // when the element is composited over a background.
+            let l = (left * i).clamp(0.0, 0.49);
+            let t = (top * i).clamp(0.0, 0.49);
+            let r = (right * i).clamp(0.0, 0.49);
+            let b = (bottom * i).clamp(0.0, 0.49);
+            let w = (1.0 - l - r).max(0.02);
+            let h = (1.0 - t - b).max(0.02);
+            format!(
+                "crop=w=iw*{w:.4}:h=ih*{h:.4}:x=iw*{l:.4}:y=ih*{t:.4},pad=w=iw/{w:.4}:h=ih/{h:.4}:x=iw*{lp:.4}:y=ih*{tp:.4}:color=0x00000000",
+                w = w, h = h, l = l, t = t,
+                lp = l / (1.0 - l - r).max(0.001),
+                tp = t / (1.0 - t - b).max(0.001),
+            )
+        }
     })
 }
