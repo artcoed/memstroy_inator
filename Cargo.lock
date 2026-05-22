@@ -2711,7 +2711,6 @@ dependencies = [
  "image",
  "memstroy-core",
  "memstroy-render",
- "memstroy-tg",
  "memstroy-vision",
  "reqwest",
  "rfd",

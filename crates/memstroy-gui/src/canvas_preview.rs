@@ -1110,15 +1110,105 @@ fn draw_canvas_overlays(
                 draw_text_overlay(painter, full_rect, state, idx, txt, &ov_state, center_pos, display_mode);
             }
             Overlay::Image(img) => {
-                let elem_w = 200.0 * ov_state.scale;
-                let elem_h = 200.0 * ov_state.scale * ov_state.scale_y;
-                let half_w = elem_w * 0.5 * state.canvas_viewport.zoom;
-                let half_h = elem_h * 0.5 * state.canvas_viewport.zoom;
-                let elem_rect = Rect::from_center_size(center_pos, Vec2::new(half_w * 2.0, half_h * 2.0));
+                let zoom = state.canvas_viewport.zoom;
+                let real_size = ensure_image_loaded(state, &img.source, painter.ctx());
+                // Fall back to a 200×200 logical box when the file
+                // hasn't been decoded (yet or at all). Once the texture
+                // is loaded, the real PNG dimensions drive the bbox so
+                // resize handles snap to the picture's edges.
+                let (sw, sh) = real_size.unwrap_or((200, 200));
+                let elem_w = sw as f32 * ov_state.scale;
+                let elem_h = sh as f32 * ov_state.scale * ov_state.scale_y;
+                let half_w = elem_w * 0.5 * zoom;
+                let half_h = elem_h * 0.5 * zoom;
+                let elem_rect =
+                    Rect::from_center_size(center_pos, Vec2::new(half_w * 2.0, half_h * 2.0));
                 if !full_rect.intersects(elem_rect) { continue; }
-                draw_overlay_placeholder(painter, elem_rect, COL_OVERLAY_IMAGE, idx, state,
-                    &format!("IMG: {}", img.source.file_name().and_then(|s| s.to_str()).unwrap_or("?")),
-                    display_mode);
+
+                let tex_handle: Option<egui::TextureHandle> = state
+                    .image_textures
+                    .lock()
+                    .ok()
+                    .and_then(|map| match map.get(&img.source) {
+                        Some(crate::state::ImageTextureSlot::Loaded { texture, .. }) => {
+                            Some(texture.clone())
+                        }
+                        _ => None,
+                    });
+
+                if let Some(tex) = tex_handle {
+                    let rotation_rad = ov_state.rotation_deg.to_radians();
+                    let abs_fx = ov_state.flip_x_anim.abs().max(0.02);
+                    let abs_fy = ov_state.flip_y_anim.abs().max(0.02);
+                    let cos_r = rotation_rad.cos();
+                    let sin_r = rotation_rad.sin();
+                    let center = elem_rect.center();
+                    let hw = elem_rect.width() * 0.5 * abs_fx;
+                    let hh = elem_rect.height() * 0.5 * abs_fy;
+                    let corners_local = [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]];
+                    let (uv_l, uv_r) = if ov_state.flip_x_anim < 0.0 { (1.0, 0.0) } else { (0.0, 1.0) };
+                    let (uv_t, uv_b) = if ov_state.flip_y_anim < 0.0 { (1.0, 0.0) } else { (0.0, 1.0) };
+                    let uv_corners = [
+                        Pos2::new(uv_l, uv_t), Pos2::new(uv_r, uv_t),
+                        Pos2::new(uv_r, uv_b), Pos2::new(uv_l, uv_b),
+                    ];
+                    let alpha_factor = match display_mode {
+                        DisplayMode::Active => 1.0,
+                        _ => 0.5,
+                    };
+                    let a = (ov_state.opacity * alpha_factor * 255.0).clamp(0.0, 255.0) as u8;
+                    let tint = Color32::from_rgba_unmultiplied(255, 255, 255, a);
+                    let mut mesh = egui::Mesh::with_texture(tex.id());
+                    for ci in 0..4 {
+                        let [lx, ly] = corners_local[ci];
+                        let rx = lx * cos_r - ly * sin_r + center.x;
+                        let ry = lx * sin_r + ly * cos_r + center.y;
+                        mesh.vertices.push(egui::epaint::Vertex {
+                            pos: Pos2::new(rx, ry),
+                            uv: uv_corners[ci],
+                            color: tint,
+                        });
+                    }
+                    mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+                    painter.add(egui::Shape::mesh(mesh));
+
+                    // Selection / FIRST/LAST badges still useful even
+                    // when the picture is fully drawn.
+                    let is_selected = state.selection == Selection::Overlay(idx);
+                    if is_selected {
+                        painter.rect_stroke(
+                            elem_rect,
+                            Rounding::same(2.0),
+                            Stroke::new(2.0, COL_SELECTED_BORDER),
+                        );
+                    }
+                    if display_mode != DisplayMode::Active {
+                        let badge = match display_mode {
+                            DisplayMode::BeforeStart => "FIRST",
+                            DisplayMode::AfterEnd => "LAST",
+                            _ => "",
+                        };
+                        painter.text(
+                            Pos2::new(elem_rect.min.x + 4.0, elem_rect.min.y + 4.0),
+                            egui::Align2::LEFT_TOP,
+                            badge,
+                            egui::FontId::proportional(9.0),
+                            Color32::from_rgb(255, 180, 80),
+                        );
+                    }
+                } else {
+                    // Decode failed or asset is genuinely missing.
+                    // Fall back to the labelled placeholder so the user
+                    // can still see WHERE the overlay is and remove it.
+                    draw_overlay_placeholder(
+                        painter, elem_rect, COL_OVERLAY_IMAGE, idx, state,
+                        &format!(
+                            "IMG (missing): {}",
+                            img.source.file_name().and_then(|s| s.to_str()).unwrap_or("?")
+                        ),
+                        display_mode,
+                    );
+                }
             }
             Overlay::Video(vid) => {
                 let elem_w = 300.0 * ov_state.scale;
@@ -1200,12 +1290,25 @@ fn draw_text_overlay(
     // visible size, exactly like every other element.
     let zoom = state.canvas_viewport.zoom;
     let effective_size = (style.font_size * ov_state.scale * zoom).clamp(4.0, 1024.0);
-    let italic_skew = if style.italic { 0.18 } else { 0.0 };
+    // Italic is faked via a horizontal skew on each glyph row. Slightly
+    // larger than the previous 0.18 so the slant reads at small sizes.
+    let italic_skew = if style.italic { 0.22 } else { 0.0 };
     let rotation_rad = ov_state.rotation_deg.to_radians();
     let rotated = rotation_rad.abs() > 0.001;
 
-    let font_id = egui::FontId::new(effective_size,
-        if style.bold { egui::FontFamily::Proportional } else { egui::FontFamily::Proportional });
+    // Logical font family: "Monospace" → bundled mono font, anything
+    // else → bundled proportional. Real custom-font loading still needs
+    // bundled TTFs (deferred); the field is kept so existing scenes
+    // round-trip unchanged.
+    let family = if style.font.eq_ignore_ascii_case("Monospace")
+        || style.font.eq_ignore_ascii_case("Courier")
+        || style.font.eq_ignore_ascii_case("Hack")
+    {
+        egui::FontFamily::Monospace
+    } else {
+        egui::FontFamily::Proportional
+    };
+    let font_id = egui::FontId::new(effective_size, family);
 
     // Per-line layout: split text into lines and measure each in egui.
     let lines: Vec<&str> = if txt.text.is_empty() { vec![" "] } else { txt.text.lines().collect() };
@@ -1225,13 +1328,33 @@ fn draw_text_overlay(
     let max_line_w = galleys.iter().map(|g| g.size().x).fold(0.0_f32, f32::max);
     let total_h = galleys.len() as f32 * line_h;
 
-    // Padding/border in screen pixels (scaled by zoom for visual consistency)
+    // Padding/border in screen pixels (scaled by zoom for visual consistency).
+    // `box_padding` is the symmetric padding around the text; `box_extra_left`
+    // and `box_extra_right` widen the plate **outwards** (without changing
+    // the text scale or its anchor) so the user can ask for "background a
+    // bit wider on the left only" and combine it with TextAlign for proper
+    // typography (left-aligned text on a left-wide plate looks like a
+    // banner with right-padding, etc.). The text's natural anchor stays
+    // on `center_pos`.
     let padding = (style.box_padding * zoom * ov_state.scale).max(0.0);
+    let pad_extra_l = (style.box_extra_left * zoom * ov_state.scale).max(0.0);
+    let pad_extra_r = (style.box_extra_right * zoom * ov_state.scale).max(0.0);
     let radius = (style.box_corner_radius * zoom * ov_state.scale).max(0.0);
-    let plate_w = max_line_w + padding * 2.0;
     let plate_h = total_h + padding * 2.0;
 
-    let plate_rect = Rect::from_center_size(center_pos, Vec2::new(plate_w, plate_h));
+    // Compose plate min/max around `center_pos` directly so the L/R
+    // extras can extend asymmetrically without disturbing the rotation
+    // pivot or the on-canvas drag anchor (both follow `center_pos`).
+    let half_text = max_line_w * 0.5;
+    let plate_min_x = center_pos.x - half_text - padding - pad_extra_l;
+    let plate_max_x = center_pos.x + half_text + padding + pad_extra_r;
+    let plate_min_y = center_pos.y - plate_h * 0.5;
+    let plate_max_y = center_pos.y + plate_h * 0.5;
+    let plate_rect = Rect::from_min_max(
+        Pos2::new(plate_min_x, plate_min_y),
+        Pos2::new(plate_max_x, plate_max_y),
+    );
+    let plate_w = plate_rect.width();
 
     // Skip if completely off-screen (use a generous rotation-aware margin)
     let bbox_margin = if rotated { plate_w.max(plate_h) } else { 50.0 };
@@ -1336,6 +1459,16 @@ fn draw_text_overlay(
     let mut y = plate_rect.center().y - total_h * 0.5 + line_h * 0.5;
     let center_x = plate_rect.center().x;
 
+    // Bold synthesis: with the bundled font there is no real bold variant,
+    // so we emulate weight by repainting each line with a sub-pixel
+    // horizontal offset. Two extra passes feel close enough to a bold
+    // weight without ghosting.
+    let bold_offsets: &[f32] = if style.bold {
+        &[0.0, 0.7, 1.4]
+    } else {
+        &[0.0]
+    };
+
     for (li, galley) in galleys.iter().enumerate() {
         let line_w = galley.size().x;
         let line_x_left = match style.align {
@@ -1361,8 +1494,13 @@ fn draw_text_overlay(
             }
         }
 
-        paint_text_line_rot(painter, pos, &lines[li], font_id.clone(), glyph_color,
-            italic_skew, rotation_rad, center_pos);
+        // Main glyph fill — repeated once per bold offset to synthesise
+        // weight on the bundled font.
+        for &dx in bold_offsets {
+            let p = if dx > 0.0 { pos + Vec2::new(dx, 0.0) } else { pos };
+            paint_text_line_rot(painter, p, &lines[li], font_id.clone(), glyph_color,
+                italic_skew, rotation_rad, center_pos);
+        }
         y += line_h;
     }
 
@@ -1574,6 +1712,19 @@ fn draw_selection_gizmo(
             state.canvas_drag.start_screen = local;
             state.canvas_drag.mode = decide_drag_mode(state, full_rect, viewport_size, start, world);
 
+            // Freeze the playhead for the rest of the gesture so every
+            // keyframe upsert lands on the same `t` (one kf per drag,
+            // even when playback was running at drag start). Auto-pause
+            // playback while the user is interacting with the canvas —
+            // dragging through a moving timeline is never what the user
+            // actually wants and is the source of the "thousand kfs"
+            // bug they reported.
+            state.canvas_drag.drag_start_playhead = Some(state.playhead);
+            state.canvas_drag.was_playing_at_drag_start = state.playing;
+            if state.playing {
+                state.playing = false;
+            }
+
             // ── Render-frame drags must NOT touch other elements ──
             // Previously we snapshotted child positions and re-projected
             // them to keep their world coordinate fixed; that caused the
@@ -1602,6 +1753,10 @@ fn draw_selection_gizmo(
             state.canvas_drag.actor_legacy_snapshot.clear();
             state.canvas_drag.overlay_world_snapshot.clear();
             state.canvas_drag.snap_guides.clear();
+            // Release the frozen-playhead lock; subsequent inspector
+            // edits go back to using the live playhead.
+            state.canvas_drag.drag_start_playhead = None;
+            state.canvas_drag.was_playing_at_drag_start = false;
         }
     }
 
@@ -1966,12 +2121,12 @@ fn apply_drag(
         }
 
         CanvasDragMode::MoveRenderFrame { initial_pos } => {
-            // Insert a keyframe at the current playhead and write the new
-            // position there — same canvas-first semantics as actors and
-            // overlays. Without this the render frame's animation could
-            // only be edited via the kf at t=0, which made it impossible
-            // to author a moving frame from the canvas.
-            let t = state.playhead;
+            // Insert a keyframe at the drag-start playhead and write the
+            // new position there — same canvas-first semantics as actors
+            // and overlays. Re-using the cached drag-start playhead
+            // means the entire drag produces a single kf rather than
+            // one per frame while playback is running.
+            let t = state.canvas_drag.drag_start_playhead.unwrap_or(state.playhead);
             let new_x = initial_pos[0] + world_dx;
             let new_y = initial_pos[1] + world_dy;
             ensure_render_frame_kf_at_playhead(&mut state.scene.render_frame.layout, t);
@@ -1992,7 +2147,7 @@ fn apply_drag(
             if anchor_distance > 1.0 {
                 let factor = (cur_dist / anchor_distance).max(0.05);
                 let new_zoom = (initial_zoom / factor).clamp(0.1, 10.0);
-                let t = state.playhead;
+                let t = state.canvas_drag.drag_start_playhead.unwrap_or(state.playhead);
                 ensure_render_frame_kf_at_playhead(&mut state.scene.render_frame.layout, t);
                 apply_to_render_frame_kf(&mut state.scene.render_frame.layout, t, |v| {
                     v.zoom = new_zoom;
@@ -2181,8 +2336,12 @@ fn current_selection_base_dims(state: &EditorState) -> Option<(f32, f32)> {
         Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
             let ov = &state.scene.overlays[idx];
             // Use the bbox at scale=1, scale_y=1 for the base dimensions.
+            // For image overlays, ask the texture cache for the real
+            // PNG dimensions when they're loaded so resize handles snap
+            // to the visible picture corners (not the legacy 200×200
+            // placeholder).
             let neutral = OverlayState { pos: [0.0, 0.0], scale: 1.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 1.0, flip_x_anim: 1.0, flip_y_anim: 1.0 };
-            Some(overlay_bbox(ov, &neutral))
+            Some(overlay_bbox_with_state(ov, &neutral, state))
         }
         Selection::RenderFrame => {
             let [rw, rh] = state.scene.render_frame.resolution;
@@ -2234,24 +2393,38 @@ fn current_selection_world_center(state: &EditorState) -> Option<[f32; 2]> {
 /// playhead is at a non-zero time and no keyframe exists at that time
 /// yet, a new keyframe is inserted (seeded with the eased current value)
 /// so dragging on the canvas at any time directly authors animation.
+/// World-space center of the selected element is updated. Routes through
+/// `kf_anim::write_*_param` so canvas drags respect the per-parameter
+/// `animated_params` set:
+///   - if the parameter is animated → the value is written to a kf at
+///     the **drag-start playhead** (re-using the same kf across the
+///     gesture, so a single drag produces ONE kf, not N);
+///   - if the parameter is static → the new value is broadcast to every
+///     existing kf and no auto-animation kicks in.
+///
+/// `auto_animate_on_canvas_drag = false` everywhere — canvas drags must
+/// not silently mark a parameter as animated; the user explicitly
+/// toggles that via the diamond next to the inspector control.
 fn set_selection_world_center(state: &mut EditorState, center: [f32; 2]) {
-    let t = state.playhead;
+    // Re-anchor every keyframe write to the playhead captured at drag
+    // start (frozen for the duration of the gesture). Outside an active
+    // drag the live playhead is used so single inspector edits still
+    // land at the visible time.
+    let t = state.canvas_drag.drag_start_playhead.unwrap_or(state.playhead);
     match state.selection {
         Selection::Actor(idx) if idx < state.scene.actors.len() => {
             let actor_id = state.scene.actors[idx].id.clone();
             // Prefer canvas_layouts entry when present (free canvas v2).
+            // The world-pixel canvas track is always-animate by design
+            // (it only exists when the user has dragged the actor on
+            // the free canvas at least once).
             if let Some(cl) = state.scene.canvas_layouts.iter_mut()
                 .find(|cl| cl.element_id == actor_id)
             {
-                ensure_canvas_kf_at_playhead(&mut cl.keyframes, t);
-                let eps = 1.0e-3;
-                if let Some(kf) = cl.keyframes.iter_mut().find(|k| (k.t - t).abs() < eps) {
-                    kf.value.pos.x = center[0];
-                    kf.value.pos.y = center[1];
-                } else if let Some(kf) = cl.keyframes.first_mut() {
-                    kf.value.pos.x = center[0];
-                    kf.value.pos.y = center[1];
-                }
+                crate::kf_anim::write_canvas_param(&mut cl.keyframes, t, |v| {
+                    v.pos.x = center[0];
+                    v.pos.y = center[1];
+                });
                 return;
             }
             // Legacy normalised: convert to render-frame-relative.
@@ -2264,15 +2437,20 @@ fn set_selection_world_center(state: &mut EditorState, center: [f32; 2]) {
             let frame_tl_y = rf_state.pos.y - world_h * 0.5;
             if world_w <= 0.0 || world_h <= 0.0 { return; }
             let new_norm = [(center[0] - frame_tl_x) / world_w, (center[1] - frame_tl_y) / world_h];
-            ensure_actor_kf_at_playhead(&mut state.scene.actors[idx].layout, t);
-            apply_to_anim_kf(&mut state.scene.actors[idx].layout, t, |v| v.pos = new_norm);
-            mark_actor_canvas_animated(state, idx, t, &[
-                memstroy_core::param_ids::POS_X,
-                memstroy_core::param_ids::POS_Y,
-            ]);
+            let actor = &mut state.scene.actors[idx];
+            crate::kf_anim::write_actor_param(
+                &mut actor.layout, &mut actor.animated_params, t,
+                memstroy_core::param_ids::POS_X, false,
+                |v| v.pos[0] = new_norm[0],
+            );
+            crate::kf_anim::write_actor_param(
+                &mut actor.layout, &mut actor.animated_params, t,
+                memstroy_core::param_ids::POS_Y, false,
+                |v| v.pos[1] = new_norm[1],
+            );
         }
         Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
-            let local_t = overlay_clip_local_time(state, idx);
+            let local_t = overlay_clip_local_time_at(state, idx, t);
             let rf = &state.scene.render_frame;
             let rf_state = sample_render_frame(rf, t);
             let [rw, rh] = rf.resolution;
@@ -2282,13 +2460,20 @@ fn set_selection_world_center(state: &mut EditorState, center: [f32; 2]) {
             let frame_tl_y = rf_state.pos.y - world_h * 0.5;
             if world_w <= 0.0 || world_h <= 0.0 { return; }
             let new_norm = [(center[0] - frame_tl_x) / world_w, (center[1] - frame_tl_y) / world_h];
-            let layout = overlay_layout_mut(&mut state.scene.overlays[idx]);
-            ensure_overlay_kf_at_playhead(layout, local_t);
-            apply_to_overlay_kf(layout, local_t, |v| v.pos = new_norm);
-            mark_overlay_canvas_animated(state, idx, local_t, &[
-                memstroy_core::param_ids::POS_X,
-                memstroy_core::param_ids::POS_Y,
-            ]);
+            let (layout, animated_params) =
+                overlay_layout_and_animated_mut(&mut state.scene.overlays[idx]);
+            crate::kf_anim::write_overlay_param(
+                layout, animated_params, local_t,
+                memstroy_core::param_ids::POS_X, false,
+                |v| v.pos[0] = new_norm[0],
+            );
+            let (layout, animated_params) =
+                overlay_layout_and_animated_mut(&mut state.scene.overlays[idx]);
+            crate::kf_anim::write_overlay_param(
+                layout, animated_params, local_t,
+                memstroy_core::param_ids::POS_Y, false,
+                |v| v.pos[1] = new_norm[1],
+            );
         }
         Selection::RenderFrame => {
             ensure_render_frame_kf_at_playhead(&mut state.scene.render_frame.layout, t);
@@ -2301,58 +2486,32 @@ fn set_selection_world_center(state: &mut EditorState, center: [f32; 2]) {
     }
 }
 
-/// Insert the named animated-param ids on the targeted actor when the
-/// edit happens at a time past 0. At t≈0 the canvas drag is interpreted
-/// as setting the base pose so the parameter stays static.
-fn mark_actor_canvas_animated(
-    state: &mut EditorState,
-    idx: usize,
-    t: f32,
-    params: &[&str],
-) {
-    if t <= 1.0e-3 { return; }
-    if let Some(a) = state.scene.actors.get_mut(idx) {
-        for p in params {
-            a.animated_params.insert((*p).to_string());
-        }
-    }
-}
-
-/// Per-overlay equivalent of `mark_actor_canvas_animated`.
-fn mark_overlay_canvas_animated(
-    state: &mut EditorState,
-    idx: usize,
-    local_t: f32,
-    params: &[&str],
-) {
-    if local_t <= 1.0e-3 { return; }
-    if let Some(ov) = state.scene.overlays.get_mut(idx) {
-        let set: &mut std::collections::BTreeSet<String> = match ov {
-            memstroy_core::Overlay::Text(t) => &mut t.animated_params,
-            memstroy_core::Overlay::Image(im) => &mut im.animated_params,
-            memstroy_core::Overlay::Video(v) => &mut v.animated_params,
-        };
-        for p in params {
-            set.insert((*p).to_string());
-        }
-    }
-}
+// `mark_actor_canvas_animated` / `mark_overlay_canvas_animated` were
+// removed (and replaced by the gating inside `kf_anim::write_*_param`).
+// Canvas drags no longer auto-mark a parameter as animated — the user
+// explicitly toggles that with the diamond next to the inspector field.
 
 fn set_selection_scale_y(state: &mut EditorState, new_scale_y: f32) {
     let s = new_scale_y.clamp(0.05, 20.0);
-    let t = state.playhead;
+    let t = state.canvas_drag.drag_start_playhead.unwrap_or(state.playhead);
     match state.selection {
         Selection::Actor(idx) if idx < state.scene.actors.len() => {
-            ensure_actor_kf_at_playhead(&mut state.scene.actors[idx].layout, t);
-            apply_to_anim_kf(&mut state.scene.actors[idx].layout, t, |v| v.scale_y = s);
-            mark_actor_canvas_animated(state, idx, t, &[memstroy_core::param_ids::SCALE_Y]);
+            let actor = &mut state.scene.actors[idx];
+            crate::kf_anim::write_actor_param(
+                &mut actor.layout, &mut actor.animated_params, t,
+                memstroy_core::param_ids::SCALE_Y, false,
+                |v| v.scale_y = s,
+            );
         }
         Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
-            let local_t = overlay_clip_local_time(state, idx);
-            let layout = overlay_layout_mut(&mut state.scene.overlays[idx]);
-            ensure_overlay_kf_at_playhead(layout, local_t);
-            apply_to_overlay_kf(layout, local_t, |v| v.scale_y = s);
-            mark_overlay_canvas_animated(state, idx, local_t, &[memstroy_core::param_ids::SCALE_Y]);
+            let local_t = overlay_clip_local_time_at(state, idx, t);
+            let (layout, animated_params) =
+                overlay_layout_and_animated_mut(&mut state.scene.overlays[idx]);
+            crate::kf_anim::write_overlay_param(
+                layout, animated_params, local_t,
+                memstroy_core::param_ids::SCALE_Y, false,
+                |v| v.scale_y = s,
+            );
         }
         // Render frame is locked to its output aspect ratio — scale_y is
         // ignored here, scale alone changes its size on the canvas.
@@ -2362,19 +2521,25 @@ fn set_selection_scale_y(state: &mut EditorState, new_scale_y: f32) {
 
 fn set_selection_scale(state: &mut EditorState, new_scale: f32) {
     let s = new_scale.clamp(0.05, 20.0);
-    let t = state.playhead;
+    let t = state.canvas_drag.drag_start_playhead.unwrap_or(state.playhead);
     match state.selection {
         Selection::Actor(idx) if idx < state.scene.actors.len() => {
-            ensure_actor_kf_at_playhead(&mut state.scene.actors[idx].layout, t);
-            apply_to_anim_kf(&mut state.scene.actors[idx].layout, t, |v| v.scale = s);
-            mark_actor_canvas_animated(state, idx, t, &[memstroy_core::param_ids::SCALE]);
+            let actor = &mut state.scene.actors[idx];
+            crate::kf_anim::write_actor_param(
+                &mut actor.layout, &mut actor.animated_params, t,
+                memstroy_core::param_ids::SCALE, false,
+                |v| v.scale = s,
+            );
         }
         Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
-            let local_t = overlay_clip_local_time(state, idx);
-            let layout = overlay_layout_mut(&mut state.scene.overlays[idx]);
-            ensure_overlay_kf_at_playhead(layout, local_t);
-            apply_to_overlay_kf(layout, local_t, |v| v.scale = s);
-            mark_overlay_canvas_animated(state, idx, local_t, &[memstroy_core::param_ids::SCALE]);
+            let local_t = overlay_clip_local_time_at(state, idx, t);
+            let (layout, animated_params) =
+                overlay_layout_and_animated_mut(&mut state.scene.overlays[idx]);
+            crate::kf_anim::write_overlay_param(
+                layout, animated_params, local_t,
+                memstroy_core::param_ids::SCALE, false,
+                |v| v.scale = s,
+            );
         }
         Selection::RenderFrame => {
             // Map scale → inverse zoom (bigger scale = bigger frame).
@@ -2399,19 +2564,25 @@ fn apply_scale_delta(state: &mut EditorState, delta: f32) {
 /// canvas-first animation workflow: drag the rotation gizmo at any
 /// time and the system records a keyframe automatically.
 fn set_selection_rotation(state: &mut EditorState, new_rot_deg: f32) {
-    let t = state.playhead;
+    let t = state.canvas_drag.drag_start_playhead.unwrap_or(state.playhead);
     match state.selection {
         Selection::Actor(idx) if idx < state.scene.actors.len() => {
-            ensure_actor_kf_at_playhead(&mut state.scene.actors[idx].layout, t);
-            apply_to_anim_kf(&mut state.scene.actors[idx].layout, t, |v| v.rotation_deg = new_rot_deg);
-            mark_actor_canvas_animated(state, idx, t, &[memstroy_core::param_ids::ROTATION]);
+            let actor = &mut state.scene.actors[idx];
+            crate::kf_anim::write_actor_param(
+                &mut actor.layout, &mut actor.animated_params, t,
+                memstroy_core::param_ids::ROTATION, false,
+                |v| v.rotation_deg = new_rot_deg,
+            );
         }
         Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
-            let local_t = overlay_clip_local_time(state, idx);
-            let layout = overlay_layout_mut(&mut state.scene.overlays[idx]);
-            ensure_overlay_kf_at_playhead(layout, local_t);
-            apply_to_overlay_kf(layout, local_t, |v| v.rotation_deg = new_rot_deg);
-            mark_overlay_canvas_animated(state, idx, local_t, &[memstroy_core::param_ids::ROTATION]);
+            let local_t = overlay_clip_local_time_at(state, idx, t);
+            let (layout, animated_params) =
+                overlay_layout_and_animated_mut(&mut state.scene.overlays[idx]);
+            crate::kf_anim::write_overlay_param(
+                layout, animated_params, local_t,
+                memstroy_core::param_ids::ROTATION, false,
+                |v| v.rotation_deg = new_rot_deg,
+            );
         }
         Selection::RenderFrame => {
             ensure_render_frame_kf_at_playhead(&mut state.scene.render_frame.layout, t);
@@ -2426,6 +2597,7 @@ fn set_selection_rotation(state: &mut EditorState, new_rot_deg: f32) {
 /// Insert a keyframe within ε of `t` on an actor track, seeding it with
 /// the eased current value so animation continues smoothly from the
 /// visual state.
+#[allow(dead_code)]
 fn ensure_actor_kf_at_playhead(layout: &mut Vec<Keyframe<ActorState>>, t: f32) {
     if layout.is_empty() {
         layout.push(Keyframe::new(t, ActorState::default()));
@@ -2440,6 +2612,7 @@ fn ensure_actor_kf_at_playhead(layout: &mut Vec<Keyframe<ActorState>>, t: f32) {
     layout.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
 }
 
+#[allow(dead_code)]
 fn ensure_overlay_kf_at_playhead(layout: &mut Vec<Keyframe<OverlayState>>, t: f32) {
     if layout.is_empty() {
         layout.push(Keyframe::new(t, OverlayState::default()));
@@ -2454,6 +2627,7 @@ fn ensure_overlay_kf_at_playhead(layout: &mut Vec<Keyframe<OverlayState>>, t: f3
     layout.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
 }
 
+#[allow(dead_code)]
 fn ensure_canvas_kf_at_playhead(layout: &mut Vec<Keyframe<CanvasTransform>>, t: f32) {
     if layout.is_empty() {
         layout.push(Keyframe::new(t, CanvasTransform::default()));
@@ -2486,6 +2660,7 @@ fn ensure_render_frame_kf_at_playhead(layout: &mut Vec<Keyframe<RenderFrameState
     layout.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
 }
 
+#[allow(dead_code)]
 fn apply_to_anim_kf<F: FnOnce(&mut ActorState)>(
     layout: &mut Vec<Keyframe<ActorState>>,
     t: f32,
@@ -2501,6 +2676,7 @@ fn apply_to_anim_kf<F: FnOnce(&mut ActorState)>(
     }
 }
 
+#[allow(dead_code)]
 fn apply_to_overlay_kf<F: FnOnce(&mut OverlayState)>(
     layout: &mut Vec<Keyframe<OverlayState>>,
     t: f32,
@@ -2534,11 +2710,29 @@ fn apply_to_render_frame_kf<F: FnOnce(&mut RenderFrameState)>(
     }
 }
 
+#[allow(dead_code)]
 fn overlay_layout_mut(overlay: &mut Overlay) -> &mut Vec<Keyframe<OverlayState>> {
     match overlay {
         Overlay::Text(t) => &mut t.layout,
         Overlay::Image(im) => &mut im.layout,
         Overlay::Video(v) => &mut v.layout,
+    }
+}
+
+/// Borrow both the layout vec AND the per-overlay `animated_params` set
+/// at once. Used by canvas drag setters that route through
+/// `kf_anim::write_overlay_param`, which needs both to gate per-param
+/// keyframing vs. broadcasting.
+fn overlay_layout_and_animated_mut<'a>(
+    overlay: &'a mut Overlay,
+) -> (
+    &'a mut Vec<Keyframe<OverlayState>>,
+    &'a mut std::collections::BTreeSet<String>,
+) {
+    match overlay {
+        Overlay::Text(t) => (&mut t.layout, &mut t.animated_params),
+        Overlay::Image(im) => (&mut im.layout, &mut im.animated_params),
+        Overlay::Video(v) => (&mut v.layout, &mut v.animated_params),
     }
 }
 
@@ -2548,13 +2742,20 @@ fn overlay_layout_mut(overlay: &mut Overlay) -> &mut Vec<Keyframe<OverlayState>>
 /// the same time base — otherwise a kf inserted at the global playhead
 /// would never be visible.
 fn overlay_clip_local_time(state: &EditorState, ov_idx: usize) -> f32 {
-    if ov_idx >= state.scene.overlays.len() { return state.playhead; }
+    overlay_clip_local_time_at(state, ov_idx, state.playhead)
+}
+
+/// Same as `overlay_clip_local_time` but lets the caller pin the scene
+/// time explicitly. Used by the canvas drag setters so they can re-anchor
+/// every kf write to the drag-start playhead instead of the live one.
+fn overlay_clip_local_time_at(state: &EditorState, ov_idx: usize, scene_t: f32) -> f32 {
+    if ov_idx >= state.scene.overlays.len() { return scene_t; }
     let t_in = match &state.scene.overlays[ov_idx] {
         Overlay::Text(t) => t.t_in,
         Overlay::Image(im) => im.t_in,
         Overlay::Video(v) => v.t_in,
     };
-    (state.playhead - t_in).max(0.0)
+    (scene_t - t_in).max(0.0)
 }
 
 /// Lightweight hit sniffer (read-only) — returns what would be selected at a
@@ -3229,13 +3430,106 @@ fn overlay_bbox(overlay: &Overlay, ov_state: &OverlayState) -> (f32, f32) {
             // ~0.55 per glyph is a reasonable heuristic for proportional fonts.
             let text_w = (max_chars.max(1.0)) * font * 0.55;
             let text_h = (lines.len() as f32) * font * 1.2;
-            let pad = style.box_padding * 2.0;
+            // Symmetric padding + asymmetric extras on the horizontal axis.
+            // Resize handles need the FULL plate size so they snap to the
+            // visible edges, hence we account for both extras here.
+            let pad = style.box_padding * 2.0
+                + style.box_extra_left
+                + style.box_extra_right;
+            let pad_v = style.box_padding * 2.0;
             ((text_w + pad).max(40.0) * sx,
-             (text_h + pad).max(20.0) * sy)
+             (text_h + pad_v).max(20.0) * sy)
         }
         Overlay::Image(_) => (200.0 * sx, 200.0 * sy),
         Overlay::Video(_) => (300.0 * sx, 300.0 * 16.0 / 9.0 * sy),
     }
+}
+
+/// Same as `overlay_bbox` but returns the actual on-disk dimensions of
+/// loaded image overlays when available. Used by the resize-handle math
+/// so the gizmo snaps to the visible PNG corners (not the legacy 200×200
+/// placeholder bbox). Falls back to `overlay_bbox` for the other variants.
+fn overlay_bbox_with_state(
+    overlay: &Overlay,
+    ov_state: &OverlayState,
+    state: &EditorState,
+) -> (f32, f32) {
+    if let Overlay::Image(img) = overlay {
+        if let Ok(map) = state.image_textures.lock() {
+            if let Some(crate::state::ImageTextureSlot::Loaded { size, .. }) =
+                map.get(&img.source)
+            {
+                let sx = ov_state.scale;
+                let sy = ov_state.scale * ov_state.scale_y;
+                return (size[0] as f32 * sx, size[1] as f32 * sy);
+            }
+        }
+    }
+    overlay_bbox(overlay, ov_state)
+}
+
+/// Lazily decode `path` into a cached `egui::TextureHandle` and report
+/// the source dimensions. Re-entry is cheap — once a slot is `Loaded`
+/// or `Failed`, subsequent calls only do a hash-map lookup. Returns
+/// `Some((w, h))` when a real texture is available, `None` while
+/// loading or after a permanent failure.
+fn ensure_image_loaded(
+    state: &EditorState,
+    path: &std::path::Path,
+    ctx: &egui::Context,
+) -> Option<(u32, u32)> {
+    use crate::state::ImageTextureSlot;
+    // Fast path: already in the map.
+    if let Ok(map) = state.image_textures.lock() {
+        if let Some(slot) = map.get(path) {
+            return match slot {
+                ImageTextureSlot::Loaded { size, .. } => Some((size[0], size[1])),
+                ImageTextureSlot::Failed => None,
+            };
+        }
+    }
+
+    // Slow path: decode now. We do a synchronous decode because typical
+    // sticker PNGs are small and the result is cached after the first
+    // hit; bumping this to a background thread is a follow-up if very
+    // large images become common.
+    let decoded = image::open(path).map(|img| img.to_rgba8());
+    let (handle, size) = match decoded {
+        Ok(rgba) => {
+            let w = rgba.width();
+            let h = rgba.height();
+            let pixels = rgba.into_raw();
+            let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                [w as usize, h as usize],
+                &pixels,
+            );
+            let name = format!(
+                "img_overlay_{}",
+                path.file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("anon")
+            );
+            let handle = ctx.load_texture(name, color_image, egui::TextureOptions::LINEAR);
+            (Some(handle), Some([w, h]))
+        }
+        Err(_) => (None, None),
+    };
+
+    if let Ok(mut map) = state.image_textures.lock() {
+        match (handle, size) {
+            (Some(texture), Some(sz)) => {
+                map.insert(
+                    path.to_path_buf(),
+                    ImageTextureSlot::Loaded { texture, size: sz },
+                );
+                return Some((sz[0], sz[1]));
+            }
+            _ => {
+                map.insert(path.to_path_buf(), ImageTextureSlot::Failed);
+            }
+        }
+    }
+    None
 }
 
 /// Try to select an element at the given world position.
