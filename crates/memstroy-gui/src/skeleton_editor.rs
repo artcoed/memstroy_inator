@@ -296,7 +296,11 @@ fn skeleton_editor_content(ui: &mut egui::Ui, state: &mut EditorState) {
                 ui.add_space(4.0);
                 transport_bar(ui, state);
                 ui.add_space(4.0);
-                skeleton_timeline(ui, state, pw);
+                ui.horizontal(|ui| {
+                    timeline_loop_toggle(ui, state);
+                    ui.add_space(4.0);
+                    skeleton_timeline(ui, state, pw - 70.0);
+                });
                 ui.add_space(4.0);
                 keyframe_easing_panel(ui, state);
             });
@@ -893,7 +897,7 @@ fn transport_bar(ui: &mut egui::Ui, state: &mut EditorState) {
             state.skeleton_editor.last_play_tick = None;
         }
 
-        if ui.button("\u{25B8}").on_hover_text("Next frame").clicked()
+        if ui.button("\u{23E9}").on_hover_text("Next frame").clicked()
             && state.skeleton_editor.current_frame + 1 < total
         {
             state.skeleton_editor.current_frame += 1;
@@ -925,26 +929,27 @@ fn transport_bar(ui: &mut egui::Ui, state: &mut EditorState) {
                 resp.on_hover_text(format!("Looping over '{}'", name));
             });
         }
-
-        // ── Loop toggle (mirrors the main timeline's Loop button) ──
-        // When ON the playhead wraps to 0 once it reaches the end of the
-        // clip; when OFF playback pauses at the last frame.
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let on = state.skeleton_editor.loop_playback;
-            let col = if on {
-                Color32::from_rgb(255, 180, 80)
-            } else {
-                COL_TEXT_DIM
-            };
-            let btn = egui::Button::new(RichText::new("\u{1F501} Loop").size(11.0).color(col));
-            if ui.add(btn)
-                .on_hover_text("Loop playback (wrap to start at end of clip)")
-                .clicked()
-            {
-                state.skeleton_editor.loop_playback = !state.skeleton_editor.loop_playback;
-            }
-        });
     });
+}
+
+/// Compact "Loop" toggle, rendered to the *left* of the timeline ruler
+/// (inside the timeline panel rather than at the far-right of the
+/// transport bar) so the user can find it next to the timecodes it
+/// affects.
+fn timeline_loop_toggle(ui: &mut egui::Ui, state: &mut EditorState) {
+    let on = state.skeleton_editor.loop_playback;
+    let col = if on {
+        Color32::from_rgb(255, 180, 80)
+    } else {
+        COL_TEXT_DIM
+    };
+    let btn = egui::Button::new(RichText::new("\u{1F501} Loop").size(11.0).color(col));
+    if ui.add(btn)
+        .on_hover_text("Loop playback (wrap to start at end of clip)")
+        .clicked()
+    {
+        state.skeleton_editor.loop_playback = !state.skeleton_editor.loop_playback;
+    }
 }
 
 // ─── TIMELINE ────────────────────────────────────────────────────────
