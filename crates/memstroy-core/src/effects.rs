@@ -187,6 +187,99 @@ impl Effect {
     pub fn vhs() -> Self { Self::new(EffectKind::Vhs) }
     pub fn glitch() -> Self { Self::new(EffectKind::Glitch { strength: 0.5 }) }
     pub fn bloom() -> Self { Self::new(EffectKind::Bloom { radius: 18.0 }) }
+
+    /// Sample a single named parameter at clip-local time `t_local`.
+    ///
+    /// When `key` is in `animated_params` AND `param_kfs[key]` has at
+    /// least one keyframe, the eased keyframe value is returned;
+    /// otherwise `fallback` is passed through. The renderer / preview
+    /// path uses this to honour per-parameter keyframes without having
+    /// to special-case every effect kind.
+    ///
+    /// Standard keys used by the inspector:
+    /// - `"intensity"` — master amount on `Effect.intensity`.
+    /// - `"p0"` and (for two-param kinds) `"p1"` — primary / secondary
+    ///   per-kind parameter (radius / amount / threshold / …).
+    pub fn sample_param_at(&self, t_local: f32, key: &str, fallback: f32) -> f32 {
+        if !self.animated_params.contains(key) {
+            return fallback;
+        }
+        let Some(kfs) = self.param_kfs.get(key) else { return fallback; };
+        if kfs.is_empty() {
+            return fallback;
+        }
+        crate::keyframe::sample(kfs, t_local).unwrap_or(fallback)
+    }
+
+    /// Return a clone of this effect with every animated parameter
+    /// replaced by its keyframe-sampled value at `t_local`. Consumers
+    /// (preview pipeline, ffmpeg filtergraph builder) that want to
+    /// honour animation just call `eff.sampled_at(t_local)` and treat
+    /// the result as a static-effect description.
+    pub fn sampled_at(&self, t_local: f32) -> Self {
+        use EffectKind as K;
+        let mut out = self.clone();
+        out.intensity = self.sample_param_at(t_local, "intensity", self.intensity);
+        out.kind = match &self.kind {
+            K::Blur { radius } => K::Blur {
+                radius: self.sample_param_at(t_local, "p0", *radius),
+            },
+            K::Sharpen { amount } => K::Sharpen {
+                amount: self.sample_param_at(t_local, "p0", *amount),
+            },
+            K::HueShift { degrees } => K::HueShift {
+                degrees: self.sample_param_at(t_local, "p0", *degrees),
+            },
+            K::Vignette { strength } => K::Vignette {
+                strength: self.sample_param_at(t_local, "p0", *strength),
+            },
+            K::Pixelate { block_size } => K::Pixelate {
+                block_size: self.sample_param_at(t_local, "p0", *block_size),
+            },
+            K::Posterize { levels } => K::Posterize {
+                levels: (self
+                    .sample_param_at(t_local, "p0", *levels as f32)
+                    as u32)
+                    .max(2),
+            },
+            K::Glow { radius, intensity } => K::Glow {
+                radius: self.sample_param_at(t_local, "p0", *radius),
+                intensity: self.sample_param_at(t_local, "p1", *intensity),
+            },
+            K::Brightness { amount } => K::Brightness {
+                amount: self.sample_param_at(t_local, "p0", *amount),
+            },
+            K::Contrast { amount } => K::Contrast {
+                amount: self.sample_param_at(t_local, "p0", *amount),
+            },
+            K::Saturation { amount } => K::Saturation {
+                amount: self.sample_param_at(t_local, "p0", *amount),
+            },
+            K::EdgeDetect { threshold } => K::EdgeDetect {
+                threshold: self.sample_param_at(t_local, "p0", *threshold),
+            },
+            K::ChromaticAberration { offset } => K::ChromaticAberration {
+                offset: self.sample_param_at(t_local, "p0", *offset),
+            },
+            K::Noise { amount } => K::Noise {
+                amount: self.sample_param_at(t_local, "p0", *amount),
+            },
+            K::Wave { amplitude, wavelength } => K::Wave {
+                amplitude: self.sample_param_at(t_local, "p0", *amplitude),
+                wavelength: self.sample_param_at(t_local, "p1", *wavelength),
+            },
+            K::Glitch { strength } => K::Glitch {
+                strength: self.sample_param_at(t_local, "p0", *strength),
+            },
+            K::Bloom { radius } => K::Bloom {
+                radius: self.sample_param_at(t_local, "p0", *radius),
+            },
+            // Kinds without numeric parameters pass through unchanged.
+            K::Grayscale | K::Sepia | K::Invert | K::MirrorH | K::MirrorV
+                | K::OldFilm | K::Vhs => self.kind.clone(),
+        };
+        out
+    }
 }
 
 /// Every effect kind known to the editor, in display order. Used by the

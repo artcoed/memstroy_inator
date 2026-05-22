@@ -226,6 +226,15 @@ pub struct EditorState {
     /// `EditorState::mutate_drag` for the full contract — the short
     /// version is "one undo snapshot per drag gesture, automatically".
     pub last_drag_group: Option<u64>,
+    /// Snapshot of the scene captured the last time a pointer button
+    /// was pressed. Used by `app.rs::update` as a frame-level catch-all
+    /// for inspector edits (slider drags, button clicks, …) that don't
+    /// route through `mutate_drag`. On pointer-release, if the scene
+    /// has diverged from this snapshot AND no `mutate_drag` token
+    /// fired during the gesture, the snapshot is pushed to the undo
+    /// stack — yielding "one Ctrl+Z = one user gesture" everywhere,
+    /// not just on the canvas / timeline.
+    pub pre_press_scene: Option<memstroy_core::Scene>,
     /// Playback state
     pub playing: bool,
     /// Playback speed multiplier (1.0 = normal, 2.0 = 2x, 0.5 = half)
