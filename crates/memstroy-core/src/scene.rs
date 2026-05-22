@@ -913,6 +913,44 @@ pub struct AudioTrack {
     /// duration (i.e. classic "scrub speed", not time-stretch).
     #[serde(default = "one")]
     pub speed: f32,
+    /// Pitch shift in semitones (12 = +1 octave, -12 = -1 octave).
+    /// Combined with `speed` as `effective_rate = speed * 2^(pitch/12)`.
+    /// Because we resample (no time-stretching), changing pitch also
+    /// changes effective duration; for the editor preview that's an
+    /// acceptable trade-off and gives the user an instantly recognisable
+    /// "Mickey Mouse / chipmunk" pitch knob.
+    #[serde(default)]
+    pub pitch_semitones: f32,
+    /// Stereo pan. `-1.0` = full left, `0.0` = centre, `+1.0` = full right.
+    #[serde(default)]
+    pub pan: f32,
+    /// Optional low-pass filter cutoff frequency in Hz. `None` disables.
+    /// Range typically 100..=22000.
+    #[serde(default)]
+    pub low_pass_hz: Option<u32>,
+    /// Optional high-pass filter cutoff frequency in Hz. `None` disables.
+    /// Implemented as a one-pole IIR in the engine.
+    #[serde(default)]
+    pub high_pass_hz: Option<u32>,
+    /// Linear fade-in duration at clip start (seconds). 0 = no fade.
+    #[serde(default)]
+    pub fade_in: f32,
+    /// Linear fade-out duration at clip end (seconds). 0 = no fade.
+    /// Only effective when `t_out` is set or the source has a known length.
+    #[serde(default)]
+    pub fade_out: f32,
+    /// Mute the track without removing it. Survives save/load.
+    #[serde(default)]
+    pub mute: bool,
+    /// When the visible window outlasts the source file, keep the source
+    /// looping until `t_out` (or the scene end) instead of going silent.
+    #[serde(default)]
+    pub loop_source: bool,
+    /// Reverb mix (0..1). Implemented as a small comb-filter feedback
+    /// echo in the engine — gives a quick "room" feel without the cost
+    /// of a real convolution reverb.
+    #[serde(default)]
+    pub reverb: f32,
     /// If set, this audio track belongs to the actor with this `id`. The
     /// editor uses this to keep clip & audio in lock-step: moving / trimming
     /// / deleting the actor mirrors the same change on the bound audio so
@@ -934,6 +972,33 @@ pub struct AudioTrack {
     /// fresh audio tracks.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub animated_params: BTreeSet<String>,
+}
+
+impl Default for AudioTrack {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            source: PathBuf::new(),
+            t_in: 0.0,
+            t_out: None,
+            source_start: 0.0,
+            volume: 1.0,
+            speed: 1.0,
+            pitch_semitones: 0.0,
+            pan: 0.0,
+            low_pass_hz: None,
+            high_pass_hz: None,
+            fade_in: 0.0,
+            fade_out: 0.0,
+            mute: false,
+            loop_source: false,
+            reverb: 0.0,
+            parent_actor: None,
+            volume_kfs: Vec::new(),
+            speed_kfs: Vec::new(),
+            animated_params: BTreeSet::new(),
+        }
+    }
 }
 
 impl AudioTrack {

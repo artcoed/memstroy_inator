@@ -2,13 +2,32 @@
 //!
 //! The engine manages a set of parallel `rodio::Sink`s — one per active
 //! audio source — so multiple tracks (scene audio + actor video soundtracks)
-//! play together in sync with the timeline playhead. Each source is opened,
-//! decoded, seeked into via `skip_duration`, optionally trimmed via
-//! `take_duration`, optionally delayed via `delay`, and amplified to its
-//! per-track volume.
+//! play together in sync with the timeline playhead.
 //!
-//! On play-start or after a seek, the engine tears down all current sinks
-//! and rebuilds them from scratch at the new playhead.
+//! ## Per-track effect chain
+//!
+//! Each scheduled source flows through this chain (in order):
+//!
+//! 1. **Decode** to f32 samples.
+//! 2. **Speed × pitch resample** — both knobs are folded into one rate
+//!    factor: `effective_rate = speed * 2^(pitch_semitones / 12)`. We
+//!    don't do time-stretching, so changing pitch shortens/lengthens
+//!    the clip in wall-clock time the same way speed does. That's the
+//!    classic editor "scrub speed + Mickey-Mouse" feel.
+//! 3. **Skip into source_start** + the live playhead offset.
+//! 4. **Loop** the source if `loop_source` is set.
+//! 5. **Take** only the visible duration.
+//! 6. **High-pass filter** (one-pole IIR), if `high_pass_hz` is set.
+//! 7. **Low-pass filter** (one-pole IIR), if `low_pass_hz` is set.
+//! 8. **Reverb** (single-tap feedback comb), if `reverb > 0`.
+//! 9. **Stereo splitter + pan + volume + fade in/out + mute** in a
+//!    single combined adapter (see `dsp::Stereo`). Always forces
+//!    output to 2 channels so panning is meaningful.
+//! 10. **Delay** so the source becomes audible at the correct
+//!     `t_in - playhead` offset.
+//!
+//! All custom adapters are no-ops when their parameter is at neutral,
+//! so untouched tracks pay no extra DSP cost.
 //!
 //! ## Background loading
 //!
@@ -34,6 +53,8 @@ use std::time::{Duration, Instant};
 use rodio::Source;
 use tracing::{debug, info, warn};
 
+mod dsp;
+
 /// Global one-shot panic-hook installer. Suppresses the stderr "thread
 /// 'memstroy-audio-load-N' panicked at ..." spam that rodio 0.19's
 /// symphonia adapter emits when probing some MP4s with no/short audio.
@@ -52,8 +73,6 @@ fn install_audio_panic_hook() {
                 .map(|n| n.starts_with("memstroy-audio-load-"))
                 .unwrap_or(false);
             if on_audio_thread {
-                // Audio worker hit a decoder panic — already handled by
-                // catch_unwind in load_sinks, no need to scare the user.
                 debug!(
                     "Suppressed audio-worker panic ({}): {}",
                     thread::current().name().unwrap_or("?"),
@@ -79,9 +98,51 @@ pub struct AudioSourceSpec {
     pub source_start: f32,
     /// Per-track linear gain (0.0..N).
     pub volume: f32,
-    /// Per-track playback rate (1.0 = normal, 2.0 = double speed +
-    /// octave-up pitch). Applied via `Source::speed`.
+    /// Per-track playback rate (1.0 = normal, 2.0 = double speed).
+    /// Combined with `pitch_semitones` to form the effective resample
+    /// rate (`speed * 2^(pitch/12)`).
     pub speed: f32,
+    /// Pitch shift in semitones (12 = +1 octave). 0 = neutral.
+    pub pitch_semitones: f32,
+    /// Stereo pan, -1.0 = full left, +1.0 = full right.
+    pub pan: f32,
+    /// One-pole low-pass cutoff in Hz; `None` disables.
+    pub low_pass_hz: Option<u32>,
+    /// One-pole high-pass cutoff in Hz; `None` disables.
+    pub high_pass_hz: Option<u32>,
+    /// Linear fade-in length in scene seconds. 0 = no fade.
+    pub fade_in: f32,
+    /// Linear fade-out length in scene seconds. 0 = no fade.
+    /// Only effective when `t_out` is set.
+    pub fade_out: f32,
+    /// Mute the source without removing it from the schedule.
+    pub mute: bool,
+    /// Loop the source for the duration of the visible window.
+    pub loop_source: bool,
+    /// Reverb mix (0..1). 0 = dry.
+    pub reverb: f32,
+}
+
+impl Default for AudioSourceSpec {
+    fn default() -> Self {
+        Self {
+            path: PathBuf::new(),
+            t_in: 0.0,
+            t_out: None,
+            source_start: 0.0,
+            volume: 1.0,
+            speed: 1.0,
+            pitch_semitones: 0.0,
+            pan: 0.0,
+            low_pass_hz: None,
+            high_pass_hz: None,
+            fade_in: 0.0,
+            fade_out: 0.0,
+            mute: false,
+            loop_source: false,
+            reverb: 0.0,
+        }
+    }
 }
 
 /// A pre-built sink that the worker thread hands back, ready to be
@@ -114,8 +175,6 @@ pub struct AudioEngine {
 impl AudioEngine {
     /// Create a new audio engine. Initialises the output stream.
     pub fn new() -> Self {
-        // Quiet down the rodio/symphonia decoder panics that we already
-        // catch_unwind on the worker thread.
         install_audio_panic_hook();
         let (stream, handle) = match rodio::OutputStream::try_default() {
             Ok((stream, handle)) => {
@@ -152,8 +211,6 @@ impl AudioEngine {
     /// construction happens on a worker thread; sinks are attached
     /// progressively as they become ready (see [`Self::poll_pending`]).
     pub fn play_sources(&mut self, sources: &[AudioSourceSpec], playhead: f32) {
-        // Tear down whatever was playing instantly so the user perceives
-        // the seek/restart as snappy.
         self.stop_all_sinks();
         self.generation = self.generation.wrapping_add(1);
         let gen = self.generation;
@@ -192,24 +249,26 @@ impl AudioEngine {
         tx: mpsc::Sender<ReadySink>,
     ) {
         for spec in specs {
+            // Mute = skip entirely so we don't waste a sink on silence.
+            if spec.mute {
+                continue;
+            }
             // Compensate for time elapsed during background decode so the
             // already-running visual playhead doesn't drift away from audio.
             let elapsed = started_at.elapsed().as_secs_f32();
             let live_playhead = playhead + elapsed;
 
             if let Some(t_out) = spec.t_out {
-                if live_playhead >= t_out { continue; }
+                if live_playhead >= t_out {
+                    continue;
+                }
             }
-            if !spec.path.exists() { continue; }
+            if !spec.path.exists() {
+                continue;
+            }
 
-            // ── Container fallback: extract audio via ffmpeg for files
-            // that rodio's symphonia adapter can't safely probe (mp4 / mkv
-            // / mov panic at "Seek errors should not occur during
-            // initialization" on rodio 0.19). The first probe per file
-            // dumps the audio stream to a cached WAV in the system temp
-            // dir; subsequent loads of the same source mtime hit the cache
-            // and finish in microseconds. Plain audio files (mp3 / wav /
-            // ogg / ...) skip this step entirely.
+            // Container fallback: extract audio via ffmpeg for files that
+            // rodio's symphonia adapter can't safely probe.
             let resolved_path = match resolve_audio_source(&spec.path) {
                 Some(p) => p,
                 None => {
@@ -224,14 +283,14 @@ impl AudioEngine {
             let file = match File::open(&resolved_path) {
                 Ok(f) => f,
                 Err(e) => {
-                    warn!("Failed to open audio file {}: {}", resolved_path.display(), e);
+                    warn!(
+                        "Failed to open audio file {}: {}",
+                        resolved_path.display(),
+                        e
+                    );
                     continue;
                 }
             };
-            // Reject obviously empty / tiny files outright. rodio 0.19 + symphonia
-            // 0.5 will sometimes panic on init when the underlying source is too
-            // short to probe (the panic site is `unreachable!("Seek errors should
-            // not occur during initialization")` in rodio's symphonia adapter).
             if let Ok(meta) = file.metadata() {
                 if meta.len() < 64 {
                     debug!(
@@ -242,26 +301,15 @@ impl AudioEngine {
                 }
             }
             let reader = BufReader::new(file);
-            // `rodio::Decoder::new` can panic — not just return Err — when
-            // symphonia hits an unexpected internal seek error during probe.
-            // Wrap the call in `catch_unwind` so a single bad attachment
-            // (e.g. a video file with no audio stream, a partial download,
-            // or an unsupported codec) doesn't take down the whole audio
-            // worker thread.
-            let decoder_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                rodio::Decoder::new(reader)
-            }));
+            let decoder_result =
+                std::panic::catch_unwind(AssertUnwindSafe(|| rodio::Decoder::new(reader)));
             let decoder = match decoder_result {
                 Ok(Ok(d)) => d,
                 Ok(Err(e)) => {
-                    // Many image / unsupported files end up here when an
-                    // "actor" path doesn't actually have an audio stream.
                     debug!("No decodable audio in {}: {}", spec.path.display(), e);
                     continue;
                 }
                 Err(_) => {
-                    // Decoder panicked while probing the source. Skip it
-                    // gracefully instead of crashing the worker thread.
                     warn!(
                         "Audio decoder panicked while probing {}; skipping.",
                         spec.path.display()
@@ -269,28 +317,6 @@ impl AudioEngine {
                     continue;
                 }
             };
-
-            let stream = decoder.convert_samples::<f32>();
-            // Apply per-track speed at the source level. `speed` divides
-            // every internal duration we hand the source (skip, take,
-            // delay) so time still maps to the user's scene timeline:
-            // the audio plays N× faster but starts/ends at the same
-            // visible scene-times.
-            let speed = spec.speed.max(0.05);
-            let stream = stream.speed(speed);
-            let skip_secs = (spec.source_start
-                + (live_playhead - spec.t_in).max(0.0))
-                .max(0.0);
-            // skip / take / delay are all stated in *scene-time* seconds
-            // by the caller; multiply by `speed` to recover the
-            // wall-clock seconds the now-faster source needs to consume.
-            let stream = stream.skip_duration(Duration::from_secs_f32(skip_secs * speed));
-            let stream = stream.amplify(spec.volume.max(0.0));
-            let take_secs = spec.t_out.map(|end| {
-                let visible_start = live_playhead.max(spec.t_in);
-                (end - visible_start).max(0.0)
-            });
-            let delay_secs = (spec.t_in - live_playhead).max(0.0);
 
             let sink = match rodio::Sink::try_new(handle) {
                 Ok(s) => s,
@@ -300,24 +326,89 @@ impl AudioEngine {
                 }
             };
             sink.set_volume(master_volume);
-            sink.pause(); // start paused so the UI thread starts us at the right moment
+            sink.pause();
 
-            match (take_secs, delay_secs > 0.0) {
-                (Some(td), true) => sink.append(
-                    stream
-                        .take_duration(Duration::from_secs_f32(td * speed))
-                        .delay(Duration::from_secs_f32(delay_secs)),
-                ),
-                (Some(td), false) => sink.append(
-                    stream.take_duration(Duration::from_secs_f32(td * speed)),
-                ),
-                (None, true) => sink.append(
-                    stream.delay(Duration::from_secs_f32(delay_secs)),
-                ),
-                (None, false) => sink.append(stream),
+            // ── Build the per-track effect chain. ─────────────────────
+            let stream = decoder.convert_samples::<f32>();
+
+            // (1) Resample factor combines speed and pitch.
+            let pitch_factor = 2.0_f32.powf(spec.pitch_semitones / 12.0);
+            let rate = (spec.speed * pitch_factor).max(0.05);
+            let stream = stream.speed(rate);
+
+            // (2) Skip into the source. The user's `source_start` plus the
+            // amount of clip time already elapsed since `t_in`.
+            let skip_secs =
+                (spec.source_start + (live_playhead - spec.t_in).max(0.0)).max(0.0);
+            // skip / take are stated in scene-time seconds; multiply by
+            // `rate` to recover the wall-clock seconds the now-faster
+            // source needs to consume.
+            let stream = stream.skip_duration(Duration::from_secs_f32(skip_secs * rate));
+
+            // (3) Optional looping. `repeat_infinite` consumes the entire
+            // upstream and replays it forever; we then bound the output
+            // with `take_duration` below.
+            let stream: Box<dyn Source<Item = f32> + Send> = if spec.loop_source {
+                Box::new(stream.buffered().repeat_infinite())
+            } else {
+                Box::new(stream)
+            };
+            let stream = dsp::DynSource::new(stream);
+
+            // (4) Take only the visible duration.
+            let take_secs = spec.t_out.map(|end| {
+                let visible_start = live_playhead.max(spec.t_in);
+                (end - visible_start).max(0.0)
+            });
+            let take_total_secs = take_secs.map(|s| s * rate);
+
+            let stream: Box<dyn Source<Item = f32> + Send> = match take_total_secs {
+                Some(td) if td > 0.0 => {
+                    Box::new(stream.take_duration(Duration::from_secs_f32(td)))
+                }
+                _ => Box::new(stream),
+            };
+            let stream = dsp::DynSource::new(stream);
+
+            // (5) High-pass filter.
+            let stream = dsp::HighPass::new(stream, spec.high_pass_hz);
+            // (6) Low-pass filter.
+            let stream = dsp::LowPass::new(stream, spec.low_pass_hz);
+            // (7) Reverb.
+            let stream = dsp::Reverb::new(stream, spec.reverb);
+
+            // (8) Final stereo bus: pan + volume + fade in/out.
+            let fade_in_samples = if spec.fade_in > 0.0 {
+                Some((spec.fade_in * rate * stream.sample_rate() as f32) as u64)
+            } else {
+                None
+            };
+            let total_samples = take_total_secs
+                .map(|td| (td * stream.sample_rate() as f32) as u64);
+            let fade_out_samples = if spec.fade_out > 0.0 && total_samples.is_some() {
+                Some((spec.fade_out * rate * stream.sample_rate() as f32) as u64)
+            } else {
+                None
+            };
+
+            let stream = dsp::Stereo::new(
+                stream,
+                spec.volume.max(0.0),
+                spec.pan,
+                fade_in_samples,
+                fade_out_samples,
+                total_samples,
+            );
+
+            // (9) Delay until t_in (only when scheduling something that
+            // hasn't started yet).
+            let delay_secs = (spec.t_in - live_playhead).max(0.0);
+            if delay_secs > 0.0 {
+                sink.append(stream.delay(Duration::from_secs_f32(delay_secs)));
+            } else {
+                sink.append(stream);
             }
 
-            // If the receiver was dropped (next play_sources arrived), bail.
             if tx.send(ReadySink { sink }).is_err() {
                 return;
             }
@@ -327,12 +418,9 @@ impl AudioEngine {
     /// Drain any sinks the worker thread has finished building and start
     /// them. Call this every UI frame.
     pub fn poll_pending(&mut self) {
-        // Snapshot the current generation up front so we don't hold a borrow
-        // on `self.pending` while we mutate `self.sinks`.
         let cur_gen = self.generation;
         let Some((gen, rx)) = self.pending.take() else { return };
         if gen != cur_gen {
-            // A newer play_sources call superseded this one: drop everything.
             for ready in rx.try_iter() {
                 ready.sink.stop();
             }
@@ -375,7 +463,6 @@ impl AudioEngine {
     }
 
     /// Set the master volume (0.0 .. 1.0). Per-track volumes still apply.
-    #[allow(dead_code)]
     pub fn set_master_volume(&mut self, v: f32) {
         self.volume = v.clamp(0.0, 1.0);
         for sink in &self.sinks {
@@ -396,14 +483,6 @@ impl AudioEngine {
 /// using ffmpeg the first time they're seen — rodio 0.19's symphonia
 /// adapter is known to panic during probe on some valid mp4s, and falling
 /// back to ffmpeg sidesteps that bug entirely.
-///
-/// Cache key = `<file_stem>_<size>_<mtime_secs>.wav` in the system temp
-/// dir (`memstroy_audio_cache/`). Subsequent calls with the same source
-/// hit the cache and return immediately.
-///
-/// Returns `None` only if extraction was attempted and failed (no audio
-/// stream / ffmpeg unavailable / write error). Plain audio paths always
-/// succeed.
 fn resolve_audio_source(src: &Path) -> Option<PathBuf> {
     let ext = src
         .extension()
@@ -440,7 +519,6 @@ fn resolve_audio_source(src: &Path) -> Option<PathBuf> {
     let cache_name = format!("{}_{}_{}.wav", stem, size, mtime);
     let cache_path = cache_dir.join(cache_name);
 
-    // Cache hit?
     if cache_path.exists()
         && std::fs::metadata(&cache_path)
             .map(|m| m.len() > 1024)
@@ -449,9 +527,6 @@ fn resolve_audio_source(src: &Path) -> Option<PathBuf> {
         return Some(cache_path);
     }
 
-    // Cache miss — invoke ffmpeg synchronously. We're already on a
-    // background worker thread so blocking here is fine; the extracted
-    // WAV is then served to subsequent load_sinks calls instantly.
     let ffmpeg = memstroy_render::ffmpeg_binary();
     let status = std::process::Command::new(&ffmpeg)
         .args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
@@ -464,8 +539,6 @@ fn resolve_audio_source(src: &Path) -> Option<PathBuf> {
 
     match status {
         Ok(s) if s.success() => {
-            // ffmpeg writes a valid header even when no audio stream was
-            // present — guard with a size sanity check.
             let len = std::fs::metadata(&cache_path).map(|m| m.len()).unwrap_or(0);
             if len > 1024 {
                 debug!(
