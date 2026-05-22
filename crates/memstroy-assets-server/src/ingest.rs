@@ -65,6 +65,56 @@ pub fn spawn_tg_ingest(store: AssetStore, channel: String, limit: u32) {
             Err(e) => warn!(error = %e, "download_videos failed"),
         }
 
+        // ── Persist the per-post description as `<id>.txt` and an
+        // optional short label as `<id>.label` so the asset store's
+        // `index_dir` picks it up on the next pass. The store already
+        // reads these sidecars into `AssetEntry.description` /
+        // `AssetEntry.label`, which the API then surfaces in the
+        // listing the GUI consumes — restoring the pre-server flow
+        // where every clip card showed the original Telegram caption.
+        for post in &posts {
+            let stem = post.id.to_string();
+            let video_path = clips_dir.join(format!("{}.mp4", stem));
+            // Only write sidecars for clips that successfully landed on disk.
+            if !video_path.exists() {
+                continue;
+            }
+            let description = post.clean_description();
+            // Skip empty descriptions to avoid creating empty `<id>.txt`
+            // files that would just clutter the assets dir.
+            if !description.is_empty() {
+                let txt_path = clips_dir.join(format!("{}.txt", stem));
+                if let Err(e) = tokio::fs::write(&txt_path, description.as_bytes()).await {
+                    warn!(
+                        error = %e,
+                        path = %txt_path.display(),
+                        "failed to write description sidecar"
+                    );
+                }
+            }
+            // Use the same description (truncated) as a human-readable
+            // label so the listing endpoint shows something nicer than
+            // the bare numeric id when no `<id>.label` exists.
+            let label_path = clips_dir.join(format!("{}.label", stem));
+            if !label_path.exists() {
+                let short_label: String = description
+                    .chars()
+                    .take(60)
+                    .collect::<String>()
+                    .trim()
+                    .to_string();
+                if !short_label.is_empty() {
+                    if let Err(e) = tokio::fs::write(&label_path, short_label.as_bytes()).await {
+                        warn!(
+                            error = %e,
+                            path = %label_path.display(),
+                            "failed to write label sidecar"
+                        );
+                    }
+                }
+            }
+        }
+
         if let Err(e) = store.index_dir(&root) {
             warn!(error = %e, "post-ingest reindex failed");
         }

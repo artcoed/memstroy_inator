@@ -183,6 +183,22 @@ pub fn spawn_refresh(
             // Server ids match the ingest filenames: `{id}.mp4`.
             let file_name = format!("{}.mp4", sanitise_id(&item.id));
             let local_path = clips_dir.join(&file_name);
+            // Always mirror the description as a sidecar so the GUI's
+            // local library scan (which reads `<stem>.txt` next to each
+            // mp4) can show the Telegram caption even after the server
+            // is offline. We write the file unconditionally because the
+            // server is the source of truth for descriptions and may
+            // have re-cleaned an existing one.
+            if !item.description.is_empty() {
+                let txt_path = clips_dir.join(format!("{}.txt", sanitise_id(&item.id)));
+                if let Err(e) = tokio::fs::write(&txt_path, item.description.as_bytes()).await {
+                    warn!(
+                        id = %item.id,
+                        error = %e,
+                        "failed to mirror description sidecar locally"
+                    );
+                }
+            }
             if local_path.exists() {
                 continue;
             }
@@ -218,6 +234,11 @@ struct ServerAssetSummary {
     id: String,
     #[allow(dead_code)]
     label: String,
+    /// Free-form description (cleaned Telegram caption for clips, or
+    /// the contents of a `<id>.txt` sidecar for any other kind). The
+    /// server already truncates this to 240 chars in `AssetSummary`.
+    #[serde(default)]
+    description: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

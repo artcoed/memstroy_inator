@@ -15,9 +15,8 @@
 //!    the clip in wall-clock time the same way speed does. That's the
 //!    classic editor "scrub speed + Mickey-Mouse" feel.
 //! 3. **Skip into source_start** + the live playhead offset.
-//! 4. **Loop** the source if `loop_source` is set.
-//! 5. **Take** only the visible duration.
-//! 6. **High-pass filter** (one-pole IIR), if `high_pass_hz` is set.
+//! 4. **Take** only the visible duration.
+//! 5. **High-pass filter** (one-pole IIR), if `high_pass_hz` is set.
 //! 7. **Low-pass filter** (one-pole IIR), if `low_pass_hz` is set.
 //! 8. **Reverb** (single-tap feedback comb), if `reverb > 0`.
 //! 9. **Stereo splitter + pan + volume + fade in/out + mute** in a
@@ -117,8 +116,6 @@ pub struct AudioSourceSpec {
     pub fade_out: f32,
     /// Mute the source without removing it from the schedule.
     pub mute: bool,
-    /// Loop the source for the duration of the visible window.
-    pub loop_source: bool,
     /// Reverb mix (0..1). 0 = dry.
     pub reverb: f32,
 }
@@ -139,9 +136,43 @@ impl Default for AudioSourceSpec {
             fade_in: 0.0,
             fade_out: 0.0,
             mute: false,
-            loop_source: false,
             reverb: 0.0,
         }
+    }
+}
+
+impl AudioSourceSpec {
+    /// Stable, hash-friendly fingerprint of every field that influences
+    /// the rodio sink. Used by `app.rs` to decide whether the running
+    /// playback needs to be rebuilt because the user just touched an
+    /// audio inspector slider mid-playback (volume, pan, pitch, …).
+    /// Two specs with the same `signature` are guaranteed to produce
+    /// the same audible output, so we can short-circuit the rebuild.
+    pub fn signature(&self) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        self.path.hash(&mut h);
+        self.t_in.to_bits().hash(&mut h);
+        match self.t_out {
+            Some(v) => {
+                1u8.hash(&mut h);
+                v.to_bits().hash(&mut h);
+            }
+            None => 0u8.hash(&mut h),
+        }
+        self.source_start.to_bits().hash(&mut h);
+        self.volume.to_bits().hash(&mut h);
+        self.speed.to_bits().hash(&mut h);
+        self.pitch_semitones.to_bits().hash(&mut h);
+        self.pan.to_bits().hash(&mut h);
+        self.low_pass_hz.hash(&mut h);
+        self.high_pass_hz.hash(&mut h);
+        self.fade_in.to_bits().hash(&mut h);
+        self.fade_out.to_bits().hash(&mut h);
+        self.mute.hash(&mut h);
+        self.reverb.to_bits().hash(&mut h);
+        h.finish()
     }
 }
 
@@ -345,14 +376,11 @@ impl AudioEngine {
             // source needs to consume.
             let stream = stream.skip_duration(Duration::from_secs_f32(skip_secs * rate));
 
-            // (3) Optional looping. `repeat_infinite` consumes the entire
-            // upstream and replays it forever; we then bound the output
-            // with `take_duration` below.
-            let stream: Box<dyn Source<Item = f32> + Send> = if spec.loop_source {
-                Box::new(stream.buffered().repeat_infinite())
-            } else {
-                Box::new(stream)
-            };
+            // (3) Take only the visible duration. The audio engine no
+            // longer loops sources — when the visible window outlasts
+            // the file the tail is silent, which matches the inspector
+            // (the loop toggle was removed).
+            let stream: Box<dyn Source<Item = f32> + Send> = Box::new(stream);
             let stream = dsp::DynSource::new(stream);
 
             // (4) Take only the visible duration.
