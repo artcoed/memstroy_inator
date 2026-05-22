@@ -677,6 +677,44 @@ pub fn inspector(ui: &mut egui::Ui, state: &mut EditorState) {
 }
 
 fn inspector_body(ui: &mut egui::Ui, state: &mut EditorState) {
+    // ── Multi-select short-circuit ──
+    // When the user has lassoed more than one element on the canvas,
+    // the inspector intentionally hides the per-element parameters and
+    // just reports the count. Move / scale / rotate gizmos on the canvas
+    // still apply to every element in `canvas_selection` (relative to
+    // each element's own drag-start state) — see canvas_preview's
+    // broadcast_multi_* helpers.
+    if state.canvas_selection.len() > 1 {
+        let n = state.canvas_selection.len();
+        ui.add_space(20.0);
+        ui.vertical_centered(|ui| {
+            ui.label(
+                RichText::new(format!("{} elements selected", n))
+                    .size(14.0)
+                    .strong()
+                    .color(Color32::from_rgb(255, 200, 80)),
+            );
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(
+                    "Use the canvas to move, scale, or rotate them as a group."
+                )
+                .italics()
+                .size(11.0)
+                .color(COL_TEXT_DIM),
+            );
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(
+                    "Click a single element (or press Esc) to edit one at a time."
+                )
+                .size(10.0)
+                .color(COL_TEXT_DIM),
+            );
+        });
+        return;
+    }
+
     match state.selection {
         Selection::None => {
             inspector_nothing(ui, state);
@@ -3569,6 +3607,845 @@ fn collect_clip_edges(state: &EditorState, exclude_actor: Option<usize>) -> Vec<
 }
 
 
+// ─── OVERLAP TRIMMING ON LAYER ───────────────────────────────────────
+//
+// "On one layer, only one clip can exist at a time." When a clip is
+// moved, trimmed, or freshly placed, the helpers below trim every
+// other clip on the SAME timeline lane that ends up overlapping the
+// mover. Four cases per overlapping victim:
+//
+//   1. Victim is fully inside the mover  → remove the victim entirely.
+//   2. Mover is fully inside the victim → split the victim around the
+//      mover (left half keeps `t_in`, right half keeps `t_out`).
+//   3. Victim's right edge crosses mover's left edge → trim victim
+//      right edge down to `mover.t_in`.
+//   4. Victim's left edge crosses mover's right edge → trim victim
+//      left edge up to `mover.t_out`.
+//
+// All writes happen inside the caller-supplied `mutate_drag` token so
+// the entire compound change collapses into ONE undo step.
+//
+// `enforce_no_overlap_on_layer` returns the mover's possibly-shifted
+// index in case its index changed (removals at lower indices, splits
+// inserting before it, etc.). Callers that need to keep using the
+// mover's index after the call should swap it for the returned value.
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum MovedClipKind {
+    Actor(usize),
+    Overlay(usize),
+    Audio(usize),
+    Background(usize),
+}
+
+/// Enforce the "one clip per layer at a time" rule for the given
+/// mover. Returns the (possibly updated) mover identifier.
+pub(crate) fn enforce_no_overlap_on_layer(
+    state: &mut EditorState,
+    mover: MovedClipKind,
+    token: u64,
+) -> MovedClipKind {
+    let duration = state.scene.output.duration.max(0.0);
+
+    // Resolve the mover's lane and time window. Anything that doesn't
+    // resolve (out-of-range index, zero-length window, etc.) bails out
+    // early so we never touch other clips for an invalid mover.
+    let (lane_kind, m_in, m_out) = match resolve_mover(state, mover, duration) {
+        Some(t) => t,
+        None => return mover,
+    };
+    if m_out - m_in < 1.0e-4 {
+        return mover;
+    }
+
+    // ── First pass: classify every potential victim. ──
+    // We do this read-only so we can decide on the SET of operations
+    // before any indices shift. Splits / removals / trims are then
+    // applied in an order that keeps the mover's index valid.
+    let mut splits: Vec<SplitOp> = Vec::new();
+    let mut removes: Vec<RemoveOp> = Vec::new();
+    let mut trims: Vec<TrimOp> = Vec::new();
+
+    classify_victims(
+        state,
+        lane_kind,
+        mover,
+        m_in,
+        m_out,
+        &mut splits,
+        &mut removes,
+        &mut trims,
+    );
+
+    // ── Apply the operations. ──
+    //
+    // Order matters because every Remove/Split potentially shifts the
+    // mover's own index. We track that via `mover_kind`.
+    let mut mover_kind = mover;
+
+    // Splits first: they only apply to victims that contain the mover
+    // (and there can be at most one such victim per lane). Splitting
+    // inserts a new clip at victim_idx + 1; if victim_idx < mover_idx
+    // (same kind), mover_idx must shift by +1.
+    for op in splits {
+        mover_kind = apply_split(state, op, mover_kind, token);
+    }
+
+    // Removes next, descending order so removing a higher index first
+    // never invalidates lower ones we still want to remove.
+    removes.sort_by(|a, b| b.victim_idx.cmp(&a.victim_idx));
+    for op in removes {
+        mover_kind = apply_remove(state, op, mover_kind, token);
+    }
+
+    // Trims last: pure mutations, no index shifts.
+    for op in trims {
+        apply_trim(state, op, token);
+    }
+
+    // Bound audio rows that follow a parent actor must stay in sync
+    // with their actor's window after any trim / split — re-run the
+    // bookkeeping once at the end.
+    if let MovedClipKind::Actor(ai) = mover_kind {
+        if ai < state.scene.actors.len() {
+            sync_audio_to_actor(state, ai);
+        }
+    }
+
+    mover_kind
+}
+
+/// Identifies a timeline "layer" — either a track-indexed video lane
+/// (host of actors + overlays), an audio lane (host of audio rows), or
+/// the global background lane (host of `Scene::backgrounds`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LayerKind {
+    Video(usize),
+    Audio(usize),
+    Background,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum VictimKind {
+    Actor(usize),
+    Overlay(usize),
+    Audio(usize),
+    Background(usize),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TrimOp {
+    victim: VictimKind,
+    /// New time window after trim — interpreted as `[new_t_in, new_t_out]`
+    /// in scene-time. Background uses (start, start + duration).
+    new_t_in: f32,
+    new_t_out: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RemoveOp {
+    victim: VictimKind,
+    /// Pulled out so the post-pass can sort by descending index without
+    /// matching on the enum.
+    victim_idx: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SplitOp {
+    victim: VictimKind,
+    /// Cut the victim into a left half ending at `m_in` and a right
+    /// half starting at `m_out`.
+    m_in: f32,
+    m_out: f32,
+}
+
+fn resolve_mover(
+    state: &EditorState,
+    mover: MovedClipKind,
+    duration: f32,
+) -> Option<(LayerKind, f32, f32)> {
+    match mover {
+        MovedClipKind::Actor(ai) => {
+            if ai >= state.scene.actors.len() { return None; }
+            let a = &state.scene.actors[ai];
+            let lane = state
+                .actor_track_assignments
+                .get(&ai)
+                .copied()
+                .unwrap_or_else(|| {
+                    state
+                        .video_track_indices()
+                        .first()
+                        .copied()
+                        .unwrap_or(0)
+                });
+            Some((
+                LayerKind::Video(lane),
+                a.t_in.unwrap_or(0.0),
+                a.t_out.unwrap_or(duration),
+            ))
+        }
+        MovedClipKind::Overlay(oi) => {
+            if oi >= state.scene.overlays.len() { return None; }
+            let (t_in, t_out) = match &state.scene.overlays[oi] {
+                Overlay::Text(t) => (t.t_in, t.t_out),
+                Overlay::Image(im) => (im.t_in, im.t_out),
+                Overlay::Video(v) => (v.t_in, v.t_out),
+            };
+            let lane = state
+                .overlay_track_assignments
+                .get(&oi)
+                .copied()
+                .unwrap_or_else(|| default_overlay_lane(state));
+            Some((LayerKind::Video(lane), t_in, t_out))
+        }
+        MovedClipKind::Audio(aui) => {
+            if aui >= state.scene.audio.len() { return None; }
+            let a = &state.scene.audio[aui];
+            let lane = state
+                .audio_track_assignments
+                .get(&aui)
+                .copied()
+                .unwrap_or(0);
+            Some((LayerKind::Audio(lane), a.t_in, a.t_out.unwrap_or(duration)))
+        }
+        MovedClipKind::Background(bi) => {
+            if bi >= state.scene.backgrounds.len() { return None; }
+            let bg = &state.scene.backgrounds[bi];
+            Some((LayerKind::Background, bg.start, bg.start + bg.duration))
+        }
+    }
+}
+
+/// Mirror of `canvas_preview::default_overlay_track` — picks the second
+/// video lane when one exists, else the first, else 0.
+fn default_overlay_lane(state: &EditorState) -> usize {
+    let video_tracks: Vec<usize> = (0..state.tracks.len())
+        .filter(|i| state.tracks[*i].kind == TrackKind::Video)
+        .collect();
+    if video_tracks.len() >= 2 {
+        video_tracks[1]
+    } else if !video_tracks.is_empty() {
+        video_tracks[0]
+    } else {
+        0
+    }
+}
+
+fn classify_victims(
+    state: &EditorState,
+    lane: LayerKind,
+    mover: MovedClipKind,
+    m_in: f32,
+    m_out: f32,
+    splits: &mut Vec<SplitOp>,
+    removes: &mut Vec<RemoveOp>,
+    trims: &mut Vec<TrimOp>,
+) {
+    let duration = state.scene.output.duration.max(0.0);
+
+    // Helper: given a victim's window, decide what to do.
+    let mut classify =
+        |victim: VictimKind, v_in: f32, v_out: f32, mover_skip: bool| {
+            if mover_skip { return; }
+            if v_out - v_in < 1.0e-4 { return; }
+            // No overlap at all → leave it.
+            if v_out <= m_in || v_in >= m_out {
+                return;
+            }
+            let victim_idx = match victim {
+                VictimKind::Actor(i) => i,
+                VictimKind::Overlay(i) => i,
+                VictimKind::Audio(i) => i,
+                VictimKind::Background(i) => i,
+            };
+            // Victim is fully inside mover → remove.
+            if v_in >= m_in && v_out <= m_out {
+                removes.push(RemoveOp { victim, victim_idx });
+                return;
+            }
+            // Mover is fully inside victim → split victim around mover.
+            if v_in < m_in && v_out > m_out {
+                splits.push(SplitOp { victim, m_in, m_out });
+                return;
+            }
+            // Right-edge overlap: victim's tail intrudes into mover.
+            if v_in < m_in && v_out > m_in && v_out <= m_out {
+                trims.push(TrimOp {
+                    victim,
+                    new_t_in: v_in,
+                    new_t_out: m_in,
+                });
+                return;
+            }
+            // Left-edge overlap: victim's head intrudes into mover.
+            if v_in >= m_in && v_in < m_out && v_out > m_out {
+                trims.push(TrimOp {
+                    victim,
+                    new_t_in: m_out,
+                    new_t_out: v_out,
+                });
+            }
+        };
+
+    match lane {
+        LayerKind::Video(track_idx) => {
+            // Actors on the same video lane.
+            let first_video = state
+                .video_track_indices()
+                .first()
+                .copied()
+                .unwrap_or(0);
+            for ai in 0..state.scene.actors.len() {
+                let assigned = state
+                    .actor_track_assignments
+                    .get(&ai)
+                    .copied()
+                    .unwrap_or(first_video);
+                if assigned != track_idx { continue; }
+                let actor = &state.scene.actors[ai];
+                let t_in = actor.t_in.unwrap_or(0.0);
+                let t_out = actor.t_out.unwrap_or(duration);
+                let skip = matches!(mover, MovedClipKind::Actor(mai) if mai == ai);
+                classify(VictimKind::Actor(ai), t_in, t_out, skip);
+            }
+
+            // Overlays on the same video lane.
+            let default_lane = default_overlay_lane(state);
+            for oi in 0..state.scene.overlays.len() {
+                let assigned = state
+                    .overlay_track_assignments
+                    .get(&oi)
+                    .copied()
+                    .unwrap_or(default_lane);
+                if assigned != track_idx { continue; }
+                let (t_in, t_out) = match &state.scene.overlays[oi] {
+                    Overlay::Text(t) => (t.t_in, t.t_out),
+                    Overlay::Image(im) => (im.t_in, im.t_out),
+                    Overlay::Video(v) => (v.t_in, v.t_out),
+                };
+                let skip = matches!(mover, MovedClipKind::Overlay(moi) if moi == oi);
+                classify(VictimKind::Overlay(oi), t_in, t_out, skip);
+            }
+        }
+        LayerKind::Audio(track_idx) => {
+            for aui in 0..state.scene.audio.len() {
+                let assigned = state
+                    .audio_track_assignments
+                    .get(&aui)
+                    .copied()
+                    .unwrap_or(0);
+                if assigned != track_idx { continue; }
+                let a = &state.scene.audio[aui];
+                let t_in = a.t_in;
+                let t_out = a.t_out.unwrap_or(duration);
+                let skip = matches!(mover, MovedClipKind::Audio(mai) if mai == aui);
+                classify(VictimKind::Audio(aui), t_in, t_out, skip);
+            }
+        }
+        LayerKind::Background => {
+            for bi in 0..state.scene.backgrounds.len() {
+                let bg = &state.scene.backgrounds[bi];
+                let t_in = bg.start;
+                let t_out = bg.start + bg.duration;
+                let skip = matches!(mover, MovedClipKind::Background(mbi) if mbi == bi);
+                classify(VictimKind::Background(bi), t_in, t_out, skip);
+            }
+        }
+    }
+}
+
+/// Apply a victim trim (left edge, right edge, or both) to the scene.
+/// Mutates the scene in place inside a `mutate_drag` block keyed on
+/// `token` so the operation stays inside the same undo group as the
+/// caller's own writes.
+fn apply_trim(state: &mut EditorState, op: TrimOp, token: u64) {
+    let TrimOp { victim, new_t_in, new_t_out } = op;
+    if new_t_out - new_t_in < 1.0e-4 {
+        // Pathological case — would produce a zero-length clip. The
+        // caller's classify pass shouldn't generate these, but be safe.
+        return;
+    }
+    state.mutate_drag(token, |s| match victim {
+        VictimKind::Actor(i) => {
+            if i >= s.actors.len() { return; }
+            let a = &mut s.actors[i];
+            let old_in = a.t_in.unwrap_or(0.0);
+            // Bump source_start when shifting the in-edge so the
+            // visible content doesn't slip under the trim.
+            let shift_in = new_t_in - old_in;
+            if shift_in.abs() > 1.0e-6 {
+                a.source_start = (a.source_start + shift_in).max(0.0);
+            }
+            a.t_in = Some(new_t_in);
+            a.t_out = Some(new_t_out);
+            a.layout
+                .retain(|kf| kf.t >= new_t_in - 1.0e-3 && kf.t <= new_t_out + 1.0e-3);
+            if a.layout.is_empty() {
+                a.layout.push(memstroy_core::Keyframe::new(
+                    new_t_in,
+                    memstroy_core::ActorState::default(),
+                ));
+            }
+        }
+        VictimKind::Overlay(i) => {
+            if i >= s.overlays.len() { return; }
+            // Overlay kfs are clip-local. Shifting the in-edge requires
+            // re-anchoring every kf by `-(new_t_in - old_t_in)`.
+            let (old_t_in, old_t_out, layout): (
+                f32,
+                f32,
+                &mut Vec<memstroy_core::Keyframe<memstroy_core::OverlayState>>,
+            ) = match &mut s.overlays[i] {
+                Overlay::Text(t) => {
+                    let oi = t.t_in;
+                    let oo = t.t_out;
+                    t.t_in = new_t_in;
+                    t.t_out = new_t_out;
+                    (oi, oo, &mut t.layout)
+                }
+                Overlay::Image(im) => {
+                    let oi = im.t_in;
+                    let oo = im.t_out;
+                    im.t_in = new_t_in;
+                    im.t_out = new_t_out;
+                    (oi, oo, &mut im.layout)
+                }
+                Overlay::Video(v) => {
+                    let oi = v.t_in;
+                    let oo = v.t_out;
+                    v.t_in = new_t_in;
+                    v.t_out = new_t_out;
+                    (oi, oo, &mut v.layout)
+                }
+            };
+            let shift = new_t_in - old_t_in;
+            let _ = old_t_out;
+            if shift.abs() > 1.0e-6 {
+                for kf in layout.iter_mut() {
+                    kf.t -= shift;
+                }
+            }
+            let max_local = (new_t_out - new_t_in).max(0.0) + 1.0e-3;
+            layout.retain(|kf| kf.t >= -1.0e-3 && kf.t <= max_local);
+            for kf in layout.iter_mut() { kf.t = kf.t.max(0.0); }
+            if layout.is_empty() {
+                layout.push(memstroy_core::Keyframe::new(
+                    0.0,
+                    memstroy_core::OverlayState::default(),
+                ));
+            }
+        }
+        VictimKind::Audio(i) => {
+            if i >= s.audio.len() { return; }
+            let au = &mut s.audio[i];
+            let old_in = au.t_in;
+            let shift_in = new_t_in - old_in;
+            if shift_in.abs() > 1.0e-6 {
+                au.source_start = (au.source_start + shift_in).max(0.0);
+            }
+            au.t_in = new_t_in;
+            au.t_out = Some(new_t_out);
+        }
+        VictimKind::Background(i) => {
+            if i >= s.backgrounds.len() { return; }
+            let bg = &mut s.backgrounds[i];
+            bg.start = new_t_in;
+            bg.duration = (new_t_out - new_t_in).max(0.05);
+        }
+    });
+}
+
+/// Apply a victim removal. Cleans up bookkeeping side-tables (frame
+/// caches, audio waveforms, *_track_assignments) and shifts the
+/// mover's index when the removed clip was the same kind and lived at
+/// a smaller index.
+fn apply_remove(
+    state: &mut EditorState,
+    op: RemoveOp,
+    mover: MovedClipKind,
+    token: u64,
+) -> MovedClipKind {
+    let mut mover_out = mover;
+    let RemoveOp { victim, victim_idx: _ } = op;
+    state.mutate_drag(token, |s| match victim {
+        VictimKind::Actor(i) => {
+            if i >= s.actors.len() { return; }
+            s.actors.remove(i);
+        }
+        VictimKind::Overlay(i) => {
+            if i >= s.overlays.len() { return; }
+            s.overlays.remove(i);
+        }
+        VictimKind::Audio(i) => {
+            if i >= s.audio.len() { return; }
+            s.audio.remove(i);
+        }
+        VictimKind::Background(i) => {
+            if i >= s.backgrounds.len() { return; }
+            s.backgrounds.remove(i);
+        }
+    });
+    // Side-tables that mirror scene Vec indices.
+    match victim {
+        VictimKind::Actor(i) => {
+            if i < state.frame_caches.len() {
+                state.frame_caches.remove(i);
+            }
+            shift_assignments_after_remove(&mut state.actor_track_assignments, i);
+            if let MovedClipKind::Actor(mai) = mover_out {
+                if i < mai { mover_out = MovedClipKind::Actor(mai - 1); }
+            }
+        }
+        VictimKind::Overlay(i) => {
+            shift_assignments_after_remove(&mut state.overlay_track_assignments, i);
+            if let MovedClipKind::Overlay(moi) = mover_out {
+                if i < moi { mover_out = MovedClipKind::Overlay(moi - 1); }
+            }
+        }
+        VictimKind::Audio(i) => {
+            if i < state.audio_waveforms.len() {
+                state.audio_waveforms.remove(i);
+            }
+            shift_assignments_after_remove(&mut state.audio_track_assignments, i);
+            if let MovedClipKind::Audio(mai) = mover_out {
+                if i < mai { mover_out = MovedClipKind::Audio(mai - 1); }
+            }
+        }
+        VictimKind::Background(i) => {
+            if let MovedClipKind::Background(mbi) = mover_out {
+                if i < mbi { mover_out = MovedClipKind::Background(mbi - 1); }
+            }
+        }
+    }
+    if state.selection == sel_for_victim(victim) {
+        // Selected element vanished — drop the focus to None so the
+        // inspector falls back to its "nothing selected" view.
+        state.selection = Selection::None;
+    }
+    mover_out
+}
+
+fn sel_for_victim(victim: VictimKind) -> Selection {
+    match victim {
+        VictimKind::Actor(i) => Selection::Actor(i),
+        VictimKind::Overlay(i) => Selection::Overlay(i),
+        VictimKind::Audio(i) => Selection::Audio(i),
+        VictimKind::Background(i) => Selection::Background(i),
+    }
+}
+
+/// Decrement every map value pointing at an index >= `removed`. Map
+/// entries with key == `removed` are deleted, and entries with key
+/// > `removed` are re-keyed down by one — same scheme used by
+/// `EditorState::insert_video_track_at_*` for inserts, but in reverse.
+fn shift_assignments_after_remove(
+    map: &mut std::collections::HashMap<usize, usize>,
+    removed: usize,
+) {
+    let mut new_map: std::collections::HashMap<usize, usize> =
+        std::collections::HashMap::with_capacity(map.len());
+    for (k, v) in map.iter() {
+        if *k == removed { continue; }
+        let nk = if *k > removed { *k - 1 } else { *k };
+        new_map.insert(nk, *v);
+    }
+    *map = new_map;
+}
+
+/// Apply a victim split. The original clip becomes the LEFT half
+/// (ends at `m_in`); a clone becomes the RIGHT half (starts at `m_out`)
+/// and is inserted at index + 1. Track assignments are shifted so
+/// existing entries at indices >= victim+1 move up by one, and the
+/// new right-half clip inherits the same lane.
+fn apply_split(
+    state: &mut EditorState,
+    op: SplitOp,
+    mover: MovedClipKind,
+    token: u64,
+) -> MovedClipKind {
+    let SplitOp { victim, m_in, m_out } = op;
+    let mut mover_out = mover;
+    match victim {
+        VictimKind::Actor(i) => {
+            if i >= state.scene.actors.len() { return mover_out; }
+            // Clone first (immutable read), trim left and insert right.
+            let original = state.scene.actors[i].clone();
+            let mut right = original.clone();
+            right.id = unique_actor_id_in_scene(&state.scene.actors, &right.id);
+            // Right half: shift source_start so playback continues,
+            // crop kfs to scene-time >= m_out (actor kfs are scene-time).
+            let original_t_in = original.t_in.unwrap_or(0.0);
+            let original_t_out = original.t_out.unwrap_or(state.scene.output.duration);
+            right.t_in = Some(m_out);
+            right.t_out = Some(original_t_out);
+            right.source_start = original.source_start + (m_out - original_t_in).max(0.0);
+            right.layout.retain(|kf| kf.t >= m_out - 1.0e-3);
+            if right.layout.is_empty() {
+                let last = original.layout.last().map(|k| k.value).unwrap_or_default();
+                right.layout.push(memstroy_core::Keyframe::new(m_out, last));
+            }
+            // Bound audio (if any) belongs to the left half — wipe the
+            // parent_actor binding on the right half so a later
+            // sync_bound_audio_lanes doesn't try to follow it.
+            // (The audio row stays attached to the original actor on
+            // the left.)
+            state.mutate_drag(token, |s| {
+                // Trim left half.
+                let a = &mut s.actors[i];
+                a.t_out = Some(m_in);
+                a.layout.retain(|kf| kf.t <= m_in + 1.0e-3);
+                if a.layout.is_empty() {
+                    a.layout.push(memstroy_core::Keyframe::new(
+                        m_in,
+                        memstroy_core::ActorState::default(),
+                    ));
+                }
+                // Insert right half at i+1.
+                s.actors.insert(i + 1, right);
+            });
+            // Side-table bookkeeping.
+            shift_assignments_for_insert(&mut state.actor_track_assignments, i + 1);
+            // The right half inherits the original's lane.
+            let original_lane = state.actor_track_assignments.get(&i).copied();
+            if let Some(lane) = original_lane {
+                state.actor_track_assignments.insert(i + 1, lane);
+            }
+            // Frame caches: insert a placeholder at i+1 so subsequent
+            // actors don't drift relative to their caches.
+            if i + 1 <= state.frame_caches.len() {
+                state.frame_caches.insert(
+                    i + 1,
+                    crate::video_cache::FrameCache::new(
+                        std::path::PathBuf::new(),
+                        i + 1,
+                    ),
+                );
+            }
+            // Mover index shift: any actor with index > i moves up by 1
+            // because we inserted right-half AT i+1.
+            if let MovedClipKind::Actor(mai) = mover_out {
+                if mai >= i + 1 { mover_out = MovedClipKind::Actor(mai + 1); }
+            }
+        }
+        VictimKind::Overlay(i) => {
+            if i >= state.scene.overlays.len() { return mover_out; }
+            let original = state.scene.overlays[i].clone();
+            let mut right = original.clone();
+            // Mutate left half + insert right.
+            // Overlay kfs are clip-local: right's kfs need to subtract
+            // (m_out - original.t_in) from each kf time so kf=0 maps
+            // to the new t_in.
+            let (original_t_in, original_t_out) = match &original {
+                Overlay::Text(t) => (t.t_in, t.t_out),
+                Overlay::Image(im) => (im.t_in, im.t_out),
+                Overlay::Video(v) => (v.t_in, v.t_out),
+            };
+            let local_split = m_out - original_t_in;
+            // Right-half kfs filtered + re-anchored.
+            match &mut right {
+                Overlay::Text(t) => {
+                    t.id = unique_overlay_id_in_scene(&state.scene.overlays, &t.id);
+                    t.t_in = m_out;
+                    t.t_out = original_t_out;
+                    t.layout.retain(|kf| kf.t >= local_split - 1.0e-3);
+                    for kf in t.layout.iter_mut() { kf.t -= local_split; kf.t = kf.t.max(0.0); }
+                    if t.layout.is_empty() {
+                        t.layout.push(memstroy_core::Keyframe::new(
+                            0.0,
+                            memstroy_core::OverlayState::default(),
+                        ));
+                    }
+                }
+                Overlay::Image(im) => {
+                    im.id = unique_overlay_id_in_scene(&state.scene.overlays, &im.id);
+                    im.t_in = m_out;
+                    im.t_out = original_t_out;
+                    im.layout.retain(|kf| kf.t >= local_split - 1.0e-3);
+                    for kf in im.layout.iter_mut() { kf.t -= local_split; kf.t = kf.t.max(0.0); }
+                    if im.layout.is_empty() {
+                        im.layout.push(memstroy_core::Keyframe::new(
+                            0.0,
+                            memstroy_core::OverlayState::default(),
+                        ));
+                    }
+                }
+                Overlay::Video(v) => {
+                    v.id = unique_overlay_id_in_scene(&state.scene.overlays, &v.id);
+                    v.t_in = m_out;
+                    v.t_out = original_t_out;
+                    v.source_start = v.source_start + local_split.max(0.0);
+                    v.layout.retain(|kf| kf.t >= local_split - 1.0e-3);
+                    for kf in v.layout.iter_mut() { kf.t -= local_split; kf.t = kf.t.max(0.0); }
+                    if v.layout.is_empty() {
+                        v.layout.push(memstroy_core::Keyframe::new(
+                            0.0,
+                            memstroy_core::OverlayState::default(),
+                        ));
+                    }
+                }
+            }
+            let local_split_left = m_in - original_t_in;
+            state.mutate_drag(token, |s| {
+                // Trim left half.
+                match &mut s.overlays[i] {
+                    Overlay::Text(t) => {
+                        t.t_out = m_in;
+                        t.layout.retain(|kf| kf.t <= local_split_left + 1.0e-3);
+                        if t.layout.is_empty() {
+                            t.layout.push(memstroy_core::Keyframe::new(
+                                0.0,
+                                memstroy_core::OverlayState::default(),
+                            ));
+                        }
+                    }
+                    Overlay::Image(im) => {
+                        im.t_out = m_in;
+                        im.layout.retain(|kf| kf.t <= local_split_left + 1.0e-3);
+                        if im.layout.is_empty() {
+                            im.layout.push(memstroy_core::Keyframe::new(
+                                0.0,
+                                memstroy_core::OverlayState::default(),
+                            ));
+                        }
+                    }
+                    Overlay::Video(v) => {
+                        v.t_out = m_in;
+                        v.layout.retain(|kf| kf.t <= local_split_left + 1.0e-3);
+                        if v.layout.is_empty() {
+                            v.layout.push(memstroy_core::Keyframe::new(
+                                0.0,
+                                memstroy_core::OverlayState::default(),
+                            ));
+                        }
+                    }
+                }
+                s.overlays.insert(i + 1, right);
+            });
+            shift_assignments_for_insert(&mut state.overlay_track_assignments, i + 1);
+            let original_lane = state.overlay_track_assignments.get(&i).copied();
+            if let Some(lane) = original_lane {
+                state.overlay_track_assignments.insert(i + 1, lane);
+            }
+            if let MovedClipKind::Overlay(moi) = mover_out {
+                if moi >= i + 1 { mover_out = MovedClipKind::Overlay(moi + 1); }
+            }
+        }
+        VictimKind::Audio(i) => {
+            if i >= state.scene.audio.len() { return mover_out; }
+            let original = state.scene.audio[i].clone();
+            let mut right = original.clone();
+            right.id = unique_audio_id_in_scene(&state.scene.audio, &right.id);
+            let original_t_in = original.t_in;
+            let original_t_out =
+                original.t_out.unwrap_or(state.scene.output.duration);
+            right.t_in = m_out;
+            right.t_out = Some(original_t_out);
+            right.source_start = original.source_start + (m_out - original_t_in).max(0.0);
+            // The right half drops its parent_actor binding so the
+            // sync_audio_to_actor pass doesn't try to drag it back to
+            // the left half's window. The user can re-bind manually.
+            right.parent_actor = None;
+            state.mutate_drag(token, |s| {
+                let au = &mut s.audio[i];
+                au.t_out = Some(m_in);
+                s.audio.insert(i + 1, right);
+            });
+            shift_assignments_for_insert(&mut state.audio_track_assignments, i + 1);
+            let original_lane = state.audio_track_assignments.get(&i).copied();
+            if let Some(lane) = original_lane {
+                state.audio_track_assignments.insert(i + 1, lane);
+            }
+            if i + 1 <= state.audio_waveforms.len() {
+                state.audio_waveforms.insert(
+                    i + 1,
+                    crate::state::AudioWaveform::default(),
+                );
+            }
+            if let MovedClipKind::Audio(mai) = mover_out {
+                if mai >= i + 1 { mover_out = MovedClipKind::Audio(mai + 1); }
+            }
+        }
+        VictimKind::Background(i) => {
+            if i >= state.scene.backgrounds.len() { return mover_out; }
+            let original = state.scene.backgrounds[i].clone();
+            let mut right = original.clone();
+            right.id = unique_background_id_in_scene(&state.scene.backgrounds, &right.id);
+            right.start = m_out;
+            right.duration = (original.start + original.duration - m_out).max(0.05);
+            state.mutate_drag(token, |s| {
+                s.backgrounds[i].duration = (m_in - s.backgrounds[i].start).max(0.05);
+                s.backgrounds.insert(i + 1, right);
+            });
+            if let MovedClipKind::Background(mbi) = mover_out {
+                if mbi >= i + 1 { mover_out = MovedClipKind::Background(mbi + 1); }
+            }
+        }
+    }
+    mover_out
+}
+
+fn shift_assignments_for_insert(
+    map: &mut std::collections::HashMap<usize, usize>,
+    inserted: usize,
+) {
+    let mut new_map: std::collections::HashMap<usize, usize> =
+        std::collections::HashMap::with_capacity(map.len() + 1);
+    for (k, v) in map.iter() {
+        let nk = if *k >= inserted { *k + 1 } else { *k };
+        new_map.insert(nk, *v);
+    }
+    *map = new_map;
+}
+
+fn unique_actor_id_in_scene(actors: &[memstroy_core::Actor], base: &str) -> String {
+    let mut candidate = format!("{}_R", base);
+    let mut n = 2;
+    while actors.iter().any(|a| a.id == candidate) {
+        candidate = format!("{}_R{}", base, n);
+        n += 1;
+    }
+    candidate
+}
+
+fn unique_overlay_id_in_scene(overlays: &[Overlay], base: &str) -> String {
+    let mut candidate = format!("{}_R", base);
+    let mut n = 2;
+    while overlays.iter().any(|o| match o {
+        Overlay::Text(t) => t.id == candidate,
+        Overlay::Image(im) => im.id == candidate,
+        Overlay::Video(v) => v.id == candidate,
+    }) {
+        candidate = format!("{}_R{}", base, n);
+        n += 1;
+    }
+    candidate
+}
+
+fn unique_audio_id_in_scene(audios: &[memstroy_core::AudioTrack], base: &str) -> String {
+    let mut candidate = format!("{}_R", base);
+    let mut n = 2;
+    while audios.iter().any(|a| a.id == candidate) {
+        candidate = format!("{}_R{}", base, n);
+        n += 1;
+    }
+    candidate
+}
+
+fn unique_background_id_in_scene(
+    bgs: &[memstroy_core::Background],
+    base: &str,
+) -> String {
+    let mut candidate = format!("{}_R", base);
+    let mut n = 2;
+    while bgs.iter().any(|b| b.id == candidate) {
+        candidate = format!("{}_R{}", base, n);
+        n += 1;
+    }
+    candidate
+}
+
+
 // ─── TIMELINE ────────────────────────────────────────────────────────
 
 pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
@@ -4206,7 +5083,16 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                     s.backgrounds[bi].start = new_start;
                                     s.backgrounds[bi].duration = new_dur;
                                 });
-                                to_select = Some(Selection::Background(bi));
+                                let updated = enforce_no_overlap_on_layer(
+                                    state,
+                                    MovedClipKind::Background(bi),
+                                    token,
+                                );
+                                let bi_eff = match updated {
+                                    MovedClipKind::Background(i) => i,
+                                    _ => bi,
+                                };
+                                to_select = Some(Selection::Background(bi_eff));
                             } else if clicked == f32::NEG_INFINITY {
                                 // Trim right: stretch / shrink the duration.
                                 let dx = ui.input(|i| i.pointer.delta().x);
@@ -4216,7 +5102,16 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                 state.mutate_drag(token, |s| {
                                     s.backgrounds[bi].duration = new_dur;
                                 });
-                                to_select = Some(Selection::Background(bi));
+                                let updated = enforce_no_overlap_on_layer(
+                                    state,
+                                    MovedClipKind::Background(bi),
+                                    token,
+                                );
+                                let bi_eff = match updated {
+                                    MovedClipKind::Background(i) => i,
+                                    _ => bi,
+                                };
+                                to_select = Some(Selection::Background(bi_eff));
                             } else if clicked < 0.0 {
                                 let new_start = (-clicked).max(0.0);
                                 let dur = clip_end - clip_start;
@@ -4225,7 +5120,16 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                     s.backgrounds[bi].start = new_start;
                                     s.backgrounds[bi].duration = dur;
                                 });
-                                to_select = Some(Selection::Background(bi));
+                                let updated = enforce_no_overlap_on_layer(
+                                    state,
+                                    MovedClipKind::Background(bi),
+                                    token,
+                                );
+                                let bi_eff = match updated {
+                                    MovedClipKind::Background(i) => i,
+                                    _ => bi,
+                                };
+                                to_select = Some(Selection::Background(bi_eff));
                             } else if state.split_tool_active {
                                 to_select = Some(Selection::Background(bi));
                                 state.playhead = clicked;
@@ -4288,10 +5192,21 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                     ));
                                 }
                             });
+                            // Trim/split/remove any neighbours we now
+                            // overlap on the same lane.
+                            let updated = enforce_no_overlap_on_layer(
+                                state,
+                                MovedClipKind::Actor(ai),
+                                token,
+                            );
+                            let ai_eff = match updated {
+                                MovedClipKind::Actor(i) => i,
+                                _ => ai,
+                            };
                             // Bound audio: shift its in-edge by the same delta and
                             // advance source_start so the playback head doesn't slip.
-                            sync_audio_to_actor(state, ai);
-                            to_select = Some(Selection::Actor(ai));
+                            sync_audio_to_actor(state, ai_eff);
+                            to_select = Some(Selection::Actor(ai_eff));
                         } else if clicked == f32::NEG_INFINITY {
                             // Trim right edge: adjust t_out.
                             //
@@ -4331,8 +5246,17 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                     ));
                                 }
                             });
-                            sync_audio_to_actor(state, ai);
-                            to_select = Some(Selection::Actor(ai));
+                            let updated = enforce_no_overlap_on_layer(
+                                state,
+                                MovedClipKind::Actor(ai),
+                                token,
+                            );
+                            let ai_eff = match updated {
+                                MovedClipKind::Actor(i) => i,
+                                _ => ai,
+                            };
+                            sync_audio_to_actor(state, ai_eff);
+                            to_select = Some(Selection::Actor(ai_eff));
                         } else if clicked < 0.0 {
                             // Drag: move the actor's time window
                             let mut new_start = (-clicked).max(0.0);
@@ -4457,8 +5381,22 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                     }
                                 }
                             });
-                            sync_audio_to_actor(state, ai);
-                            to_select = Some(Selection::Actor(ai));
+                            // Same-lane overlap rule: trim/split/remove
+                            // any clips that this move just collided
+                            // with on the actor's current lane. The
+                            // helper may shift `ai` if it removes /
+                            // splits clips at lower indices.
+                            let updated = enforce_no_overlap_on_layer(
+                                state,
+                                MovedClipKind::Actor(ai),
+                                token,
+                            );
+                            let ai_eff = match updated {
+                                MovedClipKind::Actor(i) => i,
+                                _ => ai,
+                            };
+                            sync_audio_to_actor(state, ai_eff);
+                            to_select = Some(Selection::Actor(ai_eff));
                         } else if state.split_tool_active {
                             to_select = Some(Selection::Actor(ai));
                             state.playhead = clicked;
@@ -4577,7 +5515,16 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                     ));
                                 }
                             });
-                            to_select = Some(Selection::Overlay(oi));
+                            let updated = enforce_no_overlap_on_layer(
+                                state,
+                                MovedClipKind::Overlay(oi),
+                                token,
+                            );
+                            let oi_eff = match updated {
+                                MovedClipKind::Overlay(i) => i,
+                                _ => oi,
+                            };
+                            to_select = Some(Selection::Overlay(oi_eff));
                         } else if clicked == f32::NEG_INFINITY {
                             // Trim right edge.
                             let dx = ui.input(|i| i.pointer.delta().x);
@@ -4602,7 +5549,16 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                     ));
                                 }
                             });
-                            to_select = Some(Selection::Overlay(oi));
+                            let updated = enforce_no_overlap_on_layer(
+                                state,
+                                MovedClipKind::Overlay(oi),
+                                token,
+                            );
+                            let oi_eff = match updated {
+                                MovedClipKind::Overlay(i) => i,
+                                _ => oi,
+                            };
+                            to_select = Some(Selection::Overlay(oi_eff));
                         } else if clicked < 0.0 {
                             // Drag: move the overlay's time window.
                             let new_start = (-clicked).max(0.0);
@@ -4677,7 +5633,19 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                     }
                                 }
                             }
-                            to_select = Some(Selection::Overlay(oi));
+                            // Trim/split/remove neighbours that this
+                            // overlay just collided with on its (now
+                            // possibly-different) lane.
+                            let updated = enforce_no_overlap_on_layer(
+                                state,
+                                MovedClipKind::Overlay(oi),
+                                token,
+                            );
+                            let oi_eff = match updated {
+                                MovedClipKind::Overlay(i) => i,
+                                _ => oi,
+                            };
+                            to_select = Some(Selection::Overlay(oi_eff));
                         } else if state.split_tool_active {
                             to_select = Some(Selection::Overlay(oi));
                             state.playhead = clicked;
@@ -4750,7 +5718,16 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                 s.audio[aui].source_start =
                                     (prev_src + actual_delta).max(0.0);
                             });
-                            to_select = Some(Selection::Audio(aui));
+                            let updated = enforce_no_overlap_on_layer(
+                                state,
+                                MovedClipKind::Audio(aui),
+                                token,
+                            );
+                            let aui_eff = match updated {
+                                MovedClipKind::Audio(i) => i,
+                                _ => aui,
+                            };
+                            to_select = Some(Selection::Audio(aui_eff));
                         } else if clicked == f32::NEG_INFINITY {
                             // Trim right: extend / shrink the audible window.
                             let dx = ui.input(|i| i.pointer.delta().x);
@@ -4760,7 +5737,16 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             state.mutate_drag(token, |s| {
                                 s.audio[aui].t_out = Some(new_out);
                             });
-                            to_select = Some(Selection::Audio(aui));
+                            let updated = enforce_no_overlap_on_layer(
+                                state,
+                                MovedClipKind::Audio(aui),
+                                token,
+                            );
+                            let aui_eff = match updated {
+                                MovedClipKind::Audio(i) => i,
+                                _ => aui,
+                            };
+                            to_select = Some(Selection::Audio(aui_eff));
                         } else if clicked < 0.0 {
                             // Drag: move the audio clip horizontally.
                             let new_start = (-clicked).max(0.0);
@@ -4845,7 +5831,19 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                     }
                                 }
                             }
-                            to_select = Some(Selection::Audio(aui));
+                            // Trim/split/remove neighbours that the
+                            // audio just collided with on its (now
+                            // possibly-different) lane.
+                            let updated = enforce_no_overlap_on_layer(
+                                state,
+                                MovedClipKind::Audio(aui),
+                                token,
+                            );
+                            let aui_eff = match updated {
+                                MovedClipKind::Audio(i) => i,
+                                _ => aui,
+                            };
+                            to_select = Some(Selection::Audio(aui_eff));
                         } else {
                             to_select = Some(Selection::Audio(aui));
                         }
@@ -5159,6 +6157,17 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                     // The bound audio (added by add_actor_from_clip_at_time)
                     // mirrors the actor's lane via sync_bound_audio_lanes()
                     // at the end of the frame.
+                    // Same-lane overlap rule: trim/split/remove anything
+                    // we just dropped on top of.
+                    let drop_token =
+                        EditorState::drag_token("library_drop", new_idx);
+                    state.mutate_drag(drop_token, |_| {});
+                    let _ = enforce_no_overlap_on_layer(
+                        state,
+                        MovedClipKind::Actor(new_idx),
+                        drop_token,
+                    );
+                    state.end_drag_group();
                 }
             } else if matches!(kind, AssetDragKind::Sound | AssetDragKind::Image | AssetDragKind::Particle) {
                 // Build a LibraryAsset proxy from the drag payload and
@@ -5179,6 +6188,36 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                 state.playhead = drop_time;
                 add_library_asset_at_playhead(state, &asset, kind);
                 state.playhead = saved_t;
+                // Trim/split/remove neighbours on the freshly-dropped
+                // asset's lane. We dispatch by kind because the
+                // last-pushed element index varies per spawner above.
+                let drop_token = EditorState::drag_token("library_drop_asset", 0);
+                state.mutate_drag(drop_token, |_| {});
+                let mover = match kind {
+                    AssetDragKind::Sound => state
+                        .scene
+                        .audio
+                        .len()
+                        .checked_sub(1)
+                        .map(MovedClipKind::Audio),
+                    AssetDragKind::Image | AssetDragKind::Particle => state
+                        .scene
+                        .overlays
+                        .len()
+                        .checked_sub(1)
+                        .map(MovedClipKind::Overlay),
+                    AssetDragKind::Video => state
+                        .scene
+                        .actors
+                        .len()
+                        .checked_sub(1)
+                        .map(MovedClipKind::Actor),
+                    _ => None,
+                };
+                if let Some(m) = mover {
+                    let _ = enforce_no_overlap_on_layer(state, m, drop_token);
+                }
+                state.end_drag_group();
             }
 
             // Clear the drag state.
