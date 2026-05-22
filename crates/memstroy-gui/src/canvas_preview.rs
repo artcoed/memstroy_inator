@@ -99,6 +99,18 @@ fn overlay_is_behind_actors(state: &EditorState, overlay_idx: usize) -> bool {
 
 /// Render the free canvas preview panel.
 pub fn canvas_preview(ui: &mut egui::Ui, state: &mut EditorState) {
+    // Force a per-frame repaint while a canvas drag (move / resize /
+    // rotate / pan / asset-drop) is in flight so motion stays smooth
+    // — egui's reactive scheduler would otherwise wait for the next
+    // input event and the dragged element would trail the cursor by a
+    // frame or two ("застревание" feedback from users).
+    let any_pointer_down = ui.input(|i| i.pointer.any_down());
+    let canvas_drag_active = state.canvas_drag.mode != crate::state::CanvasDragMode::None
+        || state.asset_drag.dragging.is_some();
+    if any_pointer_down || canvas_drag_active {
+        ui.ctx().request_repaint();
+    }
+
     let avail = ui.available_size_before_wrap();
     let (full_rect, response) = ui.allocate_exact_size(avail, Sense::click_and_drag());
 
@@ -279,13 +291,27 @@ fn handle_canvas_input(
         state.canvas_panning = false;
     }
 
-    // Scroll wheel → zoom viewport
+    // Scroll wheel → zoom viewport.
+    //
+    // The previous step was 1.05× per wheel notch which felt aggressive
+    // for fine-grained editing on the canvas. We now scale the zoom by
+    // an exponential curve based on the actual scroll magnitude so the
+    // user gets:
+    //   * very small steps (~1.5%) per detent for precise tweaks,
+    //   * proportional behaviour when the OS sends large smooth-scroll
+    //     deltas (e.g. continuous trackpad pinch),
+    //   * Ctrl+Wheel = larger steps for fast traversal between zoom
+    //     levels (mirrors Photoshop / Figma muscle memory).
     if response.hovered() {
         let scroll = ui.input(|i| i.smooth_scroll_delta);
+        let ctrl = ui.input(|i| i.modifiers.ctrl);
 
         if scroll.y.abs() > 0.1 {
-            // Zoom towards mouse position
-            let factor = if scroll.y > 0.0 { 1.05 } else { 1.0 / 1.05 };
+            let base = if ctrl { 0.0040_f32 } else { 0.0015_f32 };
+            // Cap |dy| so a runaway momentum scroll can't multiply the
+            // zoom by an extreme factor in a single frame.
+            let dy = scroll.y.clamp(-120.0, 120.0);
+            let factor = (base * dy).exp();
             if let Some(mouse) = ui.input(|i| i.pointer.hover_pos()) {
                 let local = [mouse.x - _full_rect.min.x, mouse.y - _full_rect.min.y];
                 state.canvas_viewport.zoom_at(local, viewport_size, factor);
@@ -805,13 +831,28 @@ fn draw_canvas_elements(
             );
         }
 
-        // Border
+        // Border. Primary selection gets the bright yellow gizmo
+        // border; multi-selection (Ctrl+click) shows a slimmer dashed
+        // border so the user can see every element in the set without
+        // confusing it with the primary "edit me" target.
+        let multi_selected = state
+            .canvas_selection
+            .iter()
+            .any(|s| *s == Selection::Actor(idx));
         let border_col = if state.selection == Selection::Actor(idx) {
             COL_SELECTED_BORDER
+        } else if multi_selected {
+            Color32::from_rgb(255, 180, 60)
         } else {
             COL_ELEMENT_BORDER
         };
-        let border_width = if state.selection == Selection::Actor(idx) { 2.0 } else { 1.0 };
+        let border_width = if state.selection == Selection::Actor(idx) {
+            2.0
+        } else if multi_selected {
+            1.5
+        } else {
+            1.0
+        };
         painter.rect_stroke(elem_rect, Rounding::same(3.0), Stroke::new(border_width, border_col));
 
         // Display mode indicator
@@ -1577,7 +1618,30 @@ fn draw_selection_gizmo(
         if let Some(mouse) = response.interact_pointer_pos() {
             let local = [mouse.x - full_rect.min.x, mouse.y - full_rect.min.y];
             let click_world = state.canvas_viewport.screen_to_world(local, viewport_size);
+            let modifiers = ui.input(|i| i.modifiers);
+            let extend = modifiers.ctrl || modifiers.shift || modifiers.command;
             try_select_at(state, click_world);
+            if extend {
+                // Ctrl/Shift+click toggles the clicked element in the
+                // canvas multi-selection. Empty hits (Selection::None)
+                // are ignored so the modifier-click never accidentally
+                // wipes the existing set.
+                if state.selection != Selection::None {
+                    let sel = state.selection;
+                    if let Some(pos) = state.canvas_selection.iter().position(|s| *s == sel) {
+                        state.canvas_selection.remove(pos);
+                    } else {
+                        state.canvas_selection.push(sel);
+                    }
+                }
+            } else {
+                // Plain click: replace the multi-selection with the
+                // single hit (or clear it if nothing was hit).
+                state.canvas_selection.clear();
+                if state.selection != Selection::None {
+                    state.canvas_selection.push(state.selection);
+                }
+            }
         }
     }
 
@@ -1700,6 +1764,29 @@ fn decide_drag_mode(
     let rf_center = Pos2::new(full_rect.min.x + center_screen[0], full_rect.min.y + center_screen[1]);
     if (start - rf_center).length() < RF_CENTER_RADIUS * 2.0 {
         return CanvasDragMode::MoveRenderFrame { initial_pos: [rf_state.pos.x, rf_state.pos.y] };
+    }
+
+    // 3b. When the render frame is the selection, dragging anywhere
+    //     inside the (rotated) frame body also moves it. We project the
+    //     click into the frame's local coordinates so the body-click
+    //     hit-test follows the visible rotated outline rather than the
+    //     un-rotated bbox.
+    if state.selection == Selection::RenderFrame {
+        let [rw, rh] = rf.resolution;
+        let world_w = rw as f32 / rf_state.zoom.max(1e-6);
+        let world_h = rh as f32 / rf_state.zoom.max(1e-6);
+        let dx = world.x - rf_state.pos.x;
+        let dy = world.y - rf_state.pos.y;
+        let rad = rf_state.rotation_deg.to_radians();
+        let cs = rad.cos();
+        let sn = rad.sin();
+        let lx = dx * cs + dy * sn;
+        let ly = -dx * sn + dy * cs;
+        if lx.abs() <= world_w * 0.5 && ly.abs() <= world_h * 0.5 {
+            return CanvasDragMode::MoveRenderFrame {
+                initial_pos: [rf_state.pos.x, rf_state.pos.y],
+            };
+        }
     }
 
     // 4. Click on a render frame corner → ResizeRenderFrame.
@@ -2604,23 +2691,15 @@ fn selected_element_screen_rect(
         }
         Selection::RenderFrame => {
             // The render frame is selectable like any other element so the
-            // user can rotate/resize/reposition it from the canvas with
-            // the same handles + rotation gizmo as the rest. We return an
-            // axis-aligned bbox here (rotation is rendered separately by
-            // `draw_render_frame`); resizing this AABB is mapped to
-            // changing `zoom` via `set_selection_scale`.
-            let rf = &state.scene.render_frame;
-            let rf_state = sample_render_frame(rf, t);
-            let [rw, rh] = rf.resolution;
-            let world_w = rw as f32 / rf_state.zoom.max(1e-6);
-            let world_h = rh as f32 / rf_state.zoom.max(1e-6);
-            let center_screen = state.canvas_viewport.world_to_screen(rf_state.pos, viewport_size);
-            let half_w = world_w * 0.5 * state.canvas_viewport.zoom;
-            let half_h = world_h * 0.5 * state.canvas_viewport.zoom;
-            Some(Rect::from_center_size(
-                Pos2::new(full_rect.min.x + center_screen[0], full_rect.min.y + center_screen[1]),
-                Vec2::new(half_w * 2.0, half_h * 2.0),
-            ))
+            // user can rotate/resize/reposition it from the canvas. We
+            // intentionally return `None` here so the generic AABB
+            // handles drawn by `draw_selection_handles` don't appear on
+            // top of the rotated handles drawn by `draw_render_frame`.
+            // The resize / move drag modes for the render frame are
+            // detected separately in `decide_drag_mode` using rotated
+            // corner positions, and the rotated body hit-test uses the
+            // OBB so a click inside the visible frame still selects it.
+            None
         }
         _ => None,
     }
@@ -3247,12 +3326,22 @@ fn try_select_at(state: &mut EditorState, pos: WorldPos) {
         }
     }
 
-    // Render frame fall-through: clicking inside the frame border area
-    // (when nothing else matched) selects the render frame itself so the
-    // inspector exposes its position / size / rotation.
-    if pos.x >= frame_tl_x && pos.x <= frame_tl_x + world_w
-        && pos.y >= frame_tl_y && pos.y <= frame_tl_y + world_h
-    {
+    // Render frame fall-through: clicking inside the frame outline
+    // (when nothing else matched) selects the render frame itself so
+    // the inspector exposes its position / size / rotation. The
+    // hit-test rotates the click position into the frame's local
+    // coordinate frame so the collider follows the visible (rotated)
+    // outline rather than the un-rotated bbox.
+    let rad = rf_state.rotation_deg.to_radians();
+    let cs = rad.cos();
+    let sn = rad.sin();
+    let dx = pos.x - rf_state.pos.x;
+    let dy = pos.y - rf_state.pos.y;
+    let lx = dx * cs + dy * sn;
+    let ly = -dx * sn + dy * cs;
+    let half_w = world_w * 0.5;
+    let half_h = world_h * 0.5;
+    if lx >= -half_w && lx <= half_w && ly >= -half_h && ly <= half_h {
         state.selection = Selection::RenderFrame;
         return;
     }
