@@ -44,6 +44,19 @@ impl App {
         state.tokio_handle = Some(rt.handle().clone());
         state.reload_library();
 
+        // ── Auto-bootstrap the local memstroy-assets-server ──
+        // The Library panel's "Refresh" / shared-asset endpoints expect
+        // a server running at `state.server_url`. Previously the user
+        // had to remember to launch `cargo run -p memstroy-assets-server`
+        // in a second terminal, and the GUI just printed connection
+        // errors when they didn't. We now spin one up in-process on the
+        // same tokio runtime, indexing whatever `assets/` directory the
+        // editor is rooted at. If the bind fails (port already taken,
+        // another server instance is already running, etc.) the GUI
+        // still works — the network calls just talk to the existing
+        // server through the same loopback URL.
+        Self::spawn_local_assets_server(rt.handle(), &state);
+
         // Construct the audio engine and immediately apply the master
         // volume from the persisted settings. That way the very first
         // playback obeys the user's saved level instead of the engine's
@@ -87,6 +100,75 @@ impl App {
             prev_playhead: 0.0,
             prev_audio_source_count: 0,
         }
+    }
+
+    /// Spin up a `memstroy-assets-server` instance on the same tokio
+    /// runtime as the GUI, parsing the address out of `state.server_url`.
+    /// Failures (bad URL, port already bound by another instance, etc.)
+    /// are logged but do not abort start-up — the GUI's HTTP calls fall
+    /// through to whatever (if anything) is already listening on that
+    /// port, which keeps developer workflows where the server is run
+    /// separately working unchanged.
+    fn spawn_local_assets_server(
+        handle: &tokio::runtime::Handle,
+        state: &EditorState,
+    ) {
+        // Parse `host:port` out of `state.server_url`. We accept either
+        // `http://host:port` or just `host:port`.
+        let raw = state.server_url.trim();
+        let stripped = raw
+            .strip_prefix("http://")
+            .or_else(|| raw.strip_prefix("https://"))
+            .unwrap_or(raw)
+            .trim_end_matches('/')
+            .trim_end_matches("/api");
+        let host_port = stripped.split('/').next().unwrap_or(stripped);
+        let addr: std::net::SocketAddr = match host_port.parse() {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::warn!(
+                    server_url = %raw,
+                    error = %e,
+                    "could not parse asset server URL — skipping in-process bootstrap"
+                );
+                return;
+            }
+        };
+
+        // Anchor the asset root at the editor's current `assets_root` so
+        // the server indexes the same files the GUI's local library tab
+        // surfaces. Existing subdirectories (`assets/mellstroy/`,
+        // `assets/sounds/`, ...) are picked up by the walker.
+        let root = state.assets_root.join("assets");
+        if let Err(e) = std::fs::create_dir_all(&root) {
+            tracing::warn!(
+                root = %root.display(),
+                error = %e,
+                "could not create asset root for in-process server"
+            );
+            return;
+        }
+
+        // The server is fully async, so spawn it onto our runtime. Any
+        // bind error inside `start()` is logged by the server itself
+        // and the join handle simply resolves — the GUI keeps running.
+        let store = memstroy_assets_server::AssetStore::new();
+        if let Err(e) = store.index_dir(&root) {
+            tracing::warn!(
+                root = %root.display(),
+                error = %e,
+                "failed to index asset root for in-process server"
+            );
+        }
+        let _ = handle.enter();
+        let _join = handle.spawn(async move {
+            let _ = memstroy_assets_server::start(addr, store).await;
+        });
+        tracing::info!(
+            addr = %addr,
+            root = %root.display(),
+            "spawned in-process memstroy-assets-server"
+        );
     }
 
     fn pump_events(&mut self, _ctx: &egui::Context) {
@@ -1531,6 +1613,16 @@ impl eframe::App for App {
             self.state.pre_press_scene = Some(self.state.scene.clone());
         }
 
+        // Snapshot the scene at the *very* start of every frame so we
+        // can fall back to a "scene differs at end of frame, no pointer
+        // gesture in flight" undo entry. This catches edits that don't
+        // go through a pointer press/release at all — keyboard typing
+        // into a `DragValue`, arrow-key nudges, popup menu picks, etc.
+        // Without it, those edits would never get an undo snapshot, and
+        // the user only sees ONE history entry for an entire session
+        // (which manifests as "Ctrl+Z bounces between two states").
+        let frame_start_scene = self.state.scene.clone();
+
         // ── End the active drag-undo group when no mouse button is down ──
         // The undo/redo system snapshots once per drag gesture by tracking
         // a `last_drag_group` token. The token must be cleared as soon as
@@ -2064,9 +2156,11 @@ impl eframe::App for App {
                 || i.pointer.secondary_down()
                 || i.pointer.middle_down()
         });
+        let mut release_block_handled_undo = false;
         if released_this_frame && !any_pointer_still_down {
             if let Some(pre) = self.state.pre_press_scene.take() {
                 let mutate_drag_handled = self.state.last_drag_group.is_some();
+                release_block_handled_undo = true;
                 if !mutate_drag_handled {
                     let pre_yaml = serde_yaml::to_string(&pre).unwrap_or_default();
                     let cur_yaml =
@@ -2075,6 +2169,37 @@ impl eframe::App for App {
                         self.state.undo.push(&pre);
                     }
                 }
+            }
+        }
+
+        // ── Frame-level fallback: catch edits that bypass pointer ──
+        //
+        // The press/release path above only fires when the user actually
+        // released a mouse button this frame. Edits driven purely by
+        // the keyboard (typing into a DragValue, arrow-key nudges,
+        // ComboBox keyboard navigation, …) can mutate `state.scene`
+        // without ever touching `pre_press_scene`, which is what made
+        // Ctrl+Z bounce between just the two states the press/release
+        // mechanism happened to capture.
+        //
+        // To restore granular undo, compare the scene captured at the
+        // very start of this frame to the scene at the end. When the
+        // user is NOT in the middle of a pointer gesture AND no drag
+        // group is in flight AND no release fired this frame (so the
+        // press/release path didn't already handle it), push the start-
+        // of-frame snapshot as a fresh undo entry whenever the scene
+        // actually changed.
+        if !any_pointer_still_down
+            && self.state.last_drag_group.is_none()
+            && !release_block_handled_undo
+            && self.state.pre_press_scene.is_none()
+        {
+            let pre_yaml =
+                serde_yaml::to_string(&frame_start_scene).unwrap_or_default();
+            let cur_yaml =
+                serde_yaml::to_string(&self.state.scene).unwrap_or_default();
+            if pre_yaml != cur_yaml {
+                self.state.undo.push(&frame_start_scene);
             }
         }
     }

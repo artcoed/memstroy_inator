@@ -2709,6 +2709,7 @@ dependencies = [
  "egui",
  "egui_extras",
  "image",
+ "memstroy-assets-server",
  "memstroy-core",
  "memstroy-render",
  "memstroy-vision",
