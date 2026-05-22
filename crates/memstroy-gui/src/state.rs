@@ -1123,10 +1123,23 @@ impl EditorState {
                 } else {
                     None
                 };
+                // Pick up the description sidecar (`<stem>.txt`) if it
+                // exists. It's written by the assets-server during TG
+                // ingest and mirrored locally by `jobs::spawn_refresh`,
+                // so each clip card can show the original Telegram
+                // caption rather than the bare numeric id.
+                let txt_path = clips_dir.join(format!("{}.txt", stem));
+                let description = match std::fs::read_to_string(&txt_path) {
+                    Ok(s) => {
+                        let trimmed = s.trim().to_string();
+                        if trimmed.is_empty() { stem.clone() } else { trimmed }
+                    }
+                    Err(_) => stem.clone(),
+                };
                 clips.push(LibraryClip {
                     id,
                     path: path.clone(),
-                    description: stem,
+                    description,
                     downloaded: true,
                     thumbnail,
                 });
@@ -1424,10 +1437,23 @@ fn scan_asset_dir(dir: &std::path::Path, category: AssetCategory) -> Vec<Library
                 candidates.into_iter().find(|p| p.exists())
             }
         };
+        // Optional sidecar caption: `<stem>.txt` next to the asset.
+        // The assets-server writes these for Telegram-ingested clips,
+        // and the GUI mirrors them locally on refresh — picking them
+        // up here means sounds / videos / particles get a real label
+        // instead of a bare numeric id once a sidecar is present.
+        let txt_path = path.with_extension("txt");
+        let label = match std::fs::read_to_string(&txt_path) {
+            Ok(s) => {
+                let trimmed = s.trim().to_string();
+                if trimmed.is_empty() { id.clone() } else { trimmed }
+            }
+            Err(_) => id.clone(),
+        };
         out.push(LibraryAsset {
             id: id.clone(),
             path: path.clone(),
-            label: id,
+            label,
             thumbnail,
         });
     }
