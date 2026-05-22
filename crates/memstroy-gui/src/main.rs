@@ -7,10 +7,12 @@ mod clip_editor;
 mod curve_editor;
 
 mod gpu_preview;
+mod i18n;
 mod jobs;
 mod kf_anim;
 mod node_editor;
 mod panels;
+mod settings;
 mod skeleton_editor;
 mod state;
 mod title_templates;

@@ -628,13 +628,8 @@ fn cmd_add_audio(args: &[String], scene: &mut Scene) -> Result<(), String> {
         source: PathBuf::from(src),
         t_in,
         t_out,
-        source_start: 0.0,
         volume,
-        speed: 1.0,
-        parent_actor: None,
-        volume_kfs: Vec::new(),
-        speed_kfs: Vec::new(),
-        animated_params: Default::default(),
+        ..Default::default()
     });
     Ok(())
 }
