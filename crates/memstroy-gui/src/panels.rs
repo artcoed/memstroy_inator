@@ -264,6 +264,20 @@ fn library_clips_tab(ui: &mut egui::Ui, state: &mut EditorState) {
             .strong()
             .color(Color32::from_rgb(220, 130, 50)),
     );
+    // Clips are server-managed by design — the Refresh action POSTs
+    // to the in-process memstroy-assets-server which scrapes Telegram
+    // on the GUI's behalf. Surface that explicitly so users know which
+    // controls drive this list.
+    ui.label(
+        RichText::new(format!(
+            "\u{1F310} {}: {}",
+            crate::i18n::t("server"),
+            state.server_url
+        ))
+        .size(9.0)
+        .italics()
+        .color(COL_TEXT_DIM),
+    );
     if state.refreshing {
         ui.label(
             RichText::new(crate::i18n::t("refreshing..."))
@@ -377,22 +391,103 @@ fn library_assets_tab(ui: &mut egui::Ui, state: &mut EditorState, kind: AssetDra
     let scroll_id = format!("library_{}_scroll", title.to_lowercase());
     // Snapshot the row data so the borrow checker is happy with the
     // mutable `state` we pass to `library_asset_card`.
-    let rows: Vec<crate::state::LibraryAsset> = assets
-        .iter()
-        .filter(|a| {
-            search_lower.is_empty()
-                || a.label.to_lowercase().contains(&search_lower)
-                || a.id.to_lowercase().contains(&search_lower)
-        })
-        .cloned()
-        .collect();
+    // Partition the rows into "Local" (anything under the editor's
+    // local asset directory `dir`) and "Server" (everything else —
+    // typically files the in-process memstroy-assets-server pulled
+    // from the network or a shared cache). The user explicitly asked
+    // for this distinction so they can tell at a glance which assets
+    // they own and which need a live server connection to update.
+    let local_dir = dir.clone();
+    let mut local_rows: Vec<crate::state::LibraryAsset> = Vec::new();
+    let mut server_rows: Vec<crate::state::LibraryAsset> = Vec::new();
+    for a in assets.iter() {
+        if !search_lower.is_empty()
+            && !a.label.to_lowercase().contains(&search_lower)
+            && !a.id.to_lowercase().contains(&search_lower)
+        {
+            continue;
+        }
+        if a.path.starts_with(&local_dir) {
+            local_rows.push(a.clone());
+        } else {
+            server_rows.push(a.clone());
+        }
+    }
 
     egui::ScrollArea::vertical()
         .id_source(scroll_id)
         .auto_shrink([false; 2])
         .show(ui, |ui| {
-            for asset in &rows {
-                library_asset_card(ui, state, asset, kind, title_color);
+            ui.label(
+                RichText::new(format!(
+                    "\u{1F4C1} {} ({})",
+                    crate::i18n::t("Local (your library)"),
+                    local_rows.len()
+                ))
+                .size(11.0)
+                .strong()
+                .color(Color32::from_rgb(180, 220, 180)),
+            );
+            ui.label(
+                RichText::new(format!(
+                    "{}: {}",
+                    crate::i18n::t("dir"),
+                    local_dir.display()
+                ))
+                .size(9.0)
+                .italics()
+                .color(COL_TEXT_DIM),
+            );
+            if local_rows.is_empty() {
+                ui.label(
+                    RichText::new(crate::i18n::t(
+                        "(empty — drop files into the local directory above)"
+                    ))
+                    .size(10.0)
+                    .italics()
+                    .color(COL_TEXT_DIM),
+                );
+            } else {
+                for asset in &local_rows {
+                    library_asset_card(ui, state, asset, kind, title_color);
+                }
+            }
+            ui.add_space(6.0);
+            ui.separator();
+            ui.add_space(2.0);
+            ui.label(
+                RichText::new(format!(
+                    "\u{1F310} {} ({})",
+                    crate::i18n::t("Server (auto-fetched)"),
+                    server_rows.len()
+                ))
+                .size(11.0)
+                .strong()
+                .color(Color32::from_rgb(180, 200, 255)),
+            );
+            ui.label(
+                RichText::new(format!(
+                    "{}: {}",
+                    crate::i18n::t("source"),
+                    state.server_url
+                ))
+                .size(9.0)
+                .italics()
+                .color(COL_TEXT_DIM),
+            );
+            if server_rows.is_empty() {
+                ui.label(
+                    RichText::new(crate::i18n::t(
+                        "(none — server hasn't ingested anything in this category yet)"
+                    ))
+                    .size(10.0)
+                    .italics()
+                    .color(COL_TEXT_DIM),
+                );
+            } else {
+                for asset in &server_rows {
+                    library_asset_card(ui, state, asset, kind, title_color);
+                }
             }
         });
 }
@@ -793,9 +888,15 @@ fn inspector_actor(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
     ui.add_space(4.0);
 
     match state.inspector_tab {
-        0 => inspector_actor_transform(ui, state, i),
+        0 => {
+            inspector_actor_transform(ui, state, i);
+            inspector_actor_speed(ui, state, i);
+        }
         2 => inspector_actor_effects(ui, state, i, actor_count, cache_count),
-        _ => inspector_actor_transform(ui, state, i),
+        _ => {
+            inspector_actor_transform(ui, state, i);
+            inspector_actor_speed(ui, state, i);
+        }
     }
 }
 
@@ -1444,6 +1545,17 @@ fn inspector_effect_kind_params(
             ui, eff, "p0", "Strength", 0.0..=1.0, false, t_local, ("eff_glitch", ei)),
         K::Bloom { .. } => inspector_effect_anim_slider(
             ui, eff, "p0", "Radius (px)", 0.0..=80.0, false, t_local, ("eff_bloom", ei)),
+        K::Crop { .. } => {
+            // Photoshop-style "Crop" — four normalised insets in 0..0.49.
+            inspector_effect_anim_slider(
+                ui, eff, "p0", "Crop left", 0.0..=0.49, false, t_local, ("eff_crop_l", ei));
+            inspector_effect_anim_slider(
+                ui, eff, "p1", "Crop top", 0.0..=0.49, false, t_local, ("eff_crop_t", ei));
+            inspector_effect_anim_slider(
+                ui, eff, "p2", "Crop right", 0.0..=0.49, false, t_local, ("eff_crop_r", ei));
+            inspector_effect_anim_slider(
+                ui, eff, "p3", "Crop bottom", 0.0..=0.49, false, t_local, ("eff_crop_b", ei));
+        }
         K::Grayscale | K::Sepia | K::Invert | K::MirrorH | K::MirrorV
             | K::OldFilm | K::Vhs => unreachable!(),
     }
@@ -1476,6 +1588,10 @@ fn effect_kind_param_get(
         K::Wave { wavelength, .. } if key == "p1" => Some(*wavelength),
         K::Glitch { strength } if key == "p0" => Some(*strength),
         K::Bloom { radius } if key == "p0" => Some(*radius),
+        K::Crop { left, .. } if key == "p0" => Some(*left),
+        K::Crop { top, .. } if key == "p1" => Some(*top),
+        K::Crop { right, .. } if key == "p2" => Some(*right),
+        K::Crop { bottom, .. } if key == "p3" => Some(*bottom),
         _ => None,
     }
 }
@@ -1509,6 +1625,10 @@ fn effect_kind_param_set(
         K::Wave { wavelength, .. } if key == "p1" => *wavelength = new_val,
         K::Glitch { strength } if key == "p0" => *strength = new_val,
         K::Bloom { radius } if key == "p0" => *radius = new_val,
+        K::Crop { left, .. } if key == "p0" => *left = new_val.clamp(0.0, 0.49),
+        K::Crop { top, .. } if key == "p1" => *top = new_val.clamp(0.0, 0.49),
+        K::Crop { right, .. } if key == "p2" => *right = new_val.clamp(0.0, 0.49),
+        K::Crop { bottom, .. } if key == "p3" => *bottom = new_val.clamp(0.0, 0.49),
         _ => {}
     }
 }
@@ -1617,6 +1737,117 @@ fn inspector_effect_anim_slider(
     }
 }
 
+
+/// Inspector row for the actor's playback speed. Uses a `DragValue`
+/// (no slider) so the user can dial in arbitrary multipliers without
+/// bumping into a fixed range. Editing speed:
+///
+/// * compresses / stretches the actor's timeline window (`t_out` is
+///   recomputed from the source clip's duration so the picture covers
+///   the same number of source-seconds at the new rate),
+/// * mirrors the change onto any audio track bound to the actor via
+///   `parent_actor` so linked layers stay in lock-step on the timeline,
+/// * keeps `source_start` / `t_in` fixed — the in-edge of the clip
+///   doesn't move, only the out-edge.
+fn inspector_actor_speed(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
+    use crate::i18n::t;
+    if i >= state.scene.actors.len() { return; }
+
+    ui.add_space(10.0);
+    ui.separator();
+    ui.label(
+        RichText::new(t("Playback speed"))
+            .size(12.0)
+            .strong()
+            .color(COL_TEXT_DIM),
+    );
+    ui.add_space(2.0);
+
+    // Snapshot fields we need for the post-edit cascade so we can let
+    // the mutable borrow on `actors[i]` end before touching the audio
+    // vec / frame-cache map.
+    let source_duration = state
+        .frame_caches
+        .get(i)
+        .filter(|fc| fc.is_ready())
+        .map(|fc| fc.duration)
+        .unwrap_or(0.0);
+
+    let mut new_speed: f32;
+    let actor_id;
+    let t_in;
+    let source_start;
+    {
+        let a = &mut state.scene.actors[i];
+        new_speed = a.speed;
+        actor_id = a.id.clone();
+        t_in = a.t_in.unwrap_or(0.0);
+        source_start = a.source_start.max(0.0);
+
+        ui.horizontal(|ui| {
+            ui.label(t("Speed"));
+            // No slider — DragValue lets the user dial in 0.05x..16x or
+            // anything in between with the keyboard / mouse-drag.
+            let resp = ui.add(
+                egui::DragValue::new(&mut new_speed)
+                    .speed(0.01)
+                    .range(0.05..=16.0)
+                    .fixed_decimals(3)
+                    .suffix("x"),
+            )
+            .on_hover_text(t(
+                "Numeric speed multiplier. The clip's bar on the timeline shrinks when speeding up and stretches when slowing down. Bound audio follows automatically.",
+            ));
+            if resp.changed() && new_speed.is_finite() && new_speed > 0.0 {
+                a.speed = new_speed.max(0.05);
+            }
+            // Quick reset.
+            if ui.small_button("1×").on_hover_text(t("Reset to 1.0x")).clicked() {
+                a.speed = 1.0;
+                new_speed = 1.0;
+            }
+        });
+
+        if source_duration > 0.0 {
+            let visible_dur =
+                ((source_duration - source_start).max(0.0)) / a.speed.max(0.0001);
+            ui.label(
+                RichText::new(format!(
+                    "{}: {:.2}s  \u{2022}  {}: {:.2}s",
+                    t("Source"), source_duration,
+                    t("Visible"), visible_dur,
+                ))
+                .size(9.0)
+                .color(COL_TEXT_DIM),
+            );
+        }
+    }
+
+    // ── Cascade: when speed changed, also rewrite t_out so the
+    // timeline bar shrinks/stretches in sync with the visible duration,
+    // then mirror onto bound audio so linked layers move together.
+    let speed_now = state.scene.actors[i].speed.max(0.0001);
+    if source_duration > 0.0 {
+        let visible_dur =
+            ((source_duration - source_start).max(0.0)) / speed_now;
+        let new_t_out = t_in + visible_dur.max(0.05);
+        let cur_t_out = state.scene.actors[i].t_out.unwrap_or(0.0);
+        if (cur_t_out - new_t_out).abs() > 1.0e-3 {
+            state.scene.actors[i].t_out = Some(new_t_out);
+        }
+    }
+
+    // Sync to bound audio — same id-based link that move/trim already
+    // uses in `sync_audio_to_actor`. Also mirror the speed value so the
+    // audio playback rate matches the picture.
+    let actor_speed = state.scene.actors[i].speed;
+    for au in state.scene.audio.iter_mut() {
+        if au.parent_actor.as_deref() == Some(&actor_id) {
+            au.speed = actor_speed.max(0.05);
+        }
+    }
+    sync_audio_to_actor(state, i);
+}
 
 fn inspector_actor_effects(ui: &mut egui::Ui, state: &mut EditorState, i: usize, _actor_count: usize, _cache_count: usize) {
     let a = &mut state.scene.actors[i];
@@ -2623,6 +2854,60 @@ fn inspector_overlay(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
                 ui.label("Out:");
                 ui.add(egui::DragValue::new(&mut v.t_out).range(0.0..=duration).speed(0.02).suffix("s"));
             });
+
+            // ── Playback speed (DragValue, not a slider, so the user
+            // can dial in arbitrary values without being clamped to a
+            // small range) ──
+            //
+            // We capture the *old* speed BEFORE the widget writes the
+            // new value. The clip's reference "1× length" is derived
+            // from the current window times the old speed, then the new
+            // window is reconstructed from that same reference at the
+            // new speed. This keeps the math self-contained without
+            // needing a per-frame ffprobe.
+            let old_speed = v.speed.max(0.0001);
+            let cur_dur = (v.t_out - v.t_in).max(0.05);
+            let one_x_dur = cur_dur * old_speed;
+
+            let mut new_speed = v.speed;
+            let mut speed_changed = false;
+            ui.horizontal(|ui| {
+                ui.label(crate::i18n::t("Speed"));
+                let resp = ui.add(
+                    egui::DragValue::new(&mut new_speed)
+                        .speed(0.01)
+                        .range(0.05..=16.0)
+                        .fixed_decimals(3)
+                        .suffix("x"),
+                )
+                .on_hover_text(crate::i18n::t(
+                    "Numeric speed multiplier — clip width on the timeline scales with this value.",
+                ));
+                if resp.changed() && new_speed.is_finite() && new_speed > 0.0 {
+                    v.speed = new_speed.max(0.05);
+                    speed_changed = true;
+                }
+                if ui.small_button("1\u{00D7}")
+                    .on_hover_text(crate::i18n::t("Reset to 1.0x"))
+                    .clicked()
+                {
+                    v.speed = 1.0;
+                    speed_changed = true;
+                }
+            });
+            if speed_changed {
+                let new_dur = (one_x_dur / v.speed.max(0.0001)).max(0.05);
+                v.t_out = v.t_in + new_dur;
+            }
+            ui.label(
+                RichText::new(format!(
+                    "{}: {:.2}s  \u{2022}  1\u{00D7} ref: {:.2}s",
+                    crate::i18n::t("Visible"), v.t_out - v.t_in, one_x_dur
+                ))
+                .size(9.0)
+                .color(COL_TEXT_DIM),
+            );
+
             inspector_overlay_state_widgets(
                 ui, &mut v.layout, &mut v.animated_params, playhead, i, "vid",
                 state.kf_highlight.clone());
@@ -3217,43 +3502,115 @@ fn inspector_background(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
 fn inspector_audio(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
     use crate::i18n::t;
     let _ = state.scene.output.duration;
-    let audio = &mut state.scene.audio[i];
-    ui.label(RichText::new(format!("{}: {}", t("Audio"), audio.id)).strong().size(14.0).color(COL_CLIP_AUDIO));
-    ui.add_space(4.0);
 
-    // Clip-local time at the playhead — keyframes for volume / speed
-    // are stored in clip-local seconds so the same edits apply when the
-    // user moves the audio along the timeline.
-    let t_local = (state.playhead - audio.t_in).max(0.0);
+    // Snapshot fields needed for the post-edit cascade so the borrow on
+    // `audio` can end before we touch the actor / frame-cache vecs.
+    let parent_actor_id: Option<String>;
+    let speed_changed: bool;
+    let new_speed_value: f32;
+    {
+        let audio = &mut state.scene.audio[i];
+        parent_actor_id = audio.parent_actor.clone();
 
-    // ── Volume ───────────────────────────────────────────────────────
-    inspector_audio_param(
-        ui,
-        t("Volume"),
-        "volume",
-        0.0..=2.0,
-        false, // not logarithmic
-        t_local,
-        &mut audio.volume,
-        &mut audio.volume_kfs,
-        &mut audio.animated_params,
-    );
+        ui.label(RichText::new(format!("{}: {}", t("Audio"), audio.id)).strong().size(14.0).color(COL_CLIP_AUDIO));
+        ui.add_space(4.0);
 
-    // ── Speed (logarithmic, 0.25× .. 4.0×, 1.0× neutral) ─────────────
-    inspector_audio_param(
-        ui,
-        t("Speed"),
-        "speed",
-        0.25..=4.0,
-        true, // logarithmic
-        t_local,
-        &mut audio.speed,
-        &mut audio.speed_kfs,
-        &mut audio.animated_params,
-    );
-    if audio.speed.abs() < 0.05 {
-        audio.speed = 0.05;
+        // Clip-local time at the playhead — keyframes for volume / speed
+        // are stored in clip-local seconds so the same edits apply when the
+        // user moves the audio along the timeline.
+        let t_local = (state.playhead - audio.t_in).max(0.0);
+
+        // ── Volume ───────────────────────────────────────────────────────
+        inspector_audio_param(
+            ui,
+            t("Volume"),
+            "volume",
+            0.0..=2.0,
+            false, // not logarithmic
+            t_local,
+            &mut audio.volume,
+            &mut audio.volume_kfs,
+            &mut audio.animated_params,
+        );
+
+        // ── Speed (DragValue — no slider so the user can dial in
+        // arbitrary multipliers) ────────────────────────────────────────
+        // When changed, the bar on the timeline shrinks/expands to
+        // reflect the new playback length, mirroring the new video
+        // behaviour. Bound layers (an actor that owns this audio's
+        // `parent_actor` link) are updated by the cascade below.
+        let old_speed = audio.speed.max(0.0001);
+        let cur_dur = match audio.t_out {
+            Some(o) => (o - audio.t_in).max(0.05),
+            None => 0.0,
+        };
+        let one_x_dur = cur_dur * old_speed;
+        let mut new_speed = audio.speed;
+        let mut speed_dirty = false;
+        ui.horizontal(|ui| {
+            ui.label(t("Speed"));
+            let resp = ui.add(
+                egui::DragValue::new(&mut new_speed)
+                    .speed(0.01)
+                    .range(0.05..=16.0)
+                    .fixed_decimals(3)
+                    .suffix("x"),
+            )
+            .on_hover_text(t(
+                "Numeric playback speed. The clip bar on the timeline shrinks when speeding up and stretches when slowing down. If this audio is bound to a video clip, both update together.",
+            ));
+            if resp.changed() && new_speed.is_finite() && new_speed > 0.0 {
+                audio.speed = new_speed.max(0.05);
+                speed_dirty = true;
+            }
+            if ui.small_button("1\u{00D7}").on_hover_text(t("Reset to 1.0x")).clicked() {
+                audio.speed = 1.0;
+                speed_dirty = true;
+            }
+        });
+        if speed_dirty && cur_dur > 0.0 {
+            // Resize the visible window to match the new speed using
+            // the cached "1× length" reference so the math is symmetric.
+            let new_dur = (one_x_dur / audio.speed.max(0.0001)).max(0.05);
+            audio.t_out = Some(audio.t_in + new_dur);
+        }
+        speed_changed = speed_dirty;
+        new_speed_value = audio.speed;
+
+        if audio.speed.abs() < 0.05 {
+            audio.speed = 0.05;
+        }
     }
+
+    // ── Cascade speed onto the linked actor (and its bar width) ──
+    if speed_changed {
+        if let Some(parent) = parent_actor_id {
+            let parent_idx = state
+                .scene
+                .actors
+                .iter()
+                .position(|a| a.id == parent);
+            if let Some(ai) = parent_idx {
+                state.scene.actors[ai].speed = new_speed_value.max(0.05);
+                let source_duration = state
+                    .frame_caches
+                    .get(ai)
+                    .filter(|fc| fc.is_ready())
+                    .map(|fc| fc.duration)
+                    .unwrap_or(0.0);
+                let t_in = state.scene.actors[ai].t_in.unwrap_or(0.0);
+                let source_start = state.scene.actors[ai].source_start.max(0.0);
+                if source_duration > 0.0 {
+                    let visible_dur = ((source_duration - source_start).max(0.0))
+                        / new_speed_value.max(0.0001);
+                    state.scene.actors[ai].t_out = Some(t_in + visible_dur.max(0.05));
+                }
+                sync_audio_to_actor(state, ai);
+            }
+        }
+    }
+
+    let audio = &mut state.scene.audio[i];
 
     // ── Pitch (semitones) + Pan + Mute ───────────────────────────────
     // Note: pitch / pan / reverb / filter cutoffs are not keyframable
@@ -5058,7 +5415,12 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             TrackKind::Video => {
                 // Draw backgrounds on track 0
                 if track_idx == 0 {
+                    // The vec can shrink mid-iteration when
+                    // `enforce_no_overlap_on_layer` removes neighbours
+                    // on the same lane. The bounds check at the top of
+                    // each iteration body makes us tolerate that.
                     for bi in 0..state.scene.backgrounds.len() {
+                        if bi >= state.scene.backgrounds.len() { break; }
                         let bg_elem = &state.scene.backgrounds[bi];
                         let clip_start = bg_elem.start;
                         let clip_end = bg_elem.start + bg_elem.duration;
@@ -5150,6 +5512,11 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                     .collect();
 
                 for ai in 0..state.scene.actors.len() {
+                    // The vec can shrink mid-iteration when
+                    // `enforce_no_overlap_on_layer` removes a colliding
+                    // actor on the same lane (PANIC fix: previously this
+                    // walked off the end of `state.scene.actors`).
+                    if ai >= state.scene.actors.len() { break; }
                     let assigned_track = if let Some(&assigned) = state.actor_track_assignments.get(&ai) {
                         assigned
                     } else {
@@ -5418,6 +5785,13 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                         }
                     }
 
+                    // The click handler can call `enforce_no_overlap_on_layer`
+                    // which deletes overlapping actors on the same lane.
+                    // If that wiped out the actor at our current index,
+                    // skip the indicator/keyframe draw to avoid the
+                    // "index out of bounds" panic that used to fire here.
+                    if ai >= state.scene.actors.len() { continue; }
+
                     // Transition indicators on the clip bar (faded gradient near edges).
                     draw_transition_indicators(
                         painter,
@@ -5465,6 +5839,9 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                     0
                 };
                 for oi in 0..state.scene.overlays.len() {
+                    // Tolerate mid-iteration removal (overlap-resolution
+                    // helper can splice/delete overlays on the same lane).
+                    if oi >= state.scene.overlays.len() { break; }
                     let assigned = state
                         .overlay_track_assignments
                         .get(&oi)
@@ -5654,6 +6031,10 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             to_select = Some(Selection::Overlay(oi));
                         }
                     }
+                    // The overlay click handler may have removed
+                    // colliding overlays via overlap-resolution; bail
+                    // out before reading the (possibly invalid) index.
+                    if oi >= state.scene.overlays.len() { continue; }
                     // Keyframe diamonds for overlays too.
                     let layout_ref: &[Keyframe<OverlayState>] = match &state.scene.overlays[oi] {
                         Overlay::Text(t) => &t.layout,
@@ -5679,6 +6060,8 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                 let audio_tracks: Vec<usize> = (0..num_tracks).filter(|ti| state.tracks[*ti].kind == TrackKind::Audio).collect();
 
                 for aui in 0..state.scene.audio.len() {
+                    // Tolerate mid-iteration removal.
+                    if aui >= state.scene.audio.len() { break; }
                     // Use explicit assignment if set, otherwise round-robin across audio tracks.
                     let target_track_idx = if let Some(&t) = state.audio_track_assignments.get(&aui) {
                         t
@@ -8043,6 +8426,7 @@ pub(crate) fn add_actor_from_clip_at_time(state: &mut EditorState, path: &PathBu
         transition_out: Transition::Cut,
         transition_duration: 0.3,
         effects: Vec::new(),
+        speed: 1.0,
         animated_params: Default::default(),
     };
     state.scene.actors.push(actor);
