@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "egui/eframe editor for memstroy_generator scenes"
+description = "egui/eframe editor for memstroy-inator scenes"
 
 [[bin]]
 name = "memstroy-gui"
@@ -28,6 +28,7 @@ chrono = { workspace = true }
 memstroy-core = { workspace = true }
 memstroy-render = { workspace = true }
 memstroy-vision = { workspace = true }
+memstroy-assets-server = { workspace = true }
 wgpu = { workspace = true }
 rodio = { workspace = true }
 # HTTP client for the shared asset server. Keep the same TLS backend
