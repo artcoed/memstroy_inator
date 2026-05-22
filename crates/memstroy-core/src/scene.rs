@@ -475,6 +475,20 @@ pub struct ColorCorrection {
     /// Master + per-channel tone curves. Neutral curve = `[(0,0), (1,1)]`.
     #[serde(default)]
     pub curves: ToneCurves,
+
+    /// Per-parameter keyframe tracks for the scalar CC fields. Same
+    /// convention as `Effect::param_kfs` — keyed by the param id
+    /// (`"brightness"`, `"contrast"`, `"saturation"`, `"temperature"`).
+    /// Sampled in clip-local time so animations move with the host clip.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub kfs: std::collections::BTreeMap<String, Vec<Keyframe<f32>>>,
+
+    /// Set of CC param ids the user has flagged as animatable. When a
+    /// param id is in this set AND `kfs[id]` has at least one keyframe,
+    /// the runtime value is sampled from the kf track instead of the
+    /// static field.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub animated_params: BTreeSet<String>,
 }
 
 fn default_lift() -> [f32; 3] { [0.0, 0.0, 0.0] }
@@ -554,11 +568,40 @@ impl Default for ColorCorrection {
             gamma: [1.0; 3],
             gain: [1.0; 3],
             curves: ToneCurves::default(),
+            kfs: std::collections::BTreeMap::new(),
+            animated_params: BTreeSet::new(),
         }
     }
 }
 
 impl ColorCorrection {
+    /// Sample a single named scalar CC parameter at clip-local time
+    /// `t_local`. When `key` is in `animated_params` AND `kfs[key]` is
+    /// non-empty, the eased keyframe value is returned; otherwise
+    /// `fallback` is passed through. Mirrors `Effect::sample_param_at`.
+    pub fn sample_param_at(&self, t_local: f32, key: &str, fallback: f32) -> f32 {
+        if !self.animated_params.contains(key) {
+            return fallback;
+        }
+        let Some(kfs) = self.kfs.get(key) else { return fallback; };
+        if kfs.is_empty() {
+            return fallback;
+        }
+        crate::keyframe::sample(kfs, t_local).unwrap_or(fallback)
+    }
+
+    /// Return a clone with every animated scalar field replaced by its
+    /// keyframe-sampled value at `t_local`. Tone curves and the LGG
+    /// vector fields are NOT keyframable today (the inspector does not
+    /// expose a diamond for them), so they pass through unchanged.
+    pub fn sampled_at(&self, t_local: f32) -> Self {
+        let mut out = self.clone();
+        out.brightness = self.sample_param_at(t_local, "brightness", self.brightness);
+        out.contrast   = self.sample_param_at(t_local, "contrast",   self.contrast);
+        out.saturation = self.sample_param_at(t_local, "saturation", self.saturation);
+        out.temperature = self.sample_param_at(t_local, "temperature", self.temperature);
+        out
+    }
     /// Whether every parameter is at its neutral / identity value, i.e. this
     /// correction would be a no-op. Used as a fast-path so untouched clips
     /// skip the full CPU correction pipeline entirely.

@@ -1517,6 +1517,20 @@ impl eframe::App for App {
         // Keyboard shortcuts
         self.handle_shortcuts(ctx);
 
+        // ── Frame-level "auto undo snapshot on press" ──
+        //
+        // Capture the scene the moment any pointer button transitions
+        // to pressed-this-frame, so any inspector edit that happens
+        // during the resulting gesture (slider drag, checkbox toggle,
+        // ComboBox pick, …) can be turned into exactly one undo entry
+        // even when it doesn't go through `mutate_drag`. The matching
+        // "push or discard" runs at the end of the frame after the UI
+        // has had a chance to mutate `state.scene`.
+        let pressed_this_frame = ctx.input(|i| i.pointer.any_pressed());
+        if pressed_this_frame && self.state.pre_press_scene.is_none() {
+            self.state.pre_press_scene = Some(self.state.scene.clone());
+        }
+
         // ── End the active drag-undo group when no mouse button is down ──
         // The undo/redo system snapshots once per drag gesture by tracking
         // a `last_drag_group` token. The token must be cleared as soon as
@@ -2024,6 +2038,45 @@ impl eframe::App for App {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         // When idle/paused with no jobs: don't request repaint (reactive mode)
+
+        // ── Frame-level "auto undo snapshot on release" ──
+        //
+        // Counterpart to the press-snapshot at the top of update(). On
+        // pointer release we either:
+        //   * commit the snapshot to the undo stack (one entry per
+        //     gesture) when the gesture actually mutated the scene AND
+        //     no `mutate_drag` token fired (so we don't double-push for
+        //     canvas / timeline drags), OR
+        //   * discard the snapshot when the gesture had no effect on
+        //     the scene (a click that didn't change anything).
+        //
+        // `last_drag_group.is_some()` is the signal that `mutate_drag`
+        // has already pushed an undo entry for this gesture. It's
+        // cleared at the top of update() when no pointer button is
+        // down, so by the time we get here on a release frame the
+        // value still reflects whether the JUST-ENDED gesture used a
+        // drag-token. Comparison uses serde_yaml (cheap on small
+        // scenes) — derived `PartialEq` would be ideal but the deep
+        // recursive Float fields make that fragile.
+        let released_this_frame = ctx.input(|i| i.pointer.any_released());
+        let any_pointer_still_down = ctx.input(|i| {
+            i.pointer.primary_down()
+                || i.pointer.secondary_down()
+                || i.pointer.middle_down()
+        });
+        if released_this_frame && !any_pointer_still_down {
+            if let Some(pre) = self.state.pre_press_scene.take() {
+                let mutate_drag_handled = self.state.last_drag_group.is_some();
+                if !mutate_drag_handled {
+                    let pre_yaml = serde_yaml::to_string(&pre).unwrap_or_default();
+                    let cur_yaml =
+                        serde_yaml::to_string(&self.state.scene).unwrap_or_default();
+                    if pre_yaml != cur_yaml {
+                        self.state.undo.push(&pre);
+                    }
+                }
+            }
+        }
     }
 }
 

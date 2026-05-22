@@ -141,12 +141,20 @@ pub fn write_overlay_param<F>(
     }
 }
 
-/// Canvas-layout (free canvas v2) variant. Always animates by definition
-/// — the canvas_layouts entries are only created the first time a clip is
-/// dragged on the free canvas, so every change should land as a kf at the
-/// playhead.
+/// Canvas-layout (free canvas v2) variant. Honours the host element's
+/// `animated_params` set — if no relevant param id is animated, the new
+/// value is broadcast to every kf in the layout (single static value);
+/// otherwise it's upserted at the playhead like the legacy paths.
+///
+/// `relevant_param_ids` lists the param ids whose animation flag should
+/// gate this write. Most callers pass the position pair (`POS_X`, `POS_Y`)
+/// for moves, or the scale/rotation single for resize / rotate. As long
+/// as **any** of the listed ids is in `animated_params`, the write
+/// upserts at `t`; otherwise it broadcasts.
 pub fn write_canvas_param<F>(
     layout: &mut Vec<Keyframe<CanvasTransform>>,
+    animated_params: &BTreeSet<String>,
+    relevant_param_ids: &[&str],
     t: f32,
     f: F,
 ) where
@@ -155,10 +163,24 @@ pub fn write_canvas_param<F>(
     if layout.is_empty() {
         layout.push(Keyframe::new(0.0, CanvasTransform::default()));
     }
-    let seed = keyframe::sample(layout, t).unwrap_or_default();
-    let idx = upsert_index(layout, t, seed);
-    if let Some(kf) = layout.get_mut(idx) {
-        f(&mut kf.value);
+    let any_animated = relevant_param_ids
+        .iter()
+        .any(|id| animated_params.contains(*id));
+    if any_animated {
+        let seed = keyframe::sample(layout, t).unwrap_or_default();
+        let idx = upsert_index(layout, t, seed);
+        if let Some(kf) = layout.get_mut(idx) {
+            f(&mut kf.value);
+        }
+    } else {
+        // Static: broadcast to every keyframe so the value stays
+        // constant across the entire track. This matches what the
+        // user expects when the per-param diamond is OFF — canvas
+        // drags during playback should not silently spawn a
+        // mid-track keyframe.
+        for kf in layout.iter_mut() {
+            f(&mut kf.value);
+        }
     }
 }
 
