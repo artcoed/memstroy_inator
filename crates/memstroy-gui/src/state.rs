@@ -407,6 +407,19 @@ pub struct EditorState {
     /// How many of the most recent matching posts to ingest per refresh.
     pub tg_limit: u32,
 
+    /// Last value of `library_search` we acted on. The library panel
+    /// compares against this every frame and triggers a server refresh
+    /// when the user types into the search box, so the inspector stays
+    /// auto-fresh without an explicit Refresh button.
+    pub prev_library_search: String,
+    /// Tab whose `prev_library_search` snapshot was taken on, so
+    /// switching tabs alone does not fire a refresh.
+    pub prev_library_search_tab: LibraryTab,
+    /// Wall-clock time of the last auto-refresh kick (any source). Used
+    /// to debounce the "scroll near bottom" trigger so we don't refire
+    /// the network call every frame the user holds the mouse wheel.
+    pub last_auto_refresh: Option<std::time::Instant>,
+
     /// Tokio runtime handle injected by the App on startup so panels
     /// that talk to network services (the asset server, Telegram
     /// ingest, etc.) can spawn async tasks without rebuilding their
@@ -614,6 +627,9 @@ impl EditorState {
         s.server_url = "http://127.0.0.1:8765".to_string();
         s.tg_channel = "MELLSTROYfonz".to_string();
         s.tg_limit = 80;
+        s.prev_library_search = String::new();
+        s.prev_library_search_tab = LibraryTab::Clips;
+        s.last_auto_refresh = None;
 
         // ── Load persistent editor preferences (language, master
         // volume, autosave interval, snap toggle) and apply the bits
