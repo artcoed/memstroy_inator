@@ -52,7 +52,7 @@ pub fn library(ui: &mut egui::Ui, state: &mut EditorState, _request_refresh: imp
     // Plain header (no Refresh button anymore — Refresh is now a
     // per-asset-tab action: Clips refreshes from Telegram via the
     // assets-server, the other tabs rescan local directories).
-    ui.label(RichText::new("Library").size(16.0).strong());
+    ui.label(RichText::new(crate::i18n::t("Library")).size(16.0).strong());
     ui.add_space(4.0);
 
     // Tab bar — Clips / Videos / Sounds / Images / Particles.
@@ -62,14 +62,15 @@ pub fn library(ui: &mut egui::Ui, state: &mut EditorState, _request_refresh: imp
     // limit live as plain fields on EditorState (and surface inside
     // the Clips tab toolbar) instead of a separate panel.
     ui.horizontal_wrapped(|ui| {
-        let tabs = [
-            (LibraryTab::Clips,     "\u{1F3AC} Clips"),
-            (LibraryTab::Videos,    "\u{1F4FD} Videos"),
-            (LibraryTab::Sounds,    "\u{1F50A} Sounds"),
-            (LibraryTab::Images,    "\u{1F5BC} Images"),
-            (LibraryTab::Particles, "\u{2728} Particles"),
+        let tabs: [(LibraryTab, &str, &'static str); 5] = [
+            (LibraryTab::Clips,     "\u{1F3AC} ", "Clips"),
+            (LibraryTab::Videos,    "\u{1F4FD} ", "Videos"),
+            (LibraryTab::Sounds,    "\u{1F50A} ", "Sounds"),
+            (LibraryTab::Images,    "\u{1F5BC} ", "Images"),
+            (LibraryTab::Particles, "\u{2728} ",  "Particles"),
         ];
-        for (tab, label) in tabs {
+        for (tab, icon, key) in tabs {
+            let label = format!("{}{}", icon, crate::i18n::t(key));
             if ui.selectable_label(state.library_tab == tab, label).clicked() {
                 state.library_tab = tab;
             }
@@ -79,7 +80,7 @@ pub fn library(ui: &mut egui::Ui, state: &mut EditorState, _request_refresh: imp
 
     ui.add(
         egui::TextEdit::singleline(&mut state.library_search)
-            .hint_text("Search...")
+            .hint_text(crate::i18n::t("Search library..."))
             .desired_width(ui.available_width()),
     );
     ui.add_space(2.0);
@@ -247,15 +248,13 @@ fn library_clips_tab(ui: &mut egui::Ui, state: &mut EditorState) {
                 .prefix("limit "),
         );
         let btn = egui::Button::new(
-            RichText::new("Refresh").color(Color32::WHITE).size(12.0),
+            RichText::new(crate::i18n::t("Refresh")).color(Color32::WHITE).size(12.0),
         )
         .fill(Color32::from_rgb(80, 50, 180))
         .rounding(Rounding::same(6.0));
         if ui
             .add_enabled(!state.refreshing, btn)
-            .on_hover_text(
-                "POST to {server}/api/ingest/tg, then sync the local clips dir from disk",
-            )
+            .on_hover_text(crate::i18n::t("Refresh from Telegram"))
             .clicked()
         {
             state.status = "__REFRESH_REQUESTED__".into();
@@ -507,14 +506,7 @@ pub(crate) fn add_library_asset_at_playhead(
                 id: asset.id.clone(),
                 source: asset.path.clone(),
                 t_in: t,
-                t_out: None,
-                source_start: 0.0,
-                volume: 1.0,
-                speed: 1.0,
-                parent_actor: None,
-                volume_kfs: Vec::new(),
-                speed_kfs: Vec::new(),
-                animated_params: Default::default(),
+                ..Default::default()
             });
             state.selection = Selection::Audio(state.scene.audio.len() - 1);
             state.status = format!("Added sound: {}", asset.id);
@@ -673,7 +665,7 @@ fn clip_drag_label(clip: &crate::state::LibraryClip) -> String {
 
 pub fn inspector(ui: &mut egui::Ui, state: &mut EditorState) {
     ui.horizontal(|ui| {
-        ui.label(RichText::new("Inspector").size(16.0).strong());
+        ui.label(RichText::new(crate::i18n::t("Inspector")).size(16.0).strong());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if state.eyedropper_active {
                 ui.label(RichText::new("PICK").size(10.0).color(Color32::from_rgb(255, 200, 50)));
@@ -734,7 +726,7 @@ fn inspector_body(ui: &mut egui::Ui, state: &mut EditorState) {
 
 fn inspector_nothing(ui: &mut egui::Ui, state: &mut EditorState) {
     ui.add_space(20.0);
-    ui.label(RichText::new("Select a clip on the timeline").italics().color(COL_TEXT_DIM).size(13.0));
+    ui.label(RichText::new(crate::i18n::t("Select a clip on the timeline")).italics().color(COL_TEXT_DIM).size(13.0));
     ui.add_space(20.0);
     ui.separator();
     ui.add_space(8.0);
@@ -2686,9 +2678,11 @@ fn inspector_background(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
 }
 
 fn inspector_audio(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
+    use crate::i18n::t;
     let _ = state.scene.output.duration;
+    let scene_duration = state.scene.output.duration;
     let audio = &mut state.scene.audio[i];
-    ui.label(RichText::new(format!("Audio: {}", audio.id)).strong().size(14.0).color(COL_CLIP_AUDIO));
+    ui.label(RichText::new(format!("{}: {}", t("Audio"), audio.id)).strong().size(14.0).color(COL_CLIP_AUDIO));
     ui.add_space(4.0);
 
     // Clip-local time at the playhead — keyframes for volume / speed
@@ -2699,7 +2693,7 @@ fn inspector_audio(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
     // ── Volume ───────────────────────────────────────────────────────
     inspector_audio_param(
         ui,
-        "Volume",
+        t("Volume"),
         "volume",
         0.0..=2.0,
         false, // not logarithmic
@@ -2712,7 +2706,7 @@ fn inspector_audio(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
     // ── Speed (logarithmic, 0.25× .. 4.0×, 1.0× neutral) ─────────────
     inspector_audio_param(
         ui,
-        "Speed",
+        t("Speed"),
         "speed",
         0.25..=4.0,
         true, // logarithmic
@@ -2725,17 +2719,138 @@ fn inspector_audio(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
         audio.speed = 0.05;
     }
 
+    // ── Pitch (semitones) + Pan + Mute ───────────────────────────────
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.label(t("Pitch (semitones)"));
+        ui.add(
+            egui::Slider::new(&mut audio.pitch_semitones, -24.0..=24.0)
+                .fixed_decimals(1)
+                .suffix(" st"),
+        )
+        .on_hover_text(t(
+            "Pitch shifts the sound up or down without changing the timeline placement.",
+        ));
+    });
+    ui.horizontal(|ui| {
+        ui.label(t("Pan"));
+        ui.add(egui::Slider::new(&mut audio.pan, -1.0..=1.0).fixed_decimals(2))
+            .on_hover_text(t("Pan: -1 = full left, 0 = centre, +1 = full right."));
+    });
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut audio.mute, t("Mute"));
+        ui.add_space(8.0);
+        ui.checkbox(&mut audio.loop_source, t("Loop source"));
+    });
+
+    // ── Fades ────────────────────────────────────────────────────────
+    ui.add_space(6.0);
+    ui.label(RichText::new(t("Audio effects")).strong().size(12.0).color(COL_TEXT_DIM));
+    let max_fade = scene_duration.max(1.0);
+    ui.horizontal(|ui| {
+        ui.label(t("Fade in (s)"));
+        ui.add(
+            egui::DragValue::new(&mut audio.fade_in)
+                .range(0.0..=max_fade)
+                .speed(0.05)
+                .suffix(" s"),
+        );
+    });
+    ui.horizontal(|ui| {
+        ui.label(t("Fade out (s)"));
+        ui.add(
+            egui::DragValue::new(&mut audio.fade_out)
+                .range(0.0..=max_fade)
+                .speed(0.05)
+                .suffix(" s"),
+        );
+    });
+
+    // ── Reverb ───────────────────────────────────────────────────────
+    ui.horizontal(|ui| {
+        ui.label(t("Reverb"));
+        ui.add(egui::Slider::new(&mut audio.reverb, 0.0..=1.0).fixed_decimals(2));
+    });
+
+    // ── Filters ──────────────────────────────────────────────────────
+    ui.add_space(6.0);
+    ui.label(RichText::new(t("Filters")).strong().size(12.0).color(COL_TEXT_DIM));
+
+    // Low-pass: a checkbox that owns whether the filter is active, plus
+    // a frequency slider that's only enabled when the box is ticked.
+    ui.horizontal(|ui| {
+        let mut lp_on = audio.low_pass_hz.is_some();
+        if ui.checkbox(&mut lp_on, t("Enable low-pass filter")).changed() {
+            audio.low_pass_hz = if lp_on { Some(8000) } else { None };
+        }
+    });
+    if let Some(lp) = audio.low_pass_hz.as_mut() {
+        ui.horizontal(|ui| {
+            ui.label(t("Low-pass cutoff (Hz)"));
+            let mut v = *lp as f32;
+            if ui
+                .add(
+                    egui::Slider::new(&mut v, 100.0..=20000.0)
+                        .logarithmic(true)
+                        .fixed_decimals(0)
+                        .suffix(" Hz"),
+                )
+                .changed()
+            {
+                *lp = v.clamp(100.0, 20000.0) as u32;
+            }
+        });
+    }
+
+    ui.horizontal(|ui| {
+        let mut hp_on = audio.high_pass_hz.is_some();
+        if ui.checkbox(&mut hp_on, t("Enable high-pass filter")).changed() {
+            audio.high_pass_hz = if hp_on { Some(120) } else { None };
+        }
+    });
+    if let Some(hp) = audio.high_pass_hz.as_mut() {
+        ui.horizontal(|ui| {
+            ui.label(t("High-pass cutoff (Hz)"));
+            let mut v = *hp as f32;
+            if ui
+                .add(
+                    egui::Slider::new(&mut v, 20.0..=8000.0)
+                        .logarithmic(true)
+                        .fixed_decimals(0)
+                        .suffix(" Hz"),
+                )
+                .changed()
+            {
+                *hp = v.clamp(20.0, 8000.0) as u32;
+            }
+        });
+    }
+
+    // ── Reset effects button ─────────────────────────────────────────
+    ui.add_space(6.0);
+    if ui.button(t("Reset audio effects")).clicked() {
+        audio.pitch_semitones = 0.0;
+        audio.pan = 0.0;
+        audio.fade_in = 0.0;
+        audio.fade_out = 0.0;
+        audio.reverb = 0.0;
+        audio.low_pass_hz = None;
+        audio.high_pass_hz = None;
+        audio.mute = false;
+        audio.loop_source = false;
+    }
+
     ui.add_space(6.0);
     if audio.parent_actor.is_some() {
         ui.label(
-            RichText::new("Bound to an actor — moves and trims with its parent clip.")
+            RichText::new(t("Bound to an actor — moves and trims with its parent clip."))
                 .size(10.0)
                 .italics()
                 .color(COL_TEXT_DIM),
         );
     } else {
         ui.label(
-            RichText::new("Standalone music — independent of any actor.")
+            RichText::new(t("Standalone music — independent of any actor."))
                 .size(10.0)
                 .italics()
                 .color(COL_TEXT_DIM),
@@ -2801,7 +2916,7 @@ fn inspector_audio_param(
         let mut anim_on = is_animated;
         let toggle = ui
             .selectable_label(anim_on, "\u{29BF}") // bullseye glyph
-            .on_hover_text("Toggle animation for this parameter");
+            .on_hover_text(crate::i18n::t("Toggle animation for this parameter"));
         if toggle.clicked() {
             anim_on = !anim_on;
             if anim_on {
@@ -2821,8 +2936,8 @@ fn inspector_audio_param(
         ui.horizontal(|ui| {
             ui.add_space(8.0);
             if ui
-                .small_button("+ kf at playhead")
-                .on_hover_text("Add a keyframe at the current playhead")
+                .small_button(crate::i18n::t("+ kf at playhead"))
+                .on_hover_text(crate::i18n::t("Add a keyframe at the current playhead"))
                 .clicked()
             {
                 if kfs.is_empty() {
@@ -2830,7 +2945,7 @@ fn inspector_audio_param(
                 }
                 memstroy_core::upsert_keyframe(kfs, t_local, display);
             }
-            if !kfs.is_empty() && ui.small_button("Clear kfs").clicked() {
+            if !kfs.is_empty() && ui.small_button(crate::i18n::t("Clear kfs")).clicked() {
                 kfs.clear();
             }
             ui.label(
@@ -6004,12 +6119,8 @@ fn push_audio_track_for_actor(state: &mut EditorState, actor_id: &str, source: &
         t_in,
         t_out,
         source_start,
-        volume: 1.0,
-        speed: 1.0,
         parent_actor: Some(actor_id.to_string()),
-        volume_kfs: Vec::new(),
-        speed_kfs: Vec::new(),
-        animated_params: Default::default(),
+        ..Default::default()
     });
     state.scene.audio.len() - 1
 }
