@@ -1,4 +1,10 @@
-# memstroy_generator
+# memstroy-inator
+
+> Formerly known as `memstroy_generator`. The workspace directory and
+> per-crate package names (`memstroy-core`, `memstroy-gui`, …) are kept
+> for compatibility with existing scripts and project files; the
+> product is now branded **memstroy-inator** in the editor window
+> title, the README and the Cargo descriptions.
 
 A desktop tool for assembling **Mellstroy-style memes** for short
 vertical videos. The workflow is:
@@ -21,7 +27,7 @@ vertical videos. The workflow is:
 ## Repository layout
 
 ```
-memstroy_generator/
+memstroy-inator/                # was: memstroy_generator/
 ├── Cargo.toml                 # workspace root
 ├── crates/
 │   ├── memstroy-core/         # Scene + animation model (serde-driven)

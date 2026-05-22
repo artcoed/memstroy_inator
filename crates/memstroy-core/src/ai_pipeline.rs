@@ -282,6 +282,7 @@ impl MontageOutput {
                 transition_out: crate::Transition::Cut,
                 transition_duration: 0.3,
                 effects: Vec::new(),
+                speed: 1.0,
                 animated_params: Default::default(),
             };
             scene.actors.push(actor);

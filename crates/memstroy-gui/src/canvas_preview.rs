@@ -3505,7 +3505,10 @@ fn selected_element_screen_rect(
                 x: frame_tl_x + ov_state.pos[0] * world_w,
                 y: frame_tl_y + ov_state.pos[1] * world_h,
             };
-            let (elem_w, elem_h) = overlay_bbox(overlay, &ov_state);
+            // Use the texture-aware bbox so resize handles snap to the
+            // image's real dimensions instead of the legacy 200×200
+            // placeholder square that used to bunch them in the centre.
+            let (elem_w, elem_h) = overlay_bbox_with_state(overlay, &ov_state, state);
             let center_screen = state.canvas_viewport.world_to_screen(world_pos, viewport_size);
             let half_w = elem_w * 0.5 * state.canvas_viewport.zoom;
             let half_h = elem_h * 0.5 * state.canvas_viewport.zoom;
@@ -3848,7 +3851,7 @@ fn draw_element_resize_handles(
                 x: frame_tl_x + ov_state.pos[0] * world_w,
                 y: frame_tl_y + ov_state.pos[1] * world_h,
             };
-            let (elem_w, elem_h) = overlay_bbox(overlay, &ov_state);
+            let (elem_w, elem_h) = overlay_bbox_with_state(overlay, &ov_state, state);
             let center_screen = state.canvas_viewport.world_to_screen(world_pos, viewport_size);
             let half_w = elem_w * 0.5 * state.canvas_viewport.zoom;
             let half_h = elem_h * 0.5 * state.canvas_viewport.zoom;
