@@ -372,6 +372,35 @@ pub struct EditorState {
     /// timeline's vertical zoom. Comparing per-frame ensures we don't
     /// keep re-applying the bump every paint while a layer is selected.
     pub last_v_zoom_selection: Option<Selection>,
+
+    // ─── Clipboard & multi-selection ──────────────────────────────
+    /// Items copied via Ctrl+C, pasted via Ctrl+V. Each paste creates a
+    /// fresh element with a derived id and (for actors / audio) lands
+    /// on a brand-new track ABOVE the current ones so the user can
+    /// freely tweak the duplicate without touching the source.
+    pub clipboard: Vec<ClipboardItem>,
+    /// Multi-selection on the canvas. Mirrors `selection` for the
+    /// inspector but holds the FULL set the user has painted with
+    /// Ctrl/Shift+click or a marquee. Ctrl+C copies every entry; Ctrl+V
+    /// pastes one duplicate per entry on its own new layer. Empty when
+    /// only the primary `selection` is active.
+    pub canvas_selection: Vec<Selection>,
+    /// Active marquee (rubber-band) selection on the canvas. `Some` while
+    /// the user is dragging an empty area to lasso multiple elements at
+    /// once. World-pixel coords for both corners.
+    pub canvas_marquee: Option<CanvasMarquee>,
+
+    /// State for the "Shared" library tab — talks to a separate
+    /// `memstroy-assets-server` instance over HTTP and lazily streams
+    /// previews / files into the editor.
+    pub shared_library: crate::shared_library::SharedLibraryState,
+
+    /// Tokio runtime handle injected by the App on startup so panels
+    /// that talk to network services (the shared library, Telegram
+    /// ingest, etc.) can spawn async tasks without rebuilding their
+    /// own runtime. `None` only inside unit tests that don't bring
+    /// up an `App`.
+    pub tokio_handle: Option<tokio::runtime::Handle>,
 }
 
 /// A single scene tab with its own file path and name.
@@ -428,6 +457,9 @@ pub enum LibraryTab {
     Images,
     Particles,
     Videos,
+    /// Lazily-fetched assets served by an external
+    /// `memstroy-assets-server`. See `crate::shared_library`.
+    Shared,
 }
 
 #[derive(Debug, Clone)]
@@ -1012,6 +1044,199 @@ impl EditorState {
     pub fn videos_dir(&self) -> PathBuf {
         self.assets_root.join("assets").join("videos")
     }
+
+    // ─── Clipboard / copy-paste ─────────────────────────────────────
+
+    /// Snapshot the currently-active selection set into the clipboard.
+    /// When [`Self::canvas_selection`] is non-empty, every entry in it
+    /// is copied; otherwise the primary [`Self::selection`] is the
+    /// only item snapshotted.
+    ///
+    /// Each item is a deep clone of the live scene element so the
+    /// clipboard survives subsequent edits / deletions of the source.
+    pub fn copy_selection_to_clipboard(&mut self) -> usize {
+        let mut targets: Vec<Selection> = if !self.canvas_selection.is_empty() {
+            self.canvas_selection.clone()
+        } else if self.selection != Selection::None {
+            vec![self.selection]
+        } else {
+            return 0;
+        };
+        // Stable order: actors before overlays before backgrounds before
+        // audio, ascending by index, so paste deterministic.
+        targets.sort_by_key(|s| match s {
+            Selection::Actor(i) => (0_u8, *i),
+            Selection::Overlay(i) => (1, *i),
+            Selection::Background(i) => (2, *i),
+            Selection::Audio(i) => (3, *i),
+            _ => (255, 0),
+        });
+        targets.dedup();
+
+        let mut buf: Vec<ClipboardItem> = Vec::with_capacity(targets.len());
+        for sel in targets {
+            match sel {
+                Selection::Actor(i) if i < self.scene.actors.len() => {
+                    buf.push(ClipboardItem::Actor(self.scene.actors[i].clone()));
+                }
+                Selection::Overlay(i) if i < self.scene.overlays.len() => {
+                    buf.push(ClipboardItem::Overlay(self.scene.overlays[i].clone()));
+                }
+                Selection::Background(i) if i < self.scene.backgrounds.len() => {
+                    buf.push(ClipboardItem::Background(self.scene.backgrounds[i].clone()));
+                }
+                Selection::Audio(i) if i < self.scene.audio.len() => {
+                    buf.push(ClipboardItem::Audio(self.scene.audio[i].clone()));
+                }
+                _ => {}
+            }
+        }
+        let n = buf.len();
+        if n > 0 {
+            self.clipboard = buf;
+        }
+        n
+    }
+
+    /// Paste every item in [`Self::clipboard`] into the scene. Each
+    /// pasted item lands on a brand-new layer at the TOP of the layer
+    /// stack so it doesn't overwrite existing content. Returns the
+    /// number of items pasted.
+    pub fn paste_clipboard(&mut self) -> usize {
+        if self.clipboard.is_empty() {
+            return 0;
+        }
+        let buf = self.clipboard.clone();
+        let mut new_selections: Vec<Selection> = Vec::new();
+        // Take a single undo snapshot for the whole paste batch.
+        self.last_drag_group = None;
+        self.undo.push(&self.scene);
+
+        for item in buf {
+            match item {
+                ClipboardItem::Actor(mut a) => {
+                    a.id = unique_actor_id(&self.scene.actors, &a.id);
+                    let new_idx = self.scene.actors.len();
+                    self.scene.actors.push(a);
+                    // Each pasted actor goes onto a brand-new video
+                    // track inserted at the very TOP of the panel so
+                    // the duplicate stacks above the source.
+                    let new_track = self.insert_video_track_at_top();
+                    self.actor_track_assignments.insert(new_idx, new_track);
+                    new_selections.push(Selection::Actor(new_idx));
+                }
+                ClipboardItem::Overlay(mut o) => {
+                    match &mut o {
+                        memstroy_core::Overlay::Text(t) => {
+                            t.id = unique_overlay_id(&self.scene.overlays, &t.id);
+                        }
+                        memstroy_core::Overlay::Image(im) => {
+                            im.id = unique_overlay_id(&self.scene.overlays, &im.id);
+                        }
+                        memstroy_core::Overlay::Video(v) => {
+                            v.id = unique_overlay_id(&self.scene.overlays, &v.id);
+                        }
+                    }
+                    let new_idx = self.scene.overlays.len();
+                    self.scene.overlays.push(o);
+                    let new_track = self.insert_video_track_at_top();
+                    self.overlay_track_assignments.insert(new_idx, new_track);
+                    new_selections.push(Selection::Overlay(new_idx));
+                }
+                ClipboardItem::Background(mut bg) => {
+                    bg.id = unique_background_id(&self.scene.backgrounds, &bg.id);
+                    let new_idx = self.scene.backgrounds.len();
+                    self.scene.backgrounds.push(bg);
+                    new_selections.push(Selection::Background(new_idx));
+                }
+                ClipboardItem::Audio(mut au) => {
+                    au.id = unique_audio_id(&self.scene.audio, &au.id);
+                    // Standalone copy — never inherit a parent_actor
+                    // binding, otherwise the duplicate would shadow the
+                    // source's actor sync logic.
+                    au.parent_actor = None;
+                    let new_idx = self.scene.audio.len();
+                    self.scene.audio.push(au);
+                    let new_track = self.insert_audio_track_at_top();
+                    self.audio_track_assignments.insert(new_idx, new_track);
+                    new_selections.push(Selection::Audio(new_idx));
+                }
+            }
+        }
+
+        // Switch the primary selection to the LAST pasted item; keep
+        // the full list as the multi-selection so the user can keep
+        // working with the duplicates as a group.
+        if let Some(&last) = new_selections.last() {
+            self.selection = last;
+        }
+        self.canvas_selection = new_selections.clone();
+
+        new_selections.len()
+    }
+}
+
+fn unique_actor_id(actors: &[memstroy_core::Actor], base: &str) -> String {
+    let stem = strip_copy_suffix(base);
+    let mut candidate = format!("{}_copy", stem);
+    let mut n = 2;
+    while actors.iter().any(|a| a.id == candidate) {
+        candidate = format!("{}_copy{}", stem, n);
+        n += 1;
+    }
+    candidate
+}
+
+fn unique_overlay_id(overlays: &[memstroy_core::Overlay], base: &str) -> String {
+    let stem = strip_copy_suffix(base);
+    let mut candidate = format!("{}_copy", stem);
+    let mut n = 2;
+    while overlays.iter().any(|o| {
+        let id = match o {
+            memstroy_core::Overlay::Text(t) => &t.id,
+            memstroy_core::Overlay::Image(im) => &im.id,
+            memstroy_core::Overlay::Video(v) => &v.id,
+        };
+        id == &candidate
+    }) {
+        candidate = format!("{}_copy{}", stem, n);
+        n += 1;
+    }
+    candidate
+}
+
+fn unique_background_id(bgs: &[memstroy_core::Background], base: &str) -> String {
+    let stem = strip_copy_suffix(base);
+    let mut candidate = format!("{}_copy", stem);
+    let mut n = 2;
+    while bgs.iter().any(|b| b.id == candidate) {
+        candidate = format!("{}_copy{}", stem, n);
+        n += 1;
+    }
+    candidate
+}
+
+fn unique_audio_id(audios: &[memstroy_core::AudioTrack], base: &str) -> String {
+    let stem = strip_copy_suffix(base);
+    let mut candidate = format!("{}_copy", stem);
+    let mut n = 2;
+    while audios.iter().any(|a| a.id == candidate) {
+        candidate = format!("{}_copy{}", stem, n);
+        n += 1;
+    }
+    candidate
+}
+
+/// Strip a trailing `_copy[<digits>]` so repeated copy-paste cycles
+/// don't grow ids like `foo_copy_copy_copy`.
+fn strip_copy_suffix(id: &str) -> &str {
+    if let Some(idx) = id.rfind("_copy") {
+        let tail = &id[idx + "_copy".len()..];
+        if tail.is_empty() || tail.chars().all(|c| c.is_ascii_digit()) {
+            return &id[..idx];
+        }
+    }
+    id
 }
 
 /// Categories used by `scan_asset_dir` to filter the file extensions
@@ -1139,6 +1364,38 @@ pub enum SnapAxis {
     Vertical,
     /// Horizontal line at world Y = `world` — used to snap vertical positions.
     Horizontal,
+}
+
+// ─── CLIPBOARD / MULTI-SELECTION TYPES ──────────────────────────────
+
+/// One entry in the editor's in-memory clipboard. Each variant owns a
+/// fully-cloned snapshot of the source scene element so paste does not
+/// depend on the source still existing.
+#[derive(Clone)]
+pub enum ClipboardItem {
+    Actor(memstroy_core::Actor),
+    Overlay(memstroy_core::Overlay),
+    Background(memstroy_core::Background),
+    Audio(memstroy_core::AudioTrack),
+}
+
+/// Active marquee (rubber-band) selection on the canvas. Both corners
+/// live in world-pixel coordinates so the same rectangle stays anchored
+/// regardless of pan / zoom while the user drags.
+#[derive(Clone, Copy, Debug)]
+pub struct CanvasMarquee {
+    pub start: [f32; 2],
+    pub end: [f32; 2],
+}
+
+impl CanvasMarquee {
+    pub fn rect_world(&self) -> ([f32; 2], [f32; 2]) {
+        let xa = self.start[0].min(self.end[0]);
+        let xb = self.start[0].max(self.end[0]);
+        let ya = self.start[1].min(self.end[1]);
+        let yb = self.start[1].max(self.end[1]);
+        ([xa, ya], [xb, yb])
+    }
 }
 
 #[derive(Default, Clone, Copy, PartialEq)]
