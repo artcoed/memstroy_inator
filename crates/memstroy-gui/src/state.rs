@@ -1448,6 +1448,25 @@ fn check_ffmpeg() -> bool {
 
 // ─── CANVAS INTERACTION STATE ────────────────────────────────────────
 
+/// Per-element snapshot used by canvas multi-selection drags. The
+/// editor stores one of these per `state.canvas_selection` entry at
+/// drag start, then re-uses them every frame to compute "where this
+/// element should be RIGHT NOW" from the primary's accumulated delta —
+/// so the entire group translates / scales / rotates as one piece
+/// without drifting between frames.
+#[derive(Clone, Copy)]
+pub struct MultiDragEntry {
+    pub selection: Selection,
+    /// World-pixel centre of the element at drag start.
+    pub initial_pos: [f32; 2],
+    /// Scale at drag start. 1.0 for elements that don't expose a scale.
+    pub initial_scale: f32,
+    /// Y-axis stretch factor at drag start.
+    pub initial_scale_y: f32,
+    /// Rotation in degrees at drag start.
+    pub initial_rotation: f32,
+}
+
 /// Active interaction with the free canvas. Captured once at the start of a
 /// drag and persisted until the pointer is released, so the origin doesn't
 /// drift between frames.
@@ -1463,6 +1482,14 @@ pub struct CanvasDrag {
     /// Snapshot of overlay WORLD positions at drag start. Used to keep
     /// overlays visually fixed while the render frame moves/resizes.
     pub overlay_world_snapshot: Vec<(usize, [f32; 2])>,
+    /// Per-element snapshot for canvas_selection at the start of a
+    /// Move/Resize/Rotate gesture. Each entry stores the element's
+    /// world-centre, scale, scale_y, and rotation — applied on every
+    /// frame as `entry + (delta vs primary)` so every selected element
+    /// transforms together without per-frame drift.
+    /// Only filled when `canvas_selection.len() > 1` and the drag mode
+    /// is a transform; cleared on drag end.
+    pub multi_drag_snapshot: Vec<MultiDragEntry>,
     /// Currently active snap guidelines in world space — drawn on top of
     /// the canvas while a move/resize drag is in flight to give the user
     /// visual feedback about which edge/center the element snapped to.
@@ -1562,6 +1589,20 @@ pub enum CanvasDragMode {
     MoveRenderFrame { initial_pos: [f32; 2] },
     /// Resize (zoom) the render frame.
     ResizeRenderFrame { initial_zoom: f32, anchor_distance: f32 },
+    /// Active rubber-band (marquee) selection. The user pressed the
+    /// primary button on an empty area of the canvas and is dragging to
+    /// lasso multiple elements at once. World-pixel coordinates of the
+    /// drag origin are kept here so the live `CanvasMarquee.start`
+    /// stays anchored regardless of pan / zoom while the gesture is
+    /// in flight.
+    ///
+    /// `extend` is set when the user held Ctrl/Shift/Cmd at drag-start
+    /// — on commit, the lasso ADDS to the existing `canvas_selection`
+    /// instead of replacing it.
+    Marquee {
+        start_world: [f32; 2],
+        extend: bool,
+    },
     /// Rotate the selected element around its centre. `start_angle_rad`
     /// is the angle from element-centre to pointer at drag start (radians).
     /// `initial_rot_deg` is the element's rotation at drag start.
