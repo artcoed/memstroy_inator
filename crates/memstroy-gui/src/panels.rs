@@ -1221,6 +1221,7 @@ fn inspector_effect_stack(
     ui: &mut egui::Ui,
     effects: &mut Vec<Effect>,
     salt: impl std::hash::Hash + Copy,
+    t_local: f32,
 ) {
     let header = RichText::new(format!(
         "Effect Stack ({})",
@@ -1269,25 +1270,22 @@ fn inspector_effect_stack(
                                 });
                             });
                             ui.add_space(2.0);
-                            // Master intensity with per-effect "Animated"
-                            // toggle. The toggle marks `intensity` as
-                            // animatable on this Effect; when ON future
-                            // edits write into `eff.param_kfs["intensity"]`
-                            // at the playhead. (Renderer wiring for
-                            // animated effect params is incremental — see
-                            // memstroy_core::Effect for the data model.)
-                            ui.horizontal(|ui| {
-                                crate::kf_anim::animated_toggle(
-                                    ui,
-                                    &mut eff.animated_params,
-                                    "intensity",
-                                    ("eff_int", ei),
-                                );
-                                ui.add(egui::Slider::new(&mut eff.intensity, 0.0..=1.0)
-                                    .text("Intensity"));
-                            });
+                            // Master intensity row. Diamond marks
+                            // `"intensity"` as animatable; the slider
+                            // honours the per-param keyframe track when
+                            // the diamond is ON.
+                            inspector_effect_anim_slider(
+                                ui,
+                                eff,
+                                "intensity",
+                                "Intensity",
+                                0.0..=1.0,
+                                false,
+                                t_local,
+                                ("eff_int", ei),
+                            );
                             ui.add_space(2.0);
-                            inspector_effect_kind_params(ui, &mut eff.kind, salt, ei);
+                            inspector_effect_kind_params(ui, eff, salt, ei, t_local);
                         });
                     ui.add_space(3.0);
                 }
@@ -1332,40 +1330,252 @@ fn inspector_effect_stack(
 /// Render the per-kind parameter sliders for a single effect entry. Kept
 /// as a standalone fn so each variant has its own minimal UI without
 /// clogging up `inspector_effect_stack`.
+///
+/// Every numeric parameter gets a small "Animated" diamond on its left
+/// (matching the per-param toggle style used elsewhere in the
+/// inspector). Toggling the diamond ON makes future edits write
+/// keyframes into `eff.param_kfs[<key>]` at `t_local`; OFF makes
+/// edits land on the static field on the `EffectKind` variant. The
+/// runtime preview / renderer pipe reads the animated value via
+/// `Effect::sampled_at(t_local)` so the inspector and the picture
+/// stay in sync.
+///
+/// Parameter keys follow the documented `param_ids::fx_param`
+/// convention: `"intensity"` for the master amount, `"p0"` for the
+/// first per-kind parameter, and `"p1"` for the (optional) second.
 fn inspector_effect_kind_params(
     ui: &mut egui::Ui,
-    kind: &mut EffectKind,
+    eff: &mut Effect,
     _salt: impl std::hash::Hash + Copy,
-    _ei: usize,
+    ei: usize,
+    t_local: f32,
+) {
+    use memstroy_core::EffectKind as K;
+    // For variants with no parameters, just emit a "no parameters"
+    // hint and bail out — there's nothing to animate or edit.
+    if matches!(
+        &eff.kind,
+        K::Grayscale | K::Sepia | K::Invert | K::MirrorH | K::MirrorV | K::OldFilm | K::Vhs
+    ) {
+        ui.label(
+            RichText::new("No parameters.")
+                .size(10.0)
+                .color(COL_TEXT_DIM)
+                .italics(),
+        );
+        return;
+    }
+    match &eff.kind {
+        K::Blur { .. } => inspector_effect_anim_slider(
+            ui, eff, "p0", "Radius (px)", 0.0..=80.0, false, t_local, ("eff_blur", ei)),
+        K::Sharpen { .. } => inspector_effect_anim_slider(
+            ui, eff, "p0", "Amount", 0.0..=3.0, false, t_local, ("eff_sharpen", ei)),
+        K::HueShift { .. } => inspector_effect_anim_slider(
+            ui, eff, "p0", "Hue \u{00B0}", -180.0..=180.0, false, t_local, ("eff_hue", ei)),
+        K::Vignette { .. } => inspector_effect_anim_slider(
+            ui, eff, "p0", "Strength", 0.0..=1.0, false, t_local, ("eff_vignette", ei)),
+        K::Pixelate { .. } => inspector_effect_anim_slider(
+            ui, eff, "p0", "Block size (px)", 2.0..=80.0, false, t_local, ("eff_pix", ei)),
+        K::Posterize { .. } => inspector_effect_anim_slider(
+            ui, eff, "p0", "Levels", 2.0..=32.0, false, t_local, ("eff_post", ei)),
+        K::Glow { .. } => {
+            inspector_effect_anim_slider(
+                ui, eff, "p0", "Radius (px)", 0.0..=64.0, false, t_local, ("eff_glow_r", ei));
+            inspector_effect_anim_slider(
+                ui, eff, "p1", "Glow strength", 0.0..=2.0, false, t_local, ("eff_glow_i", ei));
+        }
+        K::Brightness { .. } => inspector_effect_anim_slider(
+            ui, eff, "p0", "Amount", -1.0..=1.0, false, t_local, ("eff_bri", ei)),
+        K::Contrast { .. } => inspector_effect_anim_slider(
+            ui, eff, "p0", "Amount", -1.0..=1.0, false, t_local, ("eff_con", ei)),
+        K::Saturation { .. } => inspector_effect_anim_slider(
+            ui, eff, "p0", "Amount", -1.0..=1.0, false, t_local, ("eff_sat", ei)),
+        K::EdgeDetect { .. } => inspector_effect_anim_slider(
+            ui, eff, "p0", "Threshold", 0.0..=1.0, false, t_local, ("eff_edge", ei)),
+        K::ChromaticAberration { .. } => inspector_effect_anim_slider(
+            ui, eff, "p0", "Offset (px)", 0.0..=24.0, false, t_local, ("eff_ca", ei)),
+        K::Noise { .. } => inspector_effect_anim_slider(
+            ui, eff, "p0", "Amount", 0.0..=1.0, false, t_local, ("eff_noise", ei)),
+        K::Wave { .. } => {
+            inspector_effect_anim_slider(
+                ui, eff, "p0", "Amplitude (px)", 0.0..=40.0, false, t_local, ("eff_wave_a", ei));
+            inspector_effect_anim_slider(
+                ui, eff, "p1", "Wavelength (px)", 4.0..=400.0, false, t_local, ("eff_wave_w", ei));
+        }
+        K::Glitch { .. } => inspector_effect_anim_slider(
+            ui, eff, "p0", "Strength", 0.0..=1.0, false, t_local, ("eff_glitch", ei)),
+        K::Bloom { .. } => inspector_effect_anim_slider(
+            ui, eff, "p0", "Radius (px)", 0.0..=80.0, false, t_local, ("eff_bloom", ei)),
+        K::Grayscale | K::Sepia | K::Invert | K::MirrorH | K::MirrorV
+            | K::OldFilm | K::Vhs => unreachable!(),
+    }
+}
+
+/// Resolve the static value of an `EffectKind` parameter for the given
+/// param `key`. Returns `None` for variants that don't own the
+/// requested key (e.g. asking for `"p1"` on `Blur`).
+fn effect_kind_param_get(
+    kind: &memstroy_core::EffectKind,
+    key: &str,
+) -> Option<f32> {
+    use memstroy_core::EffectKind as K;
+    match kind {
+        K::Blur { radius } if key == "p0" => Some(*radius),
+        K::Sharpen { amount } if key == "p0" => Some(*amount),
+        K::HueShift { degrees } if key == "p0" => Some(*degrees),
+        K::Vignette { strength } if key == "p0" => Some(*strength),
+        K::Pixelate { block_size } if key == "p0" => Some(*block_size),
+        K::Posterize { levels } if key == "p0" => Some(*levels as f32),
+        K::Glow { radius, .. } if key == "p0" => Some(*radius),
+        K::Glow { intensity, .. } if key == "p1" => Some(*intensity),
+        K::Brightness { amount } if key == "p0" => Some(*amount),
+        K::Contrast { amount } if key == "p0" => Some(*amount),
+        K::Saturation { amount } if key == "p0" => Some(*amount),
+        K::EdgeDetect { threshold } if key == "p0" => Some(*threshold),
+        K::ChromaticAberration { offset } if key == "p0" => Some(*offset),
+        K::Noise { amount } if key == "p0" => Some(*amount),
+        K::Wave { amplitude, .. } if key == "p0" => Some(*amplitude),
+        K::Wave { wavelength, .. } if key == "p1" => Some(*wavelength),
+        K::Glitch { strength } if key == "p0" => Some(*strength),
+        K::Bloom { radius } if key == "p0" => Some(*radius),
+        _ => None,
+    }
+}
+
+/// Write the static value of an `EffectKind` parameter at the given
+/// param `key`. No-ops for variants that don't own the key.
+fn effect_kind_param_set(
+    kind: &mut memstroy_core::EffectKind,
+    key: &str,
+    new_val: f32,
 ) {
     use memstroy_core::EffectKind as K;
     match kind {
-        K::Blur { radius } => { ui.add(egui::Slider::new(radius, 0.0..=80.0).text("Radius (px)")); }
-        K::Sharpen { amount } => { ui.add(egui::Slider::new(amount, 0.0..=3.0).text("Amount")); }
-        K::Grayscale | K::Sepia | K::Invert | K::MirrorH | K::MirrorV
-            | K::OldFilm | K::Vhs => {
-            ui.label(RichText::new("No parameters.").size(10.0).color(COL_TEXT_DIM).italics());
+        K::Blur { radius } if key == "p0" => *radius = new_val,
+        K::Sharpen { amount } if key == "p0" => *amount = new_val,
+        K::HueShift { degrees } if key == "p0" => *degrees = new_val,
+        K::Vignette { strength } if key == "p0" => *strength = new_val,
+        K::Pixelate { block_size } if key == "p0" => *block_size = new_val,
+        K::Posterize { levels } if key == "p0" => {
+            *levels = (new_val as u32).clamp(2, 32);
         }
-        K::HueShift { degrees } => { ui.add(egui::Slider::new(degrees, -180.0..=180.0).text("Hue \u{00B0}")); }
-        K::Vignette { strength } => { ui.add(egui::Slider::new(strength, 0.0..=1.0).text("Strength")); }
-        K::Pixelate { block_size } => { ui.add(egui::Slider::new(block_size, 2.0..=80.0).text("Block size (px)")); }
-        K::Posterize { levels } => { ui.add(egui::Slider::new(levels, 2..=32).text("Levels")); }
-        K::Glow { radius, intensity } => {
-            ui.add(egui::Slider::new(radius, 0.0..=64.0).text("Radius (px)"));
-            ui.add(egui::Slider::new(intensity, 0.0..=2.0).text("Intensity"));
+        K::Glow { radius, .. } if key == "p0" => *radius = new_val,
+        K::Glow { intensity, .. } if key == "p1" => *intensity = new_val,
+        K::Brightness { amount } if key == "p0" => *amount = new_val,
+        K::Contrast { amount } if key == "p0" => *amount = new_val,
+        K::Saturation { amount } if key == "p0" => *amount = new_val,
+        K::EdgeDetect { threshold } if key == "p0" => *threshold = new_val,
+        K::ChromaticAberration { offset } if key == "p0" => *offset = new_val,
+        K::Noise { amount } if key == "p0" => *amount = new_val,
+        K::Wave { amplitude, .. } if key == "p0" => *amplitude = new_val,
+        K::Wave { wavelength, .. } if key == "p1" => *wavelength = new_val,
+        K::Glitch { strength } if key == "p0" => *strength = new_val,
+        K::Bloom { radius } if key == "p0" => *radius = new_val,
+        _ => {}
+    }
+}
+
+/// Generic "animatable" param row for an `Effect`. Renders a left-aligned
+/// diamond toggle, the slider, and (when animated) a small "+ kf" button
+/// that re-anchors the kf at the current playhead. Reads the displayed
+/// value from `eff.param_kfs[key]` when animated, otherwise from the
+/// static field on the `EffectKind` variant. On change, writes into
+/// `param_kfs` (animated) or the variant's field (static).
+///
+/// The `key` argument selects which Effect parameter we're driving:
+/// `"intensity"` for the master amount or `"p0"` / `"p1"` for the
+/// per-kind primary / secondary numeric fields. Keys that don't apply
+/// to the current variant short-circuit to a no-op.
+fn inspector_effect_anim_slider(
+    ui: &mut egui::Ui,
+    eff: &mut Effect,
+    key: &'static str,
+    label: &str,
+    range: std::ops::RangeInclusive<f32>,
+    logarithmic: bool,
+    t_local: f32,
+    salt: impl std::hash::Hash + Copy,
+) {
+    // Resolve current static value: master "intensity" lives on the
+    // Effect, the per-kind keys live inside the variant payload.
+    let static_value: f32 = match key {
+        "intensity" => eff.intensity,
+        _ => match effect_kind_param_get(&eff.kind, key) {
+            Some(v) => v,
+            None => return, // variant doesn't own this key
+        },
+    };
+    let is_animated = eff.animated_params.contains(key);
+    let mut display = if is_animated {
+        eff.param_kfs
+            .get(key)
+            .filter(|kfs| !kfs.is_empty())
+            .map(|kfs| memstroy_core::keyframe::sample(kfs, t_local).unwrap_or(static_value))
+            .unwrap_or(static_value)
+    } else {
+        static_value
+    };
+
+    ui.horizontal(|ui| {
+        // Diamond toggle: clicking flips membership in animated_params.
+        // When toggled ON we also seed a starter kf at `t_local` with
+        // the current static value so the slider doesn't visually jump
+        // to zero on first edit.
+        if crate::kf_anim::animated_toggle(ui, &mut eff.animated_params, key, salt) {
+            if eff.animated_params.contains(key) {
+                let entry = eff.param_kfs.entry(key.to_string()).or_default();
+                if entry.is_empty() {
+                    entry.push(memstroy_core::Keyframe::new(t_local.max(0.0), static_value));
+                }
+            }
         }
-        K::Brightness { amount } => { ui.add(egui::Slider::new(amount, -1.0..=1.0).text("Amount")); }
-        K::Contrast { amount } => { ui.add(egui::Slider::new(amount, -1.0..=1.0).text("Amount")); }
-        K::Saturation { amount } => { ui.add(egui::Slider::new(amount, -1.0..=1.0).text("Amount")); }
-        K::EdgeDetect { threshold } => { ui.add(egui::Slider::new(threshold, 0.0..=1.0).text("Threshold")); }
-        K::ChromaticAberration { offset } => { ui.add(egui::Slider::new(offset, 0.0..=24.0).text("Offset (px)")); }
-        K::Noise { amount } => { ui.add(egui::Slider::new(amount, 0.0..=1.0).text("Amount")); }
-        K::Wave { amplitude, wavelength } => {
-            ui.add(egui::Slider::new(amplitude, 0.0..=40.0).text("Amplitude (px)"));
-            ui.add(egui::Slider::new(wavelength, 4.0..=400.0).text("Wavelength (px)"));
+        ui.label(label);
+        let mut slider = egui::Slider::new(&mut display, range.clone());
+        if logarithmic {
+            slider = slider.logarithmic(true);
         }
-        K::Glitch { strength } => { ui.add(egui::Slider::new(strength, 0.0..=1.0).text("Strength")); }
-        K::Bloom { radius } => { ui.add(egui::Slider::new(radius, 0.0..=80.0).text("Radius (px)")); }
+        let resp = ui.add(slider);
+        if resp.changed() {
+            if is_animated {
+                let entry = eff.param_kfs.entry(key.to_string()).or_default();
+                if entry.is_empty() {
+                    entry.push(memstroy_core::Keyframe::new(t_local.max(0.0), display));
+                } else {
+                    memstroy_core::upsert_keyframe(entry, t_local.max(0.0), display);
+                }
+            } else if key == "intensity" {
+                eff.intensity = display;
+            } else {
+                effect_kind_param_set(&mut eff.kind, key, display);
+            }
+        }
+    });
+
+    if is_animated {
+        ui.horizontal(|ui| {
+            ui.add_space(20.0);
+            if ui
+                .small_button("+ kf at playhead")
+                .on_hover_text("Add a keyframe at the current playhead")
+                .clicked()
+            {
+                let entry = eff.param_kfs.entry(key.to_string()).or_default();
+                if entry.is_empty() {
+                    entry.push(memstroy_core::Keyframe::new(t_local.max(0.0), display));
+                } else {
+                    memstroy_core::upsert_keyframe(entry, t_local.max(0.0), display);
+                }
+            }
+            let kf_count = eff.param_kfs.get(key).map(|v| v.len()).unwrap_or(0);
+            if kf_count > 0 && ui.small_button("Clear kfs").clicked() {
+                eff.param_kfs.remove(key);
+            }
+            ui.label(
+                RichText::new(format!("({} kf)", kf_count))
+                    .size(9.0)
+                    .color(COL_TEXT_DIM),
+            );
+        });
     }
 }
 
@@ -1425,8 +1635,12 @@ fn inspector_actor_effects(ui: &mut egui::Ui, state: &mut EditorState, i: usize,
 
     ui.add_space(12.0);
     // Effect stack — generic post-process effects layered on top of CC.
+    // Effect param keyframes are stored in clip-local time so they
+    // travel with the actor when its `t_in` shifts on the timeline.
+    let actor_t_in = state.scene.actors[i].t_in.unwrap_or(0.0);
+    let fx_t_local = (state.playhead - actor_t_in).max(0.0);
     let a = &mut state.scene.actors[i];
-    inspector_effect_stack(ui, &mut a.effects, ("actor_fx", i));
+    inspector_effect_stack(ui, &mut a.effects, ("actor_fx", i), fx_t_local);
 }
 
 // ─── PROFESSIONAL COLOR CORRECTION INSPECTOR ─────────────────────────
@@ -1443,6 +1657,96 @@ fn inspector_actor_effects(ui: &mut egui::Ui, state: &mut EditorState, i: usize,
 //
 // All three tabs feed into the same `ColorCorrection` struct and the apply
 // pipeline is shared with the export path (see `apply_effects_cpu`).
+
+/// Animatable param row for a `ColorCorrection` scalar field. Mirrors
+/// `inspector_effect_anim_slider` but writes into the CC struct's own
+/// `kfs` / `animated_params`. Supported keys: `"brightness"`,
+/// `"contrast"`, `"saturation"`, `"temperature"` (the four scalar
+/// fields). Unknown keys short-circuit to a no-op.
+fn inspector_cc_anim_slider(
+    ui: &mut egui::Ui,
+    cc: &mut memstroy_core::ColorCorrection,
+    key: &'static str,
+    label: &str,
+    range: std::ops::RangeInclusive<f32>,
+    t_local: f32,
+    salt: impl std::hash::Hash + Copy,
+) {
+    // Pull the current static value via the param key.
+    let static_value: f32 = match key {
+        "brightness" => cc.brightness,
+        "contrast" => cc.contrast,
+        "saturation" => cc.saturation,
+        "temperature" => cc.temperature,
+        _ => return,
+    };
+    let is_animated = cc.animated_params.contains(key);
+    let mut display = if is_animated {
+        cc.kfs
+            .get(key)
+            .filter(|kfs| !kfs.is_empty())
+            .map(|kfs| memstroy_core::keyframe::sample(kfs, t_local).unwrap_or(static_value))
+            .unwrap_or(static_value)
+    } else {
+        static_value
+    };
+    ui.horizontal(|ui| {
+        if crate::kf_anim::animated_toggle(ui, &mut cc.animated_params, key, salt) {
+            if cc.animated_params.contains(key) {
+                let entry = cc.kfs.entry(key.to_string()).or_default();
+                if entry.is_empty() {
+                    entry.push(memstroy_core::Keyframe::new(t_local.max(0.0), static_value));
+                }
+            }
+        }
+        ui.label(label);
+        let resp = ui.add(egui::Slider::new(&mut display, range.clone()));
+        if resp.changed() {
+            if is_animated {
+                let entry = cc.kfs.entry(key.to_string()).or_default();
+                if entry.is_empty() {
+                    entry.push(memstroy_core::Keyframe::new(t_local.max(0.0), display));
+                } else {
+                    memstroy_core::upsert_keyframe(entry, t_local.max(0.0), display);
+                }
+            } else {
+                match key {
+                    "brightness" => cc.brightness = display,
+                    "contrast" => cc.contrast = display,
+                    "saturation" => cc.saturation = display,
+                    "temperature" => cc.temperature = display,
+                    _ => {}
+                }
+            }
+        }
+    });
+    if is_animated {
+        ui.horizontal(|ui| {
+            ui.add_space(20.0);
+            if ui
+                .small_button("+ kf at playhead")
+                .on_hover_text("Add a keyframe at the current playhead")
+                .clicked()
+            {
+                let entry = cc.kfs.entry(key.to_string()).or_default();
+                if entry.is_empty() {
+                    entry.push(memstroy_core::Keyframe::new(t_local.max(0.0), display));
+                } else {
+                    memstroy_core::upsert_keyframe(entry, t_local.max(0.0), display);
+                }
+            }
+            let kf_count = cc.kfs.get(key).map(|v| v.len()).unwrap_or(0);
+            if kf_count > 0 && ui.small_button("Clear kfs").clicked() {
+                cc.kfs.remove(key);
+            }
+            ui.label(
+                RichText::new(format!("({} kf)", kf_count))
+                    .size(9.0)
+                    .color(COL_TEXT_DIM),
+            );
+        });
+    }
+}
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum CcTab {
@@ -1487,13 +1791,21 @@ fn color_correction_inspector(ui: &mut egui::Ui, state: &mut EditorState, actor_
     ui.data_mut(|d| d.insert_temp(tab_id, tab));
     ui.add_space(4.0);
 
+    // CC keyframes are stored in clip-local time so they shift with the
+    // host actor. Compute the frame at which to read/write before we
+    // grab a `&mut` to the colour-correction struct.
+    let cc_t_local = (state.playhead - state.scene.actors[actor_idx].t_in.unwrap_or(0.0)).max(0.0);
     let cc = &mut state.scene.actors[actor_idx].color_correction;
     match tab {
         CcTab::Basic => {
-            ui.add(egui::Slider::new(&mut cc.brightness, -1.0..=1.0).text("Brightness"));
-            ui.add(egui::Slider::new(&mut cc.contrast, 0.0..=3.0).text("Contrast"));
-            ui.add(egui::Slider::new(&mut cc.saturation, 0.0..=3.0).text("Saturation"));
-            ui.add(egui::Slider::new(&mut cc.temperature, -1.0..=1.0).text("Temperature"));
+            inspector_cc_anim_slider(
+                ui, cc, "brightness", "Brightness", -1.0..=1.0, cc_t_local, ("cc_b", actor_idx));
+            inspector_cc_anim_slider(
+                ui, cc, "contrast", "Contrast", 0.0..=3.0, cc_t_local, ("cc_c", actor_idx));
+            inspector_cc_anim_slider(
+                ui, cc, "saturation", "Saturation", 0.0..=3.0, cc_t_local, ("cc_s", actor_idx));
+            inspector_cc_anim_slider(
+                ui, cc, "temperature", "Temperature", -1.0..=1.0, cc_t_local, ("cc_t", actor_idx));
         }
         CcTab::Wheels => {
             // Lift wheel: neutral 0, range ±0.5
@@ -1922,11 +2234,20 @@ fn inspector_actor_skeleton_attachments(ui: &mut egui::Ui, state: &mut EditorSta
             }
         }
         ui.add_space(6.0);
+        ui.label(
+            RichText::new("Tip: Alt+drag a clip on the timeline → drop on a point row to attach.")
+                .size(9.0)
+                .color(COL_TEXT_DIM)
+                .italics(),
+        );
+        ui.add_space(2.0);
 
         // ── Per-template point list with drop zones ──
-        // (Drag chips above were removed; the drop zones still listen for
-        // an `element_drag.source` so a future "drag from layer panel"
-        // implementation will keep working with this codepath.)
+        // The drop zones listen for `element_drag.source` on pointer
+        // release. The supported authoring path is now Alt+drag from a
+        // timeline clip bar (set in the actor / overlay drag arms of
+        // `timeline()`); the picker above remains as a click-to-attach
+        // fallback for when the user wants a precise menu choice.
         let dragging_label = state.element_drag.label.clone();
         let dragging = state.element_drag.source;
         let pointer_released = ui.input(|i| i.pointer.any_released());
@@ -2252,7 +2573,8 @@ fn inspector_overlay(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
             ui.add_space(8.0);
             inspector_modifiers(ui, &mut im.modifiers, ("img_mods", i));
             ui.add_space(8.0);
-            inspector_effect_stack(ui, &mut im.effects, ("img_fx", i));
+            let fx_t_local = (playhead - im.t_in).max(0.0);
+            inspector_effect_stack(ui, &mut im.effects, ("img_fx", i), fx_t_local);
         }
         Overlay::Video(v) => {
             ui.label(RichText::new(format!("Video: {}", v.id)).strong().size(14.0).color(COL_CLIP_OVERLAY));
@@ -2269,7 +2591,8 @@ fn inspector_overlay(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
             ui.add_space(8.0);
             inspector_modifiers(ui, &mut v.modifiers, ("vid_mods", i));
             ui.add_space(8.0);
-            inspector_effect_stack(ui, &mut v.effects, ("vid_fx", i));
+            let fx_t_local = (playhead - v.t_in).max(0.0);
+            inspector_effect_stack(ui, &mut v.effects, ("vid_fx", i), fx_t_local);
         }
     }
 }
@@ -2693,6 +3016,7 @@ const COMMON_FONTS: &[&str] = &[
 /// Inspector for the render frame (output area). Exposes position,
 /// rotation, and size in world pixels just like any other element.
 fn inspector_render_frame(ui: &mut egui::Ui, state: &mut EditorState) {
+    let rf_t_local = state.playhead;
     let rf = &mut state.scene.render_frame;
     let [rw, rh] = rf.resolution;
 
@@ -2821,7 +3145,8 @@ fn inspector_render_frame(ui: &mut egui::Ui, state: &mut EditorState) {
     ui.add_space(10.0);
     inspector_modifiers(ui, &mut rf.modifiers, "rf_mods");
     ui.add_space(8.0);
-    inspector_effect_stack(ui, &mut rf.effects, "rf_fx");
+    // Render frame is scene-time anchored — effect kfs use scene-time.
+    inspector_effect_stack(ui, &mut rf.effects, "rf_fx", rf_t_local);
 }
 
 fn inspector_background(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
@@ -2991,14 +3316,99 @@ fn inspector_audio(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
     // clear.)
 
     ui.add_space(6.0);
-    if audio.parent_actor.is_some() {
+    // ── Actor link / unlink controls ──
+    //
+    // Shows the current binding and exposes a single button to attach
+    // (when standalone) or detach (when bound). When bound, every
+    // movement / trim of the parent actor mirrors onto this audio
+    // track, and the reverse direction is now also wired up so the
+    // user can drag the audio bar and see the actor follow.
+    //
+    // Attach uses a tiny ComboBox listing every actor that doesn't
+    // already have a bound audio track — picking one writes the
+    // `parent_actor` field. Detach simply clears the binding.
+    let parent_now = audio.parent_actor.clone();
+    ui.label(RichText::new(t("Link to actor")).strong().size(12.0).color(COL_TEXT_DIM));
+    if let Some(parent_id) = parent_now.as_ref() {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!("\u{1F517} {}", parent_id))
+                    .size(11.0)
+                    .color(Color32::from_rgb(180, 220, 180)),
+            );
+            if ui
+                .small_button(t("Unlink"))
+                .on_hover_text(t(
+                    "Detach this audio from its parent actor. The actor stops syncing and the audio becomes standalone.",
+                ))
+                .clicked()
+            {
+                audio.parent_actor = None;
+            }
+        });
         ui.label(
-            RichText::new(t("Bound to an actor — moves and trims with its parent clip."))
-                .size(10.0)
-                .italics()
-                .color(COL_TEXT_DIM),
+            RichText::new(t(
+                "Bound to an actor — moves and trims with its parent clip (and vice versa).",
+            ))
+            .size(10.0)
+            .italics()
+            .color(COL_TEXT_DIM),
         );
     } else {
+        // Build the list of attach candidates from a snapshot so we can
+        // mutate audio.parent_actor inside the closure without a double
+        // borrow.
+        let candidates: Vec<String> = state
+            .scene
+            .actors
+            .iter()
+            .map(|a| a.id.clone())
+            .collect();
+        let pick_id = ui.id().with(("audio_link_pick", i));
+        let mut pick_idx: usize = ui.data(|d| d.get_temp(pick_id).unwrap_or(0));
+        if pick_idx >= candidates.len() {
+            pick_idx = 0;
+        }
+        // Re-borrow audio mutably (we dropped it via parent_now.clone() above
+        // for the read; the previous mutable borrow ends with the if-arm).
+        let audio = &mut state.scene.audio[i];
+        ui.horizontal(|ui| {
+            if candidates.is_empty() {
+                ui.label(
+                    RichText::new(t("No actors yet — add one first."))
+                        .size(10.0)
+                        .italics()
+                        .color(COL_TEXT_DIM),
+                );
+            } else {
+                let label_now = candidates
+                    .get(pick_idx)
+                    .cloned()
+                    .unwrap_or_else(|| "—".into());
+                egui::ComboBox::from_id_source(("audio_link_cmb", i))
+                    .selected_text(label_now)
+                    .width(160.0)
+                    .show_ui(ui, |ui| {
+                        for (k, name) in candidates.iter().enumerate() {
+                            if ui.selectable_label(k == pick_idx, name).clicked() {
+                                pick_idx = k;
+                            }
+                        }
+                    });
+                ui.data_mut(|d| d.insert_temp(pick_id, pick_idx));
+                if ui
+                    .small_button(t("Link"))
+                    .on_hover_text(t(
+                        "Bind this audio to the chosen actor so move/trim stays in sync both ways.",
+                    ))
+                    .clicked()
+                {
+                    if let Some(name) = candidates.get(pick_idx) {
+                        audio.parent_actor = Some(name.clone());
+                    }
+                }
+            }
+        });
         ui.label(
             RichText::new(t("Standalone music — independent of any actor."))
                 .size(10.0)
@@ -3249,6 +3659,36 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             if !state.loop_mode {
                 state.loop_pending_start = None;
             }
+        }
+
+        ui.separator();
+
+        // ── Explicit "+ Layer" buttons ──
+        //
+        // Adds a fresh empty video / audio lane to the timeline at the
+        // top of its respective block. The drag-to-margin gesture also
+        // creates lanes (and remains the canonical way to drop a clip
+        // straight onto a new lane), but it only fires on drag-end so
+        // it's awkward for users who just want a blank scratch lane.
+        // These buttons remove the "max 1 new layer per session" feel
+        // by giving an unconditional, repeatable creation path.
+        if ui
+            .button(RichText::new("+ V Layer").size(11.0).color(Color32::from_rgb(140, 220, 255)))
+            .on_hover_text("Add a new empty video layer at the top of the panel")
+            .clicked()
+        {
+            state.mutate(|_| {});
+            let _ = state.insert_video_track_at_top();
+            state.status = "\u{2728} New video layer.".into();
+        }
+        if ui
+            .button(RichText::new("+ A Layer").size(11.0).color(Color32::from_rgb(120, 220, 200)))
+            .on_hover_text("Add a new empty audio layer below the existing audio block")
+            .clicked()
+        {
+            state.mutate(|_| {});
+            state.add_audio_track();
+            state.status = "\u{2728} New audio layer.".into();
         }
 
         // Zoom display (read-only — adjust via scrollbar handles)
@@ -3559,7 +3999,20 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             acc += h;
         }
     }
-    let pointer_y: Option<f32> = ui.input(|i| i.pointer.hover_pos().map(|p| p.y));
+    let pointer_y: Option<f32> = ui.input(|i| {
+        // While dragging, `hover_pos` returns None as soon as the
+        // cursor leaves the timeline panel, which used to break the
+        // cross-lane drag the moment the user moved the mouse over the
+        // inspector. `interact_pos` keeps reporting the latest pointer
+        // sample for the duration of the drag, so cross-lane drops
+        // continue to fire correctly. We still fall back to
+        // `hover_pos` for the no-drag case so plain hover highlighting
+        // stays accurate.
+        i.pointer
+            .interact_pos()
+            .or_else(|| i.pointer.hover_pos())
+            .map(|p| p.y)
+    });
     let any_pointer_down = ui.input(|i| i.pointer.any_down());
 
     // Classify a pointer Y into a drop target relative to the current
@@ -3893,6 +4346,31 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                 state.timeline_drag.start_pointer_y = pointer_y;
                             }
 
+                            // ── Alt-modifier: ALSO publish an
+                            // ElementDrag so the user can drag the
+                            // clip directly from the timeline onto a
+                            // skeleton-attachment-point row in the
+                            // inspector. The existing drop zones in
+                            // `inspector_actor_skeleton_attachments`
+                            // listen for `state.element_drag.source`
+                            // on pointer release. Without the modifier
+                            // the drag stays a pure timeline move.
+                            if ui.input(|i| i.modifiers.alt) {
+                                state.element_drag.source =
+                                    Some(crate::state::AttachableElement::Actor(ai));
+                                state.element_drag.label = format!(
+                                    "A:{}",
+                                    state.scene.actors[ai].id
+                                );
+                                if let Some(p) = ui.input(|i| {
+                                    i.pointer
+                                        .interact_pos()
+                                        .or_else(|| i.pointer.hover_pos())
+                                }) {
+                                    state.element_drag.pos = [p.x, p.y];
+                                }
+                            }
+
                             // ── Resolve the destination track from the pointer's Y position ──
                             // Actors only ever land on video lanes. Dropping
                             // into the gap above the topmost video row, or
@@ -4130,6 +4608,32 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             let new_start = (-clicked).max(0.0);
                             let dur = clip_end - clip_start;
                             let new_end = new_start + dur;
+                            // Track active drag for lane-lock & new-lane intents.
+                            if state.timeline_drag.dragging_clip.is_none() {
+                                state.timeline_drag.dragging_clip = Some(oi);
+                                state.timeline_drag.pending_new_lane = None;
+                                state.timeline_drag.start_pointer_y = pointer_y;
+                            }
+                            // Alt-modifier — see the actor arm above for
+                            // why this turns the timeline drag into a
+                            // skeleton-attach drag-source.
+                            if ui.input(|i| i.modifiers.alt) {
+                                state.element_drag.source =
+                                    Some(crate::state::AttachableElement::Overlay(oi));
+                                let lbl = match &state.scene.overlays[oi] {
+                                    Overlay::Text(t) => format!("T:{}", t.id),
+                                    Overlay::Image(im) => format!("I:{}", im.id),
+                                    Overlay::Video(v) => format!("V:{}", v.id),
+                                };
+                                state.element_drag.label = lbl;
+                                if let Some(p) = ui.input(|i| {
+                                    i.pointer
+                                        .interact_pos()
+                                        .or_else(|| i.pointer.hover_pos())
+                                }) {
+                                    state.element_drag.pos = [p.x, p.y];
+                                }
+                            }
                             let token = EditorState::drag_token("move_overlay", oi);
                             state.mutate_drag(token, |s| {
                                 match &mut s.overlays[oi] {
@@ -4142,8 +4646,18 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             // Vertical: re-assign track based on pointer Y.
                             // Overlays only land on video lanes, mirroring
                             // the actor drag rules. Layer creation is
-                            // deferred to drag-end.
-                            if let Some(py) = pointer_y {
+                            // deferred to drag-end. Lane lock is the same
+                            // 14-px hysteresis used for actors so the
+                            // dragged overlay stops "wobbling" between
+                            // adjacent lanes during a horizontal move.
+                            const LANE_LOCK_THRESHOLD: f32 = 14.0;
+                            let lane_locked = match (state.timeline_drag.start_pointer_y, pointer_y) {
+                                (Some(y0), Some(y1)) => (y1 - y0).abs() < LANE_LOCK_THRESHOLD,
+                                _ => false,
+                            };
+                            if lane_locked {
+                                // Skip lane reassignment entirely.
+                            } else if let Some(py) = pointer_y {
                                 let cur = state.overlay_track_assignments.get(&oi).copied();
                                 match classify_pointer_y(py, cur) {
                                     DropIntent::ToVideoRow(idx) => {
@@ -4251,16 +4765,67 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             // Drag: move the audio clip horizontally.
                             let new_start = (-clicked).max(0.0);
                             let dur = clip_end - clip_start;
+                            // Track active drag for lane-lock & new-lane intents.
+                            if state.timeline_drag.dragging_clip.is_none() {
+                                state.timeline_drag.dragging_clip = Some(aui);
+                                state.timeline_drag.pending_new_lane = None;
+                                state.timeline_drag.start_pointer_y = pointer_y;
+                            }
                             let token = EditorState::drag_token("move_audio", aui);
+                            // Capture parent_actor binding (if any) so we
+                            // can mirror the audio's horizontal move onto
+                            // the video clip it's linked to. This makes
+                            // audio<->video movement bidirectional —
+                            // moving the actor already syncs its bound
+                            // audio via `sync_audio_to_actor`; this path
+                            // closes the loop in the other direction.
+                            let parent_actor_id = state.scene.audio[aui].parent_actor.clone();
+                            let prev_t_in = state.scene.audio[aui].t_in;
                             state.mutate_drag(token, |s| {
                                 s.audio[aui].t_in = new_start;
                                 s.audio[aui].t_out = Some(new_start + dur);
                             });
+                            if let Some(parent_id) = parent_actor_id {
+                                let dt = new_start - prev_t_in;
+                                if dt.abs() > 1.0e-6 {
+                                    if let Some(parent_idx) =
+                                        state.scene.actors.iter().position(|a| a.id == parent_id)
+                                    {
+                                        // Shift the parent actor's window
+                                        // by the same delta, dragging its
+                                        // scene-time keyframes along.
+                                        let _ = state.mutate_drag(token, |s| {
+                                            let actor = &mut s.actors[parent_idx];
+                                            let new_in = (actor.t_in.unwrap_or(0.0) + dt).max(0.0);
+                                            let cur_dur = actor
+                                                .t_out
+                                                .map(|out| out - actor.t_in.unwrap_or(0.0))
+                                                .unwrap_or(0.0);
+                                            actor.t_in = Some(new_in);
+                                            if cur_dur > 0.0 {
+                                                actor.t_out = Some(new_in + cur_dur);
+                                            }
+                                            for kf in actor.layout.iter_mut() {
+                                                kf.t += dt;
+                                            }
+                                        });
+                                    }
+                                }
+                            }
 
                             // Vertical: only allow audio to land on audio
                             // lanes. Lane creation is deferred to drag-end
                             // via state.timeline_drag.pending_new_lane.
-                            if let Some(py) = pointer_y {
+                            // Lane-lock hysteresis kills the inter-lane
+                            // wobble during a primarily-horizontal drag.
+                            const LANE_LOCK_THRESHOLD: f32 = 14.0;
+                            let lane_locked = match (state.timeline_drag.start_pointer_y, pointer_y) {
+                                (Some(y0), Some(y1)) => (y1 - y0).abs() < LANE_LOCK_THRESHOLD,
+                                _ => false,
+                            };
+                            if lane_locked {
+                                // Skip lane reassignment entirely.
+                            } else if let Some(py) = pointer_y {
                                 let cur = state.audio_track_assignments.get(&aui).copied();
                                 match classify_pointer_y(py, cur) {
                                     DropIntent::ToAudioRow(idx) => {
@@ -4757,6 +5322,15 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
         state.timeline_drag.dragging_clip = None;
         state.timeline_drag.pending_new_lane = None;
         state.timeline_drag.start_pointer_y = None;
+        // Clear any in-flight element-drag that wasn't consumed by a
+        // skeleton drop zone (e.g. user Alt-dragged a clip but
+        // released over the timeline). The inspector's drop zones
+        // already clear it on a successful attach; this is the
+        // fallback for "released elsewhere".
+        if state.element_drag.source.is_some() {
+            state.element_drag.source = None;
+            state.element_drag.label.clear();
+        }
     }
 }
 
