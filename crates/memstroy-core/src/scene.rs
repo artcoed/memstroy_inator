@@ -45,8 +45,8 @@ pub mod param_ids {
         match id {
             POS_X => "Position X",
             POS_Y => "Position Y",
-            SCALE => "Scale",
-            SCALE_Y => "Stretch Y",
+            SCALE => "Scale X",
+            SCALE_Y => "Scale Y",
             ROTATION => "Rotation",
             OPACITY => "Opacity",
             FLIP_X => "Flip X",

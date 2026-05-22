@@ -43,24 +43,27 @@ const COL_SELECTED: Color32 = Color32::from_rgb(255, 220, 80);
 /// PNG stickers, and particle presets. Each tab shares the same drag
 /// model — picking up an entry sets `state.asset_drag` and the canvas /
 /// timeline drop targets handle the rest.
+///
+/// **Refresh model**: the library no longer has a manual Refresh button
+/// or visible Server / channel / limit fields. Instead, the GUI auto-
+/// triggers a refresh when:
+///   1. The user types into the search box (the in-flight server fetch
+///      is debounced so we don't refire every keystroke).
+///   2. The clips list is scrolled near its bottom (infinite-scroll
+///      style — gives the user "more clips" without leaving the panel).
+/// The `memstroy-assets-server` instance is expected to be running and
+/// to periodically re-ingest from Telegram on its own; the GUI only
+/// asks it to deliver more.
 pub fn library(ui: &mut egui::Ui, state: &mut EditorState, _request_refresh: impl Fn()) {
     // Capture the panel rect so the OS-level file-drop handler in `app.rs`
     // can route drops onto this region into the Videos / Images / Sounds
     // sub-folder rather than dropping straight onto the timeline.
     state.library_panel_rect = Some(ui.max_rect());
 
-    // Plain header (no Refresh button anymore — Refresh is now a
-    // per-asset-tab action: Clips refreshes from Telegram via the
-    // assets-server, the other tabs rescan local directories).
     ui.label(RichText::new(crate::i18n::t("Library")).size(16.0).strong());
     ui.add_space(4.0);
 
     // Tab bar — Clips / Videos / Sounds / Images / Particles.
-    // The previous "Shared" tab was removed: the editor now
-    // delegates Telegram ingest to the assets-server and reuses the
-    // Clips tab as the single TG-clip browser. Server URL / channel /
-    // limit live as plain fields on EditorState (and surface inside
-    // the Clips tab toolbar) instead of a separate panel.
     ui.horizontal_wrapped(|ui| {
         let tabs: [(LibraryTab, &str, &'static str); 5] = [
             (LibraryTab::Clips,     "\u{1F3AC} ", "Clips"),
@@ -78,15 +81,32 @@ pub fn library(ui: &mut egui::Ui, state: &mut EditorState, _request_refresh: imp
     });
     ui.add_space(4.0);
 
-    ui.add(
+    // ── Search field. Typing here triggers an auto-refresh when the
+    // active tab is `Clips`, so the editor pulls fresh posts that match
+    // the new query (the assets-server scrapes the channel; the GUI
+    // doesn't care which subset of the channel matches client-side). ──
+    let search_resp = ui.add(
         egui::TextEdit::singleline(&mut state.library_search)
             .hint_text(crate::i18n::t("Search library..."))
             .desired_width(ui.available_width()),
     );
+    let search_changed = search_resp.changed()
+        || state.prev_library_search_tab != state.library_tab;
+    let search_committed = search_resp.lost_focus()
+        && ui.input(|i| i.key_pressed(egui::Key::Enter));
+    if search_changed || search_committed {
+        state.prev_library_search = state.library_search.clone();
+        state.prev_library_search_tab = state.library_tab;
+        // Only the Clips tab talks to the server; other tabs rescan
+        // their local directories instead.
+        if state.library_tab == LibraryTab::Clips {
+            maybe_auto_refresh(state, /*force=*/ search_committed);
+        }
+    }
     ui.add_space(2.0);
 
     let hint_text = match state.library_tab {
-        LibraryTab::Clips => "Drag a clip onto the canvas or timeline. Hit Refresh to ingest the latest Telegram channel posts via the assets-server.",
+        LibraryTab::Clips => "Drag a clip onto the canvas or timeline. The library auto-updates from the assets-server (which periodically ingests from Telegram).",
         LibraryTab::Videos => "User-imported videos. Drop a video file from your file manager into this panel to add it. Drag a row onto the canvas or timeline to spawn an actor.",
         LibraryTab::Sounds => "Drop a sound onto the timeline to add it as an audio track. Drop audio files from your file manager here to import.",
         LibraryTab::Images => "Drag a sticker onto the canvas to add it as an image overlay. Drop image files from your file manager here to import.",
@@ -109,14 +129,28 @@ pub fn library(ui: &mut egui::Ui, state: &mut EditorState, _request_refresh: imp
     }
 }
 
-/// Render a "Local | Global" split inside the library panel. Both
-/// sections live inside a single vertical column with a draggable 6 px
-/// handle in the middle that adjusts `state.library_split` (0.05..=0.95).
-/// The same split ratio is reused across every tab so the user's choice
-/// persists when they hop between Clips / Videos / Sounds / etc.
-///
-/// Each section's header is rendered automatically — callers only need
-/// to push the rows / cards into the closure.
+/// Fire a server refresh, debounced. `force=true` bypasses the debounce
+/// (used by Enter-in-search-box, where the user has clearly committed).
+fn maybe_auto_refresh(state: &mut EditorState, force: bool) {
+    if state.refreshing {
+        return;
+    }
+    if !force {
+        if let Some(t) = state.last_auto_refresh {
+            if t.elapsed() < std::time::Duration::from_millis(500) {
+                return;
+            }
+        }
+    }
+    state.last_auto_refresh = Some(std::time::Instant::now());
+    state.status = "__REFRESH_REQUESTED__".into();
+}
+
+/// Render a "Local | Global" split inside the library panel — kept
+/// here as dead code in case future iterations want to bring back a
+/// per-tab user/global division. The current UI flattens the list
+/// because the "Local" half had been an empty placeholder anyway.
+#[allow(dead_code)]
 fn library_split_panel<L, G>(
     ui: &mut egui::Ui,
     state: &mut EditorState,
@@ -214,102 +248,70 @@ fn library_split_panel<L, G>(
     );
 }
 
-/// Render the original Mellstroy clip browser content (split out so the
-/// new tabs can render their own variants of the list).
-///
-/// The toolbar at the top of this tab is where the user controls the
-/// **server-driven Telegram refresh** that replaced the old "Shared"
-/// panel. Clicking Refresh POSTs to `{server_url}/api/ingest/tg` with
-/// the channel + limit configured here; the GUI then waits for the
-/// server to download, sweeps the local clips dir for new files, and
-/// reloads the library.
+/// Render the Mellstroy clip browser content. Refresh is now implicit:
+/// scrolling near the bottom of the list asks the assets-server for
+/// more, and editing the search field re-fires the request. Server URL
+/// / channel / limit no longer have UI controls — they live as plain
+/// EditorState fields so the assets-server can be configured from
+/// outside (or via project settings) without surfacing infrastructure
+/// in the editor chrome.
 fn library_clips_tab(ui: &mut egui::Ui, state: &mut EditorState) {
-    // ── Server / Telegram refresh toolbar ──
-    // Lives inside the Clips tab so the browser controls sit next to
-    // the clip browser they affect (replaces the global Refresh button
-    // that used to live in the panel's top-right corner).
-    ui.horizontal_wrapped(|ui| {
-        ui.label(RichText::new("Server:").size(10.0).color(COL_TEXT_DIM));
-        ui.add(
-            egui::TextEdit::singleline(&mut state.server_url)
-                .hint_text("http://host:port")
-                .desired_width(150.0),
-        );
-        ui.label(RichText::new("@").size(10.0).color(COL_TEXT_DIM));
-        ui.add(
-            egui::TextEdit::singleline(&mut state.tg_channel)
-                .hint_text("channel")
-                .desired_width(110.0),
-        );
-        ui.add(
-            egui::DragValue::new(&mut state.tg_limit)
-                .range(1..=500)
-                .speed(1.0)
-                .prefix("limit "),
-        );
-        let btn = egui::Button::new(
-            RichText::new(crate::i18n::t("Refresh")).color(Color32::WHITE).size(12.0),
-        )
-        .fill(Color32::from_rgb(80, 50, 180))
-        .rounding(Rounding::same(6.0));
-        if ui
-            .add_enabled(!state.refreshing, btn)
-            .on_hover_text(crate::i18n::t("Refresh from Telegram"))
-            .clicked()
-        {
-            state.status = "__REFRESH_REQUESTED__".into();
-        }
-    });
-    ui.add_space(4.0);
-
-    library_split_panel(
-        ui,
-        state,
-        "library_split_clips",
-        |_ui, _state| {
-            // Local clips section: currently empty placeholder. Future
-            // work could let users import their own video clips into
-            // a "local clips" pool that lives outside `assets/videos/`.
-        },
-        |ui, state| {
-            let search_lower = state.library_search.to_lowercase();
-            let clip_count = state.library.mellstroy_clips.len();
-            ui.label(
-                RichText::new(format!("Clips ({})", clip_count))
-                    .size(12.0)
-                    .strong()
-                    .color(Color32::from_rgb(220, 130, 50)),
-            );
-            ui.add_space(2.0);
-
-            egui::ScrollArea::vertical()
-                .id_source("library_clips_scroll")
-                .auto_shrink([false; 2])
-                .show(ui, |ui| {
-                    if state.library.mellstroy_clips.is_empty() {
-                        ui.label(
-                            RichText::new("No clips. Hit Refresh to download.")
-                                .italics()
-                                .color(COL_TEXT_DIM)
-                                .size(11.0),
-                        );
-                        return;
-                    }
-                    for idx in 0..state.library.mellstroy_clips.len() {
-                        let clip = &state.library.mellstroy_clips[idx];
-                        if !search_lower.is_empty() {
-                            let clean = clean_clip_text(&clip.description).to_lowercase();
-                            let id_str = clip.id.to_string();
-                            if !clean.contains(&search_lower) && !id_str.contains(&search_lower) {
-                                continue;
-                            }
-                        }
-                        let clip = state.library.mellstroy_clips[idx].clone();
-                        clip_card(ui, state, &clip);
-                    }
-                });
-        },
+    let search_lower = state.library_search.to_lowercase();
+    let clip_count = state.library.mellstroy_clips.len();
+    ui.label(
+        RichText::new(format!("Clips ({})", clip_count))
+            .size(12.0)
+            .strong()
+            .color(Color32::from_rgb(220, 130, 50)),
     );
+    if state.refreshing {
+        ui.label(
+            RichText::new(crate::i18n::t("refreshing..."))
+                .size(10.0)
+                .italics()
+                .color(Color32::from_rgb(255, 200, 80)),
+        );
+    }
+    ui.add_space(2.0);
+
+    let scroll_out = egui::ScrollArea::vertical()
+        .id_source("library_clips_scroll")
+        .auto_shrink([false; 2])
+        .show(ui, |ui| {
+            if state.library.mellstroy_clips.is_empty() {
+                ui.label(
+                    RichText::new("No clips yet — start typing in the search box or scroll to fetch from the server.")
+                        .italics()
+                        .color(COL_TEXT_DIM)
+                        .size(11.0),
+                );
+                return;
+            }
+            for idx in 0..state.library.mellstroy_clips.len() {
+                let clip = &state.library.mellstroy_clips[idx];
+                if !search_lower.is_empty() {
+                    let clean = clean_clip_text(&clip.description).to_lowercase();
+                    let id_str = clip.id.to_string();
+                    if !clean.contains(&search_lower) && !id_str.contains(&search_lower) {
+                        continue;
+                    }
+                }
+                let clip = state.library.mellstroy_clips[idx].clone();
+                clip_card(ui, state, &clip);
+            }
+        });
+
+    // ── Auto-refresh on near-bottom scroll ──
+    // When the visible viewport ends within ~80 px of the content's
+    // bottom AND the list is non-empty AND we're not already refreshing,
+    // ask the server for more clips. The debounce inside
+    // `maybe_auto_refresh` prevents storming on every paint.
+    let viewport_bottom = scroll_out.state.offset.y + scroll_out.inner_rect.height();
+    let near_bottom = viewport_bottom + 80.0 >= scroll_out.content_size.y
+        && scroll_out.content_size.y > scroll_out.inner_rect.height();
+    if near_bottom && !state.library.mellstroy_clips.is_empty() {
+        maybe_auto_refresh(state, /*force=*/ false);
+    }
 }
 
 /// Render a generic LibraryAsset list (sounds / images / particles / videos).
@@ -341,73 +343,58 @@ fn library_assets_tab(ui: &mut egui::Ui, state: &mut EditorState, kind: AssetDra
         _ => return,
     };
 
-    let split_id = format!("library_split_{}", title.to_lowercase());
+    let assets: &[crate::state::LibraryAsset] = match kind {
+        AssetDragKind::Sound => &state.library.sounds,
+        AssetDragKind::Image => &state.library.images,
+        AssetDragKind::Particle => &state.library.particles,
+        AssetDragKind::Video => &state.library.videos,
+        _ => return,
+    };
 
-    library_split_panel(
-        ui,
-        state,
-        &split_id,
-        |ui, state| {
-            let assets: &[crate::state::LibraryAsset] = match kind {
-                AssetDragKind::Sound => &state.library.sounds,
-                AssetDragKind::Image => &state.library.images,
-                AssetDragKind::Particle => &state.library.particles,
-                AssetDragKind::Video => &state.library.videos,
-                _ => return,
-            };
-
-            let search_lower = state.library_search.to_lowercase();
-            let count = assets.len();
-            ui.label(
-                RichText::new(format!("{} ({})", title, count))
-                    .size(12.0)
-                    .strong()
-                    .color(title_color),
-            );
-            ui.add_space(2.0);
-
-            if count == 0 {
-                ui.label(
-                    RichText::new(format!(
-                        "Empty. Drop files into:\n  {}\nthen click Refresh.",
-                        dir.display()
-                    ))
-                    .italics()
-                    .color(COL_TEXT_DIM)
-                    .size(10.0),
-                );
-                return;
-            }
-
-            let scroll_id = format!("library_{}_scroll", title.to_lowercase());
-            // Snapshot the row data so the borrow checker is happy with the
-            // mutable `state` we pass to `library_asset_card`.
-            let rows: Vec<crate::state::LibraryAsset> = assets
-                .iter()
-                .filter(|a| {
-                    search_lower.is_empty()
-                        || a.label.to_lowercase().contains(&search_lower)
-                        || a.id.to_lowercase().contains(&search_lower)
-                })
-                .cloned()
-                .collect();
-
-            egui::ScrollArea::vertical()
-                .id_source(scroll_id)
-                .auto_shrink([false; 2])
-                .show(ui, |ui| {
-                    for asset in &rows {
-                        library_asset_card(ui, state, asset, kind, title_color);
-                    }
-                });
-        },
-        |_ui, _state| {
-            // Global section is intentionally empty for non-Clips tabs
-            // for now — the slot exists so the splitter layout matches
-            // every tab and so future work can wire a remote/built-in
-            // library here without changing the UI shape.
-        },
+    let search_lower = state.library_search.to_lowercase();
+    let count = assets.len();
+    ui.label(
+        RichText::new(format!("{} ({})", title, count))
+            .size(12.0)
+            .strong()
+            .color(title_color),
     );
+    ui.add_space(2.0);
+
+    if count == 0 {
+        ui.label(
+            RichText::new(format!(
+                "Empty. Drop files into {}.",
+                dir.display()
+            ))
+            .italics()
+            .color(COL_TEXT_DIM)
+            .size(10.0),
+        );
+        return;
+    }
+
+    let scroll_id = format!("library_{}_scroll", title.to_lowercase());
+    // Snapshot the row data so the borrow checker is happy with the
+    // mutable `state` we pass to `library_asset_card`.
+    let rows: Vec<crate::state::LibraryAsset> = assets
+        .iter()
+        .filter(|a| {
+            search_lower.is_empty()
+                || a.label.to_lowercase().contains(&search_lower)
+                || a.id.to_lowercase().contains(&search_lower)
+        })
+        .cloned()
+        .collect();
+
+    egui::ScrollArea::vertical()
+        .id_source(scroll_id)
+        .auto_shrink([false; 2])
+        .show(ui, |ui| {
+            for asset in &rows {
+                library_asset_card(ui, state, asset, kind, title_color);
+            }
+        });
 }
 
 /// Compact card for a single sound / image / particle entry. Mirrors
@@ -832,32 +819,75 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
 
     // ── Scale ──
     let mut new_scale = cur.scale;
+    let mut new_scale_y = cur.scale_y;
+    // Per-actor "lock" between Scale X and Scale Y. Default = LOCKED so
+    // proportional scaling is the out-of-the-box behaviour. The user
+    // unlocks via the chain glyph next to the X slider.
+    let lock_id = ui.make_persistent_id(("actor_scale_lock", i));
+    let mut linked: bool = ui.data(|d| d.get_temp(lock_id).unwrap_or(true));
+
     ui.horizontal(|ui| {
         kf_anim::animated_toggle(ui, &mut a.animated_params, param_ids::SCALE, ("act_scale", i));
-        ui.label(param_label(highlight.is_active(param_ids::SCALE), "Scale:"));
+        ui.label(param_label(highlight.is_active(param_ids::SCALE), "Scale X:"));
         let r = ui.add(egui::Slider::new(&mut new_scale, 0.05..=5.0).logarithmic(true));
         if r.changed() {
             kf_anim::write_actor_param(
                 &mut a.layout, &mut a.animated_params, playhead,
                 param_ids::SCALE, false,
                 |s| s.scale = new_scale);
+            if linked {
+                new_scale_y = 1.0;
+                kf_anim::write_actor_param(
+                    &mut a.layout, &mut a.animated_params, playhead,
+                    param_ids::SCALE_Y, false,
+                    |s| s.scale_y = 1.0);
+            }
+        }
+        let chain = if linked { "\u{1F517}" } else { "\u{26D3}" };
+        if ui.small_button(chain)
+            .on_hover_text(if linked {
+                "Scale X and Scale Y are linked — click to unlink"
+            } else {
+                "Scale X and Scale Y are independent — click to link"
+            })
+            .clicked()
+        {
+            linked = !linked;
+            ui.data_mut(|d| d.insert_temp(lock_id, linked));
+            if linked {
+                new_scale_y = 1.0;
+                kf_anim::write_actor_param(
+                    &mut a.layout, &mut a.animated_params, playhead,
+                    param_ids::SCALE_Y, false,
+                    |s| s.scale_y = 1.0);
+            }
+        } else {
+            ui.data_mut(|d| d.insert_temp(lock_id, linked));
         }
     });
 
-    // ── Stretch Y ──
-    let mut new_scale_y = cur.scale_y;
     ui.horizontal(|ui| {
         kf_anim::animated_toggle(ui, &mut a.animated_params, param_ids::SCALE_Y, ("act_sy", i));
-        ui.label(param_label(highlight.is_active(param_ids::SCALE_Y), "Stretch Y:"))
-            .on_hover_text("Y-axis stretch on top of uniform scale (1.0 = proportional)");
+        ui.label(param_label(highlight.is_active(param_ids::SCALE_Y), "Scale Y:"))
+            .on_hover_text("Independent Y-axis scale. Linked to Scale X by default.");
         let r = ui.add(egui::Slider::new(&mut new_scale_y, 0.1..=5.0).logarithmic(true));
         if r.changed() {
             kf_anim::write_actor_param(
                 &mut a.layout, &mut a.animated_params, playhead,
                 param_ids::SCALE_Y, false,
                 |s| s.scale_y = new_scale_y);
+            if linked {
+                let target_y = new_scale_y * cur.scale;
+                kf_anim::write_actor_param(
+                    &mut a.layout, &mut a.animated_params, playhead,
+                    param_ids::SCALE_Y, false,
+                    |s| s.scale_y = 1.0);
+                kf_anim::write_actor_param(
+                    &mut a.layout, &mut a.animated_params, playhead,
+                    param_ids::SCALE, false,
+                    |s| s.scale = target_y);
+            }
         }
-        // Reset (\u{21BB}) button intentionally removed — set Stretch Y to 1.0 via the slider directly.
     });
 
     // ── Rotation (dial + numeric) ──
@@ -1074,6 +1104,7 @@ fn inspector_modifiers(
                     ModifierKind::Shake { .. } => Color32::from_rgb(255, 160, 100),
                     ModifierKind::Pulse { .. } => Color32::from_rgb(255, 220, 100),
                     ModifierKind::Spin { .. } => Color32::from_rgb(180, 255, 150),
+                    ModifierKind::Walk { .. } => Color32::from_rgb(220, 180, 255),
                 };
                 egui::Frame::none()
                     .fill(Color32::from_rgb(28, 28, 38))
@@ -1134,6 +1165,12 @@ fn inspector_modifiers(
                             ModifierKind::Spin { speed_dps } => {
                                 ui.add(egui::Slider::new(speed_dps, -720.0..=720.0).text("Speed \u{00B0}/s"));
                             }
+                            ModifierKind::Walk { freq_hz, amp_deg, bob_y, phase } => {
+                                ui.add(egui::Slider::new(freq_hz, 0.2..=6.0).text("Cadence Hz"));
+                                ui.add(egui::Slider::new(amp_deg, 0.0..=45.0).text("Sway \u{00B0}"));
+                                ui.add(egui::Slider::new(bob_y, 0.0..=40.0).text("Bob Y (px)"));
+                                ui.add(egui::Slider::new(phase, 0.0..=std::f32::consts::TAU).text("Phase"));
+                            }
                         }
                     });
                 ui.add_space(3.0);
@@ -1164,6 +1201,11 @@ fn inspector_modifiers(
                 "Continuous rotation"
             ).clicked() {
                 modifiers.push(TrackModifier::spin());
+            }
+            if ui.button(RichText::new("+ Walk").size(10.0)).on_hover_text(
+                "Pendulum rotation imitating a walking gait (rocks left/right around upright)"
+            ).clicked() {
+                modifiers.push(TrackModifier::walk());
             }
         });
     });
@@ -1680,8 +1722,21 @@ fn curve_editor_widget(
                     if is_endpoint {
                         points[idx][1] = np[1];
                     } else {
-                        let xmin = points[idx - 1][0] + 0.001;
-                        let xmax = points[idx + 1][0] - 0.001;
+                        // Defensive clamp: when neighbours are squeezed
+                        // closer than 0.002 the naive `xmin = left+0.001;
+                        // xmax = right-0.001` ordering inverts and
+                        // `f32::clamp(min, max)` panics with `min > max`
+                        // (the exact `1.001 > 1.0` panic users have hit
+                        // when both neighbours sit on the right endpoint).
+                        // Snap to the midpoint instead so the drag is a
+                        // no-op rather than a crash.
+                        let mut xmin = points[idx - 1][0] + 0.001;
+                        let mut xmax = points[idx + 1][0] - 0.001;
+                        if xmin > xmax {
+                            let mid = 0.5 * (points[idx - 1][0] + points[idx + 1][0]);
+                            xmin = mid;
+                            xmax = mid;
+                        }
                         points[idx][0] = np[0].clamp(xmin, xmax);
                         points[idx][1] = np[1];
                     }
@@ -1788,51 +1843,90 @@ fn inspector_actor_skeleton_attachments(ui: &mut egui::Ui, state: &mut EditorSta
             return;
         }
 
-        // ── Drag sources: chips for every overlay and every OTHER actor.
-        ui.label(RichText::new("Drag an element onto a point to attach:")
-            .size(10.0).color(COL_TEXT_DIM));
-        ui.horizontal_wrapped(|ui| {
+        // ── Compact "bind a layer" picker (replaces the row of
+        //     drag-source chips with layer names — those felt like a
+        //     duplicate of the timeline's layer panel). The user picks
+        //     one element + one point and clicks Attach. The eventual
+        //     plan is to make timeline layer rows themselves act as
+        //     drag sources to skeleton point rows; until that ships,
+        //     this picker is the supported attach path. ──
+        let element_options: Vec<(crate::state::AttachableElement, String)> = {
+            let mut v: Vec<(crate::state::AttachableElement, String)> = Vec::new();
             for oi in 0..state.scene.overlays.len() {
                 let label = match &state.scene.overlays[oi] {
-                    Overlay::Text(t) => format!("T:{}", ellipsis(&t.id, 12)),
-                    Overlay::Image(im) => format!("I:{}", ellipsis(&im.id, 12)),
-                    Overlay::Video(v) => format!("V:{}", ellipsis(&v.id, 12)),
+                    Overlay::Text(t)   => format!("T:{}",  ellipsis(&t.id, 14)),
+                    Overlay::Image(im) => format!("I:{}",  ellipsis(&im.id, 14)),
+                    Overlay::Video(v)  => format!("V:{}",  ellipsis(&v.id, 14)),
                 };
-                let chip = element_drag_chip(
-                    ui,
-                    ("ovr_chip", oi),
-                    &label,
-                    Color32::from_rgb(80, 200, 120),
-                );
-                if chip.dragged() {
-                    state.element_drag.source = Some(crate::state::AttachableElement::Overlay(oi));
-                    state.element_drag.label = label.clone();
-                    if let Some(p) = ui.input(|i| i.pointer.hover_pos()) {
-                        state.element_drag.pos = [p.x, p.y];
-                    }
-                }
+                v.push((crate::state::AttachableElement::Overlay(oi), label));
             }
             for ai in 0..state.scene.actors.len() {
                 if ai == i { continue; }
-                let label = format!("A:{}", ellipsis(&state.scene.actors[ai].id, 12));
-                let chip = element_drag_chip(
-                    ui,
-                    ("act_chip", ai),
-                    &label,
-                    Color32::from_rgb(220, 130, 50),
-                );
-                if chip.dragged() {
-                    state.element_drag.source = Some(crate::state::AttachableElement::Actor(ai));
-                    state.element_drag.label = label.clone();
-                    if let Some(p) = ui.input(|i| i.pointer.hover_pos()) {
-                        state.element_drag.pos = [p.x, p.y];
+                v.push((
+                    crate::state::AttachableElement::Actor(ai),
+                    format!("A:{}", ellipsis(&state.scene.actors[ai].id, 14)),
+                ));
+            }
+            v
+        };
+
+        if !element_options.is_empty() {
+            // Persist the picker selection across paints so the user can
+            // keep tweaking after a successful attach.
+            let pick_id = ui.make_persistent_id(("skel_attach_pick", i));
+            let mut pick_idx: usize = ui.data(|d| d.get_temp(pick_id).unwrap_or(0));
+            if pick_idx >= element_options.len() { pick_idx = 0; }
+            let mut commit_pick: Option<(crate::state::AttachableElement, String, String)> = None;
+
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Layer:").size(10.0).color(COL_TEXT_DIM));
+                egui::ComboBox::from_id_source(("skel_layer_pick", i))
+                    .selected_text(element_options[pick_idx].1.clone())
+                    .show_ui(ui, |ui| {
+                        for (k, (_, label)) in element_options.iter().enumerate() {
+                            if ui.selectable_label(k == pick_idx, label).clicked() {
+                                pick_idx = k;
+                            }
+                        }
+                    });
+                ui.data_mut(|d| d.insert_temp(pick_id, pick_idx));
+
+                // Walk every (template, point) pair and offer a small
+                // "+ <point>" button for each. Compact, predictable.
+                for (tmpl_idx, tmpl_name) in &templates {
+                    let template = &state.scene.skeleton_templates[*tmpl_idx];
+                    for (point_name, _) in &template.points {
+                        let lbl = format!("\u{2192} {}.{}",
+                            ellipsis(tmpl_name, 8), ellipsis(point_name, 12));
+                        if ui
+                            .small_button(lbl)
+                            .on_hover_text(format!(
+                                "Attach '{}' to '{}.{}'",
+                                element_options[pick_idx].1, tmpl_name, point_name
+                            ))
+                            .clicked()
+                        {
+                            commit_pick = Some((
+                                element_options[pick_idx].0,
+                                tmpl_name.clone(),
+                                point_name.clone(),
+                            ));
+                        }
                     }
                 }
+            });
+
+            if let Some((src, skel_id, point_name)) = commit_pick {
+                attach_element_to_skeleton_point(state, src, &skel_id, &point_name);
+                state.status = format!("Attached to {}.{}", skel_id, point_name);
             }
-        });
+        }
         ui.add_space(6.0);
 
         // ── Per-template point list with drop zones ──
+        // (Drag chips above were removed; the drop zones still listen for
+        // an `element_drag.source` so a future "drag from layer panel"
+        // implementation will keep working with this codepath.)
         let dragging_label = state.element_drag.label.clone();
         let dragging = state.element_drag.source;
         let pointer_released = ui.input(|i| i.pointer.any_released());
@@ -2038,6 +2132,10 @@ fn overlay_id(ov: &Overlay) -> String {
 }
 
 /// Visual chip + drag source for the skeleton attach panel.
+/// Currently unused (the inspector uses a compact ComboBox + Attach
+/// buttons instead of a chip row), kept for the future cross-panel
+/// drag-from-layers implementation.
+#[allow(dead_code)]
 fn element_drag_chip(
     ui: &mut egui::Ui,
     salt: impl std::hash::Hash + Copy,
@@ -2065,15 +2163,44 @@ fn element_drag_chip(
     resp
 }
 
-/// Commit a drag-and-drop attach: write the binding into the source
-/// element's `skeleton_attachment` field (overlays) or push into the
-/// source actor's `skeleton_attachments` list.
+/// Commit a drag-and-drop / picker-driven attach: write the binding
+/// into the source element's `skeleton_attachment` field (overlays) or
+/// push into the source actor's `skeleton_attachments` list. Only ONE
+/// element may bind to a given (skeleton_id, point_name) at a time —
+/// any prior binding (overlay or actor) on the same target is cleared
+/// before the new one is committed. This matches the user-visible
+/// rule that each skeleton point is occupied by at most one layer.
 fn attach_element_to_skeleton_point(
     state: &mut EditorState,
     src: crate::state::AttachableElement,
     skeleton_id: &str,
     point_name: &str,
 ) {
+    // ── 1. Clear any existing bindings (across all elements) at the
+    //       target slot, so each (skeleton, point) pair holds at most
+    //       one element. This is what stops duplicate chips piling up
+    //       on the same row in the inspector.
+    for ov in &mut state.scene.overlays {
+        let slot = match ov {
+            Overlay::Text(t) => &mut t.skeleton_attachment,
+            Overlay::Image(im) => &mut im.skeleton_attachment,
+            Overlay::Video(v) => &mut v.skeleton_attachment,
+        };
+        if slot
+            .as_ref()
+            .map(|att| att.skeleton_id == skeleton_id && att.point_name == point_name)
+            .unwrap_or(false)
+        {
+            *slot = None;
+        }
+    }
+    for actor in &mut state.scene.actors {
+        actor.skeleton_attachments.retain(|att| {
+            !(att.skeleton_id == skeleton_id && att.point_name == point_name)
+        });
+    }
+
+    // ── 2. Apply the new binding to the source element.
     let attachment = memstroy_core::SkeletonAttachment {
         skeleton_id: skeleton_id.into(),
         point_name: point_name.into(),
@@ -2092,10 +2219,6 @@ fn attach_element_to_skeleton_point(
         }
         crate::state::AttachableElement::Actor(ai) => {
             if ai >= state.scene.actors.len() { return; }
-            // Avoid duplicates for the same skeleton + point.
-            state.scene.actors[ai].skeleton_attachments.retain(|att| {
-                !(att.skeleton_id == skeleton_id && att.point_name == point_name)
-            });
             state.scene.actors[ai].skeleton_attachments.push(attachment);
         }
     }
@@ -2117,12 +2240,12 @@ fn inspector_overlay(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
         Overlay::Image(im) => {
             ui.label(RichText::new(format!("Image: {}", im.id)).strong().size(14.0).color(COL_CLIP_OVERLAY));
             ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.label("In:");
-                ui.add(egui::DragValue::new(&mut im.t_in).range(0.0..=duration).speed(0.02).suffix("s"));
-                ui.label("Out:");
-                ui.add(egui::DragValue::new(&mut im.t_out).range(0.0..=duration).speed(0.02).suffix("s"));
-            });
+            // The In / Out time controls were intentionally removed
+            // from the inspector — the user adjusts an image's visible
+            // window by dragging its clip edges in the layer panel.
+            // Trying to maintain two sources of truth (drag handles +
+            // numeric fields) was the source of multiple "image keeps
+            // jumping back to old t_in" bugs.
             inspector_overlay_state_widgets(
                 ui, &mut im.layout, &mut im.animated_params, playhead, i, "img",
                 state.kf_highlight.clone());
@@ -2192,24 +2315,75 @@ fn inspector_overlay_state_widgets(
     });
 
     let mut new_scale = cur.scale;
+    let mut new_sy = cur.scale_y;
+    // Per-element "lock" between Scale X and Scale Y. Persisted in the
+    // egui memory under a stable id so each overlay/actor remembers
+    // whether the user wants synchronised scaling. Default = LOCKED so
+    // the first thing a user gets is the proportional behaviour they
+    // expect; click the chain glyph to break it.
+    let lock_id = ui.make_persistent_id(("scale_lock", salt_kind, salt_idx));
+    let mut linked: bool = ui.data(|d| d.get_temp(lock_id).unwrap_or(true));
+
     ui.horizontal(|ui| {
         kf_anim::animated_toggle(ui, animated_params, param_ids::SCALE, (salt_kind, "sc", salt_idx));
-        ui.label(param_label(highlight.is_active(param_ids::SCALE), "Scale:"));
+        ui.label(param_label(highlight.is_active(param_ids::SCALE), "Scale X:"));
         let r = ui.add(egui::Slider::new(&mut new_scale, 0.05..=5.0).logarithmic(true));
         if r.changed() {
             kf_anim::write_overlay_param(layout, animated_params, playhead,
                 param_ids::SCALE, false, |s| s.scale = new_scale);
+            if linked {
+                // Mirror the X edit onto Y. Note: scale_y is a Y-stretch
+                // multiplier ON TOP of `scale`, so to keep total Y scale
+                // unchanged when a user is in lock-mode and edits X we
+                // simply hold scale_y at 1.0 (uniform) — that's the
+                // intent of "synced X and Y scale".
+                new_sy = 1.0;
+                kf_anim::write_overlay_param(layout, animated_params, playhead,
+                    param_ids::SCALE_Y, false, |s| s.scale_y = 1.0);
+            }
+        }
+        // Link/unlink chain glyph. \u{1F517} = 🔗, \u{1F494} = 💔 (broken).
+        let chain = if linked { "\u{1F517}" } else { "\u{26D3}" };
+        if ui.small_button(chain)
+            .on_hover_text(if linked {
+                "Scale X and Scale Y are linked — click to unlink"
+            } else {
+                "Scale X and Scale Y are independent — click to link"
+            })
+            .clicked()
+        {
+            linked = !linked;
+            ui.data_mut(|d| d.insert_temp(lock_id, linked));
+            if linked {
+                // Re-syncing forces Y to follow X (uniform).
+                new_sy = 1.0;
+                kf_anim::write_overlay_param(layout, animated_params, playhead,
+                    param_ids::SCALE_Y, false, |s| s.scale_y = 1.0);
+            }
+        } else {
+            ui.data_mut(|d| d.insert_temp(lock_id, linked));
         }
     });
 
-    let mut new_sy = cur.scale_y;
     ui.horizontal(|ui| {
         kf_anim::animated_toggle(ui, animated_params, param_ids::SCALE_Y, (salt_kind, "sy", salt_idx));
-        ui.label(param_label(highlight.is_active(param_ids::SCALE_Y), "Stretch Y:"));
+        ui.label(param_label(highlight.is_active(param_ids::SCALE_Y), "Scale Y:"));
         let r = ui.add(egui::Slider::new(&mut new_sy, 0.1..=5.0).logarithmic(true));
         if r.changed() {
             kf_anim::write_overlay_param(layout, animated_params, playhead,
                 param_ids::SCALE_Y, false, |s| s.scale_y = new_sy);
+            if linked {
+                // Editing Y with the lock on: bump the uniform `scale`
+                // so the visible Y grows by the typed factor while X
+                // tracks it. We compute the "effective" Y the user sees
+                // (`scale * scale_y`) and rebalance: keep scale_y = 1.0,
+                // set scale = effective.
+                let target_y = new_sy * cur.scale;
+                kf_anim::write_overlay_param(layout, animated_params, playhead,
+                    param_ids::SCALE_Y, false, |s| s.scale_y = 1.0);
+                kf_anim::write_overlay_param(layout, animated_params, playhead,
+                    param_ids::SCALE, false, |s| s.scale = target_y);
+            }
         }
     });
 
@@ -2680,7 +2854,6 @@ fn inspector_background(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
 fn inspector_audio(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
     use crate::i18n::t;
     let _ = state.scene.output.duration;
-    let scene_duration = state.scene.output.duration;
     let audio = &mut state.scene.audio[i];
     ui.label(RichText::new(format!("{}: {}", t("Audio"), audio.id)).strong().size(14.0).color(COL_CLIP_AUDIO));
     ui.add_space(4.0);
@@ -2720,6 +2893,11 @@ fn inspector_audio(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
     }
 
     // ── Pitch (semitones) + Pan + Mute ───────────────────────────────
+    // Note: pitch / pan / reverb / filter cutoffs are not keyframable
+    // today (the audio engine snapshots them at sink-build time). Adding
+    // a per-param animation toggle here is tracked separately — the
+    // existing rows already follow the new "left-aligned compact" style
+    // used by the video inspector. See TODO at the top of this fn.
     ui.add_space(6.0);
     ui.horizontal(|ui| {
         ui.label(t("Pitch (semitones)"));
@@ -2743,30 +2921,11 @@ fn inspector_audio(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
         ui.checkbox(&mut audio.loop_source, t("Loop source"));
     });
 
-    // ── Fades ────────────────────────────────────────────────────────
+    // ── Reverb ───────────────────────────────────────────────────────
+    // (Fade in / fade out controls were removed — author them via
+    // keyframes on volume instead, which is the same workflow as video.)
     ui.add_space(6.0);
     ui.label(RichText::new(t("Audio effects")).strong().size(12.0).color(COL_TEXT_DIM));
-    let max_fade = scene_duration.max(1.0);
-    ui.horizontal(|ui| {
-        ui.label(t("Fade in (s)"));
-        ui.add(
-            egui::DragValue::new(&mut audio.fade_in)
-                .range(0.0..=max_fade)
-                .speed(0.05)
-                .suffix(" s"),
-        );
-    });
-    ui.horizontal(|ui| {
-        ui.label(t("Fade out (s)"));
-        ui.add(
-            egui::DragValue::new(&mut audio.fade_out)
-                .range(0.0..=max_fade)
-                .speed(0.05)
-                .suffix(" s"),
-        );
-    });
-
-    // ── Reverb ───────────────────────────────────────────────────────
     ui.horizontal(|ui| {
         ui.label(t("Reverb"));
         ui.add(egui::Slider::new(&mut audio.reverb, 0.0..=1.0).fixed_decimals(2));
@@ -2826,19 +2985,10 @@ fn inspector_audio(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
         });
     }
 
-    // ── Reset effects button ─────────────────────────────────────────
-    ui.add_space(6.0);
-    if ui.button(t("Reset audio effects")).clicked() {
-        audio.pitch_semitones = 0.0;
-        audio.pan = 0.0;
-        audio.fade_in = 0.0;
-        audio.fade_out = 0.0;
-        audio.reverb = 0.0;
-        audio.low_pass_hz = None;
-        audio.high_pass_hz = None;
-        audio.mute = false;
-        audio.loop_source = false;
-    }
+    // (Reset audio effects button removed — destructive bulk edits are
+    // better expressed via undo, and the per-row animation toggle now
+    // gives users finer-grained control over which params they want to
+    // clear.)
 
     ui.add_space(6.0);
     if audio.parent_actor.is_some() {
@@ -2858,11 +3008,13 @@ fn inspector_audio(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
     }
 }
 
-/// Render one row of the audio inspector with an animation toggle.
-/// Mirrors the behaviour of inspector_anim_row for transform params on
-/// actors / overlays — when "Animated" is on, edits to the slider write
-/// a keyframe at the playhead's clip-local time; otherwise edits change
-/// the static value.
+/// Render one row of the audio inspector with a left-aligned animation
+/// toggle (matching the per-param diamond used in the video inspector).
+/// When the toggle is ON, edits to the slider write a keyframe at the
+/// playhead's clip-local time; otherwise edits change the static value.
+/// The "+ kf" / "Clear kfs" helpers are no longer rendered separately —
+/// the row is now a single line so the inspector stays scannable when a
+/// scene has lots of audio tracks.
 #[allow(clippy::too_many_arguments)]
 fn inspector_audio_param(
     ui: &mut egui::Ui,
@@ -2887,7 +3039,31 @@ fn inspector_audio_param(
     };
 
     ui.horizontal(|ui| {
+        // Compact left-aligned animation marker: filled diamond when ON,
+        // outline diamond when OFF — same affordance as the video
+        // inspector's per-param `kf_anim::animated_toggle`. Clicking
+        // toggles whether the param is keyframed; the row otherwise
+        // looks like a regular labelled slider.
+        let marker = if is_animated { "\u{25C6}" } else { "\u{25C7}" }; // ◆ / ◇
+        let col = if is_animated { Color32::from_rgb(255, 180, 80) } else { COL_TEXT_DIM };
+        let toggle = ui
+            .add(egui::Button::new(RichText::new(marker).size(11.0).color(col))
+                .frame(false)
+                .min_size(Vec2::new(14.0, 14.0)))
+            .on_hover_text(crate::i18n::t("Toggle animation for this parameter"));
+        if toggle.clicked() {
+            if is_animated {
+                animated.remove(param_id);
+            } else {
+                animated.insert(param_id.to_string());
+                if kfs.is_empty() {
+                    kfs.push(memstroy_core::Keyframe::new(0.0, *static_value));
+                }
+            }
+        }
+
         ui.label(label);
+
         let mut slider = egui::Slider::new(&mut display, range.clone());
         if logarithmic {
             slider = slider.logarithmic(true);
@@ -2899,10 +3075,6 @@ fn inspector_audio_param(
 
         if resp.changed() {
             if is_animated {
-                // Insert / replace a keyframe at the current clip-local
-                // playhead. Seed the track with the current static
-                // value at t=0 if it's still empty so the timeline has
-                // a stable starting point.
                 if kfs.is_empty() {
                     kfs.push(memstroy_core::Keyframe::new(0.0, *static_value));
                 }
@@ -2911,30 +3083,11 @@ fn inspector_audio_param(
                 *static_value = display;
             }
         }
-
-        // Animation toggle on the right.
-        let mut anim_on = is_animated;
-        let toggle = ui
-            .selectable_label(anim_on, "\u{29BF}") // bullseye glyph
-            .on_hover_text(crate::i18n::t("Toggle animation for this parameter"));
-        if toggle.clicked() {
-            anim_on = !anim_on;
-            if anim_on {
-                animated.insert(param_id.to_string());
-                if kfs.is_empty() {
-                    kfs.push(memstroy_core::Keyframe::new(0.0, *static_value));
-                }
-            } else {
-                animated.remove(param_id);
-            }
-        }
     });
 
-    // Quick "+ kf" button row when animated, so the user can drop
-    // keyframes without dragging the slider every time.
     if is_animated {
         ui.horizontal(|ui| {
-            ui.add_space(8.0);
+            ui.add_space(20.0); // align under the slider
             if ui
                 .small_button(crate::i18n::t("+ kf at playhead"))
                 .on_hover_text(crate::i18n::t("Add a keyframe at the current playhead"))

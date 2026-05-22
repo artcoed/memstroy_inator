@@ -1651,6 +1651,39 @@ fn get_element_world_pos(
     legacy_layout: &[Keyframe<ActorState>],
     t: f32,
 ) -> WorldPos {
+    // ── Skeleton-attachment override (actors only) ──
+    // When this element is an actor that has at least one
+    // `skeleton_attachments` binding, snap its world centre to the
+    // first bound point. Without this the actor was rendered at its
+    // legacy `layout` position and IGNORED the attachment, which
+    // surfaced as the user-visible "attached video clip just plays
+    // without moving" bug. Only the first attachment is used as the
+    // primary anchor; downstream code can still apply offsets / scale.
+    if let Some(actor) = state.scene.actors.iter().find(|a| a.id == element_id) {
+        if let Some(att) = actor.skeleton_attachments.first() {
+            if let Some(p) = resolve_overlay_attachment_world(state, att, t) {
+                return p;
+            }
+        }
+    }
+    // Same override path for any overlay that's bound to a skeleton
+    // point — `draw_canvas_overlays` already calls
+    // `resolve_overlay_attachment_world` directly, but auxiliary
+    // codepaths (selection gizmos, snapping guides, drag origin, …)
+    // call `get_element_world_pos` with the overlay id and need the
+    // attachment to be honoured here too so the gizmo doesn't drift
+    // off the picture's centre when an attachment is active.
+    if let Some(att) = state.scene.overlays.iter().find_map(|ov| match ov {
+        Overlay::Text(o)  if o.id == element_id => o.skeleton_attachment.as_ref(),
+        Overlay::Image(o) if o.id == element_id => o.skeleton_attachment.as_ref(),
+        Overlay::Video(o) if o.id == element_id => o.skeleton_attachment.as_ref(),
+        _ => None,
+    }) {
+        if let Some(p) = resolve_overlay_attachment_world(state, att, t) {
+            return p;
+        }
+    }
+
     // Check canvas_layouts for this element
     if let Some(cl) = state.scene.canvas_layouts.iter().find(|cl| cl.element_id == element_id) {
         if let Some(transform) = keyframe::sample(&cl.keyframes, t) {
