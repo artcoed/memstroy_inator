@@ -220,6 +220,19 @@ fn clip_editor_content(ui: &mut egui::Ui, state: &mut EditorState) {
         ui.add_space(8.0);
 
         // ── In/Out numeric editors ──
+        // The Out value is hard-capped at the source clip's duration when
+        // the frame cache has it — same rule as the timeline trim handle.
+        let source_dur_known = state
+            .frame_caches
+            .get(actor_idx)
+            .map(|fc| if fc.is_ready() { fc.duration } else { 0.0 })
+            .unwrap_or(0.0);
+        let out_upper = if source_dur_known > 0.0 {
+            (t_in + (source_dur_known - source_start).max(0.1)).min(duration)
+        } else {
+            duration
+        };
+
         ui.horizontal(|ui| {
             ui.label(RichText::new("In:").size(11.0));
             let mut in_val = t_in;
@@ -244,7 +257,7 @@ fn clip_editor_content(ui: &mut egui::Ui, state: &mut EditorState) {
             if ui
                 .add(
                     egui::DragValue::new(&mut out_val)
-                        .range(0.0..=duration)
+                        .range(0.0..=out_upper)
                         .speed(0.02)
                         .suffix("s"),
                 )
@@ -252,7 +265,9 @@ fn clip_editor_content(ui: &mut egui::Ui, state: &mut EditorState) {
             {
                 if let crate::state::Selection::Actor(i) = state.selection {
                     if i < state.scene.actors.len() {
-                        state.scene.actors[i].t_out = Some(out_val);
+                        // Clamp again defensively — egui may report a value
+                        // slightly past the range when the user types it.
+                        state.scene.actors[i].t_out = Some(out_val.min(out_upper));
                     }
                 }
             }

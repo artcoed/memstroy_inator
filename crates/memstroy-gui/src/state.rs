@@ -1,7 +1,6 @@
 use std::path::PathBuf;
 
 use memstroy_core::Scene;
-use memstroy_tg::model::DownloadState;
 
 use crate::undo::UndoStack;
 
@@ -393,14 +392,53 @@ pub struct EditorState {
     /// State for the "Shared" library tab — talks to a separate
     /// `memstroy-assets-server` instance over HTTP and lazily streams
     /// previews / files into the editor.
-    pub shared_library: crate::shared_library::SharedLibraryState,
+    // ─── Server-driven Telegram refresh (replaces the old "Shared" tab) ────
+    /// Base URL of the local `memstroy-assets-server` instance that
+    /// performs Telegram scraping on the GUI's behalf. The Refresh
+    /// button on the Clips library tab POSTs to `{server_url}/api/ingest/tg`
+    /// with `{tg_channel, tg_limit}`. Default points at loopback so a
+    /// developer running `cargo run -p memstroy-assets-server` next to
+    /// the GUI gets the right URL out of the box.
+    pub server_url: String,
+    /// Telegram channel name (without the leading `@`) the GUI asks the
+    /// server to refresh. Surfaced on the Clips tab so the user can
+    /// edit it without leaving the editor.
+    pub tg_channel: String,
+    /// How many of the most recent matching posts to ingest per refresh.
+    pub tg_limit: u32,
 
     /// Tokio runtime handle injected by the App on startup so panels
-    /// that talk to network services (the shared library, Telegram
+    /// that talk to network services (the asset server, Telegram
     /// ingest, etc.) can spawn async tasks without rebuilding their
     /// own runtime. `None` only inside unit tests that don't bring
     /// up an `App`.
     pub tokio_handle: Option<tokio::runtime::Handle>,
+
+    /// Lazy texture cache for `Overlay::Image` PNG/JPEG sources. The
+    /// canvas-side draw code calls `image_textures.lock()` and either
+    /// retrieves an existing handle or kicks off a synchronous decode
+    /// of the file with `image::open`. Mutex (rather than RefCell) so
+    /// EditorState stays `Send` for any future background users; the
+    /// lock is only held for the few microseconds spent on the lookup
+    /// or the one-time decode.
+    pub image_textures: std::sync::Mutex<
+        std::collections::HashMap<PathBuf, ImageTextureSlot>,
+    >,
+}
+
+/// Cached state for one image-overlay source. `Loading` is held only
+/// briefly while the synchronous decode runs (we keep it as a state
+/// rather than `Option<Result<...>>` so future async loaders can fit
+/// without changing call-sites).
+#[derive(Clone)]
+pub enum ImageTextureSlot {
+    Loaded {
+        texture: egui::TextureHandle,
+        size: [u32; 2],
+    },
+    /// Decode failed (missing file, unsupported format, etc.). Cached
+    /// so we don't keep retrying on every frame.
+    Failed,
 }
 
 /// A single scene tab with its own file path and name.
@@ -457,9 +495,6 @@ pub enum LibraryTab {
     Images,
     Particles,
     Videos,
-    /// Lazily-fetched assets served by an external
-    /// `memstroy-assets-server`. See `crate::shared_library`.
-    Shared,
 }
 
 #[derive(Debug, Clone)]
@@ -562,6 +597,16 @@ impl EditorState {
 
         // Default library local/global split — equal halves.
         s.library_split = 0.5;
+
+        // ── Server-driven TG refresh defaults ──
+        // The user clicks Refresh on the Clips tab; the GUI POSTs to
+        // `{server_url}/api/ingest/tg` with `{tg_channel, tg_limit}`.
+        // The server (memstroy-assets-server) does the actual scraping
+        // and download. Defaults assume the server is running locally
+        // on its standard port.
+        s.server_url = "http://127.0.0.1:8765".to_string();
+        s.tg_channel = "MELLSTROYfonz".to_string();
+        s.tg_limit = 80;
 
         s
     }
@@ -992,27 +1037,61 @@ impl EditorState {
     }
 
     pub fn reload_library(&mut self) {
-        let state = DownloadState::load(&self.state_path());
+        // Local clip pool — we no longer carry a Telegram-side
+        // `DownloadState` sidecar in the GUI (TG is the server's job).
+        // Just enumerate `*.mp4` files in the clips dir and pair them
+        // with thumbnails, when present, in the `thumbs/` subfolder.
         let clips_dir = self.clips_dir();
-
-        self.library.mellstroy_clips = state
-            .all_clips_sorted()
-            .into_iter()
-            .filter(|c| c.downloaded)
-            .map(|c| {
-                let thumb_path = clips_dir.join("thumbs").join(format!("{}.jpg", c.id));
-                let thumbnail = if thumb_path.exists() { Some(thumb_path) } else { None };
-                LibraryClip {
-                    id: c.id,
-                    path: clips_dir.join(&c.filename),
-                    description: c.description.clone(),
-                    downloaded: c.downloaded,
+        let thumbs_dir = clips_dir.join("thumbs");
+        let mut clips: Vec<LibraryClip> = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&clips_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_file() { continue; }
+                let ext = path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .map(str::to_ascii_lowercase)
+                    .unwrap_or_default();
+                if ext != "mp4" { continue; }
+                let stem = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("clip")
+                    .to_string();
+                // Preserve the existing `id: u64` shape so the rest of
+                // the GUI keeps treating clips as numeric ids; non-numeric
+                // filenames hash to a derived id so the row still
+                // displays.
+                let id: u64 = stem
+                    .parse::<u64>()
+                    .unwrap_or_else(|_| {
+                        use std::collections::hash_map::DefaultHasher;
+                        use std::hash::{Hash, Hasher};
+                        let mut h = DefaultHasher::new();
+                        stem.hash(&mut h);
+                        h.finish()
+                    });
+                let thumb_jpg = thumbs_dir.join(format!("{}.jpg", stem));
+                let thumb_png = thumbs_dir.join(format!("{}.png", stem));
+                let thumbnail = if thumb_jpg.exists() {
+                    Some(thumb_jpg)
+                } else if thumb_png.exists() {
+                    Some(thumb_png)
+                } else {
+                    None
+                };
+                clips.push(LibraryClip {
+                    id,
+                    path: path.clone(),
+                    description: stem,
+                    downloaded: true,
                     thumbnail,
-                }
-            })
-            .collect();
-
-        self.library.mellstroy_clips.sort_by_key(|c| c.id);
+                });
+            }
+        }
+        clips.sort_by_key(|c| c.id);
+        self.library.mellstroy_clips = clips;
 
         // Also rescan the user's sound / image / particle bundles so the
         // sub-libraries pick up any new files dropped into their dirs.
@@ -1348,6 +1427,19 @@ pub struct CanvasDrag {
     /// Each entry is (axis, world_coordinate). Reset to empty whenever no
     /// snap is active.
     pub snap_guides: Vec<SnapGuide>,
+    /// Playhead time captured the moment the drag started (seconds, in
+    /// scene time). Every keyframe write performed during the gesture is
+    /// re-anchored to THIS time instead of the live `state.playhead`, so
+    /// dragging while playback is running cannot spawn a fresh keyframe
+    /// per frame — every upsert lands on the same kf and the result is
+    /// exactly one keyframe at the drag-start time. `None` outside an
+    /// active drag.
+    pub drag_start_playhead: Option<f32>,
+    /// Whether playback was running at drag start. Used so the canvas
+    /// can auto-pause for the duration of the gesture (and optionally
+    /// resume on release — currently we leave it paused so the user
+    /// can review the keyframe they just authored).
+    pub was_playing_at_drag_start: bool,
 }
 
 /// One active snap guideline.
