@@ -758,8 +758,24 @@ fn draw_canvas_elements(
             if fc.is_ready() {
                 // Apply chromakey on the raw frame data if actor has non-default settings
                 let actor_ck = &state.scene.actors[idx].chroma_key;
-                let actor_cc = &state.scene.actors[idx].color_correction;
-                let actor_fx = &state.scene.actors[idx].effects;
+                // Sample CC + effect-stack params at the actor's local
+                // playhead so animated diamonds materialise into the
+                // running preview. Without this the inspector would
+                // show kfs but the picture would stay frozen at the
+                // static field values.
+                let actor_t_in = state.scene.actors[idx].t_in.unwrap_or(0.0);
+                let local_for_anim = (state.playhead - actor_t_in).max(0.0);
+                let actor_cc_owned: memstroy_core::ColorCorrection =
+                    state.scene.actors[idx].color_correction.sampled_at(local_for_anim);
+                let actor_cc = &actor_cc_owned;
+                let actor_fx_owned: Vec<memstroy_core::Effect> = state
+                    .scene
+                    .actors[idx]
+                    .effects
+                    .iter()
+                    .map(|e| e.sampled_at(local_for_anim))
+                    .collect();
+                let actor_fx = &actor_fx_owned;
                 // Bypass the (expensive) preview pipeline when chroma /
                 // colour correction / and the effect stack are all
                 // empty / identity. Otherwise route through the processed
@@ -2436,26 +2452,73 @@ fn current_selection_world_center(state: &EditorState) -> Option<[f32; 2]> {
 /// `auto_animate_on_canvas_drag = false` everywhere — canvas drags must
 /// not silently mark a parameter as animated; the user explicitly
 /// toggles that via the diamond next to the inspector control.
+/// Stable category strings for canvas-drag undo grouping. Each setter
+/// uses `mutate_drag` with a per-element token so ONE undo snapshot is
+/// taken at the start of the gesture and the whole drag collapses into
+/// a single Ctrl+Z step. Outside an active gesture (e.g. a single
+/// slider tick from the inspector), `state.last_drag_group` is reset by
+/// `app.rs::end_drag_group` so the next edit begins a fresh entry.
+const CANVAS_TOKEN_POS: &str = "canvas_pos";
+const CANVAS_TOKEN_SCALE: &str = "canvas_scale";
+const CANVAS_TOKEN_SCALE_Y: &str = "canvas_scale_y";
+const CANVAS_TOKEN_ROTATION: &str = "canvas_rotation";
+
+/// Compute a per-element token salt for canvas drag undo. Passing 0 for
+/// `RenderFrame` (the only "non-indexed" target) is safe because each
+/// category string is namespaced.
+fn canvas_drag_token(category: &'static str, sel: Selection) -> u64 {
+    let salt = match sel {
+        Selection::Actor(i) => 0x1000 + i,
+        Selection::Overlay(i) => 0x2000 + i,
+        Selection::Background(i) => 0x3000 + i,
+        Selection::Audio(i) => 0x4000 + i,
+        Selection::Camera(i) => 0x6000 + i,
+        Selection::RenderFrame => 0x5000,
+        Selection::None => 0xFFFF,
+    };
+    EditorState::drag_token(category, salt)
+}
+
 fn set_selection_world_center(state: &mut EditorState, center: [f32; 2]) {
     // Re-anchor every keyframe write to the playhead captured at drag
     // start (frozen for the duration of the gesture). Outside an active
     // drag the live playhead is used so single inspector edits still
     // land at the visible time.
     let t = state.canvas_drag.drag_start_playhead.unwrap_or(state.playhead);
+    // ── Undo grouping: one snapshot per drag gesture, per element. ──
+    let token = canvas_drag_token(CANVAS_TOKEN_POS, state.selection);
+    if state.last_drag_group != Some(token) {
+        state.undo.push(&state.scene);
+        state.last_drag_group = Some(token);
+    }
     match state.selection {
         Selection::Actor(idx) if idx < state.scene.actors.len() => {
             let actor_id = state.scene.actors[idx].id.clone();
             // Prefer canvas_layouts entry when present (free canvas v2).
-            // The world-pixel canvas track is always-animate by design
-            // (it only exists when the user has dragged the actor on
-            // the free canvas at least once).
+            // The world-pixel canvas track honours the host actor's
+            // `animated_params` for POS_X / POS_Y so toggling the
+            // diamond OFF makes canvas drags broadcast (static) instead
+            // of animating mid-track. Without this every drag while a
+            // canvas_layouts entry existed silently authored animation,
+            // even when the inspector clearly showed the param as
+            // static.
+            let animated_clone = state.scene.actors[idx].animated_params.clone();
             if let Some(cl) = state.scene.canvas_layouts.iter_mut()
                 .find(|cl| cl.element_id == actor_id)
             {
-                crate::kf_anim::write_canvas_param(&mut cl.keyframes, t, |v| {
-                    v.pos.x = center[0];
-                    v.pos.y = center[1];
-                });
+                crate::kf_anim::write_canvas_param(
+                    &mut cl.keyframes,
+                    &animated_clone,
+                    &[
+                        memstroy_core::param_ids::POS_X,
+                        memstroy_core::param_ids::POS_Y,
+                    ],
+                    t,
+                    |v| {
+                        v.pos.x = center[0];
+                        v.pos.y = center[1];
+                    },
+                );
                 return;
             }
             // Legacy normalised: convert to render-frame-relative.
@@ -2525,6 +2588,11 @@ fn set_selection_world_center(state: &mut EditorState, center: [f32; 2]) {
 fn set_selection_scale_y(state: &mut EditorState, new_scale_y: f32) {
     let s = new_scale_y.clamp(0.05, 20.0);
     let t = state.canvas_drag.drag_start_playhead.unwrap_or(state.playhead);
+    let token = canvas_drag_token(CANVAS_TOKEN_SCALE_Y, state.selection);
+    if state.last_drag_group != Some(token) {
+        state.undo.push(&state.scene);
+        state.last_drag_group = Some(token);
+    }
     match state.selection {
         Selection::Actor(idx) if idx < state.scene.actors.len() => {
             let actor = &mut state.scene.actors[idx];
@@ -2553,6 +2621,11 @@ fn set_selection_scale_y(state: &mut EditorState, new_scale_y: f32) {
 fn set_selection_scale(state: &mut EditorState, new_scale: f32) {
     let s = new_scale.clamp(0.05, 20.0);
     let t = state.canvas_drag.drag_start_playhead.unwrap_or(state.playhead);
+    let token = canvas_drag_token(CANVAS_TOKEN_SCALE, state.selection);
+    if state.last_drag_group != Some(token) {
+        state.undo.push(&state.scene);
+        state.last_drag_group = Some(token);
+    }
     match state.selection {
         Selection::Actor(idx) if idx < state.scene.actors.len() => {
             let actor = &mut state.scene.actors[idx];
@@ -2596,6 +2669,11 @@ fn apply_scale_delta(state: &mut EditorState, delta: f32) {
 /// time and the system records a keyframe automatically.
 fn set_selection_rotation(state: &mut EditorState, new_rot_deg: f32) {
     let t = state.canvas_drag.drag_start_playhead.unwrap_or(state.playhead);
+    let token = canvas_drag_token(CANVAS_TOKEN_ROTATION, state.selection);
+    if state.last_drag_group != Some(token) {
+        state.undo.push(&state.scene);
+        state.last_drag_group = Some(token);
+    }
     match state.selection {
         Selection::Actor(idx) if idx < state.scene.actors.len() => {
             let actor = &mut state.scene.actors[idx];
