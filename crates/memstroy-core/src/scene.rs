@@ -716,9 +716,21 @@ pub struct TextStyle {
     /// Solid plate colour. `None` = transparent text only.
     #[serde(default)]
     pub box_color: Option<[u8; 3]>,
-    /// Padding inside the box, in pixels.
+    /// Padding inside the box, in pixels. Used as the *symmetric*
+    /// padding around the text — for asymmetric (left/right only)
+    /// extension see `box_extra_left` / `box_extra_right` below.
     #[serde(default)]
     pub box_padding: f32,
+    /// Extra horizontal padding added on top of `box_padding` to
+    /// extend the plate **only on the left**. Used to widen the
+    /// background relative to the text without changing the text
+    /// scale, so alignment-inside-the-plate becomes meaningful.
+    #[serde(default)]
+    pub box_extra_left: f32,
+    /// Extra horizontal padding added on top of `box_padding` to
+    /// extend the plate **only on the right** (mirrors `box_extra_left`).
+    #[serde(default)]
+    pub box_extra_right: f32,
     #[serde(default)]
     pub bold: bool,
     #[serde(default)]
@@ -763,6 +775,8 @@ impl Default for TextStyle {
             color: [0, 0, 0],
             box_color: Some([255, 255, 255]),
             box_padding: 24.0,
+            box_extra_left: 0.0,
+            box_extra_right: 0.0,
             bold: true,
             italic: false,
             outline: None,
