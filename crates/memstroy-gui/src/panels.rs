@@ -49,30 +49,25 @@ pub fn library(ui: &mut egui::Ui, state: &mut EditorState, _request_refresh: imp
     // sub-folder rather than dropping straight onto the timeline.
     state.library_panel_rect = Some(ui.max_rect());
 
-    // Header
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("Library").size(16.0).strong());
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let btn = egui::Button::new(RichText::new("Refresh").color(Color32::WHITE).size(12.0))
-                .fill(Color32::from_rgb(80, 50, 180))
-                .rounding(Rounding::same(6.0));
-            if ui.add_enabled(!state.refreshing, btn).clicked() {
-                state.status = "__REFRESH_REQUESTED__".into();
-            }
-        });
-    });
+    // Plain header (no Refresh button anymore — Refresh is now a
+    // per-asset-tab action: Clips refreshes from Telegram via the
+    // assets-server, the other tabs rescan local directories).
+    ui.label(RichText::new("Library").size(16.0).strong());
     ui.add_space(4.0);
 
-    // Tab bar — Clips / Videos / Sounds / Images / Particles / Shared.
-    // Sticky across sessions via `state.library_tab`.
+    // Tab bar — Clips / Videos / Sounds / Images / Particles.
+    // The previous "Shared" tab was removed: the editor now
+    // delegates Telegram ingest to the assets-server and reuses the
+    // Clips tab as the single TG-clip browser. Server URL / channel /
+    // limit live as plain fields on EditorState (and surface inside
+    // the Clips tab toolbar) instead of a separate panel.
     ui.horizontal_wrapped(|ui| {
         let tabs = [
-            (LibraryTab::Clips,    "\u{1F3AC} Clips"),
-            (LibraryTab::Videos,   "\u{1F4FD} Videos"),
-            (LibraryTab::Sounds,   "\u{1F50A} Sounds"),
-            (LibraryTab::Images,   "\u{1F5BC} Images"),
+            (LibraryTab::Clips,     "\u{1F3AC} Clips"),
+            (LibraryTab::Videos,    "\u{1F4FD} Videos"),
+            (LibraryTab::Sounds,    "\u{1F50A} Sounds"),
+            (LibraryTab::Images,    "\u{1F5BC} Images"),
             (LibraryTab::Particles, "\u{2728} Particles"),
-            (LibraryTab::Shared,   "\u{2601} Shared"),
         ];
         for (tab, label) in tabs {
             if ui.selectable_label(state.library_tab == tab, label).clicked() {
@@ -90,12 +85,11 @@ pub fn library(ui: &mut egui::Ui, state: &mut EditorState, _request_refresh: imp
     ui.add_space(2.0);
 
     let hint_text = match state.library_tab {
-        LibraryTab::Clips => "Drag a clip onto the canvas or timeline. Drop video files here from your file manager to import them into the Videos tab.",
+        LibraryTab::Clips => "Drag a clip onto the canvas or timeline. Hit Refresh to ingest the latest Telegram channel posts via the assets-server.",
         LibraryTab::Videos => "User-imported videos. Drop a video file from your file manager into this panel to add it. Drag a row onto the canvas or timeline to spawn an actor.",
         LibraryTab::Sounds => "Drop a sound onto the timeline to add it as an audio track. Drop audio files from your file manager here to import.",
         LibraryTab::Images => "Drag a sticker onto the canvas to add it as an image overlay. Drop image files from your file manager here to import.",
         LibraryTab::Particles => "Drag a particle onto the canvas — it spawns with spin + pulse modifiers.",
-        LibraryTab::Shared => "Lazily-fetched assets served by an external memstroy-assets-server. Search, preview, download — or pull a Telegram channel to populate it.",
     };
     ui.label(
         RichText::new(hint_text)
@@ -111,19 +105,6 @@ pub fn library(ui: &mut egui::Ui, state: &mut EditorState, _request_refresh: imp
         LibraryTab::Sounds => library_assets_tab(ui, state, AssetDragKind::Sound),
         LibraryTab::Images => library_assets_tab(ui, state, AssetDragKind::Image),
         LibraryTab::Particles => library_assets_tab(ui, state, AssetDragKind::Particle),
-        LibraryTab::Shared => {
-            // Use the runtime handle that App stashed at startup.
-            // Cloning a Handle is cheap; we clone here so the borrow
-            // checker is happy while the closure mutably borrows state.
-            if let Some(handle) = state.tokio_handle.clone() {
-                crate::shared_library::shared_library_panel(ui, state, &handle);
-            } else {
-                ui.label(
-                    RichText::new("No tokio runtime available — restart the editor.")
-                        .color(COL_TEXT_DIM),
-                );
-            }
-        }
     }
 }
 
@@ -234,7 +215,54 @@ fn library_split_panel<L, G>(
 
 /// Render the original Mellstroy clip browser content (split out so the
 /// new tabs can render their own variants of the list).
+///
+/// The toolbar at the top of this tab is where the user controls the
+/// **server-driven Telegram refresh** that replaced the old "Shared"
+/// panel. Clicking Refresh POSTs to `{server_url}/api/ingest/tg` with
+/// the channel + limit configured here; the GUI then waits for the
+/// server to download, sweeps the local clips dir for new files, and
+/// reloads the library.
 fn library_clips_tab(ui: &mut egui::Ui, state: &mut EditorState) {
+    // ── Server / Telegram refresh toolbar ──
+    // Lives inside the Clips tab so the browser controls sit next to
+    // the clip browser they affect (replaces the global Refresh button
+    // that used to live in the panel's top-right corner).
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new("Server:").size(10.0).color(COL_TEXT_DIM));
+        ui.add(
+            egui::TextEdit::singleline(&mut state.server_url)
+                .hint_text("http://host:port")
+                .desired_width(150.0),
+        );
+        ui.label(RichText::new("@").size(10.0).color(COL_TEXT_DIM));
+        ui.add(
+            egui::TextEdit::singleline(&mut state.tg_channel)
+                .hint_text("channel")
+                .desired_width(110.0),
+        );
+        ui.add(
+            egui::DragValue::new(&mut state.tg_limit)
+                .range(1..=500)
+                .speed(1.0)
+                .prefix("limit "),
+        );
+        let btn = egui::Button::new(
+            RichText::new("Refresh").color(Color32::WHITE).size(12.0),
+        )
+        .fill(Color32::from_rgb(80, 50, 180))
+        .rounding(Rounding::same(6.0));
+        if ui
+            .add_enabled(!state.refreshing, btn)
+            .on_hover_text(
+                "POST to {server}/api/ingest/tg, then sync the local clips dir from disk",
+            )
+            .clicked()
+        {
+            state.status = "__REFRESH_REQUESTED__".into();
+        }
+    });
+    ui.add_space(4.0);
+
     library_split_panel(
         ui,
         state,
@@ -2297,6 +2325,11 @@ fn inspector_text_overlay(
     ).default_open(true).show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.label("Family:");
+            // The bundled font set only exposes a proportional and a
+            // monospace family today, so the picker is restricted to
+            // those two until the editor learns to load custom TTFs.
+            // The `font` string is preserved exactly as authored so
+            // existing project files round-trip unchanged.
             egui::ComboBox::from_id_source("text_font_family")
                 .selected_text(t.style.font.clone())
                 .show_ui(ui, |ui| {
@@ -2306,12 +2339,9 @@ fn inspector_text_overlay(
                 });
         });
 
-        // ── Size: compact "−  [drag value]  +" trio with quick presets.
-        // The user's #1 ask was "more intuitive sizing with fewer params"
-        // — the wide 8..=512 slider felt finicky. The drag value still
-        // covers the whole sane range, but the −/+ buttons step by a
-        // visible amount and the preset row gets you to common sizes
-        // in one click.
+        // ── Size: compact "−  [drag value]  +" trio.
+        // The "Preset:" row was removed — the −/+ buttons cover quick
+        // adjustments and the drag value covers the full range.
         ui.horizontal(|ui| {
             ui.label("Size:");
             if ui.small_button("\u{2212}").on_hover_text("Decrease (-4)").clicked() {
@@ -2327,18 +2357,15 @@ fn inspector_text_overlay(
                 t.style.font_size = (t.style.font_size + 4.0).min(512.0);
             }
         });
-        ui.horizontal(|ui| {
-            ui.label("Preset:");
-            for (label, sz) in [("S", 24.0_f32), ("M", 48.0), ("L", 96.0), ("XL", 144.0)] {
-                if ui.small_button(label).on_hover_text(format!("{} px", sz as i32)).clicked() {
-                    t.style.font_size = sz;
-                }
-            }
-        });
 
         ui.horizontal(|ui| {
-            ui.checkbox(&mut t.style.bold, "Bold");
-            ui.checkbox(&mut t.style.italic, "Italic");
+            ui.checkbox(&mut t.style.bold, "Bold")
+                .on_hover_text(
+                    "Synthesised on the bundled font by repainting glyphs \
+                     with sub-pixel offsets",
+                );
+            ui.checkbox(&mut t.style.italic, "Italic")
+                .on_hover_text("Slants glyphs ~13° to the right");
         });
         ui.horizontal(|ui| {
             ui.label("Color:");
@@ -2427,6 +2454,26 @@ fn inspector_text_overlay(
             ui.add(egui::Slider::new(&mut t.style.box_padding, 0.0..=80.0).text("Padding"));
             ui.add(egui::Slider::new(&mut t.style.box_corner_radius, 0.0..=80.0).text("Corner radius"));
 
+            // Asymmetric horizontal extension: widens the plate to the
+            // left or to the right WITHOUT changing the text scale.
+            // Combined with TextAlign::{Left,Center,Right}, this lets
+            // the user place the text anywhere inside a wider banner —
+            // exactly the use-case the previous "scale only" controls
+            // couldn't address.
+            ui.label(
+                RichText::new("Asymmetric width (px)")
+                    .size(10.0)
+                    .color(COL_TEXT_DIM),
+            );
+            ui.add(
+                egui::Slider::new(&mut t.style.box_extra_left, 0.0..=400.0)
+                    .text("Extra left"),
+            );
+            ui.add(
+                egui::Slider::new(&mut t.style.box_extra_right, 0.0..=400.0)
+                    .text("Extra right"),
+            );
+
             // Plate border (independent of glyph stroke)
             let mut has_border = t.style.box_outline_color.is_some() || t.style.box_outline_width > 0.0;
             ui.checkbox(&mut has_border, "Plate border");
@@ -2450,27 +2497,30 @@ fn inspector_text_overlay(
 
     ui.add_space(8.0);
     inspector_modifiers(ui, &mut t.modifiers, ("text_mods", idx));
-    ui.add_space(8.0);
-    inspector_effect_stack(ui, &mut t.effects, ("text_fx", idx));
+    // NOTE: the per-effect "Effect stack" UI is intentionally NOT
+    // surfaced for text overlays. The live preview path (this file)
+    // does not yet rasterise text into a buffer that `apply_effect_stack_cpu`
+    // could process, so showing the editor here would advertise an
+    // effect that visibly never runs. The model field
+    // `TextOverlay::effects` is still preserved in the scene schema so
+    // older project files load and re-save unchanged, and the eventual
+    // preview-side effect plumbing can be re-enabled here without a
+    // schema migration. (User requested either real effects or no UI.)
 
     // Layer/z-index actions are no longer exposed from the inspector — the
     // timeline track row order alone determines stacking.
     None
 }
 
+// Logical font-family options. The bundled font set today only ships
+// proportional + monospace, so picking anything else is a no-op visually
+// (the field is preserved on disk so the export pipeline / a future
+// font-loading PR can still consume it). Until custom-TTF loading lands,
+// keeping this list tight prevents the user from picking "Impact" and
+// wondering why nothing changed.
 const COMMON_FONTS: &[&str] = &[
-    "DejaVuSans",
-    "DejaVuSans-Bold",
-    "Arial",
-    "Helvetica",
-    "Impact",
-    "Roboto",
-    "Times",
-    "Courier",
-    "Comic Sans MS",
-    "Verdana",
-    "Tahoma",
-    "Georgia",
+    "Default",
+    "Monospace",
 ];
 
 
@@ -3534,10 +3584,31 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             sync_audio_to_actor(state, ai);
                             to_select = Some(Selection::Actor(ai));
                         } else if clicked == f32::NEG_INFINITY {
-                            // Trim right edge: adjust t_out
+                            // Trim right edge: adjust t_out.
+                            //
+                            // Hard-cap the new out-edge against the source clip's
+                            // duration so the user can't stretch the clip past
+                            // its real footage. Without this clamp the timeline
+                            // happily lets you drag the right edge into infinity
+                            // and the trailing area plays as a frozen black frame.
                             let dx = ui.input(|i| i.pointer.delta().x);
                             let delta_t = dx / pps;
-                            let new_out = (clip_end + delta_t).max(clip_start + 0.1);
+                            let mut new_out = (clip_end + delta_t).max(clip_start + 0.1);
+                            // Source duration upper bound, only applied when the
+                            // frame cache for the actor has finished probing.
+                            // `t_out_max = t_in + max_clip_dur` where
+                            // `max_clip_dur = source_duration - source_start`.
+                            let source_start = state.scene.actors[ai].source_start;
+                            if let Some(fc) = state.frame_caches.get(ai) {
+                                if fc.is_ready() && fc.duration > 0.0 {
+                                    let max_clip_dur =
+                                        (fc.duration - source_start).max(0.1);
+                                    let max_out = clip_start + max_clip_dur;
+                                    if new_out > max_out {
+                                        new_out = max_out;
+                                    }
+                                }
+                            }
                             let token = EditorState::drag_token("trim_actor_right", ai);
                             state.mutate_drag(token, |s| {
                                 s.actors[ai].t_out = Some(new_out);
@@ -3992,16 +4063,18 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                 };
                 let clip_x_start = (clip_start_t - state.timeline_scroll) * pps + track_left;
                 let clip_x_end = (clip_end_t - state.timeline_scroll) * pps + track_left;
-                let kf_pairs: Vec<(f32, f32)> = keyframe_times_for_layer(state, sel_layer)
-                    .into_iter()
-                    .map(|local_t| (local_t, kf_time_to_scene_time(state, sel_layer, local_t)))
-                    .collect();
+                // Per-parameter keyframe lists. Filtering to actual
+                // change-points means a layer with 5 scale edits and 2
+                // opacity edits shows 5 diamonds in the Scale row and 2
+                // in the Opacity row — instead of all 7 in every row,
+                // which the user explicitly called out as confusing.
+                let param_kf_pairs = compute_param_change_points(state, sel_layer);
                 let outcome = draw_param_kf_rows(
                     ui,
                     painter,
                     &layer_label,
                     &params,
-                    &kf_pairs,
+                    &param_kf_pairs,
                     row_top + track_h,
                     expansion,
                     track_left,
@@ -5255,6 +5328,127 @@ fn keyframe_times_for_layer(state: &EditorState, sel: Selection) -> Vec<f32> {
     }
 }
 
+/// For each animatable transform parameter on the selected layer,
+/// return the list of `(local_t, scene_t)` keyframe pairs at which
+/// **that specific parameter actually changes value** relative to the
+/// previous kf in the same layer. The first kf of the layer is always
+/// included (it sets the initial value). Layers with fewer than two
+/// kfs return empty lists per parameter — there is nothing to animate
+/// to display.
+///
+/// Heuristic, not schema-based: the layout vec carries one
+/// `ActorState` / `OverlayState` per kf, so when the user edits only
+/// `opacity` at the playhead the new kf still inherits the eased
+/// values for every other field. Comparing each kf to its predecessor
+/// per-field reconstructs which fields the user *meant* to author.
+/// This avoids a schema migration while still giving the user the
+/// "5 scale changes vs. 2 opacity changes" view they asked for.
+fn compute_param_change_points(
+    state: &EditorState,
+    sel: Selection,
+) -> std::collections::BTreeMap<String, Vec<(f32, f32)>> {
+    use memstroy_core::param_ids as p;
+    let mut out: std::collections::BTreeMap<String, Vec<(f32, f32)>> =
+        std::collections::BTreeMap::new();
+    const EPS: f32 = 1.0e-4;
+
+    fn changed_actor<F>(layout: &[Keyframe<ActorState>], get: F) -> Vec<f32>
+    where
+        F: Fn(&ActorState) -> f32,
+    {
+        if layout.len() < 2 { return Vec::new(); }
+        let mut times: Vec<f32> = Vec::new();
+        // Always include the first kf — that's the initial value for
+        // the parameter and the user wants to see/click it.
+        times.push(layout[0].t);
+        for win in layout.windows(2) {
+            let (prev, cur) = (&win[0].value, &win[1].value);
+            if (get(cur) - get(prev)).abs() > EPS {
+                times.push(win[1].t);
+            }
+        }
+        times
+    }
+
+    fn changed_overlay<F>(layout: &[Keyframe<OverlayState>], get: F) -> Vec<f32>
+    where
+        F: Fn(&OverlayState) -> f32,
+    {
+        if layout.len() < 2 { return Vec::new(); }
+        let mut times: Vec<f32> = Vec::new();
+        times.push(layout[0].t);
+        for win in layout.windows(2) {
+            let (prev, cur) = (&win[0].value, &win[1].value);
+            if (get(cur) - get(prev)).abs() > EPS {
+                times.push(win[1].t);
+            }
+        }
+        times
+    }
+
+    let pairs = |times: Vec<f32>, sel: Selection| -> Vec<(f32, f32)> {
+        times
+            .into_iter()
+            .map(|local_t| (local_t, kf_time_to_scene_time(state, sel, local_t)))
+            .collect()
+    };
+
+    match sel {
+        Selection::Actor(ai) => {
+            if let Some(a) = state.scene.actors.get(ai) {
+                out.insert(p::POS_X.to_string(),
+                    pairs(changed_actor(&a.layout, |s| s.pos[0]), sel));
+                out.insert(p::POS_Y.to_string(),
+                    pairs(changed_actor(&a.layout, |s| s.pos[1]), sel));
+                out.insert(p::SCALE.to_string(),
+                    pairs(changed_actor(&a.layout, |s| s.scale), sel));
+                out.insert(p::SCALE_Y.to_string(),
+                    pairs(changed_actor(&a.layout, |s| s.scale_y), sel));
+                out.insert(p::ROTATION.to_string(),
+                    pairs(changed_actor(&a.layout, |s| s.rotation_deg), sel));
+                out.insert(p::OPACITY.to_string(),
+                    pairs(changed_actor(&a.layout, |s| s.opacity), sel));
+                out.insert(p::FLIP_X.to_string(),
+                    pairs(changed_actor(&a.layout, |s| s.flip_x_anim), sel));
+                out.insert(p::FLIP_Y.to_string(),
+                    pairs(changed_actor(&a.layout, |s| s.flip_y_anim), sel));
+            }
+        }
+        Selection::Overlay(oi) => {
+            if let Some(ov) = state.scene.overlays.get(oi) {
+                let layout: &[Keyframe<OverlayState>] = match ov {
+                    Overlay::Text(t) => &t.layout,
+                    Overlay::Image(im) => &im.layout,
+                    Overlay::Video(v) => &v.layout,
+                };
+                out.insert(p::POS_X.to_string(),
+                    pairs(changed_overlay(layout, |s| s.pos[0]), sel));
+                out.insert(p::POS_Y.to_string(),
+                    pairs(changed_overlay(layout, |s| s.pos[1]), sel));
+                out.insert(p::SCALE.to_string(),
+                    pairs(changed_overlay(layout, |s| s.scale), sel));
+                out.insert(p::SCALE_Y.to_string(),
+                    pairs(changed_overlay(layout, |s| s.scale_y), sel));
+                out.insert(p::ROTATION.to_string(),
+                    pairs(changed_overlay(layout, |s| s.rotation_deg), sel));
+                out.insert(p::OPACITY.to_string(),
+                    pairs(changed_overlay(layout, |s| s.opacity), sel));
+                out.insert(p::FLIP_X.to_string(),
+                    pairs(changed_overlay(layout, |s| s.flip_x_anim), sel));
+                out.insert(p::FLIP_Y.to_string(),
+                    pairs(changed_overlay(layout, |s| s.flip_y_anim), sel));
+            }
+        }
+        _ => {
+            // RenderFrame / unknown layers fall through with an empty
+            // map. The per-param rows only render for actors and
+            // overlays right now (selected_layer_animated_params already
+            // filters those upstream), so this is a no-op for them.
+        }
+    }
+    out
+}
+
 /// Translate kf times (LOCAL for overlays / scene-time for actors) to
 /// scene-time absolute coords used by the timeline ruler.
 fn kf_time_to_scene_time(state: &EditorState, sel: Selection, kf_t: f32) -> f32 {
@@ -5362,7 +5556,12 @@ fn draw_param_kf_rows(
     painter: &egui::Painter,
     sel_layer_label: &crate::kf_anim::SelectedLayer,
     params: &[String],
-    kf_pairs: &[(f32, f32)],
+    // Per-parameter list of `(local_t, scene_t)` pairs. The caller
+    // computes change-points for each parameter from the layer's
+    // typed layout so opacity-only edits don't pollute the scale row
+    // (and vice versa). When a key is missing, that param's row is
+    // drawn empty.
+    param_kfs: &std::collections::BTreeMap<String, Vec<(f32, f32)>>,
     expansion_top: f32,
     expansion_height: f32,
     track_left: f32,
@@ -5453,9 +5652,17 @@ fn draw_param_kf_rows(
 
         // Diamond per kf, hit-tested. Diamonds outside the clip's strip
         // are skipped so the per-param row only carries keyframes that
-        // belong to the clip's visible range.
+        // belong to the clip's visible range. The list of kfs is
+        // **per-parameter** (caller pre-computes change-points against
+        // the layer's typed layout), so a kf that only changes opacity
+        // never appears in the scale row, etc.
+        let empty: Vec<(f32, f32)> = Vec::new();
+        let kfs_for_param: &[(f32, f32)] = param_kfs
+            .get(param_id)
+            .map(|v| v.as_slice())
+            .unwrap_or(&empty);
         let half = 4.5_f32;
-        for &(local_t, scene_t) in kf_pairs {
+        for &(local_t, scene_t) in kfs_for_param {
             let x = (scene_t - scroll) * pps + track_left;
             if !strip_visible {
                 continue;
@@ -5878,6 +6085,8 @@ pub fn add_text_overlay(state: &mut EditorState) -> usize {
         color: [255, 255, 255],
         box_color: Some([0, 0, 0]),
         box_padding: 24.0,
+        box_extra_left: 0.0,
+        box_extra_right: 0.0,
         bold: true,
         italic: false,
         outline: Some([0, 0, 0]),

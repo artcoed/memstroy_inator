@@ -26,7 +26,6 @@ serde_yaml = { workspace = true }
 image = { workspace = true }
 chrono = { workspace = true }
 memstroy-core = { workspace = true }
-memstroy-tg = { workspace = true }
 memstroy-render = { workspace = true }
 memstroy-vision = { workspace = true }
 wgpu = { workspace = true }
