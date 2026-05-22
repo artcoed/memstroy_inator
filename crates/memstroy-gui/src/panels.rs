@@ -3024,12 +3024,12 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
 
     // ── Toolbar ──
     ui.horizontal(|ui| {
-        // ── Play / Pause / Stop transport ──
-        // Always-visible inline playback controls so the user doesn't have
-        // to reach for the Space shortcut. Stop returns the playhead to 0
-        // and pauses; the Play button toggles like Space does. The big
-        // glyphs render via the default font and stay legible at any
-        // zoom level.
+        // ── Play / Pause transport ──
+        // Single inline toggle button — the icon swaps between ▶ and ⏸
+        // depending on `state.playing`, mirroring the Space shortcut.
+        // The previous separate Stop button was removed so the user has
+        // a single, unambiguous transport control; the playhead can be
+        // rewound by clicking the timeline ruler or pressing Home.
         let play_glyph = if state.playing { "\u{23F8}" } else { "\u{25B6}" }; // ⏸ / ▶
         let play_label = if state.playing { "Pause (Space)" } else { "Play (Space)" };
         let play_color = if state.playing {
@@ -3048,18 +3048,6 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             } else {
                 "\u{23F8} Paused".into()
             };
-        }
-
-        let stop_btn = egui::Button::new(
-            RichText::new("\u{23F9}")
-                .size(14.0)
-                .color(Color32::from_rgb(220, 120, 120)),
-        )
-        .min_size(Vec2::new(26.0, 22.0));
-        if ui.add(stop_btn).on_hover_text("Stop & rewind to start").clicked() {
-            state.playing = false;
-            state.playhead = 0.0;
-            state.status = "\u{23F9} Stopped".into();
         }
 
         ui.separator();
