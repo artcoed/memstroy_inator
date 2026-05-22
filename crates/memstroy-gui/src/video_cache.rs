@@ -490,6 +490,12 @@ fn hash_effect_kind<H: std::hash::Hasher>(kind: &memstroy_core::EffectKind, h: &
             bits(*amplitude).hash(h); bits(*wavelength).hash(h);
         }
         K::Bloom { radius } => bits(*radius).hash(h),
+        K::Crop { left, top, right, bottom } => {
+            bits(*left).hash(h);
+            bits(*top).hash(h);
+            bits(*right).hash(h);
+            bits(*bottom).hash(h);
+        }
     }
 }
 
@@ -723,7 +729,50 @@ fn apply_single_effect(
         K::Vhs => vhs(img, intensity),
         K::Glitch { strength } => glitch(img, *strength * intensity),
         K::Bloom { radius } => bloom(img, *radius, intensity),
+        K::Crop { left, top, right, bottom } => crop_alpha(
+            img,
+            (*left * intensity).clamp(0.0, 0.49),
+            (*top * intensity).clamp(0.0, 0.49),
+            (*right * intensity).clamp(0.0, 0.49),
+            (*bottom * intensity).clamp(0.0, 0.49),
+        ),
     }
+}
+
+/// Apply a Crop effect by zeroing the alpha channel outside the visible
+/// rectangle. Cheap and faithful enough for the preview path; the
+/// ffmpeg export uses a real `crop` filter for full fidelity.
+fn crop_alpha(
+    img: &ColorImage,
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+) -> ColorImage {
+    let mut out = img.clone();
+    let w = img.size[0];
+    let h = img.size[1];
+    if w == 0 || h == 0 {
+        return out;
+    }
+    let lx = (left * w as f32).round() as usize;
+    let ty = (top * h as f32).round() as usize;
+    let rx = w.saturating_sub((right * w as f32).round() as usize);
+    let by = h.saturating_sub((bottom * h as f32).round() as usize);
+    for y in 0..h {
+        for x in 0..w {
+            if x < lx || x >= rx || y < ty || y >= by {
+                let idx = y * w + x;
+                if idx < out.pixels.len() {
+                    let p = out.pixels[idx];
+                    out.pixels[idx] = egui::Color32::from_rgba_unmultiplied(
+                        p.r(), p.g(), p.b(), 0,
+                    );
+                }
+            }
+        }
+    }
+    out
 }
 
 fn mix_pixels(a: &ColorImage, b: &ColorImage, t: f32) -> ColorImage {
