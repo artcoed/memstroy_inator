@@ -351,17 +351,30 @@ impl App {
                 }
                 if ui.button("\u{1F4C2} Open scene...").clicked() {
                     if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Memstroy Project", &["memstroy"])
                         .add_filter("Scene", &["yaml", "yml", "json"])
                         .pick_file()
                     {
-                        match Scene::load(&path) {
+                        let is_memstroy = path
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .map(|s| s.eq_ignore_ascii_case("memstroy"))
+                            .unwrap_or(false);
+                        let load_res: Result<Scene, String> = if is_memstroy {
+                            self.state.load_memstroy(&path)
+                        } else {
+                            Scene::load(&path).map_err(|e| e.to_string())
+                        };
+                        match load_res {
                             Ok(s) => {
                                 self.state.scene = s;
                                 self.state.scene_path = Some(path.clone());
                                 self.state.status = "\u{2705} Scene loaded.".into();
-                                // Load layout alongside scene
-                                let layout_path = path.with_extension("layout.json");
-                                self.state.load_layout(&layout_path);
+                                // Sidecar layout for non-bundle formats.
+                                if !is_memstroy {
+                                    let layout_path = path.with_extension("layout.json");
+                                    self.state.load_layout(&layout_path);
+                                }
                                 // Update tab name
                                 let name = path.file_stem().and_then(|s| s.to_str())
                                     .unwrap_or("Scene").to_string();
@@ -444,6 +457,13 @@ impl App {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        // Skip global shortcuts when any widget wants keyboard input —
+        // typing into a text overlay or a search box should not
+        // play/pause, undo, or delete things behind the user's back.
+        if ctx.wants_keyboard_input() {
+            return;
+        }
+
         let modifiers = ctx.input(|i| i.modifiers);
         let ctrl = modifiers.ctrl || modifiers.mac_cmd;
 
@@ -457,8 +477,8 @@ impl App {
                     self.state.status = "\u{23F8} Paused".into();
                 }
             }
-            // Ctrl+Z = Undo
-            if ctrl && i.key_pressed(egui::Key::Z) && !modifiers.shift {
+            // Ctrl+Z = Undo (NOT Shift+Z, which is redo).
+            if ctrl && !modifiers.shift && i.key_pressed(egui::Key::Z) {
                 self.state.undo();
             }
             // Ctrl+Shift+Z or Ctrl+Y = Redo
@@ -939,14 +959,28 @@ impl App {
 
     fn save_scene(&mut self) {
         if let Some(path) = self.state.scene_path.clone() {
-            match self.state.scene.save(&path) {
-                Ok(()) => {
-                    self.state.status = "\u{2705} Saved.".into();
-                    // Save layout alongside scene
-                    let layout_path = path.with_extension("layout.json");
-                    self.state.save_layout(&layout_path);
+            let is_memstroy = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|s| s.eq_ignore_ascii_case("memstroy"))
+                .unwrap_or(false);
+            if is_memstroy {
+                match self.state.save_memstroy(&path) {
+                    Ok(()) => {
+                        self.state.status = "\u{2705} Saved (.memstroy).".into();
+                    }
+                    Err(e) => self.state.status = format!("\u{274C} Save failed: {e}"),
                 }
-                Err(e) => self.state.status = format!("\u{274C} Save failed: {e}"),
+            } else {
+                match self.state.scene.save(&path) {
+                    Ok(()) => {
+                        self.state.status = "\u{2705} Saved.".into();
+                        // Save layout alongside scene
+                        let layout_path = path.with_extension("layout.json");
+                        self.state.save_layout(&layout_path);
+                    }
+                    Err(e) => self.state.status = format!("\u{274C} Save failed: {e}"),
+                }
             }
         } else {
             self.save_as();
@@ -955,17 +989,48 @@ impl App {
 
     fn save_as(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
+            // .memstroy is the project-native bundle (scene + layout in
+            // a single JSON file). YAML / JSON remain available for
+            // CLI / version-control friendliness.
+            .add_filter("Memstroy Project", &["memstroy"])
             .add_filter("Scene YAML", &["yaml", "yml"])
             .add_filter("Scene JSON", &["json"])
+            .set_file_name("project.memstroy")
             .save_file()
         {
-            match self.state.scene.save(&path) {
+            let is_memstroy = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|s| s.eq_ignore_ascii_case("memstroy"))
+                .unwrap_or(false);
+            let result = if is_memstroy {
+                self.state
+                    .save_memstroy(&path)
+                    .map_err(|e| e.to_string())
+            } else {
+                self.state
+                    .scene
+                    .save(&path)
+                    .map_err(|e| e.to_string())
+                    .map(|_| {
+                        let layout_path = path.with_extension("layout.json");
+                        self.state.save_layout(&layout_path);
+                    })
+            };
+            match result {
                 Ok(()) => {
                     self.state.scene_path = Some(path.clone());
                     self.state.status = "\u{2705} Saved.".into();
-                    // Save layout alongside scene
-                    let layout_path = path.with_extension("layout.json");
-                    self.state.save_layout(&layout_path);
+                    if self.state.active_tab < self.state.scene_tabs.len() {
+                        let name = path
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("Scene")
+                            .to_string();
+                        self.state.scene_tabs[self.state.active_tab].name = name;
+                        self.state.scene_tabs[self.state.active_tab].path =
+                            Some(path.clone());
+                    }
                 }
                 Err(e) => self.state.status = format!("\u{274C} Save failed: {e}"),
             }
@@ -986,14 +1051,22 @@ impl App {
             error: None,
             progress: 0.0,
         });
+        // Force the project-native 1080x1920 (9:16 vertical) output for
+        // every render. The user explicitly asked for "render quality
+        // always 1080/1920" — overriding the scene's resolution at this
+        // boundary keeps the rendered MP4 byte-for-byte aligned with the
+        // editor's preview canvas, which is hard-coded to the same size
+        // (see `inspector_nothing` in panels.rs).
+        let mut scene_for_render = self.state.scene.clone();
+        scene_for_render.output.resolution = [1080, 1920];
         spawn_render(
             self.rt.handle(),
             self.tx.clone(),
-            self.state.scene.clone(),
+            scene_for_render,
             self.state.assets_root.clone(),
             path,
         );
-        self.state.status = "\u{1F3A5} Rendering...".into();
+        self.state.status = "\u{1F3A5} Rendering at 1080x1920...".into();
     }
 
     fn run_refresh(&mut self) {
@@ -1400,6 +1473,24 @@ impl eframe::App for App {
         // Keyboard shortcuts
         self.handle_shortcuts(ctx);
 
+        // ── End the active drag-undo group when no mouse button is down ──
+        // The undo/redo system snapshots once per drag gesture by tracking
+        // a `last_drag_group` token. The token must be cleared as soon as
+        // the gesture ends (no pointer button held), so the *next* drag
+        // pushes a fresh undo entry instead of being absorbed into the
+        // previous one. See `EditorState::mutate_drag` for details.
+        // (`state.timeline_drag.dragging_clip` is also cleared on drag-end,
+        // but that's owned by `panels::timeline` itself — don't touch it
+        // from here or its lane-commit logic stops firing.)
+        let any_pointer_down = ctx.input(|i| {
+            i.pointer.primary_down()
+                || i.pointer.secondary_down()
+                || i.pointer.middle_down()
+        });
+        if !any_pointer_down {
+            self.state.end_drag_group();
+        }
+
         // Play/pause: advance playhead
         if self.state.playing {
             let dt = ctx.input(|i| i.stable_dt).min(0.1); // cap at 100ms
@@ -1525,10 +1616,25 @@ impl eframe::App for App {
         // refreshed. Drops anywhere else continue to add the file
         // straight to the scene (legacy behaviour).
         let dropped_files: Vec<_> = ctx.input(|i| i.raw.dropped_files.clone());
-        let drop_pointer = ctx.input(|i| i.pointer.hover_pos());
+        // Use `latest_pos` with `hover_pos` fallback. egui can drop the
+        // hover position to None on the same frame the OS drop event
+        // arrives, which would mis-route the file to the canvas. The
+        // latest_pos snapshot survives the gap.
+        let drop_pointer = ctx.input(|i| {
+            i.pointer.latest_pos().or_else(|| i.pointer.hover_pos())
+        });
         let lib_rect = self.state.library_panel_rect;
         let into_library = match (drop_pointer, lib_rect) {
             (Some(p), Some(r)) => r.contains(p),
+            // No pointer info — be lenient and route to library if a
+            // recognised file kind is dropped while the library tab is
+            // visibly Videos / Sounds / Images / Particles. This makes
+            // OS-level drops on the panel "just work" even when egui's
+            // pointer tracking blanks out at drop time.
+            (None, _) => !matches!(
+                self.state.library_tab,
+                crate::state::LibraryTab::Clips
+            ),
             _ => false,
         };
         if !dropped_files.is_empty() {

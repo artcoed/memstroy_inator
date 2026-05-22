@@ -168,9 +168,13 @@ pub fn write_canvas_param<F>(
 /// `animated_params`, and toggle membership on click. Returns `true` when
 /// the toggle changed this frame so the caller can refresh dependent UI.
 ///
+/// The diamond is **painted directly** rather than rendered as a Unicode
+/// glyph because egui's default font doesn't include U+2B25 / U+2B26 and
+/// they showed up as empty squares — see the bug report from 2026‑05.
+///
 /// Visual:
-/// - filled gold diamond  ⬥  → param is animated (changes will create kfs)
-/// - hollow gray diamond  ⬦  → param is static (single value across track)
+/// - filled gold diamond  → param is animated (changes will create kfs)
+/// - hollow gray diamond  → param is static (single value across track)
 pub fn animated_toggle(
     ui: &mut egui::Ui,
     animated_params: &mut BTreeSet<String>,
@@ -179,18 +183,40 @@ pub fn animated_toggle(
 ) -> bool {
     let _ = salt; // reserved for future per-instance ids
     let on = animated_params.contains(param_id);
-    let glyph = if on { "\u{2B25}" } else { "\u{2B26}" }; // filled vs hollow diamond
-    let color = if on {
-        egui::Color32::from_rgb(255, 220, 80)
+
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::Vec2::splat(14.0), egui::Sense::click());
+    let center = rect.center();
+    let half = 5.0_f32;
+    let pts = vec![
+        egui::pos2(center.x, center.y - half),
+        egui::pos2(center.x + half, center.y),
+        egui::pos2(center.x, center.y + half),
+        egui::pos2(center.x - half, center.y),
+    ];
+
+    let hovered = resp.hovered();
+    let (fill, stroke_col) = if on {
+        let base = egui::Color32::from_rgb(255, 220, 80);
+        let hov = egui::Color32::from_rgb(255, 240, 120);
+        (
+            if hovered { hov } else { base },
+            egui::Color32::from_rgb(120, 90, 0),
+        )
     } else {
-        egui::Color32::from_rgb(120, 120, 140)
+        let base = egui::Color32::TRANSPARENT;
+        let hov = egui::Color32::from_rgba_premultiplied(180, 180, 200, 40);
+        (
+            if hovered { hov } else { base },
+            egui::Color32::from_rgb(140, 140, 160),
+        )
     };
-    let btn = egui::Button::new(
-        egui::RichText::new(glyph).size(11.0).color(color),
-    )
-    .frame(false)
-    .min_size(egui::Vec2::new(14.0, 14.0));
-    let resp = ui.add(btn);
+    ui.painter().add(egui::Shape::convex_polygon(
+        pts,
+        fill,
+        egui::Stroke::new(1.4, stroke_col),
+    ));
+
     let resp = resp.on_hover_text(if on {
         "Animated — click to lock to a single static value"
     } else {
