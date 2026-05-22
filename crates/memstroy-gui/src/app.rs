@@ -41,6 +41,7 @@ impl App {
     pub fn new(rt: Runtime) -> Self {
         let (tx, rx) = channel();
         let mut state = EditorState::new();
+        state.tokio_handle = Some(rt.handle().clone());
         state.reload_library();
 
         // Recovery: if an autosave from a previous session exists and is newer
@@ -492,6 +493,38 @@ impl App {
             // Ctrl+D = duplicate selected
             if ctrl && i.key_pressed(egui::Key::D) {
                 self.duplicate_selected();
+            }
+            // Ctrl+C = copy current selection (single or multi-select)
+            // into the in-memory clipboard.
+            if ctrl && i.key_pressed(egui::Key::C) {
+                let n = self.state.copy_selection_to_clipboard();
+                if n > 0 {
+                    self.state.status = format!(
+                        "\u{1F4CB} Copied {} item{} to clipboard",
+                        n,
+                        if n == 1 { "" } else { "s" }
+                    );
+                }
+            }
+            // Ctrl+V = paste every clipboard item, each onto its own
+            // brand-new top layer.
+            if ctrl && i.key_pressed(egui::Key::V) {
+                let n = self.state.paste_clipboard();
+                if n > 0 {
+                    self.state.status = format!(
+                        "\u{1F4CB} Pasted {} item{} to new top layer{}",
+                        n,
+                        if n == 1 { "" } else { "s" },
+                        if n == 1 { "" } else { "s" },
+                    );
+                }
+            }
+            // Escape clears the canvas multi-selection so the user can
+            // exit a marquee paint without affecting other shortcuts.
+            if i.key_pressed(egui::Key::Escape) {
+                if !self.state.canvas_selection.is_empty() {
+                    self.state.canvas_selection.clear();
+                }
             }
         });
     }
@@ -1765,6 +1798,9 @@ impl eframe::App for App {
                             volume: 1.0,
                             speed: 1.0,
                             parent_actor: None,
+                            volume_kfs: Vec::new(),
+                            speed_kfs: Vec::new(),
+                            animated_params: Default::default(),
                         });
                         self.state.selection = Selection::Audio(self.state.scene.audio.len() - 1);
                         self.state.status = format!("Dropped audio: {}", id);
@@ -1798,13 +1834,21 @@ impl eframe::App for App {
             let mut seen: std::collections::HashSet<std::path::PathBuf> =
                 std::collections::HashSet::new();
             for a in &state.scene.audio {
+                // When `volume` / `speed` are animated, sample the kf
+                // track at the playhead's clip-local time so a freshly-
+                // started playback uses the user's animated value at
+                // that moment. Live updates while the sink is already
+                // running are not yet supported (the rodio sink would
+                // need to be rebuilt for a speed change), but seeking +
+                // restarting picks up the latest sampled value.
+                let t_local = (state.playhead - a.t_in).max(0.0);
                 out.push(crate::audio_engine::AudioSourceSpec {
                     path: a.source.clone(),
                     t_in: a.t_in,
                     t_out: a.t_out,
                     source_start: a.source_start,
-                    volume: a.volume,
-                    speed: a.speed,
+                    volume: a.volume_at(t_local),
+                    speed: a.speed_at(t_local),
                 });
                 seen.insert(a.source.clone());
             }

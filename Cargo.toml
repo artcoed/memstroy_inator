@@ -7,6 +7,7 @@ members = [
     "crates/memstroy-render",
     "crates/memstroy-cli",
     "crates/memstroy-gui",
+    "crates/memstroy-assets-server",
 ]
 
 [workspace.package]
@@ -63,6 +64,7 @@ memstroy-core = { path = "crates/memstroy-core" }
 memstroy-tg = { path = "crates/memstroy-tg" }
 memstroy-vision = { path = "crates/memstroy-vision" }
 memstroy-render = { path = "crates/memstroy-render" }
+memstroy-assets-server = { path = "crates/memstroy-assets-server" }
 
 [profile.release]
 opt-level = 3

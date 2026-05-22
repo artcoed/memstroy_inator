@@ -11,6 +11,7 @@ mod jobs;
 mod kf_anim;
 mod node_editor;
 mod panels;
+mod shared_library;
 mod skeleton_editor;
 mod state;
 mod title_templates;
