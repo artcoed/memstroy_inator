@@ -300,3 +300,256 @@ impl KfHighlight {
         }
     }
 }
+
+// ─── Per-parameter keyframe strip (inspector) ────────────────────────
+//
+// A thin horizontal "ruler" drawn directly under a parameter widget.
+// Every keyframe of the parameter is rendered as a diamond at its
+// time-position; the user can:
+//
+//   • CLICK a diamond → seek the timeline playhead to that kf.
+//   • DRAG a diamond → move the kf along the time axis (clamped to
+//     `[0, duration]`).
+//   • RIGHT-CLICK a diamond → context menu to choose the interpolation
+//     curve coming INTO that kf (Linear / Ease in / Ease out / …).
+//
+// The widget is purely visual: it never owns the kf vector. The caller
+// passes in (time, easing) tuples and applies the interaction outcome
+// to its own data structure. This keeps it usable for the three
+// flavours of keyframe storage in the codebase without coupling:
+//
+//   1. `Vec<Keyframe<f32>>` (audio per-param, effect / colour-correction
+//      per-param via BTreeMap).
+//   2. `Vec<Keyframe<ActorState>>` / `Vec<Keyframe<OverlayState>>`
+//      (transform layouts, where the user's "per-param strip" filters
+//      to time-points where THIS param's value actually changes).
+//
+// Drag semantics for case 2: the strip operates on the SHARED kf time,
+// so moving it shifts every co-animated param at that time. This is a
+// pragmatic compromise — true per-param time-vectors would require a
+// schema migration.
+
+/// Per-keyframe interaction reported back to the caller. Indices map
+/// 1:1 to the `(time, easing)` pairs the caller passed in.
+#[derive(Default, Debug, Clone)]
+pub struct KfStripInteraction {
+    /// Kf at this index was clicked (no drag, no modifier). Caller
+    /// usually translates this into a playhead-seek.
+    pub clicked_idx: Option<usize>,
+    /// Kf at this index was dragged; the new clip-local time is in
+    /// the second tuple slot. Already clamped to `[0, duration]`.
+    pub dragged_idx_to: Option<(usize, f32)>,
+    /// User selected a new easing for the kf at this index from the
+    /// context menu. Caller writes this onto the matching `Keyframe<T>`.
+    pub easing_changed: Option<(usize, memstroy_core::Easing)>,
+}
+
+/// Draw a horizontal keyframe strip and collect pointer interactions.
+///
+/// `times` and `easings` must have the same length. `duration` is the
+/// clip-local span the strip represents (left edge = 0s, right edge =
+/// duration). Pass `Some(playhead)` to draw a thin marker at the
+/// current clip-local playhead.
+pub fn keyframe_strip(
+    ui: &mut egui::Ui,
+    times: &[f32],
+    easings: &[memstroy_core::Easing],
+    duration: f32,
+    playhead_local: Option<f32>,
+    salt: impl std::hash::Hash + Copy,
+) -> KfStripInteraction {
+    debug_assert_eq!(times.len(), easings.len());
+
+    let mut out = KfStripInteraction::default();
+    let row_h = 16.0_f32;
+    let avail_w = ui.available_width().max(40.0);
+    let (rect, _bg_resp) =
+        ui.allocate_exact_size(egui::Vec2::new(avail_w, row_h), egui::Sense::hover());
+
+    // Subtle background ruler so the strip reads as "the time axis of
+    // this parameter".
+    ui.painter().rect_filled(
+        rect,
+        egui::Rounding::same(2.0),
+        egui::Color32::from_rgba_premultiplied(255, 255, 255, 12),
+    );
+    // Horizontal centerline.
+    let cy = rect.center().y;
+    ui.painter().line_segment(
+        [egui::pos2(rect.min.x, cy), egui::pos2(rect.max.x, cy)],
+        egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgba_premultiplied(255, 255, 255, 30),
+        ),
+    );
+
+    let dur = duration.max(1.0e-3);
+    let time_to_x = |t: f32| -> f32 {
+        rect.min.x + (t / dur).clamp(0.0, 1.0) * rect.width()
+    };
+    let x_to_time = |x: f32| -> f32 {
+        ((x - rect.min.x) / rect.width()).clamp(0.0, 1.0) * dur
+    };
+
+    // Playhead tick.
+    if let Some(ph) = playhead_local {
+        if ph >= 0.0 && ph <= dur {
+            let x = time_to_x(ph);
+            ui.painter().line_segment(
+                [
+                    egui::pos2(x, rect.min.y + 2.0),
+                    egui::pos2(x, rect.max.y - 2.0),
+                ],
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(255, 180, 80)),
+            );
+        }
+    }
+
+    let half = 5.0_f32;
+    for (i, (t, easing)) in times.iter().zip(easings.iter()).enumerate() {
+        let x = time_to_x(*t);
+        let pts = vec![
+            egui::pos2(x, cy - half),
+            egui::pos2(x + half, cy),
+            egui::pos2(x, cy + half),
+            egui::pos2(x - half, cy),
+        ];
+        // Each easing flavour gets a slightly different fill so the
+        // user can read "this is a Step" at a glance once they learn
+        // the colour code.
+        let fill = match *easing {
+            memstroy_core::Easing::Step => egui::Color32::from_rgb(180, 180, 200),
+            memstroy_core::Easing::Linear => egui::Color32::from_rgb(160, 200, 255),
+            memstroy_core::Easing::EaseIn => egui::Color32::from_rgb(255, 200, 120),
+            memstroy_core::Easing::EaseOut => egui::Color32::from_rgb(120, 220, 200),
+            memstroy_core::Easing::EaseInOut => egui::Color32::from_rgb(200, 160, 255),
+            memstroy_core::Easing::Cubic => egui::Color32::from_rgb(255, 160, 200),
+        };
+
+        let hit = egui::Rect::from_center_size(
+            egui::pos2(x, cy),
+            egui::Vec2::new(half * 2.5, row_h),
+        );
+        let id = ui.id().with(("kf_strip", &salt, i));
+        let resp = ui.interact(hit, id, egui::Sense::click_and_drag());
+        ui.painter().add(egui::Shape::convex_polygon(
+            pts,
+            fill,
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(20, 20, 30)),
+        ));
+
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+            // Tooltip: time + easing name so the user can read the kf
+            // without having to open the context menu.
+            let easing_name = match *easing {
+                memstroy_core::Easing::Step => "Step",
+                memstroy_core::Easing::Linear => "Linear",
+                memstroy_core::Easing::EaseIn => "Ease in",
+                memstroy_core::Easing::EaseOut => "Ease out",
+                memstroy_core::Easing::EaseInOut => "Ease in/out",
+                memstroy_core::Easing::Cubic => "Cubic",
+            };
+            egui::show_tooltip_text(
+                ui.ctx(),
+                ui.layer_id(),
+                id.with("tooltip"),
+                format!("kf {:.3}s · {}", t, easing_name),
+            );
+        }
+
+        if resp.dragged() {
+            let dx = resp.drag_delta().x;
+            if dx.abs() > 0.0 {
+                let new_x = x + dx;
+                let new_t = x_to_time(new_x);
+                out.dragged_idx_to = Some((i, new_t));
+            }
+        } else if resp.clicked() {
+            out.clicked_idx = Some(i);
+        }
+
+        // Right-click context menu for picking the interpolation curve.
+        // Each entry calls back into the outcome struct so the caller
+        // can mutate its own kf vector.
+        resp.context_menu(|ui| {
+            ui.label(egui::RichText::new("Interpolation").size(10.0).strong());
+            ui.separator();
+            for (label, value) in [
+                ("Linear", memstroy_core::Easing::Linear),
+                ("Ease in", memstroy_core::Easing::EaseIn),
+                ("Ease out", memstroy_core::Easing::EaseOut),
+                ("Ease in/out", memstroy_core::Easing::EaseInOut),
+                ("Step (hold)", memstroy_core::Easing::Step),
+                ("Cubic", memstroy_core::Easing::Cubic),
+            ] {
+                let selected = *easing == value;
+                if ui
+                    .selectable_label(selected, label)
+                    .clicked()
+                {
+                    out.easing_changed = Some((i, value));
+                    ui.close_menu();
+                }
+            }
+        });
+    }
+
+    out
+}
+
+// ─── Convenience writers tied to the strip outcome ───────────────────
+
+/// Apply a [`KfStripInteraction`] to a `Vec<Keyframe<f32>>`. The drag
+/// is clamped, sorted, and de-duplicated; any easing change is
+/// persisted. Returns the new (still-valid) index of the kf the user
+/// interacted with — useful when the caller wants to keep tracking it
+/// after a sort. `None` when no interaction touched a kf.
+pub fn apply_strip_to_f32_kfs(
+    kfs: &mut Vec<memstroy_core::Keyframe<f32>>,
+    interaction: &KfStripInteraction,
+) -> Option<usize> {
+    let mut acted_t: Option<f32> = None;
+    if let Some((idx, new_t)) = interaction.dragged_idx_to {
+        if idx < kfs.len() {
+            kfs[idx].t = new_t.max(0.0);
+            acted_t = Some(kfs[idx].t);
+            kfs.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
+        }
+    }
+    if let Some((idx, easing)) = interaction.easing_changed {
+        if idx < kfs.len() {
+            kfs[idx].easing = easing;
+            acted_t.get_or_insert(kfs[idx].t);
+        }
+    }
+    acted_t.and_then(|t| {
+        kfs.iter()
+            .position(|k| (k.t - t).abs() < 1.0e-3)
+    })
+}
+
+/// Same as [`apply_strip_to_f32_kfs`] but for any `Vec<Keyframe<T>>`.
+/// Used by actor / overlay layouts where `T` is `ActorState` or
+/// `OverlayState`. Easing change is per-kf; drag moves the kf time.
+/// Note: when multiple parameters are co-animated at the same kf,
+/// dragging shifts all of them together — that's a pragmatic
+/// compromise for the shared-layout schema.
+pub fn apply_strip_to_kfs<T>(
+    kfs: &mut Vec<memstroy_core::Keyframe<T>>,
+    interaction: &KfStripInteraction,
+) where
+    T: Clone,
+{
+    if let Some((idx, new_t)) = interaction.dragged_idx_to {
+        if idx < kfs.len() {
+            kfs[idx].t = new_t.max(0.0);
+            kfs.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
+        }
+    }
+    if let Some((idx, easing)) = interaction.easing_changed {
+        if idx < kfs.len() {
+            kfs[idx].easing = easing;
+        }
+    }
+}

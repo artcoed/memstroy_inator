@@ -207,12 +207,15 @@ fn handle_eyedropper_click(
     let t = state.playhead;
     let t_in = actor.t_in.unwrap_or(0.0);
     let t_out = actor.t_out.unwrap_or(state.scene.output.duration);
+    // Match the actor's playback speed so the eyedropper picks the
+    // same pixel the user sees on canvas at the current playhead.
+    let speed = actor.speed.max(0.0001);
     let local_t = if t >= t_in && t <= t_out {
-        t - t_in + actor.source_start
+        (t - t_in) * speed + actor.source_start
     } else if t < t_in {
         actor.source_start
     } else {
-        actor.source_start + (t_out - t_in)
+        actor.source_start + (t_out - t_in) * speed
     };
 
     if let Some(fc) = state.frame_caches.get_mut(idx) {
@@ -969,13 +972,19 @@ fn draw_canvas_elements(
         let alpha = (actor_opacity * (base_tint.a() as f32 / 255.0)).clamp(0.0, 1.0);
         let tint = Color32::from_rgba_unmultiplied(base_tint.r(), base_tint.g(), base_tint.b(), (alpha * 255.0) as u8);
 
-        // Try to show actual frame from cache
+        // Try to show actual frame from cache. Apply `actor.speed` to
+        // the source-time so a >1.0 multiplier actually plays the file
+        // faster (consumes more source seconds per scene-second) — the
+        // previous formula stretched the visible window without
+        // touching the frame index, which made fast-mode look identical
+        // to a regular trim.
+        let speed = actor.speed.max(0.0001);
         let local_t = match display_mode {
-            DisplayMode::Active => t - t_in + actor.source_start,
+            DisplayMode::Active => (t - t_in) * speed + actor.source_start,
             DisplayMode::BeforeStart => actor.source_start, // first frame
             DisplayMode::AfterEnd => {
-                // last frame: source_start + (t_out - t_in)
-                actor.source_start + (t_out - t_in)
+                // last frame: source_start + visible_dur_in_source
+                actor.source_start + (t_out - t_in) * speed
             }
         };
 
@@ -1524,14 +1533,15 @@ fn draw_text_overlay(
 ) {
     let style = &txt.style;
 
-    // Effective font size in screen pixels = font_size * scale * canvas_zoom.
-    // The inspector no longer exposes a Scale slider for text — `font_size`
-    // is the user-facing size control — but `scale` still participates so
-    // corner-drag resize keeps working without a special path. The two
-    // multiply, which means resizing by handle simply multiplies the
-    // visible size, exactly like every other element.
+    // Effective font size in screen pixels = font_size * canvas_zoom only.
+    // The Scale slider on a Text overlay used to multiply the glyph size
+    // too, which made the inspector confusing — `font_size` says "Size"
+    // but the on-screen glyphs grew or shrank with `scale` as well.
+    // Scale is now reserved for the **background plate** (padding,
+    // corner radius, asymmetric extras): glyphs follow `font_size`
+    // alone, the plate around them follows `scale`.
     let zoom = state.canvas_viewport.zoom;
-    let effective_size = (style.font_size * ov_state.scale * zoom).clamp(4.0, 1024.0);
+    let effective_size = (style.font_size * zoom).clamp(4.0, 1024.0);
     // Italic is faked via a horizontal skew on each glyph row. Slightly
     // larger than the previous 0.18 so the slant reads at small sizes.
     let italic_skew = if style.italic { 0.22 } else { 0.0 };
@@ -4054,18 +4064,24 @@ fn overlay_bbox(overlay: &Overlay, ov_state: &OverlayState) -> (f32, f32) {
             let lines: Vec<&str> = if txt.text.is_empty() { vec![" "] } else { txt.text.lines().collect() };
             let max_chars = lines.iter().map(|l| l.chars().count()).max().unwrap_or(1) as f32;
             let font = style.font_size;
-            // ~0.55 per glyph is a reasonable heuristic for proportional fonts.
+            // Glyphs are sized by `font_size` alone — `scale` only
+            // governs the background plate (padding / extras / corner
+            // radius). See draw_text_overlay for the matching change.
             let text_w = (max_chars.max(1.0)) * font * 0.55;
             let text_h = (lines.len() as f32) * font * 1.2;
             // Symmetric padding + asymmetric extras on the horizontal axis.
             // Resize handles need the FULL plate size so they snap to the
-            // visible edges, hence we account for both extras here.
-            let pad = style.box_padding * 2.0
+            // visible edges; padding scales with `ov_state.scale` so the
+            // plate itself can be enlarged without touching the glyphs.
+            let pad_w = (style.box_padding * 2.0
                 + style.box_extra_left
-                + style.box_extra_right;
-            let pad_v = style.box_padding * 2.0;
-            ((text_w + pad).max(40.0) * sx,
-             (text_h + pad_v).max(20.0) * sy)
+                + style.box_extra_right)
+                * sx;
+            let pad_h = style.box_padding * 2.0 * sy;
+            (
+                (text_w + pad_w).max(40.0),
+                (text_h + pad_h).max(20.0),
+            )
         }
         Overlay::Image(_) => (200.0 * sx, 200.0 * sy),
         Overlay::Video(_) => (300.0 * sx, 300.0 * 16.0 / 9.0 * sy),

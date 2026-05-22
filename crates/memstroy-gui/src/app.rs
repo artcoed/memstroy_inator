@@ -32,8 +32,15 @@ pub struct App {
     was_playing: bool,
     /// Previous playhead for detecting seeks
     prev_playhead: f32,
-    /// Previous count of audio sources used by the engine, so we can rebuild
-    /// the engine when the user adds/removes a track mid-playback.
+    /// Previous spec signature so we can rebuild the engine the moment the
+    /// user touches an audio inspector slider mid-playback. The hash
+    /// covers every field that changes the audible output (volume, pan,
+    /// pitch, filter cutoffs, reverb, mute, source list, …) so two
+    /// frames with identical signatures don't restart the sinks.
+    prev_audio_signature: u64,
+    /// Cached source count — kept around for status reporting and quick
+    /// "did we add a track" debug checks; the live-update logic itself
+    /// uses the signature above.
     prev_audio_source_count: usize,
 }
 
@@ -98,6 +105,7 @@ impl App {
             audio_engine,
             was_playing: false,
             prev_playhead: 0.0,
+            prev_audio_signature: 0,
             prev_audio_source_count: 0,
         }
     }
@@ -1944,13 +1952,12 @@ impl eframe::App for App {
             let mut seen: std::collections::HashSet<std::path::PathBuf> =
                 std::collections::HashSet::new();
             for a in &state.scene.audio {
-                // When `volume` / `speed` are animated, sample the kf
-                // track at the playhead's clip-local time so a freshly-
-                // started playback uses the user's animated value at
-                // that moment. Live updates while the sink is already
-                // running are not yet supported (the rodio sink would
-                // need to be rebuilt for a speed change), but seeking +
-                // restarting picks up the latest sampled value.
+                // Sample every animatable field at the playhead's
+                // clip-local time so a freshly-built sink reflects the
+                // user's animated values at the current moment. The
+                // engine then plays back those static values; live
+                // mid-stream updates happen by detecting a change in
+                // `signature()` between frames and rebuilding.
                 let t_local = (state.playhead - a.t_in).max(0.0);
                 out.push(crate::audio_engine::AudioSourceSpec {
                     path: a.source.clone(),
@@ -1959,15 +1966,14 @@ impl eframe::App for App {
                     source_start: a.source_start,
                     volume: a.volume_at(t_local),
                     speed: a.speed_at(t_local),
-                    pitch_semitones: a.pitch_semitones,
-                    pan: a.pan,
-                    low_pass_hz: a.low_pass_hz,
-                    high_pass_hz: a.high_pass_hz,
+                    pitch_semitones: a.pitch_at(t_local),
+                    pan: a.pan_at(t_local),
+                    low_pass_hz: a.low_pass_at(t_local),
+                    high_pass_hz: a.high_pass_at(t_local),
                     fade_in: a.fade_in,
                     fade_out: a.fade_out,
                     mute: a.mute,
-                    loop_source: a.loop_source,
-                    reverb: a.reverb,
+                    reverb: a.reverb_at(t_local),
                 });
                 seen.insert(a.source.clone());
             }
@@ -1987,6 +1993,18 @@ impl eframe::App for App {
             out
         };
 
+        // Cheap whole-spec-list signature: XOR of every spec's signature
+        // (order-independent, hash-friendly). Differs whenever any
+        // animatable field changes, so the live-update branch below
+        // restarts the sinks the instant the user moves a slider.
+        let signature_of = |specs: &[crate::audio_engine::AudioSourceSpec]| -> u64 {
+            let mut h: u64 = specs.len() as u64;
+            for s in specs {
+                h = h.wrapping_mul(0x100000001b3).wrapping_add(s.signature());
+            }
+            h
+        };
+
         // Detect a seek (playhead jumped further than a sane frame's worth).
         let dt = ctx.input(|i| i.stable_dt).min(0.1);
         let expected_step = if self.state.playing { dt * self.state.playback_speed.abs() } else { 0.0 };
@@ -1998,6 +2016,7 @@ impl eframe::App for App {
             // Transition: paused → playing. Start playback at the current playhead.
             let sources = build_sources(&self.state);
             self.prev_audio_source_count = sources.len();
+            self.prev_audio_signature = signature_of(&sources);
             self.audio_engine.play_sources(&sources, self.state.playhead);
         } else if !self.state.playing && self.was_playing {
             // Transition: playing → paused.
@@ -2006,13 +2025,24 @@ impl eframe::App for App {
             // Seek while playing — restart from the new position so audio stays in sync.
             let sources = build_sources(&self.state);
             self.prev_audio_source_count = sources.len();
+            self.prev_audio_signature = signature_of(&sources);
             self.audio_engine.play_sources(&sources, self.state.playhead);
         } else if self.state.playing {
-            // Detect new/removed sources mid-playback (e.g., user just dropped
-            // an audio clip on the timeline). Rebuild so the new track is heard.
+            // Live mid-playback rebuild: any time a spec field changes
+            // (slider edits, kf track edits, mute toggle, …) the new
+            // signature differs from the previous one, so we re-fire
+            // play_sources at the current playhead. This is the
+            // simplest path to "audio param changes apply in real time"
+            // without a full DSP-control plumb-through; the rebuild is
+            // ~tens of ms because the sinks are constructed on a worker
+            // thread.
             let sources = build_sources(&self.state);
-            if sources.len() != self.prev_audio_source_count {
+            let new_sig = signature_of(&sources);
+            let count_changed = sources.len() != self.prev_audio_source_count;
+            let params_changed = new_sig != self.prev_audio_signature;
+            if count_changed || params_changed {
                 self.prev_audio_source_count = sources.len();
+                self.prev_audio_signature = new_sig;
                 self.audio_engine.play_sources(&sources, self.state.playhead);
             }
         }
