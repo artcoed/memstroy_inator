@@ -44,6 +44,13 @@ impl App {
         state.tokio_handle = Some(rt.handle().clone());
         state.reload_library();
 
+        // Construct the audio engine and immediately apply the master
+        // volume from the persisted settings. That way the very first
+        // playback obeys the user's saved level instead of the engine's
+        // default 1.0.
+        let mut audio_engine = AudioEngine::new();
+        audio_engine.set_master_volume(state.settings.master_volume);
+
         // Recovery: if an autosave from a previous session exists and is newer
         // than the user's current scene file, surface a recovery dialog.
         let autosave_path = EditorState::autosave_path();
@@ -75,7 +82,7 @@ impl App {
             node_editor: NodeEditor::default(),
             frame_extract_results: Vec::new(),
             waveform_extract_results: Vec::new(),
-            audio_engine: AudioEngine::new(),
+            audio_engine,
             was_playing: false,
             prev_playhead: 0.0,
             prev_audio_source_count: 0,
@@ -277,9 +284,9 @@ impl App {
                                 .min_size(Vec2::new(16.0, 16.0));
                                 let close_resp = ui.add(close_btn);
                                 let close_resp = if num_tabs > 1 {
-                                    close_resp.on_hover_text("Close tab")
+                                    close_resp.on_hover_text(crate::i18n::t("Close tab"))
                                 } else {
-                                    close_resp.on_hover_text("Reset to a fresh untitled scene")
+                                    close_resp.on_hover_text(crate::i18n::t("Reset to a fresh untitled scene"))
                                 };
                                 if close_resp.clicked() {
                                     close_tab = Some(i);
@@ -314,7 +321,7 @@ impl App {
             .rounding(Rounding::same(7.0))
             .stroke(Stroke::new(1.0, Color32::from_rgb(50, 80, 50)))
             .min_size(Vec2::new(26.0, 22.0));
-            if ui.add(plus_btn).on_hover_text("New scene tab").clicked() {
+            if ui.add(plus_btn).on_hover_text(crate::i18n::t("New scene tab")).clicked() {
                 self.state.new_tab();
             }
         });
@@ -342,15 +349,16 @@ impl App {
     }
 
     fn menu(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        use crate::i18n::t;
         egui::menu::bar(ui, |ui| {
-            ui.menu_button(RichText::new("\u{1F4C1} File").strong(), |ui| {
-                if ui.button("\u{2728} New scene").clicked() {
+            ui.menu_button(RichText::new(t("\u{1F4C1} File")).strong(), |ui| {
+                if ui.button(t("\u{2728} New scene")).clicked() {
                     self.state.scene = Scene::default();
                     self.state.scene_path = None;
-                    self.state.status = "\u{2728} New scene created.".into();
+                    self.state.status = t("\u{2728} New scene created.").into();
                     ui.close_menu();
                 }
-                if ui.button("\u{1F4C2} Open scene...").clicked() {
+                if ui.button(t("\u{1F4C2} Open scene...")).clicked() {
                     if let Some(path) = rfd::FileDialog::new()
                         .add_filter("Memstroy Project", &["memstroy"])
                         .add_filter("Scene", &["yaml", "yml", "json"])
@@ -370,7 +378,7 @@ impl App {
                             Ok(s) => {
                                 self.state.scene = s;
                                 self.state.scene_path = Some(path.clone());
-                                self.state.status = "\u{2705} Scene loaded.".into();
+                                self.state.status = t("\u{2705} Scene loaded.").into();
                                 // Sidecar layout for non-bundle formats.
                                 if !is_memstroy {
                                     let layout_path = path.with_extension("layout.json");
@@ -390,29 +398,34 @@ impl App {
                     }
                     ui.close_menu();
                 }
-                if ui.button("\u{1F4BE} Save scene").clicked() {
+                if ui.button(t("\u{1F4BE} Save scene")).clicked() {
                     self.save_scene();
                     ui.close_menu();
                 }
-                if ui.button("\u{1F4BE} Save scene as...").clicked() {
+                if ui.button(t("\u{1F4BE} Save scene as...")).clicked() {
                     self.save_as();
                     ui.close_menu();
                 }
                 ui.separator();
-                if ui.button("\u{1F6AA} Exit").clicked() {
+                if ui.button(t("\u{2699} Settings...")).clicked() {
+                    self.state.settings_open = true;
+                    ui.close_menu();
+                }
+                ui.separator();
+                if ui.button(t("\u{1F6AA} Exit")).clicked() {
                     ctx.send_viewport_cmd(ViewportCommand::Close);
                 }
             });
 
-            ui.menu_button(RichText::new("\u{1F3AC} Render").strong(), |ui| {
-                if ui.button("\u{1F3A5} Render full clip...").clicked() {
+            ui.menu_button(RichText::new(t("\u{1F3AC} Render")).strong(), |ui| {
+                if ui.button(t("\u{1F3A5} Render full clip...")).clicked() {
                     self.run_render();
                     ui.close_menu();
                 }
             });
 
-            ui.menu_button(RichText::new("\u{1F9E0} Tools").strong(), |ui| {
-                if ui.button("\u{1F9B4} Skeleton Constructor...").clicked() {
+            ui.menu_button(RichText::new(t("\u{1F9E0} Tools")).strong(), |ui| {
+                if ui.button(t("\u{1F9B4} Skeleton Constructor...")).clicked() {
                     self.state.skeleton_editor.open = true;
                     // Pre-select the source clip from the currently selected
                     // actor (so the editor is ready to edit a familiar clip),
@@ -432,7 +445,7 @@ impl App {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if self.state.refreshing {
                     ui.spinner();
-                    ui.label(RichText::new("refreshing...").color(Color32::from_rgb(255, 200, 50)).size(11.0));
+                    ui.label(RichText::new(t("refreshing...")).color(Color32::from_rgb(255, 200, 50)).size(11.0));
                 } else if let Some(rp) = &self.state.render_progress {
                     if !rp.done {
                         ui.add(egui::ProgressBar::new(rp.progress).text(format!("{:.0}%", rp.progress * 100.0)));
@@ -1266,13 +1279,13 @@ impl App {
         let mut close = false;
         let mut decision: Option<&'static str> = None;
 
-        egui::Window::new("Recover scene?")
+        egui::Window::new(crate::i18n::t("Recover scene?"))
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 ui.label(
-                    RichText::new("\u{26A0} A recovered scene was found.")
+                    RichText::new(crate::i18n::t("\u{26A0} A recovered scene was found."))
                         .size(14.0)
                         .strong()
                         .color(Color32::from_rgb(255, 200, 80)),
@@ -1284,22 +1297,22 @@ impl App {
                         .color(Color32::from_rgb(160, 160, 180)),
                 );
                 ui.add_space(8.0);
-                ui.label("Restore the auto-saved scene?");
+                ui.label(crate::i18n::t("Restore the auto-saved scene?"));
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    let yes = egui::Button::new(RichText::new("Yes, restore").color(Color32::WHITE))
+                    let yes = egui::Button::new(RichText::new(crate::i18n::t("Yes, restore")).color(Color32::WHITE))
                         .fill(Color32::from_rgb(60, 160, 80));
                     if ui.add(yes).clicked() {
                         decision = Some("yes");
                         close = true;
                     }
-                    let no = egui::Button::new(RichText::new("No, discard").color(Color32::WHITE))
+                    let no = egui::Button::new(RichText::new(crate::i18n::t("No, discard")).color(Color32::WHITE))
                         .fill(Color32::from_rgb(200, 60, 60));
                     if ui.add(no).clicked() {
                         decision = Some("no");
                         close = true;
                     }
-                    if ui.button("Later").clicked() {
+                    if ui.button(crate::i18n::t("Later")).clicked() {
                         decision = Some("later");
                         close = true;
                     }
@@ -1348,7 +1361,7 @@ impl App {
         let scene_dur = self.state.scene.output.duration;
         let mut chosen: Option<usize> = None;
 
-        egui::Window::new("Add Title")
+        egui::Window::new(crate::i18n::t("Add Title"))
             .open(&mut open)
             .resizable(true)
             .default_width(520.0)
@@ -1356,17 +1369,17 @@ impl App {
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 ui.label(
-                    RichText::new("Pick a title template")
+                    RichText::new(crate::i18n::t("Pick a title template"))
                         .strong()
                         .size(14.0)
                         .color(Color32::from_rgb(180, 140, 255)),
                 );
                 ui.add_space(6.0);
                 ui.label(
-                    RichText::new(
+                    RichText::new(crate::i18n::t(
                         "Adds a 3-second text overlay at the playhead. \
                         Edit text/style afterwards in the Inspector.",
-                    )
+                    ))
                     .size(11.0)
                     .color(Color32::from_rgb(160, 160, 180)),
                 );
@@ -1791,14 +1804,7 @@ impl eframe::App for App {
                             id: id.clone(),
                             source: path.to_path_buf(),
                             t_in: self.state.playhead,
-                            t_out: None,
-                            source_start: 0.0,
-                            volume: 1.0,
-                            speed: 1.0,
-                            parent_actor: None,
-                            volume_kfs: Vec::new(),
-                            speed_kfs: Vec::new(),
-                            animated_params: Default::default(),
+                            ..Default::default()
                         });
                         self.state.selection = Selection::Audio(self.state.scene.audio.len() - 1);
                         self.state.status = format!("Dropped audio: {}", id);
@@ -1847,6 +1853,15 @@ impl eframe::App for App {
                     source_start: a.source_start,
                     volume: a.volume_at(t_local),
                     speed: a.speed_at(t_local),
+                    pitch_semitones: a.pitch_semitones,
+                    pan: a.pan,
+                    low_pass_hz: a.low_pass_hz,
+                    high_pass_hz: a.high_pass_hz,
+                    fade_in: a.fade_in,
+                    fade_out: a.fade_out,
+                    mute: a.mute,
+                    loop_source: a.loop_source,
+                    reverb: a.reverb,
                 });
                 seen.insert(a.source.clone());
             }
@@ -1860,6 +1875,7 @@ impl eframe::App for App {
                     source_start: actor.source_start,
                     volume: 1.0,
                     speed: 1.0,
+                    ..Default::default()
                 });
             }
             out
@@ -1987,6 +2003,10 @@ impl eframe::App for App {
         // Auto-save tick + recovery modal
         self.tick_autosave();
         self.show_recovery_dialog(ctx);
+
+        // Settings dialog (File > Settings...). Always called; the
+        // function early-returns when `state.settings_open` is false.
+        crate::settings::show_settings_dialog(ctx, &mut self.state, &mut self.audio_engine);
 
         // Repaint scheduling:
         // - When playing with ready frame cache: 16ms (~60fps)

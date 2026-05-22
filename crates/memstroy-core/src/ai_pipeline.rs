@@ -365,13 +365,8 @@ impl MontageOutput {
                 source: clips_dir.join(&ap.asset_id),
                 t_in: ap.t_in,
                 t_out: Some(ap.t_out),
-                source_start: 0.0,
                 volume: ap.volume,
-                speed: 1.0,
-                parent_actor: None,
-                volume_kfs: Vec::new(),
-                speed_kfs: Vec::new(),
-                animated_params: Default::default(),
+                ..Default::default()
             });
         }
     }

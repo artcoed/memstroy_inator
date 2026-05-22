@@ -414,6 +414,13 @@ pub struct EditorState {
     /// up an `App`.
     pub tokio_handle: Option<tokio::runtime::Handle>,
 
+    /// Persistent editor settings (language, master volume, etc.).
+    /// Loaded from disk at startup; the settings dialog edits these
+    /// fields directly and writes them back on close.
+    pub settings: crate::settings::EditorSettings,
+    /// Whether the File > Settings modal window is currently visible.
+    pub settings_open: bool,
+
     /// Lazy texture cache for `Overlay::Image` PNG/JPEG sources. The
     /// canvas-side draw code calls `image_textures.lock()` and either
     /// retrieves an existing handle or kicks off a synchronous decode
@@ -607,6 +614,16 @@ impl EditorState {
         s.server_url = "http://127.0.0.1:8765".to_string();
         s.tg_channel = "MELLSTROYfonz".to_string();
         s.tg_limit = 80;
+
+        // ── Load persistent editor preferences (language, master
+        // volume, autosave interval, snap toggle) and apply the bits
+        // that mirror onto runtime fields. The audio engine's master
+        // volume is applied later in App::new (after the engine is
+        // constructed), so we only stash the value here.
+        s.settings = crate::settings::EditorSettings::load();
+        s.autosave_interval = s.settings.autosave_interval;
+        s.snap_enabled = s.settings.snap_enabled;
+        s.settings_open = false;
 
         s
     }
