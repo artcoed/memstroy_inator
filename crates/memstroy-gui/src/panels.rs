@@ -63,8 +63,8 @@ pub fn library(ui: &mut egui::Ui, state: &mut EditorState, _request_refresh: imp
     });
     ui.add_space(4.0);
 
-    // Tab bar — Clips / Videos / Sounds / Images / Particles. Sticky across
-    // sessions via `state.library_tab`.
+    // Tab bar — Clips / Videos / Sounds / Images / Particles / Shared.
+    // Sticky across sessions via `state.library_tab`.
     ui.horizontal_wrapped(|ui| {
         let tabs = [
             (LibraryTab::Clips,    "\u{1F3AC} Clips"),
@@ -72,6 +72,7 @@ pub fn library(ui: &mut egui::Ui, state: &mut EditorState, _request_refresh: imp
             (LibraryTab::Sounds,   "\u{1F50A} Sounds"),
             (LibraryTab::Images,   "\u{1F5BC} Images"),
             (LibraryTab::Particles, "\u{2728} Particles"),
+            (LibraryTab::Shared,   "\u{2601} Shared"),
         ];
         for (tab, label) in tabs {
             if ui.selectable_label(state.library_tab == tab, label).clicked() {
@@ -94,6 +95,7 @@ pub fn library(ui: &mut egui::Ui, state: &mut EditorState, _request_refresh: imp
         LibraryTab::Sounds => "Drop a sound onto the timeline to add it as an audio track. Drop audio files from your file manager here to import.",
         LibraryTab::Images => "Drag a sticker onto the canvas to add it as an image overlay. Drop image files from your file manager here to import.",
         LibraryTab::Particles => "Drag a particle onto the canvas — it spawns with spin + pulse modifiers.",
+        LibraryTab::Shared => "Lazily-fetched assets served by an external memstroy-assets-server. Search, preview, download — or pull a Telegram channel to populate it.",
     };
     ui.label(
         RichText::new(hint_text)
@@ -109,6 +111,19 @@ pub fn library(ui: &mut egui::Ui, state: &mut EditorState, _request_refresh: imp
         LibraryTab::Sounds => library_assets_tab(ui, state, AssetDragKind::Sound),
         LibraryTab::Images => library_assets_tab(ui, state, AssetDragKind::Image),
         LibraryTab::Particles => library_assets_tab(ui, state, AssetDragKind::Particle),
+        LibraryTab::Shared => {
+            // Use the runtime handle that App stashed at startup.
+            // Cloning a Handle is cheap; we clone here so the borrow
+            // checker is happy while the closure mutably borrows state.
+            if let Some(handle) = state.tokio_handle.clone() {
+                crate::shared_library::shared_library_panel(ui, state, &handle);
+            } else {
+                ui.label(
+                    RichText::new("No tokio runtime available — restart the editor.")
+                        .color(COL_TEXT_DIM),
+                );
+            }
+        }
     }
 }
 
@@ -469,6 +484,9 @@ pub(crate) fn add_library_asset_at_playhead(
                 volume: 1.0,
                 speed: 1.0,
                 parent_actor: None,
+                volume_kfs: Vec::new(),
+                speed_kfs: Vec::new(),
+                animated_params: Default::default(),
             });
             state.selection = Selection::Audio(state.scene.audio.len() - 1);
             state.status = format!("Added sound: {}", asset.id);
@@ -2618,34 +2636,47 @@ fn inspector_background(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
 }
 
 fn inspector_audio(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
-    let duration = state.scene.output.duration;
+    let _ = state.scene.output.duration;
     let audio = &mut state.scene.audio[i];
     ui.label(RichText::new(format!("Audio: {}", audio.id)).strong().size(14.0).color(COL_CLIP_AUDIO));
     ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        ui.label("In:");
-        ui.add(egui::DragValue::new(&mut audio.t_in).range(0.0..=duration).speed(0.02).suffix("s"));
-        let mut t_out = audio.t_out.unwrap_or(duration);
-        ui.label("Out:");
-        if ui.add(egui::DragValue::new(&mut t_out).range(0.0..=duration).speed(0.02).suffix("s")).changed() {
-            audio.t_out = Some(t_out);
-        }
-    });
-    ui.add_space(4.0);
-    ui.add(egui::Slider::new(&mut audio.volume, 0.0..=2.0).text("Volume"));
-    ui.add(egui::Slider::new(&mut audio.speed, 0.25..=4.0)
-        .logarithmic(true)
-        .text("Speed")
-        .suffix("x"));
+
+    // Clip-local time at the playhead — keyframes for volume / speed
+    // are stored in clip-local seconds so the same edits apply when the
+    // user moves the audio along the timeline.
+    let t_local = (state.playhead - audio.t_in).max(0.0);
+
+    // ── Volume ───────────────────────────────────────────────────────
+    inspector_audio_param(
+        ui,
+        "Volume",
+        "volume",
+        0.0..=2.0,
+        false, // not logarithmic
+        t_local,
+        &mut audio.volume,
+        &mut audio.volume_kfs,
+        &mut audio.animated_params,
+    );
+
+    // ── Speed (logarithmic, 0.25× .. 4.0×, 1.0× neutral) ─────────────
+    inspector_audio_param(
+        ui,
+        "Speed",
+        "speed",
+        0.25..=4.0,
+        true, // logarithmic
+        t_local,
+        &mut audio.speed,
+        &mut audio.speed_kfs,
+        &mut audio.animated_params,
+    );
     if audio.speed.abs() < 0.05 {
         audio.speed = 0.05;
     }
-    ui.horizontal(|ui| {
-        ui.label("Source offset:");
-        ui.add(egui::DragValue::new(&mut audio.source_start).range(0.0..=600.0).speed(0.02).suffix("s"));
-    });
+
+    ui.add_space(6.0);
     if audio.parent_actor.is_some() {
-        ui.add_space(2.0);
         ui.label(
             RichText::new("Bound to an actor — moves and trims with its parent clip.")
                 .size(10.0)
@@ -2653,13 +2684,111 @@ fn inspector_audio(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
                 .color(COL_TEXT_DIM),
         );
     } else {
-        ui.add_space(2.0);
         ui.label(
             RichText::new("Standalone music — independent of any actor.")
                 .size(10.0)
                 .italics()
                 .color(COL_TEXT_DIM),
         );
+    }
+}
+
+/// Render one row of the audio inspector with an animation toggle.
+/// Mirrors the behaviour of inspector_anim_row for transform params on
+/// actors / overlays — when "Animated" is on, edits to the slider write
+/// a keyframe at the playhead's clip-local time; otherwise edits change
+/// the static value.
+#[allow(clippy::too_many_arguments)]
+fn inspector_audio_param(
+    ui: &mut egui::Ui,
+    label: &str,
+    param_id: &str,
+    range: std::ops::RangeInclusive<f32>,
+    logarithmic: bool,
+    t_local: f32,
+    static_value: &mut f32,
+    kfs: &mut Vec<memstroy_core::Keyframe<f32>>,
+    animated: &mut std::collections::BTreeSet<String>,
+) {
+    let is_animated = animated.contains(param_id);
+
+    // Display value: when animated, sample the kf track at the playhead
+    // so the slider reflects the current animated value; otherwise the
+    // static field.
+    let mut display = if is_animated && !kfs.is_empty() {
+        memstroy_core::keyframe::sample(kfs, t_local).unwrap_or(*static_value)
+    } else {
+        *static_value
+    };
+
+    ui.horizontal(|ui| {
+        ui.label(label);
+        let mut slider = egui::Slider::new(&mut display, range.clone());
+        if logarithmic {
+            slider = slider.logarithmic(true);
+            if param_id == "speed" {
+                slider = slider.suffix("x");
+            }
+        }
+        let resp = ui.add(slider);
+
+        if resp.changed() {
+            if is_animated {
+                // Insert / replace a keyframe at the current clip-local
+                // playhead. Seed the track with the current static
+                // value at t=0 if it's still empty so the timeline has
+                // a stable starting point.
+                if kfs.is_empty() {
+                    kfs.push(memstroy_core::Keyframe::new(0.0, *static_value));
+                }
+                memstroy_core::upsert_keyframe(kfs, t_local, display);
+            } else {
+                *static_value = display;
+            }
+        }
+
+        // Animation toggle on the right.
+        let mut anim_on = is_animated;
+        let toggle = ui
+            .selectable_label(anim_on, "\u{29BF}") // bullseye glyph
+            .on_hover_text("Toggle animation for this parameter");
+        if toggle.clicked() {
+            anim_on = !anim_on;
+            if anim_on {
+                animated.insert(param_id.to_string());
+                if kfs.is_empty() {
+                    kfs.push(memstroy_core::Keyframe::new(0.0, *static_value));
+                }
+            } else {
+                animated.remove(param_id);
+            }
+        }
+    });
+
+    // Quick "+ kf" button row when animated, so the user can drop
+    // keyframes without dragging the slider every time.
+    if is_animated {
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            if ui
+                .small_button("+ kf at playhead")
+                .on_hover_text("Add a keyframe at the current playhead")
+                .clicked()
+            {
+                if kfs.is_empty() {
+                    kfs.push(memstroy_core::Keyframe::new(0.0, *static_value));
+                }
+                memstroy_core::upsert_keyframe(kfs, t_local, display);
+            }
+            if !kfs.is_empty() && ui.small_button("Clear kfs").clicked() {
+                kfs.clear();
+            }
+            ui.label(
+                RichText::new(format!("({} kf)", kfs.len()))
+                    .size(9.0)
+                    .color(COL_TEXT_DIM),
+            );
+        });
     }
 }
 
@@ -2715,6 +2844,19 @@ fn collect_clip_edges(state: &EditorState, exclude_actor: Option<usize>) -> Vec<
 // ─── TIMELINE ────────────────────────────────────────────────────────
 
 pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
+    // While any drag-related interaction is in progress on the timeline
+    // (clip drag, asset drop, scrollbar grip, ruler scrub), force a
+    // repaint every frame so motion stays smooth even when the egui
+    // reactive scheduler would otherwise delay the next update. Without
+    // this the user sees the "застревание" (stuck) feel where the
+    // dragged element trails the cursor by a frame or two.
+    let any_pointer_down = ui.input(|i| i.pointer.any_down());
+    let drag_in_flight = state.timeline_drag.dragging_clip.is_some()
+        || state.asset_drag.dragging.is_some();
+    if any_pointer_down || drag_in_flight {
+        ui.ctx().request_repaint();
+    }
+
     // ── Toolbar ──
     ui.horizontal(|ui| {
         // ── Play / Pause / Stop transport ──
@@ -4365,7 +4507,15 @@ fn stretchable_scrollbar(
             ui.ctx().memory_mut(|m| m.data.insert_temp(mode_key, raw));
         }
     }
-    if !resp.dragged() && !resp.drag_started() {
+    // Only reset the captured drag mode once the user has actually
+    // RELEASED the primary pointer button. The previous code reset on
+    // any frame where `dragged()` was false (which can happen for a
+    // single frame when the pointer momentarily stops moving while
+    // still pressed) — that lost the captured mode and forced a
+    // re-detection on the next motion, producing the "застревание"
+    // (stuck) feel the user reported when stretching scrollbar grips.
+    let pointer_released = ui.input(|i| !i.pointer.primary_down());
+    if pointer_released && !resp.drag_started() && !resp.dragged() {
         mode = Mode::None;
         ui.ctx().memory_mut(|m| m.data.insert_temp(mode_key, 3u8));
     }
@@ -4390,6 +4540,10 @@ fn stretchable_scrollbar(
     let mut new_b = b;
 
     if resp.dragged() {
+        // Force a repaint next frame so smooth pointer motion produces
+        // smooth scrollbar updates even when nothing else in the UI
+        // changes between the two frames.
+        ui.ctx().request_repaint();
         let d_pixels = if horizontal {
             resp.drag_delta().x
         } else {
@@ -5646,6 +5800,9 @@ fn push_audio_track_for_actor(state: &mut EditorState, actor_id: &str, source: &
         volume: 1.0,
         speed: 1.0,
         parent_actor: Some(actor_id.to_string()),
+        volume_kfs: Vec::new(),
+        speed_kfs: Vec::new(),
+        animated_params: Default::default(),
     });
     state.scene.audio.len() - 1
 }

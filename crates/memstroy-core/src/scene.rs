@@ -905,4 +905,43 @@ pub struct AudioTrack {
     /// they always export together.
     #[serde(default)]
     pub parent_actor: Option<String>,
+    /// Optional keyframe track for `volume`, sampled in CLIP-LOCAL time
+    /// (`t - t_in`). When non-empty AND `"volume"` is in
+    /// `animated_params`, the player and renderer should sample this
+    /// track instead of using the static `volume` field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volume_kfs: Vec<Keyframe<f32>>,
+    /// Optional keyframe track for `speed`, sampled in CLIP-LOCAL time.
+    /// Same toggle convention as `volume_kfs`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub speed_kfs: Vec<Keyframe<f32>>,
+    /// Set of audio param ids the user has flagged as animatable. The
+    /// recognised ids today are `"volume"` and `"speed"`. Empty for
+    /// fresh audio tracks.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub animated_params: BTreeSet<String>,
+}
+
+impl AudioTrack {
+    /// Sample the volume at clip-local time `t_local`. When
+    /// `"volume" ∈ animated_params` and `volume_kfs` has at least one
+    /// keyframe, the eased keyframe value is returned; otherwise the
+    /// static `volume` field is used.
+    pub fn volume_at(&self, t_local: f32) -> f32 {
+        if self.animated_params.contains("volume") && !self.volume_kfs.is_empty() {
+            crate::keyframe::sample(&self.volume_kfs, t_local).unwrap_or(self.volume)
+        } else {
+            self.volume
+        }
+    }
+
+    /// Sample the speed at clip-local time `t_local`. Same semantics as
+    /// [`Self::volume_at`].
+    pub fn speed_at(&self, t_local: f32) -> f32 {
+        if self.animated_params.contains("speed") && !self.speed_kfs.is_empty() {
+            crate::keyframe::sample(&self.speed_kfs, t_local).unwrap_or(self.speed)
+        } else {
+            self.speed
+        }
+    }
 }
