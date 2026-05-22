@@ -1714,16 +1714,14 @@ fn draw_selection_gizmo(
 
             // Freeze the playhead for the rest of the gesture so every
             // keyframe upsert lands on the same `t` (one kf per drag,
-            // even when playback was running at drag start). Auto-pause
-            // playback while the user is interacting with the canvas —
-            // dragging through a moving timeline is never what the user
-            // actually wants and is the source of the "thousand kfs"
-            // bug they reported.
+            // even when playback is running at drag start). This alone
+            // prevents the "thousand kfs" bug — every write during the
+            // drag re-anchors to `drag_start_playhead`, not the live
+            // playhead — so we deliberately DO NOT pause playback when
+            // the user grabs an element. Preview keeps running while
+            // they reposition / resize / rotate.
             state.canvas_drag.drag_start_playhead = Some(state.playhead);
             state.canvas_drag.was_playing_at_drag_start = state.playing;
-            if state.playing {
-                state.playing = false;
-            }
 
             // ── Render-frame drags must NOT touch other elements ──
             // Previously we snapshotted child positions and re-projected
