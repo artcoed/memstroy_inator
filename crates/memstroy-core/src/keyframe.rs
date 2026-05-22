@@ -174,6 +174,19 @@ pub enum ModifierKind {
     Spin {
         speed_dps: f32,
     },
+    /// Pendulum-style left/right rotation that imitates a walking gait —
+    /// the element rocks between `-amp_deg` and `+amp_deg` at `freq_hz`
+    /// cycles per second around its current rotation. Optional
+    /// `bob_y` adds a small vertical bobbing offset (in world pixels) at
+    /// twice the rotation frequency to sell the "step" feel.
+    Walk {
+        freq_hz: f32,
+        amp_deg: f32,
+        #[serde(default)]
+        bob_y: f32,
+        #[serde(default)]
+        phase: f32,
+    },
 }
 
 impl Default for ModifierKind {
@@ -248,6 +261,16 @@ pub fn evaluate_modifiers(modifiers: &[TrackModifier], t: f32) -> ModifierDelta 
             ModifierKind::Spin { speed_dps } => {
                 out.d_rotation_deg += speed_dps * t;
             }
+            ModifierKind::Walk { freq_hz, amp_deg, bob_y, phase } => {
+                let w = std::f32::consts::TAU * freq_hz * t + phase;
+                out.d_rotation_deg += amp_deg * w.sin();
+                if bob_y.abs() > 1.0e-4 {
+                    // Bob at 2× cadence — like a pelvis bobbing between
+                    // each footstep. Always non-negative so the figure
+                    // dips and returns to neutral instead of jumping up.
+                    out.dy += bob_y * (1.0 - (2.0 * w).cos()) * 0.5;
+                }
+            }
         }
     }
     out
@@ -293,6 +316,19 @@ impl TrackModifier {
             ..Self::default()
         }
     }
+    /// Walk preset: pendulum rotation around upright at a comfortable
+    /// "stroll" cadence with a touch of vertical bobbing for personality.
+    pub fn walk() -> Self {
+        Self {
+            kind: ModifierKind::Walk {
+                freq_hz: 2.0,
+                amp_deg: 12.0,
+                bob_y: 4.0,
+                phase: 0.0,
+            },
+            ..Self::default()
+        }
+    }
 
     /// Human-readable label for UI display.
     pub fn kind_label(&self) -> &'static str {
@@ -301,6 +337,7 @@ impl TrackModifier {
             ModifierKind::Shake { .. } => "Shake",
             ModifierKind::Pulse { .. } => "Pulse",
             ModifierKind::Spin { .. } => "Spin",
+            ModifierKind::Walk { .. } => "Walk",
         }
     }
 }
