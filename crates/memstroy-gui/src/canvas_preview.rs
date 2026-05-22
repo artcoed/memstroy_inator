@@ -149,11 +149,18 @@ pub fn canvas_preview(ui: &mut egui::Ui, state: &mut EditorState) {
     // ── Draw element gizmo for selected ──
     draw_selection_gizmo(ui, &painter, &response, full_rect, state, viewport_size);
 
+    // ── Draw multi-select outlines (every secondary entry in canvas_selection) ──
+    draw_multi_selection_borders(&painter, full_rect, state, viewport_size);
+
     // ── Fit button overlay ──
     draw_viewport_controls(ui, full_rect, state, viewport_size);
 
     // ── Snap guidelines for the active drag (drawn last so they're on top) ──
     draw_snap_guides(&painter, full_rect, state, viewport_size);
+
+    // ── Marquee (rubber-band) selection rectangle, drawn above
+    //    everything else so the user can see what they're lassoing.
+    draw_canvas_marquee(&painter, full_rect, state, viewport_size);
 
     // ── Library drag-to-canvas: visual ghost + drop accept ──
     handle_canvas_asset_drag(ui, state, full_rect, viewport_size);
@@ -259,6 +266,225 @@ fn actor_screen_rect(
         Pos2::new(full_rect.min.x + center_screen[0], full_rect.min.y + center_screen[1]),
         Vec2::new(half_w * 2.0, half_h * 2.0),
     ))
+}
+
+
+// ─── MARQUEE (RUBBER-BAND) HELPERS ───────────────────────────────────
+//
+// The marquee lives in WORLD pixel coords on `EditorState::canvas_marquee`
+// (Option<CanvasMarquee>) so it stays anchored to the canvas region the
+// user lassoed regardless of pan / zoom. These helpers are used by:
+//   * `apply_drag` (Marquee arm) — updates the live rectangle.
+//   * `draw_canvas_marquee` — paints the semi-transparent rect on top of
+//     the scene.
+//   * `commit_marquee_selection` — converts the rectangle into a list of
+//     selected elements when the user releases the mouse.
+//   * `draw_multi_selection_borders` — paints a slim coloured outline
+//     around every element currently in `state.canvas_selection`, so
+//     the user can see who's "in the bag" while they keep dragging.
+
+const COL_MARQUEE_FILL: Color32 = Color32::from_rgba_premultiplied(255, 220, 80, 30);
+const COL_MARQUEE_STROKE: Color32 = Color32::from_rgb(255, 220, 80);
+const COL_MULTI_SELECT_BORDER: Color32 = Color32::from_rgb(255, 180, 60);
+
+/// World-space AABB of an actor at the current playhead. Mirrors the
+/// math in `actor_screen_rect` but stays in world pixels (no canvas
+/// zoom multiplier, no full_rect offset). Returns `(min, max)` corners.
+fn actor_world_aabb(state: &EditorState, idx: usize) -> Option<([f32; 2], [f32; 2])> {
+    let actor = state.scene.actors.get(idx)?;
+    let t = state.playhead;
+
+    let world_pos = get_element_world_pos(state, &actor.id, &actor.layout, t);
+    let (src_w, src_h) = if let Some(fc) = state.frame_caches.get(idx) {
+        if fc.is_ready() && fc.frame_count > 0 {
+            (fc.source_width as f32, fc.source_height as f32)
+        } else { (1080.0_f32, 1920.0) }
+    } else { (1080.0_f32, 1920.0) };
+
+    let actor_state = keyframe::sample(&actor.layout, t).unwrap_or_default();
+    let elem_w = src_w * actor_state.scale;
+    let elem_h = src_h * actor_state.scale * actor_state.scale_y;
+    let half_w = elem_w * 0.5;
+    let half_h = elem_h * 0.5;
+
+    Some((
+        [world_pos.x - half_w, world_pos.y - half_h],
+        [world_pos.x + half_w, world_pos.y + half_h],
+    ))
+}
+
+/// World-space AABB of an overlay at the current playhead. Mirrors the
+/// math in `draw_canvas_overlays`. Returns `(min, max)` corners.
+fn overlay_world_aabb(state: &EditorState, idx: usize) -> Option<([f32; 2], [f32; 2])> {
+    let overlay = state.scene.overlays.get(idx)?;
+    let t = state.playhead;
+    let (t_in, t_out, layout) = match overlay {
+        Overlay::Text(txt) => (txt.t_in, txt.t_out, &txt.layout),
+        Overlay::Image(img) => (img.t_in, img.t_out, &img.layout),
+        Overlay::Video(vid) => (vid.t_in, vid.t_out, &vid.layout),
+    };
+    let sample_t = if t >= t_in && t <= t_out { t - t_in }
+        else if t < t_in { 0.0 } else { (t_out - t_in).max(0.0) };
+    let ov_state = keyframe::sample(layout, sample_t).unwrap_or_default();
+
+    let rf = &state.scene.render_frame;
+    let rf_state = sample_render_frame(rf, t);
+    let [rw, rh] = rf.resolution;
+    let world_w = rw as f32 / rf_state.zoom.max(1e-6);
+    let world_h = rh as f32 / rf_state.zoom.max(1e-6);
+    let frame_tl_x = rf_state.pos.x - world_w * 0.5;
+    let frame_tl_y = rf_state.pos.y - world_h * 0.5;
+    let center_x = frame_tl_x + ov_state.pos[0] * world_w;
+    let center_y = frame_tl_y + ov_state.pos[1] * world_h;
+
+    let (ew, eh) = overlay_bbox(overlay, &ov_state);
+    Some((
+        [center_x - ew * 0.5, center_y - eh * 0.5],
+        [center_x + ew * 0.5, center_y + eh * 0.5],
+    ))
+}
+
+/// AABB ∩ AABB test (both expressed as `(min, max)` world-pixel pairs).
+fn aabbs_overlap(a: ([f32; 2], [f32; 2]), b: ([f32; 2], [f32; 2])) -> bool {
+    let (a_min, a_max) = a;
+    let (b_min, b_max) = b;
+    a_min[0] <= b_max[0] && a_max[0] >= b_min[0]
+        && a_min[1] <= b_max[1] && a_max[1] >= b_min[1]
+}
+
+/// Convert the world-coord marquee rectangle into a list of selected
+/// elements and commit them to `state.canvas_selection`. When `extend`
+/// is set, the lasso adds to whatever was already selected; otherwise
+/// it replaces the set.
+///
+/// The primary `state.selection` is updated to the topmost (lowest
+/// track index) hit so the inspector still has a sensible "focused"
+/// element — but the inspector itself short-circuits to a count when
+/// the lasso captured more than one item.
+fn commit_marquee_selection(state: &mut EditorState, extend: bool) {
+    let Some(marquee) = state.canvas_marquee else { return; };
+    let (mn, mx) = marquee.rect_world();
+    // Reject zero-size lassos (≤ 2 world-pixels in either dimension).
+    // Treat these as an empty-area click instead of a selection paint —
+    // we just clear the existing selection (unless extend was held).
+    let too_small = (mx[0] - mn[0]).abs() < 2.0 || (mx[1] - mn[1]).abs() < 2.0;
+
+    if too_small {
+        if !extend {
+            state.canvas_selection.clear();
+            state.selection = Selection::None;
+        }
+        return;
+    }
+
+    let marquee_box = (mn, mx);
+
+    // Collect every actor / overlay whose world AABB intersects the
+    // marquee. Backgrounds and the render frame stay out of the lasso —
+    // they're full-canvas clips and would always match.
+    let mut hits: Vec<Selection> = Vec::new();
+    for idx in 0..state.scene.actors.len() {
+        if !state.scene.actors[idx].visible { continue; }
+        if let Some(aabb) = actor_world_aabb(state, idx) {
+            if aabbs_overlap(aabb, marquee_box) {
+                hits.push(Selection::Actor(idx));
+            }
+        }
+    }
+    for idx in 0..state.scene.overlays.len() {
+        if let Some(aabb) = overlay_world_aabb(state, idx) {
+            if aabbs_overlap(aabb, marquee_box) {
+                hits.push(Selection::Overlay(idx));
+            }
+        }
+    }
+
+    if !extend {
+        state.canvas_selection.clear();
+    }
+    for h in hits {
+        if !state.canvas_selection.contains(&h) {
+            state.canvas_selection.push(h);
+        }
+    }
+
+    // Pick a primary so the inspector has something to anchor on.
+    // Prefer the existing primary when it's still in the set;
+    // otherwise fall back to the first entry. When the set is empty
+    // the primary clears too.
+    if state.canvas_selection.is_empty() {
+        state.selection = Selection::None;
+    } else if !state.canvas_selection.iter().any(|s| *s == state.selection) {
+        state.selection = state.canvas_selection[0];
+    }
+}
+
+/// Paint the live marquee rectangle on top of the canvas. Called once
+/// per frame from the bottom of `canvas_preview()` so it sits above
+/// every element / gizmo.
+fn draw_canvas_marquee(
+    painter: &egui::Painter,
+    full_rect: Rect,
+    state: &EditorState,
+    viewport_size: [f32; 2],
+) {
+    let Some(marquee) = state.canvas_marquee else { return; };
+    let (mn, mx) = marquee.rect_world();
+    let tl_screen = state.canvas_viewport.world_to_screen(
+        memstroy_core::WorldPos { x: mn[0], y: mn[1] },
+        viewport_size,
+    );
+    let br_screen = state.canvas_viewport.world_to_screen(
+        memstroy_core::WorldPos { x: mx[0], y: mx[1] },
+        viewport_size,
+    );
+    let rect = Rect::from_min_max(
+        Pos2::new(full_rect.min.x + tl_screen[0], full_rect.min.y + tl_screen[1]),
+        Pos2::new(full_rect.min.x + br_screen[0], full_rect.min.y + br_screen[1]),
+    );
+    painter.rect_filled(rect, Rounding::same(1.0), COL_MARQUEE_FILL);
+    painter.rect_stroke(rect, Rounding::same(1.0), Stroke::new(1.0, COL_MARQUEE_STROKE));
+}
+
+/// Paint a slim outline around every element in `state.canvas_selection`
+/// that is NOT the primary selection (the primary already gets the gold
+/// gizmo border drawn by `draw_selection_handles`). This way the user
+/// can see the full lassoed set at a glance — useful both during the
+/// marquee paint (live update of who's currently inside the box) and
+/// after release (so the user knows what the next move/scale/rotate
+/// will broadcast to).
+fn draw_multi_selection_borders(
+    painter: &egui::Painter,
+    full_rect: Rect,
+    state: &EditorState,
+    viewport_size: [f32; 2],
+) {
+    if state.canvas_selection.len() < 2 {
+        return;
+    }
+    for sel in &state.canvas_selection {
+        // Skip the primary — its handles/border are drawn elsewhere.
+        if *sel == state.selection { continue; }
+        let aabb = match *sel {
+            Selection::Actor(i) => actor_world_aabb(state, i),
+            Selection::Overlay(i) => overlay_world_aabb(state, i),
+            _ => None,
+        };
+        let Some((mn, mx)) = aabb else { continue; };
+        let tl = state.canvas_viewport.world_to_screen(
+            memstroy_core::WorldPos { x: mn[0], y: mn[1] },
+            viewport_size,
+        );
+        let br = state.canvas_viewport.world_to_screen(
+            memstroy_core::WorldPos { x: mx[0], y: mx[1] },
+            viewport_size,
+        );
+        let rect = Rect::from_min_max(
+            Pos2::new(full_rect.min.x + tl[0], full_rect.min.y + tl[1]),
+            Pos2::new(full_rect.min.x + br[0], full_rect.min.y + br[1]),
+        );
+        painter.rect_stroke(rect, Rounding::same(2.0), Stroke::new(1.5, COL_MULTI_SELECT_BORDER));
+    }
 }
 
 
@@ -1758,8 +1984,17 @@ fn draw_selection_gizmo(
         if let Some(start) = response.interact_pointer_pos() {
             let local = [start.x - full_rect.min.x, start.y - full_rect.min.y];
             let world = state.canvas_viewport.screen_to_world(local, viewport_size);
+            let modifiers = ui.input(|i| i.modifiers);
+            let extend_marquee = modifiers.ctrl || modifiers.shift || modifiers.command;
             state.canvas_drag.start_screen = local;
-            state.canvas_drag.mode = decide_drag_mode(state, full_rect, viewport_size, start, world);
+            state.canvas_drag.mode = decide_drag_mode(
+                state,
+                full_rect,
+                viewport_size,
+                start,
+                world,
+                extend_marquee,
+            );
 
             // Freeze the playhead for the rest of the gesture so every
             // keyframe upsert lands on the same `t` (one kf per drag,
@@ -1788,17 +2023,53 @@ fn draw_selection_gizmo(
                     state.canvas_drag.actor_legacy_snapshot.clear();
                     state.canvas_drag.overlay_world_snapshot.clear();
                 }
+                CanvasDragMode::Marquee { start_world, .. } => {
+                    // Initialise the live marquee at a zero-size box on
+                    // the press point so the very first paint already
+                    // shows the rectangle (it then grows with apply_drag).
+                    state.canvas_marquee = Some(crate::state::CanvasMarquee {
+                        start: start_world,
+                        end: start_world,
+                    });
+                    state.canvas_drag.actor_legacy_snapshot.clear();
+                    state.canvas_drag.overlay_world_snapshot.clear();
+                    state.canvas_drag.multi_drag_snapshot.clear();
+                }
                 _ => {
                     state.canvas_drag.actor_legacy_snapshot.clear();
                     state.canvas_drag.overlay_world_snapshot.clear();
+                    // Snapshot every entry of canvas_selection (when the
+                    // user has lassoed more than one element) so the
+                    // active transform mode broadcasts to all of them.
+                    // The snapshot captures the current world centre,
+                    // scale and rotation — apply_drag adds the primary's
+                    // accumulated delta to each entry per frame so the
+                    // group moves together without drift.
+                    state.canvas_drag.multi_drag_snapshot =
+                        snapshot_multi_drag(state);
                 }
             }
         }
     } else if response.drag_stopped() || !response.dragged() {
         if !response.dragged() && state.canvas_drag.mode != crate::state::CanvasDragMode::None {
+            // ── Marquee commit ──
+            // The drag is ending (or the response says the pointer is
+            // no longer down). When the active mode was a marquee, we
+            // resolve which elements lie inside the rectangle and
+            // populate `canvas_selection` accordingly. Done here, on
+            // drag-end, so the user sees live preview of who's inside
+            // while they drag (handled by per-element highlights), but
+            // commit only happens once on release.
+            if let crate::state::CanvasDragMode::Marquee { extend, .. } =
+                state.canvas_drag.mode
+            {
+                commit_marquee_selection(state, extend);
+                state.canvas_marquee = None;
+            }
             state.canvas_drag.mode = crate::state::CanvasDragMode::None;
             state.canvas_drag.actor_legacy_snapshot.clear();
             state.canvas_drag.overlay_world_snapshot.clear();
+            state.canvas_drag.multi_drag_snapshot.clear();
             state.canvas_drag.snap_guides.clear();
             // Release the frozen-playhead lock; subsequent inspector
             // edits go back to using the live playhead.
@@ -1875,6 +2146,7 @@ fn decide_drag_mode(
     viewport_size: [f32; 2],
     start: Pos2,
     world: WorldPos,
+    extend_marquee: bool,
 ) -> crate::state::CanvasDragMode {
     use crate::state::CanvasDragMode;
 
@@ -2018,7 +2290,14 @@ fn decide_drag_mode(
         }
     }
 
-    CanvasDragMode::None
+    // 6. Empty canvas drag → rubber-band marquee selection. Records the
+    //    drag-origin in world coords so the live rectangle stays anchored
+    //    to the start point regardless of pan / zoom while the user
+    //    drags the opposite corner around.
+    CanvasDragMode::Marquee {
+        start_world: [world.x, world.y],
+        extend: extend_marquee,
+    }
 }
 
 /// Apply the active drag mode using the current pointer position.
@@ -2043,6 +2322,19 @@ fn apply_drag(
     match mode {
         CanvasDragMode::None => {}
 
+        CanvasDragMode::Marquee { start_world, .. } => {
+            // Live update of the rubber-band rectangle's far corner.
+            // Both corners stay in world coords so panning / zooming
+            // during the gesture leaves the box anchored to the same
+            // canvas region the user lassoed at the start.
+            let viewport = &state.canvas_viewport;
+            let cur_world = viewport.screen_to_world(cur_local, viewport_size);
+            state.canvas_marquee = Some(crate::state::CanvasMarquee {
+                start: start_world,
+                end: [cur_world.x, cur_world.y],
+            });
+        }
+
         CanvasDragMode::MoveActorWorld { actor_idx, initial_pos } => {
             if actor_idx < state.scene.actors.len() {
                 let proposed_x = initial_pos[0] + world_dx;
@@ -2057,6 +2349,13 @@ fn apply_drag(
                 // Route through the unified setter so a non-zero playhead
                 // auto-inserts a keyframe (canvas-first animation).
                 set_selection_world_center(state, [snapped_x, snapped_y]);
+                // Broadcast the primary's POST-SNAP world delta to every
+                // other lassoed element so the whole canvas_selection
+                // moves together, anchored relative to each element's
+                // own drag-start world centre.
+                let total_dx = snapped_x - initial_pos[0];
+                let total_dy = snapped_y - initial_pos[1];
+                broadcast_multi_translation(state, total_dx, total_dy);
             }
         }
 
@@ -2080,6 +2379,15 @@ fn apply_drag(
                 );
                 state.canvas_drag.snap_guides = guides;
                 set_selection_world_center(state, [snapped_world_x, snapped_world_y]);
+                // Broadcast snapped delta in world coords so non-primary
+                // elements track the primary's actual on-screen motion.
+                let prim_initial_world_x =
+                    rf_state.pos.x - world_w * 0.5 + initial_pos[0] * world_w;
+                let prim_initial_world_y =
+                    rf_state.pos.y - world_h * 0.5 + initial_pos[1] * world_h;
+                let total_dx = snapped_world_x - prim_initial_world_x;
+                let total_dy = snapped_world_y - prim_initial_world_y;
+                broadcast_multi_translation(state, total_dx, total_dy);
             }
         }
 
@@ -2104,6 +2412,14 @@ fn apply_drag(
                 );
                 state.canvas_drag.snap_guides = guides;
                 set_selection_world_center(state, [snapped_world_x, snapped_world_y]);
+                // Broadcast snapped world delta to other selected items.
+                let prim_initial_world_x =
+                    rf_state.pos.x - world_w * 0.5 + initial_pos[0] * world_w;
+                let prim_initial_world_y =
+                    rf_state.pos.y - world_h * 0.5 + initial_pos[1] * world_h;
+                let total_dx = snapped_world_x - prim_initial_world_x;
+                let total_dy = snapped_world_y - prim_initial_world_y;
+                broadcast_multi_translation(state, total_dx, total_dy);
             }
         }
 
@@ -2165,6 +2481,18 @@ fn apply_drag(
             set_selection_scale(state, new_scale);
             set_selection_scale_y(state, new_scale_y);
             set_selection_world_center(state, [cx, cy]);
+
+            // Broadcast the same scale ratio + translation delta to
+            // every other lassoed element. We use ratios (not absolute
+            // values) so each element scales relative to its own
+            // drag-start size; translation is the primary's centre
+            // delta, applied uniformly to keep the group cohesive.
+            let scale_factor = new_scale / initial_scale.max(1e-3);
+            let scale_y_factor = new_scale_y / initial_scale_y.max(1e-3);
+            broadcast_multi_scale(state, scale_factor, scale_y_factor);
+            let total_dx = cx - initial_pos_world[0];
+            let total_dy = cy - initial_pos_world[1];
+            broadcast_multi_translation(state, total_dx, total_dy);
         }
 
         CanvasDragMode::MoveRenderFrame { initial_pos } => {
@@ -2221,6 +2549,11 @@ fn apply_drag(
             // Clamp to a reasonable range to avoid runaway values.
             new_rot = new_rot.clamp(-3600.0, 3600.0);
             set_selection_rotation(state, new_rot);
+            // Broadcast the same rotation delta to every other lassoed
+            // element. Each non-primary element rotates around its own
+            // centre, so the group spins in unison without drifting.
+            let total_delta = new_rot - initial_rot_deg;
+            broadcast_multi_rotation(state, total_delta);
         }
     }
 }
@@ -2480,18 +2813,170 @@ fn canvas_drag_token(category: &'static str, sel: Selection) -> u64 {
 }
 
 fn set_selection_world_center(state: &mut EditorState, center: [f32; 2]) {
+    let token = canvas_drag_token(CANVAS_TOKEN_POS, state.selection);
+    let sel = state.selection;
+    write_selection_world_center(state, sel, center, token);
+}
+
+// ─── MULTI-DRAG BROADCAST HELPERS ────────────────────────────────────
+//
+// When `state.canvas_selection` holds more than one element, every
+// canvas-side transform (move / scale / rotate) should be relative to
+// each element's drag-start state, NOT the primary's. We snapshot
+// every selected element's world-centre + scale + rotation when the
+// gesture begins, then per-frame compute "where this element should
+// be RIGHT NOW" from the primary's accumulated delta. Each frame's
+// writes route through the same undo token as the primary's setter
+// so the entire compound move is one Ctrl+Z.
+
+/// Snapshot every entry in `state.canvas_selection` so the active
+/// transform mode can later broadcast to all of them. Returns an empty
+/// vec when fewer than 2 elements are selected.
+fn snapshot_multi_drag(state: &EditorState) -> Vec<crate::state::MultiDragEntry> {
+    if state.canvas_selection.len() < 2 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(state.canvas_selection.len());
+    for sel in &state.canvas_selection {
+        let pos = match *sel {
+            Selection::Actor(i) => {
+                actor_world_aabb(state, i).map(|(mn, mx)| {
+                    [(mn[0] + mx[0]) * 0.5, (mn[1] + mx[1]) * 0.5]
+                })
+            }
+            Selection::Overlay(i) => {
+                overlay_world_aabb(state, i).map(|(mn, mx)| {
+                    [(mn[0] + mx[0]) * 0.5, (mn[1] + mx[1]) * 0.5]
+                })
+            }
+            _ => None,
+        };
+        let Some(initial_pos) = pos else { continue; };
+        let (initial_scale, initial_scale_y, initial_rotation) =
+            sample_selection_transform(state, *sel);
+        out.push(crate::state::MultiDragEntry {
+            selection: *sel,
+            initial_pos,
+            initial_scale,
+            initial_scale_y,
+            initial_rotation,
+        });
+    }
+    out
+}
+
+/// Read scale, scale_y, rotation_deg for an arbitrary `Selection` at the
+/// current playhead. Falls back to neutral defaults when the element
+/// has no layout / is the render frame / etc.
+fn sample_selection_transform(state: &EditorState, sel: Selection) -> (f32, f32, f32) {
+    let t = state.playhead;
+    match sel {
+        Selection::Actor(idx) if idx < state.scene.actors.len() => {
+            let st = keyframe::sample(&state.scene.actors[idx].layout, t).unwrap_or_default();
+            (st.scale, st.scale_y, st.rotation_deg)
+        }
+        Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
+            let local_t = overlay_clip_local_time(state, idx);
+            let layout: &Vec<Keyframe<OverlayState>> = match &state.scene.overlays[idx] {
+                Overlay::Text(t) => &t.layout,
+                Overlay::Image(im) => &im.layout,
+                Overlay::Video(v) => &v.layout,
+            };
+            let st = keyframe::sample(layout, local_t).unwrap_or_default();
+            (st.scale, st.scale_y, st.rotation_deg)
+        }
+        Selection::RenderFrame => {
+            let rf_state = sample_render_frame(&state.scene.render_frame, t);
+            (
+                (1.0 / rf_state.zoom.max(1e-4)).clamp(0.05, 20.0),
+                1.0,
+                rf_state.rotation_deg,
+            )
+        }
+        _ => (1.0, 1.0, 0.0),
+    }
+}
+
+/// Apply the same total world translation to every snapshot entry that
+/// is NOT the primary selection. Re-uses the primary's undo token so
+/// the whole compound move is a single undo entry.
+fn broadcast_multi_translation(state: &mut EditorState, total_dx: f32, total_dy: f32) {
+    if state.canvas_drag.multi_drag_snapshot.is_empty() {
+        return;
+    }
+    let token = canvas_drag_token(CANVAS_TOKEN_POS, state.selection);
+    let primary = state.selection;
+    let snapshot = state.canvas_drag.multi_drag_snapshot.clone();
+    for entry in snapshot {
+        if entry.selection == primary { continue; }
+        let new_center = [
+            entry.initial_pos[0] + total_dx,
+            entry.initial_pos[1] + total_dy,
+        ];
+        write_selection_world_center(state, entry.selection, new_center, token);
+    }
+}
+
+/// Apply the same scale ratio to every snapshot entry that is NOT the
+/// primary selection. `scale_factor` is the multiplier between the
+/// primary's drag-start scale and its current value.
+fn broadcast_multi_scale(state: &mut EditorState, scale_factor: f32, scale_y_factor: f32) {
+    if state.canvas_drag.multi_drag_snapshot.is_empty() {
+        return;
+    }
+    let primary = state.selection;
+    let token_x = canvas_drag_token(CANVAS_TOKEN_SCALE, state.selection);
+    let token_y = canvas_drag_token(CANVAS_TOKEN_SCALE_Y, state.selection);
+    let snapshot = state.canvas_drag.multi_drag_snapshot.clone();
+    for entry in snapshot {
+        if entry.selection == primary { continue; }
+        let new_scale = (entry.initial_scale * scale_factor).clamp(0.05, 20.0);
+        let new_scale_y = (entry.initial_scale_y * scale_y_factor).clamp(0.05, 20.0);
+        write_selection_scale(state, entry.selection, new_scale, token_x);
+        write_selection_scale_y(state, entry.selection, new_scale_y, token_y);
+    }
+}
+
+/// Apply the same absolute rotation delta to every snapshot entry that
+/// is NOT the primary selection. `delta_deg` is `current - initial`
+/// for the primary; each non-primary element rotates around its own
+/// centre by the same amount.
+fn broadcast_multi_rotation(state: &mut EditorState, delta_deg: f32) {
+    if state.canvas_drag.multi_drag_snapshot.is_empty() {
+        return;
+    }
+    let primary = state.selection;
+    let token = canvas_drag_token(CANVAS_TOKEN_ROTATION, state.selection);
+    let snapshot = state.canvas_drag.multi_drag_snapshot.clone();
+    for entry in snapshot {
+        if entry.selection == primary { continue; }
+        let new_rot = (entry.initial_rotation + delta_deg).clamp(-3600.0, 3600.0);
+        write_selection_rotation(state, entry.selection, new_rot, token);
+    }
+}
+
+/// Apply a new world-pixel centre to an arbitrary selection. Same
+/// semantics as [`set_selection_world_center`] but takes the target
+/// element AND the undo token explicitly so multi-element drags can
+/// route every broadcast through the SAME token (one undo entry per
+/// gesture, not N).
+fn write_selection_world_center(
+    state: &mut EditorState,
+    sel: Selection,
+    center: [f32; 2],
+    token: u64,
+) {
     // Re-anchor every keyframe write to the playhead captured at drag
     // start (frozen for the duration of the gesture). Outside an active
     // drag the live playhead is used so single inspector edits still
     // land at the visible time.
     let t = state.canvas_drag.drag_start_playhead.unwrap_or(state.playhead);
-    // ── Undo grouping: one snapshot per drag gesture, per element. ──
-    let token = canvas_drag_token(CANVAS_TOKEN_POS, state.selection);
+    // ── Undo grouping: one snapshot per drag gesture. ──
     if state.last_drag_group != Some(token) {
         state.undo.push(&state.scene);
         state.last_drag_group = Some(token);
     }
-    match state.selection {
+    match sel {
         Selection::Actor(idx) if idx < state.scene.actors.len() => {
             let actor_id = state.scene.actors[idx].id.clone();
             // Prefer canvas_layouts entry when present (free canvas v2).
@@ -2586,14 +3071,24 @@ fn set_selection_world_center(state: &mut EditorState, center: [f32; 2]) {
 // explicitly toggles that with the diamond next to the inspector field.
 
 fn set_selection_scale_y(state: &mut EditorState, new_scale_y: f32) {
+    let token = canvas_drag_token(CANVAS_TOKEN_SCALE_Y, state.selection);
+    let sel = state.selection;
+    write_selection_scale_y(state, sel, new_scale_y, token);
+}
+
+fn write_selection_scale_y(
+    state: &mut EditorState,
+    sel: Selection,
+    new_scale_y: f32,
+    token: u64,
+) {
     let s = new_scale_y.clamp(0.05, 20.0);
     let t = state.canvas_drag.drag_start_playhead.unwrap_or(state.playhead);
-    let token = canvas_drag_token(CANVAS_TOKEN_SCALE_Y, state.selection);
     if state.last_drag_group != Some(token) {
         state.undo.push(&state.scene);
         state.last_drag_group = Some(token);
     }
-    match state.selection {
+    match sel {
         Selection::Actor(idx) if idx < state.scene.actors.len() => {
             let actor = &mut state.scene.actors[idx];
             crate::kf_anim::write_actor_param(
@@ -2619,14 +3114,24 @@ fn set_selection_scale_y(state: &mut EditorState, new_scale_y: f32) {
 }
 
 fn set_selection_scale(state: &mut EditorState, new_scale: f32) {
+    let token = canvas_drag_token(CANVAS_TOKEN_SCALE, state.selection);
+    let sel = state.selection;
+    write_selection_scale(state, sel, new_scale, token);
+}
+
+fn write_selection_scale(
+    state: &mut EditorState,
+    sel: Selection,
+    new_scale: f32,
+    token: u64,
+) {
     let s = new_scale.clamp(0.05, 20.0);
     let t = state.canvas_drag.drag_start_playhead.unwrap_or(state.playhead);
-    let token = canvas_drag_token(CANVAS_TOKEN_SCALE, state.selection);
     if state.last_drag_group != Some(token) {
         state.undo.push(&state.scene);
         state.last_drag_group = Some(token);
     }
-    match state.selection {
+    match sel {
         Selection::Actor(idx) if idx < state.scene.actors.len() => {
             let actor = &mut state.scene.actors[idx];
             crate::kf_anim::write_actor_param(
@@ -2668,13 +3173,23 @@ fn apply_scale_delta(state: &mut EditorState, delta: f32) {
 /// canvas-first animation workflow: drag the rotation gizmo at any
 /// time and the system records a keyframe automatically.
 fn set_selection_rotation(state: &mut EditorState, new_rot_deg: f32) {
-    let t = state.canvas_drag.drag_start_playhead.unwrap_or(state.playhead);
     let token = canvas_drag_token(CANVAS_TOKEN_ROTATION, state.selection);
+    let sel = state.selection;
+    write_selection_rotation(state, sel, new_rot_deg, token);
+}
+
+fn write_selection_rotation(
+    state: &mut EditorState,
+    sel: Selection,
+    new_rot_deg: f32,
+    token: u64,
+) {
+    let t = state.canvas_drag.drag_start_playhead.unwrap_or(state.playhead);
     if state.last_drag_group != Some(token) {
         state.undo.push(&state.scene);
         state.last_drag_group = Some(token);
     }
-    match state.selection {
+    match sel {
         Selection::Actor(idx) if idx < state.scene.actors.len() => {
             let actor = &mut state.scene.actors[idx];
             crate::kf_anim::write_actor_param(
