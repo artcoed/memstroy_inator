@@ -1107,16 +1107,14 @@ impl App {
             return;
         }
         self.state.refreshing = true;
-        self.state.status = "\u{1F504} Refreshing clips from Telegram...".into();
+        self.state.status = "\u{1F504} Refreshing clips via assets-server...".into();
         spawn_refresh(
             self.rt.handle(),
             self.tx.clone(),
-            "MELLSTROYfonz".into(),
+            self.state.server_url.clone(),
+            self.state.tg_channel.clone(),
+            self.state.tg_limit,
             self.state.clips_dir(),
-            self.state.state_path(),
-            "\u{0418}\u{043C}\u{0431}\u{0430}".into(), // "Имба"
-            80,
-            4,
         );
     }
 
