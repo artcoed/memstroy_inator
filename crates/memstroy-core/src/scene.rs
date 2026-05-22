@@ -999,10 +999,6 @@ pub struct AudioTrack {
     /// Mute the track without removing it. Survives save/load.
     #[serde(default)]
     pub mute: bool,
-    /// When the visible window outlasts the source file, keep the source
-    /// looping until `t_out` (or the scene end) instead of going silent.
-    #[serde(default)]
-    pub loop_source: bool,
     /// Reverb mix (0..1). Implemented as a small comb-filter feedback
     /// echo in the engine — gives a quick "room" feel without the cost
     /// of a real convolution reverb.
@@ -1024,8 +1020,31 @@ pub struct AudioTrack {
     /// Same toggle convention as `volume_kfs`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub speed_kfs: Vec<Keyframe<f32>>,
+    /// Optional keyframe track for `pitch_semitones`. Same toggle
+    /// convention as the other audio kf vectors — empty by default,
+    /// only consulted when `"pitch"` is in `animated_params`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pitch_kfs: Vec<Keyframe<f32>>,
+    /// Optional keyframe track for `pan` (-1..=1).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pan_kfs: Vec<Keyframe<f32>>,
+    /// Optional keyframe track for the low-pass cutoff in Hz. Stored as
+    /// f32 so eased interpolation works smoothly; the engine rounds to
+    /// `u32` when handing the value to the filter. Animation is only
+    /// honoured when `"low_pass"` is in `animated_params` AND
+    /// `low_pass_hz` is `Some(_)` (i.e. the user enabled the filter).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub low_pass_kfs: Vec<Keyframe<f32>>,
+    /// Optional keyframe track for the high-pass cutoff in Hz. Same
+    /// rules as `low_pass_kfs`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub high_pass_kfs: Vec<Keyframe<f32>>,
+    /// Optional keyframe track for the reverb mix (0..=1).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reverb_kfs: Vec<Keyframe<f32>>,
     /// Set of audio param ids the user has flagged as animatable. The
-    /// recognised ids today are `"volume"` and `"speed"`. Empty for
+    /// recognised ids today are `"volume"`, `"speed"`, `"pitch"`,
+    /// `"pan"`, `"low_pass"`, `"high_pass"` and `"reverb"`. Empty for
     /// fresh audio tracks.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub animated_params: BTreeSet<String>,
@@ -1048,11 +1067,15 @@ impl Default for AudioTrack {
             fade_in: 0.0,
             fade_out: 0.0,
             mute: false,
-            loop_source: false,
             reverb: 0.0,
             parent_actor: None,
             volume_kfs: Vec::new(),
             speed_kfs: Vec::new(),
+            pitch_kfs: Vec::new(),
+            pan_kfs: Vec::new(),
+            low_pass_kfs: Vec::new(),
+            high_pass_kfs: Vec::new(),
+            reverb_kfs: Vec::new(),
             animated_params: BTreeSet::new(),
         }
     }
@@ -1078,6 +1101,63 @@ impl AudioTrack {
             crate::keyframe::sample(&self.speed_kfs, t_local).unwrap_or(self.speed)
         } else {
             self.speed
+        }
+    }
+
+    /// Sample the pitch shift in semitones at clip-local time `t_local`.
+    pub fn pitch_at(&self, t_local: f32) -> f32 {
+        if self.animated_params.contains("pitch") && !self.pitch_kfs.is_empty() {
+            crate::keyframe::sample(&self.pitch_kfs, t_local).unwrap_or(self.pitch_semitones)
+        } else {
+            self.pitch_semitones
+        }
+    }
+
+    /// Sample the stereo pan at clip-local time `t_local` (-1..=1).
+    pub fn pan_at(&self, t_local: f32) -> f32 {
+        if self.animated_params.contains("pan") && !self.pan_kfs.is_empty() {
+            crate::keyframe::sample(&self.pan_kfs, t_local).unwrap_or(self.pan)
+        } else {
+            self.pan
+        }
+    }
+
+    /// Sample the low-pass cutoff in Hz at clip-local time. Returns
+    /// `None` when the filter is disabled (`low_pass_hz == None`),
+    /// otherwise the eased animated cutoff (rounded to `u32`) when
+    /// animated, or the static cutoff.
+    pub fn low_pass_at(&self, t_local: f32) -> Option<u32> {
+        let static_hz = self.low_pass_hz?;
+        if self.animated_params.contains("low_pass") && !self.low_pass_kfs.is_empty() {
+            let v = crate::keyframe::sample(&self.low_pass_kfs, t_local)
+                .unwrap_or(static_hz as f32);
+            Some(v.clamp(20.0, 22000.0) as u32)
+        } else {
+            Some(static_hz)
+        }
+    }
+
+    /// Sample the high-pass cutoff in Hz at clip-local time. Same
+    /// disable-when-`None` rules as [`Self::low_pass_at`].
+    pub fn high_pass_at(&self, t_local: f32) -> Option<u32> {
+        let static_hz = self.high_pass_hz?;
+        if self.animated_params.contains("high_pass") && !self.high_pass_kfs.is_empty() {
+            let v = crate::keyframe::sample(&self.high_pass_kfs, t_local)
+                .unwrap_or(static_hz as f32);
+            Some(v.clamp(20.0, 22000.0) as u32)
+        } else {
+            Some(static_hz)
+        }
+    }
+
+    /// Sample the reverb mix at clip-local time (0..=1).
+    pub fn reverb_at(&self, t_local: f32) -> f32 {
+        if self.animated_params.contains("reverb") && !self.reverb_kfs.is_empty() {
+            crate::keyframe::sample(&self.reverb_kfs, t_local)
+                .unwrap_or(self.reverb)
+                .clamp(0.0, 1.0)
+        } else {
+            self.reverb
         }
     }
 }
