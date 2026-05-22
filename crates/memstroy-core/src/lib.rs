@@ -51,6 +51,20 @@ impl Scene {
         let mut scene: Scene = match path.extension().and_then(|s| s.to_str()) {
             Some("yaml") | Some("yml") => serde_yaml::from_str(&raw)?,
             Some("json") => serde_json::from_str(&raw)?,
+            // Project-native ".memstroy" file. Always JSON, with the
+            // scene tucked under a "scene" key so it can sit alongside
+            // editor layout / per-tab metadata in the same document.
+            // See `EditorState::save_memstroy` for the writer side.
+            Some("memstroy") => {
+                let bundle: serde_json::Value = serde_json::from_str(&raw)?;
+                let scene_value = bundle
+                    .get("scene")
+                    .cloned()
+                    .ok_or_else(|| SceneError::UnknownFormat(
+                        ".memstroy file missing required \"scene\" key".into(),
+                    ))?;
+                serde_json::from_value(scene_value)?
+            }
             other => return Err(SceneError::UnknownFormat(other.unwrap_or("").into())),
         };
         // Back-fill `animated_params` for scenes saved before per-param
@@ -66,6 +80,18 @@ impl Scene {
         let serialized = match path.extension().and_then(|s| s.to_str()) {
             Some("yaml") | Some("yml") => serde_yaml::to_string(self)?,
             Some("json") => serde_json::to_string_pretty(self)?,
+            // `.memstroy` minimal write — only the scene, no layout.
+            // The GUI's `save_memstroy` writes a richer bundle that also
+            // captures editor layout; this fallback exists for the CLI
+            // and tests, where a Scene-only round-trip is enough.
+            Some("memstroy") => {
+                let bundle = serde_json::json!({
+                    "format": "memstroy",
+                    "format_version": 1,
+                    "scene": self,
+                });
+                serde_json::to_string_pretty(&bundle)?
+            }
             other => return Err(SceneError::UnknownFormat(other.unwrap_or("").into())),
         };
         std::fs::write(path, serialized)?;

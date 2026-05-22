@@ -223,6 +223,10 @@ pub struct EditorState {
     pub render_progress: Option<RenderProgress>,
     pub refreshing: bool,
     pub undo: UndoStack,
+    /// Token of the in-flight drag-undo group, if any. See
+    /// `EditorState::mutate_drag` for the full contract — the short
+    /// version is "one undo snapshot per drag gesture, automatically".
+    pub last_drag_group: Option<u64>,
     /// Playback state
     pub playing: bool,
     /// Playback speed multiplier (1.0 = normal, 2.0 = 2x, 0.5 = half)
@@ -358,6 +362,12 @@ pub struct EditorState {
     /// app's external file-drop handler can route OS drops to the right
     /// asset directory based on which tab is visible.
     pub library_panel_rect: Option<egui::Rect>,
+    /// Vertical split ratio inside the library panel between the
+    /// "Local" (user-imported, drop-zone) section on top and the
+    /// "Global" (auto-fetched / built-in) section on the bottom.
+    /// Range 0.05..=0.95; persisted in the layout file. The same ratio
+    /// is reused across every tab for predictable feel.
+    pub library_split: f32,
     /// Tracks which selection most recently caused us to auto-bump the
     /// timeline's vertical zoom. Comparing per-frame ensures we don't
     /// keep re-applying the bump every paint while a layer is selected.
@@ -518,6 +528,9 @@ impl EditorState {
         }];
         s.active_tab = 0;
 
+        // Default library local/global split — equal halves.
+        s.library_split = 0.5;
+
         s
     }
 
@@ -546,12 +559,59 @@ impl EditorState {
 
     /// Save undo snapshot, then apply a mutation via the closure.
     pub fn mutate(&mut self, f: impl FnOnce(&mut Scene)) {
+        // Any explicit `mutate` call ends the previous drag-group, so the
+        // next drag starts a fresh undo entry.
+        self.last_drag_group = None;
         self.undo.push(&self.scene);
         f(&mut self.scene);
     }
 
+    /// Drag-aware mutation. Pushes ONE undo snapshot for the very first
+    /// mutation in a contiguous gesture identified by `token`, then
+    /// mutates without snapshotting on every subsequent call. The token
+    /// stays "live" until either:
+    ///  - a different token is passed to `mutate_drag`,
+    ///  - `mutate(...)` is called (which ends the group), or
+    ///  - the application explicitly calls `end_drag_group()` (typically
+    ///    when no pointer button is held).
+    ///
+    /// The result: dragging a clip across 60 frames produces a single
+    /// undoable history entry instead of 60. Ctrl+Z reverts the entire
+    /// gesture, Ctrl+Shift+Z restores it.
+    pub fn mutate_drag<F>(&mut self, token: u64, f: F)
+    where
+        F: FnOnce(&mut Scene),
+    {
+        if self.last_drag_group != Some(token) {
+            self.undo.push(&self.scene);
+            self.last_drag_group = Some(token);
+        }
+        f(&mut self.scene);
+    }
+
+    /// Clear the active drag-undo group. The next `mutate_drag` call
+    /// (regardless of token) will push a fresh undo snapshot.
+    pub fn end_drag_group(&mut self) {
+        self.last_drag_group = None;
+    }
+
+    /// Stable, namespace-aware token suitable for `mutate_drag`. Combine
+    /// a fixed category string (`"drag_actor"`, `"trim_audio_left"`,
+    /// etc.) with a small payload hash to keep different elements'
+    /// drags isolated from each other.
+    pub fn drag_token(category: &'static str, id: usize) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        category.hash(&mut h);
+        id.hash(&mut h);
+        h.finish()
+    }
+
     /// Undo the last action.
     pub fn undo(&mut self) {
+        // Pressing Ctrl+Z must finalise any in-flight drag group so the
+        // next drag pushes a fresh snapshot afterwards.
+        self.last_drag_group = None;
         if let Some(prev) = self.undo.undo(&self.scene) {
             self.scene = prev;
             self.status = "\u{21A9} Undo".into();
@@ -560,6 +620,7 @@ impl EditorState {
 
     /// Redo the last undone action.
     pub fn redo(&mut self) {
+        self.last_drag_group = None;
         if let Some(next) = self.undo.redo(&self.scene) {
             self.scene = next;
             self.status = "\u{21AA} Redo".into();
@@ -796,7 +857,13 @@ impl EditorState {
     pub fn load_layout(&mut self, path: &std::path::Path) {
         let Ok(contents) = std::fs::read_to_string(path) else { return };
         let Ok(data) = serde_json::from_str::<serde_json::Value>(&contents) else { return };
+        self.apply_layout_json(&data);
+    }
 
+    /// Apply a layout JSON value to the editor state. Extracted so the
+    /// `.memstroy` bundle loader can reuse the same field-by-field
+    /// extraction without going through the filesystem.
+    fn apply_layout_json(&mut self, data: &serde_json::Value) {
         if let Some(zoom) = data.get("timeline_zoom").and_then(|v| v.as_f64()) {
             self.timeline_zoom = zoom as f32;
         }
@@ -821,6 +888,75 @@ impl EditorState {
         if let Some(clip_open) = data.get("clip_editor_open").and_then(|v| v.as_bool()) {
             self.clip_editor_open = clip_open;
         }
+        if let Some(split) = data.get("library_split").and_then(|v| v.as_f64()) {
+            self.library_split = (split as f32).clamp(0.05, 0.95);
+        }
+    }
+
+    /// Build a JSON value summarising editor layout (zoom, track
+    /// heights, etc.). Used by both `save_layout` and `save_memstroy`.
+    fn build_layout_json(&self) -> serde_json::Value {
+        let track_heights: Vec<f32> = self.tracks.iter().map(|t| t.height).collect();
+        serde_json::json!({
+            "timeline_zoom": self.timeline_zoom,
+            "timeline_scroll": self.timeline_scroll,
+            "track_heights": track_heights,
+            "curve_editor_open": self.curve_editor_open,
+            "curve_editor_property": self.curve_editor_property,
+            "clip_editor_open": self.clip_editor_open,
+            "library_split": self.library_split,
+        })
+    }
+
+    /// Save the active scene + editor layout to a `.memstroy` project
+    /// file. The format is JSON with the shape:
+    ///
+    /// ```json
+    /// {
+    ///   "format": "memstroy",
+    ///   "format_version": 1,
+    ///   "scene": { ... },
+    ///   "layout": { ... }
+    /// }
+    /// ```
+    ///
+    /// Both keys are required; `scene` carries the full scene tree
+    /// (round-trippable through `Scene::load`), `layout` carries the
+    /// editor's view state (timeline zoom, track heights, ...).
+    pub fn save_memstroy(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let bundle = serde_json::json!({
+            "format": "memstroy",
+            "format_version": 1,
+            "scene": &self.scene,
+            "layout": self.build_layout_json(),
+        });
+        let json = serde_json::to_string_pretty(&bundle)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(path, json)
+    }
+
+    /// Load a `.memstroy` bundle: returns the parsed Scene and applies
+    /// the embedded layout to `self`. The caller is responsible for
+    /// installing the scene into the active tab.
+    pub fn load_memstroy(&mut self, path: &std::path::Path) -> Result<Scene, String> {
+        let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        let bundle: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|e| format!("invalid .memstroy json: {e}"))?;
+        let scene_value = bundle
+            .get("scene")
+            .cloned()
+            .ok_or_else(|| ".memstroy file missing \"scene\" key".to_string())?;
+        let mut scene: Scene = serde_json::from_value(scene_value)
+            .map_err(|e| format!("invalid scene in .memstroy: {e}"))?;
+        scene.backfill_animated_params();
+        // Apply layout if present (it's optional).
+        if let Some(layout) = bundle.get("layout") {
+            self.apply_layout_json(layout);
+        }
+        Ok(scene)
     }
 
     pub fn reload_library(&mut self) {
