@@ -54,7 +54,11 @@ use crate::state::{EditorState, ImageBrushTool};
 /// window is still open after this frame.
 pub fn image_editor_window(ctx: &egui::Context, state: &mut EditorState) -> bool {
     let mut open = true;
-    egui::Window::new(format!("\u{1F5BC} {}", crate::i18n::t("Image Editor")))
+    // The window title used to splice in the 🖼 (U+1F5BC) emoji, but
+    // that codepoint is not in egui's bundled font and showed up as a
+    // missing-glyph box on Windows. Drop it so the title row is just
+    // localised text.
+    egui::Window::new(crate::i18n::t("Image Editor"))
         .open(&mut open)
         .default_size([520.0, 640.0])
         .min_width(380.0)
@@ -132,36 +136,76 @@ fn image_editor_content(ui: &mut egui::Ui, state: &mut EditorState) {
     brush_toolbar(ui, state);
     ui.add_space(4.0);
 
+    // ── Save / preview-zoom toolbar ──
+    //
+    // Sits above the preview pane so the user can (a) bake the
+    // current effect stack into a fresh PNG that lands in the
+    // project's image library (and can be dropped onto the canvas
+    // like any other sticker), and (b) zoom / pan the preview
+    // independently of the window size. The "Save" action is what
+    // the user asked for in "сохранить изменённый вариант
+    // изображения в локальные ресурсы проекта".
+    save_and_zoom_toolbar(ui, state, i, &source);
+    ui.add_space(4.0);
+
     // ── Preview ──
     //
     // The preview uses the same baked texture the canvas uses (with
     // the same crop UV inset) so what the user sees here matches the
     // canvas paint exactly. While a brush tool is armed the rect
     // captures click+drag input and accumulates polygon points /
-    // crop drag anchors.
-    let preview_h = 260.0_f32;
+    // crop drag anchors. The pane is rendered inside an `egui::Resize`
+    // so the user can drag the bottom-right handle to give the
+    // picture more (or less) vertical room.
+    let preview_h = state.image_brush.preview_height.clamp(120.0, 1200.0);
     let preview_w = ui.available_width();
     let interactive = state.image_brush.tool != ImageBrushTool::None;
     let sense = if interactive {
         Sense::click_and_drag()
     } else {
-        Sense::hover()
+        Sense::click_and_drag()
     };
-    let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(preview_w, preview_h), sense);
-    let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, Rounding::same(6.0), Color32::from_rgb(14, 14, 22));
+    let resp = egui::Resize::default()
+        .id_source(("image_editor_preview_resize", i))
+        .resizable([false, true])
+        .default_size(Vec2::new(preview_w, preview_h))
+        .min_height(120.0)
+        .max_height(1200.0)
+        .show(ui, |ui| {
+            let avail = ui.available_size();
+            let (rect, response) = ui.allocate_exact_size(avail, sense);
+            let painter = ui.painter_at(rect);
+            painter.rect_filled(rect, Rounding::same(6.0), Color32::from_rgb(14, 14, 22));
 
-    // The img_rect we draw the picture into (centred + aspect-locked).
-    let img_rect_opt = paint_preview(ui.ctx(), &painter, rect, state, &source, i);
+            // The img_rect we draw the picture into (centred + aspect-locked).
+            let img_rect_opt = paint_preview(ui.ctx(), &painter, rect, state, &source, i);
 
-    // Brush input lives over the painted img_rect — once we know it.
-    if interactive {
-        if let Some(img_rect) = img_rect_opt {
-            handle_brush_input(ui, &response, state, img_rect, i);
-            draw_brush_overlay(&painter, img_rect, state);
-        }
-    }
+            // Wheel zoom + middle/right drag pan, applied regardless
+            // of whether a brush tool is armed (so the user can frame
+            // the picture before painting).
+            handle_preview_pan_zoom(ui, state, &response, rect);
+
+            // Brush input lives over the painted img_rect — once we
+            // know it.
+            if interactive {
+                if let Some(img_rect) = img_rect_opt {
+                    handle_brush_input(ui, &response, state, img_rect, i);
+                    draw_brush_overlay(&painter, img_rect, state);
+                }
+            }
+            // Surface the actually-allocated pane height back to the
+            // outer scope so we can persist it on `EditorState` for
+            // a stable initial size after a window-toggle round-trip
+            // (egui::Resize keeps its own per-id memory across
+            // frames, but `default_size` only honours the first
+            // call — round-tripping through our state field gives
+            // a sane fallback if the egui memory is cleared).
+            avail.y
+        });
+    // Persist the new height back so the next frame paints with it.
+    // `Resize::show` returns the closure's R directly, which is the
+    // height we surfaced above.
+    state.image_brush.preview_height = resp.max(120.0).min(1200.0);
     ui.add_space(6.0);
 
     // ── Source info row ──
@@ -231,8 +275,9 @@ fn image_editor_content(ui: &mut egui::Ui, state: &mut EditorState) {
 // ─── PREVIEW ──────────────────────────────────────────────────────────
 
 /// Paint the preview thumbnail into `outer_rect`. Returns the centred
-/// image rect (after aspect-fit + crop inset) so the brush input
-/// handler can map cursor positions back into source-image UV.
+/// image rect (after aspect-fit + crop inset, then the user-controlled
+/// preview zoom + pan) so the brush input handler can map cursor
+/// positions back into source-image UV.
 fn paint_preview(
     ctx: &egui::Context,
     painter: &egui::Painter,
@@ -317,8 +362,16 @@ fn paint_preview(
         display_h = max_h;
         display_w = display_h * cropped_aspect;
     }
-    let off_x = (preview_w - display_w) * 0.5;
-    let off_y = (preview_h - display_h) * 0.5;
+    // Apply user-controlled zoom + pan around the pane centre. The
+    // returned img_rect is what the brush input handler maps cursor
+    // positions through, so zooming in still gives pixel-accurate
+    // brush strokes.
+    let zoom = state.image_brush.preview_zoom.clamp(0.1, 8.0);
+    display_w *= zoom;
+    display_h *= zoom;
+    let pan = state.image_brush.preview_pan;
+    let off_x = (preview_w - display_w) * 0.5 + pan[0];
+    let off_y = (preview_h - display_h) * 0.5 + pan[1];
     let img_rect = Rect::from_min_size(
         Pos2::new(outer_rect.min.x + off_x, outer_rect.min.y + off_y),
         Vec2::new(display_w, display_h),
@@ -354,33 +407,38 @@ fn brush_toolbar(ui: &mut egui::Ui, state: &mut EditorState) {
                 .size(11.0)
                 .color(Color32::from_rgb(170, 170, 200)),
         );
+        // Tool buttons use translated text labels rather than the
+        // previous emoji glyphs (✂, 🖌, ⭮ …) — several of those
+        // codepoints are outside the bundled font's coverage and
+        // rendered as missing-glyph boxes on Windows builds, which
+        // the user reported as "иконки которые не отрисовываются".
         let tools: [(ImageBrushTool, &str, &str); 4] = [
             (
                 ImageBrushTool::None,
-                "\u{2196}",
+                "View",
                 "View only — no interactive painting",
             ),
             (
                 ImageBrushTool::Brush,
-                "\u{1F58C}",
+                "Brush",
                 "Brush — paint a freehand mask: pixels INSIDE the painted shape are kept, the rest is masked away",
             ),
             (
                 ImageBrushTool::Cutout,
-                "\u{2702}",
+                "Cutout",
                 "Cutout — paint a freehand mask: pixels INSIDE the painted shape are masked away (erase a region)",
             ),
             (
                 ImageBrushTool::Crop,
-                "\u{2702}\u{FE0F}",
+                "Crop",
                 "Crop — drag a rectangle to set the crop bounds",
             ),
         ];
-        for (tool, glyph, hint) in tools {
+        for (tool, label, hint) in tools {
             let active = state.image_brush.tool == tool;
             let btn = egui::Button::new(
-                RichText::new(glyph)
-                    .size(15.0)
+                RichText::new(crate::i18n::t(label))
+                    .size(11.5)
                     .color(if active {
                         Color32::WHITE
                     } else {
@@ -394,8 +452,8 @@ fn brush_toolbar(ui: &mut egui::Ui, state: &mut EditorState) {
             })
             .stroke(Stroke::new(1.0, Color32::from_rgb(80, 70, 100)))
             .rounding(Rounding::same(4.0))
-            .min_size(Vec2::new(28.0, 24.0));
-            if ui.add(btn).on_hover_text(hint).clicked() {
+            .min_size(Vec2::new(54.0, 24.0));
+            if ui.add(btn).on_hover_text(crate::i18n::t(hint)).clicked() {
                 // Toggle: clicking the active tool returns to None;
                 // clicking a different tool replaces it. Either way
                 // we drop any in-progress shape so the user gets a
@@ -444,15 +502,240 @@ fn brush_params_section(ui: &mut egui::Ui, state: &mut EditorState) {
         ui.label(crate::i18n::t("Feather"));
         ui.add(egui::Slider::new(&mut state.image_brush.feather, 0.0..=0.3));
         ui.checkbox(&mut state.image_brush.invert, crate::i18n::t("Invert"))
-            .on_hover_text(
+            .on_hover_text(crate::i18n::t(
                 "When checked, the painted polygon is the masked-OUT region (instead of the kept region).",
-            );
+            ));
         if !state.image_brush.draft.is_empty()
             && ui.button(crate::i18n::t("Clear stroke")).clicked()
         {
             state.image_brush.draft.clear();
         }
     });
+}
+
+// ─── SAVE / ZOOM TOOLBAR ──────────────────────────────────────────────
+
+/// Toolbar above the preview pane. Hosts the "save edited variant
+/// to the project's image library" action (the user's primary
+/// request) plus zoom controls (zoom-out / fit / 1:1 / zoom-in)
+/// that drive `state.image_brush.preview_zoom` and `preview_pan`.
+fn save_and_zoom_toolbar(
+    ui: &mut egui::Ui,
+    state: &mut EditorState,
+    overlay_idx: usize,
+    source: &std::path::Path,
+) {
+    ui.horizontal(|ui| {
+        // ── Save edited image to local library ──
+        let save_btn = egui::Button::new(
+            RichText::new(crate::i18n::t("Save edited image"))
+                .size(11.5)
+                .color(Color32::WHITE),
+        )
+        .fill(Color32::from_rgb(70, 130, 90))
+        .stroke(Stroke::new(1.0, Color32::from_rgb(120, 200, 140)))
+        .rounding(Rounding::same(4.0))
+        .min_size(Vec2::new(150.0, 24.0));
+        if ui
+            .add(save_btn)
+            .on_hover_text(crate::i18n::t(
+                "Bake the current effect stack into a fresh PNG and add it to the project's local image library.",
+            ))
+            .clicked()
+        {
+            match bake_and_save_edited_image(state, overlay_idx, source) {
+                Ok(name) => {
+                    state.status = format!(
+                        "{} {}",
+                        crate::i18n::t("\u{2705} Edited image saved to library:"),
+                        name,
+                    );
+                }
+                Err(e) => {
+                    state.status = format!(
+                        "{} {}",
+                        crate::i18n::t("\u{274C} Save edited image failed:"),
+                        e,
+                    );
+                }
+            }
+        }
+
+        ui.separator();
+
+        // ── Zoom controls ──
+        ui.label(
+            RichText::new(crate::i18n::t("Zoom:"))
+                .size(11.0)
+                .color(Color32::from_rgb(170, 170, 200)),
+        );
+        let zoom_minus = egui::Button::new(RichText::new("-").size(13.0))
+            .min_size(Vec2::new(24.0, 22.0));
+        if ui
+            .add(zoom_minus)
+            .on_hover_text(crate::i18n::t("Zoom out"))
+            .clicked()
+        {
+            state.image_brush.preview_zoom =
+                (state.image_brush.preview_zoom * 0.8).clamp(0.1, 8.0);
+            if state.image_brush.preview_zoom <= 1.0 {
+                state.image_brush.preview_pan = [0.0, 0.0];
+            }
+        }
+        let zoom_label = format!("{:.0}%", state.image_brush.preview_zoom * 100.0);
+        ui.label(
+            RichText::new(zoom_label)
+                .size(11.0)
+                .color(Color32::from_rgb(220, 220, 240)),
+        );
+        let zoom_plus = egui::Button::new(RichText::new("+").size(13.0))
+            .min_size(Vec2::new(24.0, 22.0));
+        if ui
+            .add(zoom_plus)
+            .on_hover_text(crate::i18n::t("Zoom in"))
+            .clicked()
+        {
+            state.image_brush.preview_zoom =
+                (state.image_brush.preview_zoom * 1.25).clamp(0.1, 8.0);
+        }
+
+        if ui
+            .button(crate::i18n::t("Fit"))
+            .on_hover_text(crate::i18n::t("Fit the picture into the preview pane"))
+            .clicked()
+        {
+            state.image_brush.preview_zoom = 1.0;
+            state.image_brush.preview_pan = [0.0, 0.0];
+        }
+        if ui
+            .button(crate::i18n::t("1:1"))
+            .on_hover_text(crate::i18n::t("Show preview at native pixel scale"))
+            .clicked()
+        {
+            // Approximate 1:1 by setting zoom to a value that brings the
+            // image close to its native pixel size at the current pane
+            // dimensions. The exact ratio depends on the source size,
+            // but `2.0` is a reasonable upper-mid for typical sticker
+            // sources on a moderately-sized window.
+            state.image_brush.preview_zoom = 2.0;
+        }
+    });
+}
+
+// ─── PREVIEW PAN / ZOOM INPUT ─────────────────────────────────────────
+
+/// Mouse-wheel zoom + middle/secondary-button drag panning for the
+/// preview pane. Cumulative — repeated wheel ticks compound the same
+/// way they do in any image viewer, and panning is decoupled from
+/// brush input so the user can frame the picture even while a tool
+/// is armed.
+fn handle_preview_pan_zoom(
+    ui: &egui::Ui,
+    state: &mut EditorState,
+    response: &egui::Response,
+    rect: Rect,
+) {
+    // Wheel zoom — only respond when the cursor hovers the preview
+    // rect; otherwise scrolling the surrounding scroll area would
+    // also stomp the zoom.
+    if response.hovered() {
+        let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+        if scroll.abs() > 0.1 {
+            let factor = if scroll > 0.0 { 1.1 } else { 1.0 / 1.1 };
+            let new_zoom =
+                (state.image_brush.preview_zoom * factor).clamp(0.1, 8.0);
+            // Anchor the zoom to the cursor so the pixel under the
+            // cursor stays approximately put across the zoom step.
+            if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
+                let cx = rect.center().x;
+                let cy = rect.center().y;
+                let rel_x = pos.x - cx - state.image_brush.preview_pan[0];
+                let rel_y = pos.y - cy - state.image_brush.preview_pan[1];
+                let scale = new_zoom / state.image_brush.preview_zoom.max(1e-3);
+                state.image_brush.preview_pan[0] += rel_x * (1.0 - scale);
+                state.image_brush.preview_pan[1] += rel_y * (1.0 - scale);
+            }
+            state.image_brush.preview_zoom = new_zoom;
+            if state.image_brush.preview_zoom <= 1.0 {
+                state.image_brush.preview_pan = [0.0, 0.0];
+            }
+        }
+    }
+    // Middle / secondary mouse drag = pan. Egui's `Response::dragged`
+    // only reports primary drags by default; we read the raw button
+    // state from `Input` so brush-tool primary drags don't double up
+    // as pans.
+    let middle_down = ui.input(|i| i.pointer.middle_down());
+    let secondary_down = ui.input(|i| i.pointer.secondary_down());
+    if (middle_down || secondary_down) && response.hovered() {
+        let delta = ui.input(|i| i.pointer.delta());
+        if delta.length() > 0.01 {
+            state.image_brush.preview_pan[0] += delta.x;
+            state.image_brush.preview_pan[1] += delta.y;
+        }
+    }
+}
+
+// ─── BAKE & SAVE ──────────────────────────────────────────────────────
+
+/// Decode the source image, run the overlay's full effect stack on
+/// the CPU (mirrors the canvas / export pipeline), apply the
+/// resulting Crop inset by slicing the buffer, and hand the bytes
+/// off to [`EditorState::save_edited_image_to_library`]. Returns the
+/// new file's stem on success — the caller turns that into a status
+/// toast so the user can find the file in the Images library tab.
+fn bake_and_save_edited_image(
+    state: &mut EditorState,
+    overlay_idx: usize,
+    source: &std::path::Path,
+) -> Result<String, String> {
+    use memstroy_core::Overlay;
+
+    let effects = match state.scene.overlays.get(overlay_idx) {
+        Some(Overlay::Image(im)) => im.effects.clone(),
+        _ => return Err("not an image overlay".to_string()),
+    };
+    let img = image::open(source)
+        .map_err(|e| format!("decode {}: {}", source.display(), e))?
+        .to_rgba8();
+    let w = img.width();
+    let h = img.height();
+    let mut buf = img.into_raw();
+    let crop = crate::image_effects::apply_effect_stack(&mut buf, w, h, &effects, 0.0);
+
+    // Apply the accumulated crop inset by slicing the buffer to the
+    // visible rectangle. Without this, the saved PNG would still
+    // carry transparent / black borders the editor's preview hides
+    // through UV trimming. We also clamp the inset to leave at least
+    // one pixel in each dimension so a misconfigured Crop doesn't
+    // produce a 0×N image.
+    let (cl, ct, cr, cb) = crop;
+    let left = ((cl * w as f32).round() as u32).min(w.saturating_sub(1));
+    let top = ((ct * h as f32).round() as u32).min(h.saturating_sub(1));
+    let right = ((cr * w as f32).round() as u32).min(w.saturating_sub(1));
+    let bottom = ((cb * h as f32).round() as u32).min(h.saturating_sub(1));
+    let new_w = w.saturating_sub(left + right).max(1);
+    let new_h = h.saturating_sub(top + bottom).max(1);
+
+    let cropped: Vec<u8> = if new_w == w && new_h == h {
+        buf
+    } else {
+        let mut out = Vec::with_capacity((new_w * new_h * 4) as usize);
+        for y in 0..new_h {
+            let src_y = y + top;
+            let row_start = ((src_y * w + left) * 4) as usize;
+            let row_end = row_start + (new_w as usize) * 4;
+            out.extend_from_slice(&buf[row_start..row_end]);
+        }
+        out
+    };
+
+    let stem = source
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("image");
+    let asset = state.save_edited_image_to_library(&cropped, new_w, new_h, stem)?;
+    Ok(asset.id)
 }
 
 // ─── BRUSH INPUT ──────────────────────────────────────────────────────
@@ -799,9 +1082,13 @@ fn geometry_section(ui: &mut egui::Ui, state: &mut EditorState, overlay_idx: usi
     .show(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
             // Mirror H / V — toggle EffectKind::MirrorH / MirrorV.
+            // Emoji-arrow glyphs (⭮ ⭯) outside the bundled font's
+            // coverage rendered as missing-glyph boxes; the basic
+            // bidirectional arrows below ship with every desktop
+            // font set.
             if let Some(Overlay::Image(im)) = state.scene.overlays.get_mut(overlay_idx) {
-                mirror_button(ui, &mut im.effects, "\u{2B6E} Mirror H", true);
-                mirror_button(ui, &mut im.effects, "\u{2B6F} Mirror V", false);
+                mirror_button(ui, &mut im.effects, "\u{2194} Mirror H", true);
+                mirror_button(ui, &mut im.effects, "\u{2195} Mirror V", false);
             }
 
             // Rotate buttons mutate the layout's first keyframe so
@@ -809,28 +1096,28 @@ fn geometry_section(ui: &mut egui::Ui, state: &mut EditorState, overlay_idx: usi
             // touch the static value — animation curves stay intact.
             if ui
                 .button(crate::i18n::t("\u{21BA} -90\u{00B0}"))
-                .on_hover_text("Rotate 90° counter-clockwise")
+                .on_hover_text(crate::i18n::t("Rotate 90° counter-clockwise"))
                 .clicked()
             {
                 rotate_overlay(state, overlay_idx, -90.0);
             }
             if ui
                 .button(crate::i18n::t("\u{21BB} +90\u{00B0}"))
-                .on_hover_text("Rotate 90° clockwise")
+                .on_hover_text(crate::i18n::t("Rotate 90° clockwise"))
                 .clicked()
             {
                 rotate_overlay(state, overlay_idx, 90.0);
             }
             if ui
                 .button(crate::i18n::t("180\u{00B0}"))
-                .on_hover_text("Flip 180°")
+                .on_hover_text(crate::i18n::t("Flip 180°"))
                 .clicked()
             {
                 rotate_overlay(state, overlay_idx, 180.0);
             }
             if ui
                 .button(crate::i18n::t("Reset"))
-                .on_hover_text("Reset rotation to 0°")
+                .on_hover_text(crate::i18n::t("Reset rotation to 0°"))
                 .clicked()
             {
                 if let Some(Overlay::Image(im)) =
@@ -1076,7 +1363,7 @@ fn posterize_slider(ui: &mut egui::Ui, effects: &mut Vec<Effect>) {
                 _ => {}
             }
         }
-        if ui.small_button("\u{21BA}").on_hover_text("Reset").clicked() {
+        if ui.small_button("\u{21BA}").on_hover_text(crate::i18n::t("Reset")).clicked() {
             if let Some(i) = idx {
                 effects.remove(i);
             }
@@ -1269,7 +1556,7 @@ fn adjust_slider<F, R, M>(
                 (None, true) => { /* no-op */ }
             }
         }
-        if ui.small_button("\u{21BA}").on_hover_text("Reset").clicked() {
+        if ui.small_button("\u{21BA}").on_hover_text(crate::i18n::t("Reset")).clicked() {
             if let Some(i) = idx {
                 effects.remove(i);
             }
