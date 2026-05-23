@@ -514,8 +514,14 @@ impl App {
                 }
             });
 
-            ui.menu_button(RichText::new(t("\u{1F9E0} Tools")).strong(), |ui| {
-                if ui.button(t("\u{1F9B4} Skeleton Constructor...")).clicked() {
+            // The Tools menu and the Skeleton Constructor item used the
+            // 🧠 (brain, U+1F9E0) and 🦴 (bone, U+1F9B4) emojis, but
+            // egui's bundled font set has no glyph for either. They
+            // rendered as the "□" missing-glyph mark, which the user
+            // reported as "null smiley". Substitute glyphs that are
+            // present in the default font (gear / spanner motif).
+            ui.menu_button(RichText::new(t("\u{2699} Tools")).strong(), |ui| {
+                if ui.button(t("\u{2692} Skeleton Constructor...")).clicked() {
                     self.state.skeleton_editor.open = true;
                     // Pre-select the source clip from the currently selected
                     // actor (so the editor is ready to edit a familiar clip),
