@@ -5132,11 +5132,12 @@ fn draw_mask_toolbar(
     let btn_w = 28.0;
     let btn_h = 24.0;
     let gap = 4.0;
-    let tools: [(MaskTool, &str, &str); 4] = [
+    let tools: [(MaskTool, &str, &str); 5] = [
         (MaskTool::None, "\u{2196}", "Select / transform (Esc)"),
         (MaskTool::RectMask, "\u{25A1}", "Rectangle mask / crop — drag to define a rectangular region. Combines the legacy Rectangle and Crop tools."),
         (MaskTool::EllipseMask, "\u{25CB}", "Ellipse mask — drag to mask outside the ellipse"),
         (MaskTool::FreehandMask, "\u{270F}", "Freehand mask — paint a closed polygon"),
+        (MaskTool::Eyedropper, "\u{1F4A7}", "Eyedropper colour-key mask — click on the picture to pick a colour, every pixel close to that colour gets masked out. Works on actors AND image overlays."),
     ];
     for (i, (tool, glyph, hint)) in tools.iter().enumerate() {
         let rect = Rect::from_min_size(
@@ -5241,10 +5242,35 @@ fn screen_to_element_uv(
     if elem_rect.width() <= 0.5 || elem_rect.height() <= 0.5 {
         return None;
     }
-    // Sample the element's rotation at the playhead. Render frame
-    // selections aren't masked (the toolbar is per-element) so we
-    // only care about Actor / Overlay rotations here.
-    let rotation_deg = match state.selection {
+    let rotation_deg = selected_element_rotation_deg(state);
+
+    let center = elem_rect.center();
+    // Inverse-rotate the pointer around the element centre. Because
+    // the element rect is the AABB of the *unrotated* image (the
+    // renderer rotates the picture around the same centre), the
+    // local axis-aligned dims here are the right denominators for
+    // image-local UV. The inverse rotation lines up "image-local
+    // X/Y" with the click before normalising into UV.
+    let theta = (-rotation_deg).to_radians();
+    let (s, c) = (theta.sin(), theta.cos());
+    let dx = pointer.x - center.x;
+    let dy = pointer.y - center.y;
+    let local_x = dx * c - dy * s;
+    let local_y = dx * s + dy * c;
+    let half_w = elem_rect.width() * 0.5;
+    let half_h = elem_rect.height() * 0.5;
+    let u = (local_x / (half_w * 2.0)) + 0.5;
+    let v = (local_y / (half_h * 2.0)) + 0.5;
+    Some(([u.clamp(-0.5, 1.5), v.clamp(-0.5, 1.5)], state.selection, elem_rect))
+}
+
+/// Sample the rotation (in degrees, CW positive) of the currently-
+/// selected actor / overlay at the playhead. Used by both
+/// `screen_to_element_uv` (for input) and `draw_mask_draft` (for the
+/// preview overlay) so the two stay in lock-step. Returns 0.0 for
+/// any non-rotatable selection (RenderFrame, Audio, none).
+fn selected_element_rotation_deg(state: &EditorState) -> f32 {
+    match state.selection {
         Selection::Actor(idx) if idx < state.scene.actors.len() => {
             let layout = &state.scene.actors[idx].layout;
             keyframe::sample(layout, state.playhead)
@@ -5267,27 +5293,7 @@ fn screen_to_element_uv(
                 .unwrap_or(0.0)
         }
         _ => 0.0,
-    };
-
-    let center = elem_rect.center();
-    // Inverse-rotate the pointer around the element centre. Because
-    // the element rect is the AABB of the rotated image, both `width`
-    // and `height` here are the AABB dimensions; we still use them
-    // for the UV mapping because the user clicked inside that AABB
-    // and the rotated image fills it pixel-for-pixel along the
-    // rotated axes. The inverse rotation lines up "image-local
-    // X/Y" with the click before normalising into UV.
-    let theta = (-rotation_deg).to_radians();
-    let (s, c) = (theta.sin(), theta.cos());
-    let dx = pointer.x - center.x;
-    let dy = pointer.y - center.y;
-    let local_x = dx * c - dy * s;
-    let local_y = dx * s + dy * c;
-    let half_w = elem_rect.width() * 0.5;
-    let half_h = elem_rect.height() * 0.5;
-    let u = (local_x / (half_w * 2.0)) + 0.5;
-    let v = (local_y / (half_h * 2.0)) + 0.5;
-    Some(([u.clamp(-0.5, 1.5), v.clamp(-0.5, 1.5)], state.selection, elem_rect))
+    }
 }
 
 /// Run the mask drawing input handler. Must be called from
@@ -5304,6 +5310,23 @@ pub(crate) fn handle_mask_draw_input(
     if !mask_tool_active(state) {
         return false;
     }
+
+    // Eyedropper is single-click — there is no draft drag to commit.
+    // Pre-empt the rest of the input pipeline so we don't accidentally
+    // start a DrawMask drag for what's meant to be a one-shot click.
+    if state.mask_tool == MaskTool::Eyedropper {
+        let pointer_pos = ui.input(|i| i.pointer.hover_pos());
+        if response.clicked() || response.drag_started() {
+            if let Some(p) = pointer_pos {
+                handle_eyedropper_mask_click(ui, state, full_rect, viewport_size, p);
+            }
+        }
+        // Always keep the cursor as a crosshair so the user knows the
+        // tool is armed even between clicks.
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+        return true;
+    }
+
     // The crop / rect / ellipse / freehand tools all dispatch through
     // the same code path; a single `CanvasDragMode::DrawMask` carries
     // the active tool tag.
@@ -5374,8 +5397,9 @@ pub(crate) fn handle_mask_draw_input(
 }
 
 /// Push the painted shape onto the target element's `effects` stack.
-/// Crop becomes `EffectKind::Crop`; the other tools build an
-/// `EffectKind::Mask` carrying the matching shape.
+/// Builds an `EffectKind::Mask` carrying the matching shape; the
+/// eyedropper tool short-circuits before reaching this commit and
+/// uses `handle_eyedropper_mask_click` instead.
 fn commit_mask_draft(
     state: &mut EditorState,
     tool: MaskTool,
@@ -5397,21 +5421,6 @@ fn commit_mask_draft(
     }
 
     let new_effect = match tool {
-        MaskTool::Crop => {
-            // Crop insets are measured FROM each edge in 0..0.49.
-            let l = lx.clamp(0.0, 0.49);
-            let t = ty.clamp(0.0, 0.49);
-            let r = (1.0 - rx).clamp(0.0, 0.49);
-            let b = (1.0 - by).clamp(0.0, 0.49);
-            Some(memstroy_core::Effect::new(
-                memstroy_core::EffectKind::Crop {
-                    left: l,
-                    top: t,
-                    right: r,
-                    bottom: b,
-                },
-            ))
-        }
         MaskTool::RectMask => Some(memstroy_core::Effect::new(
             memstroy_core::EffectKind::Mask {
                 shape: memstroy_core::MaskShape::Rect {
@@ -5457,6 +5466,16 @@ fn commit_mask_draft(
                 ))
             }
         }
+        MaskTool::Eyedropper => {
+            // Eyedropper commits via a separate single-click handler
+            // (`handle_eyedropper_mask_click`) that knows how to read
+            // the underlying pixel colour for actors and image
+            // overlays. The drag pipeline never reaches commit for
+            // this tool — the click consumes the input on press, so
+            // arriving here means a stray drag finish that we can
+            // safely ignore.
+            None
+        }
         MaskTool::None => None,
     };
 
@@ -5483,9 +5502,169 @@ fn commit_mask_draft(
     state.status = format!("\u{2702} {} applied", tool.label());
 }
 
+/// Eyedropper colour-key mask — the click handler for
+/// `MaskTool::Eyedropper`. Resolves the click into the selected
+/// element's UV space, samples the underlying pixel from the frame
+/// cache (actor) or the source PNG (image overlay), and either:
+///
+///   - updates the most-recent `EffectKind::ColorKey` entry on the
+///     layer's effect stack with the picked colour, OR
+///   - pushes a fresh `EffectKind::ColorKey` if the layer doesn't
+///     have one yet.
+///
+/// The choice between "update existing" and "push new" matters for
+/// the user's workflow: clicking a fresh colour while a colour-key
+/// mask is already armed should refine the same effect rather than
+/// stack a new translucent layer of keys on top. The decision is
+/// taken by inspecting the latest existing entry and matching its
+/// kind. The picked colour overwrites whatever was on that entry,
+/// so the inspector "Re-pick" button (which arms this same tool
+/// without pushing a new effect) feels self-explanatory.
+fn handle_eyedropper_mask_click(
+    ui: &egui::Ui,
+    state: &mut EditorState,
+    full_rect: Rect,
+    viewport_size: [f32; 2],
+    pointer: Pos2,
+) {
+    let Some((uv, target, _rect)) =
+        screen_to_element_uv(state, full_rect, viewport_size, pointer)
+    else {
+        state.status = "Eyedropper mask: select an element first.".into();
+        return;
+    };
+    // The UV math returns a clamped value in [-0.5, 1.5] so the user
+    // can paint near the edges; for sampling we need a real pixel
+    // inside the source so a click outside the picture is rejected.
+    if uv[0] < 0.0 || uv[0] > 1.0 || uv[1] < 0.0 || uv[1] > 1.0 {
+        state.status = "Eyedropper mask: click on the picture itself.".into();
+        return;
+    }
+
+    let picked: Option<[u8; 3]> = match target {
+        Selection::Actor(idx) if idx < state.scene.actors.len() => {
+            sample_actor_pixel(state, idx, uv)
+        }
+        Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
+            sample_overlay_pixel(state, idx, uv)
+        }
+        _ => None,
+    };
+    let Some(rgb) = picked else {
+        state.status =
+            "Eyedropper mask: source frame not yet decoded — try again in a moment.".into();
+        return;
+    };
+
+    // Apply the picked colour: overwrite the latest ColorKey entry on
+    // the layer if there is one, otherwise push a fresh one.
+    let label = format!(
+        "\u{1F4A7} Color key: #{:02X}{:02X}{:02X}",
+        rgb[0], rgb[1], rgb[2],
+    );
+    state.mutate(|scene| {
+        let effects: &mut Vec<memstroy_core::Effect> = match target {
+            Selection::Actor(i) => &mut scene.actors[i].effects,
+            Selection::Overlay(i) => match &mut scene.overlays[i] {
+                memstroy_core::Overlay::Text(t) => &mut t.effects,
+                memstroy_core::Overlay::Image(im) => &mut im.effects,
+                memstroy_core::Overlay::Video(v) => &mut v.effects,
+            },
+            _ => return,
+        };
+        // Prefer the rightmost existing ColorKey so the user's most
+        // recently-added entry is the one that updates.
+        let existing = effects
+            .iter_mut()
+            .rev()
+            .find(|e| matches!(e.kind, memstroy_core::EffectKind::ColorKey { .. }));
+        if let Some(eff) = existing {
+            if let memstroy_core::EffectKind::ColorKey { color, .. } = &mut eff.kind {
+                *color = rgb;
+            }
+        } else {
+            // Construct via the canonical preset so we inherit the
+            // default similarity / blend / spill values defined by
+            // the core `Effect::color_key()` helper.
+            let mut eff = memstroy_core::Effect::color_key();
+            if let memstroy_core::EffectKind::ColorKey { color, .. } = &mut eff.kind {
+                *color = rgb;
+            }
+            effects.push(eff);
+        }
+    });
+    state.status = label;
+    ui.ctx().request_repaint();
+}
+
+/// Sample a single pixel from the actor's decoded frame cache at the
+/// given UV. Returns `None` when the cache hasn't decoded the frame
+/// yet (the user can retry once the frame lands). Mirrors the source-
+/// time math used by `handle_eyedropper_click_actor` so the picked
+/// pixel matches what the user sees on canvas. Takes `&mut` because
+/// the underlying frame-cache fetch lazily promotes decoded frames
+/// onto the recently-used list.
+fn sample_actor_pixel(state: &mut EditorState, idx: usize, uv: [f32; 2]) -> Option<[u8; 3]> {
+    let actor = state.scene.actors.get(idx)?;
+    let t = state.playhead;
+    let t_in = actor.t_in.unwrap_or(0.0);
+    let t_out = actor.t_out.unwrap_or(state.scene.output.duration);
+    let speed = actor.speed.max(0.0001);
+    let local_t = if t >= t_in && t <= t_out {
+        (t - t_in) * speed + actor.source_start
+    } else if t < t_in {
+        actor.source_start
+    } else {
+        actor.source_start + (t_out - t_in) * speed
+    };
+    let fc = state.frame_caches.get_mut(idx)?;
+    let img = fc.raw_frame_at_time(local_t)?;
+    let px = ((uv[0] * img.size[0] as f32) as usize).min(img.size[0].saturating_sub(1));
+    let py = ((uv[1] * img.size[1] as f32) as usize).min(img.size[1].saturating_sub(1));
+    let pixel = img.pixels[py * img.size[0] + px];
+    Some([pixel.r(), pixel.g(), pixel.b()])
+}
+
+/// Sample a single pixel from an image overlay's source PNG at the
+/// given UV. Loads the file directly (small sticker PNGs decode in
+/// milliseconds — same trade-off the existing
+/// `handle_eyedropper_click_overlay` makes). Text / video overlays
+/// don't have a single source colour so they short-circuit to
+/// `None`; the click-handler then surfaces a useful status line.
+fn sample_overlay_pixel(state: &EditorState, idx: usize, uv: [f32; 2]) -> Option<[u8; 3]> {
+    let overlay = state.scene.overlays.get(idx)?;
+    let path = match overlay {
+        memstroy_core::Overlay::Image(im) => im.source.clone(),
+        _ => return None,
+    };
+    let path_buf = if path.is_absolute() {
+        path
+    } else {
+        state.assets_root.join(path)
+    };
+    let rgba = image::open(&path_buf).ok()?.to_rgba8();
+    let w = rgba.width() as usize;
+    let h = rgba.height() as usize;
+    if w == 0 || h == 0 { return None; }
+    let px = ((uv[0] * w as f32) as usize).min(w - 1);
+    let py = ((uv[1] * h as f32) as usize).min(h - 1);
+    let raw = rgba.as_raw();
+    let i = (py * w + px) * 4;
+    Some([raw[i], raw[i + 1], raw[i + 2]])
+}
+
 /// Draw the in-progress mask shape on top of the canvas while the
 /// user is dragging. Visual only — committed shapes render through
 /// the live image-effects pipeline.
+///
+/// The UV→screen mapping rotates each point around the element's
+/// centre so the dashed preview tracks the *rotated* picture pixel
+/// for pixel. Without this the preview rectangle / ellipse / polyline
+/// floats axis-aligned over a rotated layer, which the user reported
+/// as "masks work poorly on rotated elements". The render side and
+/// the input side already operate in image-local UV (the input pipe
+/// inverse-rotates the pointer in `screen_to_element_uv`) so this
+/// preview alignment is the only piece that was missing.
 fn draw_mask_draft(
     painter: &egui::Painter,
     full_rect: Rect,
@@ -5502,11 +5681,21 @@ fn draw_mask_draft(
     else {
         return;
     };
+    let rotation_deg = selected_element_rotation_deg(state);
+    let center = elem_rect.center();
+    let half_w = elem_rect.width() * 0.5;
+    let half_h = elem_rect.height() * 0.5;
+    let theta = rotation_deg.to_radians();
+    let (s, c) = (theta.sin(), theta.cos());
+    // UV (0..1, image-local) → screen, applying the element's rotation
+    // around the centre. Identical to the inverse of
+    // `screen_to_element_uv` modulo the clamp.
     let to_screen = |uv: [f32; 2]| {
-        Pos2::new(
-            elem_rect.min.x + uv[0] * elem_rect.width(),
-            elem_rect.min.y + uv[1] * elem_rect.height(),
-        )
+        let lx = (uv[0] - 0.5) * 2.0 * half_w;
+        let ly = (uv[1] - 0.5) * 2.0 * half_h;
+        let rx = lx * c - ly * s;
+        let ry = lx * s + ly * c;
+        Pos2::new(center.x + rx, center.y + ry)
     };
     let stroke_main = Stroke::new(1.5, Color32::from_rgb(255, 200, 50));
     let stroke_dash = Stroke::new(1.0, Color32::from_rgba_premultiplied(255, 200, 50, 160));
@@ -5515,60 +5704,42 @@ fn draw_mask_draft(
         .last()
         .unwrap_or(&start_uv);
     match tool {
-        MaskTool::Crop | MaskTool::RectMask => {
-            let a = to_screen(start_uv);
-            let b = to_screen(last_uv);
-            let r = Rect::from_two_pos(a, b);
-            painter.rect_stroke(r, Rounding::ZERO, stroke_main);
-            // Dim the area being trimmed away so the user can preview
-            // the cropped result without committing.
-            if matches!(tool, MaskTool::Crop) {
-                let dim = Color32::from_rgba_premultiplied(0, 0, 0, 110);
-                let er = elem_rect;
-                if r.min.y > er.min.y {
-                    painter.rect_filled(
-                        Rect::from_min_max(er.min, Pos2::new(er.max.x, r.min.y)),
-                        Rounding::ZERO, dim);
-                }
-                if r.max.y < er.max.y {
-                    painter.rect_filled(
-                        Rect::from_min_max(Pos2::new(er.min.x, r.max.y), er.max),
-                        Rounding::ZERO, dim);
-                }
-                if r.min.x > er.min.x {
-                    painter.rect_filled(
-                        Rect::from_min_max(
-                            Pos2::new(er.min.x, r.min.y),
-                            Pos2::new(r.min.x, r.max.y),
-                        ),
-                        Rounding::ZERO, dim);
-                }
-                if r.max.x < er.max.x {
-                    painter.rect_filled(
-                        Rect::from_min_max(
-                            Pos2::new(r.max.x, r.min.y),
-                            Pos2::new(er.max.x, r.max.y),
-                        ),
-                        Rounding::ZERO, dim);
-                }
-            }
+        MaskTool::RectMask => {
+            // Draw the rectangle as a closed polyline in element-local
+            // UV so it rotates with the image. `Rect::from_two_pos`
+            // would axis-align it on screen; we want the four corners
+            // mapped through `to_screen` instead.
+            let lx = start_uv[0].min(last_uv[0]);
+            let rx = start_uv[0].max(last_uv[0]);
+            let ty = start_uv[1].min(last_uv[1]);
+            let by = start_uv[1].max(last_uv[1]);
+            let p00 = to_screen([lx, ty]);
+            let p10 = to_screen([rx, ty]);
+            let p11 = to_screen([rx, by]);
+            let p01 = to_screen([lx, by]);
+            painter.line_segment([p00, p10], stroke_main);
+            painter.line_segment([p10, p11], stroke_main);
+            painter.line_segment([p11, p01], stroke_main);
+            painter.line_segment([p01, p00], stroke_main);
         }
         MaskTool::EllipseMask => {
-            let a = to_screen(start_uv);
-            let b = to_screen(last_uv);
-            let r = Rect::from_two_pos(a, b);
-            // Approximate an ellipse with a dense polyline.
-            let cx = r.center().x;
-            let cy = r.center().y;
-            let rx = r.width() * 0.5;
-            let ry = r.height() * 0.5;
+            // Approximate an ellipse with a dense polyline IN UV
+            // space, then project each vertex through `to_screen` so
+            // the curve rotates with the picture.
+            let cx_uv = (start_uv[0] + last_uv[0]) * 0.5;
+            let cy_uv = (start_uv[1] + last_uv[1]) * 0.5;
+            let rx_uv = ((last_uv[0] - start_uv[0]).abs() * 0.5).max(0.001);
+            let ry_uv = ((last_uv[1] - start_uv[1]).abs() * 0.5).max(0.001);
             let segments = 64;
-            let mut prev = Pos2::new(cx + rx, cy);
+            let mut prev = to_screen([cx_uv + rx_uv, cy_uv]);
             for s in 1..=segments {
                 let theta = (s as f32 / segments as f32) * std::f32::consts::TAU;
-                let p = Pos2::new(cx + rx * theta.cos(), cy + ry * theta.sin());
-                painter.line_segment([prev, p], stroke_main);
-                prev = p;
+                let cur = to_screen([
+                    cx_uv + rx_uv * theta.cos(),
+                    cy_uv + ry_uv * theta.sin(),
+                ]);
+                painter.line_segment([prev, cur], stroke_main);
+                prev = cur;
             }
         }
         MaskTool::FreehandMask => {
@@ -5585,6 +5756,13 @@ fn draw_mask_draft(
                     painter.line_segment([prev, to_screen(first)], stroke_dash);
                 }
             }
+        }
+        MaskTool::Eyedropper => {
+            // The eyedropper commits on click via
+            // `handle_eyedropper_mask_click` — there is no drag draft
+            // to draw. The cursor reticle is painted by
+            // `draw_eyedropper_reticle` separately so it stays
+            // visible even when the gesture has not yet started.
         }
         MaskTool::None => {}
     }
