@@ -236,6 +236,66 @@ impl App {
                     self.state.refreshing = false;
                     self.state.status = format!("\u{274C} Refresh failed: {}", e);
                 }
+                JobEvent::WebSearchFinished(res) => {
+                    self.state.web_image_search.searching = false;
+                    match res {
+                        Ok(hits) => {
+                            let n = hits.len();
+                            self.state.web_image_search.results = hits;
+                            self.state.web_image_search.status = if n == 0 {
+                                "\u{1F50D} No results.".to_string()
+                            } else {
+                                format!("\u{2705} Got {} result(s).", n)
+                            };
+                        }
+                        Err(e) => {
+                            self.state.web_image_search.results.clear();
+                            self.state.web_image_search.status =
+                                format!("\u{274C} {}", e);
+                        }
+                    }
+                }
+                JobEvent::WebImageDownloaded {
+                    request_id: _,
+                    image_url,
+                    place_on_canvas,
+                    result,
+                } => {
+                    // Update the matching row in the panel (downloading
+                    // flag, local_path, last_error) regardless of
+                    // outcome so the spinner clears and the user can
+                    // see the error tooltip if any.
+                    crate::web_image_search::ingest_download_result(
+                        &mut self.state.web_image_search,
+                        &image_url,
+                        &result,
+                    );
+                    match result {
+                        Ok(asset) => {
+                            // Refresh library so the file appears on
+                            // the Images tab (matches Ctrl+V flow).
+                            self.state.reload_library();
+                            self.state.web_image_search.status = format!(
+                                "\u{2705} Saved \u{2192} {}",
+                                asset.label,
+                            );
+                            if place_on_canvas {
+                                let _idx =
+                                    self.state.add_image_overlay_at_playhead(&asset);
+                                self.state.library_tab =
+                                    crate::state::LibraryTab::Images;
+                                self.state.status = format!(
+                                    "\u{1F310} Web image \u{2192} {}",
+                                    asset.label,
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            self.state.web_image_search.status =
+                                format!("\u{274C} Download failed: {}", e);
+                        }
+                    }
+                }
             }
         }
     }
@@ -535,6 +595,42 @@ impl App {
                     }
                     ui.close_menu();
                 }
+                ui.separator();
+                if ui.button(t("\u{1F310} Web Image Search...")).clicked() {
+                    // Sibling to Skeleton Constructor — opens the
+                    // floating browser-lite panel. Kept here as well
+                    // as in the View menu because users tend to look
+                    // for "find an image" under Tools first.
+                    self.state.web_image_search_open = true;
+                    ui.close_menu();
+                }
+            });
+
+            // ── View menu ─────────────────────────────────────────
+            // Single home for every floating-window toggle in the
+            // editor. Adding new floating windows should only need a
+            // checkbox here.
+            ui.menu_button(RichText::new(t("\u{1F441} View")).strong(), |ui| {
+                ui.checkbox(
+                    &mut self.state.web_image_search_open,
+                    t("\u{1F310} Web Image Search"),
+                );
+                ui.checkbox(
+                    &mut self.state.node_editor_open,
+                    t("\u{1F517} Node Editor"),
+                );
+                ui.checkbox(
+                    &mut self.state.curve_editor_open,
+                    t("\u{1F4C8} Curve Editor"),
+                );
+                ui.checkbox(
+                    &mut self.state.clip_editor_open,
+                    t("\u{2702} Clip Editor"),
+                );
+                ui.checkbox(
+                    &mut self.state.skeleton_editor.open,
+                    t("\u{2692} Skeleton Editor"),
+                );
             });
 
             // Status indicator on the right
@@ -2259,6 +2355,13 @@ impl eframe::App for App {
         // Settings dialog (File > Settings...). Always called; the
         // function early-returns when `state.settings_open` is false.
         crate::settings::show_settings_dialog(ctx, &mut self.state, &mut self.audio_engine);
+
+        // Web image search floating window. Self-contained; the
+        // function early-returns when the toggle is off so this
+        // call is cheap on every frame.
+        if self.state.web_image_search_open {
+            crate::web_image_search::show_window(ctx, &mut self.state, &self.tx);
+        }
 
         // Repaint scheduling:
         // - When playing with ready frame cache: 16ms (~60fps)
