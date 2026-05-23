@@ -2,11 +2,12 @@
 //!
 //! All operations the GUI does are also exposed here for headless and
 //! scripted use:
-//!   `memstroy download` — pull every "Имба" clip from the channel.
-//!   `memstroy chroma`   — strip the green background from one clip.
-//!   `memstroy render`   — produce an MP4 from a scene description.
-//!   `memstroy preview`  — render one PNG frame from a scene.
-//!   `memstroy new`      — emit a starter scene.yaml.
+//!   `memstroy download`  — pull every "Имба" clip from the channel.
+//!   `memstroy chroma`    — strip the green background from one clip.
+//!   `memstroy remove-bg` — rembg-style ML matting (U²-Netp) on a still.
+//!   `memstroy render`    — produce an MP4 from a scene description.
+//!   `memstroy preview`   — render one PNG frame from a scene.
+//!   `memstroy new`       — emit a starter scene.yaml.
 
 use std::path::PathBuf;
 
@@ -63,6 +64,24 @@ enum Cmd {
         #[arg(long, default_value_t = 0.10)]
         blend: f32,
     },
+    /// Remove the background from a still image using the U²-Netp ONNX
+    /// model (rembg-style alpha matting). Outputs an RGBA PNG.
+    RemoveBg {
+        /// Source image (PNG / JPEG / WebP).
+        input: PathBuf,
+        /// Destination RGBA PNG.
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Path to the U²-Netp ONNX model. Download from
+        /// `https://github.com/danielgatis/rembg/releases` and place it
+        /// at the default location to avoid passing this flag.
+        #[arg(long, default_value = "assets/models/u2netp.onnx")]
+        model: PathBuf,
+        /// Optional saliency threshold in `[0, 1]`. When set above 0,
+        /// produces a hard binary cutout instead of the soft matte.
+        #[arg(long)]
+        threshold: Option<f32>,
+    },
     /// Render a scene file to MP4.
     Render {
         scene: PathBuf,
@@ -96,6 +115,9 @@ async fn main() -> Result<()> {
         }
         Cmd::Chroma { input, output, similarity, blend } => {
             run_chroma(input, output, similarity, blend).await
+        }
+        Cmd::RemoveBg { input, output, model, threshold } => {
+            run_remove_bg(input, output, model, threshold).await
         }
         Cmd::Render { scene, output, assets } => run_render(scene, output, assets).await,
         Cmd::Preview { scene, output, t, assets } => run_preview(scene, output, t, assets).await,
@@ -169,6 +191,30 @@ async fn run_chroma(input: PathBuf, output: PathBuf, similarity: f32, blend: f32
     if !status.success() {
         anyhow::bail!("ffmpeg chromakey failed: {:?}", status);
     }
+    Ok(())
+}
+
+async fn run_remove_bg(
+    input: PathBuf,
+    output: PathBuf,
+    model: PathBuf,
+    threshold: Option<f32>,
+) -> Result<()> {
+    use memstroy_vision::bgremove::{remove_background_to_file, BackgroundRemover, U2NetpBgRemover};
+
+    let mut remover = U2NetpBgRemover::new(model.clone());
+    if let Some(t) = threshold {
+        remover = remover.with_threshold(t);
+    }
+    info!(
+        backend = remover.id(),
+        model = %model.display(),
+        in_path = %input.display(),
+        out_path = %output.display(),
+        "running background removal"
+    );
+    remove_background_to_file(&remover, &input, &output).await?;
+    info!(out = %output.display(), "background removal complete");
     Ok(())
 }
 
