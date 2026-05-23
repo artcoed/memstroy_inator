@@ -317,6 +317,94 @@ pub enum SelectedLayer {
     Actor(usize),
     Overlay(usize),
     RenderFrame,
+    /// Audio track at the given index in `Scene::audio`. Audio kfs
+    /// live in dedicated per-param `Vec<Keyframe<f32>>` (volume_kfs,
+    /// speed_kfs, …) rather than a shared `layout`, so the
+    /// timeline / multi-select / delete / easing-change paths use
+    /// [`audio_param_kfs_mut`] to resolve the right vec from a
+    /// param id.
+    Audio(usize),
+}
+
+/// Recognised audio param ids. The strings match
+/// `AudioTrack::animated_params` membership.
+pub mod audio_param_ids {
+    pub const VOLUME: &str    = "volume";
+    pub const SPEED: &str     = "speed";
+    pub const PITCH: &str     = "pitch";
+    pub const PAN: &str       = "pan";
+    pub const LOW_PASS: &str  = "low_pass";
+    pub const HIGH_PASS: &str = "high_pass";
+    pub const REVERB: &str    = "reverb";
+
+    /// All audio params in inspector / timeline display order.
+    pub const ALL: &[&str] = &[
+        VOLUME, SPEED, PITCH, PAN, LOW_PASS, HIGH_PASS, REVERB,
+    ];
+
+    /// Human-readable label for an audio param id. Returns the id back
+    /// as a fallback for unknown / future ids.
+    pub fn label(id: &str) -> &'static str {
+        match id {
+            VOLUME    => "Volume",
+            SPEED     => "Speed",
+            PITCH     => "Pitch",
+            PAN       => "Pan",
+            LOW_PASS  => "Low-pass",
+            HIGH_PASS => "High-pass",
+            REVERB    => "Reverb",
+            _         => "param",
+        }
+    }
+}
+
+/// Resolve the `Vec<Keyframe<f32>>` track for one audio param. Returns
+/// `None` for unknown ids so callers can transparently skip the
+/// rendering / mutation step instead of panicking. Used by the
+/// timeline param-row pipeline for click / drag / easing / delete on
+/// audio keyframes.
+pub fn audio_param_kfs_mut<'a>(
+    audio: &'a mut memstroy_core::AudioTrack,
+    param_id: &str,
+) -> Option<&'a mut Vec<memstroy_core::Keyframe<f32>>> {
+    use audio_param_ids as p;
+    match param_id {
+        p::VOLUME    => Some(&mut audio.volume_kfs),
+        p::SPEED     => Some(&mut audio.speed_kfs),
+        p::PITCH     => Some(&mut audio.pitch_kfs),
+        p::PAN       => Some(&mut audio.pan_kfs),
+        p::LOW_PASS  => Some(&mut audio.low_pass_kfs),
+        p::HIGH_PASS => Some(&mut audio.high_pass_kfs),
+        p::REVERB    => Some(&mut audio.reverb_kfs),
+        _ => None,
+    }
+}
+
+/// Read-only counterpart to [`audio_param_kfs_mut`]. Used by the
+/// timeline param-row pipeline when building the
+/// `(local_t, scene_t)` change-point lists without mutating the
+/// scene.
+///
+/// **Currently unused** — the timeline path reads kfs through the
+/// `Scene` borrow directly (see `compute_param_change_points`). Kept
+/// public as a symmetric counterpart to `audio_param_kfs_mut` for
+/// future read-side callers.
+#[allow(dead_code)]
+pub fn audio_param_kfs<'a>(
+    audio: &'a memstroy_core::AudioTrack,
+    param_id: &str,
+) -> Option<&'a Vec<memstroy_core::Keyframe<f32>>> {
+    use audio_param_ids as p;
+    match param_id {
+        p::VOLUME    => Some(&audio.volume_kfs),
+        p::SPEED     => Some(&audio.speed_kfs),
+        p::PITCH     => Some(&audio.pitch_kfs),
+        p::PAN       => Some(&audio.pan_kfs),
+        p::LOW_PASS  => Some(&audio.low_pass_kfs),
+        p::HIGH_PASS => Some(&audio.high_pass_kfs),
+        p::REVERB    => Some(&audio.reverb_kfs),
+        _ => None,
+    }
 }
 
 /// Highlight target for the inspector when a kf was just clicked. The
@@ -344,36 +432,25 @@ impl KfHighlight {
     }
 }
 
-// ─── Per-parameter keyframe strip (inspector) ────────────────────────
+// ─── Per-parameter keyframe strip (inspector) — UNUSED SINCE 2026-05 ─
 //
-// A thin horizontal "ruler" drawn directly under a parameter widget.
-// Every keyframe of the parameter is rendered as a diamond at its
-// time-position; the user can:
+// A thin horizontal "ruler" used to be drawn directly under each
+// parameter widget in the inspector. The widget rendered every
+// keyframe as a diamond and supported click/drag/right-click for
+// time and easing edits.
 //
-//   • CLICK a diamond → seek the timeline playhead to that kf.
-//   • DRAG a diamond → move the kf along the time axis (clamped to
-//     `[0, duration]`).
-//   • RIGHT-CLICK a diamond → context menu to choose the interpolation
-//     curve coming INTO that kf (Linear / Ease in / Ease out / …).
-//
-// The widget is purely visual: it never owns the kf vector. The caller
-// passes in (time, easing) tuples and applies the interaction outcome
-// to its own data structure. This keeps it usable for the three
-// flavours of keyframe storage in the codebase without coupling:
-//
-//   1. `Vec<Keyframe<f32>>` (audio per-param, effect / colour-correction
-//      per-param via BTreeMap).
-//   2. `Vec<Keyframe<ActorState>>` / `Vec<Keyframe<OverlayState>>`
-//      (transform layouts, where the user's "per-param strip" filters
-//      to time-points where THIS param's value actually changes).
-//
-// Drag semantics for case 2: the strip operates on the SHARED kf time,
-// so moving it shifts every co-animated param at that time. This is a
-// pragmatic compromise — true per-param time-vectors would require a
-// schema migration.
+// Per the 2026-05 keyframe refactor, the inspector no longer
+// displays keyframes at all — they live exclusively in the
+// per-parameter rows under each element on the timeline (see
+// `panels.rs::draw_param_kf_rows`). The widget below is kept here
+// as a breadcrumb so a future contributor reaching for an in-line
+// keyframe ruler has a starting point, but it is currently **not
+// referenced** by any production code path. Hence the
+// `#[allow(dead_code)]` on the type and the function.
 
 /// Per-keyframe interaction reported back to the caller. Indices map
 /// 1:1 to the `(time, easing)` pairs the caller passed in.
+#[allow(dead_code)]
 #[derive(Default, Debug, Clone)]
 pub struct KfStripInteraction {
     /// Kf at this index was clicked (no drag, no modifier). Caller
@@ -393,6 +470,7 @@ pub struct KfStripInteraction {
 /// clip-local span the strip represents (left edge = 0s, right edge =
 /// duration). Pass `Some(playhead)` to draw a thin marker at the
 /// current clip-local playhead.
+#[allow(dead_code)]
 pub fn keyframe_strip(
     ui: &mut egui::Ui,
     times: &[f32],
@@ -548,6 +626,12 @@ pub fn keyframe_strip(
 /// persisted. Returns the new (still-valid) index of the kf the user
 /// interacted with — useful when the caller wants to keep tracking it
 /// after a sort. `None` when no interaction touched a kf.
+///
+/// Currently unused since the inspector strip helpers were retired in
+/// 2026-05. Retained alongside `keyframe_strip` as a self-contained
+/// reference implementation of "consume interaction outcome → mutate
+/// kfs" for any future consumer.
+#[allow(dead_code)]
 pub fn apply_strip_to_f32_kfs(
     kfs: &mut Vec<memstroy_core::Keyframe<f32>>,
     interaction: &KfStripInteraction,

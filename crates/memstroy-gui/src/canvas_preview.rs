@@ -3195,14 +3195,33 @@ fn apply_drag(
             // and overlays. Re-using the cached drag-start playhead
             // means the entire drag produces a single kf rather than
             // one per frame while playback is running.
+            //
+            // Routed through `kf_anim::write_render_frame_param` so the
+            // write is GATED on `render_frame.animated_params`. When
+            // POS_X / POS_Y aren't toggled animated, the new value is
+            // broadcast to every existing kf (static) instead of
+            // silently spawning a mid-track keyframe — that's what
+            // produced "parameter-less" diamonds during playback drags
+            // before this fix.
             let t = state.canvas_drag.drag_start_playhead.unwrap_or(state.playhead);
             let new_x = initial_pos[0] + world_dx;
             let new_y = initial_pos[1] + world_dy;
-            ensure_render_frame_kf_at_playhead(&mut state.scene.render_frame.layout, t);
-            apply_to_render_frame_kf(&mut state.scene.render_frame.layout, t, |v| {
-                v.pos.x = new_x;
-                v.pos.y = new_y;
-            });
+            crate::kf_anim::write_render_frame_param(
+                &mut state.scene.render_frame.layout,
+                &mut state.scene.render_frame.animated_params,
+                t,
+                memstroy_core::param_ids::POS_X,
+                false,
+                |v| v.pos.x = new_x,
+            );
+            crate::kf_anim::write_render_frame_param(
+                &mut state.scene.render_frame.layout,
+                &mut state.scene.render_frame.animated_params,
+                t,
+                memstroy_core::param_ids::POS_Y,
+                false,
+                |v| v.pos.y = new_y,
+            );
             // ── No child-compensation needed in v2 ──
             //
             // Element world positions are decoupled from the render
@@ -3229,10 +3248,18 @@ fn apply_drag(
                 let factor = (cur_dist / anchor_distance).max(0.05);
                 let new_zoom = (initial_zoom / factor).clamp(0.1, 10.0);
                 let t = state.canvas_drag.drag_start_playhead.unwrap_or(state.playhead);
-                ensure_render_frame_kf_at_playhead(&mut state.scene.render_frame.layout, t);
-                apply_to_render_frame_kf(&mut state.scene.render_frame.layout, t, |v| {
-                    v.zoom = new_zoom;
-                });
+                // Same gating as MoveRenderFrame above — the resize
+                // becomes static when SCALE isn't in
+                // `animated_params`, otherwise upserts a kf at the
+                // drag-start playhead.
+                crate::kf_anim::write_render_frame_param(
+                    &mut state.scene.render_frame.layout,
+                    &mut state.scene.render_frame.animated_params,
+                    t,
+                    memstroy_core::param_ids::SCALE,
+                    false,
+                    |v| v.zoom = new_zoom,
+                );
                 // Same as MoveRenderFrame above: no child compensation
                 // is needed in v2 because element world positions are
                 // independent of `rf.zoom`.
@@ -3766,11 +3793,22 @@ fn write_selection_world_center(
             );
         }
         Selection::RenderFrame => {
-            ensure_render_frame_kf_at_playhead(&mut state.scene.render_frame.layout, t);
-            apply_to_render_frame_kf(&mut state.scene.render_frame.layout, t, |v| {
-                v.pos.x = center[0];
-                v.pos.y = center[1];
-            });
+            crate::kf_anim::write_render_frame_param(
+                &mut state.scene.render_frame.layout,
+                &mut state.scene.render_frame.animated_params,
+                t,
+                memstroy_core::param_ids::POS_X,
+                false,
+                |v| v.pos.x = center[0],
+            );
+            crate::kf_anim::write_render_frame_param(
+                &mut state.scene.render_frame.layout,
+                &mut state.scene.render_frame.animated_params,
+                t,
+                memstroy_core::param_ids::POS_Y,
+                false,
+                |v| v.pos.y = center[1],
+            );
         }
         _ => {}
     }
@@ -3863,10 +3901,15 @@ fn write_selection_scale(
         }
         Selection::RenderFrame => {
             // Map scale → inverse zoom (bigger scale = bigger frame).
-            ensure_render_frame_kf_at_playhead(&mut state.scene.render_frame.layout, t);
-            apply_to_render_frame_kf(&mut state.scene.render_frame.layout, t, |v| {
-                v.zoom = (1.0 / s.max(1e-4)).clamp(0.001, 1000.0);
-            });
+            let new_zoom = (1.0 / s.max(1e-4)).clamp(0.001, 1000.0);
+            crate::kf_anim::write_render_frame_param(
+                &mut state.scene.render_frame.layout,
+                &mut state.scene.render_frame.animated_params,
+                t,
+                memstroy_core::param_ids::SCALE,
+                false,
+                |v| v.zoom = new_zoom,
+            );
         }
         _ => {}
     }
@@ -3920,10 +3963,14 @@ fn write_selection_rotation(
             );
         }
         Selection::RenderFrame => {
-            ensure_render_frame_kf_at_playhead(&mut state.scene.render_frame.layout, t);
-            apply_to_render_frame_kf(&mut state.scene.render_frame.layout, t, |v| {
-                v.rotation_deg = new_rot_deg;
-            });
+            crate::kf_anim::write_render_frame_param(
+                &mut state.scene.render_frame.layout,
+                &mut state.scene.render_frame.animated_params,
+                t,
+                memstroy_core::param_ids::ROTATION,
+                false,
+                |v| v.rotation_deg = new_rot_deg,
+            );
         }
         _ => {}
     }
@@ -3981,6 +4028,13 @@ fn ensure_canvas_kf_at_playhead(layout: &mut Vec<Keyframe<CanvasTransform>>, t: 
 /// eased current value. Used so that moving / resizing / rotating the
 /// render frame on the canvas at any playhead authors animation
 /// automatically (canvas-first workflow, same as actors / overlays).
+///
+/// **Unused** since the render-frame canvas drag handlers were routed
+/// through the gated [`crate::kf_anim::write_render_frame_param`] —
+/// kept here as a breadcrumb so a future contributor doesn't
+/// reintroduce parameter-less keyframe authoring (the bug we
+/// removed in this refactor).
+#[allow(dead_code)]
 fn ensure_render_frame_kf_at_playhead(layout: &mut Vec<Keyframe<RenderFrameState>>, t: f32) {
     if layout.is_empty() {
         layout.push(Keyframe::new(t, RenderFrameState::default()));
@@ -4030,6 +4084,9 @@ fn apply_to_overlay_kf<F: FnOnce(&mut OverlayState)>(
 /// Apply a closure to the render-frame keyframe at `t`. Falls back to the
 /// first keyframe when no exact match exists (mirrors the behaviour of
 /// `apply_to_anim_kf`).
+///
+/// **Unused** — see [`ensure_render_frame_kf_at_playhead`] for context.
+#[allow(dead_code)]
 fn apply_to_render_frame_kf<F: FnOnce(&mut RenderFrameState)>(
     layout: &mut Vec<Keyframe<RenderFrameState>>,
     t: f32,
