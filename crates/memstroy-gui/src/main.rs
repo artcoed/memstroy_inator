@@ -2,6 +2,7 @@
 
 mod app;
 mod audio_engine;
+mod build_info;
 mod canvas_preview;
 mod curve_editor;
 
