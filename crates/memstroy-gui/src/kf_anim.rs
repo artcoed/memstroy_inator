@@ -141,6 +141,49 @@ pub fn write_overlay_param<F>(
     }
 }
 
+/// Same as [`write_overlay_param`] but for a [`RenderFrame`]'s
+/// `Vec<Keyframe<RenderFrameState>>` plus its `animated_params` set.
+/// Mirrors the semantics: when the requested param is animated the
+/// edit upserts a kf at `t`, otherwise the value is broadcast to
+/// every kf so the param stays static across the whole scene.
+///
+/// The render frame uses the same `param_ids::POS_X` / `POS_Y` /
+/// `SCALE` / `ROTATION` namespace as actor / overlay layouts so the
+/// diamond toggle widget (`animated_toggle`) reads / writes the same
+/// well-known strings without any per-element re-mapping. `zoom` is
+/// what gets keyframed (the inspector's "scale" slider is just
+/// `1.0 / zoom`).
+pub fn write_render_frame_param<F>(
+    layout: &mut Vec<Keyframe<memstroy_core::RenderFrameState>>,
+    animated_params: &mut BTreeSet<String>,
+    t: f32,
+    param_id: &str,
+    auto_animate_on_canvas_drag: bool,
+    f: F,
+) where
+    F: Fn(&mut memstroy_core::RenderFrameState),
+{
+    if layout.is_empty() {
+        layout.push(Keyframe::new(0.0, memstroy_core::RenderFrameState::default()));
+    }
+    if auto_animate_on_canvas_drag && t > 1.0e-3 {
+        animated_params.insert(param_id.to_string());
+    }
+    let is_animated = animated_params.contains(param_id);
+    if is_animated {
+        let seed = keyframe::sample(layout, t)
+            .unwrap_or(memstroy_core::RenderFrameState::default());
+        let idx = upsert_index(layout, t, seed);
+        if let Some(kf) = layout.get_mut(idx) {
+            f(&mut kf.value);
+        }
+    } else {
+        for kf in layout.iter_mut() {
+            f(&mut kf.value);
+        }
+    }
+}
+
 /// Canvas-layout (free canvas v2) variant. Honours the host element's
 /// `animated_params` set — if no relevant param id is animated, the new
 /// value is broadcast to every kf in the layout (single static value);

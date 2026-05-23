@@ -751,7 +751,14 @@ impl EditorState {
         // verbatim in `strings(1)` over the binary.
         s.server_url = crate::build_info::default_server_url();
         s.tg_channel = "MELLSTROYfonz".to_string();
-        s.tg_limit = 80;
+        // Default catalogue depth for the "Refresh from Telegram"
+        // button. Set to 500 (was 80) so the first refresh on a
+        // fresh install pulls a real backlog of clips instead of
+        // the most recent handful — the user reported that the
+        // library showed only the latest few dozen even on
+        // channels with hundreds of posts. The server caps this on
+        // its side as well, so very large values are safe.
+        s.tg_limit = 500;
         s.prev_library_search = String::new();
         s.prev_library_search_tab = LibraryTab::Clips;
         s.last_auto_refresh = None;
@@ -1986,7 +1993,49 @@ pub struct CanvasDrag {
 pub struct SnapGuide {
     pub axis: SnapAxis,
     /// World coord (X for Vertical guides, Y for Horizontal guides).
+    /// Unused when `axis == SnapAxis::Line`; see `line_origin` /
+    /// `line_angle_rad` instead.
     pub world: f32,
+    /// World-space anchor for a free-orientation `Line` guide. The
+    /// guide passes through this point at angle `line_angle_rad`.
+    /// Defaults to the origin so `SnapGuide { axis, world }`-style
+    /// constructors keep working without explicit values.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub line_origin: [f32; 2],
+    /// Direction of the `Line` guide in radians, measured from the
+    /// world +X axis. Snapping projects onto the line perpendicularly.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub line_angle_rad: f32,
+}
+
+impl SnapGuide {
+    /// Convenience constructor for the common axis-aligned cases so
+    /// existing `SnapGuide { axis, world }` literals can migrate
+    /// incrementally without having to touch every callsite at once.
+    #[inline]
+    pub fn axis_aligned(axis: SnapAxis, world: f32) -> Self {
+        Self {
+            axis,
+            world,
+            line_origin: [0.0, 0.0],
+            line_angle_rad: 0.0,
+        }
+    }
+
+    /// Free-orientation guide: the line passes through `origin` at
+    /// `angle_rad`. Used when the render frame is rotated and we want
+    /// to snap to one of its rotated edges.
+    #[inline]
+    pub fn line(origin: [f32; 2], angle_rad: f32) -> Self {
+        Self {
+            axis: SnapAxis::Line,
+            world: 0.0,
+            line_origin: origin,
+            line_angle_rad: angle_rad,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1995,6 +2044,11 @@ pub enum SnapAxis {
     Vertical,
     /// Horizontal line at world Y = `world` — used to snap vertical positions.
     Horizontal,
+    /// Free-orientation line. The line passes through
+    /// `SnapGuide::line_origin` at `SnapGuide::line_angle_rad`. Used
+    /// for rotated render-frame edges so the user sees the actual
+    /// rotated guide rather than an axis-aligned approximation.
+    Line,
 }
 
 // ─── CLIPBOARD / MULTI-SELECTION TYPES ──────────────────────────────

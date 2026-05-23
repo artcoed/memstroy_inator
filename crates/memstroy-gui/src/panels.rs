@@ -4444,6 +4444,17 @@ fn inspector_text_overlay(
                              produces the uneven, line-following background look used on \
                              title-card memes.",
                         ));
+                        ui.selectable_value(
+                            &mut t.style.box_kind,
+                            TextBoxKind::FitText,
+                            crate::i18n::t("Fit text"),
+                        )
+                        .on_hover_text(crate::i18n::t(
+                            "Plate hugs the text glyphs as tightly as possible, ignoring \
+                             box_padding and box_extra_left/right. Use this when the user \
+                             wants a halo right around the text instead of a container-shaped \
+                             background.",
+                        ));
                         ui.selectable_value(&mut t.style.box_kind, TextBoxKind::None, crate::i18n::t("None (text only)"));
                     });
             });
@@ -4543,6 +4554,8 @@ const BUNDLED_FONTS: &[&str] = &[
 /// Inspector for the render frame (output area). Exposes position,
 /// rotation, and size in world pixels just like any other element.
 fn inspector_render_frame(ui: &mut egui::Ui, state: &mut EditorState) {
+    use crate::kf_anim;
+    use memstroy_core::param_ids;
     let rf_t_local = state.playhead;
     let rf = &mut state.scene.render_frame;
     // Output resolution is fixed at 1080x1920 — every export goes through
@@ -4573,68 +4586,131 @@ fn inspector_render_frame(ui: &mut egui::Ui, state: &mut EditorState) {
     );
     ui.add_space(8.0);
 
-    if let Some(kf) = rf.layout.first_mut() {
-        // ─── Position (world pixels) ────────────────────────────
-        ui.horizontal(|ui| {
-            ui.label(t("X:"));
-            ui.add(egui::DragValue::new(&mut kf.value.pos.x).speed(0.5));
-            ui.label(t("Y:"));
-            ui.add(egui::DragValue::new(&mut kf.value.pos.y).speed(0.5));
-        });
-        ui.add_space(4.0);
+    // Sample current values via the eased kf-aware sampler so the
+    // displayed numbers reflect the playhead position, just like the
+    // inspector does for actor / overlay layouts. Without this the
+    // widgets always showed the first kf's value, even when later
+    // kfs animated the frame off-screen.
+    let cur_state = memstroy_core::keyframe::sample(&rf.layout, rf_t_local)
+        .unwrap_or_default();
+    let mut new_pos_x = cur_state.pos.x;
+    let mut new_pos_y = cur_state.pos.y;
+    let mut new_rot = cur_state.rotation_deg;
+    // Inspector exposes the inverse of `zoom` as "Scale" — see the
+    // comment on the slider below.
+    let mut new_scale = 1.0_f32 / cur_state.zoom.max(1e-4);
 
-        // ─── Rotation ────────────────────────────────────────────
-        let mut new_rot = kf.value.rotation_deg;
-        ui.horizontal(|ui| {
-            ui.label(t("Rotation"));
-            let prev_rot = new_rot;
-            circular_rotation_widget(ui, ("rf_rot",), &mut new_rot, 80.0);
-            let mut dial_changed = (new_rot - prev_rot).abs() > 1.0e-4;
-            ui.vertical(|ui| {
-                let r = ui.add(
-                    egui::DragValue::new(&mut new_rot)
-                        .range(-3600.0..=3600.0)
-                        .speed(0.5)
-                        .suffix("\u{00B0}")
-                        .fixed_decimals(1),
-                );
-                if r.changed() { dial_changed = true; }
-                if ui.small_button("0\u{00B0}").clicked() {
-                    new_rot = 0.0;
-                    dial_changed = true;
-                }
-            });
-            if dial_changed {
-                kf.value.rotation_deg = new_rot;
+    // ─── Position ─────────────────────────────────────────────
+    ui.horizontal(|ui| {
+        kf_anim::animated_toggle(
+            ui,
+            &mut rf.animated_params,
+            param_ids::POS_X,
+            ("rf_pos_x",),
+        );
+        ui.label(t("X:"));
+        let r_x = ui.add(egui::DragValue::new(&mut new_pos_x).speed(0.5));
+        kf_anim::animated_toggle(
+            ui,
+            &mut rf.animated_params,
+            param_ids::POS_Y,
+            ("rf_pos_y",),
+        );
+        ui.label(t("Y:"));
+        let r_y = ui.add(egui::DragValue::new(&mut new_pos_y).speed(0.5));
+        if r_x.changed() {
+            kf_anim::write_render_frame_param(
+                &mut rf.layout,
+                &mut rf.animated_params,
+                rf_t_local,
+                param_ids::POS_X,
+                false,
+                |s| s.pos.x = new_pos_x,
+            );
+        }
+        if r_y.changed() {
+            kf_anim::write_render_frame_param(
+                &mut rf.layout,
+                &mut rf.animated_params,
+                rf_t_local,
+                param_ids::POS_Y,
+                false,
+                |s| s.pos.y = new_pos_y,
+            );
+        }
+    });
+    ui.add_space(4.0);
+
+    // ─── Rotation ─────────────────────────────────────────────
+    ui.horizontal(|ui| {
+        kf_anim::animated_toggle(
+            ui,
+            &mut rf.animated_params,
+            param_ids::ROTATION,
+            ("rf_rot",),
+        );
+        ui.label(t("Rotation"));
+        let prev_rot = new_rot;
+        circular_rotation_widget(ui, ("rf_rot",), &mut new_rot, 80.0);
+        let mut dial_changed = (new_rot - prev_rot).abs() > 1.0e-4;
+        ui.vertical(|ui| {
+            let r = ui.add(
+                egui::DragValue::new(&mut new_rot)
+                    .range(-3600.0..=3600.0)
+                    .speed(0.5)
+                    .suffix("\u{00B0}")
+                    .fixed_decimals(1),
+            );
+            if r.changed() { dial_changed = true; }
+            if ui.small_button("0\u{00B0}").clicked() {
+                new_rot = 0.0;
+                dial_changed = true;
             }
         });
-        ui.add_space(4.0);
-
-        // ─── Scale ──────────────────────────────────────────────
-        // Scale here is the inverse of the legacy `zoom` field: scale = 1
-        // means the frame's world size matches the output resolution 1:1;
-        // scale > 1 enlarges the frame on the canvas; scale < 1 shrinks
-        // it. We expose this as the user-facing concept because
-        // "scale" reads more intuitively for an animatable element than
-        // "zoom" did.
-        let mut scale = 1.0 / kf.value.zoom.max(1e-4);
-        if ui
-            .add(
-                egui::Slider::new(&mut scale, 0.1..=20.0)
-                    .text(t("Scale"))
-                    .logarithmic(true),
-            )
-            .changed()
-        {
-            kf.value.zoom = (1.0 / scale.max(1e-4)).clamp(0.001, 1000.0);
+        if dial_changed {
+            kf_anim::write_render_frame_param(
+                &mut rf.layout,
+                &mut rf.animated_params,
+                rf_t_local,
+                param_ids::ROTATION,
+                false,
+                |s| s.rotation_deg = new_rot,
+            );
         }
-    } else {
-        ui.label(
-            RichText::new(t("Render frame has no keyframes."))
-                .italics()
-                .color(COL_TEXT_DIM),
+    });
+    ui.add_space(4.0);
+
+    // ─── Scale (= 1 / zoom) ───────────────────────────────────
+    // Scale here is the inverse of the legacy `zoom` field: scale = 1
+    // means the frame's world size matches the output resolution 1:1;
+    // scale > 1 enlarges the frame on the canvas; scale < 1 shrinks
+    // it. We expose this as the user-facing concept because
+    // "scale" reads more intuitively for an animatable element than
+    // "zoom" did.
+    ui.horizontal(|ui| {
+        kf_anim::animated_toggle(
+            ui,
+            &mut rf.animated_params,
+            param_ids::SCALE,
+            ("rf_scale",),
         );
-    }
+        let r = ui.add(
+            egui::Slider::new(&mut new_scale, 0.1..=20.0)
+                .text(t("Scale"))
+                .logarithmic(true),
+        );
+        if r.changed() {
+            let new_zoom = (1.0 / new_scale.max(1e-4)).clamp(0.001, 1000.0);
+            kf_anim::write_render_frame_param(
+                &mut rf.layout,
+                &mut rf.animated_params,
+                rf_t_local,
+                param_ids::SCALE,
+                false,
+                |s| s.zoom = new_zoom,
+            );
+        }
+    });
 
     // ─── Per-param keyframe strips ──────────────────────────────
     // Render-frame keyframes show up in the inspector exactly like a
@@ -7278,7 +7354,12 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                 egui::pos2(tracks_rect.max.x, row_bot),
             );
             let painter_rf = &tracks_painter;
-            let rf_selected = state.selection == Selection::RenderFrame;
+            // The render frame row participates in the canvas multi-
+            // selection just like every other layer — highlight the
+            // row whenever it's the primary selection OR it's part of
+            // a marquee / Ctrl-click multi-selection set.
+            let rf_selected = state.selection == Selection::RenderFrame
+                || state.canvas_selection.contains(&Selection::RenderFrame);
             let bg_color = if rf_selected {
                 Color32::from_rgb(58, 38, 38)
             } else {
@@ -7432,7 +7513,18 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                         // Cull off-screen background clips before any
                         // per-clip allocation / interaction work.
                         if !in_viewport(clip_start, clip_end) { continue; }
-                        let sel = state.selection == Selection::Background(bi);
+                        // Highlight the layer row when EITHER the primary
+                        // selection points at this background OR the
+                        // multi-selection set contains it. Without the
+                        // second check, only the primary item ever lit
+                        // up while a marquee / Ctrl-click selection had
+                        // grabbed several items — the user reported
+                        // that "the layers panel still shows just one
+                        // selected" even though the canvas correctly
+                        // outlines all of them.
+                        let target_sel = Selection::Background(bi);
+                        let sel = state.selection == target_sel
+                            || state.canvas_selection.contains(&target_sel);
                         let bg_id = egui::Id::new(("timeline_clip", "background", bi));
                         if let Some(clicked) = draw_clip(ui, painter, content_rect, &bg_elem.id, bg_id,
                             clip_start, clip_end, state.timeline_scroll, pps, track_left, track_right,
@@ -7546,7 +7638,15 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                     let trans_in = actor.transition_in;
                     let trans_out = actor.transition_out;
                     let trans_dur = actor.transition_duration;
-                    let sel = state.selection == Selection::Actor(ai);
+                    // See the matching comment in the Background branch:
+                    // a layer row is highlighted when EITHER the primary
+                    // selection or the canvas multi-selection contains
+                    // this actor. This restores the "all selected
+                    // clips light up in the layers panel" behaviour the
+                    // user reported as broken after marquee select.
+                    let target_sel = Selection::Actor(ai);
+                    let sel = state.selection == target_sel
+                        || state.canvas_selection.contains(&target_sel);
                     let actor_id = egui::Id::new(("timeline_clip", "actor", ai));
                     if let Some(clicked) = draw_clip(ui, painter, content_rect, &actor.id, actor_id,
                         clip_start, clip_end, state.timeline_scroll, pps, track_left, track_right,
@@ -7873,7 +7973,12 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                         Overlay::Video(v) => (v.t_in, v.t_out, format!("V: {}", v.id)),
                     };
                     if !in_viewport(clip_start, clip_end) { continue; }
-                    let sel = state.selection == Selection::Overlay(oi);
+                    // See the matching comment in the Background branch
+                    // above. Highlight the row when it's the primary
+                    // selection OR is part of the canvas multi-selection.
+                    let target_sel = Selection::Overlay(oi);
+                    let sel = state.selection == target_sel
+                        || state.canvas_selection.contains(&target_sel);
                     let ov_id = egui::Id::new(("timeline_clip", "overlay", oi));
                     if let Some(clicked) = draw_clip(ui, painter, content_rect, &label, ov_id,
                         clip_start, clip_end, state.timeline_scroll, pps, track_left, track_right,
@@ -8096,7 +8201,11 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                     let audio_source_start = audio.source_start;
                     let audio_speed = audio.speed;
                     if !in_viewport(clip_start, clip_end) { continue; }
-                    let sel = state.selection == Selection::Audio(aui);
+                    // Highlight when this audio is either the primary
+                    // selection or in the canvas multi-selection set.
+                    let target_sel = Selection::Audio(aui);
+                    let sel = state.selection == target_sel
+                        || state.canvas_selection.contains(&target_sel);
                     let audio_id = egui::Id::new(("timeline_clip", "audio", aui));
                     if let Some(clicked) = draw_audio_clip(ui, painter, content_rect, &audio.id, audio_id,
                         clip_start, clip_end, state.timeline_scroll, pps, track_left, track_right,
