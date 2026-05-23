@@ -473,15 +473,22 @@ fn overlay_world_aabb(state: &EditorState, idx: usize) -> Option<([f32; 2], [f32
         else if t < t_in { 0.0 } else { (t_out - t_in).max(0.0) };
     let ov_state = keyframe::sample(layout, sample_t).unwrap_or_default();
 
-    let rf = &state.scene.render_frame;
-    let rf_state = sample_render_frame(rf, t);
-    let [rw, rh] = rf.resolution;
-    let world_w = rw as f32 / rf_state.zoom.max(1e-6);
-    let world_h = rh as f32 / rf_state.zoom.max(1e-6);
-    let frame_tl_x = rf_state.pos.x - world_w * 0.5;
-    let frame_tl_y = rf_state.pos.y - world_h * 0.5;
-    let center_x = frame_tl_x + ov_state.pos[0] * world_w;
-    let center_y = frame_tl_y + ov_state.pos[1] * world_h;
+    // ── World position is decoupled from the render frame ──
+    //
+    // The legacy `pos` field is a `[0..1]` vector interpreted against
+    // a FIXED reference rectangle of size `output.resolution` anchored
+    // at world (0, 0). Editing the render frame (move / resize /
+    // rotate) therefore no longer drags this overlay along on the
+    // canvas — exactly the contract the user asked for ("область
+    // рендера — самостоятельный отдельный независимый элемент"). The
+    // rf is now a pure viewport / camera over the world; what gets
+    // captured to the output is the `[w, h]` rectangle around `rf.pos`
+    // (rotated and scaled by the rf's own state).
+    let [out_w, out_h] = state.scene.render_frame.resolution;
+    let world_w = out_w as f32;
+    let world_h = out_h as f32;
+    let center_x = ov_state.pos[0] * world_w;
+    let center_y = ov_state.pos[1] * world_h;
 
     // Use the texture-aware bbox so image overlays use real PNG
     // dimensions (not the legacy 200×200 placeholder), keeping the
@@ -1537,18 +1544,21 @@ fn draw_canvas_overlays(
         ov_state.rotation_deg += mod_delta.d_rotation_deg;
 
         let rf = &state.scene.render_frame;
-        let rf_state = sample_render_frame(rf, t);
+        // World-space size of the FIXED reference rectangle that the
+        // legacy normalised `pos` is interpreted against. Decoupled
+        // from the live render frame: editing rf.pos / rf.zoom no
+        // longer drags this overlay along on the canvas. The rf is a
+        // pure camera viewport — its parameters change WHAT gets
+        // captured to the output, not WHERE world-space layers sit.
         let [rw, rh] = rf.resolution;
-        let world_w = rw as f32 / rf_state.zoom;
-        let world_h = rh as f32 / rf_state.zoom;
-        let frame_tl_x = rf_state.pos.x - world_w * 0.5;
-        let frame_tl_y = rf_state.pos.y - world_h * 0.5;
+        let world_w = rw as f32;
+        let world_h = rh as f32;
 
         // Default world position from layout. Modifier offsets and any
         // skeleton attachment can override / shift it.
         let mut world_pos = WorldPos {
-            x: frame_tl_x + ov_state.pos[0] * world_w + mod_delta.dx,
-            y: frame_tl_y + ov_state.pos[1] * world_h + mod_delta.dy,
+            x: ov_state.pos[0] * world_w + mod_delta.dx,
+            y: ov_state.pos[1] * world_h + mod_delta.dy,
         };
 
         // Skeleton attachment: if this overlay is bound to a host actor's
@@ -2484,24 +2494,33 @@ fn get_element_world_pos(
         }
     }
 
-    // Fallback: convert legacy normalised coords to world pixels
-    // Legacy coords are [0,1] relative to the output resolution
+    // Fallback: convert legacy normalised coords to world pixels.
+    //
+    // ── Render-frame is decoupled from the world ──
+    //
+    // `pos` is interpreted against a FIXED reference rectangle of
+    // size `render_frame.resolution` anchored at world (0, 0). It
+    // does NOT depend on the live `rf.pos` / `rf.zoom` / `rf.rotation`
+    // — moving / scaling / rotating the rf no longer drags this
+    // element on the canvas. The rf is a pure camera viewport: its
+    // state determines what region of the world gets captured into
+    // the output, never where world-space elements sit.
     let rf = &state.scene.render_frame;
-    let rf_state = sample_render_frame(rf, t);
     let [rw, rh] = rf.resolution;
-    let world_w = rw as f32 / rf_state.zoom;
-    let world_h = rh as f32 / rf_state.zoom;
+    let world_w = rw as f32;
+    let world_h = rh as f32;
 
     if let Some(actor_state) = keyframe::sample(legacy_layout, t) {
-        // Convert normalised [0,1] to world pixels relative to render frame
-        let frame_tl_x = rf_state.pos.x - world_w * 0.5;
-        let frame_tl_y = rf_state.pos.y - world_h * 0.5;
         WorldPos {
-            x: frame_tl_x + actor_state.pos[0] * world_w,
-            y: frame_tl_y + actor_state.pos[1] * world_h,
+            x: actor_state.pos[0] * world_w,
+            y: actor_state.pos[1] * world_h,
         }
     } else {
-        rf_state.pos // default to center of render frame
+        // Default world centre = centre of the reference rectangle.
+        WorldPos {
+            x: world_w * 0.5,
+            y: world_h * 0.5,
+        }
     }
 }
 
@@ -2589,28 +2608,23 @@ fn draw_selection_gizmo(
             state.canvas_drag.drag_start_playhead = Some(state.playhead);
             state.canvas_drag.was_playing_at_drag_start = state.playing;
 
-            // ── Render-frame drags must KEEP child elements visually
-            // ── pinned to the canvas. ──
-            // Overlays (and legacy actors without a canvas_layouts
-            // entry) store their `pos` as a normalised [0..1] vector
-            // relative to the render frame. If we leave that alone
-            // while the user drags the frame, every child rides along
-            // with the frame — which is NOT what users expect when
-            // they "grab the output region rectangle". So at drag
-            // start we snapshot every child's WORLD position and on
-            // every drag tick we re-derive their normalised `pos` so
-            // the world position survives. The compensation is
-            // applied in `apply_drag`'s MoveRenderFrame / ResizeRenderFrame
-            // arms after the frame's new state is written.
+            // ── Render-frame drags are self-contained ──
+            //
+            // The render frame became a fully independent element in
+            // scene v2 (see `Scene::migrate_decouple_render_frame`):
+            // its position / zoom / rotation no longer feed into any
+            // child's world-pixel layout. So a drag on the rf no
+            // longer needs the elaborate "snapshot every child's
+            // world pos so we can re-derive their normalised pos
+            // against the new frame state" dance — we just write the
+            // new rf state and let the canvas redraw.
             use crate::state::CanvasDragMode;
             match state.canvas_drag.mode {
                 CanvasDragMode::MoveRenderFrame { .. }
                 | CanvasDragMode::ResizeRenderFrame { .. } => {
                     state.selection = Selection::RenderFrame;
-                    state.canvas_drag.actor_legacy_snapshot =
-                        snapshot_legacy_actor_world_positions(state);
-                    state.canvas_drag.overlay_world_snapshot =
-                        snapshot_overlay_world_positions(state);
+                    state.canvas_drag.actor_legacy_snapshot.clear();
+                    state.canvas_drag.overlay_world_snapshot.clear();
                 }
                 CanvasDragMode::Marquee { start_world, .. } => {
                     // Initialise the live marquee at a zero-size box on
@@ -3189,10 +3203,18 @@ fn apply_drag(
                 v.pos.x = new_x;
                 v.pos.y = new_y;
             });
-            // Keep every child element pinned to its drag-start world
-            // position by re-deriving their normalised `pos` against
-            // the new frame state.
-            compensate_children_after_render_frame_change(state, t);
+            // ── No child-compensation needed in v2 ──
+            //
+            // Element world positions are decoupled from the render
+            // frame (see `migrate_decouple_render_frame` in
+            // memstroy-core/scene.rs and the formula in
+            // `get_element_world_pos`): they're a fixed multiple of
+            // `render_frame.resolution` and do not depend on
+            // `rf.pos` / `rf.zoom`. So moving the render frame on
+            // canvas no longer drags any child elements with it —
+            // the rf is a self-contained camera viewport now and the
+            // explicit "snapshot world pos / re-derive norm" pass
+            // that v1 needed is gone with it.
         }
 
         CanvasDragMode::ResizeRenderFrame { initial_zoom, anchor_distance } => {
@@ -3211,7 +3233,9 @@ fn apply_drag(
                 apply_to_render_frame_kf(&mut state.scene.render_frame.layout, t, |v| {
                     v.zoom = new_zoom;
                 });
-                compensate_children_after_render_frame_change(state, t);
+                // Same as MoveRenderFrame above: no child compensation
+                // is needed in v2 because element world positions are
+                // independent of `rf.zoom`.
             }
         }
 
@@ -3439,16 +3463,15 @@ fn current_selection_world_center(state: &EditorState) -> Option<[f32; 2]> {
                 Overlay::Video(v) => &v.layout,
             };
             let ov_state = keyframe::sample(layout, local_t).unwrap_or_default();
-            let rf = &state.scene.render_frame;
-            let rf_state = sample_render_frame(rf, t);
-            let [rw, rh] = rf.resolution;
-            let world_w = rw as f32 / rf_state.zoom;
-            let world_h = rh as f32 / rf_state.zoom;
-            let frame_tl_x = rf_state.pos.x - world_w * 0.5;
-            let frame_tl_y = rf_state.pos.y - world_h * 0.5;
+            // Decoupled-from-rf world position (see comments on the
+            // matching maths in `draw_canvas_overlays` and
+            // `get_element_world_pos`).
+            let [rw, rh] = state.scene.render_frame.resolution;
+            let world_w = rw as f32;
+            let world_h = rh as f32;
             Some([
-                frame_tl_x + ov_state.pos[0] * world_w,
-                frame_tl_y + ov_state.pos[1] * world_h,
+                ov_state.pos[0] * world_w,
+                ov_state.pos[1] * world_h,
             ])
         }
         Selection::RenderFrame => {
@@ -3696,16 +3719,16 @@ fn write_selection_world_center(
                 );
                 return;
             }
-            // Legacy normalised: convert to render-frame-relative.
-            let rf = &state.scene.render_frame;
-            let rf_state = sample_render_frame(rf, t);
-            let [rw, rh] = rf.resolution;
-            let world_w = rw as f32 / rf_state.zoom;
-            let world_h = rh as f32 / rf_state.zoom;
-            let frame_tl_x = rf_state.pos.x - world_w * 0.5;
-            let frame_tl_y = rf_state.pos.y - world_h * 0.5;
+            // Legacy normalised: convert world centre to a normalised
+            // pos against the FIXED reference rectangle (size =
+            // `render_frame.resolution`). Decoupled from the live rf
+            // — moving / resizing / rotating the rf no longer
+            // perturbs this actor's authored position.
+            let [rw, rh] = state.scene.render_frame.resolution;
+            let world_w = rw as f32;
+            let world_h = rh as f32;
             if world_w <= 0.0 || world_h <= 0.0 { return; }
-            let new_norm = [(center[0] - frame_tl_x) / world_w, (center[1] - frame_tl_y) / world_h];
+            let new_norm = [center[0] / world_w, center[1] / world_h];
             let actor = &mut state.scene.actors[idx];
             crate::kf_anim::write_actor_param(
                 &mut actor.layout, &mut actor.animated_params, t,
@@ -3720,15 +3743,13 @@ fn write_selection_world_center(
         }
         Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
             let local_t = overlay_clip_local_time_at(state, idx, t);
-            let rf = &state.scene.render_frame;
-            let rf_state = sample_render_frame(rf, t);
-            let [rw, rh] = rf.resolution;
-            let world_w = rw as f32 / rf_state.zoom;
-            let world_h = rh as f32 / rf_state.zoom;
-            let frame_tl_x = rf_state.pos.x - world_w * 0.5;
-            let frame_tl_y = rf_state.pos.y - world_h * 0.5;
+            // Same decoupled-from-rf world→norm conversion as the
+            // actor branch above.
+            let [rw, rh] = state.scene.render_frame.resolution;
+            let world_w = rw as f32;
+            let world_h = rh as f32;
             if world_w <= 0.0 || world_h <= 0.0 { return; }
-            let new_norm = [(center[0] - frame_tl_x) / world_w, (center[1] - frame_tl_y) / world_h];
+            let new_norm = [center[0] / world_w, center[1] / world_h];
             let (layout, animated_params) =
                 overlay_layout_and_animated_mut(&mut state.scene.overlays[idx]);
             crate::kf_anim::write_overlay_param(
@@ -4024,139 +4045,23 @@ fn apply_to_render_frame_kf<F: FnOnce(&mut RenderFrameState)>(
     }
 }
 
-// ─── RENDER-FRAME CHILD COMPENSATION ─────────────────────────────────
+// ─── RENDER-FRAME CHILD COMPENSATION (REMOVED IN SCENE V2) ───────────
 //
-// When the user drags the render frame (move or resize), we want the
-// elements that LIVE INSIDE the frame to stay visually pinned to their
-// original world position — the user is reframing the output region, not
-// re-arranging the scene contents. Overlays and legacy actors store
-// their `pos` as a normalised [0..1] vector relative to the render
-// frame, so a frame move would otherwise drag every child along.
+// Scene v1 stored every overlay / legacy actor's `pos` as a normalised
+// `[0..1]` vector relative to the live render frame. Dragging or
+// resizing the rf therefore shifted every child along with it, so the
+// editor needed an explicit "snapshot world pos at drag start →
+// re-derive normalised pos against the new frame state" compensation
+// pass to keep children visually pinned.
 //
-// Approach:
-//   1. At drag start, snapshot every child's CURRENT world position
-//      (before the frame moves) into the canvas drag state.
-//   2. After every drag tick that mutates the render frame, re-derive
-//      each child's normalised `pos` from the snapshotted world point
-//      against the NEW frame state — so the world point is preserved.
-
-/// Snapshot the world position of every overlay relative to the render
-/// frame at the drag-start playhead. Skipped for overlays attached to a
-/// skeleton point (those are positioned by a different mechanism and
-/// would fight the compensation).
-fn snapshot_overlay_world_positions(state: &EditorState) -> Vec<(usize, [f32; 2])> {
-    let mut out = Vec::new();
-    let t = state.playhead;
-    let rf = &state.scene.render_frame;
-    let rf_state = sample_render_frame(rf, t);
-    let [rw, rh] = rf.resolution;
-    let world_w = rw as f32 / rf_state.zoom.max(1e-6);
-    let world_h = rh as f32 / rf_state.zoom.max(1e-6);
-    let frame_tl_x = rf_state.pos.x - world_w * 0.5;
-    let frame_tl_y = rf_state.pos.y - world_h * 0.5;
-
-    for (idx, overlay) in state.scene.overlays.iter().enumerate() {
-        // Skeleton-attached overlays follow their host bone; leave them
-        // alone or the compensation would fight the attachment.
-        let attached = match overlay {
-            Overlay::Text(t) => t.skeleton_attachment.is_some(),
-            Overlay::Image(im) => im.skeleton_attachment.is_some(),
-            Overlay::Video(v) => v.skeleton_attachment.is_some(),
-        };
-        if attached { continue; }
-        let (t_in, t_out, layout) = match overlay {
-            Overlay::Text(t) => (t.t_in, t.t_out, &t.layout),
-            Overlay::Image(im) => (im.t_in, im.t_out, &im.layout),
-            Overlay::Video(v) => (v.t_in, v.t_out, &v.layout),
-        };
-        let sample_t = if t >= t_in && t <= t_out { t - t_in }
-            else if t < t_in { 0.0 } else { (t_out - t_in).max(0.0) };
-        let ov_state = keyframe::sample(layout, sample_t).unwrap_or_default();
-        let world_x = frame_tl_x + ov_state.pos[0] * world_w;
-        let world_y = frame_tl_y + ov_state.pos[1] * world_h;
-        out.push((idx, [world_x, world_y]));
-    }
-    out
-}
-
-/// Snapshot the world position of every actor that is using the LEGACY
-/// normalised layout (i.e. has no entry in `canvas_layouts`). Actors
-/// already pinned via canvas_layouts are world-pixel anchored and don't
-/// need compensation.
-fn snapshot_legacy_actor_world_positions(state: &EditorState) -> Vec<(usize, [f32; 2])> {
-    let mut out = Vec::new();
-    let t = state.playhead;
-    for (idx, actor) in state.scene.actors.iter().enumerate() {
-        if state.scene.canvas_layouts.iter().any(|cl| cl.element_id == actor.id) {
-            continue;
-        }
-        let world_pos = get_element_world_pos(state, &actor.id, &actor.layout, t);
-        out.push((idx, [world_pos.x, world_pos.y]));
-    }
-    out
-}
-
-/// After the render-frame keyframe at `t` was just mutated, re-derive
-/// the normalised `pos` of every snapshotted child so they land on the
-/// SAME world coordinate as before the mutation. Called at the end of
-/// MoveRenderFrame / ResizeRenderFrame `apply_drag` arms.
-fn compensate_children_after_render_frame_change(state: &mut EditorState, t: f32) {
-    let rf_state_new = sample_render_frame(&state.scene.render_frame, t);
-    let [rw, rh] = state.scene.render_frame.resolution;
-    let world_w = (rw as f32 / rf_state_new.zoom.max(1e-6)).max(1e-3);
-    let world_h = (rh as f32 / rf_state_new.zoom.max(1e-6)).max(1e-3);
-    let frame_tl_x = rf_state_new.pos.x - world_w * 0.5;
-    let frame_tl_y = rf_state_new.pos.y - world_h * 0.5;
-
-    // Overlays — pos[0]/[1] are normalised [0..1] relative to the frame.
-    let overlay_snap = state.canvas_drag.overlay_world_snapshot.clone();
-    for (idx, world_xy) in overlay_snap {
-        if let Some(overlay) = state.scene.overlays.get_mut(idx) {
-            let (t_in, t_out, layout) = match overlay {
-                Overlay::Text(o) => (o.t_in, o.t_out, &mut o.layout),
-                Overlay::Image(o) => (o.t_in, o.t_out, &mut o.layout),
-                Overlay::Video(o) => (o.t_in, o.t_out, &mut o.layout),
-            };
-            let sample_t = if t >= t_in && t <= t_out { t - t_in }
-                else if t < t_in { 0.0 } else { (t_out - t_in).max(0.0) };
-            let new_norm_x = (world_xy[0] - frame_tl_x) / world_w;
-            let new_norm_y = (world_xy[1] - frame_tl_y) / world_h;
-            // Insert a kf at sample_t (seeded with the current eased
-            // value) when one isn't already there, then write the
-            // compensated pos to it. The previous "closest within 0.5s"
-            // heuristic silently no-op'd whenever the playhead sat in
-            // the middle of a long segment, which is the bug the user
-            // saw as "elements drift along with the render frame".
-            ensure_overlay_kf_at_playhead(layout, sample_t);
-            let eps = 1.0e-3;
-            if let Some(kf) = layout.iter_mut().find(|kf| (kf.t - sample_t).abs() < eps) {
-                kf.value.pos[0] = new_norm_x;
-                kf.value.pos[1] = new_norm_y;
-            }
-        }
-    }
-
-    // Legacy actors — same idea, but the layout is on the actor itself.
-    let actor_snap = state.canvas_drag.actor_legacy_snapshot.clone();
-    for (idx, world_xy) in actor_snap {
-        if let Some(actor) = state.scene.actors.get_mut(idx) {
-            let new_norm_x = (world_xy[0] - frame_tl_x) / world_w;
-            let new_norm_y = (world_xy[1] - frame_tl_y) / world_h;
-            // Same upsert pattern — guarantee a kf at scene-time `t`
-            // before writing so compensation always lands on the right
-            // moment instead of polluting whatever kf happened to be
-            // closest. Without this the actor's first kf would be
-            // mutated even when the playhead is many seconds away,
-            // which made the actor visibly snap to a new spot at t=0.
-            ensure_actor_kf_at_playhead(&mut actor.layout, t);
-            let eps = 1.0e-3;
-            if let Some(kf) = actor.layout.iter_mut().find(|kf| (kf.t - t).abs() < eps) {
-                kf.value.pos[0] = new_norm_x;
-                kf.value.pos[1] = new_norm_y;
-            }
-        }
-    }
-}
+// In scene v2 (`Scene::migrate_decouple_render_frame`) the same `pos`
+// channel is interpreted against a FIXED reference rectangle of size
+// `render_frame.resolution` anchored at world (0, 0). Element world
+// positions no longer depend on `rf.pos` / `rf.zoom` / `rf.rotation`,
+// so child compensation is a no-op by construction — and the helpers
+// that drove it (`snapshot_overlay_world_positions`,
+// `snapshot_legacy_actor_world_positions`,
+// `compensate_children_after_render_frame_change`) have been removed.
 
 #[allow(dead_code)]
 fn overlay_layout_mut(overlay: &mut Overlay) -> &mut Vec<Keyframe<OverlayState>> {
