@@ -72,8 +72,12 @@ if ([string]::IsNullOrWhiteSpace($BundleDir) -and [string]::IsNullOrWhiteSpace($
 # ── Build the bundle if not pre-supplied ────────────────────────────
 if ([string]::IsNullOrWhiteSpace($BundleDir)) {
     Write-Host "==> building client bundle via scripts/package-client.ps1"
-    $pkgArgs = @("-ServerUrl", $ServerUrl)
-    if ($AllowLoopback) { $pkgArgs += "-AllowLoopback" }
+    # Use hashtable splatting so named parameters (-ServerUrl, -AllowLoopback)
+    # bind by name regardless of the receiving script's positional rules.
+    # Array splatting can mis-bind "-ServerUrl" as the *value* of $ServerUrl
+    # when the target parameter has an implicit position.
+    $pkgArgs = @{ ServerUrl = $ServerUrl }
+    if ($AllowLoopback) { $pkgArgs.AllowLoopback = $true }
     & (Join-Path $ScriptDir "package-client.ps1") @pkgArgs
     if ($LASTEXITCODE -ne 0) { throw "package-client.ps1 failed" }
 
