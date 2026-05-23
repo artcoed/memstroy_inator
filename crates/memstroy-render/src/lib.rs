@@ -20,9 +20,11 @@ pub mod filtergraph;
 pub mod runner;
 pub mod fonts;
 pub mod text_rasterize;
+pub mod proc;
 
 pub use plan::*;
 pub use filtergraph::*;
 pub use runner::*;
 pub use fonts::*;
 pub use text_rasterize::*;
+pub use proc::*;

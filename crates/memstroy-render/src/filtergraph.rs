@@ -932,11 +932,16 @@ impl<'a> FilterGraphBuilder<'a> {
         let has_rotation = camera.iter().any(|kf| kf.value.rotation_deg.abs() > 0.01);
 
         if has_rotation {
-            // With rotation: use rotate filter before crop
+            // With rotation: use rotate filter before crop. Wrap the
+            // angle expression in single quotes — when keyframes
+            // produce piecewise `if(lt(t,…),…,…)` expressions the
+            // commas inside would otherwise be parsed as filter-chain
+            // separators by FFmpeg, breaking the entire graph with
+            // "No option name near 'none:ow=iw:oh=ih'".
             let rot_rad = format!("({})*PI/180", rot_expr);
             let rot_label = self.alloc_label("rot");
             self.chunks.push(format!(
-                "{cur}rotate={rad}:c=none:ow=iw:oh=ih{out}",
+                "{cur}rotate='{rad}':ow=iw:oh=ih:c=none{out}",
                 cur = self.cursor,
                 rad = rot_rad,
                 out = rot_label,
@@ -1009,10 +1014,15 @@ impl<'a> FilterGraphBuilder<'a> {
 
         let has_rotation = rf.layout.iter().any(|kf| kf.value.rotation_deg.abs() > 0.01);
         if has_rotation {
+            // Wrap the angle expression in single quotes so the
+            // piecewise `if(lt(t,…),…,…)` commas don't get parsed as
+            // filter-chain separators. Without the quotes FFmpeg fails
+            // with "No option name near 'none:ow=iw:oh=ih'" the moment
+            // the user keyframes a non-zero render-frame rotation.
             let rot_rad = format!("({})*PI/180", rot_expr);
             let rot_label = self.alloc_label("rfrot");
             self.chunks.push(format!(
-                "{cur}rotate={rad}:c=none:ow=iw:oh=ih{out}",
+                "{cur}rotate='{rad}':ow=iw:oh=ih:c=none{out}",
                 cur = self.cursor, rad = rot_rad, out = rot_label,
             ));
             self.chunks.push(format!(

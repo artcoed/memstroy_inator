@@ -109,6 +109,9 @@ async fn run_args<F: FnMut(&str)>(args: &[String], on_log: &mut F) -> Result<()>
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Suppress the transient cmd.exe window that would otherwise pop
+    // up every render on Windows. No-op on other platforms.
+    crate::proc::hide_console_tokio(&mut cmd);
 
     let mut child = cmd.spawn().with_context(|| format!("spawn {}", bin.display()))?;
 
