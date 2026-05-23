@@ -137,7 +137,51 @@ pub enum EffectKind {
         #[serde(default)]
         invert: bool,
     },
+    /// **Colour-key mask**: keys out (or keeps) every pixel within
+    /// HSV similarity of `color`. Authored interactively via the
+    /// canvas eyedropper mask tool — clicking on the picture samples
+    /// the underlying pixel colour and pushes a `ColorKey` entry onto
+    /// the layer's effect stack. Unlike the chroma-key colour the
+    /// user sets on `Actor.chroma_key` / `Overlay::Image.chroma_key`
+    /// (which keys the SOURCE pixels before the effect stack), this
+    /// effect runs alongside the rest of the stack so it composes
+    /// with feathered masks and other geometry-based mask shapes.
+    ///
+    /// Parameters mirror the FFmpeg `chromakey` filter: `similarity`
+    /// is the colour-distance threshold, `blend` softens the edge of
+    /// the keyed region, and `spill` controls de-spill suppression
+    /// (pulls the keyed colour out of remaining edges so green halos
+    /// don't survive). `intensity` (the master envelope) blends
+    /// between "no keying" and "fully keyed" so the same effect can
+    /// be faded in / out without re-tuning the colour distance.
+    ///
+    /// `invert` flips the polarity: with `invert = false` (default)
+    /// pixels whose colour is close to `color` become transparent;
+    /// with `invert = true` pixels FAR from `color` become transparent
+    /// — useful for "keep only the green parts" instead of "remove
+    /// the green parts".
+    ColorKey {
+        /// Target colour as RGB 0..255.
+        color: [u8; 3],
+        /// Similarity threshold (0..1). Larger values key a wider
+        /// range of pixels around `color`.
+        #[serde(default = "default_color_key_similarity")]
+        similarity: f32,
+        /// Edge softening (0..1).
+        #[serde(default = "default_color_key_blend")]
+        blend: f32,
+        /// De-spill amount (0..1). Reduces the keyed colour's
+        /// presence in surviving edge pixels.
+        #[serde(default)]
+        spill: f32,
+        /// Invert the keep/remove polarity (see kind doc).
+        #[serde(default)]
+        invert: bool,
+    },
 }
+
+fn default_color_key_similarity() -> f32 { 0.18 }
+fn default_color_key_blend() -> f32 { 0.10 }
 
 /// A 2D mask shape in element-local UV coordinates (0..1 spans the
 /// bounding box). All `EffectKind::Mask` shapes round-trip through the
@@ -306,6 +350,7 @@ impl EffectKind {
             EffectKind::Bloom { .. } => "Bloom",
             EffectKind::Crop { .. } => "Crop",
             EffectKind::Mask { .. } => "Mask",
+            EffectKind::ColorKey { .. } => "Color key",
         }
     }
 }
@@ -380,6 +425,21 @@ impl Effect {
         Self::new(EffectKind::Mask {
             shape: MaskShape::Polygon { points: pts },
             feather: 0.0,
+            invert: false,
+        })
+    }
+
+    /// Colour-key mask preset. Defaults to a Telegram-channel green
+    /// (matching `ChromaKeyParams::default`) so the entry shows
+    /// visible behaviour the moment it's added; the eyedropper tool
+    /// overrides `color` immediately after committing this preset
+    /// when the user paints with `MaskTool::Eyedropper`.
+    pub fn color_key() -> Self {
+        Self::new(EffectKind::ColorKey {
+            color: [0, 177, 64],
+            similarity: default_color_key_similarity(),
+            blend: default_color_key_blend(),
+            spill: 0.0,
             invert: false,
         })
     }
@@ -476,12 +536,42 @@ impl Effect {
                 right: self.sample_param_at(t_local, "p2", *right).clamp(0.0, 0.49),
                 bottom: self.sample_param_at(t_local, "p3", *bottom).clamp(0.0, 0.49),
             },
-            // Mask shape geometry is not a scalar so it is never
-            // sampled from `param_kfs`. Feather is the only animatable
-            // scalar exposed for `Mask`.
-            K::Mask { shape, feather, invert } => K::Mask {
-                shape: shape.clone(),
-                feather: self.sample_param_at(t_local, "p0", *feather).clamp(0.0, 0.5),
+            // Mask shape geometry has historically not been animated
+            // (the geometry was never sampled from `param_kfs`), but
+            // the per-shape scalar fields ARE numerical and so are
+            // sampled here under stable per-field keys
+            // ("rect_left" / "ellipse_cx" / …). Polygon stays static
+            // — keyframing a `Vec<[f32;2]>` of varying length needs a
+            // typed kf track, which is a future extension.
+            K::Mask { shape, feather, invert } => {
+                let new_shape = match shape {
+                    MaskShape::Rect { left, top, right, bottom } => MaskShape::Rect {
+                        left:   self.sample_param_at(t_local, "rect_left",   *left).clamp(0.0, 1.0),
+                        top:    self.sample_param_at(t_local, "rect_top",    *top).clamp(0.0, 1.0),
+                        right:  self.sample_param_at(t_local, "rect_right",  *right).clamp(0.0, 1.0),
+                        bottom: self.sample_param_at(t_local, "rect_bottom", *bottom).clamp(0.0, 1.0),
+                    },
+                    MaskShape::Ellipse { cx, cy, rx, ry } => MaskShape::Ellipse {
+                        cx: self.sample_param_at(t_local, "ellipse_cx", *cx),
+                        cy: self.sample_param_at(t_local, "ellipse_cy", *cy),
+                        rx: self.sample_param_at(t_local, "ellipse_rx", *rx).max(0.0),
+                        ry: self.sample_param_at(t_local, "ellipse_ry", *ry).max(0.0),
+                    },
+                    MaskShape::Polygon { points } => MaskShape::Polygon {
+                        points: points.clone(),
+                    },
+                };
+                K::Mask {
+                    shape: new_shape,
+                    feather: self.sample_param_at(t_local, "p0", *feather).clamp(0.0, 0.5),
+                    invert: *invert,
+                }
+            }
+            K::ColorKey { color, similarity, blend, spill, invert } => K::ColorKey {
+                color: *color,
+                similarity: self.sample_param_at(t_local, "p0", *similarity).clamp(0.0, 1.0),
+                blend: self.sample_param_at(t_local, "p1", *blend).clamp(0.0, 1.0),
+                spill: self.sample_param_at(t_local, "p2", *spill).clamp(0.0, 1.0),
                 invert: *invert,
             },
             // Kinds without numeric parameters pass through unchanged.
@@ -520,9 +610,17 @@ pub fn all_effect_presets() -> Vec<Effect> {
         Effect::vhs(),
         Effect::glitch(),
         Effect::bloom(),
-        Effect::crop(),
+        // Crop is intentionally NOT exposed in the generic effect
+        // picker any more — it duplicated the rectangle mask tool
+        // from a UX standpoint, so we now expose only one rectangle
+        // operation (the rectangle mask). Crop entries are still
+        // round-tripped from older scenes and are still authored
+        // via the dedicated image editor panel (which manipulates
+        // EffectKind::Crop directly through sliders), so the
+        // constructor itself stays public.
         Effect::mask_rect(),
         Effect::mask_ellipse(),
         Effect::mask_freehand(),
+        Effect::color_key(),
     ]
 }
