@@ -203,26 +203,29 @@ impl AudioWaveform {
         };
 
         // Get duration
-        let duration = match std::process::Command::new(&ffprobe)
-            .args(["-v", "error", "-show_entries", "format=duration",
-                   "-of", "default=noprint_wrappers=1:nokey=1"])
-            .arg(audio_path)
-            .output()
-        {
-            Ok(out) => String::from_utf8_lossy(&out.stdout).trim().parse::<f32>().unwrap_or(0.0),
-            Err(_) => return None,
+        let duration = {
+            let mut cmd = std::process::Command::new(&ffprobe);
+            cmd.args(["-v", "error", "-show_entries", "format=duration",
+                      "-of", "default=noprint_wrappers=1:nokey=1"])
+                .arg(audio_path);
+            match memstroy_render::hide_console_std(&mut cmd).output() {
+                Ok(out) => String::from_utf8_lossy(&out.stdout).trim().parse::<f32>().unwrap_or(0.0),
+                Err(_) => return None,
+            }
         };
 
         if duration <= 0.0 { return None; }
 
         // Extract raw PCM samples via ffmpeg, downsample to mono 8kHz
         let ffmpeg = memstroy_render::ffmpeg_binary();
-        let output = std::process::Command::new(&ffmpeg)
-            .args(["-y", "-hide_banner", "-loglevel", "error",
-                   "-i"])
-            .arg(audio_path)
-            .args(["-ac", "1", "-ar", "8000", "-f", "s16le", "-"])
-            .output();
+        let output = {
+            let mut cmd = std::process::Command::new(&ffmpeg);
+            cmd.args(["-y", "-hide_banner", "-loglevel", "error",
+                      "-i"])
+                .arg(audio_path)
+                .args(["-ac", "1", "-ar", "8000", "-f", "s16le", "-"]);
+            memstroy_render::hide_console_std(&mut cmd).output()
+        };
 
         let raw = match output {
             Ok(o) if o.status.success() => o.stdout,
@@ -1914,12 +1917,11 @@ fn scan_asset_dir(dir: &std::path::Path, category: AssetCategory) -> Vec<Library
 
 /// Check if ffmpeg binary is accessible.
 fn check_ffmpeg() -> bool {
-    std::process::Command::new(memstroy_render::ffmpeg_binary())
-        .arg("-version")
+    let mut cmd = std::process::Command::new(memstroy_render::ffmpeg_binary());
+    cmd.arg("-version")
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok()
+        .stderr(std::process::Stdio::null());
+    memstroy_render::hide_console_std(&mut cmd).status().is_ok()
 }
 
 
