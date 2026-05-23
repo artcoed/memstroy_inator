@@ -140,9 +140,6 @@ pub fn canvas_preview(ui: &mut egui::Ui, state: &mut EditorState) {
     // ── Draw grid ──
     draw_canvas_grid(&painter, full_rect, &state.canvas_viewport, viewport_size);
 
-    // ── Draw render frame ──
-    draw_render_frame(&painter, full_rect, state, viewport_size);
-
     // ── Draw elements (actors, overlays) ──
     draw_canvas_elements(ui, &painter, full_rect, state, viewport_size);
 
@@ -151,6 +148,12 @@ pub fn canvas_preview(ui: &mut egui::Ui, state: &mut EditorState) {
 
     // ── Draw multi-select outlines (every secondary entry in canvas_selection) ──
     draw_multi_selection_borders(&painter, full_rect, state, viewport_size);
+
+    // ── Draw render frame LAST so it sits on top of every layer ──
+    //    The render frame is the output region marker — the user must
+    //    always be able to see it, including its corner/edge handles,
+    //    even when actors / overlays cover the whole canvas.
+    draw_render_frame(&painter, full_rect, state, viewport_size);
 
     // ── Fit button overlay ──
     draw_viewport_controls(ui, full_rect, state, viewport_size);
@@ -340,7 +343,10 @@ fn overlay_world_aabb(state: &EditorState, idx: usize) -> Option<([f32; 2], [f32
     let center_x = frame_tl_x + ov_state.pos[0] * world_w;
     let center_y = frame_tl_y + ov_state.pos[1] * world_h;
 
-    let (ew, eh) = overlay_bbox(overlay, &ov_state);
+    // Use the texture-aware bbox so image overlays use real PNG
+    // dimensions (not the legacy 200×200 placeholder), keeping the
+    // marquee hit-rect aligned with the visible picture.
+    let (ew, eh) = overlay_bbox_with_state(overlay, &ov_state, state);
     Some((
         [center_x - ew * 0.5, center_y - eh * 0.5],
         [center_x + ew * 0.5, center_y + eh * 0.5],
@@ -872,6 +878,60 @@ fn pick_actors_for_canvas(state: &EditorState, t: f32) -> HashSet<usize> {
     keep
 }
 
+/// Pick at most one image / video overlay per track for the preview.
+/// Mirrors `pick_actors_for_canvas` for overlays so two clips that
+/// share a lane don't render simultaneously on the canvas (one as
+/// "current" and the other as a FIRST/LAST preview).
+///
+/// Text overlays are NOT filtered here — they're treated as decorative
+/// callouts that may legitimately overlap on a single lane, and unlike
+/// video clips they don't carry the "show first frame" semantics.
+fn pick_overlays_for_canvas(state: &EditorState, t: f32) -> HashSet<usize> {
+    use std::collections::HashMap;
+    let mut by_track: HashMap<usize, Vec<usize>> = HashMap::new();
+    for oi in 0..state.scene.overlays.len() {
+        // Skip text overlays — they may overlap freely on a lane.
+        if matches!(state.scene.overlays[oi], Overlay::Text(_)) { continue; }
+        let lane = overlay_track_index(state, oi);
+        by_track.entry(lane).or_default().push(oi);
+    }
+    let mut keep = HashSet::new();
+    for (_lane, indices) in by_track {
+        let active = indices.iter().copied().find(|&oi| {
+            let (t_in, t_out) = match &state.scene.overlays[oi] {
+                Overlay::Text(o) => (o.t_in, o.t_out),
+                Overlay::Image(o) => (o.t_in, o.t_out),
+                Overlay::Video(o) => (o.t_in, o.t_out),
+            };
+            t >= t_in && t <= t_out
+        });
+        if let Some(oi) = active {
+            keep.insert(oi);
+            continue;
+        }
+        // No clip currently active on this lane — pick the closest one
+        // (in time) so the user still has a visible preview of "what
+        // this lane will show".
+        let best = indices.iter().copied().min_by(|&a, &b| {
+            let dist = |oi: usize| -> f32 {
+                let (t_in, t_out) = match &state.scene.overlays[oi] {
+                    Overlay::Text(o) => (o.t_in, o.t_out),
+                    Overlay::Image(o) => (o.t_in, o.t_out),
+                    Overlay::Video(o) => (o.t_in, o.t_out),
+                };
+                if t < t_in { (t_in - t).abs() } else { (t - t_out).abs() }
+            };
+            dist(a)
+                .partial_cmp(&dist(b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        if let Some(oi) = best {
+            keep.insert(oi);
+        }
+    }
+    keep
+}
+
 fn draw_canvas_elements(
     ui: &mut egui::Ui,
     painter: &egui::Painter,
@@ -1260,6 +1320,13 @@ fn draw_canvas_overlays(
 ) {
     let t = state.playhead;
 
+    // ── Per-lane preview filter ──
+    // For image / video overlays we only want to draw ONE per lane
+    // (the active clip if any, or the temporally closest one as a
+    // preview). Text overlays are exempt — see `pick_overlays_for_canvas`
+    // for the rationale.
+    let overlays_to_draw = pick_overlays_for_canvas(state, t);
+
     // Build a sorted list of overlay indices for this pass.
     // Sort key = track index, DESCENDING — i.e. the lowest row on the
     // panel renders FIRST so the topmost row ends up on top. Within the
@@ -1271,11 +1338,18 @@ fn draw_canvas_overlays(
     // "below actors" semantics auto-derived from the timeline layout
     // for every overlay kind, not just text.
     let mut order: Vec<(usize, usize)> = state.scene.overlays.iter().enumerate()
-        .filter(|(idx, _)| {
+        .filter(|(idx, ov)| {
             let behind = overlay_is_behind_actors(state, *idx);
-            match pass {
+            let kind_ok = match pass {
                 OverlayPass::BehindActors => behind,
                 OverlayPass::OnTop => !behind,
+            };
+            if !kind_ok { return false; }
+            // Image / Video overlays on the same lane: only the chosen
+            // one. Text overlays bypass the filter (always allowed).
+            match ov {
+                Overlay::Text(_) => true,
+                _ => overlays_to_draw.contains(idx),
             }
         })
         .map(|(idx, _)| (idx, overlay_track_index(state, idx)))
@@ -1387,15 +1461,50 @@ fn draw_canvas_overlays(
                         _ => None,
                     });
 
-                if let Some(tex) = tex_handle {
+                // ── Effect-baked override ──
+                // When the overlay carries any active effect entries,
+                // build (or fetch from cache) a CPU-processed texture
+                // and prefer it for drawing. Crop entries also return a
+                // UV inset — applied below to shrink the visible
+                // rectangle so the picture mirrors the FFmpeg export.
+                let mut crop_inset = [0.0_f32; 4];
+                let fx_tex_handle: Option<egui::TextureHandle> =
+                    if !img.effects.is_empty() && tex_handle.is_some() {
+                        match ensure_image_fx_loaded(state, &img.source, &img.effects, painter.ctx()) {
+                            Some((tex, crop)) => {
+                                crop_inset = crop;
+                                Some(tex)
+                            }
+                            None => None,
+                        }
+                    } else {
+                        None
+                    };
+                let tex_for_draw = fx_tex_handle.or(tex_handle);
+
+                if let Some(tex) = tex_for_draw {
                     let rotation_rad = ov_state.rotation_deg.to_radians();
                     let abs_fx = ov_state.flip_x_anim.abs().max(0.02);
                     let abs_fy = ov_state.flip_y_anim.abs().max(0.02);
                     let cos_r = rotation_rad.cos();
                     let sin_r = rotation_rad.sin();
                     let center = elem_rect.center();
-                    let hw = elem_rect.width() * 0.5 * abs_fx;
-                    let hh = elem_rect.height() * 0.5 * abs_fy;
+                    // Crop inset shrinks the picture's screen rect so
+                    // the user sees the same crop rectangle the export
+                    // will produce (the inset is in normalised 0..1).
+                    let crop_w_factor = (1.0 - crop_inset[0] - crop_inset[2]).max(0.001);
+                    let crop_h_factor = (1.0 - crop_inset[1] - crop_inset[3]).max(0.001);
+                    let crop_dx = (crop_inset[0] - crop_inset[2]) * 0.5; // recentre after asymmetric crop
+                    let crop_dy = (crop_inset[1] - crop_inset[3]) * 0.5;
+                    let hw = elem_rect.width() * 0.5 * abs_fx * crop_w_factor;
+                    let hh = elem_rect.height() * 0.5 * abs_fy * crop_h_factor;
+                    let center_offset_x = elem_rect.width() * 0.5 * crop_dx;
+                    let center_offset_y = elem_rect.height() * 0.5 * crop_dy;
+                    let centre_offset = Vec2::new(
+                        center_offset_x * cos_r - center_offset_y * sin_r,
+                        center_offset_x * sin_r + center_offset_y * cos_r,
+                    );
+                    let center = center + centre_offset;
                     let corners_local = [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]];
                     let (uv_l, uv_r) = if ov_state.flip_x_anim < 0.0 { (1.0, 0.0) } else { (0.0, 1.0) };
                     let (uv_t, uv_b) = if ov_state.flip_y_anim < 0.0 { (1.0, 0.0) } else { (0.0, 1.0) };
@@ -2017,21 +2126,28 @@ fn draw_selection_gizmo(
             state.canvas_drag.drag_start_playhead = Some(state.playhead);
             state.canvas_drag.was_playing_at_drag_start = state.playing;
 
-            // ── Render-frame drags must NOT touch other elements ──
-            // Previously we snapshotted child positions and re-projected
-            // them to keep their world coordinate fixed; that caused the
-            // contents to shift inside the frame and edited unrelated
-            // element data on every frame-move. We now leave children
-            // alone — they keep their normalised positions and ride along
-            // inside the frame, which is what the user expects when they
-            // grab the frame.
+            // ── Render-frame drags must KEEP child elements visually
+            // ── pinned to the canvas. ──
+            // Overlays (and legacy actors without a canvas_layouts
+            // entry) store their `pos` as a normalised [0..1] vector
+            // relative to the render frame. If we leave that alone
+            // while the user drags the frame, every child rides along
+            // with the frame — which is NOT what users expect when
+            // they "grab the output region rectangle". So at drag
+            // start we snapshot every child's WORLD position and on
+            // every drag tick we re-derive their normalised `pos` so
+            // the world position survives. The compensation is
+            // applied in `apply_drag`'s MoveRenderFrame / ResizeRenderFrame
+            // arms after the frame's new state is written.
             use crate::state::CanvasDragMode;
             match state.canvas_drag.mode {
                 CanvasDragMode::MoveRenderFrame { .. }
                 | CanvasDragMode::ResizeRenderFrame { .. } => {
                     state.selection = Selection::RenderFrame;
-                    state.canvas_drag.actor_legacy_snapshot.clear();
-                    state.canvas_drag.overlay_world_snapshot.clear();
+                    state.canvas_drag.actor_legacy_snapshot =
+                        snapshot_legacy_actor_world_positions(state);
+                    state.canvas_drag.overlay_world_snapshot =
+                        snapshot_overlay_world_positions(state);
                 }
                 CanvasDragMode::Marquee { start_world, .. } => {
                     // Initialise the live marquee at a zero-size box on
@@ -2519,6 +2635,10 @@ fn apply_drag(
                 v.pos.x = new_x;
                 v.pos.y = new_y;
             });
+            // Keep every child element pinned to its drag-start world
+            // position by re-deriving their normalised `pos` against
+            // the new frame state.
+            compensate_children_after_render_frame_change(state, t);
         }
 
         CanvasDragMode::ResizeRenderFrame { initial_zoom, anchor_distance } => {
@@ -2537,6 +2657,7 @@ fn apply_drag(
                 apply_to_render_frame_kf(&mut state.scene.render_frame.layout, t, |v| {
                     v.zoom = new_zoom;
                 });
+                compensate_children_after_render_frame_change(state, t);
             }
         }
 
@@ -3344,6 +3465,148 @@ fn apply_to_render_frame_kf<F: FnOnce(&mut RenderFrameState)>(
     }
 }
 
+// ─── RENDER-FRAME CHILD COMPENSATION ─────────────────────────────────
+//
+// When the user drags the render frame (move or resize), we want the
+// elements that LIVE INSIDE the frame to stay visually pinned to their
+// original world position — the user is reframing the output region, not
+// re-arranging the scene contents. Overlays and legacy actors store
+// their `pos` as a normalised [0..1] vector relative to the render
+// frame, so a frame move would otherwise drag every child along.
+//
+// Approach:
+//   1. At drag start, snapshot every child's CURRENT world position
+//      (before the frame moves) into the canvas drag state.
+//   2. After every drag tick that mutates the render frame, re-derive
+//      each child's normalised `pos` from the snapshotted world point
+//      against the NEW frame state — so the world point is preserved.
+
+/// Snapshot the world position of every overlay relative to the render
+/// frame at the drag-start playhead. Skipped for overlays attached to a
+/// skeleton point (those are positioned by a different mechanism and
+/// would fight the compensation).
+fn snapshot_overlay_world_positions(state: &EditorState) -> Vec<(usize, [f32; 2])> {
+    let mut out = Vec::new();
+    let t = state.playhead;
+    let rf = &state.scene.render_frame;
+    let rf_state = sample_render_frame(rf, t);
+    let [rw, rh] = rf.resolution;
+    let world_w = rw as f32 / rf_state.zoom.max(1e-6);
+    let world_h = rh as f32 / rf_state.zoom.max(1e-6);
+    let frame_tl_x = rf_state.pos.x - world_w * 0.5;
+    let frame_tl_y = rf_state.pos.y - world_h * 0.5;
+
+    for (idx, overlay) in state.scene.overlays.iter().enumerate() {
+        // Skeleton-attached overlays follow their host bone; leave them
+        // alone or the compensation would fight the attachment.
+        let attached = match overlay {
+            Overlay::Text(t) => t.skeleton_attachment.is_some(),
+            Overlay::Image(im) => im.skeleton_attachment.is_some(),
+            Overlay::Video(v) => v.skeleton_attachment.is_some(),
+        };
+        if attached { continue; }
+        let (t_in, t_out, layout) = match overlay {
+            Overlay::Text(t) => (t.t_in, t.t_out, &t.layout),
+            Overlay::Image(im) => (im.t_in, im.t_out, &im.layout),
+            Overlay::Video(v) => (v.t_in, v.t_out, &v.layout),
+        };
+        let sample_t = if t >= t_in && t <= t_out { t - t_in }
+            else if t < t_in { 0.0 } else { (t_out - t_in).max(0.0) };
+        let ov_state = keyframe::sample(layout, sample_t).unwrap_or_default();
+        let world_x = frame_tl_x + ov_state.pos[0] * world_w;
+        let world_y = frame_tl_y + ov_state.pos[1] * world_h;
+        out.push((idx, [world_x, world_y]));
+    }
+    out
+}
+
+/// Snapshot the world position of every actor that is using the LEGACY
+/// normalised layout (i.e. has no entry in `canvas_layouts`). Actors
+/// already pinned via canvas_layouts are world-pixel anchored and don't
+/// need compensation.
+fn snapshot_legacy_actor_world_positions(state: &EditorState) -> Vec<(usize, [f32; 2])> {
+    let mut out = Vec::new();
+    let t = state.playhead;
+    for (idx, actor) in state.scene.actors.iter().enumerate() {
+        if state.scene.canvas_layouts.iter().any(|cl| cl.element_id == actor.id) {
+            continue;
+        }
+        let world_pos = get_element_world_pos(state, &actor.id, &actor.layout, t);
+        out.push((idx, [world_pos.x, world_pos.y]));
+    }
+    out
+}
+
+/// After the render-frame keyframe at `t` was just mutated, re-derive
+/// the normalised `pos` of every snapshotted child so they land on the
+/// SAME world coordinate as before the mutation. Called at the end of
+/// MoveRenderFrame / ResizeRenderFrame `apply_drag` arms.
+fn compensate_children_after_render_frame_change(state: &mut EditorState, t: f32) {
+    let rf_state_new = sample_render_frame(&state.scene.render_frame, t);
+    let [rw, rh] = state.scene.render_frame.resolution;
+    let world_w = (rw as f32 / rf_state_new.zoom.max(1e-6)).max(1e-3);
+    let world_h = (rh as f32 / rf_state_new.zoom.max(1e-6)).max(1e-3);
+    let frame_tl_x = rf_state_new.pos.x - world_w * 0.5;
+    let frame_tl_y = rf_state_new.pos.y - world_h * 0.5;
+
+    // Overlays — pos[0]/[1] are normalised [0..1] relative to the frame.
+    let overlay_snap = state.canvas_drag.overlay_world_snapshot.clone();
+    for (idx, world_xy) in overlay_snap {
+        if let Some(overlay) = state.scene.overlays.get_mut(idx) {
+            let (t_in, t_out, layout) = match overlay {
+                Overlay::Text(o) => (o.t_in, o.t_out, &mut o.layout),
+                Overlay::Image(o) => (o.t_in, o.t_out, &mut o.layout),
+                Overlay::Video(o) => (o.t_in, o.t_out, &mut o.layout),
+            };
+            let sample_t = if t >= t_in && t <= t_out { t - t_in }
+                else if t < t_in { 0.0 } else { (t_out - t_in).max(0.0) };
+            let new_norm_x = (world_xy[0] - frame_tl_x) / world_w;
+            let new_norm_y = (world_xy[1] - frame_tl_y) / world_h;
+            // Find or create the keyframe nearest sample_t (overlay
+            // keyframes are clip-local). Mutate the closest one so the
+            // compensation lands on the kf the user is currently
+            // viewing rather than spawning a fresh kf per frame.
+            let eps = 1.0e-3;
+            if let Some(kf) = layout
+                .iter_mut()
+                .min_by(|a, b| {
+                    (a.t - sample_t).abs()
+                        .partial_cmp(&(b.t - sample_t).abs())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+            {
+                if (kf.t - sample_t).abs() < 0.5 + eps {
+                    kf.value.pos[0] = new_norm_x;
+                    kf.value.pos[1] = new_norm_y;
+                }
+            }
+        }
+    }
+
+    // Legacy actors — same idea, but the layout is on the actor itself.
+    let actor_snap = state.canvas_drag.actor_legacy_snapshot.clone();
+    for (idx, world_xy) in actor_snap {
+        if let Some(actor) = state.scene.actors.get_mut(idx) {
+            let new_norm_x = (world_xy[0] - frame_tl_x) / world_w;
+            let new_norm_y = (world_xy[1] - frame_tl_y) / world_h;
+            // Actor legacy kfs are scene-time anchored; pick the
+            // nearest one to the drag-start playhead.
+            if let Some(kf) = actor
+                .layout
+                .iter_mut()
+                .min_by(|a, b| {
+                    (a.t - t).abs()
+                        .partial_cmp(&(b.t - t).abs())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+            {
+                kf.value.pos[0] = new_norm_x;
+                kf.value.pos[1] = new_norm_y;
+            }
+        }
+    }
+}
+
 #[allow(dead_code)]
 fn overlay_layout_mut(overlay: &mut Overlay) -> &mut Vec<Keyframe<OverlayState>> {
     match overlay {
@@ -3435,7 +3698,7 @@ fn sniff_hit(state: &EditorState, pos: WorldPos) -> Option<Selection> {
             x: frame_tl_x + ov_state.pos[0] * world_w,
             y: frame_tl_y + ov_state.pos[1] * world_h,
         };
-        let (ew, eh) = overlay_bbox(overlay, &ov_state);
+        let (ew, eh) = overlay_bbox_with_state(overlay, &ov_state, state);
         if pos.x >= ov_world.x - ew * 0.5 && pos.x <= ov_world.x + ew * 0.5
             && pos.y >= ov_world.y - eh * 0.5 && pos.y <= ov_world.y + eh * 0.5
         {
@@ -4175,6 +4438,63 @@ fn ensure_image_loaded(
     None
 }
 
+/// Build (or fetch from cache) an image texture with the supplied
+/// effect stack baked in. Returns the `TextureHandle` plus the
+/// (left, top, right, bottom) Crop UV inset accumulated by the stack
+/// — the renderer uses the inset to shrink the picture's screen
+/// rectangle so previews match the FFmpeg export.
+fn ensure_image_fx_loaded(
+    state: &EditorState,
+    path: &std::path::Path,
+    effects: &[memstroy_core::effects::Effect],
+    ctx: &egui::Context,
+) -> Option<(egui::TextureHandle, [f32; 4])> {
+    let sig = crate::image_effects::signature(effects);
+    let key = (path.to_path_buf(), sig);
+
+    // Fast path: cached texture from a previous frame.
+    if let Ok(map) = state.image_fx_textures.lock() {
+        if let Some(slot) = map.get(&key) {
+            return Some((slot.texture.clone(), slot.crop));
+        }
+    }
+
+    // Slow path: decode the source PNG, run the CPU effect pipeline,
+    // upload the result as a fresh texture, and cache it.
+    let decoded = image::open(path).ok()?.to_rgba8();
+    let w = decoded.width();
+    let h = decoded.height();
+    let mut buf = decoded.into_raw();
+    let crop = crate::image_effects::apply_effect_stack(&mut buf, w, h, effects, 0.0);
+    let color_image = egui::ColorImage::from_rgba_unmultiplied(
+        [w as usize, h as usize],
+        &buf,
+    );
+    let name = format!(
+        "img_overlay_fx_{}_{:x}",
+        path.file_name().and_then(|s| s.to_str()).unwrap_or("anon"),
+        sig,
+    );
+    let texture = ctx.load_texture(name, color_image, egui::TextureOptions::LINEAR);
+    let crop_arr = [crop.0, crop.1, crop.2, crop.3];
+
+    if let Ok(mut map) = state.image_fx_textures.lock() {
+        // Evict every cached entry for the same source path that has a
+        // different signature — keeps the cache from growing unbounded
+        // as the user tweaks effect parameters frame-by-frame.
+        map.retain(|(p, s), _| !(p == path && *s != sig));
+        map.insert(
+            key,
+            crate::state::ImageFxSlot {
+                texture: texture.clone(),
+                size: [w, h],
+                crop: crop_arr,
+            },
+        );
+    }
+    Some((texture, crop_arr))
+}
+
 /// Try to select an element at the given world position.
 fn try_select_at(state: &mut EditorState, pos: WorldPos) {
     let t = state.playhead;
@@ -4218,7 +4538,7 @@ fn try_select_at(state: &mut EditorState, pos: WorldPos) {
             x: frame_tl_x + ov_state.pos[0] * world_w,
             y: frame_tl_y + ov_state.pos[1] * world_h,
         };
-        let (ew, eh) = overlay_bbox(overlay, &ov_state);
+        let (ew, eh) = overlay_bbox_with_state(overlay, &ov_state, state);
         if pos.x >= ov_world.x - ew * 0.5 && pos.x <= ov_world.x + ew * 0.5
             && pos.y >= ov_world.y - eh * 0.5 && pos.y <= ov_world.y + eh * 0.5
         {
@@ -4327,7 +4647,7 @@ fn is_point_on_selection(state: &EditorState, pos: WorldPos) -> bool {
                 x: frame_tl_x + ov_state.pos[0] * world_w,
                 y: frame_tl_y + ov_state.pos[1] * world_h,
             };
-            let (ew, eh) = overlay_bbox(overlay, &ov_state);
+            let (ew, eh) = overlay_bbox_with_state(overlay, &ov_state, state);
             pos.x >= ov_world.x - ew * 0.5 && pos.x <= ov_world.x + ew * 0.5
                 && pos.y >= ov_world.y - eh * 0.5 && pos.y <= ov_world.y + eh * 0.5
         }
