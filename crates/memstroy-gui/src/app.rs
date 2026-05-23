@@ -1086,7 +1086,14 @@ impl App {
             }
             // Delete key = remove selected element (only when no
             // modifier — Ctrl+Delete is reserved for future use).
+            //
+            // Suppressed when the user has a per-parameter keyframe
+            // selection on the timeline: in that case the timeline's
+            // own Delete handler (`delete_selected_keyframes`) owns
+            // the gesture and we don't want the layer to vanish out
+            // from under the user when they meant to delete a kf.
             if !ctrl
+                && self.state.selected_keyframes.is_empty()
                 && (i.key_pressed(egui::Key::Delete)
                     || i.key_pressed(egui::Key::Backspace))
             {
