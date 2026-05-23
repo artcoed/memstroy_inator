@@ -4,6 +4,133 @@ use memstroy_core::Scene;
 
 use crate::undo::UndoStack;
 
+/// Rewrite a server URL so it can actually be used as the *target* of an
+/// HTTP request from this GUI process.
+///
+/// The asset-server typically *binds* to the wildcard address
+/// `0.0.0.0:8765` (or `[::]:8765` for IPv6) so it accepts traffic on
+/// every local interface. Both addresses are valid for `bind(2)` but
+/// invalid for `connect(2)` on Windows (and on macOS for IPv6 — only
+/// Linux is forgiving here). When the user runs
+/// `memstroy-assets-server --addr 0.0.0.0:8765` and the GUI then tries
+/// to POST to `http://0.0.0.0:8765/api/ingest/tg`, Windows fails the
+/// connect with `WSAEADDRNOTAVAIL` and the user sees
+/// "Refresh failed: Server unreachable (http://0.0.0.0:8765…)".
+///
+/// Replace the unspecified host with the appropriate loopback so
+/// client requests reach the server reliably regardless of how the
+/// operator configured the bind address.
+///
+/// The function preserves the URL's scheme, port, and path intact, and
+/// only touches the host component when it matches `0.0.0.0` /
+/// `[::]` / `0:0:0:0:0:0:0:0`. Anything else (including real IPs and
+/// hostnames) is returned untouched so a remote
+/// `https://assets.example.com` keeps working.
+pub fn rewrite_server_url_for_client(url: &str) -> String {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return trimmed.to_string();
+    }
+
+    // Split optional scheme so we never strip an `http(s)://` prefix.
+    let (scheme, host_and_rest) = match trimmed.find("://") {
+        Some(idx) => (&trimmed[..idx + 3], &trimmed[idx + 3..]),
+        None => ("", trimmed),
+    };
+
+    // Split the host[:port][/path...] section: everything up to the
+    // first `/` is host(:port).
+    let (host_port, tail) = match host_and_rest.find('/') {
+        Some(idx) => (&host_and_rest[..idx], &host_and_rest[idx..]),
+        None => (host_and_rest, ""),
+    };
+
+    // Bracketed IPv6 form: `[::]:port` or `[::]`.
+    if let Some(end) = host_port.find(']') {
+        if host_port.starts_with('[') {
+            let host = &host_port[1..end];
+            let port = &host_port[end + 1..]; // includes the `:port` if any
+            if is_unspecified_ipv6(host) {
+                return format!("{}[::1]{}{}", scheme, port, tail);
+            }
+            return format!("{}{}{}", scheme, host_port, tail);
+        }
+    }
+
+    // IPv4 host[:port] form, or bare hostname.
+    let (host, port) = match host_port.rfind(':') {
+        Some(i) => (&host_port[..i], &host_port[i..]),
+        None => (host_port, ""),
+    };
+    if host == "0.0.0.0" {
+        return format!("{}127.0.0.1{}{}", scheme, port, tail);
+    }
+    if is_unspecified_ipv6(host) {
+        return format!("{}[::1]{}{}", scheme, port, tail);
+    }
+    trimmed.to_string()
+}
+
+/// IPv6 unspecified-address detector. Accepts both the canonical `::`
+/// short-form and the `0:0:…:0` long-form (eight zero groups). Pure
+/// string compare — no `Ipv6Addr::parse`, so we don't accidentally
+/// reject malformed input the rest of the URL parser would also flag.
+fn is_unspecified_ipv6(host: &str) -> bool {
+    if host == "::" {
+        return true;
+    }
+    let groups: Vec<&str> = host.split(':').collect();
+    if groups.len() == 8 && groups.iter().all(|g| !g.is_empty() && g.chars().all(|c| c == '0')) {
+        return true;
+    }
+    false
+}
+
+#[cfg(test)]
+mod url_rewrite_tests {
+    use super::rewrite_server_url_for_client as r;
+
+    #[test]
+    fn ipv4_unspecified_with_scheme() {
+        assert_eq!(r("http://0.0.0.0:8765"), "http://127.0.0.1:8765");
+        assert_eq!(
+            r("http://0.0.0.0:8765/api/assets"),
+            "http://127.0.0.1:8765/api/assets"
+        );
+    }
+
+    #[test]
+    fn ipv4_unspecified_no_scheme() {
+        assert_eq!(r("0.0.0.0:8765"), "127.0.0.1:8765");
+    }
+
+    #[test]
+    fn ipv6_unspecified_short_form() {
+        assert_eq!(r("http://[::]:8765"), "http://[::1]:8765");
+    }
+
+    #[test]
+    fn ipv6_unspecified_long_form_in_brackets() {
+        assert_eq!(
+            r("http://[0:0:0:0:0:0:0:0]:8765"),
+            "http://[::1]:8765"
+        );
+    }
+
+    #[test]
+    fn loopback_untouched() {
+        assert_eq!(r("http://127.0.0.1:8765"), "http://127.0.0.1:8765");
+    }
+
+    #[test]
+    fn remote_hostname_untouched() {
+        assert_eq!(
+            r("https://assets.example.com"),
+            "https://assets.example.com"
+        );
+    }
+}
+
 /// Fixed track in the timeline. Tracks are numbered lanes; clips sit on them.
 #[derive(Debug, Clone)]
 pub struct Track {
@@ -511,6 +638,24 @@ pub struct EditorState {
     /// the network call every frame the user holds the mouse wheel.
     pub last_auto_refresh: Option<std::time::Instant>,
 
+    /// Wall-clock time of the most recent local-asset-directory poll
+    /// (sounds / images / particles / videos / clips). Used by
+    /// [`Self::auto_rescan_local_library_if_due`] to debounce a
+    /// cheap mtime-fingerprint check that catches files dropped into
+    /// the asset directories by an external tool — file manager,
+    /// download manager, sync service — without the user needing to
+    /// trigger a paste/drag first. Replaces the old "library is
+    /// frozen until I add the first picture myself" behaviour.
+    pub last_library_rescan: Option<std::time::Instant>,
+    /// Fingerprint of the asset directories from the most recent
+    /// rescan, in the same order as [`Self::library_dirs`]. Each
+    /// entry is `(file_count, latest_mtime_unix_secs)` — picking up
+    /// a single new file changes either the count or the mtime, so
+    /// even a "rename only" external edit forces a rescan. Used
+    /// purely as an inexpensive change detector; the actual library
+    /// rebuild still goes through [`Self::reload_library`].
+    pub library_dir_fingerprint: Vec<(u64, u64)>,
+
     /// Tokio runtime handle injected by the App on startup so panels
     /// that talk to network services (the asset server, Telegram
     /// ingest, etc.) can spawn async tasks without rebuilding their
@@ -765,6 +910,8 @@ impl EditorState {
         s.prev_library_search = String::new();
         s.prev_library_search_tab = LibraryTab::Clips;
         s.last_auto_refresh = None;
+        s.last_library_rescan = None;
+        s.library_dir_fingerprint = Vec::new();
 
         // ── Load persistent editor preferences (language, master
         // volume, autosave interval, snap toggle) and apply the bits
@@ -1332,6 +1479,26 @@ impl EditorState {
     }
 
     pub fn reload_library(&mut self) {
+        // Make sure the asset subdirectories exist BEFORE we walk
+        // them. On a fresh install (or in a client build whose
+        // `assets_root` is `~/.memstroy/cache/`) none of these
+        // directories ship with the binary — and `scan_asset_dir`
+        // returns an empty Vec when the path is missing. Without this
+        // upfront `create_dir_all` the editor would show an empty
+        // Images / Sounds / Videos / Particles tab on first run, then
+        // suddenly populate the moment the user dropped or pasted the
+        // first file (which created the directory as a side-effect).
+        // The user reported exactly that: "картинки подгружаются из
+        // локального кеша в проект только после добавления первой
+        // картинки". Creating the dirs eagerly + the periodic
+        // mtime-fingerprint poll in `auto_rescan_local_library_if_due`
+        // means existing files become visible right away, and any
+        // file dropped in by an external tool is picked up within a
+        // couple of seconds without a manual refresh.
+        for dir in self.library_dirs() {
+            let _ = std::fs::create_dir_all(&dir);
+        }
+
         // Local clip pool — we no longer carry a Telegram-side
         // `DownloadState` sidecar in the GUI (TG is the server's job).
         // Just enumerate `*.mp4` files in the clips dir and pair them
@@ -1407,6 +1574,88 @@ impl EditorState {
         self.library.images = scan_asset_dir(&self.images_dir(), AssetCategory::Image);
         self.library.particles = scan_asset_dir(&self.particles_dir(), AssetCategory::Particle);
         self.library.videos = scan_asset_dir(&self.videos_dir(), AssetCategory::Video);
+
+        // Refresh the directory fingerprint so the next
+        // `auto_rescan_local_library_if_due` only triggers an actual
+        // reload when the on-disk state really did change.
+        self.library_dir_fingerprint = self.compute_library_dir_fingerprint();
+        self.last_library_rescan = Some(std::time::Instant::now());
+    }
+
+    /// Every asset directory the editor's library panel surfaces, in a
+    /// fixed order so [`Self::library_dir_fingerprint`] stays
+    /// comparable across rescans. Used to (a) eagerly create them on
+    /// startup so external file drops show up without first having to
+    /// paste an image inside the editor, and (b) walk for an mtime
+    /// fingerprint in [`Self::compute_library_dir_fingerprint`].
+    pub fn library_dirs(&self) -> [PathBuf; 5] {
+        [
+            self.clips_dir(),
+            self.sounds_dir(),
+            self.images_dir(),
+            self.particles_dir(),
+            self.videos_dir(),
+        ]
+    }
+
+    /// Cheap "did the asset dirs change?" detector. For each library
+    /// directory we walk the *direct* contents (no subdirectories
+    /// beyond `clips_dir/thumbs/`, which only the clips tab cares
+    /// about and is already tracked under the parent's mtime) and
+    /// produce `(file_count, max_mtime_unix_secs)`. Only the
+    /// aggregates leave this function — we never store the per-file
+    /// list, so the cost is one `read_dir` + a tiny stat per direct
+    /// entry, well within "run on every UI frame".
+    ///
+    /// Returns one tuple per entry in [`Self::library_dirs`].
+    fn compute_library_dir_fingerprint(&self) -> Vec<(u64, u64)> {
+        let mut out = Vec::with_capacity(5);
+        for dir in self.library_dirs() {
+            out.push(dir_fingerprint(&dir));
+        }
+        out
+    }
+
+    /// Periodic auto-rescan of the asset directories, called once per
+    /// UI frame. Cheap: at most a `read_dir` + per-entry `metadata`
+    /// per asset directory every `MIN_INTERVAL`, with an early-out
+    /// if nothing changed.
+    ///
+    /// Triggers a full [`Self::reload_library`] iff:
+    ///
+    ///   1. We have not rescanned for at least `MIN_INTERVAL`, AND
+    ///   2. The fingerprint differs from the one captured at the
+    ///      last rebuild.
+    ///
+    /// This is what keeps externally-dropped files (file manager,
+    /// download manager, screenshot tool, OneDrive sync, …) flowing
+    /// into the library panel without the user needing to paste or
+    /// drag something inside the editor first.
+    pub fn auto_rescan_local_library_if_due(&mut self) {
+        // Don't fight an ongoing TG refresh — that worker sends its
+        // own `RefreshLibraryReloaded` events when new clips land,
+        // and we'd just be doing redundant work polling alongside it.
+        if self.refreshing {
+            return;
+        }
+        const MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(2_000);
+        if let Some(last) = self.last_library_rescan {
+            if last.elapsed() < MIN_INTERVAL {
+                return;
+            }
+        }
+
+        let now = self.compute_library_dir_fingerprint();
+        if now != self.library_dir_fingerprint {
+            // On-disk state changed (file added / removed / replaced
+            // / renamed externally). Run the heavy rebuild — it
+            // re-stamps `library_dir_fingerprint` and bumps
+            // `last_library_rescan` itself.
+            self.reload_library();
+        } else {
+            // Nothing to do; just bump the timer so we don't busy-poll.
+            self.last_library_rescan = Some(std::time::Instant::now());
+        }
     }
 
     /// Directory holding sound effects available in the library. Files
@@ -1913,6 +2162,50 @@ fn scan_asset_dir(dir: &std::path::Path, category: AssetCategory) -> Vec<Library
     }
     out.sort_by(|a, b| a.label.to_ascii_lowercase().cmp(&b.label.to_ascii_lowercase()));
     out
+}
+
+/// Inexpensive `(file_count, latest_mtime_unix_secs)` summary of a
+/// single directory. Used by [`EditorState::auto_rescan_local_library_if_due`]
+/// to detect external changes without re-scanning every byte every
+/// frame. Subdirectories are ignored — the editor never recurses
+/// past one level for library assets, so anything below them
+/// (e.g. `clips_dir/thumbs/`) doesn't affect the asset listing.
+///
+/// Returns `(0, 0)` when the directory is missing, unreadable, or
+/// empty — those all map to "nothing visible in the library tab",
+/// so the comparison degrades gracefully without panicking on a
+/// recently-deleted folder.
+fn dir_fingerprint(dir: &std::path::Path) -> (u64, u64) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return (0, 0),
+    };
+    let mut count: u64 = 0;
+    let mut latest_mtime: u64 = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // Only count files; subdirs are walked separately.
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        count += 1;
+        if let Ok(modified) = meta.modified() {
+            if let Ok(d) = modified.duration_since(std::time::UNIX_EPOCH) {
+                let secs = d.as_secs();
+                if secs > latest_mtime {
+                    latest_mtime = secs;
+                }
+            }
+        }
+        // Suppress an unused-warning on the path binding when no
+        // future field needs it; debug builds optimise this out.
+        let _ = path;
+    }
+    (count, latest_mtime)
 }
 
 /// Check if ffmpeg binary is accessible.

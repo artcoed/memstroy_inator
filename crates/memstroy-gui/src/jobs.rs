@@ -151,7 +151,15 @@ pub fn spawn_refresh(
         let progress = |s: String| {
             let _ = tx.send(JobEvent::RefreshProgress(s));
         };
-        let server = server_url.trim_end_matches('/').to_string();
+        // The GUI may have been configured with a wildcard bind URL
+        // (e.g. `http://0.0.0.0:8765`) — that is a valid bind address
+        // for the server but `connect(2)` to it fails on Windows with
+        // `WSAEADDRNOTAVAIL`, which is exactly the "Refresh failed:
+        // Server unreachable" the user kept hitting. Normalise to a
+        // routable loopback before any HTTP call goes out.
+        let server = crate::state::rewrite_server_url_for_client(&server_url)
+            .trim_end_matches('/')
+            .to_string();
 
         progress(format!("Asking {} to ingest @{} (limit {})", server, channel, limit));
 
