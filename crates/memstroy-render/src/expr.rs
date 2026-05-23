@@ -18,9 +18,10 @@
 //! expression size limits even with dozens of keyframes per element.
 
 use memstroy_core::keyframe::{ModifierKind, TrackModifier};
+use memstroy_core::skeleton::{SkeletonAttachment, SkeletonTemplate};
 use memstroy_core::{
-    ActorState, CanvasTransform, ColorCorrection, Easing, Keyframe, OverlayState,
-    RenderFrameState, Scene,
+    Actor, ActorState, CanvasTransform, ColorCorrection, Easing, Effect, EffectKind, Keyframe,
+    OverlayState, RenderFrameState, Scene,
 };
 
 // ─── PIECEWISE EXPRESSIONS ──────────────────────────────────────────
@@ -319,8 +320,12 @@ pub(crate) struct ElementTransform {
 /// sample + modifier eval — but expressed as ffmpeg expressions of `t`.
 ///
 /// Position priority matches the preview:
-///   1. `Scene.canvas_layouts[element_id]` (Free Canvas v2 world px).
-///   2. The legacy normalised `[0,1]` `layout`, converted to world
+///   1. `skeleton_attachment` (when bound, the element's world centre
+///      snaps to a skeleton point on a host actor). Mirrors
+///      `canvas_preview::resolve_overlay_attachment_world` and the
+///      `Actor.skeleton_attachments[0]` override path.
+///   2. `Scene.canvas_layouts[element_id]` (Free Canvas v2 world px).
+///   3. The legacy normalised `[0,1]` `layout`, converted to world
 ///      space relative to the moving render frame (so animating
 ///      `render_frame.pos` shifts elements like the preview).
 ///
@@ -333,6 +338,7 @@ pub(crate) fn build_element_transform<S>(
     legacy_layout: &[Keyframe<S>],
     modifiers: &[TrackModifier],
     t_in: f32,
+    skeleton_attachment: Option<&SkeletonAttachment>,
 ) -> ElementTransform
 where
     S: PositionedState + Clone,
@@ -358,12 +364,21 @@ where
         format!("(({})+({}))", rf_pos_y_kf, rf_mods.dy)
     };
 
-    // ── World position (canvas_layouts override OR legacy fallback) ──
+    // ── World position priority: skeleton → canvas_layouts → legacy ─
     let canvas_layout = scene
         .canvas_layouts
         .iter()
         .find(|cl| cl.element_id == element_id);
-    let (world_x, world_y) = if let Some(cl) = canvas_layout {
+    let skeleton_world = skeleton_attachment
+        .and_then(|att| resolve_skeleton_attachment_world(scene, att));
+    let (world_x, world_y) = if let Some((sx, sy)) = skeleton_world {
+        // Skeleton override fully replaces the world position — same
+        // semantics as `canvas_preview::resolve_overlay_attachment_world`,
+        // which returns the projected point directly without consulting
+        // canvas_layouts or the legacy layout. Modifiers (Wobble / Shake
+        // / Walk) still add on top below.
+        (sx, sy)
+    } else if let Some(cl) = canvas_layout {
         (
             piecewise(&cl.keyframes, |t: &CanvasTransform| t.pos.x),
             piecewise(&cl.keyframes, |t: &CanvasTransform| t.pos.y),
@@ -490,20 +505,24 @@ where
 
 // ─── COLOUR CORRECTION ──────────────────────────────────────────────
 
-/// Build a list of ffmpeg filter snippets that approximate the
-/// preview's `ColorCorrection` block.
+/// Build a list of ffmpeg filter snippets that mirror the preview's
+/// `ColorCorrection` block.
 ///
-/// We honour the four scalar fields the preview supports per-frame
-/// (brightness / contrast / saturation / temperature). Tone curves
-/// and per-channel LGG live in the preview's CPU pipeline only —
-/// translating them to ffmpeg `curves=` would require sampling each
-/// curve's control points; we leave it as a follow-up rather than
-/// shipping a half-faithful implementation.
+/// Pipeline order (matches `video_cache::apply_effects_cpu`):
+///   1. brightness / contrast / saturation  (`eq=`)
+///   2. temperature                          (`colorbalance=`)
+///   3. lift → gain → gamma per RGB channel  (`lutrgb=` with the
+///      DaVinci-style formula `pow((in + lift*(1-in)) * gain, 1/gamma)`)
+///   4. master tone curve                    (`curves=preset=none:m='…'`)
+///   5. per-channel R / G / B tone curves    (separate `curves=` filters)
 ///
 /// Animated CC params are sampled at the clip's midpoint — same
 /// flattening rule we use for opacity / flip; full per-frame `eq=`
 /// expressions are technically possible (`eval=frame`) but blow up
 /// the filtergraph length when several actors animate CC together.
+/// Tone curves and per-channel LGG are NOT animated in the model
+/// (the inspector exposes no diamonds for them) so the midpoint
+/// sample is exact, not an approximation.
 pub(crate) fn color_correction_filters(
     cc: &ColorCorrection,
     t_in: f32,
@@ -544,5 +563,541 @@ pub(crate) fn color_correction_filters(
             t, -t,
         ));
     }
+
+    // ── Lift / Gain / Gamma per RGB channel ──────────────────────────
+    //
+    // The preview's `apply_effects_cpu` runs (in 0..1 space):
+    //
+    //   shifted = norm + lift * (1 - norm)
+    //   scaled  = shifted * gain
+    //   final   = pow(max(0, scaled), 1 / gamma)
+    //
+    // ffmpeg's `lutrgb` filter accepts per-channel expressions over
+    // `val` (the 0..255 input). We rewrite the formula in those
+    // terms: `255 * pow(max(0, (val/255 + L*(1-val/255))*G), 1/Gma)`.
+    // Identity channels (lift=0, gain=1, gamma=1) are skipped so the
+    // filter only fires when the user has actually dialled LGG.
+    let lift = cc.lift;
+    let gain = [
+        cc.gain[0].max(0.0),
+        cc.gain[1].max(0.0),
+        cc.gain[2].max(0.0),
+    ];
+    let gamma = [
+        cc.gamma[0].max(0.05),
+        cc.gamma[1].max(0.05),
+        cc.gamma[2].max(0.05),
+    ];
+    let lgg_active = lift.iter().any(|v| v.abs() > 1e-4)
+        || gain.iter().any(|v| (v - 1.0).abs() > 1e-4)
+        || gamma.iter().any(|v| (v - 1.0).abs() > 1e-4);
+    if lgg_active {
+        let chan_expr = |l: f32, g: f32, gma: f32| -> String {
+            // Per-channel identity → cheap `val` passthrough so we
+            // don't pay for a `pow()` per pixel on untouched channels.
+            if l.abs() < 1e-4 && (g - 1.0).abs() < 1e-4 && (gma - 1.0).abs() < 1e-4 {
+                return "val".to_string();
+            }
+            let inv_g = 1.0 / gma;
+            format!(
+                "clip(255*pow(max(0,(val/255+({l:.4})*(1-val/255))*({g:.4})),{inv:.4}),0,255)",
+                l = l,
+                g = g,
+                inv = inv_g,
+            )
+        };
+        let r_expr = chan_expr(lift[0], gain[0], gamma[0]);
+        let g_expr = chan_expr(lift[1], gain[1], gamma[1]);
+        let b_expr = chan_expr(lift[2], gain[2], gamma[2]);
+        out.push(format!(
+            "lutrgb=r='{r}':g='{g}':b='{b}'",
+            r = r_expr,
+            g = g_expr,
+            b = b_expr,
+        ));
+    }
+
+    // ── Tone curves (master + R / G / B) ─────────────────────────────
+    //
+    // ffmpeg's `curves` filter accepts a string of space-separated
+    // `x/y` control points per channel (master is `m=`). We emit one
+    // `curves=` filter per non-identity channel so the export
+    // composition matches the preview's order: master FIRST, then
+    // each per-channel curve, exactly as `apply_effects_cpu` walks
+    // the LUTs (`lut_master` then `lut_r` / `lut_g` / `lut_b`).
+    if !cc.curves.is_identity() {
+        if !is_curve_identity(&cc.curves.master) {
+            out.push(format!(
+                "curves=preset=none:m='{}'",
+                format_curve(&cc.curves.master),
+            ));
+        }
+        if !is_curve_identity(&cc.curves.red) {
+            out.push(format!(
+                "curves=preset=none:r='{}'",
+                format_curve(&cc.curves.red),
+            ));
+        }
+        if !is_curve_identity(&cc.curves.green) {
+            out.push(format!(
+                "curves=preset=none:g='{}'",
+                format_curve(&cc.curves.green),
+            ));
+        }
+        if !is_curve_identity(&cc.curves.blue) {
+            out.push(format!(
+                "curves=preset=none:b='{}'",
+                format_curve(&cc.curves.blue),
+            ));
+        }
+    }
     out
+}
+
+
+/// Whether a tone curve is the identity `(0,0)–(1,1)` line. Mirrors
+/// the private check in `memstroy_core::scene` so we can skip
+/// emitting a `curves=` filter for unchanged channels.
+fn is_curve_identity(c: &[[f32; 2]]) -> bool {
+    c.len() == 2
+        && (c[0][0] - 0.0).abs() < 1e-4
+        && (c[0][1] - 0.0).abs() < 1e-4
+        && (c[1][0] - 1.0).abs() < 1e-4
+        && (c[1][1] - 1.0).abs() < 1e-4
+}
+
+/// Format a tone curve's control points as a space-separated `x/y`
+/// list for ffmpeg's `curves=` filter. Points are sorted by `x` and
+/// clamped to `[0, 1]` so out-of-range authoring data doesn't
+/// generate filter-parse errors. The endpoints are kept verbatim
+/// (the model invariant guarantees `(0,0)` and `(1,1)` are present
+/// on the master / per-channel arrays whenever the user added an
+/// intermediate point).
+fn format_curve(curve: &[[f32; 2]]) -> String {
+    let mut pts: Vec<[f32; 2]> = curve
+        .iter()
+        .map(|p| [p[0].clamp(0.0, 1.0), p[1].clamp(0.0, 1.0)])
+        .collect();
+    pts.sort_by(|a, b| a[0].partial_cmp(&b[0]).unwrap_or(std::cmp::Ordering::Equal));
+    pts.iter()
+        .map(|p| format!("{:.4}/{:.4}", p[0], p[1]))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+// ─── SKELETON ATTACHMENTS ───────────────────────────────────────────
+
+/// Resolve a `SkeletonAttachment` to a pair of piecewise ffmpeg
+/// expressions for its world-pixel x / y position.
+///
+/// Mirrors `canvas_preview::resolve_overlay_attachment_world`: we find
+/// the matching template, locate the host actor that owns the source
+/// clip the skeleton was authored on, project the (animated) point's
+/// normalised coordinates through the host actor's bbox, and rotate
+/// the local offset by the host's per-frame rotation. Returns `None`
+/// when the template / point / host can't be resolved (in which case
+/// the renderer falls back to canvas_layouts / legacy positioning).
+///
+/// Source-clip dimensions are not probed — we use the same
+/// `(1080, 1920)` fallback the preview uses when the frame cache
+/// isn't ready, which keeps the export and the canvas in lock-step
+/// for the typical portrait clip aspect ratio. A future revision
+/// can ffprobe the clip dimensions if non-portrait sources show
+/// drift.
+pub(crate) fn resolve_skeleton_attachment_world(
+    scene: &Scene,
+    attachment: &SkeletonAttachment,
+) -> Option<(String, String)> {
+    let template = find_skeleton_template(scene, attachment)?;
+    let point = template.points.get(&attachment.point_name)?;
+    if point.track.is_empty() {
+        return None;
+    }
+    let host = find_host_actor(scene, template)?;
+    if !host.visible {
+        return None;
+    }
+
+    // Host actor's animated bbox dimensions (in source pixels).
+    let host_state_scale = piecewise(&host.layout, |s: &ActorState| s.scale);
+    let host_state_scale_y = piecewise(&host.layout, |s: &ActorState| s.scale_y);
+    let host_rot_deg = piecewise(&host.layout, |s: &ActorState| s.rotation_deg);
+
+    // Source dimensions: fall back to the preview's portrait default.
+    // ffprobe-driven probing is left for a follow-up — most user
+    // sources are vertical 1080×1920, matching the output canvas.
+    let (src_w, src_h) = (1080.0_f32, 1920.0_f32);
+
+    // Normalised point coords with the attachment offset baked in.
+    let nx_kf = piecewise(&point.track, |p: &memstroy_core::skeleton::PointState| p.x);
+    let ny_kf = piecewise(&point.track, |p: &memstroy_core::skeleton::PointState| p.y);
+    let nx = format!("(({nx})+({off:.6})-0.5)", nx = nx_kf, off = attachment.offset[0]);
+    let ny = format!("(({ny})+({off:.6})-0.5)", ny = ny_kf, off = attachment.offset[1]);
+
+    // Local-space pixel offset from the host's centre.
+    let local_x = format!(
+        "(({nx})*{src_w:.4}*({sc}))",
+        nx = nx,
+        src_w = src_w,
+        sc = host_state_scale,
+    );
+    let local_y = format!(
+        "(({ny})*{src_h:.4}*({sc})*({scy}))",
+        ny = ny,
+        src_h = src_h,
+        sc = host_state_scale,
+        scy = host_state_scale_y,
+    );
+
+    // Rotate the local offset by the host's per-frame rotation so the
+    // attachment follows when the host actor spins (preview parity).
+    let rot_rad = format!("(({})*PI/180)", host_rot_deg);
+    let cs = format!("cos({})", rot_rad);
+    let sn = format!("sin({})", rot_rad);
+    let rotated_x = format!(
+        "(({lx})*({cs})-({ly})*({sn}))",
+        lx = local_x,
+        ly = local_y,
+        cs = cs,
+        sn = sn,
+    );
+    let rotated_y = format!(
+        "(({lx})*({sn})+({ly})*({cs}))",
+        lx = local_x,
+        ly = local_y,
+        cs = cs,
+        sn = sn,
+    );
+
+    // Host's own world centre (skeleton attachments on the host
+    // itself are not chained — that would be a self-reference; the
+    // host's world pos always comes from canvas_layouts / legacy).
+    let host_world = host_world_pos(scene, host);
+
+    let world_x = format!("(({hx})+({rx}))", hx = host_world.0, rx = rotated_x);
+    let world_y = format!("(({hy})+({ry}))", hy = host_world.1, ry = rotated_y);
+    Some((world_x, world_y))
+}
+
+/// Find the skeleton template that an attachment refers to. Templates
+/// can be referenced by `name` (the pretty label the user typed) OR
+/// by the source clip's filename without extension — the same
+/// resolution rule the preview's `resolve_overlay_attachment_world`
+/// uses, so the export and the canvas always agree on which template
+/// is bound.
+fn find_skeleton_template<'a>(
+    scene: &'a Scene,
+    attachment: &SkeletonAttachment,
+) -> Option<&'a SkeletonTemplate> {
+    scene.skeleton_templates.iter().find(|tmpl| {
+        tmpl.name == attachment.skeleton_id
+            || tmpl
+                .source_clip
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s == attachment.skeleton_id)
+                .unwrap_or(false)
+    })
+}
+
+/// Find the actor that hosts a skeleton template (i.e. whose source
+/// clip is the one the skeleton was authored on). Matches the
+/// preview's "first actor whose source matches the template's
+/// source_clip" rule — by full path AND by filename, the latter
+/// guarding against project moves where the absolute path differs
+/// but the asset lives under a new `assets_root`.
+fn find_host_actor<'a>(scene: &'a Scene, template: &SkeletonTemplate) -> Option<&'a Actor> {
+    scene.actors.iter().find(|a| {
+        a.source == template.source_clip
+            || a.source.file_name() == template.source_clip.file_name()
+    })
+}
+
+/// Build the host actor's own world-centre expressions WITHOUT
+/// recursing into skeleton attachments (that would be circular). We
+/// reproduce the canvas_layouts → legacy fallback ladder of
+/// `build_element_transform` here because skeleton attachments are
+/// the only callers that need the host's world pos in expression
+/// form, and inlining keeps the public API single-pass.
+fn host_world_pos(scene: &Scene, host: &Actor) -> (String, String) {
+    let [out_w, out_h] = scene.output.resolution;
+    let rf = &scene.render_frame;
+    let rf_pos_x_kf = piecewise(&rf.layout, |s: &RenderFrameState| s.pos.x);
+    let rf_pos_y_kf = piecewise(&rf.layout, |s: &RenderFrameState| s.pos.y);
+    let rf_zoom_kf = piecewise(&rf.layout, |s: &RenderFrameState| s.zoom.max(1e-4));
+    let rf_mods = build_modifier_expr(&rf.modifiers, 0.0);
+    let rf_pos_x = if rf_mods.dx_is_zero() {
+        rf_pos_x_kf.clone()
+    } else {
+        format!("(({})+({}))", rf_pos_x_kf, rf_mods.dx)
+    };
+    let rf_pos_y = if rf_mods.dy_is_zero() {
+        rf_pos_y_kf.clone()
+    } else {
+        format!("(({})+({}))", rf_pos_y_kf, rf_mods.dy)
+    };
+
+    if let Some(cl) = scene.canvas_layouts.iter().find(|cl| cl.element_id == host.id) {
+        return (
+            piecewise(&cl.keyframes, |t: &CanvasTransform| t.pos.x),
+            piecewise(&cl.keyframes, |t: &CanvasTransform| t.pos.y),
+        );
+    }
+    let pos_x = piecewise(&host.layout, |s: &ActorState| s.pos[0]);
+    let pos_y = piecewise(&host.layout, |s: &ActorState| s.pos[1]);
+    let wx = format!(
+        "(({rfx})+({px}-0.5)*({W}/({rfz})))",
+        rfx = rf_pos_x,
+        px = pos_x,
+        W = out_w as f32,
+        rfz = rf_zoom_kf,
+    );
+    let wy = format!(
+        "(({rfy})+({py}-0.5)*({H}/({rfz})))",
+        rfy = rf_pos_y,
+        py = pos_y,
+        H = out_h as f32,
+        rfz = rf_zoom_kf,
+    );
+    (wx, wy)
+}
+
+// ─── EFFECT PARAMETER ANIMATION ─────────────────────────────────────
+
+/// Build the ffmpeg filter chain for a single `Effect`, honouring
+/// per-parameter keyframe animation (`Effect.param_kfs` +
+/// `animated_params`).
+///
+/// When the effect has no animated parameters we fall back to the
+/// caller-supplied static `static_snippet` so the historical fast
+/// path stays untouched. When at least one parameter animates we
+/// slice the clip's lifetime into segments at the union of the
+/// animated parameters' keyframe times (capped at `MAX_SEGMENTS`),
+/// re-sample the effect at each segment's midpoint via
+/// `Effect::sampled_at`, generate the static filter snippet for
+/// that sample, and gate it with a per-segment
+/// `:enable='between(t,a,b)'` clause. Inactive segments pass through
+/// transparently — exactly what the user sees in the preview where
+/// each frame is rendered with the effect sampled at *that* frame's
+/// time.
+///
+/// The chain is emitted as a comma-joined string suitable for
+/// inserting into a single filter-chain (the same shape the existing
+/// caller expects from `effect_to_filter`). For multi-filter effects
+/// (e.g. `Pixelate` is `scale=…,scale=…`) each component receives
+/// its own `enable=` clause so muting works on the whole effect at
+/// once.
+///
+/// `t_in` / `t_out` are the host clip's visible window. `to_filter`
+/// must reproduce the snippet `effect_to_filter` would emit for a
+/// statically-resolved effect (see `effect_to_filter` in
+/// `filtergraph.rs`); we accept it as a closure to keep this helper
+/// in `expr.rs` without pulling the per-kind translation rules in.
+pub(crate) fn effect_animated_filter_chain<F>(
+    eff: &Effect,
+    t_in: f32,
+    t_out: f32,
+    to_filter: F,
+) -> Option<String>
+where
+    F: Fn(&EffectKind, f32) -> Option<String>,
+{
+    if !eff.enabled {
+        return None;
+    }
+    if !effect_has_animation(eff) {
+        let i = eff.intensity.clamp(0.0, 1.0);
+        if i <= 0.001 {
+            return None;
+        }
+        return to_filter(&eff.kind, i);
+    }
+
+    let segments = effect_segments(eff, t_in, t_out);
+    if segments.is_empty() {
+        let i = eff.intensity.clamp(0.0, 1.0);
+        if i <= 0.001 {
+            return None;
+        }
+        return to_filter(&eff.kind, i);
+    }
+
+    let mut parts: Vec<String> = Vec::with_capacity(segments.len());
+    for (a, b) in &segments {
+        let mid = ((a + b) * 0.5).max(*a);
+        let local = (mid - t_in).max(0.0);
+        let sampled = eff.sampled_at(local);
+        let i = sampled.intensity.clamp(0.0, 1.0);
+        if i <= 0.001 {
+            // Muted segment — emit a `null` no-op gated by the same
+            // enable so the chain length stays predictable. (We can't
+            // simply skip: the chain depends on the segment count
+            // matching across consumers that introspect the graph.)
+            parts.push(format!(
+                "null:enable='between(t,{a:.4},{b:.4})'",
+                a = a,
+                b = b,
+            ));
+            continue;
+        }
+        let Some(snippet) = to_filter(&sampled.kind, i) else {
+            continue;
+        };
+        let enable = format!("between(t,{a:.4},{b:.4})", a = a, b = b);
+        parts.push(append_enable_to_chain(&snippet, &enable));
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts.join(","))
+}
+
+/// Whether an `Effect` has any animated parameter wired up. Used by
+/// the renderer to pick between the fast static-filter path and the
+/// per-segment animated path.
+fn effect_has_animation(eff: &Effect) -> bool {
+    if eff.animated_params.is_empty() || eff.param_kfs.is_empty() {
+        return false;
+    }
+    eff.animated_params
+        .iter()
+        .any(|key| eff.param_kfs.get(key).map_or(false, |kfs| kfs.len() >= 2))
+}
+
+/// Build the segment list for an animated effect. Segments are the
+/// half-open intervals between consecutive keyframe times of any
+/// animated parameter, clamped to `[t_in, t_out]` and capped at
+/// `MAX_SEGMENTS` to keep the filter graph within ffmpeg's
+/// expression-length limits even on long clips with dense keyframes.
+///
+/// Returns an empty `Vec` when the clip has zero duration (the
+/// renderer falls back to the static path so we still emit a
+/// meaningful filter).
+fn effect_segments(eff: &Effect, t_in: f32, t_out: f32) -> Vec<(f32, f32)> {
+    const MAX_SEGMENTS: usize = 24;
+    if t_out <= t_in + 1e-3 {
+        return Vec::new();
+    }
+
+    // Union of all animated-param keyframe times, in CLIP-LOCAL time.
+    let mut times: Vec<f32> = Vec::new();
+    for key in &eff.animated_params {
+        if let Some(kfs) = eff.param_kfs.get(key) {
+            for kf in kfs {
+                times.push(kf.t);
+            }
+        }
+    }
+    // Convert to scene time and clamp to the clip window.
+    times = times
+        .into_iter()
+        .map(|t| (t + t_in).clamp(t_in, t_out))
+        .collect();
+    times.push(t_in);
+    times.push(t_out);
+    times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    times.dedup_by(|a, b| (*a - *b).abs() < 1e-4);
+
+    // Ensure at least `MIN_POINTS` samples across the clip so a coarse
+    // 2-3 keyframe animation still produces enough segments to read
+    // as smooth in the export. We add a uniform grid spanning
+    // [t_in, t_out] and dedup against the existing keyframe times so
+    // grid points landing on keyframes don't bloat the segment list.
+    const MIN_POINTS: usize = 8;
+    if times.len() < MIN_POINTS {
+        let span = t_out - t_in;
+        let stride = span / (MIN_POINTS as f32 - 1.0);
+        for i in 0..MIN_POINTS {
+            times.push(t_in + (i as f32) * stride);
+        }
+        times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        times.dedup_by(|a, b| (*a - *b).abs() < 1e-4);
+    }
+
+    // Cap segment count: pick a uniform stride.
+    if times.len() > MAX_SEGMENTS + 1 {
+        let stride = ((times.len() - 1) as f32 / MAX_SEGMENTS as f32).ceil() as usize;
+        let mut sub: Vec<f32> = times.iter().step_by(stride.max(1)).copied().collect();
+        if *sub.last().unwrap() < t_out - 1e-4 {
+            sub.push(t_out);
+        }
+        times = sub;
+    }
+
+    times
+        .windows(2)
+        .filter(|w| w[1] > w[0] + 1e-4)
+        .map(|w| (w[0], w[1]))
+        .collect()
+}
+
+/// Append `:enable='<expr>'` to every filter in a comma-joined chain.
+/// Filters that already use `key=value` syntax get an extra
+/// `:enable=…` token; argument-less filters (e.g. `hflip`) are
+/// converted into `hflip=enable='…'` form so the option is parsed
+/// correctly. Filters that accept positional args (e.g. `unsharp` /
+/// `chromakey` in their short form) currently aren't emitted by
+/// `effect_to_filter` — every snippet uses named arguments — so we
+/// don't need a positional-arg converter here.
+fn append_enable_to_chain(snippet: &str, enable_expr: &str) -> String {
+    snippet
+        .split(',')
+        .map(|filter| append_enable_to_filter(filter.trim(), enable_expr))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn append_enable_to_filter(filter: &str, enable_expr: &str) -> String {
+    if filter.is_empty() {
+        return filter.to_string();
+    }
+    if filter.contains('=') {
+        format!("{filter}:enable='{enable_expr}'")
+    } else {
+        // Argument-less filter (`hflip`, `vflip`, `null`). Use `=` to
+        // open the option list.
+        format!("{filter}=enable='{enable_expr}'")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use memstroy_core::keyframe::Keyframe;
+
+    fn dummy_filter(_kind: &EffectKind, intensity: f32) -> Option<String> {
+        Some(format!("noop=i={:.3}", intensity))
+    }
+
+    #[test]
+    fn animated_chain_emits_per_segment_enable() {
+        let mut eff = Effect::blur();
+        eff.animated_params.insert("intensity".into());
+        eff.param_kfs.insert(
+            "intensity".into(),
+            vec![
+                Keyframe::new(0.0, 0.0_f32),
+                Keyframe::new(1.0, 1.0_f32),
+            ],
+        );
+        let chain = effect_animated_filter_chain(&eff, 0.0, 1.0, dummy_filter).unwrap();
+        assert!(chain.contains(":enable='between(t,"));
+        // At least 3 segments emitted (kf union + densification).
+        assert!(chain.matches(":enable='between").count() >= 3);
+    }
+
+    #[test]
+    fn static_effect_falls_back_to_helper() {
+        let eff = Effect::blur();
+        let chain = effect_animated_filter_chain(&eff, 0.0, 1.0, dummy_filter).unwrap();
+        assert_eq!(chain, "noop=i=1.000");
+    }
+
+    #[test]
+    fn argless_filter_gets_enable_via_equals() {
+        assert_eq!(
+            append_enable_to_filter("hflip", "between(t,0,1)"),
+            "hflip=enable='between(t,0,1)'"
+        );
+    }
 }
