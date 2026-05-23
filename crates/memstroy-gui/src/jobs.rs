@@ -58,6 +58,14 @@ pub enum JobEvent {
         place_on_canvas: bool,
         result: Result<crate::state::LibraryAsset, String>,
     },
+    /// A background image-effects bake completed. The RGBA buffer
+    /// inside is uploaded as an `egui::TextureHandle` on the UI
+    /// thread (texture upload requires `&egui::Context`) and stashed
+    /// in `state.image_fx_cache` keyed by `(path, sig)`. While the
+    /// bake is running the canvas falls back to drawing the
+    /// unprocessed image, so the UI never blocks on the effect
+    /// pipeline. See `image_fx_worker::submit_image_fx_job`.
+    ImageFxReady(crate::image_fx_worker::ImageFxResult),
 }
 
 #[derive(Debug, Clone)]
