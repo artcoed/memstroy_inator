@@ -111,6 +111,17 @@ pub struct RenderFrame {
     /// **Effects stack** applied to the rendered output.
     #[serde(default)]
     pub effects: Vec<crate::effects::Effect>,
+    /// **Animated parameter set** — same model the regular elements
+    /// use. Membership in this set decides whether an inspector edit
+    /// to the corresponding parameter writes a fresh keyframe at the
+    /// playhead (param IS animated) or broadcasts the new value to
+    /// every existing keyframe (param is STATIC). Without this
+    /// gating, the render-frame inspector either had to write
+    /// keyframes on every edit (one per frame during scrub — the
+    /// "thousand kfs" bug) or stay strictly static, neither of
+    /// which matches how actors / overlays work.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub animated_params: std::collections::BTreeSet<String>,
 }
 
 impl Default for RenderFrame {
@@ -120,6 +131,7 @@ impl Default for RenderFrame {
             layout: vec![Keyframe::new(0.0, RenderFrameState::default())],
             modifiers: Vec::new(),
             effects: Vec::new(),
+            animated_params: std::collections::BTreeSet::new(),
         }
     }
 }

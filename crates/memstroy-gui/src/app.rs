@@ -233,6 +233,18 @@ impl App {
                 JobEvent::RefreshProgress(msg) => {
                     self.state.status = format!("\u{1F504} {}", msg);
                 }
+                JobEvent::RefreshLibraryReloaded(msg) => {
+                    // Mid-refresh partial reload: the worker has
+                    // mirrored a fresh batch of clips to disk, so
+                    // re-scan the local library now instead of
+                    // waiting for the whole refresh to finish. This
+                    // is what restores the live "watch the catalogue
+                    // grow" feel during a 400+ clip ingest — without
+                    // it, the panel would stay frozen for the entire
+                    // multi-minute download.
+                    self.state.status = format!("\u{1F504} {}", msg);
+                    self.state.reload_library();
+                }
                 JobEvent::RefreshFinished(Ok(summary)) => {
                     self.state.refreshing = false;
                     self.state.reload_library();

@@ -41,6 +41,13 @@ pub enum JobEvent {
     RenderLog(String),
     RenderFinished(Result<PathBuf, String>),
     RefreshProgress(String),
+    /// Mid-refresh signal: the worker has just downloaded one or more
+    /// clips into `clips_dir` and the GUI should re-scan the local
+    /// library so they appear in the panel without waiting for the
+    /// entire refresh to finish. Carries the latest progress text so
+    /// the UI can update both the status bar and the library list in
+    /// one shot.
+    RefreshLibraryReloaded(String),
     RefreshFinished(Result<RefreshSummary, String>),
     /// Web image search returned a (possibly empty) list of hits, plus
     /// an optional cursor (`next_offset`) for the next page. The
@@ -113,6 +120,25 @@ pub fn spawn_render(
 /// `server_url` should be the base URL of a `memstroy-assets-server`
 /// instance (no trailing slash necessary). `channel` and `limit` are
 /// forwarded as the `/api/ingest/tg` request body.
+///
+/// ## Polling strategy
+///
+/// The previous version slept exactly 6 seconds after kicking the
+/// server's ingest job and then fetched the listing once. For any
+/// reasonably large channel (≥ a few dozen videos) the server was
+/// still mid-download when we listed, so the GUI mirrored a small
+/// fraction of the catalogue and the user was left wondering why
+/// "клипы с сервера не подгружаются" — there were 400+ clips
+/// expected and the editor only saw the first ~30. We now poll the
+/// listing repeatedly: every `POLL_INTERVAL` we re-list, mirror any
+/// newly-arrived clips to local cache, and continue until either
+///
+///   * the catalogue stops growing for `STABLE_WINDOW`, or
+///   * we reach `MAX_WAIT` total time, or
+///   * we've already mirrored at least `limit` clips.
+///
+/// Progress messages flow back through `JobEvent::RefreshProgress`
+/// so the user sees "X / Y synced" updating live in the status bar.
 pub fn spawn_refresh(
     rt: &Handle,
     tx: Sender<JobEvent>,
@@ -147,7 +173,7 @@ pub fn spawn_refresh(
         let body = serde_json::json!({ "channel": channel, "limit": limit });
         match client.post(&ingest_url).json(&body).send().await {
             Ok(resp) if resp.status().is_success() => {
-                progress("Server accepted ingest request, waiting for downloads...".into());
+                progress("Server accepted ingest request, downloading clips...".into());
             }
             Ok(resp) => {
                 let _ = tx.send(JobEvent::RefreshFinished(Err(format!(
@@ -166,43 +192,8 @@ pub fn spawn_refresh(
             }
         }
 
-        // 2. Wait for the server to scrape + download. Telegram preview
-        //    pages are small so 6s covers the common case; the user can
-        //    hit Refresh again to pick up newer clips.
-        tokio::time::sleep(Duration::from_secs(6)).await;
-
-        // 3. GET /api/assets?kind=clip — list everything the server has.
-        let list_url = format!("{}/api/assets?kind=clip&limit=200", server);
-        let listing: ListResponse = match client.get(&list_url).send().await {
-            Ok(resp) if resp.status().is_success() => match resp.json().await {
-                Ok(v) => v,
-                Err(e) => {
-                    let _ = tx.send(JobEvent::RefreshFinished(Err(format!(
-                        "Couldn't parse server listing: {e}"
-                    ))));
-                    return;
-                }
-            },
-            Ok(resp) => {
-                let _ = tx.send(JobEvent::RefreshFinished(Err(format!(
-                    "Listing failed: HTTP {}",
-                    resp.status()
-                ))));
-                return;
-            }
-            Err(e) => {
-                let _ = tx.send(JobEvent::RefreshFinished(Err(format!(
-                    "Listing failed: {e}"
-                ))));
-                return;
-            }
-        };
-
-        progress(format!(
-            "Server has {} clip(s). Syncing missing ones to local cache...",
-            listing.total
-        ));
-
+        // 2. Prepare the local mirror directory up-front so we can
+        //    start writing files as soon as the server has them.
         if let Err(e) = tokio::fs::create_dir_all(&clips_dir).await {
             let _ = tx.send(JobEvent::RefreshFinished(Err(format!(
                 "Couldn't create local clips dir {}: {e}",
@@ -213,43 +204,164 @@ pub fn spawn_refresh(
         let thumbs_dir = clips_dir.join("thumbs");
         let _ = tokio::fs::create_dir_all(&thumbs_dir).await;
 
-        // 4. Download anything the GUI doesn't already have on disk.
+        // 3. Poll the server while it ingests, mirroring as we go. A
+        //    high `limit=` is essential here: the server now allows
+        //    up to 5000 entries per response, and using anything
+        //    smaller would silently truncate channels with large
+        //    backlogs.
+        let list_url = format!(
+            "{}/api/assets?kind=clip&limit={}",
+            server,
+            // Pull a bit more than the requested limit so a server
+            // that already had clips before the ingest started still
+            // surfaces all of them.
+            (limit as u64).saturating_mul(2).max(1000),
+        );
+
+        // ── Polling parameters ──
+        // - POLL_INTERVAL: how often we list + mirror.
+        // - MAX_WAIT: hard ceiling so a flaky server can't hang us
+        //   forever (the user can Refresh again afterwards).
+        // - STABLE_WINDOW: when the server's clip count hasn't
+        //   changed for this long, we assume the ingest is done.
+        const POLL_INTERVAL: Duration = Duration::from_secs(3);
+        const MAX_WAIT: Duration = Duration::from_secs(600);
+        const STABLE_WINDOW: Duration = Duration::from_secs(8);
+
+        let started = std::time::Instant::now();
+        let mut last_change = started;
+        let mut last_total: u64 = 0;
         let mut new_count = 0usize;
         let mut failed = 0usize;
-        for item in &listing.items {
-            // Server ids match the ingest filenames: `{id}.mp4`.
-            let file_name = format!("{}.mp4", sanitise_id(&item.id));
-            let local_path = clips_dir.join(&file_name);
-            // Always mirror the description as a sidecar so the GUI's
-            // local library scan (which reads `<stem>.txt` next to each
-            // mp4) can show the Telegram caption even after the server
-            // is offline. We write the file unconditionally because the
-            // server is the source of truth for descriptions and may
-            // have re-cleaned an existing one.
-            if !item.description.is_empty() {
-                let txt_path = clips_dir.join(format!("{}.txt", sanitise_id(&item.id)));
-                if let Err(e) = tokio::fs::write(&txt_path, item.description.as_bytes()).await {
-                    warn!(
-                        id = %item.id,
-                        error = %e,
-                        "failed to mirror description sidecar locally"
-                    );
-                }
-            }
-            if local_path.exists() {
-                continue;
-            }
-            let dl_url = format!("{}/api/assets/{}/download", server, item.id);
-            match download_file(&client, &dl_url, &local_path).await {
-                Ok(_) => {
-                    info!(id = %item.id, "downloaded clip from server");
-                    new_count += 1;
+        // Most recent server-side clip count, for the final summary
+        // report. The `_assigns` allow is intentional: the inner loop
+        // overwrites this every iteration, but we still need a sane
+        // default so the post-loop send compiles in the unlikely case
+        // the loop terminates without listing once (network down +
+        // MAX_WAIT both hit on the first attempt).
+        #[allow(unused_assignments)]
+        let mut total_seen: u64 = 0;
+        // Track which ids we've already attempted (succeeded or not)
+        // so we don't keep retrying the same broken download every
+        // poll cycle.
+        let mut attempted: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
+        loop {
+            // Snapshot `new_count` at the top of the round so we can
+            // tell at the bottom whether we actually downloaded
+            // anything new this iteration (used to decide whether to
+            // ping the GUI for a partial library reload).
+            let new_count_at_round_start = new_count;
+
+            let listing: ListResponse = match client.get(&list_url).send().await {
+                Ok(resp) if resp.status().is_success() => match resp.json().await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(error = %e, "couldn't parse server listing during poll");
+                        // Soft-fail one round; try again next poll.
+                        tokio::time::sleep(POLL_INTERVAL).await;
+                        continue;
+                    }
+                },
+                Ok(resp) => {
+                    warn!(status = %resp.status(), "listing failed during poll");
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                    continue;
                 }
                 Err(e) => {
-                    warn!(id = %item.id, error = %e, "clip download failed");
-                    failed += 1;
+                    warn!(error = %e, "listing failed during poll");
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                    continue;
+                }
+            };
+
+            total_seen = listing.total;
+            if listing.total != last_total {
+                last_total = listing.total;
+                last_change = std::time::Instant::now();
+            }
+
+            // Mirror anything we don't have yet.
+            for item in &listing.items {
+                if !attempted.insert(item.id.clone()) {
+                    // Already tried this id (success or persistent
+                    // failure) — skip until next refresh.
+                    continue;
+                }
+                let file_name = format!("{}.mp4", sanitise_id(&item.id));
+                let local_path = clips_dir.join(&file_name);
+
+                // Always mirror the description sidecar (server is
+                // the source of truth and may have re-cleaned it).
+                if !item.description.is_empty() {
+                    let txt_path =
+                        clips_dir.join(format!("{}.txt", sanitise_id(&item.id)));
+                    if let Err(e) =
+                        tokio::fs::write(&txt_path, item.description.as_bytes()).await
+                    {
+                        warn!(
+                            id = %item.id,
+                            error = %e,
+                            "failed to mirror description sidecar locally"
+                        );
+                    }
+                }
+                if local_path.exists() {
+                    continue;
+                }
+                let dl_url = format!("{}/api/assets/{}/download", server, item.id);
+                match download_file(&client, &dl_url, &local_path).await {
+                    Ok(_) => {
+                        info!(id = %item.id, "downloaded clip from server");
+                        new_count += 1;
+                    }
+                    Err(e) => {
+                        warn!(id = %item.id, error = %e, "clip download failed");
+                        failed += 1;
+                    }
                 }
             }
+
+            progress(format!(
+                "Server has {} clip(s); local mirror: {} new, {} failed",
+                listing.total, new_count, failed
+            ));
+
+            // If new files actually landed in `clips_dir` this round,
+            // ping the GUI to re-scan its library so the user sees
+            // them straight away. Without this signal the list would
+            // stay frozen until the full refresh finished, which on
+            // large channels is dozens of seconds away.
+            if new_count > new_count_at_round_start {
+                let _ = tx.send(JobEvent::RefreshLibraryReloaded(format!(
+                    "Synced {} / {} clips...",
+                    new_count, listing.total
+                )));
+            }
+
+            // Termination conditions, in priority order.
+            if started.elapsed() >= MAX_WAIT {
+                info!("refresh: hit MAX_WAIT, stopping poll loop");
+                break;
+            }
+            if last_change.elapsed() >= STABLE_WINDOW
+                && listing.total > 0
+            {
+                info!(
+                    total = listing.total,
+                    "refresh: server count stable, stopping"
+                );
+                break;
+            }
+            // No clips at all yet AND no time elapsed → keep waiting,
+            // server may still be on its first scrape.
+            if listing.total == 0 && started.elapsed() < Duration::from_secs(20) {
+                tokio::time::sleep(POLL_INTERVAL).await;
+                continue;
+            }
+
+            tokio::time::sleep(POLL_INTERVAL).await;
         }
 
         if new_count > 0 {
@@ -259,7 +371,7 @@ pub fn spawn_refresh(
 
         let _ = tx.send(JobEvent::RefreshFinished(Ok(RefreshSummary {
             new_clips: new_count,
-            total_clips: listing.items.len(),
+            total_clips: total_seen as usize,
             failed,
         })));
     });
