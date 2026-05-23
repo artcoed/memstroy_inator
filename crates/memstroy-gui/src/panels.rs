@@ -1490,60 +1490,13 @@ fn inspector_overlay_param_strip<F>(
     }
 }
 
-/// Per-param keyframe strip for the render frame inspector. Mirrors
-/// `inspector_actor_param_strip` — render-frame keyframes are stored in
-/// scene-time so we don't need the t_in offset.
-fn inspector_render_frame_param_strip<F>(
-    ui: &mut egui::Ui,
-    layout: &mut Vec<Keyframe<memstroy_core::RenderFrameState>>,
-    playhead_scene: f32,
-    get: F,
-    salt: impl std::hash::Hash + Copy,
-) where
-    F: Fn(&memstroy_core::RenderFrameState) -> f32,
-{
-    if layout.len() < 2 {
-        return;
-    }
-    const EPS: f32 = 1.0e-4;
-    let mut indices: Vec<usize> = Vec::with_capacity(layout.len());
-    indices.push(0);
-    for i in 1..layout.len() {
-        if (get(&layout[i].value) - get(&layout[i - 1].value)).abs() > EPS {
-            indices.push(i);
-        }
-    }
-    if indices.len() < 2 {
-        return;
-    }
-    let times: Vec<f32> = indices.iter().map(|&i| layout[i].t.max(0.0)).collect();
-    let easings: Vec<memstroy_core::Easing> =
-        indices.iter().map(|&i| layout[i].easing).collect();
-
-    let max_kf_t = times.iter().cloned().fold(0.0_f32, f32::max);
-    let dur = max_kf_t.max(playhead_scene).max(1.0);
-
-    let interaction = crate::kf_anim::keyframe_strip(
-        ui,
-        &times,
-        &easings,
-        dur,
-        Some(playhead_scene.max(0.0)),
-        salt,
-    );
-
-    if let Some((strip_idx, new_t)) = interaction.dragged_idx_to {
-        if let Some(&kf_idx) = indices.get(strip_idx) {
-            layout[kf_idx].t = new_t.max(0.0);
-            layout.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
-        }
-    }
-    if let Some((strip_idx, easing)) = interaction.easing_changed {
-        if let Some(&kf_idx) = indices.get(strip_idx) {
-            layout[kf_idx].easing = easing;
-        }
-    }
-}
+/// Per-param keyframe strip for the render frame inspector.
+/// REMOVED: the render-frame keyframe strips moved out of the
+/// inspector and onto the dedicated "Render Frame" row of the layer
+/// panel — see `render_frame_animated_params` /
+/// `render_frame_expansion` and the strip-render branch inside the
+/// timeline RF row block. Kept this comment as a breadcrumb so a
+/// future contributor doesn't reintroduce a duplicate.
 
 
 fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
@@ -4716,23 +4669,14 @@ fn inspector_render_frame(ui: &mut egui::Ui, state: &mut EditorState) {
     });
 
     // ─── Per-param keyframe strips ──────────────────────────────
-    // Render-frame keyframes show up in the inspector exactly like a
-    // regular video element's: one strip per animated parameter, with
-    // a diamond per keyframe at its scene-time. The strips appear
-    // automatically as soon as `layout` has more than one keyframe.
+    // Render-frame keyframes used to show up here in the inspector,
+    // duplicated with the per-clip diamonds in the timeline. Per
+    // user request the strips now live ONLY under the dedicated
+    // "Render Frame" row in the layer panel, mirroring every other
+    // layer's keyframe rows. The inspector keeps the toggle
+    // diamonds + value widgets above so users can still author kfs
+    // from here; they're just no longer shown as a separate strip.
     ui.add_space(6.0);
-    inspector_render_frame_param_strip(
-        ui, &mut rf.layout, rf_t_local, |s| s.pos.x, ("rf_strip_px",),
-    );
-    inspector_render_frame_param_strip(
-        ui, &mut rf.layout, rf_t_local, |s| s.pos.y, ("rf_strip_py",),
-    );
-    inspector_render_frame_param_strip(
-        ui, &mut rf.layout, rf_t_local, |s| s.zoom, ("rf_strip_zoom",),
-    );
-    inspector_render_frame_param_strip(
-        ui, &mut rf.layout, rf_t_local, |s| s.rotation_deg, ("rf_strip_rot",),
-    );
 
     ui.add_space(8.0);
     ui.separator();
@@ -6780,10 +6724,11 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             state.status = t("\u{2728} New audio layer.").into();
         }
 
-        // Zoom display (read-only — adjust via scrollbar handles)
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(RichText::new(format!("{:.0}px/s", state.timeline_zoom)).size(10.0).color(COL_TEXT_DIM));
-        });
+        // The render-scale display lives on the canvas (render
+        // window) only — the user explicitly asked for it to be
+        // removed from the timeline / layers panel "tabs" toolbar
+        // since the same information is already visible (and
+        // adjustable) over the preview itself.
     });
     ui.add_space(2.0);
 
@@ -7171,9 +7116,13 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     let mut track_rows: Vec<(f32, f32)> = Vec::with_capacity(num_tracks);
     {
         // Reserve space for the Render Frame row at the top — every
-        // real track is shifted down by `rf_row_h` so the layout
-        // stays consistent.
-        let mut acc = rf_row_h;
+        // real track is shifted down by `rf_row_h` (the diamond strip)
+        // PLUS `rf_expansion` (the per-param keyframe rows that show
+        // up directly under the diamond strip when the render frame
+        // is the active selection, mirroring how every other layer
+        // expands beneath itself).
+        let rf_expansion = render_frame_expansion(state, v_zoom);
+        let mut acc = rf_row_h + rf_expansion;
         for (ti, tk) in state.tracks.iter().enumerate() {
             let h = tk.height * v_zoom
                 + selected_layer_mask_above_height(state, ti, v_zoom)
@@ -7311,6 +7260,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     // last-pixel round-down.
     const BOTTOM_GUTTER: f32 = 160.0;
     let total_tracks_h: f32 = rf_row_h
+        + render_frame_expansion(state, v_zoom)
         + (0..num_tracks)
             .map(|i| {
                 // Match the per-frame layout exactly:
@@ -7351,14 +7301,24 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     // dedicated row above all tracks. The row scrolls with the rest of
     // the timeline (it's not sticky) so users with very tall scenes
     // can still scroll past it.
+    //
+    // When the render frame is the active selection, we also expand
+    // the row downward with one diamond row per animated parameter —
+    // exactly like every other layer expands. This way the user
+    // works with render-frame keyframes from the SAME place as
+    // actor / overlay keyframes (the inspector used to host these
+    // strips, but per the user request we moved them onto the
+    // layer panel for consistency).
+    let rf_expansion = render_frame_expansion(state, v_zoom);
     {
         let row_top = tracks_rect.min.y - v_scroll;
-        let row_bot = row_top + rf_row_h;
+        let diamond_bot = row_top + rf_row_h;
+        let row_bot = diamond_bot + rf_expansion;
 
         if row_bot >= tracks_rect.min.y - 1.0 && row_top <= tracks_rect.max.y + 1.0 {
             let row_rect = egui::Rect::from_min_max(
                 egui::pos2(tracks_rect.min.x, row_top),
-                egui::pos2(tracks_rect.max.x, row_bot),
+                egui::pos2(tracks_rect.max.x, diamond_bot),
             );
             let painter_rf = &tracks_painter;
             // The render frame row participates in the canvas multi-
@@ -7374,7 +7334,10 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             };
             painter_rf.rect_filled(row_rect, Rounding::ZERO, bg_color);
             // Top/bottom separators so the row stands out from the
-            // ruler and the regular tracks.
+            // ruler and the regular tracks. The bottom separator
+            // sits below the param-rows expansion when present so
+            // it always reads as the floor of the whole render-
+            // frame block.
             painter_rf.line_segment(
                 [
                     egui::pos2(tracks_rect.min.x, row_top),
@@ -7401,7 +7364,10 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                 Color32::from_rgb(60, 30, 30),
             );
             header_painter.text(
-                hdr_rect.center(),
+                egui::pos2(
+                    hdr_rect.center().x,
+                    row_top + rf_row_h * 0.5,
+                ),
                 egui::Align2::CENTER_CENTER,
                 "Render Frame",
                 egui::FontId::proportional(11.0),
@@ -7413,7 +7379,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             // overlay clip-bars so the diamonds look identical.
             let content_rect_rf = egui::Rect::from_min_max(
                 egui::pos2(tracks_rect.min.x, row_top + 1.0),
-                egui::pos2(tracks_rect.max.x, row_bot - 1.0),
+                egui::pos2(tracks_rect.max.x, diamond_bot - 1.0),
             );
             let scene_dur = state.scene.output.duration.max(0.0);
             let rf_layout = state.scene.render_frame.layout.clone();
@@ -7431,19 +7397,84 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                 true, // render-frame kfs are scene-time anchored
             );
 
-            // Click anywhere inside the render-frame row to select it.
-            // We allocate a click sense over the row content area so
-            // the click interaction is independent of any sub-clip
-            // hit-test.
+            // ── Per-param keyframe rows under the render-frame
+            // diamond strip. Mirrors the per-track `draw_param_kf_rows`
+            // path used for actors / overlays so the visuals
+            // (alternating row tints, label gutter, diamond
+            // selection / drag) are byte-for-byte identical between
+            // the two layer kinds. The render frame is scene-time
+            // anchored and runs the entire scene duration, so the
+            // "clip" for the strip-attachment math spans
+            // 0..scene_duration.
+            if rf_expansion > 4.0 {
+                if let Some(params) = render_frame_animated_params(state) {
+                    let layer_label = crate::kf_anim::SelectedLayer::RenderFrame;
+                    let param_kf_pairs =
+                        compute_param_change_points(state, Selection::RenderFrame);
+                    let clip_x_start =
+                        (0.0 - state.timeline_scroll) * pps + track_left;
+                    let clip_x_end =
+                        (scene_dur - state.timeline_scroll) * pps + track_left;
+                    let outcome = draw_param_kf_rows(
+                        ui,
+                        painter_rf,
+                        &layer_label,
+                        &params,
+                        &param_kf_pairs,
+                        diamond_bot,
+                        rf_expansion,
+                        track_left,
+                        track_right,
+                        pps,
+                        state.timeline_scroll,
+                        state.playhead,
+                        &state.selected_keyframes,
+                        clip_x_start,
+                        clip_x_end,
+                    );
+                    for hit in outcome.click_hits {
+                        param_row_clicks.push((layer_label.clone(), hit));
+                    }
+                    for ec in outcome.easing_changes {
+                        param_row_easing_changes.push((layer_label.clone(), ec));
+                    }
+                }
+            }
+
+            // Click anywhere inside the render-frame DIAMOND strip to
+            // select it. The expansion area below has its own
+            // per-row click handlers (registered by
+            // `draw_param_kf_rows` above), so we deliberately scope
+            // the row-select interactor to the diamond-only band —
+            // otherwise a click on a parameter diamond would fight
+            // the row click and lose the seek-to-keyframe gesture.
             let row_id = egui::Id::new(("timeline_rf_row",));
             let row_resp = ui.interact(content_rect_rf, row_id, Sense::click());
             if row_resp.clicked() {
-                to_select = Some(Selection::RenderFrame);
+                // Mirror every other layer kind: plain click clears
+                // any prior multi-selection then re-seeds canvas_selection
+                // with just the render frame, while Ctrl+click toggles
+                // it in/out of the existing set without touching the
+                // primary selection.
+                let ctrl_held = ui.input(|i| i.modifiers.ctrl || i.modifiers.mac_cmd);
+                let target_sel = Selection::RenderFrame;
+                if ctrl_held {
+                    if let Some(pos) = state.canvas_selection.iter().position(|&s| s == target_sel) {
+                        state.canvas_selection.remove(pos);
+                    } else {
+                        state.canvas_selection.push(target_sel);
+                    }
+                } else {
+                    state.multi_select.clear();
+                    state.canvas_selection.clear();
+                    state.canvas_selection.push(target_sel);
+                }
+                to_select = Some(target_sel);
             }
         }
     }
 
-    let mut acc_y = rf_row_h;
+    let mut acc_y = rf_row_h + rf_expansion;
     for track_idx in 0..num_tracks {
         let track = &state.tracks[track_idx];
         let track_h = track.height * v_zoom;
@@ -7604,7 +7635,13 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                         state.canvas_selection.push(target_sel);
                                     }
                                 } else {
+                                    // Plain (non-Ctrl) click: drop every
+                                    // prior selection so the inspector
+                                    // can't stay in multi-select mode
+                                    // after this single click.
+                                    state.multi_select.clear();
                                     state.canvas_selection.clear();
+                                    state.canvas_selection.push(target_sel);
                                 }
                                 to_select = Some(target_sel);
                             }
@@ -7907,8 +7944,20 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                     state.canvas_selection.push(target_sel);
                                 }
                             } else {
+                                // Plain (non-Ctrl) click: replace the
+                                // whole multi-selection with just this
+                                // layer. Mirrors the canvas's plain-
+                                // click behaviour exactly so the
+                                // inspector never stays stuck in its
+                                // multi-select branch after the user
+                                // single-clicks a row in the layer
+                                // panel. Without the explicit `push`
+                                // back in canvas_selection, downstream
+                                // canvas drags wouldn't see the
+                                // primary in the snapshot list either.
                                 state.multi_select.clear();
                                 state.canvas_selection.clear();
+                                state.canvas_selection.push(target_sel);
                             }
                             to_select = Some(target_sel);
                         }
@@ -8164,7 +8213,17 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                     state.canvas_selection.push(target_sel);
                                 }
                             } else {
+                                // Plain (non-Ctrl) click: drop every
+                                // prior selection (including the
+                                // legacy actor multi_select set, which
+                                // would otherwise leak across layer
+                                // kinds) and re-seed canvas_selection
+                                // with just this overlay so the
+                                // inspector / canvas treat it as a
+                                // proper single-element selection.
+                                state.multi_select.clear();
                                 state.canvas_selection.clear();
+                                state.canvas_selection.push(target_sel);
                             }
                             to_select = Some(target_sel);
                         }
@@ -8430,7 +8489,15 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                     state.canvas_selection.push(target_sel);
                                 }
                             } else {
+                                // Plain (non-Ctrl) click: replace the
+                                // whole multi-selection with just this
+                                // audio row so a single click never
+                                // leaves stray entries in
+                                // canvas_selection from a previous
+                                // marquee / Ctrl-click set.
+                                state.multi_select.clear();
                                 state.canvas_selection.clear();
+                                state.canvas_selection.push(target_sel);
                             }
                             to_select = Some(target_sel);
                         }
@@ -8802,6 +8869,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
         // anchored to the same content fraction across zoom changes,
         // and makes "drag thumb to bottom" reliably hit the last row.
         let new_total_tracks_h: f32 = RF_ROW_BASE_H * new_v_zoom
+            + render_frame_expansion(state, new_v_zoom)
             + (0..num_tracks)
                 .map(|i| {
                     state.tracks[i].height * new_v_zoom
@@ -10017,6 +10085,36 @@ fn selected_layer_expansion(state: &EditorState, track_idx: usize, v_zoom: f32) 
     if params.is_empty() {
         return 0.0;
     }
+    (params.len() as f32) * PARAM_ROW_BASE * v_zoom + 4.0
+}
+
+/// Animated-param ids on the render frame, ordered for stable on-
+/// screen rendering. Returns `None` when the render frame is NOT the
+/// current selection — the per-param keyframe rows only appear under
+/// the dedicated render-frame row when the user has it selected, so
+/// non-RF-related layers never reserve vertical space for them.
+fn render_frame_animated_params(state: &EditorState) -> Option<Vec<String>> {
+    if state.selection != Selection::RenderFrame
+        && !state.canvas_selection.contains(&Selection::RenderFrame)
+    {
+        return None;
+    }
+    let params = ordered_animated(&state.scene.render_frame.animated_params);
+    if params.is_empty() {
+        return None;
+    }
+    Some(params)
+}
+
+/// Vertical pixels needed for the render-frame row's per-param
+/// keyframe strip, mirroring `selected_layer_expansion` for regular
+/// tracks. Returns 0 when the render frame is unselected or has no
+/// animated parameters, so the layout stays unchanged in the common
+/// case.
+fn render_frame_expansion(state: &EditorState, v_zoom: f32) -> f32 {
+    let Some(params) = render_frame_animated_params(state) else {
+        return 0.0;
+    };
     (params.len() as f32) * PARAM_ROW_BASE * v_zoom + 4.0
 }
 
