@@ -311,23 +311,55 @@ impl<'a> FilterGraphBuilder<'a> {
 
             let key = actor.chroma_key.key_color;
             let key_hex = format!("0x{:02X}{:02X}{:02X}", key[0], key[1], key[2]);
-            let (pos_x, pos_y, scale_expr, scale_y_expr) = position_and_scale_expr(&actor.layout, w, h);
+            // Build the full preview-faithful transform: canvas_layouts
+            // (when present) overrides position; render_frame motion
+            // shifts the composite; modifiers / easing / per-frame
+            // rotation / opacity / flip are all honoured. See
+            // `expr::build_element_transform` for the contract.
+            let t_in_clip = actor.t_in.unwrap_or(0.0);
+            let xform = crate::expr::build_element_transform(
+                self.scene,
+                &actor.id,
+                &actor.layout,
+                &actor.modifiers,
+                t_in_clip,
+            );
+            if xform.opacity_animated {
+                tracing::debug!(
+                    actor_id = %actor.id,
+                    "actor opacity is keyframed; export uses static midpoint sample",
+                );
+            }
             let speed = actor.speed.max(0.0001);
             let speed_part = if (speed - 1.0).abs() > 1.0e-4 {
                 Some(format!("setpts=PTS/{:.6}", speed))
             } else {
                 None
             };
-            let scale_part = format!("scale=w='iw*{sx}':h='ih*{sy}':eval=frame", sx = scale_expr, sy = scale_y_expr);
+            let scale_part = format!(
+                "scale=w='iw*{sx}':h='ih*{sy}':eval=frame",
+                sx = xform.sx_expr,
+                sy = xform.sy_expr,
+            );
+            // Combined static flip = `flip_horizontal` XOR midpoint
+            // `flip_x_anim < 0`. Same XOR rule the preview's mesh
+            // uses (`combined_x = if static_hflip { -anim } else { anim }`).
+            let want_hflip = actor.flip_horizontal ^ xform.hflip;
+            let want_vflip = xform.vflip;
+            // Pre-scale CC sits with the source's native pixel data —
+            // matching the preview where `apply_effects_cpu` also runs
+            // before the on-canvas resize.
+            let cc_filters =
+                crate::expr::color_correction_filters(&actor.color_correction, t_in_clip, actor.t_out);
             let actor_label = self.alloc_label("actor");
 
             if effects_have_mask(&actor.effects) {
                 // Mask effects need extra inputs and a multi-stream
                 // sub-graph (alphamerge), so we have to break the
                 // single-chunk chain. Lay it out in three pieces:
-                //   1) chromakey/format/hflip up to a labelled stage,
+                //   1) chromakey/format/hflip + CC up to a labelled stage,
                 //   2) the user effect stack (handles mask boundaries),
-                //   3) speed + layout scale to the final actor label.
+                //   3) speed + layout scale + per-frame rotate/alpha.
                 let mut prefix = format!(
                     "[{idx}:v]chromakey={hex}:{sim}:{blend},format=yuva420p",
                     idx = idx,
@@ -335,8 +367,15 @@ impl<'a> FilterGraphBuilder<'a> {
                     sim = actor.chroma_key.similarity,
                     blend = actor.chroma_key.blend,
                 );
-                if actor.flip_horizontal {
+                if want_hflip {
                     prefix.push_str(",hflip");
+                }
+                if want_vflip {
+                    prefix.push_str(",vflip");
+                }
+                for cc in &cc_filters {
+                    prefix.push(',');
+                    prefix.push_str(cc);
                 }
                 let pre_label = self.alloc_label("actorPre");
                 self.chunks.push(format!("{prefix}{pre_label}", prefix = prefix, pre_label = pre_label));
@@ -344,6 +383,20 @@ impl<'a> FilterGraphBuilder<'a> {
                 let mut tail_filters: Vec<String> = Vec::new();
                 if let Some(s) = speed_part { tail_filters.push(s); }
                 tail_filters.push(scale_part);
+                if let Some(rot) = &xform.rot_expr {
+                    // `c=none` keeps the corners transparent so the
+                    // rotated frame composites cleanly over the canvas.
+                    tail_filters.push(format!(
+                        "rotate={r}:c=none:ow=hypot(iw\\,ih):oh=hypot(iw\\,ih)",
+                        r = rot,
+                    ));
+                }
+                if xform.opacity_static < 0.999 {
+                    tail_filters.push(format!(
+                        "colorchannelmixer=aa={:.4}",
+                        xform.opacity_static.clamp(0.0, 1.0),
+                    ));
+                }
                 self.chunks.push(format!(
                     "{src}{filters}{out}",
                     src = after_fx,
@@ -361,8 +414,15 @@ impl<'a> FilterGraphBuilder<'a> {
                     sim = actor.chroma_key.similarity,
                     blend = actor.chroma_key.blend,
                 );
-                if actor.flip_horizontal {
+                if want_hflip {
                     chain.push_str(",hflip");
+                }
+                if want_vflip {
+                    chain.push_str(",vflip");
+                }
+                for cc in &cc_filters {
+                    chain.push(',');
+                    chain.push_str(cc);
                 }
                 for snippet in effect_stack_filters(&actor.effects) {
                     chain.push(',');
@@ -374,6 +434,20 @@ impl<'a> FilterGraphBuilder<'a> {
                 }
                 chain.push(',');
                 chain.push_str(&scale_part);
+                if let Some(rot) = &xform.rot_expr {
+                    chain.push(',');
+                    chain.push_str(&format!(
+                        "rotate={r}:c=none:ow=hypot(iw\\,ih):oh=hypot(iw\\,ih)",
+                        r = rot,
+                    ));
+                }
+                if xform.opacity_static < 0.999 {
+                    chain.push(',');
+                    chain.push_str(&format!(
+                        "colorchannelmixer=aa={:.4}",
+                        xform.opacity_static.clamp(0.0, 1.0),
+                    ));
+                }
                 self.chunks.push(format!("{chain}{out}", chain = chain, out = actor_label));
             }
 
@@ -388,8 +462,8 @@ impl<'a> FilterGraphBuilder<'a> {
                 "{cur}{actor}overlay=x='{x}':y='{y}'{enable}:eof_action=pass{out}",
                 cur = self.cursor,
                 actor = actor_label,
-                x = pos_x,
-                y = pos_y,
+                x = xform.x_expr,
+                y = xform.y_expr,
                 enable = enable,
                 out = composed,
             ));
@@ -588,35 +662,43 @@ impl<'a> FilterGraphBuilder<'a> {
         // *plate centre*; our PNG's plate centre lives at
         // (anchor_dx_from_left, anchor_dy_from_top). Subtract that
         // from the centred pos expression so the PNG slides into
-        // place such that its plate centre lands on `pos*W, pos*H`.
-        let (cx_expr, cy_expr, scale_expr, scale_y_expr) =
-            position_and_scale_expr(&t.layout, w, h);
-        // `position_and_scale_expr` returns left-edge / top-edge for
-        // an overlay whose intrinsic size is `w`/`h` (ffmpeg's
-        // overlay-time text width/height). The expression actually
-        // is `(pos*W - w/2)` so it expects the overlay's anchor at
-        // its centre. We adjust by the difference between the PNG
-        // centre and the plate centre we baked.
-        let dx = raster.anchor_dx_from_left - raster.width as f32 * 0.5;
-        let dy = raster.anchor_dy_from_top - raster.height as f32 * 0.5;
-        let x_expr = format!("({cx})-({dx})", cx = cx_expr, dx = dx);
-        let y_expr = format!("({cy})-({dy})", cy = cy_expr, dy = dy);
-
+        // place such that its plate centre lands on the layout's
+        // world-space centre — including any canvas_layouts override,
+        // render_frame motion or modifier-driven offset.
+        let xform = crate::expr::build_element_transform(
+            self.scene,
+            &t.id,
+            &t.layout,
+            &t.modifiers,
+            t.t_in,
+        );
         let scale_part = format!(
             "scale=w='iw*{sx}':h='ih*{sy}':eval=frame",
-            sx = scale_expr,
-            sy = scale_y_expr,
+            sx = xform.sx_expr,
+            sy = xform.sy_expr,
         );
+        // The PNG centre lands on `(anchor_dx_from_left,
+        // anchor_dy_from_top)`. To put the plate centre on the
+        // layout's centre we subtract that anchor offset (relative to
+        // the centre of the PNG) from the centre expression.
+        let dx = raster.anchor_dx_from_left - raster.width as f32 * 0.5;
+        let dy = raster.anchor_dy_from_top - raster.height as f32 * 0.5;
+        let x_expr = format!("({cx})-w/2-({dx:.4})", cx = xform.centre_x_expr, dx = dx);
+        let y_expr = format!("({cy})-h/2-({dy:.4})", cy = xform.centre_y_expr, dy = dy);
 
         // Build the pre-overlay chain. We support layout-driven
-        // rotation via a single `rotate=` filter (animation is
-        // sampled at midpoint — the same approximation that
-        // `position_and_scale_expr` uses for `flip_x_anim` /
-        // `flip_y_anim` etc.) and constant flip via `hflip`/`vflip`
-        // when the midpoint sample is negative. Per-frame animated
-        // rotation/flip is left as a follow-up; the static case is
-        // what the user's preview screenshots demonstrate.
-        let (rot_part, hflip, vflip) = sample_rotation_and_flip(&t.layout);
+        // rotation via a per-frame `rotate=` filter (animation is now
+        // honoured — previously the renderer sampled rotation only
+        // at the layout midpoint). Static flips fall through as
+        // `hflip` / `vflip` for the dominant midpoint sign.
+        let hflip = xform.hflip;
+        let vflip = xform.vflip;
+        let rot_part = xform.rot_expr.as_ref().map(|r| {
+            format!(
+                "rotate={r}:c=none:ow=hypot(iw\\,ih):oh=hypot(iw\\,ih)",
+                r = r,
+            )
+        });
 
         let txt_label = self.alloc_label("txt");
         let mut chain = format!("[{idx}:v]format=yuva420p", idx = idx);
@@ -631,6 +713,13 @@ impl<'a> FilterGraphBuilder<'a> {
         if let Some(r) = rot_part {
             chain.push(',');
             chain.push_str(&r);
+        }
+        if xform.opacity_static < 0.999 {
+            chain.push(',');
+            chain.push_str(&format!(
+                "colorchannelmixer=aa={:.4}",
+                xform.opacity_static.clamp(0.0, 1.0),
+            ));
         }
         self.chunks
             .push(format!("{chain}{out}", chain = chain, out = txt_label));
@@ -704,7 +793,7 @@ impl<'a> FilterGraphBuilder<'a> {
         Ok(())
     }
 
-    fn emit_image_overlay(&mut self, ov: &ImageOverlay, w: u32, h: u32) -> Result<()> {
+    fn emit_image_overlay(&mut self, ov: &ImageOverlay, _w: u32, _h: u32) -> Result<()> {
         let path = self.resolve(&ov.source);
         let idx = self.add_input(FfmpegInput {
             path,
@@ -713,11 +802,26 @@ impl<'a> FilterGraphBuilder<'a> {
             seek: None,
             t: None,
         });
-        let (x, y, scale_expr, scale_y_expr) = position_and_scale_expr(&ov.layout, w, h);
+        // Same canvas_layouts / render_frame / easing / modifier
+        // pipeline the actor uses — the preview treats image overlays
+        // identically to actor clips for positioning and animation.
+        let xform = crate::expr::build_element_transform(
+            self.scene,
+            &ov.id,
+            &ov.layout,
+            &ov.modifiers,
+            ov.t_in,
+        );
+        if xform.opacity_animated {
+            tracing::debug!(
+                overlay_id = %ov.id,
+                "image overlay opacity is keyframed; export uses static midpoint sample",
+            );
+        }
         let scale_part = format!(
             "scale=w='iw*{sx}':h='ih*{sy}':eval=frame",
-            sx = scale_expr,
-            sy = scale_y_expr,
+            sx = xform.sx_expr,
+            sy = xform.sy_expr,
         );
         // Optional chromakey filter — added when the user picked a
         // colour with the eyedropper. Mirrors the `VideoOverlay` /
@@ -737,21 +841,36 @@ impl<'a> FilterGraphBuilder<'a> {
             // See `emit_actors` — masks force a multi-stream layout
             // because they need a second input plus alphamerge.
             let pre_label = self.alloc_label("imgPre");
-            let chroma_clause = chroma_part
-                .as_ref()
-                .map(|c| format!(",{}", c))
-                .unwrap_or_default();
+            let mut prefix = format!("[{idx}:v]format=yuva420p", idx = idx);
+            if let Some(c) = &chroma_part {
+                prefix.push(',');
+                prefix.push_str(c);
+            }
+            if xform.hflip { prefix.push_str(",hflip"); }
+            if xform.vflip { prefix.push_str(",vflip"); }
             self.chunks.push(format!(
-                "[{idx}:v]format=yuva420p{ck}{pre_label}",
-                idx = idx,
-                ck = chroma_clause,
+                "{prefix}{pre_label}",
+                prefix = prefix,
                 pre_label = pre_label,
             ));
             let after_fx = self.apply_effect_stack(pre_label, &ov.effects)?;
+            let mut tail: Vec<String> = vec![scale_part];
+            if let Some(rot) = &xform.rot_expr {
+                tail.push(format!(
+                    "rotate={r}:c=none:ow=hypot(iw\\,ih):oh=hypot(iw\\,ih)",
+                    r = rot,
+                ));
+            }
+            if xform.opacity_static < 0.999 {
+                tail.push(format!(
+                    "colorchannelmixer=aa={:.4}",
+                    xform.opacity_static.clamp(0.0, 1.0),
+                ));
+            }
             self.chunks.push(format!(
-                "{src}{scale}{out}",
+                "{src}{filters}{out}",
                 src = after_fx,
-                scale = scale_part,
+                filters = tail.join(","),
                 out = img_label,
             ));
         } else {
@@ -760,6 +879,8 @@ impl<'a> FilterGraphBuilder<'a> {
                 chain.push(',');
                 chain.push_str(c);
             }
+            if xform.hflip { chain.push_str(",hflip"); }
+            if xform.vflip { chain.push_str(",vflip"); }
             // Apply the user-defined effect stack before the layout scale,
             // matching the actor pipeline so e.g. blur / hue shift work in
             // the image's native pixel space (before the on-canvas resize).
@@ -769,6 +890,20 @@ impl<'a> FilterGraphBuilder<'a> {
             }
             chain.push(',');
             chain.push_str(&scale_part);
+            if let Some(rot) = &xform.rot_expr {
+                chain.push(',');
+                chain.push_str(&format!(
+                    "rotate={r}:c=none:ow=hypot(iw\\,ih):oh=hypot(iw\\,ih)",
+                    r = rot,
+                ));
+            }
+            if xform.opacity_static < 0.999 {
+                chain.push(',');
+                chain.push_str(&format!(
+                    "colorchannelmixer=aa={:.4}",
+                    xform.opacity_static.clamp(0.0, 1.0),
+                ));
+            }
             self.chunks.push(format!("{chain}{out}", chain = chain, out = img_label));
         }
         let next = self.alloc_label("imgstack");
@@ -776,8 +911,8 @@ impl<'a> FilterGraphBuilder<'a> {
             "{cur}{img}overlay=x='{x}':y='{y}':enable='between(t,{a},{b})':eof_action=pass{out}",
             cur = self.cursor,
             img = img_label,
-            x = x,
-            y = y,
+            x = xform.x_expr,
+            y = xform.y_expr,
             a = ov.t_in,
             b = ov.t_out,
             out = next,
@@ -786,7 +921,7 @@ impl<'a> FilterGraphBuilder<'a> {
         Ok(())
     }
 
-    fn emit_video_overlay(&mut self, ov: &VideoOverlay, w: u32, h: u32) -> Result<()> {
+    fn emit_video_overlay(&mut self, ov: &VideoOverlay, _w: u32, _h: u32) -> Result<()> {
         let path = self.resolve(&ov.source);
         let idx = self.add_input(FfmpegInput {
             path,
@@ -795,7 +930,19 @@ impl<'a> FilterGraphBuilder<'a> {
             seek: if ov.source_start > 0.0 { Some(ov.source_start) } else { None },
             t: None,
         });
-        let (x, y, scale_expr, scale_y_expr) = position_and_scale_expr(&ov.layout, w, h);
+        let xform = crate::expr::build_element_transform(
+            self.scene,
+            &ov.id,
+            &ov.layout,
+            &ov.modifiers,
+            ov.t_in,
+        );
+        if xform.opacity_animated {
+            tracing::debug!(
+                overlay_id = %ov.id,
+                "video overlay opacity is keyframed; export uses static midpoint sample",
+            );
+        }
         let chroma_part = ov.chroma_key.as_ref().map(|ck| {
             let key_hex = format!(
                 "0x{:02X}{:02X}{:02X}",
@@ -809,28 +956,48 @@ impl<'a> FilterGraphBuilder<'a> {
         } else {
             None
         };
-        let scale_part = format!("scale=w='iw*{sx}':h='ih*{sy}':eval=frame", sx = scale_expr, sy = scale_y_expr);
+        let scale_part = format!(
+            "scale=w='iw*{sx}':h='ih*{sy}':eval=frame",
+            sx = xform.sx_expr,
+            sy = xform.sy_expr,
+        );
         let v_label = self.alloc_label("vid");
 
         if effects_have_mask(&ov.effects) {
             // Multi-stream layout for masks — see `emit_actors`.
             let mut prefix = format!("[{idx}:v]format=yuva420p", idx = idx);
             if let Some(c) = &chroma_part { prefix.push(','); prefix.push_str(c); }
+            if xform.hflip { prefix.push_str(",hflip"); }
+            if xform.vflip { prefix.push_str(",vflip"); }
             let pre_label = self.alloc_label("vidPre");
             self.chunks.push(format!("{prefix}{pre_label}", prefix = prefix, pre_label = pre_label));
             let after_fx = self.apply_effect_stack(pre_label, &ov.effects)?;
-            let mut tail_filters: Vec<String> = Vec::new();
-            if let Some(s) = speed_part { tail_filters.push(s); }
-            tail_filters.push(scale_part);
+            let mut tail: Vec<String> = Vec::new();
+            if let Some(s) = speed_part { tail.push(s); }
+            tail.push(scale_part);
+            if let Some(rot) = &xform.rot_expr {
+                tail.push(format!(
+                    "rotate={r}:c=none:ow=hypot(iw\\,ih):oh=hypot(iw\\,ih)",
+                    r = rot,
+                ));
+            }
+            if xform.opacity_static < 0.999 {
+                tail.push(format!(
+                    "colorchannelmixer=aa={:.4}",
+                    xform.opacity_static.clamp(0.0, 1.0),
+                ));
+            }
             self.chunks.push(format!(
                 "{src}{filters}{out}",
                 src = after_fx,
-                filters = tail_filters.join(","),
+                filters = tail.join(","),
                 out = v_label,
             ));
         } else {
             let mut chain = format!("[{idx}:v]format=yuva420p", idx = idx);
             if let Some(c) = &chroma_part { chain.push(','); chain.push_str(c); }
+            if xform.hflip { chain.push_str(",hflip"); }
+            if xform.vflip { chain.push_str(",vflip"); }
             // Apply the user-defined effect stack — same convention as
             // images / actors so the export matches what the canvas previews.
             for snippet in effect_stack_filters(&ov.effects) {
@@ -844,6 +1011,20 @@ impl<'a> FilterGraphBuilder<'a> {
             }
             chain.push(',');
             chain.push_str(&scale_part);
+            if let Some(rot) = &xform.rot_expr {
+                chain.push(',');
+                chain.push_str(&format!(
+                    "rotate={r}:c=none:ow=hypot(iw\\,ih):oh=hypot(iw\\,ih)",
+                    r = rot,
+                ));
+            }
+            if xform.opacity_static < 0.999 {
+                chain.push(',');
+                chain.push_str(&format!(
+                    "colorchannelmixer=aa={:.4}",
+                    xform.opacity_static.clamp(0.0, 1.0),
+                ));
+            }
             self.chunks.push(format!("{chain}{out}", chain = chain, out = v_label));
         }
         let next = self.alloc_label("vidstack");
@@ -851,8 +1032,8 @@ impl<'a> FilterGraphBuilder<'a> {
             "{cur}{v}overlay=x='{x}':y='{y}':enable='between(t,{a},{b})':eof_action=pass{out}",
             cur = self.cursor,
             v = v_label,
-            x = x,
-            y = y,
+            x = xform.x_expr,
+            y = xform.y_expr,
             a = ov.t_in,
             b = ov.t_out,
             out = next,
@@ -1343,40 +1524,6 @@ impl PositionedState for OverlayState {
     fn pos(&self) -> [f32; 2] { self.pos }
     fn scale(&self) -> f32 { self.scale }
     fn scale_y(&self) -> f32 { self.scale_y }
-}
-
-/// Sample rotation_deg / flip_x_anim / flip_y_anim from the layout's
-/// midpoint (or the only keyframe if there's just one) and return the
-/// matching ffmpeg pre-overlay filter snippets. Used by the text-
-/// rasterise → overlay path; the static case is what the user's
-/// preview screenshots demonstrate, and animated rotation/flip on
-/// text overlays is left as a follow-up.
-///
-/// Returns `(rotate_filter, hflip, vflip)` where `rotate_filter` is
-/// `Some("rotate=…")` when the sampled angle exceeds ~0.1° and the
-/// flip flags are set when the sampled value is negative.
-fn sample_rotation_and_flip(layout: &[Keyframe<OverlayState>]) -> (Option<String>, bool, bool) {
-    if layout.is_empty() {
-        return (None, false, false);
-    }
-    let mid_idx = layout.len() / 2;
-    let s = &layout[mid_idx].value;
-    let rot_rad = s.rotation_deg.to_radians();
-    let rot_part = if rot_rad.abs() > 0.0017_f32 {
-        // ffmpeg `rotate` extends the canvas to fit the rotated frame
-        // (`ow`/`oh` defaults), and the default fill is opaque black —
-        // we override with `c=none` so the corners stay transparent and
-        // the underlying canvas keeps showing through.
-        Some(format!(
-            "rotate={r}:c=none:ow=rotw({r}):oh=roth({r})",
-            r = rot_rad,
-        ))
-    } else {
-        None
-    };
-    let hflip = s.flip_x_anim < 0.0;
-    let vflip = s.flip_y_anim < 0.0;
-    (rot_part, hflip, vflip)
 }
 
 /// Escape a user string for use inside a `drawtext=text='...'` arg.
