@@ -1633,6 +1633,69 @@ impl EditorState {
         Ok(asset)
     }
 
+    /// Save a baked frame snapshot (e.g. produced by the "📸 Extract
+    /// frame" toolbar button) into the project's image library and
+    /// return the resulting [`LibraryAsset`].
+    ///
+    /// Mirrors [`Self::save_clipboard_image_to_library`] but writes
+    /// to `assets/images/frame_<unix-millis>.png` so the file manager
+    /// listing stays sorted and snapshots don't collide with images
+    /// pasted from the OS clipboard.
+    pub fn save_snapshot_image_to_library(
+        &mut self,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Result<LibraryAsset, String> {
+        if width == 0 || height == 0 {
+            return Err("snapshot image is empty".into());
+        }
+        let expected = (width as usize) * (height as usize) * 4;
+        if rgba.len() < expected {
+            return Err(format!(
+                "snapshot image buffer too small: {} < {}",
+                rgba.len(),
+                expected
+            ));
+        }
+        let dir = self.images_dir();
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            return Err(format!("create {}: {}", dir.display(), e));
+        }
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let mut filename = format!("frame_{}.png", stamp);
+        let mut path = dir.join(&filename);
+        let mut suffix = 1u32;
+        while path.exists() {
+            filename = format!("frame_{}_{}.png", stamp, suffix);
+            path = dir.join(&filename);
+            suffix += 1;
+            if suffix > 1000 {
+                break;
+            }
+        }
+        let buf = image::RgbaImage::from_raw(width, height, rgba.to_vec())
+            .ok_or_else(|| "failed to wrap snapshot image".to_string())?;
+        buf.save(&path)
+            .map_err(|e| format!("save {}: {}", path.display(), e))?;
+        let id = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("frame")
+            .to_string();
+        let asset = LibraryAsset {
+            id: id.clone(),
+            path: path.clone(),
+            label: id,
+            thumbnail: Some(path),
+        };
+        self.reload_library();
+        Ok(asset)
+    }
+
     /// Spawn an `Overlay::Image` for the supplied library asset at the
     /// current playhead, anchored to the first empty video lane (or a
     /// freshly-spawned one). Returns the overlay index of the new
