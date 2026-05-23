@@ -3072,14 +3072,57 @@ fn apply_drag(
                 _ => (true, true),
             };
 
+            // ── Edge / centre snap during resize ──
+            //
+            // The user explicitly asked for "помощь в точечном
+            // позиционировании" while resizing — i.e. the same kind
+            // of magnetic alignment the move arms get when an
+            // element's centre approaches the render-frame's centre
+            // or edges. We feed the dragged corner / edge through
+            // the same `snap_world_center` helper used by the move
+            // arms; it already covers RF centre, RF axis-aligned
+            // edges, RF rotated edges (via `snap_to_render_frame_rotated_edges`),
+            // and every other actor / overlay centre. We only honour
+            // the snap on the axes the active handle actually
+            // changes — for a horizontal-edge resize it would feel
+            // wrong to silently shift the element vertically, so we
+            // also drop any guide pointing along an axis that isn't
+            // moving.
+            let (snapped_cur_x, snapped_cur_y, snap_guides) = if state.snap_enabled {
+                let exclude = match state.selection {
+                    Selection::Actor(i) => Some(SnapExclude::Actor(i)),
+                    Selection::Overlay(i) => Some(SnapExclude::Overlay(i)),
+                    _ => None,
+                };
+                let (sx, sy, all_guides) =
+                    snap_world_center(state, cur_world_x, cur_world_y, exclude);
+                let final_x = if changes_x { sx } else { cur_world_x };
+                let final_y = if changes_y { sy } else { cur_world_y };
+                let filtered: Vec<crate::state::SnapGuide> = all_guides
+                    .into_iter()
+                    .filter(|g| match g.axis {
+                        crate::state::SnapAxis::Vertical => changes_x,
+                        crate::state::SnapAxis::Horizontal => changes_y,
+                        // Free-orientation guides (rotated RF edges)
+                        // are 2-D — only relevant when both axes can
+                        // move, i.e. corner handles.
+                        crate::state::SnapAxis::Line => changes_x && changes_y,
+                    })
+                    .collect();
+                (final_x, final_y, filtered)
+            } else {
+                (cur_world_x, cur_world_y, Vec::new())
+            };
+            state.canvas_drag.snap_guides = snap_guides;
+
             let init_w = base_w * initial_scale;
             let init_h = base_h * initial_scale * initial_scale_y;
 
             let new_w = if changes_x {
-                ((cur_world_x - anchor_world[0]).abs()).max(base_w * 0.05)
+                ((snapped_cur_x - anchor_world[0]).abs()).max(base_w * 0.05)
             } else { init_w };
             let new_h = if changes_y {
-                ((cur_world_y - anchor_world[1]).abs()).max(base_h * 0.05)
+                ((snapped_cur_y - anchor_world[1]).abs()).max(base_h * 0.05)
             } else { init_h };
 
             // Shift = uniform scale (lock aspect ratio).
@@ -3095,11 +3138,11 @@ fn apply_drag(
             //   - For axes that change: midpoint between pointer and anchor.
             //   - For axes that don't change: keep initial center.
             let cx = if changes_x {
-                let signed = if cur_world_x >= anchor_world[0] { 1.0 } else { -1.0 };
+                let signed = if snapped_cur_x >= anchor_world[0] { 1.0 } else { -1.0 };
                 anchor_world[0] + signed * final_w * 0.5
             } else { initial_pos_world[0] };
             let cy = if changes_y {
-                let signed = if cur_world_y >= anchor_world[1] { 1.0 } else { -1.0 };
+                let signed = if snapped_cur_y >= anchor_world[1] { 1.0 } else { -1.0 };
                 anchor_world[1] + signed * final_h * 0.5
             } else { initial_pos_world[1] };
 
@@ -3112,17 +3155,24 @@ fn apply_drag(
             set_selection_scale_y(state, new_scale_y);
             set_selection_world_center(state, [cx, cy]);
 
-            // Broadcast the same scale ratio + translation delta to
-            // every other lassoed element. We use ratios (not absolute
-            // values) so each element scales relative to its own
-            // drag-start size; translation is the primary's centre
-            // delta, applied uniformly to keep the group cohesive.
+            // Broadcast the same scale ratio to every other lassoed
+            // element. We use ratios (not absolute values) so each
+            // element scales relative to its own drag-start size,
+            // anchored at its OWN centre.
+            //
+            // The previous version also broadcast the primary's
+            // centre delta as a translation — but during a corner /
+            // edge resize the primary's centre moves only because
+            // the opposite corner is anchored, NOT because the user
+            // is moving the group. Re-applying that displacement to
+            // every other selected element produced the "parallel
+            // motion on the canvas while resizing" the user
+            // reported. Resize is a pure scale broadcast; movement
+            // is the dedicated MoveSelection / MoveActor / MoveOverlay
+            // modes' job.
             let scale_factor = new_scale / initial_scale.max(1e-3);
             let scale_y_factor = new_scale_y / initial_scale_y.max(1e-3);
             broadcast_multi_scale(state, scale_factor, scale_y_factor);
-            let total_dx = cx - initial_pos_world[0];
-            let total_dy = cy - initial_pos_world[1];
-            broadcast_multi_translation(state, total_dx, total_dy);
         }
 
         CanvasDragMode::MoveRenderFrame { initial_pos } => {
