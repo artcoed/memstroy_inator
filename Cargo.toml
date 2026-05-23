@@ -70,3 +70,30 @@ memstroy-assets-server = { path = "crates/memstroy-assets-server" }
 opt-level = 3
 lto = "thin"
 codegen-units = 1
+# ── Client-distribution hardening (Level 1) ──
+# These knobs target the binary the user ships to clients (via
+# `scripts/package-client.{sh,ps1}`); they are intentionally global so
+# every `cargo build --release` benefits — there is no scenario where
+# a debug-info-laden, unstripped release artefact is desirable.
+#
+# - `strip = "symbols"` drops the symbol table from the final ELF /
+#   PE, removing fn names, file paths and most reflection data. The
+#   packaging scripts additionally run `strip --strip-all` (Linux) /
+#   `editbin` (Windows) as belt-and-braces.
+# - `debug = false` / `debug-assertions = false` ensure no DWARF
+#   sections and no panic-message strings about expected invariants
+#   leak into the artefact.
+# - `panic = "abort"` removes the unwinder, which both shrinks the
+#   binary and erases the elaborate panic-formatting machinery (file
+#   paths, line numbers, type names of dropped values) from `strings(1)`.
+# - `overflow-checks = false` is the standard release setting; spelled
+#   out here so a future toolchain default flip can't quietly re-enable
+#   them in client builds.
+# - `incremental = false` avoids leaking incremental compilation
+#   metadata into the artefact path the linker references.
+strip = "symbols"
+debug = false
+debug-assertions = false
+overflow-checks = false
+panic = "abort"
+incremental = false

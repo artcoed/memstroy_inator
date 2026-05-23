@@ -63,7 +63,22 @@ impl App {
         // another server instance is already running, etc.) the GUI
         // still works — the network calls just talk to the existing
         // server through the same loopback URL.
-        Self::spawn_local_assets_server(rt.handle(), &state);
+        //
+        // Client-distribution builds opt out of this entirely: the
+        // bundle ships without an in-tree `assets/` dir or the
+        // `memstroy-assets-server` binary, and `state.server_url` is
+        // baked at compile time to point at the operator's remote
+        // server. Spawning a local one would mask configuration
+        // mistakes (the editor would silently serve "" assets from a
+        // brand-new empty cache dir) instead of surfacing them.
+        if crate::build_info::IS_CLIENT_BUILD {
+            tracing::info!(
+                server_url = %state.server_url,
+                "client build: skipping in-process assets-server, using remote"
+            );
+        } else {
+            Self::spawn_local_assets_server(rt.handle(), &state);
+        }
 
         // Construct the audio engine and immediately apply the master
         // volume from the persisted settings. That way the very first

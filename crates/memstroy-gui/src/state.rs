@@ -657,7 +657,7 @@ pub struct RenderProgress {
 impl EditorState {
     pub fn new() -> Self {
         let mut s = Self::default();
-        s.assets_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        s.assets_root = Self::default_assets_root();
         s.scene = Scene::default();
         s.status = "Ready".into();
         s.playback_speed = 1.0;
@@ -722,9 +722,15 @@ impl EditorState {
         // The user clicks Refresh on the Clips tab; the GUI POSTs to
         // `{server_url}/api/ingest/tg` with `{tg_channel, tg_limit}`.
         // The server (memstroy-assets-server) does the actual scraping
-        // and download. Defaults assume the server is running locally
-        // on its standard port.
-        s.server_url = "http://127.0.0.1:8765".to_string();
+        // and download. The default URL is baked at build time:
+        // developer builds get the loopback (`http://127.0.0.1:8765`,
+        // matching the in-process server `app.rs` boots up), while
+        // packaged client builds get whatever
+        // `MEMSTROY_DEFAULT_SERVER_URL` was set to when the bundle was
+        // produced (e.g. `https://assets.your-domain.example`). Either
+        // way the literal goes through `obfstr` so it is not visible
+        // verbatim in `strings(1)` over the binary.
+        s.server_url = crate::build_info::default_server_url();
         s.tg_channel = "MELLSTROYfonz".to_string();
         s.tg_limit = 80;
         s.prev_library_search = String::new();
@@ -770,6 +776,46 @@ impl EditorState {
     /// Path of the autosave scene file.
     pub fn autosave_path() -> PathBuf {
         Self::autosave_dir().join("autosave.scene.yaml")
+    }
+
+    /// Default value for `assets_root` based on the build flavour.
+    ///
+    /// * **Developer builds** (`MEMSTROY_CLIENT_BUILD` unset at compile
+    ///   time): rooted at the current working directory, matching the
+    ///   long-standing dev workflow where `cargo run -p memstroy-gui`
+    ///   from the workspace root surfaces the in-tree `assets/` dir.
+    /// * **Client-distribution builds**: rooted at a per-user cache
+    ///   directory (`~/.memstroy/cache/` on Unix,
+    ///   `%USERPROFILE%\.memstroy\cache\` on Windows). Client bundles
+    ///   ship without any bundled assets — every clip / image / sound
+    ///   is fetched from the operator's `memstroy-assets-server` over
+    ///   HTTP and lands here on demand. Putting the cache outside the
+    ///   bundle directory means re-installing the editor never wipes
+    ///   downloaded media, and the user does not need write access to
+    ///   the install location.
+    pub fn default_assets_root() -> PathBuf {
+        if crate::build_info::IS_CLIENT_BUILD {
+            Self::user_cache_dir()
+        } else {
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        }
+    }
+
+    /// Per-user cache directory used as `assets_root` in client builds.
+    ///
+    /// Mirrors the placement convention of [`Self::autosave_dir`] so
+    /// "wipe `~/.memstroy/`" cleans both autosaves and downloaded
+    /// assets at once. Falls back to `$TEMP/memstroy/cache` only when
+    /// neither `HOME` nor `USERPROFILE` is set, which in practice only
+    /// happens on heavily restricted CI runners.
+    pub fn user_cache_dir() -> PathBuf {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(".memstroy").join("cache");
+        }
+        if let Some(home) = std::env::var_os("USERPROFILE") {
+            return PathBuf::from(home).join(".memstroy").join("cache");
+        }
+        std::env::temp_dir().join("memstroy").join("cache")
     }
 
     /// Save undo snapshot, then apply a mutation via the closure.
