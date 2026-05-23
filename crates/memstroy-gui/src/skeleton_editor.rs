@@ -442,6 +442,7 @@ fn skeleton_toolbar(ui: &mut egui::Ui, state: &mut EditorState) {
 
 /// Public entry point used by `Tools → Skeleton Constructor` menu so the
 /// editor opens with a sensible source clip pre-selected.
+#[allow(dead_code)]
 pub fn select_clip(state: &mut EditorState, clip_path: &std::path::Path) {
     on_clip_changed(state, clip_path);
 }

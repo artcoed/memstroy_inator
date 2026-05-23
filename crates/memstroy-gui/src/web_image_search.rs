@@ -236,7 +236,14 @@ fn window_body(ui: &mut egui::Ui, state: &mut EditorState, tx: &Sender<JobEvent>
 }
 
 fn results_grid(ui: &mut egui::Ui, state: &mut EditorState, tx: &Sender<JobEvent>) {
-    let avail_w = ui.available_width();
+    // Subtract a safety margin equal to the vertical scrollbar width
+    // BEFORE we compute how many cards fit per row. The first paint
+    // (no scrollbar yet) and subsequent paints (scrollbar present)
+    // would otherwise compute different `cols` values, which makes
+    // the grid jitter / overflow / "разъезжается" — the exact symptom
+    // the user reported.
+    const VBAR_WIDTH: f32 = 14.0;
+    let avail_w = (ui.available_width() - VBAR_WIDTH).max(140.0);
     let card_w = 150.0_f32;
     let card_h = 180.0_f32;
     let gap = 6.0_f32;

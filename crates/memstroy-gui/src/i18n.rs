@@ -114,14 +114,10 @@ fn ru_lookup(key: &str) -> Option<&'static str> {
         "Render full clip..." => "Рендер ролика…",
         "\u{1F3A5} Render full clip..." => "\u{1F3A5} Рендер ролика…",
 
-        // Tools menu
-        // Note: the leading glyphs are gear/spanner (U+2699 / U+2692)
-        // because the previous brain (U+1F9E0) / bone (U+1F9B4) chars
-        // are absent from egui's bundled font set and rendered as
-        // missing-glyph boxes ("null smileys").
-        "Tools" => "Инструменты",
-        "\u{1F9E0} Tools" => "\u{1F9E0} Инструменты",
-        "\u{2699} Tools" => "\u{2699} Инструменты",
+        // Tools menu was removed; the entries that used to live there
+        // (Skeleton Constructor, Web Image Search) are now reachable
+        // exclusively via the View menu. Strings kept below in case
+        // a stray translation lookup hits them.
         "Skeleton Constructor..." => "Скелет…",
         "\u{1F9B4} Skeleton Constructor..." => "\u{1F9B4} Скелет…",
         "\u{2692} Skeleton Constructor..." => "\u{2692} Скелет…",
@@ -133,12 +129,44 @@ fn ru_lookup(key: &str) -> Option<&'static str> {
         "\u{1F441} View" => "\u{1F441} Вид",
         "Web Image Search" => "Поиск картинок",
         "\u{1F310} Web Image Search" => "\u{1F310} Поиск картинок",
-        "Node Editor" => "Редактор узлов",
-        "\u{1F517} Node Editor" => "\u{1F517} Редактор узлов",
         "Curve Editor" => "Редактор кривых",
         "\u{1F4C8} Curve Editor" => "\u{1F4C8} Редактор кривых",
-        "Clip Editor" => "Редактор клипа",
-        "\u{2702} Clip Editor" => "\u{2702} Редактор клипа",
+        "Image Editor" => "Редактор изображений",
+        "\u{1F5BC} Image Editor" => "\u{1F5BC} Редактор изображений",
+        "Untitled clip" => "Без названия",
+        "Masks" => "Маски",
+        "Masks hide / reveal parts of the layer. Pick a shape, then drag on the canvas to paint it." =>
+            "Маски скрывают / показывают части слоя. Выберите форму и протяните по холсту, чтобы её нарисовать.",
+        "No masks yet." => "Масок пока нет.",
+        "Add mask" => "Добавить маску",
+        "Rectangle mask" => "Прямоугольная маска",
+        "Ellipse mask" => "Эллипс-маска",
+        "Freehand mask" => "Произвольная маска",
+        "Crop" => "Кадрирование",
+        "Reset crop" => "Сбросить кадр",
+        "Repaint" => "Перерисовать",
+        "Drawing" => "Рисую",
+        "Feather" => "Размытие краёв",
+        "Invert (hide inside)" => "Инвертировать (скрывать внутри)",
+        "\u{25AD} Rectangle" => "\u{25AD} Прямоугольник",
+        "\u{2B2D} Ellipse" => "\u{2B2D} Эллипс",
+        "\u{270D} Freehand" => "\u{270D} От руки",
+        "\u{2702} Crop" => "\u{2702} Кадр",
+        "Bottom" => "Снизу",
+        "Hue \u{00B0}" => "Оттенок \u{00B0}",
+        "Quick colour" => "Быстрая цветокоррекция",
+        "Vignette" => "Виньетка",
+        "Blur" => "Размытие",
+        "Sharpen" => "Резкость",
+        "Glow" => "Свечение",
+        "Noise" => "Шум",
+        "Clear all effects" => "Очистить все эффекты",
+        "Source:" => "Источник:",
+        "Select an image overlay to edit it." => "Выберите слой-картинку, чтобы редактировать.",
+        "This panel exposes image-only editing tools (crop, quick colour, filters)." =>
+            "Эта панель содержит инструменты только для изображений (кадр, цвет, фильтры).",
+        "Preview will appear after canvas renders the image once." =>
+            "Превью появится, как только холст хоть раз отрисует это изображение.",
         "Skeleton Editor" => "Редактор скелета",
         "\u{2692} Skeleton Editor" => "\u{2692} Редактор скелета",
 
