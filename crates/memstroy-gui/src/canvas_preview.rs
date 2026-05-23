@@ -183,9 +183,11 @@ pub fn canvas_preview(ui: &mut egui::Ui, state: &mut EditorState) {
 }
 
 /// When the eyedropper is armed and the user clicks on the preview, sample
-/// the selected actor's source frame at the click's UV coordinate and store
-/// the colour as the actor's chroma key. The chroma sidecar is updated so
-/// the change persists across projects.
+/// the selected element's source frame at the click's UV coordinate and
+/// store the colour as the element's chroma key. The chroma sidecar is
+/// updated so the change persists across projects. Works for actors AND
+/// image overlays — the user explicitly asked for the latter so picture
+/// stickers can use the same green-screen workflow.
 fn handle_eyedropper_click(
     ui: &mut egui::Ui,
     state: &mut EditorState,
@@ -193,11 +195,32 @@ fn handle_eyedropper_click(
     viewport_size: [f32; 2],
     click_pos: Pos2,
 ) {
-    let Selection::Actor(idx) = state.selection else {
-        state.status = "Eyedropper: no actor selected.".into();
+    match state.selection {
+        Selection::Actor(idx) => {
+            handle_eyedropper_click_actor(ui, state, full_rect, viewport_size, click_pos, idx);
+        }
+        Selection::Overlay(idx) => {
+            handle_eyedropper_click_overlay(ui, state, full_rect, viewport_size, click_pos, idx);
+        }
+        _ => {
+            state.status = "Eyedropper: select an actor or image overlay first.".into();
+        }
+    }
+}
+
+/// Eyedropper handler for actors — picks a pixel from the decoded
+/// frame cache.
+fn handle_eyedropper_click_actor(
+    ui: &mut egui::Ui,
+    state: &mut EditorState,
+    full_rect: Rect,
+    viewport_size: [f32; 2],
+    click_pos: Pos2,
+    idx: usize,
+) {
+    if idx >= state.scene.actors.len() {
         return;
-    };
-    if idx >= state.scene.actors.len() { return; }
+    }
 
     // Compute the actor's on-screen rectangle (mirror of the math used in
     // draw_canvas_elements).
@@ -252,6 +275,110 @@ fn handle_eyedropper_click(
         }
     }
     state.status = "Eyedropper: frame not yet decoded — try again in a moment.".into();
+}
+
+/// Eyedropper handler for image overlays. Loads the source image
+/// directly (small sticker PNGs decode in milliseconds) and writes the
+/// sampled colour into the overlay's `chroma_key.key_color`. If the
+/// overlay didn't already have a `chroma_key` configured, one is
+/// initialised with default similarity / blend / spill so the keying
+/// kicks in immediately.
+fn handle_eyedropper_click_overlay(
+    ui: &mut egui::Ui,
+    state: &mut EditorState,
+    full_rect: Rect,
+    viewport_size: [f32; 2],
+    click_pos: Pos2,
+    idx: usize,
+) {
+    if idx >= state.scene.overlays.len() {
+        return;
+    }
+    // Only image overlays support the chroma_key field — text doesn't
+    // make sense and video overlays go through the actor pipeline.
+    let path = match &state.scene.overlays[idx] {
+        Overlay::Image(im) => im.source.clone(),
+        _ => {
+            state.status =
+                "Eyedropper: overlay must be an image (text / video not supported here)."
+                    .into();
+            return;
+        }
+    };
+    let elem_rect = selected_element_screen_rect(state, full_rect, viewport_size);
+    let Some(elem_rect) = elem_rect else {
+        state.status = "Eyedropper: cannot resolve overlay rect.".into();
+        return;
+    };
+    if !elem_rect.contains(click_pos) {
+        state.status = "Eyedropper: click on the overlay's image.".into();
+        return;
+    }
+    // Account for rotation just like the mask painter does — without
+    // this an eyedropper click on a rotated sticker would sample the
+    // wrong pixel.
+    let rotation_deg = match &state.scene.overlays[idx] {
+        Overlay::Image(im) => {
+            let local_t = (state.playhead - im.t_in).max(0.0);
+            keyframe::sample(&im.layout, local_t)
+                .map(|s| s.rotation_deg)
+                .unwrap_or(0.0)
+        }
+        _ => 0.0,
+    };
+    let center = elem_rect.center();
+    let theta = (-rotation_deg).to_radians();
+    let (s, c) = (theta.sin(), theta.cos());
+    let dx = click_pos.x - center.x;
+    let dy = click_pos.y - center.y;
+    let local_x = dx * c - dy * s;
+    let local_y = dx * s + dy * c;
+    let u = ((local_x / elem_rect.width().max(0.001)) + 0.5).clamp(0.0, 1.0);
+    let v = ((local_y / elem_rect.height().max(0.001)) + 0.5).clamp(0.0, 1.0);
+
+    let path_buf = if path.is_absolute() {
+        path
+    } else {
+        state.assets_root.join(path)
+    };
+    match image::open(&path_buf).map(|i| i.to_rgba8()) {
+        Ok(rgba) => {
+            let w = rgba.width() as usize;
+            let h = rgba.height() as usize;
+            if w == 0 || h == 0 {
+                state.status = "Eyedropper: overlay image has zero size.".into();
+                return;
+            }
+            let px = ((u * w as f32) as usize).min(w - 1);
+            let py = ((v * h as f32) as usize).min(h - 1);
+            let pixel = rgba.get_pixel(px as u32, py as u32);
+            let key = [pixel[0], pixel[1], pixel[2]];
+            if let Overlay::Image(im) = &mut state.scene.overlays[idx] {
+                let mut ck = im
+                    .chroma_key
+                    .clone()
+                    .unwrap_or_default();
+                ck.key_color = key;
+                // Default similarity is 0 in `ChromaKeyParams::default`;
+                // bump it to a sensible starting value when the user
+                // first picks a colour so the key actually does
+                // something visible. They can dial it back from the
+                // inspector later.
+                if ck.similarity < 1.0e-3 {
+                    ck.similarity = 0.18;
+                }
+                im.chroma_key = Some(ck);
+            }
+            state.status = format!(
+                "Picked overlay key #{:02X}{:02X}{:02X}",
+                key[0], key[1], key[2]
+            );
+            ui.ctx().request_repaint();
+        }
+        Err(e) => {
+            state.status = format!("Eyedropper: failed to read overlay image — {}", e);
+        }
+    }
 }
 
 /// Compute the screen-space rectangle of an actor on the canvas, replicating
@@ -5005,10 +5132,9 @@ fn draw_mask_toolbar(
     let btn_w = 28.0;
     let btn_h = 24.0;
     let gap = 4.0;
-    let tools: [(MaskTool, &str, &str); 5] = [
+    let tools: [(MaskTool, &str, &str); 4] = [
         (MaskTool::None, "\u{2196}", "Select / transform (Esc)"),
-        (MaskTool::Crop, "\u{2702}", "Crop tool — drag a rectangle to crop"),
-        (MaskTool::RectMask, "\u{25A1}", "Rectangle mask — drag to mask outside the rect"),
+        (MaskTool::RectMask, "\u{25A1}", "Rectangle mask / crop — drag to define a rectangular region. Combines the legacy Rectangle and Crop tools."),
         (MaskTool::EllipseMask, "\u{25CB}", "Ellipse mask — drag to mask outside the ellipse"),
         (MaskTool::FreehandMask, "\u{270F}", "Freehand mask — paint a closed polygon"),
     ];
@@ -5090,8 +5216,21 @@ pub(crate) fn mask_tool_active(state: &EditorState) -> bool {
 }
 
 /// Convert a screen-space pointer to UV (0..1) inside the selected
-/// element's screen rect. Returns `None` when no element is selected
-/// or the rect has zero size.
+/// element's image, **accounting for any rotation/scale applied to the
+/// element**. Returns `None` when no element is selected or its
+/// bounding box is degenerate.
+///
+/// The element's visible rectangle on the canvas is the axis-aligned
+/// bounding box of its (possibly rotated) image. Painting masks in
+/// raw screen UV would skew the resulting shape relative to the
+/// picture content — a rectangle drawn over a 45°-rotated sprite
+/// would persist in image space as a parallelogram-ish region. To
+/// keep the painted mask glued to the picture content we inverse-
+/// rotate the click point around the element centre by the same
+/// `rotation_deg` the renderer applies, then compute UV in the
+/// element's *unrotated* image-local frame. The downstream filters
+/// (`apply_mask_alpha`, FFmpeg mask export) consume image-local UVs,
+/// so this matches the way the mask is sampled at render time.
 fn screen_to_element_uv(
     state: &EditorState,
     full_rect: Rect,
@@ -5102,8 +5241,52 @@ fn screen_to_element_uv(
     if elem_rect.width() <= 0.5 || elem_rect.height() <= 0.5 {
         return None;
     }
-    let u = (pointer.x - elem_rect.min.x) / elem_rect.width();
-    let v = (pointer.y - elem_rect.min.y) / elem_rect.height();
+    // Sample the element's rotation at the playhead. Render frame
+    // selections aren't masked (the toolbar is per-element) so we
+    // only care about Actor / Overlay rotations here.
+    let rotation_deg = match state.selection {
+        Selection::Actor(idx) if idx < state.scene.actors.len() => {
+            let layout = &state.scene.actors[idx].layout;
+            keyframe::sample(layout, state.playhead)
+                .map(|s| s.rotation_deg)
+                .unwrap_or(0.0)
+        }
+        Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
+            let (t_in, t_out, layout) = match &state.scene.overlays[idx] {
+                Overlay::Text(t) => (t.t_in, t.t_out, &t.layout),
+                Overlay::Image(im) => (im.t_in, im.t_out, &im.layout),
+                Overlay::Video(v) => (v.t_in, v.t_out, &v.layout),
+            };
+            let local_t = if state.playhead >= t_in && state.playhead <= t_out {
+                state.playhead - t_in
+            } else {
+                0.0
+            };
+            keyframe::sample(layout, local_t)
+                .map(|s| s.rotation_deg)
+                .unwrap_or(0.0)
+        }
+        _ => 0.0,
+    };
+
+    let center = elem_rect.center();
+    // Inverse-rotate the pointer around the element centre. Because
+    // the element rect is the AABB of the rotated image, both `width`
+    // and `height` here are the AABB dimensions; we still use them
+    // for the UV mapping because the user clicked inside that AABB
+    // and the rotated image fills it pixel-for-pixel along the
+    // rotated axes. The inverse rotation lines up "image-local
+    // X/Y" with the click before normalising into UV.
+    let theta = (-rotation_deg).to_radians();
+    let (s, c) = (theta.sin(), theta.cos());
+    let dx = pointer.x - center.x;
+    let dy = pointer.y - center.y;
+    let local_x = dx * c - dy * s;
+    let local_y = dx * s + dy * c;
+    let half_w = elem_rect.width() * 0.5;
+    let half_h = elem_rect.height() * 0.5;
+    let u = (local_x / (half_w * 2.0)) + 0.5;
+    let v = (local_y / (half_h * 2.0)) + 0.5;
     Some(([u.clamp(-0.5, 1.5), v.clamp(-0.5, 1.5)], state.selection, elem_rect))
 }
 

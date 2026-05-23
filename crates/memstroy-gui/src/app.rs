@@ -11,7 +11,6 @@ use crate::jobs::{spawn_refresh, spawn_render, JobEvent};
 use crate::panels;
 use crate::state::{EditorState, Selection};
 use crate::image_editor;
-use crate::curve_editor;
 use crate::audio_engine::AudioEngine;
 
 pub struct App {
@@ -816,6 +815,262 @@ impl App {
             asset.label, width, height
         );
         true
+    }
+
+    /// Render the body of the curve-editor floating window. Resolves
+    /// the active curve target (Actor / Overlay / Audio) and shows a
+    /// dropdown picker when the user has multiple compatible elements
+    /// multi-selected so they can choose which one's curve to edit.
+    fn draw_curve_editor_body(&mut self, ui: &mut egui::Ui) {
+        use crate::curve_editor::{
+            curve_editor_panel, CurveEditorTarget, PROP_OPACITY, PROP_POS_X,
+            PROP_POS_Y, PROP_ROTATION, PROP_SCALE,
+        };
+        use crate::i18n::t;
+
+        // Build the list of candidate targets the curve editor can bind
+        // to right now. Each entry has a short label, the resolved
+        // selection it points at, and a kind tag the renderer uses to
+        // route into the right CurveEditorTarget variant.
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum CandidateKind {
+            Actor,
+            Overlay,
+            Audio,
+        }
+        let mut candidates: Vec<(String, Selection, CandidateKind)> = Vec::new();
+        // Single primary selection always comes first so it stays the
+        // default when the popup opens.
+        match self.state.selection {
+            Selection::Actor(i) if i < self.state.scene.actors.len() => {
+                let id = self.state.scene.actors[i].id.clone();
+                candidates.push((
+                    format!("{} {}", t("Actor"), id),
+                    Selection::Actor(i),
+                    CandidateKind::Actor,
+                ));
+            }
+            Selection::Overlay(i) if i < self.state.scene.overlays.len() => {
+                let id = match &self.state.scene.overlays[i] {
+                    memstroy_core::Overlay::Text(o) => o.id.clone(),
+                    memstroy_core::Overlay::Image(o) => o.id.clone(),
+                    memstroy_core::Overlay::Video(o) => o.id.clone(),
+                };
+                candidates.push((
+                    format!("{} {}", t("Overlay"), id),
+                    Selection::Overlay(i),
+                    CandidateKind::Overlay,
+                ));
+            }
+            Selection::Audio(i) if i < self.state.scene.audio.len() => {
+                let id = self.state.scene.audio[i].id.clone();
+                candidates.push((
+                    format!("{} {}", t("Audio"), id),
+                    Selection::Audio(i),
+                    CandidateKind::Audio,
+                ));
+            }
+            _ => {}
+        }
+        // Multi-selected actors (Ctrl+click) extend the candidate set so
+        // the user can flick between them without leaving the editor.
+        for &mi in &self.state.multi_select {
+            if mi >= self.state.scene.actors.len() {
+                continue;
+            }
+            let already_in_list = candidates
+                .iter()
+                .any(|(_, sel, _)| matches!(*sel, Selection::Actor(j) if j == mi));
+            if already_in_list {
+                continue;
+            }
+            let id = self.state.scene.actors[mi].id.clone();
+            candidates.push((
+                format!("{} {}", t("Actor"), id),
+                Selection::Actor(mi),
+                CandidateKind::Actor,
+            ));
+        }
+
+        if candidates.is_empty() {
+            ui.label(
+                egui::RichText::new(t(
+                    "Select an actor, overlay or audio layer to edit its curves.",
+                ))
+                .italics()
+                .color(Color32::from_rgb(140, 140, 160)),
+            );
+            return;
+        }
+
+        // ── Element picker (only shown when there's more than one) ──
+        let mut chosen_idx = self
+            .state
+            .curve_editor_active_idx
+            .min(candidates.len().saturating_sub(1));
+        if candidates.len() > 1 {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(t("Element"))
+                        .size(11.0)
+                        .color(Color32::from_rgb(160, 160, 180)),
+                );
+                egui::ComboBox::from_id_source("curve_editor_element_picker")
+                    .selected_text(&candidates[chosen_idx].0)
+                    .show_ui(ui, |ui| {
+                        for (i, (label, _sel, _kind)) in
+                            candidates.iter().enumerate()
+                        {
+                            ui.selectable_value(&mut chosen_idx, i, label);
+                        }
+                    });
+            });
+            ui.add_space(2.0);
+        }
+        self.state.curve_editor_active_idx = chosen_idx;
+
+        let (_label, sel, kind) = candidates[chosen_idx].clone();
+        let duration = self.state.scene.output.duration;
+        let playhead = self.state.playhead;
+
+        match kind {
+            CandidateKind::Actor => {
+                if let Selection::Actor(i) = sel {
+                    if let Some(a) = self.state.scene.actors.get_mut(i) {
+                        let target = CurveEditorTarget::Actor {
+                            layout: &mut a.layout,
+                            animated_params: &mut a.animated_params,
+                        };
+                        curve_editor_panel(
+                            ui,
+                            target,
+                            duration,
+                            &mut self.state.curve_editor_property,
+                            playhead,
+                        );
+                    }
+                }
+            }
+            CandidateKind::Overlay => {
+                if let Selection::Overlay(i) = sel {
+                    if let Some(ov) = self.state.scene.overlays.get_mut(i) {
+                        let (layout, animated, t_in) = match ov {
+                            memstroy_core::Overlay::Text(o) => (
+                                &mut o.layout,
+                                &mut o.animated_params,
+                                o.t_in,
+                            ),
+                            memstroy_core::Overlay::Image(o) => (
+                                &mut o.layout,
+                                &mut o.animated_params,
+                                o.t_in,
+                            ),
+                            memstroy_core::Overlay::Video(o) => (
+                                &mut o.layout,
+                                &mut o.animated_params,
+                                o.t_in,
+                            ),
+                        };
+                        let target = CurveEditorTarget::Overlay {
+                            layout,
+                            animated_params: animated,
+                            t_in,
+                        };
+                        curve_editor_panel(
+                            ui,
+                            target,
+                            duration,
+                            &mut self.state.curve_editor_property,
+                            playhead,
+                        );
+                    }
+                }
+            }
+            CandidateKind::Audio => {
+                if let Selection::Audio(i) = sel {
+                    if let Some(audio) = self.state.scene.audio.get_mut(i) {
+                        // Audio has 3 keyframable scalar params:
+                        // Volume / Speed / Pan. Re-use the property
+                        // selector slot for these so the user can
+                        // switch between them without yet another
+                        // toolbar.
+                        const AUDIO_VOLUME: usize = 0;
+                        const AUDIO_SPEED: usize = 1;
+                        const AUDIO_PAN: usize = 2;
+                        let mut audio_prop = match self.state.curve_editor_property {
+                            PROP_SCALE | PROP_POS_X | PROP_POS_Y | PROP_OPACITY | PROP_ROTATION
+                                if self.state.curve_editor_property < 3 =>
+                            {
+                                self.state.curve_editor_property
+                            }
+                            _ => 0,
+                        };
+                        // Audio property tabs.
+                        ui.horizontal(|ui| {
+                            for (i_prop, label) in [
+                                (AUDIO_VOLUME, "Volume"),
+                                (AUDIO_SPEED, "Speed"),
+                                (AUDIO_PAN, "Pan"),
+                            ] {
+                                if ui
+                                    .selectable_label(audio_prop == i_prop, t(label))
+                                    .clicked()
+                                {
+                                    audio_prop = i_prop;
+                                }
+                            }
+                        });
+                        self.state.curve_editor_property = audio_prop;
+                        ui.add_space(2.0);
+                        let t_local = (playhead - audio.t_in).max(0.0);
+                        let (kfs, label, color, range, static_v, param_id) =
+                            match audio_prop {
+                                AUDIO_SPEED => (
+                                    &mut audio.speed_kfs,
+                                    "Speed",
+                                    Color32::from_rgb(255, 180, 80),
+                                    (0.05_f32, 16.0_f32),
+                                    audio.speed,
+                                    "speed",
+                                ),
+                                AUDIO_PAN => (
+                                    &mut audio.pan_kfs,
+                                    "Pan",
+                                    Color32::from_rgb(180, 220, 255),
+                                    (-1.0_f32, 1.0_f32),
+                                    audio.pan,
+                                    "pan",
+                                ),
+                                _ => (
+                                    &mut audio.volume_kfs,
+                                    "Volume",
+                                    Color32::from_rgb(120, 220, 160),
+                                    (0.0_f32, 4.0_f32),
+                                    audio.volume,
+                                    "volume",
+                                ),
+                            };
+                        let target = CurveEditorTarget::Audio {
+                            kfs,
+                            animated_params: &mut audio.animated_params,
+                            param_id,
+                            param_label: label,
+                            param_color: color,
+                            value_range: range,
+                            static_value: static_v,
+                            t_local,
+                        };
+                        curve_editor_panel(
+                            ui,
+                            target,
+                            duration,
+                            &mut self.state.curve_editor_property,
+                            playhead,
+                        );
+                    }
+                }
+            }
+        }
     }
 
     fn delete_selected(&mut self) {
@@ -2031,6 +2286,7 @@ impl eframe::App for App {
                         skeleton_attachment: None,
                         effects: Vec::new(),
                         animated_params: Default::default(),
+                        chroma_key: None,
                     });
                     self.state.scene.overlays.push(overlay);
                     let new_idx = self.state.scene.overlays.len() - 1;
@@ -2223,30 +2479,12 @@ impl eframe::App for App {
             let mut curve_open = self.state.curve_editor_open;
             egui::Window::new("Curve Editor")
                 .open(&mut curve_open)
-                .default_size([600.0, 200.0])
+                .default_size([600.0, 240.0])
                 .resizable(true)
                 .collapsible(true)
                 .anchor(egui::Align2::LEFT_BOTTOM, [10.0, -10.0])
                 .show(ctx, |ui| {
-                    match self.state.selection {
-                        Selection::Actor(i) if i < self.state.scene.actors.len() => {
-                            let duration = self.state.scene.output.duration;
-                            let playhead = self.state.playhead;
-                            let keyframes = &mut self.state.scene.actors[i].layout;
-                            curve_editor::curve_editor_panel(
-                                ui,
-                                keyframes,
-                                duration,
-                                &mut self.state.curve_editor_property,
-                                playhead,
-                            );
-                        }
-                        _ => {
-                            ui.label(egui::RichText::new("Select an actor to edit curves.")
-                                .italics()
-                                .color(Color32::from_rgb(140, 140, 160)));
-                        }
-                    }
+                    self.draw_curve_editor_body(ui);
                 });
             self.state.curve_editor_open = curve_open;
         }
