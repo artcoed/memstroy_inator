@@ -1769,10 +1769,13 @@ impl eframe::App for App {
         }
 
         // ── OS Drag-and-Drop: accept files from Windows Explorer ──
-        // When dropped over the library panel, files are imported into
-        // the matching `assets/<sub>/` directory and the library is
-        // refreshed. Drops anywhere else continue to add the file
-        // straight to the scene (legacy behaviour).
+        // Every dropped file is ALWAYS copied into the matching local
+        // library subfolder (assets/videos / images / sounds /
+        // particles), so the user can re-use it without re-importing.
+        // If the drop landed OUTSIDE the library panel, the resulting
+        // copied file is also added to the scene at the playhead — so
+        // the user gets the legacy "drop on the canvas" behaviour AND
+        // a permanent library entry from the same gesture.
         let dropped_files: Vec<_> = ctx.input(|i| i.raw.dropped_files.clone());
         // Use `latest_pos` with `hover_pos` fallback. egui can drop the
         // hover position to None on the same frame the OS drop event
@@ -1782,68 +1785,69 @@ impl eframe::App for App {
             i.pointer.latest_pos().or_else(|| i.pointer.hover_pos())
         });
         let lib_rect = self.state.library_panel_rect;
-        let into_library = match (drop_pointer, lib_rect) {
+        let pointer_in_library = match (drop_pointer, lib_rect) {
             (Some(p), Some(r)) => r.contains(p),
-            // No pointer info — be lenient and route to library if a
-            // recognised file kind is dropped while the library tab is
-            // visibly Videos / Sounds / Images / Particles. This makes
-            // OS-level drops on the panel "just work" even when egui's
-            // pointer tracking blanks out at drop time.
-            (None, _) => !matches!(
-                self.state.library_tab,
-                crate::state::LibraryTab::Clips
-            ),
             _ => false,
         };
         if !dropped_files.is_empty() {
             for file in &dropped_files {
-                if let Some(path) = &file.path {
-                    let ext = path
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .unwrap_or("")
-                        .to_lowercase();
-                    let is_video = ["mp4", "mov", "webm", "avi", "mkv", "m4v"]
-                        .contains(&ext.as_str());
-                    let is_image =
-                        ["jpg", "jpeg", "png", "webp", "gif"].contains(&ext.as_str());
-                    let is_audio = ["mp3", "wav", "ogg", "flac", "aac", "m4a", "opus"]
-                        .contains(&ext.as_str());
+                let Some(path) = &file.path else { continue; };
+                let ext = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                let is_video = ["mp4", "mov", "webm", "avi", "mkv", "m4v"]
+                    .contains(&ext.as_str());
+                let is_image =
+                    ["jpg", "jpeg", "png", "webp", "gif"].contains(&ext.as_str());
+                let is_audio = ["mp3", "wav", "ogg", "flac", "aac", "m4a", "opus"]
+                    .contains(&ext.as_str());
+                if !(is_video || is_image || is_audio) {
+                    continue;
+                }
 
-                    if into_library && (is_video || is_image || is_audio) {
-                        // Import the file into the matching library
-                        // directory, copy it on disk, and refresh.
-                        let dest_dir = if is_video {
-                            self.state.videos_dir()
-                        } else if is_image {
-                            // Default to Images. Particles share the same
-                            // file extensions but live in a separate
-                            // folder; route to Particles only when that
-                            // tab is currently visible so the user has
-                            // an explicit way to pick between them.
-                            if self.state.library_tab
-                                == crate::state::LibraryTab::Particles
-                            {
-                                self.state.particles_dir()
-                            } else {
-                                self.state.images_dir()
-                            }
-                        } else {
-                            self.state.sounds_dir()
-                        };
-                        if let Err(err) = std::fs::create_dir_all(&dest_dir) {
-                            self.state.status =
-                                format!("Couldn't create {}: {}", dest_dir.display(), err);
-                            continue;
-                        }
-                        let file_name = path
-                            .file_name()
-                            .map(|s| s.to_owned())
-                            .unwrap_or_else(|| std::ffi::OsString::from("import"));
-                        let mut dest = dest_dir.join(&file_name);
-                        // Avoid clobbering an existing file with the same
-                        // name — append a numeric suffix until we find a
-                        // free slot.
+                // ── Step 1: copy the file into the local library. ──
+                let dest_dir = if is_video {
+                    self.state.videos_dir()
+                } else if is_image {
+                    // Default to Images. Particles share the same
+                    // file extensions but live in a separate folder;
+                    // route to Particles only when that tab is
+                    // currently visible AND the drop landed on the
+                    // library panel — otherwise images dropped on the
+                    // canvas always go into Images.
+                    if pointer_in_library
+                        && self.state.library_tab
+                            == crate::state::LibraryTab::Particles
+                    {
+                        self.state.particles_dir()
+                    } else {
+                        self.state.images_dir()
+                    }
+                } else {
+                    self.state.sounds_dir()
+                };
+                if let Err(err) = std::fs::create_dir_all(&dest_dir) {
+                    self.state.status =
+                        format!("Couldn't create {}: {}", dest_dir.display(), err);
+                    continue;
+                }
+                let file_name = path
+                    .file_name()
+                    .map(|s| s.to_owned())
+                    .unwrap_or_else(|| std::ffi::OsString::from("import"));
+                let mut dest = dest_dir.join(&file_name);
+                // Avoid clobbering an existing file with the same name
+                // — append a numeric suffix until we find a free slot.
+                // If a file with identical bytes already exists in the
+                // library we re-use it instead of duplicating.
+                if dest.exists() {
+                    let same_bytes = match (std::fs::read(path), std::fs::read(&dest)) {
+                        (Ok(a), Ok(b)) => a == b,
+                        _ => false,
+                    };
+                    if !same_bytes {
                         let mut suffix = 1;
                         while dest.exists() {
                             let stem = path
@@ -1857,72 +1861,106 @@ impl eframe::App for App {
                                 break;
                             }
                         }
-                        match std::fs::copy(path, &dest) {
-                            Ok(_) => {
-                                self.state.status = format!(
-                                    "Imported into library: {}",
-                                    dest.display()
-                                );
-                                // Switch the visible tab to the kind we
-                                // just imported so the user sees the new
-                                // entry without manual navigation.
-                                self.state.library_tab = if is_video {
-                                    crate::state::LibraryTab::Videos
-                                } else if is_image
-                                    && self.state.library_tab
-                                        != crate::state::LibraryTab::Particles
-                                {
-                                    crate::state::LibraryTab::Images
-                                } else if is_audio {
-                                    crate::state::LibraryTab::Sounds
-                                } else {
-                                    self.state.library_tab
-                                };
-                                self.state.reload_library();
-                            }
-                            Err(err) => {
-                                self.state.status =
-                                    format!("Couldn't import {}: {}", path.display(), err);
-                            }
+                    }
+                }
+                let copied_ok = if dest.exists() {
+                    // Same file already present — skip the copy but
+                    // still treat the operation as successful.
+                    true
+                } else {
+                    match std::fs::copy(path, &dest) {
+                        Ok(_) => true,
+                        Err(err) => {
+                            self.state.status = format!(
+                                "Couldn't import {}: {}",
+                                path.display(),
+                                err
+                            );
+                            false
                         }
-                        continue;
                     }
+                };
+                if !copied_ok { continue; }
 
-                    if is_video {
-                        // `add_actor_from_clip` already creates a matching AudioTrack
-                        // and pre-loads any per-clip chroma/skeleton sidecars.
-                        crate::panels::add_actor_from_clip(&mut self.state, &path.to_path_buf());
-                    } else if is_image {
-                        let id = path.file_stem().and_then(|s| s.to_str())
-                            .map(|s| format!("img_{}", s))
-                            .unwrap_or_else(|| format!("img_{}", self.state.scene.overlays.len() + 1));
-                        let overlay = memstroy_core::Overlay::Image(memstroy_core::ImageOverlay {
-                            id: id.clone(),
-                            source: path.to_path_buf(),
-                            t_in: self.state.playhead,
-                            t_out: (self.state.playhead + 3.0).min(self.state.scene.output.duration),
-                            layout: vec![memstroy_core::Keyframe::new(0.0, memstroy_core::OverlayState::default())],
-                            modifiers: Vec::new(),
-                            skeleton_attachment: None,
-                            effects: Vec::new(),
-                            animated_params: Default::default(),
-                        });
-                        self.state.scene.overlays.push(overlay);
-                        self.state.selection = Selection::Overlay(self.state.scene.overlays.len() - 1);
-                        self.state.status = format!("Dropped image: {}", id);
+                // Refresh the library so the new file shows up on the
+                // panel. Switch the visible tab to the matching kind
+                // when the drop landed on the library panel itself
+                // (otherwise leave the user where they are).
+                self.state.reload_library();
+                if pointer_in_library {
+                    self.state.library_tab = if is_video {
+                        crate::state::LibraryTab::Videos
+                    } else if is_image
+                        && self.state.library_tab
+                            != crate::state::LibraryTab::Particles
+                    {
+                        crate::state::LibraryTab::Images
                     } else if is_audio {
-                        let id = path.file_stem().and_then(|s| s.to_str())
-                            .map(|s| s.to_string())
-                            .unwrap_or_else(|| format!("audio_{}", self.state.scene.audio.len() + 1));
-                        self.state.scene.audio.push(memstroy_core::AudioTrack {
-                            id: id.clone(),
-                            source: path.to_path_buf(),
-                            t_in: self.state.playhead,
-                            ..Default::default()
-                        });
-                        self.state.selection = Selection::Audio(self.state.scene.audio.len() - 1);
-                        self.state.status = format!("Dropped audio: {}", id);
+                        crate::state::LibraryTab::Sounds
+                    } else {
+                        self.state.library_tab
+                    };
+                    self.state.status = format!(
+                        "Imported into library: {}",
+                        dest.display()
+                    );
+                    // Drop landed inside the library panel — no scene
+                    // add, the user only wants the asset registered.
+                    continue;
+                }
+
+                // ── Step 2: drop landed on canvas / timeline → also
+                //    add the (now-library-resident) copy to the scene
+                //    on its own brand-new / first-empty layer.
+                if is_video {
+                    // `add_actor_from_clip` creates a matching AudioTrack
+                    // and pre-loads any per-clip chroma/skeleton sidecars.
+                    crate::panels::add_actor_from_clip(&mut self.state, &dest);
+                    // Pin the freshly added actor onto the first empty
+                    // video lane (or a newly-inserted one) so canvas
+                    // drops always create a clean layer instead of
+                    // stacking on top of whatever was already on V1.
+                    if let Some(new_idx) =
+                        self.state.scene.actors.len().checked_sub(1)
+                    {
+                        let t = self.state.playhead;
+                        let lane = self.state.pick_or_create_empty_video_lane_at(t);
+                        self.state.actor_track_assignments.insert(new_idx, lane);
                     }
+                } else if is_image {
+                    let id = dest.file_stem().and_then(|s| s.to_str())
+                        .map(|s| format!("img_{}", s))
+                        .unwrap_or_else(|| format!("img_{}", self.state.scene.overlays.len() + 1));
+                    let overlay = memstroy_core::Overlay::Image(memstroy_core::ImageOverlay {
+                        id: id.clone(),
+                        source: dest.clone(),
+                        t_in: self.state.playhead,
+                        t_out: (self.state.playhead + 3.0).min(self.state.scene.output.duration),
+                        layout: vec![memstroy_core::Keyframe::new(0.0, memstroy_core::OverlayState::default())],
+                        modifiers: Vec::new(),
+                        skeleton_attachment: None,
+                        effects: Vec::new(),
+                        animated_params: Default::default(),
+                    });
+                    self.state.scene.overlays.push(overlay);
+                    let new_idx = self.state.scene.overlays.len() - 1;
+                    let t = self.state.playhead;
+                    let lane = self.state.pick_or_create_empty_video_lane_at(t);
+                    self.state.overlay_track_assignments.insert(new_idx, lane);
+                    self.state.selection = Selection::Overlay(new_idx);
+                    self.state.status = format!("Dropped image: {} (saved to library)", id);
+                } else if is_audio {
+                    let id = dest.file_stem().and_then(|s| s.to_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| format!("audio_{}", self.state.scene.audio.len() + 1));
+                    self.state.scene.audio.push(memstroy_core::AudioTrack {
+                        id: id.clone(),
+                        source: dest.clone(),
+                        t_in: self.state.playhead,
+                        ..Default::default()
+                    });
+                    self.state.selection = Selection::Audio(self.state.scene.audio.len() - 1);
+                    self.state.status = format!("Dropped audio: {} (saved to library)", id);
                 }
             }
         }
