@@ -5450,7 +5450,175 @@ fn snap_time(t: f32, targets: &[f32], threshold: f32) -> f32 {
     best
 }
 
+/// Which side(s) of a clip's time window the user is currently
+/// dragging — controls which edges we try to snap.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum SnapMode {
+    /// The clip is being moved as a whole — both edges shift by the
+    /// same delta. We try the start edge first; if it doesn't snap
+    /// within threshold we fall back to the end edge. Whichever edge
+    /// snaps drives the new window's offset; the other edge follows
+    /// at the original duration.
+    Move,
+    /// Trimming the in-edge — only the t_in side snaps. The out-edge
+    /// stays put.
+    TrimLeft,
+    /// Trimming the out-edge — only the t_out side snaps. The in-edge
+    /// stays put.
+    TrimRight,
+}
+
+/// Identifies the clip currently being dragged, so its own edges are
+/// excluded from the snap-target list (a clip should never snap to
+/// itself).
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum SnapExclude {
+    Actor(usize),
+    Overlay(usize),
+    Audio(usize),
+    Background(usize),
+}
+
+/// Collect every snap-eligible scene-time on the timeline:
+/// every clip edge except the dragged clip's own, the playhead, the
+/// scene start (0.0), and the scene end. Used by `apply_snap_to_window`.
+fn collect_snap_targets(state: &EditorState, exclude: SnapExclude) -> Vec<f32> {
+    let mut out = Vec::with_capacity(
+        state.scene.actors.len() * 2
+            + state.scene.overlays.len() * 2
+            + state.scene.audio.len() * 2
+            + state.scene.backgrounds.len() * 2
+            + 3,
+    );
+    let dur = state.scene.output.duration.max(0.0);
+
+    for (i, a) in state.scene.actors.iter().enumerate() {
+        if let SnapExclude::Actor(j) = exclude {
+            if i == j {
+                continue;
+            }
+        }
+        out.push(a.t_in.unwrap_or(0.0));
+        out.push(a.t_out.unwrap_or(dur));
+    }
+    for (i, bg) in state.scene.backgrounds.iter().enumerate() {
+        if let SnapExclude::Background(j) = exclude {
+            if i == j {
+                continue;
+            }
+        }
+        out.push(bg.start);
+        out.push(bg.start + bg.duration);
+    }
+    for (i, ov) in state.scene.overlays.iter().enumerate() {
+        if let SnapExclude::Overlay(j) = exclude {
+            if i == j {
+                continue;
+            }
+        }
+        let (s, e) = match ov {
+            Overlay::Text(t) => (t.t_in, t.t_out),
+            Overlay::Image(im) => (im.t_in, im.t_out),
+            Overlay::Video(v) => (v.t_in, v.t_out),
+        };
+        out.push(s);
+        out.push(e);
+    }
+    for (i, au) in state.scene.audio.iter().enumerate() {
+        if let SnapExclude::Audio(j) = exclude {
+            if i == j {
+                continue;
+            }
+        }
+        out.push(au.t_in);
+        out.push(au.t_out.unwrap_or(dur));
+    }
+    out.push(0.0);
+    out.push(state.playhead);
+    if dur > 0.0 {
+        out.push(dur);
+    }
+    out
+}
+
+/// Pixel-aware snap window: ~5 px on screen so the clip glides
+/// smoothly under the cursor instead of jumping in fixed scene-time
+/// chunks. Slightly more permissive than the actor-move-only path
+/// used to be (3 px) because the user explicitly asked for a
+/// "comfortable attach" feel — at 80 px/s default zoom this is ~62 ms.
+fn snap_threshold_for_state(state: &EditorState) -> f32 {
+    (5.0 / state.timeline_zoom.max(1.0)).max(0.001)
+}
+
+/// Try to snap a clip's [t_in, t_out] window. Returns the (possibly
+/// snapped) new window plus the snap target time when an actual snap
+/// occurred — the caller stores that on `state.timeline_drag.snap_indicator`
+/// so the panel can draw a visual guide line at the snapped scene-time.
+///
+/// When `state.snap_enabled` is false this is a pure pass-through.
+fn apply_snap_to_window(
+    state: &EditorState,
+    t_in: f32,
+    t_out: f32,
+    mode: SnapMode,
+    exclude: SnapExclude,
+) -> (f32, f32, Option<f32>) {
+    if !state.snap_enabled {
+        return (t_in, t_out, None);
+    }
+    let targets = collect_snap_targets(state, exclude);
+    let threshold = snap_threshold_for_state(state);
+
+    match mode {
+        SnapMode::Move => {
+            let dur = (t_out - t_in).max(0.0);
+            let snapped_start = snap_time(t_in, &targets, threshold);
+            let snapped_end = snap_time(t_out, &targets, threshold);
+            let dx_start = (snapped_start - t_in).abs();
+            let dx_end = (snapped_end - t_out).abs();
+            // Prefer whichever edge is closer to a target so the user
+            // gets the "stickier" attach point (start vs end) without
+            // the clip oscillating between two competing snaps.
+            if dx_start < threshold && dx_start <= dx_end {
+                let new_start = snapped_start.max(0.0);
+                return (new_start, new_start + dur, Some(snapped_start));
+            }
+            if dx_end < threshold {
+                let new_start = (snapped_end - dur).max(0.0);
+                return (new_start, new_start + dur, Some(snapped_end));
+            }
+            (t_in, t_out, None)
+        }
+        SnapMode::TrimLeft => {
+            let snapped = snap_time(t_in, &targets, threshold);
+            if (snapped - t_in).abs() < threshold {
+                // Keep the new in-edge a hair below the out-edge so we
+                // never produce a zero / negative duration window.
+                let new_in = snapped.clamp(0.0, t_out - 0.05);
+                return (new_in, t_out, Some(new_in));
+            }
+            (t_in, t_out, None)
+        }
+        SnapMode::TrimRight => {
+            let snapped = snap_time(t_out, &targets, threshold);
+            if (snapped - t_out).abs() < threshold {
+                let new_out = snapped.max(t_in + 0.05);
+                return (t_in, new_out, Some(new_out));
+            }
+            (t_in, t_out, None)
+        }
+    }
+}
+
 /// Collect all clip edges (start/end times) from the scene, excluding a specific actor index.
+///
+/// **Deprecated**: superseded by `collect_snap_targets` (above), which
+/// supports excluding any kind of clip (not just actors) and adds the
+/// playhead and scene boundaries to the snap-target set. Kept around as
+/// a no-op stub so external integrations that still call it (out-of-tree
+/// tools, tests) don't break — but every in-tree caller now goes through
+/// `collect_snap_targets` instead.
+#[allow(dead_code)]
 fn collect_clip_edges(state: &EditorState, exclude_actor: Option<usize>) -> Vec<f32> {
     let mut edges = Vec::new();
     let duration = state.scene.output.duration;
@@ -6695,7 +6863,7 @@ fn apply_split(
     mover_out
 }
 
-fn shift_assignments_for_insert(
+pub(crate) fn shift_assignments_for_insert(
     map: &mut std::collections::HashMap<usize, usize>,
     inserted: usize,
 ) {
@@ -7790,7 +7958,14 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                 // end fixed (Premiere "ripple-trim from in").
                                 let dx = ui.input(|i| i.pointer.delta().x);
                                 let delta_t = dx / pps;
-                                let new_start = (clip_start + delta_t).max(0.0).min(clip_end - 0.1);
+                                let mut new_start = (clip_start + delta_t).max(0.0).min(clip_end - 0.1);
+                                // Snap-to-edges: glue the in-edge to a
+                                // neighbour edge / playhead within ~5 px.
+                                let (snapped_in, _, snap_t) = apply_snap_to_window(
+                                    state, new_start, clip_end,
+                                    SnapMode::TrimLeft, SnapExclude::Background(bi));
+                                new_start = snapped_in;
+                                state.timeline_drag.snap_indicator = snap_t;
                                 let new_dur = (clip_end - new_start).max(0.1);
                                 let token = EditorState::drag_token("trim_bg_left", bi);
                                 state.mutate_drag(token, |s| {
@@ -7811,7 +7986,13 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                 // Trim right: stretch / shrink the duration.
                                 let dx = ui.input(|i| i.pointer.delta().x);
                                 let delta_t = dx / pps;
-                                let new_dur = (clip_end - clip_start + delta_t).max(0.1);
+                                let mut new_end = (clip_end + delta_t).max(clip_start + 0.1);
+                                let (_, snapped_out, snap_t) = apply_snap_to_window(
+                                    state, clip_start, new_end,
+                                    SnapMode::TrimRight, SnapExclude::Background(bi));
+                                new_end = snapped_out;
+                                state.timeline_drag.snap_indicator = snap_t;
+                                let new_dur = (new_end - clip_start).max(0.1);
                                 let token = EditorState::drag_token("trim_bg_right", bi);
                                 state.mutate_drag(token, |s| {
                                     s.backgrounds[bi].duration = new_dur;
@@ -7827,8 +8008,13 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                 };
                                 to_select = Some(Selection::Background(bi_eff));
                             } else if clicked < 0.0 {
-                                let new_start = (-clicked - MOVE_DRAG_BIAS).max(0.0);
+                                let mut new_start = (-clicked - MOVE_DRAG_BIAS).max(0.0);
                                 let dur = clip_end - clip_start;
+                                let (snapped_in, _, snap_t) = apply_snap_to_window(
+                                    state, new_start, new_start + dur,
+                                    SnapMode::Move, SnapExclude::Background(bi));
+                                new_start = snapped_in;
+                                state.timeline_drag.snap_indicator = snap_t;
                                 let token = EditorState::drag_token("move_bg", bi);
                                 state.mutate_drag(token, |s| {
                                     s.backgrounds[bi].start = new_start;
@@ -7917,7 +8103,13 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             // Trim left edge: adjust t_in
                             let dx = ui.input(|i| i.pointer.delta().x);
                             let delta_t = dx / pps;
-                            let new_in = (clip_start + delta_t).max(0.0).min(clip_end - 0.1);
+                            let mut new_in = (clip_start + delta_t).max(0.0).min(clip_end - 0.1);
+                            // Snap-to-edges on the in-edge.
+                            let (snapped_in, _, snap_t) = apply_snap_to_window(
+                                state, new_in, clip_end,
+                                SnapMode::TrimLeft, SnapExclude::Actor(ai));
+                            new_in = snapped_in;
+                            state.timeline_drag.snap_indicator = snap_t;
                             let token = EditorState::drag_token("trim_actor_left", ai);
                             state.mutate_drag(token, |s| {
                                 s.actors[ai].t_in = Some(new_in);
@@ -7955,16 +8147,31 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             // `t_out_max = t_in + max_clip_dur` where
                             // `max_clip_dur = source_duration - source_start`.
                             let source_start = state.scene.actors[ai].source_start;
+                            let mut hard_cap_out: Option<f32> = None;
                             if let Some(fc) = state.frame_caches.get(ai) {
                                 if fc.is_ready() && fc.duration > 0.0 {
                                     let max_clip_dur =
                                         (fc.duration - source_start).max(0.1);
-                                    let max_out = clip_start + max_clip_dur;
-                                    if new_out > max_out {
-                                        new_out = max_out;
+                                    hard_cap_out = Some(clip_start + max_clip_dur);
+                                    if let Some(cap) = hard_cap_out {
+                                        if new_out > cap {
+                                            new_out = cap;
+                                        }
                                     }
                                 }
                             }
+                            // Snap-to-edges on the out-edge. Re-clamp to
+                            // the source-duration upper bound after snap
+                            // so we can never silently extend the clip
+                            // past its real footage.
+                            let (_, snapped_out, snap_t) = apply_snap_to_window(
+                                state, clip_start, new_out,
+                                SnapMode::TrimRight, SnapExclude::Actor(ai));
+                            new_out = snapped_out.max(clip_start + 0.1);
+                            if let Some(cap) = hard_cap_out {
+                                if new_out > cap { new_out = cap; }
+                            }
+                            state.timeline_drag.snap_indicator = snap_t;
                             let token = EditorState::drag_token("trim_actor_right", ai);
                             state.mutate_drag(token, |s| {
                                 s.actors[ai].t_out = Some(new_out);
@@ -8078,25 +8285,15 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             }
 
                             // ── Snap-to-edges logic ──
-                            if state.snap_enabled {
-                                let new_end = new_start + dur;
-                                let mut snap_targets = collect_clip_edges(state, Some(ai));
-                                snap_targets.push(state.playhead);
-                                // Pixel-aware snap window: ~3 px on screen so the
-                                // clip glides smoothly under the cursor instead of
-                                // jumping in 0.1 s (≈ 8 px) chunks.
-                                let threshold = (3.0 / state.timeline_zoom.max(1.0)).max(0.001);
-
-                                let snapped_start = snap_time(new_start, &snap_targets, threshold);
-                                let snapped_end = snap_time(new_end, &snap_targets, threshold);
-
-                                // Prefer start snap, fall back to end snap
-                                if (snapped_start - new_start).abs() < threshold {
-                                    new_start = snapped_start;
-                                } else if (snapped_end - new_end).abs() < threshold {
-                                    new_start = snapped_end - dur;
-                                }
-                            }
+                            // Use the shared snap helper so the actor's
+                            // move snap shares targets / threshold with
+                            // every other drag arm and writes the snap
+                            // indicator the timeline draws as a guide.
+                            let (snapped_in, _, snap_t) = apply_snap_to_window(
+                                state, new_start, new_start + dur,
+                                SnapMode::Move, SnapExclude::Actor(ai));
+                            new_start = snapped_in;
+                            state.timeline_drag.snap_indicator = snap_t;
 
                             // ── Move keyframes with the clip ──
                             // Actor keyframes are stored in scene-time, so a
@@ -8261,7 +8458,13 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             // Trim left edge.
                             let dx = ui.input(|i| i.pointer.delta().x);
                             let delta_t = dx / pps;
-                            let new_in = (clip_start + delta_t).max(0.0).min(clip_end - 0.1);
+                            let mut new_in = (clip_start + delta_t).max(0.0).min(clip_end - 0.1);
+                            // Snap-to-edges on the in-edge.
+                            let (snapped_in, _, snap_t) = apply_snap_to_window(
+                                state, new_in, clip_end,
+                                SnapMode::TrimLeft, SnapExclude::Overlay(oi));
+                            new_in = snapped_in;
+                            state.timeline_drag.snap_indicator = snap_t;
                             let shift = new_in - clip_start;
                             let token = EditorState::drag_token("trim_overlay_left", oi);
                             state.mutate_drag(token, |s| {
@@ -8301,7 +8504,12 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             // Trim right edge.
                             let dx = ui.input(|i| i.pointer.delta().x);
                             let delta_t = dx / pps;
-                            let new_out = (clip_end + delta_t).max(clip_start + 0.1);
+                            let mut new_out = (clip_end + delta_t).max(clip_start + 0.1);
+                            let (_, snapped_out, snap_t) = apply_snap_to_window(
+                                state, clip_start, new_out,
+                                SnapMode::TrimRight, SnapExclude::Overlay(oi));
+                            new_out = snapped_out.max(clip_start + 0.1);
+                            state.timeline_drag.snap_indicator = snap_t;
                             let token = EditorState::drag_token("trim_overlay_right", oi);
                             state.mutate_drag(token, |s| {
                                 let (t_in_v, layout): (f32, &mut Vec<memstroy_core::Keyframe<memstroy_core::OverlayState>>) = match &mut s.overlays[oi] {
@@ -8333,8 +8541,14 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             to_select = Some(Selection::Overlay(oi_eff));
                         } else if clicked < 0.0 {
                             // Drag: move the overlay's time window.
-                            let new_start = (-clicked - MOVE_DRAG_BIAS).max(0.0);
+                            let mut new_start = (-clicked - MOVE_DRAG_BIAS).max(0.0);
                             let dur = clip_end - clip_start;
+                            // Snap-to-edges (start preferred, end fallback).
+                            let (snapped_in, _, snap_t) = apply_snap_to_window(
+                                state, new_start, new_start + dur,
+                                SnapMode::Move, SnapExclude::Overlay(oi));
+                            new_start = snapped_in;
+                            state.timeline_drag.snap_indicator = snap_t;
                             let new_end = new_start + dur;
                             // Track active drag for lane-lock & new-lane intents.
                             if state.timeline_drag.dragging_clip.is_none() {
@@ -8504,7 +8718,13 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             // appear to skip ahead under the user's hand).
                             let dx = ui.input(|i| i.pointer.delta().x);
                             let delta_t = dx / pps;
-                            let new_in = (clip_start + delta_t).max(0.0).min(clip_end - 0.1);
+                            let mut new_in = (clip_start + delta_t).max(0.0).min(clip_end - 0.1);
+                            // Snap-to-edges on the in-edge.
+                            let (snapped_in, _, snap_t) = apply_snap_to_window(
+                                state, new_in, clip_end,
+                                SnapMode::TrimLeft, SnapExclude::Audio(aui));
+                            new_in = snapped_in;
+                            state.timeline_drag.snap_indicator = snap_t;
                             let actual_delta = new_in - clip_start;
                             let token = EditorState::drag_token("trim_audio_left", aui);
                             state.mutate_drag(token, |s| {
@@ -8527,7 +8747,12 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             // Trim right: extend / shrink the audible window.
                             let dx = ui.input(|i| i.pointer.delta().x);
                             let delta_t = dx / pps;
-                            let new_out = (clip_end + delta_t).max(clip_start + 0.1);
+                            let mut new_out = (clip_end + delta_t).max(clip_start + 0.1);
+                            let (_, snapped_out, snap_t) = apply_snap_to_window(
+                                state, clip_start, new_out,
+                                SnapMode::TrimRight, SnapExclude::Audio(aui));
+                            new_out = snapped_out.max(clip_start + 0.1);
+                            state.timeline_drag.snap_indicator = snap_t;
                             let token = EditorState::drag_token("trim_audio_right", aui);
                             state.mutate_drag(token, |s| {
                                 s.audio[aui].t_out = Some(new_out);
@@ -8544,8 +8769,19 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             to_select = Some(Selection::Audio(aui_eff));
                         } else if clicked < 0.0 {
                             // Drag: move the audio clip horizontally.
-                            let new_start = (-clicked - MOVE_DRAG_BIAS).max(0.0);
+                            let mut new_start = (-clicked - MOVE_DRAG_BIAS).max(0.0);
                             let dur = clip_end - clip_start;
+                            // Snap-to-edges. We snap based on the audio's
+                            // own window only; the parent_actor mirror
+                            // pass below picks up the resulting delta and
+                            // shifts the bound video clip by the same
+                            // amount, so the snap stays consistent for
+                            // the pair.
+                            let (snapped_in, _, snap_t) = apply_snap_to_window(
+                                state, new_start, new_start + dur,
+                                SnapMode::Move, SnapExclude::Audio(aui));
+                            new_start = snapped_in;
+                            state.timeline_drag.snap_indicator = snap_t;
                             // Track active drag for lane-lock & new-lane intents.
                             if state.timeline_drag.dragging_clip.is_none() {
                                 state.timeline_drag.dragging_clip = Some(aui);
@@ -9428,6 +9664,41 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
         );
     }
 
+    // ── Snap guide line ─────────────────────────────────────────────
+    //
+    // When any drag handler captured a snap target this frame, paint a
+    // thin yellow vertical line at the snap time so the user sees
+    // exactly which neighbour edge / playhead / scene boundary they're
+    // glued to. The line spans the full tracks viewport, sits above
+    // every clip bar (drawn AFTER all per-track painting), and
+    // disappears the moment the snap goes away (cleared in the
+    // !any_dragging branch below and overwritten every frame the user
+    // is still dragging by the per-handler `snap_indicator = snap_t`
+    // assignments — so a non-snap frame replaces it with `None`).
+    if let Some(snap_t) = state.timeline_drag.snap_indicator {
+        let snap_x = (snap_t - state.timeline_scroll) * pps + track_left;
+        if snap_x >= track_left && snap_x <= track_right {
+            let snap_color = Color32::from_rgb(255, 230, 80);
+            // Wider, semi-transparent halo behind the line so it pops
+            // even on the brightest clip colours.
+            let halo = Color32::from_rgba_premultiplied(255, 230, 80, 80);
+            ui.painter().line_segment(
+                [
+                    egui::pos2(snap_x, tracks_rect.min.y),
+                    egui::pos2(snap_x, tracks_rect.max.y),
+                ],
+                Stroke::new(3.0, halo),
+            );
+            ui.painter().line_segment(
+                [
+                    egui::pos2(snap_x, tracks_rect.min.y),
+                    egui::pos2(snap_x, tracks_rect.max.y),
+                ],
+                Stroke::new(1.0, snap_color),
+            );
+        }
+    }
+
     // ── Reset drag state when mouse is released (no active drag) ──
     let any_dragging = ui.input(|i| i.pointer.any_down());
     if !any_dragging {
@@ -9453,6 +9724,10 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
         state.timeline_drag.dragging_clip = None;
         state.timeline_drag.pending_new_lane = None;
         state.timeline_drag.start_pointer_y = None;
+        // Snap guide is a transient hint that only makes sense while a
+        // drag is in flight — nuke it on release so the yellow line
+        // doesn't linger over the timeline after the user lets go.
+        state.timeline_drag.snap_indicator = None;
         // Clear any in-flight element-drag that wasn't consumed by a
         // skeleton drop zone (e.g. user Alt-dragged a clip but
         // released over the timeline). The inspector's drop zones
