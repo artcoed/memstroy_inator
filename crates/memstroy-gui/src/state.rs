@@ -288,8 +288,6 @@ pub struct EditorState {
     pub timeline_v_scroll: f32,
     /// Split tool active: when true, clicking on a clip cuts it at the click position.
     pub split_tool_active: bool,
-    /// Whether the (scaffold) node editor window is open.
-    pub node_editor_open: bool,
     /// Library search filter text.
     pub library_search: String,
     /// Currently visible sub-library tab (Clips / Sounds / Images / Particles).
@@ -330,10 +328,8 @@ pub struct EditorState {
     pub curve_editor_open: bool,
     /// Which property is selected in curve editor (0=scale, 1=pos_x, 2=pos_y, 3=opacity, 4=rotation)
     pub curve_editor_property: usize,
-    /// Whether clip editor window is open
-    pub clip_editor_open: bool,
-    /// Detected pose points from motion tracking (normalised [0,1] coordinates)
-    pub detected_points: Vec<[f32; 2]>,
+    /// Whether image editor window is open (image-only filters / crop).
+    pub image_editor_open: bool,
 
     /// Index of text overlay currently being inline-edited on the preview
     pub editing_text_overlay: Option<usize>,
@@ -550,9 +546,16 @@ pub enum ImageTextureSlot {
         texture: egui::TextureHandle,
         size: [u32; 2],
     },
-    /// Decode failed (missing file, unsupported format, etc.). Cached
-    /// so we don't keep retrying on every frame.
-    Failed,
+    /// Decode failed (missing file, unsupported format, partial write,
+    /// race with the downloader, …). Holds the wall-clock instant of
+    /// the last attempt so the canvas can re-try after a short cool-
+    /// down — without that, an image that was briefly missing on the
+    /// first paint (very common for files dropped from the web image
+    /// search before the download finished) was permanently disabled
+    /// because the cached `Failed` slot was never invalidated.
+    Failed {
+        last_attempt: std::time::Instant,
+    },
 }
 
 /// A single scene tab with its own file path and name.
@@ -676,9 +679,7 @@ impl EditorState {
         // New window states
         s.curve_editor_open = false;
         s.curve_editor_property = 0;
-        s.clip_editor_open = false;
-
-        s.detected_points = Vec::new();
+        s.image_editor_open = false;
 
         s.editing_text_overlay = None;
 
@@ -1127,7 +1128,7 @@ impl EditorState {
             "track_heights": track_heights,
             "curve_editor_open": self.curve_editor_open,
             "curve_editor_property": self.curve_editor_property,
-            "clip_editor_open": self.clip_editor_open,
+            "image_editor_open": self.image_editor_open,
             "web_image_search_open": self.web_image_search_open,
             "web_image_search_query": self.web_image_search.query,
         });
@@ -1168,8 +1169,8 @@ impl EditorState {
         if let Some(ce_prop) = data.get("curve_editor_property").and_then(|v| v.as_u64()) {
             self.curve_editor_property = ce_prop as usize;
         }
-        if let Some(clip_open) = data.get("clip_editor_open").and_then(|v| v.as_bool()) {
-            self.clip_editor_open = clip_open;
+        if let Some(clip_open) = data.get("image_editor_open").and_then(|v| v.as_bool()) {
+            self.image_editor_open = clip_open;
         }
         if let Some(open) = data.get("web_image_search_open").and_then(|v| v.as_bool()) {
             self.web_image_search_open = open;
@@ -1192,7 +1193,7 @@ impl EditorState {
             "track_heights": track_heights,
             "curve_editor_open": self.curve_editor_open,
             "curve_editor_property": self.curve_editor_property,
-            "clip_editor_open": self.clip_editor_open,
+            "image_editor_open": self.image_editor_open,
             "web_image_search_open": self.web_image_search_open,
             "web_image_search_query": self.web_image_search.query,
             "library_split": self.library_split,
