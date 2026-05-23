@@ -317,6 +317,11 @@ pub enum SelectedLayer {
     Actor(usize),
     Overlay(usize),
     RenderFrame,
+    /// Audio track at index `usize`. Audio kfs live in per-param vectors
+    /// (`volume_kfs`, `speed_kfs`, …) instead of a shared layout, so the
+    /// timeline / delete / easing handlers route this variant down a
+    /// separate path that keys by `param_id` to pick the right vector.
+    Audio(usize),
 }
 
 /// Highlight target for the inspector when a kf was just clicked. The
@@ -374,6 +379,7 @@ impl KfHighlight {
 
 /// Per-keyframe interaction reported back to the caller. Indices map
 /// 1:1 to the `(time, easing)` pairs the caller passed in.
+#[allow(dead_code)]
 #[derive(Default, Debug, Clone)]
 pub struct KfStripInteraction {
     /// Kf at this index was clicked (no drag, no modifier). Caller
@@ -393,6 +399,13 @@ pub struct KfStripInteraction {
 /// clip-local span the strip represents (left edge = 0s, right edge =
 /// duration). Pass `Some(playhead)` to draw a thin marker at the
 /// current clip-local playhead.
+///
+/// **Currently unused** — every inspector strip was retired in favour
+/// of the per-parameter sub-rows in the timeline panel
+/// (`draw_param_kf_rows` in `panels.rs`). Kept behind
+/// `#[allow(dead_code)]` so a future "in-window kf strip" feature can
+/// reuse the widget without re-deriving the diamond geometry.
+#[allow(dead_code)]
 pub fn keyframe_strip(
     ui: &mut egui::Ui,
     times: &[f32],
@@ -548,6 +561,9 @@ pub fn keyframe_strip(
 /// persisted. Returns the new (still-valid) index of the kf the user
 /// interacted with — useful when the caller wants to keep tracking it
 /// after a sort. `None` when no interaction touched a kf.
+///
+/// **Currently unused** — see `keyframe_strip`.
+#[allow(dead_code)]
 pub fn apply_strip_to_f32_kfs(
     kfs: &mut Vec<memstroy_core::Keyframe<f32>>,
     interaction: &KfStripInteraction,

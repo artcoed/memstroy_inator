@@ -1413,128 +1413,32 @@ fn inspector_actor(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
 }
 
 
-// ─── Per-parameter keyframe strip helpers (transform layouts) ────────
+// ─── Per-parameter keyframe strips REMOVED from the inspector ───────
 //
-// Two thin helpers that adapt the generic `kf_anim::keyframe_strip`
-// widget to the actor / overlay shared layout vector. They only
-// render when the param is in `animated_params` AND the layout
-// actually has multiple kfs whose value for THIS param differs.
-// Drag horizontal moves the kf time; right-click opens the easing
-// menu. Click is a no-op (the timeline ruler is the place to
-// navigate; the inspector strip is for editing).
-
-fn inspector_actor_param_strip<F>(
-    ui: &mut egui::Ui,
-    layout: &mut Vec<Keyframe<memstroy_core::ActorState>>,
-    is_animated: bool,
-    t_in_scene: f32,
-    playhead_scene: f32,
-    get: F,
-    salt: impl std::hash::Hash + Copy,
-) where
-    F: Fn(&memstroy_core::ActorState) -> f32,
-{
-    if !is_animated || layout.len() < 2 {
-        return;
-    }
-    const EPS: f32 = 1.0e-4;
-    // Pick the kf indices where the param's value actually changes.
-    // The first kf is always shown so the user has an anchor at t=0.
-    let mut indices: Vec<usize> = Vec::with_capacity(layout.len());
-    indices.push(0);
-    for i in 1..layout.len() {
-        if (get(&layout[i].value) - get(&layout[i - 1].value)).abs() > EPS {
-            indices.push(i);
-        }
-    }
-
-    // Convert scene-time → clip-local for display so every transform
-    // strip starts at 0 like the audio param strips do. The drag path
-    // converts back when writing.
-    let times_local: Vec<f32> = indices
-        .iter()
-        .map(|&i| (layout[i].t - t_in_scene).max(0.0))
-        .collect();
-    let easings: Vec<memstroy_core::Easing> =
-        indices.iter().map(|&i| layout[i].easing).collect();
-
-    let playhead_local = (playhead_scene - t_in_scene).max(0.0);
-    let max_kf_t = times_local.iter().cloned().fold(0.0_f32, f32::max);
-    let dur = max_kf_t.max(playhead_local).max(1.0);
-
-    let interaction = crate::kf_anim::keyframe_strip(
-        ui,
-        &times_local,
-        &easings,
-        dur,
-        Some(playhead_local),
-        salt,
-    );
-
-    if let Some((strip_idx, new_t_local)) = interaction.dragged_idx_to {
-        if let Some(&kf_idx) = indices.get(strip_idx) {
-            layout[kf_idx].t = (new_t_local + t_in_scene).max(0.0);
-            layout
-                .sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
-        }
-    }
-    if let Some((strip_idx, easing)) = interaction.easing_changed {
-        if let Some(&kf_idx) = indices.get(strip_idx) {
-            layout[kf_idx].easing = easing;
-        }
-    }
-}
-
-fn inspector_overlay_param_strip<F>(
-    ui: &mut egui::Ui,
-    layout: &mut Vec<Keyframe<memstroy_core::OverlayState>>,
-    is_animated: bool,
-    playhead_local: f32,
-    get: F,
-    salt: impl std::hash::Hash + Copy,
-) where
-    F: Fn(&memstroy_core::OverlayState) -> f32,
-{
-    if !is_animated || layout.len() < 2 {
-        return;
-    }
-    const EPS: f32 = 1.0e-4;
-    let mut indices: Vec<usize> = Vec::with_capacity(layout.len());
-    indices.push(0);
-    for i in 1..layout.len() {
-        if (get(&layout[i].value) - get(&layout[i - 1].value)).abs() > EPS {
-            indices.push(i);
-        }
-    }
-    let times: Vec<f32> = indices.iter().map(|&i| layout[i].t.max(0.0)).collect();
-    let easings: Vec<memstroy_core::Easing> =
-        indices.iter().map(|&i| layout[i].easing).collect();
-
-    let max_kf_t = times.iter().cloned().fold(0.0_f32, f32::max);
-    let dur = max_kf_t.max(playhead_local).max(1.0);
-
-    let interaction = crate::kf_anim::keyframe_strip(
-        ui,
-        &times,
-        &easings,
-        dur,
-        Some(playhead_local.max(0.0)),
-        salt,
-    );
-
-    if let Some((strip_idx, new_t)) = interaction.dragged_idx_to {
-        if let Some(&kf_idx) = indices.get(strip_idx) {
-            layout[kf_idx].t = new_t.max(0.0);
-            layout
-                .sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
-        }
-    }
-    if let Some((strip_idx, easing)) = interaction.easing_changed {
-        if let Some(&kf_idx) = indices.get(strip_idx) {
-            layout[kf_idx].easing = easing;
-        }
-    }
-}
+// Per user request the inspector no longer renders any keyframe-strip
+// widgets. Keyframes live exclusively in the timeline panel, in the
+// per-parameter sub-rows beneath each layer (see `draw_param_kf_rows`
+// in this file). Removing the inspector strips has three follow-on
+// effects:
+//
+//   1. The inspector becomes a pure "current value" editor — the
+//      diamond toggle (`kf_anim::animated_toggle`) is the only kf-aware
+//      control that remains. Toggling it on still gates whether
+//      subsequent edits create a kf at the playhead, but the strip
+//      that used to appear directly under the slider is gone.
+//   2. The legacy adapter helpers
+//      `inspector_actor_param_strip` / `inspector_overlay_param_strip`
+//      are dropped (no more `kf_anim::keyframe_strip` widget calls
+//      from the inspector).
+//   3. Keyframe drag / right-click / multi-select / delete now happens
+//      ONLY in the timeline. The user explicitly said this should be
+//      the single source of truth: "В инспекторе не должны
+//      отображаться кейфреймы".
+//
+// The render-frame inspector already lacked a strip (a breadcrumb
+// comment is kept below). The same rule now applies to actor / overlay
+// transforms, audio params, color-correction sliders, and effect-stack
+// param sliders.
 
 /// Per-param keyframe strip for the render frame inspector.
 /// REMOVED: the render-frame keyframe strips moved out of the
@@ -1576,11 +1480,6 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
 
     let highlight = state.kf_highlight.clone();
 
-    // Scene-time anchor for strip-time → scene-time conversions. Actor
-    // kfs are stored in scene-time, but the strip displays clip-local
-    // for consistency with the audio param strips and the timeline
-    // ruler beneath the layer.
-    let t_in_scene = a.t_in.unwrap_or(0.0);
 
     // ── Position X / Y ──
     let mut new_x = cur.pos[0];
@@ -1605,16 +1504,6 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
                 |s| s.pos[1] = new_y);
         }
     });
-    let pos_x_anim = a.animated_params.contains(param_ids::POS_X);
-    let pos_y_anim = a.animated_params.contains(param_ids::POS_Y);
-    inspector_actor_param_strip(
-        ui, &mut a.layout, pos_x_anim, t_in_scene, playhead,
-        |s| s.pos[0], ("act_strip_pos_x", i),
-    );
-    inspector_actor_param_strip(
-        ui, &mut a.layout, pos_y_anim, t_in_scene, playhead,
-        |s| s.pos[1], ("act_strip_pos_y", i),
-    );
 
     // ── Scale ──
     let mut new_scale = cur.scale;
@@ -1706,16 +1595,6 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
             }
         }
     });
-    let scale_anim = a.animated_params.contains(param_ids::SCALE);
-    let scale_y_anim = a.animated_params.contains(param_ids::SCALE_Y);
-    inspector_actor_param_strip(
-        ui, &mut a.layout, scale_anim, t_in_scene, playhead,
-        |s| s.scale, ("act_strip_scale", i),
-    );
-    inspector_actor_param_strip(
-        ui, &mut a.layout, scale_y_anim, t_in_scene, playhead,
-        |s| s.scale_y, ("act_strip_scale_y", i),
-    );
 
     // ── Rotation (dial + numeric) ──
     let mut new_rot = cur.rotation_deg;
@@ -1747,11 +1626,6 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
                 |s| s.rotation_deg = new_rot);
         }
     });
-    let rot_anim = a.animated_params.contains(param_ids::ROTATION);
-    inspector_actor_param_strip(
-        ui, &mut a.layout, rot_anim, t_in_scene, playhead,
-        |s| s.rotation_deg, ("act_strip_rot", i),
-    );
 
     // ── Opacity ──
     let mut new_op = cur.opacity;
@@ -1767,11 +1641,6 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
                 |s| s.opacity = new_op);
         }
     });
-    let op_anim = a.animated_params.contains(param_ids::OPACITY);
-    inspector_actor_param_strip(
-        ui, &mut a.layout, op_anim, t_in_scene, playhead,
-        |s| s.opacity, ("act_strip_op", i),
-    );
 
     // ── Flip X / Y ──
     let mut new_fx = cur.flip_x_anim;
@@ -1789,11 +1658,6 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
         }
         // Mirror (\u{21B6}) shortcut button intentionally removed — drag the slider to -1 manually.
     });
-    let flip_x_anim = a.animated_params.contains(param_ids::FLIP_X);
-    inspector_actor_param_strip(
-        ui, &mut a.layout, flip_x_anim, t_in_scene, playhead,
-        |s| s.flip_x_anim, ("act_strip_flip_x", i),
-    );
     ui.horizontal(|ui| {
         kf_anim::animated_toggle(ui, &mut a.animated_params, param_ids::FLIP_Y, ("act_fy", i));
         ui.label(param_label(highlight.is_active(param_ids::FLIP_Y), "Flip Y:"));
@@ -1805,11 +1669,6 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
                 |s| s.flip_y_anim = new_fy);
         }
     });
-    let flip_y_anim = a.animated_params.contains(param_ids::FLIP_Y);
-    inspector_actor_param_strip(
-        ui, &mut a.layout, flip_y_anim, t_in_scene, playhead,
-        |s| s.flip_y_anim, ("act_strip_flip_y", i),
-    );
 
     ui.add_space(8.0);
     ui.checkbox(&mut a.visible, "Visible");
@@ -2584,30 +2443,13 @@ fn inspector_effect_anim_slider(
         }
     });
 
-    if is_animated {
-        // Per-param keyframe strip — replaces the old "+ kf at playhead"
-        // / "Clear kfs" buttons. Drag a diamond to move it; right-click
-        // for the interpolation menu. The strip self-sizes to the
-        // largest kf time.
-        if let Some(kf_vec) = eff.param_kfs.get_mut(key) {
-            if !kf_vec.is_empty() {
-                let max_t = kf_vec.iter().map(|k| k.t).fold(0.0_f32, f32::max);
-                let dur = max_t.max(t_local).max(1.0);
-                let times: Vec<f32> = kf_vec.iter().map(|k| k.t).collect();
-                let easings: Vec<memstroy_core::Easing> =
-                    kf_vec.iter().map(|k| k.easing).collect();
-                let interaction = crate::kf_anim::keyframe_strip(
-                    ui,
-                    &times,
-                    &easings,
-                    dur,
-                    Some(t_local.max(0.0)),
-                    ("effect_kf_strip", key, salt),
-                );
-                crate::kf_anim::apply_strip_to_f32_kfs(kf_vec, &interaction);
-            }
-        }
-    }
+    // Per-parameter keyframe strip removed — keyframes now live
+    // exclusively under the layer's row in the timeline panel
+    // (per-param sub-rows, see `draw_param_kf_rows`). The diamond
+    // toggle above keeps the gating role: when it's off, edits
+    // broadcast to every existing kf; when it's on, edits author
+    // a kf at the playhead via the `kf_anim` writers.
+    let _ = is_animated;
 }
 
 
@@ -3194,28 +3036,11 @@ fn inspector_cc_anim_slider(
             }
         }
     });
-    if is_animated {
-        // Per-param keyframe strip — replaces the old buttons. Drag to
-        // move kfs in time; right-click for the easing menu.
-        if let Some(kf_vec) = cc.kfs.get_mut(key) {
-            if !kf_vec.is_empty() {
-                let max_t = kf_vec.iter().map(|k| k.t).fold(0.0_f32, f32::max);
-                let dur = max_t.max(t_local).max(1.0);
-                let times: Vec<f32> = kf_vec.iter().map(|k| k.t).collect();
-                let easings: Vec<memstroy_core::Easing> =
-                    kf_vec.iter().map(|k| k.easing).collect();
-                let interaction = crate::kf_anim::keyframe_strip(
-                    ui,
-                    &times,
-                    &easings,
-                    dur,
-                    Some(t_local.max(0.0)),
-                    ("cc_kf_strip", key, salt),
-                );
-                crate::kf_anim::apply_strip_to_f32_kfs(kf_vec, &interaction);
-            }
-        }
-    }
+    // Per-parameter keyframe strip removed — keyframes now live
+    // exclusively under the layer's row in the timeline panel. The
+    // diamond toggle above still gates whether edits author kfs at
+    // the playhead vs. broadcast across every existing kf.
+    let _ = is_animated;
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -4164,16 +3989,6 @@ fn inspector_overlay_state_widgets(
                 param_ids::POS_Y, false, |s| s.pos[1] = new_y);
         }
     });
-    let pos_x_anim = animated_params.contains(param_ids::POS_X);
-    let pos_y_anim = animated_params.contains(param_ids::POS_Y);
-    inspector_overlay_param_strip(
-        ui, layout, pos_x_anim, playhead,
-        |s| s.pos[0], (salt_kind, "strip_px", salt_idx),
-    );
-    inspector_overlay_param_strip(
-        ui, layout, pos_y_anim, playhead,
-        |s| s.pos[1], (salt_kind, "strip_py", salt_idx),
-    );
 
     let mut new_scale = cur.scale;
     let mut new_sy = cur.scale_y;
@@ -4249,16 +4064,6 @@ fn inspector_overlay_state_widgets(
             }
         }
     });
-    let scale_anim = animated_params.contains(param_ids::SCALE);
-    let scale_y_anim = animated_params.contains(param_ids::SCALE_Y);
-    inspector_overlay_param_strip(
-        ui, layout, scale_anim, playhead,
-        |s| s.scale, (salt_kind, "strip_sc", salt_idx),
-    );
-    inspector_overlay_param_strip(
-        ui, layout, scale_y_anim, playhead,
-        |s| s.scale_y, (salt_kind, "strip_sy", salt_idx),
-    );
 
     let mut new_rot = cur.rotation_deg;
     ui.horizontal(|ui| {
@@ -4275,11 +4080,6 @@ fn inspector_overlay_state_widgets(
                 param_ids::ROTATION, false, |s| s.rotation_deg = new_rot);
         }
     });
-    let rot_anim = animated_params.contains(param_ids::ROTATION);
-    inspector_overlay_param_strip(
-        ui, layout, rot_anim, playhead,
-        |s| s.rotation_deg, (salt_kind, "strip_rot", salt_idx),
-    );
 
     let mut new_op = cur.opacity;
     ui.horizontal(|ui| {
@@ -4291,11 +4091,6 @@ fn inspector_overlay_state_widgets(
                 param_ids::OPACITY, false, |s| s.opacity = new_op);
         }
     });
-    let op_anim = animated_params.contains(param_ids::OPACITY);
-    inspector_overlay_param_strip(
-        ui, layout, op_anim, playhead,
-        |s| s.opacity, (salt_kind, "strip_op", salt_idx),
-    );
 
     let mut new_fx = cur.flip_x_anim;
     let mut new_fy = cur.flip_y_anim;
@@ -4308,11 +4103,6 @@ fn inspector_overlay_state_widgets(
                 param_ids::FLIP_X, false, |s| s.flip_x_anim = new_fx);
         }
     });
-    let flip_x_anim = animated_params.contains(param_ids::FLIP_X);
-    inspector_overlay_param_strip(
-        ui, layout, flip_x_anim, playhead,
-        |s| s.flip_x_anim, (salt_kind, "strip_fx", salt_idx),
-    );
     ui.horizontal(|ui| {
         kf_anim::animated_toggle(ui, animated_params, param_ids::FLIP_Y, (salt_kind, "fy", salt_idx));
         ui.label(param_label(highlight.is_active(param_ids::FLIP_Y), "Flip Y:"));
@@ -4322,11 +4112,6 @@ fn inspector_overlay_state_widgets(
                 param_ids::FLIP_Y, false, |s| s.flip_y_anim = new_fy);
         }
     });
-    let flip_y_anim = animated_params.contains(param_ids::FLIP_Y);
-    inspector_overlay_param_strip(
-        ui, layout, flip_y_anim, playhead,
-        |s| s.flip_y_anim, (salt_kind, "strip_fy", salt_idx),
-    );
 }
 
 /// Inspector layer-order actions for a text overlay. The buttons that
@@ -4989,25 +4774,11 @@ fn inspector_audio(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
                 speed_dirty = true;
             }
         });
-        // Per-param strip for speed kfs — same widget the actor /
-        // overlay / render-frame inspectors use.
-        let speed_animated = audio.animated_params.contains("speed");
-        if speed_animated && !audio.speed_kfs.is_empty() {
-            let max_kf_t = audio.speed_kfs.iter().map(|k| k.t).fold(0.0_f32, f32::max);
-            let dur = max_kf_t.max(t_local).max(1.0);
-            let times: Vec<f32> = audio.speed_kfs.iter().map(|k| k.t).collect();
-            let easings: Vec<memstroy_core::Easing> =
-                audio.speed_kfs.iter().map(|k| k.easing).collect();
-            let interaction = crate::kf_anim::keyframe_strip(
-                ui,
-                &times,
-                &easings,
-                dur,
-                Some(t_local.max(0.0)),
-                ("audio_kf_strip", i, "speed"),
-            );
-            crate::kf_anim::apply_strip_to_f32_kfs(&mut audio.speed_kfs, &interaction);
-        }
+        // Per-parameter keyframe strip removed — kf editing for the
+        // audio "speed" param now lives under the audio track row in
+        // the timeline panel. The diamond toggle above still gates
+        // whether subsequent slider edits author a kf at the
+        // playhead vs. broadcast across every existing kf.
         if speed_dirty && cur_dur > 0.0 {
             // Resize the visible window to match the new speed using
             // the cached "1× length" reference so the math is symmetric.
@@ -5406,30 +5177,12 @@ fn inspector_audio_param_ex(
         }
     });
 
-    // Per-parameter keyframe strip — drawn ONLY when the param is
-    // animated. When the user toggles animation on without entering any
-    // edits yet, the strip will show a single seed kf at t=0 (placed
-    // by the toggle handler above) so they have something to drag.
-    let is_animated = animated.contains(param_id);
-    if is_animated && !kfs.is_empty() {
-        // Use the larger of the clip's local playhead and the largest
-        // kf time as the strip's right edge so the user can always see
-        // every kf they've authored, even when the playhead is at 0.
-        let max_kf_t = kfs.iter().map(|k| k.t).fold(0.0_f32, f32::max);
-        let dur = max_kf_t.max(t_local).max(1.0).max(0.1);
-        let times: Vec<f32> = kfs.iter().map(|k| k.t).collect();
-        let easings: Vec<memstroy_core::Easing> =
-            kfs.iter().map(|k| k.easing).collect();
-        let interaction = kf_anim::keyframe_strip(
-            ui,
-            &times,
-            &easings,
-            dur,
-            Some(t_local.max(0.0)),
-            ("audio_kf_strip", audio_idx, param_id),
-        );
-        kf_anim::apply_strip_to_f32_kfs(kfs, &interaction);
-    }
+    // Per-parameter keyframe strip removed — kf editing for audio
+    // params now lives under the audio track row in the timeline
+    // panel (per-param sub-rows). The diamond toggle above keeps
+    // gating: ON authors a kf at the playhead via the writer above,
+    // OFF makes the slider edit the static value field.
+    let _ = kfs;
 }
 
 
@@ -7510,6 +7263,12 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     // row is being drawn.
     let mut param_row_easing_changes: Vec<(crate::kf_anim::SelectedLayer, ParamRowEasingChange)> =
         Vec::new();
+    // Drag deltas collected from the per-param kf rows. Each entry
+    // moves a single kf by `delta_t` (with optional broadcast to the
+    // current multi-selection). Drained alongside the click / easing
+    // outcomes after every row has been drawn so the layer storage
+    // is mutated outside the row loop.
+    let mut param_row_drags: Vec<(crate::kf_anim::SelectedLayer, ParamRowDrag)> = Vec::new();
 
     // ── Render Frame row (always at the top of the panel) ──
     // The render frame is the "where do we crop the output" rectangle,
@@ -7594,24 +7353,30 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             // Diamond row showing every render-frame keyframe at its
             // scene-time. Re-uses the same renderer used for actor /
             // overlay clip-bars so the diamonds look identical.
+            // ── Render-frame layer row content ──
+            //
+            // Per user request the row itself is intentionally EMPTY
+            // of keyframe diamonds — the same rule the actor / overlay
+            // / audio rows already follow. Keyframes belong only in
+            // the per-parameter rows below, gated by
+            // `rf.animated_params`. This kills the misleading
+            // "row-aggregate" diamonds that used to imply every
+            // parameter was animated together.
             let content_rect_rf = egui::Rect::from_min_max(
                 egui::pos2(tracks_rect.min.x, row_top + 1.0),
                 egui::pos2(tracks_rect.max.x, diamond_bot - 1.0),
             );
             let scene_dur = state.scene.output.duration.max(0.0);
-            let rf_layout = state.scene.render_frame.layout.clone();
-            draw_keyframe_diamonds(
-                painter_rf,
+            // Subtle band fill so the row still has visual weight
+            // (clickable surface) without authoring any kf glyphs.
+            painter_rf.rect_filled(
                 content_rect_rf,
-                0.0,
-                scene_dur,
-                &rf_layout,
-                state.timeline_scroll,
-                pps,
-                track_left,
-                track_right,
-                rf_selected,
-                true, // render-frame kfs are scene-time anchored
+                Rounding::same(2.0),
+                if rf_selected {
+                    Color32::from_rgba_premultiplied(255, 130, 130, 28)
+                } else {
+                    Color32::from_rgba_premultiplied(255, 130, 130, 14)
+                },
             );
 
             // ── Per-param keyframe rows under the render-frame
@@ -7654,6 +7419,9 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                     }
                     for ec in outcome.easing_changes {
                         param_row_easing_changes.push((layer_label.clone(), ec));
+                    }
+                    for dr in outcome.drags {
+                        param_row_drags.push((layer_label.clone(), dr));
                     }
                 }
             }
@@ -8733,6 +8501,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                 let layer_label = match sel_layer {
                     Selection::Actor(ai) => crate::kf_anim::SelectedLayer::Actor(ai),
                     Selection::Overlay(oi) => crate::kf_anim::SelectedLayer::Overlay(oi),
+                    Selection::Audio(ai) => crate::kf_anim::SelectedLayer::Audio(ai),
                     _ => crate::kf_anim::SelectedLayer::RenderFrame,
                 };
                 // Compute the selected layer's clip range in scene-time so
@@ -8748,6 +8517,21 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             Overlay::Image(im) => (im.t_in, im.t_out),
                             Overlay::Video(v) => (v.t_in, v.t_out),
                         }
+                    }
+                    Selection::Audio(ai) => {
+                        let a = &state.scene.audio[ai];
+                        let end = a.t_out.unwrap_or_else(|| {
+                            // No explicit out: use the audio waveform's
+                            // measured duration when we have one;
+                            // otherwise fall back to the scene end so
+                            // the strip still fills the visible row.
+                            state
+                                .audio_waveforms
+                                .get(ai)
+                                .map(|w| (a.t_in + w.duration).max(a.t_in + 0.001))
+                                .unwrap_or(duration)
+                        });
+                        (a.t_in, end)
                     }
                     _ => (0.0, duration),
                 };
@@ -8782,6 +8566,9 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                 for ec in outcome.easing_changes {
                     param_row_easing_changes.push((layer_label.clone(), ec));
                 }
+                for dr in outcome.drags {
+                    param_row_drags.push((layer_label.clone(), dr));
+                }
             }
         }
 
@@ -8796,6 +8583,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                     let layer_label = match sel_layer {
                         Selection::Actor(ai) => crate::kf_anim::SelectedLayer::Actor(ai),
                         Selection::Overlay(oi) => crate::kf_anim::SelectedLayer::Overlay(oi),
+                        Selection::Audio(ai) => crate::kf_anim::SelectedLayer::Audio(ai),
                         _ => crate::kf_anim::SelectedLayer::RenderFrame,
                     };
                     let (clip_start_t, clip_end_t) = match sel_layer {
@@ -8876,24 +8664,81 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
         }
     }
 
+    // ── Per-param keyframe row drag → time-shift ──
+    if !param_row_drags.is_empty() {
+        // We push an undo snapshot the first frame of any drag gesture
+        // so the whole drag is one Ctrl+Z entry (matches the canvas
+        // drag undo grouping). The token is keyed on the layer +
+        // param so each row's drag is its own undo entry.
+        let any_drag = !param_row_drags.is_empty();
+        if any_drag {
+            let token = EditorState::drag_token("param_kf_drag", 0);
+            if state.last_drag_group != Some(token) {
+                state.undo.push(&state.scene);
+                state.last_drag_group = Some(token);
+            }
+        }
+        // Apply each drag delta to the layer's typed storage. When a
+        // drag carries `broadcast_to_selection`, every entry in
+        // `state.selected_keyframes` matching the dragged layer is
+        // shifted by the same delta — this is what makes
+        // multi-selecting kfs and dragging one of them move the
+        // whole batch together.
+        let selected_snapshot = state.selected_keyframes.clone();
+        for (layer, drag) in &param_row_drags {
+            let mut targets: Vec<(crate::kf_anim::SelectedLayer, String, f32)> = Vec::new();
+            if drag.broadcast_to_selection && !selected_snapshot.is_empty() {
+                for sk in &selected_snapshot {
+                    if &sk.layer == layer {
+                        targets.push((sk.layer.clone(), sk.param_id.clone(), sk.t));
+                    }
+                }
+                // Defensive: if for some reason none of the selected
+                // kfs are on this layer, still apply to the dragged
+                // kf so the user sees feedback.
+                if targets.is_empty() {
+                    targets.push((layer.clone(), drag.param_id.clone(), drag.kf_t));
+                }
+            } else {
+                targets.push((layer.clone(), drag.param_id.clone(), drag.kf_t));
+            }
+            for (l, pid, old_t) in targets {
+                if let Some(new_t) = apply_kf_drag_to_layer(state, &l, &pid, old_t, drag.delta_t) {
+                    // Keep `state.selected_keyframes` in sync so the
+                    // diamond stays painted yellow on the new t and
+                    // subsequent frames continue to broadcast against
+                    // the live entries.
+                    for sk in state.selected_keyframes.iter_mut() {
+                        if sk.layer == l && sk.param_id == pid && (sk.t - old_t).abs() < 1.0e-3 {
+                            sk.t = new_t;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // ── Per-param keyframe row right-click → easing change ──
     if !param_row_easing_changes.is_empty() {
         let selected_kfs = state.selected_keyframes.clone();
         for (layer_label, change) in &param_row_easing_changes {
-            // Build the list of (layer, t) pairs the change should
-            // touch. Right-clicking a kf that's part of the current
-            // multi-selection batches the easing onto every selected
-            // kf; otherwise it's a one-off edit.
-            let mut targets: Vec<(crate::kf_anim::SelectedLayer, f32)> = Vec::new();
+            // Build the list of (layer, param_id, t) triples the
+            // change should touch. Right-clicking a kf that's part
+            // of the current multi-selection batches the easing onto
+            // every selected kf; otherwise it's a one-off edit.
+            // `param_id` is required by the audio routing (each
+            // param owns its own kf vector) and ignored by the
+            // shared-layout layer kinds.
+            let mut targets: Vec<(crate::kf_anim::SelectedLayer, String, f32)> = Vec::new();
             if change.apply_to_selection && !selected_kfs.is_empty() {
                 for sk in &selected_kfs {
-                    targets.push((sk.layer.clone(), sk.t));
+                    targets.push((sk.layer.clone(), sk.param_id.clone(), sk.t));
                 }
             } else {
-                targets.push((layer_label.clone(), change.t));
+                targets.push((layer_label.clone(), change.param_id.clone(), change.t));
             }
-            for (layer, t) in targets {
-                apply_easing_to_layer_kf(state, &layer, t, change.easing);
+            for (layer, pid, t) in targets {
+                apply_easing_to_layer_kf(state, &layer, &pid, t, change.easing);
             }
         }
     }
@@ -10391,18 +10236,50 @@ fn selected_layer_animated_params(
             let params = ordered_animated(ap);
             Some((state.selection, params))
         }
+        Selection::Audio(ai) => {
+            // Audio rows respect the same explicit-assignment fallback
+            // chain as their clip drawer (see the audio block in
+            // `timeline()`): explicit override → round-robin across
+            // audio tracks → 0. Returning `None` for any other track
+            // keeps the per-param expansion attached to the row that
+            // actually carries the clip.
+            let audio_tracks: Vec<usize> = (0..state.tracks.len())
+                .filter(|ti| state.tracks[*ti].kind == TrackKind::Audio)
+                .collect();
+            let assigned = if let Some(&t) = state.audio_track_assignments.get(&ai) {
+                t
+            } else if audio_tracks.is_empty() {
+                0
+            } else {
+                audio_tracks[ai % audio_tracks.len()]
+            };
+            if assigned != track_idx {
+                return None;
+            }
+            let track = state.scene.audio.get(ai)?;
+            let params = ordered_animated(&track.animated_params);
+            Some((state.selection, params))
+        }
         _ => None,
     }
 }
 
 /// Stable ordering for the param rows so the visual layout doesn't
-/// shuffle as the user toggles params on/off.
+/// shuffle as the user toggles params on/off. Both the transform
+/// param-id pool (POS_X / POS_Y / SCALE / …) and the audio-only ids
+/// (`"volume"` / `"speed"` / `"pitch"` / `"pan"` / `"low_pass"` /
+/// `"high_pass"` / `"reverb"`) are listed up-front so audio rows get
+/// the same predictable left-to-right ordering as video rows.
 fn ordered_animated(set: &std::collections::BTreeSet<String>) -> Vec<String> {
     use memstroy_core::param_ids::*;
     let mut out = Vec::with_capacity(set.len());
-    for known in [POS_X, POS_Y, SCALE, SCALE_Y, ROTATION, OPACITY, FLIP_X, FLIP_Y] {
-        if set.contains(known) {
-            out.push(known.to_string());
+    let known: [&str; 15] = [
+        POS_X, POS_Y, SCALE, SCALE_Y, ROTATION, OPACITY, FLIP_X, FLIP_Y,
+        "volume", "speed", "pitch", "pan", "low_pass", "high_pass", "reverb",
+    ];
+    for k in known {
+        if set.contains(k) {
+            out.push(k.to_string());
         }
     }
     // Then any remaining unknown / future ids in BTreeSet order.
@@ -10761,10 +10638,10 @@ fn compute_param_change_points(
             }
         }
         _ => {
-            // RenderFrame is handled below; any other selection (None,
-            // Background, Audio, Camera) has no per-param strip in the
-            // timeline expansion area, so it falls through with an
-            // empty map.
+            // RenderFrame and Audio are handled below via dedicated
+            // blocks; any other selection (None, Background, Camera)
+            // has no per-param strip in the timeline expansion area,
+            // so it falls through with an empty map.
         }
     }
 
@@ -10803,6 +10680,32 @@ fn compute_param_change_points(
         out.insert(p::ROTATION.to_string(),
             pairs(changed_rf(layout, |s| s.rotation_deg), sel));
     }
+
+    // Audio per-param tracks. Each animatable audio parameter has its
+    // own `Vec<Keyframe<f32>>`, so unlike actors / overlays the times
+    // ARE per-parameter natively — no change-point heuristic needed.
+    // The strip only authors a row when `param_id ∈ animated_params`,
+    // matching the gating used by the audio writers in the inspector.
+    if let Selection::Audio(ai) = sel {
+        if let Some(track) = state.scene.audio.get(ai) {
+            let push_kfs = |out: &mut std::collections::BTreeMap<String, Vec<(f32, f32)>>,
+                            id: &str,
+                            kfs: &[Keyframe<f32>]| {
+                if !track.animated_params.contains(id) || kfs.is_empty() {
+                    return;
+                }
+                let times: Vec<f32> = kfs.iter().map(|k| k.t).collect();
+                out.insert(id.to_string(), pairs(times, sel));
+            };
+            push_kfs(&mut out, "volume", &track.volume_kfs);
+            push_kfs(&mut out, "speed", &track.speed_kfs);
+            push_kfs(&mut out, "pitch", &track.pitch_kfs);
+            push_kfs(&mut out, "pan", &track.pan_kfs);
+            push_kfs(&mut out, "low_pass", &track.low_pass_kfs);
+            push_kfs(&mut out, "high_pass", &track.high_pass_kfs);
+            push_kfs(&mut out, "reverb", &track.reverb_kfs);
+        }
+    }
     out
 }
 
@@ -10819,6 +10722,14 @@ fn kf_time_to_scene_time(state: &EditorState, sel: Selection, kf_t: f32) -> f32 
             }).unwrap_or(0.0);
             t_in + kf_t
         }
+        Selection::Audio(ai) => {
+            // Audio kfs are stored clip-local (`volume_kfs[i].t` is the
+            // offset from the clip's `t_in`), same convention as
+            // overlays. Adding `t_in` lets the timeline ruler position
+            // the diamond at the right scene-time x-coordinate.
+            let t_in = state.scene.audio.get(ai).map(|a| a.t_in).unwrap_or(0.0);
+            t_in + kf_t
+        }
         _ => kf_t,
     }
 }
@@ -10831,13 +10742,89 @@ fn kf_scene_time(state: &EditorState, sel: Selection, kf_t: f32) -> f32 {
     kf_time_to_scene_time(state, sel, kf_t)
 }
 
+/// Apply a time delta to a keyframe inside the given layer's typed
+/// storage. Looks up the kf at `old_t` (within ε), shifts it to
+/// `old_t + delta_t` (clamped to ≥ 0), and re-sorts the storage.
+/// Returns the kf's new time on success or `None` when the kf wasn't
+/// found — in which case the caller skips updating
+/// `state.selected_keyframes` for that target so a stale entry
+/// doesn't get "moved" without a real kf behind it.
+///
+/// `param_id` is consulted for the `Audio` variant — each audio
+/// parameter owns its own `Vec<Keyframe<f32>>` and we have to pick
+/// the right one. Actor / Overlay / RenderFrame share a single
+/// typed layout where time is the unique kf identifier, so the id
+/// is ignored on those paths.
+fn apply_kf_drag_to_layer(
+    state: &mut EditorState,
+    layer: &crate::kf_anim::SelectedLayer,
+    param_id: &str,
+    old_t: f32,
+    delta_t: f32,
+) -> Option<f32> {
+    let eps = 1.0e-3;
+    let new_t = (old_t + delta_t).max(0.0);
+    match layer {
+        crate::kf_anim::SelectedLayer::Actor(ai) => {
+            let a = state.scene.actors.get_mut(*ai)?;
+            let kf = a.layout.iter_mut().find(|k| (k.t - old_t).abs() < eps)?;
+            kf.t = new_t;
+            a.layout.sort_by(|x, y| x.t.partial_cmp(&y.t).unwrap_or(std::cmp::Ordering::Equal));
+            Some(new_t)
+        }
+        crate::kf_anim::SelectedLayer::Overlay(oi) => {
+            let ov = state.scene.overlays.get_mut(*oi)?;
+            let layout: &mut Vec<Keyframe<OverlayState>> = match ov {
+                Overlay::Text(t) => &mut t.layout,
+                Overlay::Image(im) => &mut im.layout,
+                Overlay::Video(v) => &mut v.layout,
+            };
+            let kf = layout.iter_mut().find(|k| (k.t - old_t).abs() < eps)?;
+            kf.t = new_t;
+            layout.sort_by(|x, y| x.t.partial_cmp(&y.t).unwrap_or(std::cmp::Ordering::Equal));
+            Some(new_t)
+        }
+        crate::kf_anim::SelectedLayer::RenderFrame => {
+            let layout = &mut state.scene.render_frame.layout;
+            let kf = layout.iter_mut().find(|k| (k.t - old_t).abs() < eps)?;
+            kf.t = new_t;
+            layout.sort_by(|x, y| x.t.partial_cmp(&y.t).unwrap_or(std::cmp::Ordering::Equal));
+            Some(new_t)
+        }
+        crate::kf_anim::SelectedLayer::Audio(ai) => {
+            let track = state.scene.audio.get_mut(*ai)?;
+            let kfs: &mut Vec<Keyframe<f32>> = match param_id {
+                "volume"    => &mut track.volume_kfs,
+                "speed"     => &mut track.speed_kfs,
+                "pitch"     => &mut track.pitch_kfs,
+                "pan"       => &mut track.pan_kfs,
+                "low_pass"  => &mut track.low_pass_kfs,
+                "high_pass" => &mut track.high_pass_kfs,
+                "reverb"    => &mut track.reverb_kfs,
+                _ => return None,
+            };
+            let kf = kfs.iter_mut().find(|k| (k.t - old_t).abs() < eps)?;
+            kf.t = new_t;
+            kfs.sort_by(|x, y| x.t.partial_cmp(&y.t).unwrap_or(std::cmp::Ordering::Equal));
+            Some(new_t)
+        }
+    }
+}
+
 /// Apply `easing` to the keyframe at time `kf_t` in the given layer's
 /// layout. Used by the per-param row context menu and the multi-edit
 /// path (when a batch of kfs is selected, the easing is broadcast to
 /// every entry). Time matching uses an ε of 1ms to absorb fp drift.
+///
+/// `param_id` only matters for the `Audio` variant — each audio
+/// parameter owns its own `Vec<Keyframe<f32>>`, so the function uses
+/// the id to pick the right vector. Actor / Overlay / RenderFrame
+/// share a single typed layout where `kf_t` is unique per kf, so
+/// `param_id` is ignored on those paths.
 fn apply_easing_to_layer_kf(
     state: &mut EditorState,
     layer: &crate::kf_anim::SelectedLayer,
+    param_id: &str,
     kf_t: f32,
     easing: memstroy_core::Easing,
 ) {
@@ -10873,6 +10860,22 @@ fn apply_easing_to_layer_kf(
                 kf.easing = easing;
             }
         }
+        crate::kf_anim::SelectedLayer::Audio(ai) => {
+            let Some(track) = state.scene.audio.get_mut(*ai) else { return; };
+            let kfs: &mut Vec<Keyframe<f32>> = match param_id {
+                "volume"    => &mut track.volume_kfs,
+                "speed"     => &mut track.speed_kfs,
+                "pitch"     => &mut track.pitch_kfs,
+                "pan"       => &mut track.pan_kfs,
+                "low_pass"  => &mut track.low_pass_kfs,
+                "high_pass" => &mut track.high_pass_kfs,
+                "reverb"    => &mut track.reverb_kfs,
+                _ => return,
+            };
+            if let Some(kf) = kfs.iter_mut().find(|k| (k.t - kf_t).abs() < eps) {
+                kf.easing = easing;
+            }
+        }
     }
 }
 
@@ -10894,6 +10897,10 @@ fn delete_selected_keyframes(state: &mut EditorState) {
         std::collections::HashMap::new();
     let mut overlay_kfs: std::collections::HashMap<usize, Vec<f32>> =
         std::collections::HashMap::new();
+    // Audio deletes are keyed by (audio_idx, param_id) → list of kf
+    // times, because each audio parameter owns its own Vec<Keyframe<f32>>.
+    let mut audio_kfs: std::collections::HashMap<(usize, String), Vec<f32>> =
+        std::collections::HashMap::new();
     for kf in to_delete {
         match kf.layer {
             crate::kf_anim::SelectedLayer::Actor(ai) => {
@@ -10909,6 +10916,12 @@ fn delete_selected_keyframes(state: &mut EditorState) {
                     .layout
                     .retain(|kfx| (kfx.t - kf.t).abs() > eps);
                 removed += 1;
+            }
+            crate::kf_anim::SelectedLayer::Audio(ai) => {
+                audio_kfs
+                    .entry((ai, kf.param_id.clone()))
+                    .or_default()
+                    .push(kf.t);
             }
         }
     }
@@ -10931,6 +10944,24 @@ fn delete_selected_keyframes(state: &mut EditorState) {
             layout
                 .retain(|kfx| !ts.iter().any(|t| (kfx.t - t).abs() < eps));
             removed += before - layout.len();
+        }
+    }
+    for ((ai, pid), ts) in audio_kfs {
+        let Some(track) = state.scene.audio.get_mut(ai) else { continue; };
+        let kfs_vec: Option<&mut Vec<Keyframe<f32>>> = match pid.as_str() {
+            "volume"    => Some(&mut track.volume_kfs),
+            "speed"     => Some(&mut track.speed_kfs),
+            "pitch"     => Some(&mut track.pitch_kfs),
+            "pan"       => Some(&mut track.pan_kfs),
+            "low_pass"  => Some(&mut track.low_pass_kfs),
+            "high_pass" => Some(&mut track.high_pass_kfs),
+            "reverb"    => Some(&mut track.reverb_kfs),
+            _ => None,
+        };
+        if let Some(kfs) = kfs_vec {
+            let before = kfs.len();
+            kfs.retain(|kfx| !ts.iter().any(|t| (kfx.t - t).abs() < eps));
+            removed += before - kfs.len();
         }
     }
 
@@ -11225,7 +11256,7 @@ fn draw_param_kf_rows(
             .map(|v| v.as_slice())
             .unwrap_or(&empty);
         let half = 4.5_f32;
-        for &(local_t, scene_t) in kfs_for_param {
+        for (kf_idx_in_param, &(local_t, scene_t)) in kfs_for_param.iter().enumerate() {
             let x = (scene_t - scroll) * pps + track_left;
             if !strip_visible {
                 continue;
@@ -11269,14 +11300,43 @@ fn draw_param_kf_rows(
                 );
             }
 
-            // Click hit-test (small rect around the diamond).
+            // Click hit-test (small rect around the diamond). Note the
+            // id is keyed on the kf's INDEX inside `kfs_for_param`
+            // rather than its time — that keeps egui's drag-state
+            // alive across frames as the kf's `t` mutates while the
+            // user drags. (If we keyed on `local_t.to_bits()` the id
+            // would change every frame and the drag would die after
+            // one tick.)
             let hit = egui::Rect::from_center_size(
                 egui::pos2(x, cy),
                 Vec2::new(half * 2.5, row_h.min(20.0)),
             );
-            let id = ui.id().with(("param_kf", sel_layer_label, param_id, local_t.to_bits()));
+            let id = ui.id().with((
+                "param_kf",
+                sel_layer_label,
+                param_id,
+                kf_idx_in_param,
+            ));
             let r = ui.interact(hit, id, Sense::click_and_drag());
-            if r.clicked() {
+
+            // Drag — emit a delta-based outcome the post-loop applies
+            // to the layer's typed layout. The kf at `local_t` moves
+            // to `local_t + delta_t`; when the kf is part of the
+            // current multi-selection the same delta broadcasts to
+            // every selected kf so a group drags together.
+            if r.dragged() {
+                let dx = r.drag_delta().x;
+                if dx.abs() > 0.01 {
+                    let delta_t = dx / pps.max(1.0);
+                    outcome.drags.push(ParamRowDrag {
+                        param_id: param_id.clone(),
+                        kf_t: local_t,
+                        delta_t,
+                        broadcast_to_selection: is_selected,
+                    });
+                }
+                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+            } else if r.clicked() {
                 outcome.click_hits.push(ParamRowClick {
                     param_id: param_id.clone(),
                     t: local_t,
@@ -11315,6 +11375,7 @@ fn draw_param_kf_rows(
                         .clicked()
                     {
                         outcome.easing_changes.push(ParamRowEasingChange {
+                            param_id: param_id.clone(),
                             t: local_t,
                             easing: e,
                             apply_to_selection: kf_in_selection,
@@ -11340,6 +11401,12 @@ struct ParamRowOutcome {
     /// currently-selected keyframe of the same layer (so the user can
     /// "make these 5 step-holds" in one shot).
     easing_changes: Vec<ParamRowEasingChange>,
+    /// Drag deltas reported by the per-frame keyframe-diamond drag
+    /// gesture. Each entry maps an existing kf at `kf_t` to a new
+    /// time `kf_t + delta_t`. The post-loop applies these to the
+    /// matching layer's typed layout (Actor / Overlay / RenderFrame /
+    /// Audio param vec) and resorts on completion.
+    drags: Vec<ParamRowDrag>,
 }
 
 struct ParamRowClick {
@@ -11356,6 +11423,11 @@ struct ParamRowClick {
 }
 
 struct ParamRowEasingChange {
+    /// Param id whose row was right-clicked. Only matters for audio
+    /// rows where each parameter owns its own kf vector — the
+    /// non-audio layer kinds share a single typed layout, so they
+    /// look up the kf by `t` alone and ignore the field.
+    param_id: String,
     /// Local kf time (the row coordinate space) of the kf the user
     /// right-clicked on.
     t: f32,
@@ -11367,11 +11439,48 @@ struct ParamRowEasingChange {
     apply_to_selection: bool,
 }
 
+/// One per-frame drag delta on a keyframe diamond inside a
+/// per-parameter sub-row. The post-loop turns this into an actual
+/// time-shift on the layer's typed storage, sorting after every
+/// applied delta so the kf order stays canonical.
+struct ParamRowDrag {
+    /// Param id of the row whose diamond was dragged. Required for
+    /// the audio routing (each param owns its own `Vec<Keyframe<f32>>`).
+    /// Non-audio layers share a single typed layout where `(layer, t)`
+    /// is sufficient — the field is still carried so the post-loop
+    /// can update `state.selected_keyframes` entries by `(param_id, t)`.
+    param_id: String,
+    /// Time of the kf BEFORE this frame's delta is applied. Used as
+    /// the lookup key against the layer's storage / against
+    /// `state.selected_keyframes`.
+    kf_t: f32,
+    /// Time delta this frame in the same coordinate space as `kf_t`
+    /// (clip-local for overlays / audio, scene-time for actors and
+    /// the render frame). Negative for a leftward drag.
+    delta_t: f32,
+    /// When true, the same delta is broadcast to every entry in
+    /// `state.selected_keyframes` whose layer matches the dragged
+    /// kf's layer — so dragging one kf of a multi-selection moves
+    /// the whole batch together. Set when the dragged kf was
+    /// already part of the selection.
+    broadcast_to_selection: bool,
+}
+
 
 /// Draw small diamond markers on a clip bar, one per layout keyframe.
 /// `kf_t_is_scene_time` controls whether `kf.t` is interpreted as the
 /// final scene-time (true — actors) or as a clip-local offset that
 /// should be added to `clip_start` (false — overlays).
+///
+/// **No live caller today.** Per user request the layer rows
+/// (render-frame, actors, overlays, audio) are kept clean: keyframes
+/// only ever appear in the per-parameter sub-rows underneath the row
+/// (drawn by `draw_param_kf_rows`), gated by the per-element
+/// `animated_params` set. The function is retained behind
+/// `#[allow(dead_code)]` so a future "row-aggregate" view can opt in
+/// without re-deriving the diamond geometry, but the timeline never
+/// invokes it any more.
+#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 fn draw_keyframe_diamonds<T>(
     painter: &egui::Painter,
