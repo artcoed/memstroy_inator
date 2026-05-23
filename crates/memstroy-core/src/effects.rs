@@ -119,6 +119,156 @@ pub enum EffectKind {
     /// Acts as a Photoshop-style "Crop" tool when applied to images
     /// AND a coarse-grained mask when applied to videos / actors.
     Crop { left: f32, top: f32, right: f32, bottom: f32 },
+    /// **Free-form mask**: keeps pixels INSIDE `shape` (or outside when
+    /// `invert` is set), zeroing the alpha of the rest. The shape
+    /// coordinates live in the element's own UV space (0..1 mapped to
+    /// the element's bounding box) so the mask follows the element
+    /// without re-tuning when it is moved / resized on the canvas.
+    ///
+    /// `feather` softens the edge of the mask. Expressed as a fraction
+    /// of the element's smaller dimension (0..0.5), it produces an
+    /// alpha gradient that fades from 1 inside the shape to 0 outside.
+    /// Authored interactively via the canvas mask tools (rectangle,
+    /// ellipse, freehand) — see `EditorState::mask_tool`.
+    Mask {
+        shape: MaskShape,
+        #[serde(default)]
+        feather: f32,
+        #[serde(default)]
+        invert: bool,
+    },
+}
+
+/// A 2D mask shape in element-local UV coordinates (0..1 spans the
+/// bounding box). All `EffectKind::Mask` shapes round-trip through the
+/// scene file the same way as the parent effect — they're intentionally
+/// simple enough to YAML-serialise without custom helpers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "shape", rename_all = "snake_case")]
+pub enum MaskShape {
+    /// Axis-aligned rectangle, edges in UV.
+    Rect { left: f32, top: f32, right: f32, bottom: f32 },
+    /// Ellipse with centre and radii in UV. `rx`, `ry` are radii (not
+    /// diameters); a circle is `rx == ry`.
+    Ellipse { cx: f32, cy: f32, rx: f32, ry: f32 },
+    /// Closed polygon — the outline is implicitly closed by joining the
+    /// last point back to the first when rendering / hit-testing. UV
+    /// coordinates per vertex. Drawn by the freehand mask tool.
+    Polygon { points: Vec<[f32; 2]> },
+}
+
+impl MaskShape {
+    /// Default rectangle covering the whole element — used as the
+    /// preset value when the user picks "Mask (rect)" from the
+    /// inspector dropdown. Subsequently overwritten by the canvas
+    /// mask tool when the user actually paints a shape.
+    pub fn rect_full() -> Self {
+        Self::Rect { left: 0.1, top: 0.1, right: 0.9, bottom: 0.9 }
+    }
+
+    /// Default ellipse centred on the element.
+    pub fn ellipse_full() -> Self {
+        Self::Ellipse { cx: 0.5, cy: 0.5, rx: 0.4, ry: 0.4 }
+    }
+
+    /// Test whether a UV point falls inside this shape.
+    /// `(0,0)` is the top-left of the element, `(1,1)` is the bottom-right.
+    pub fn contains_uv(&self, u: f32, v: f32) -> bool {
+        match self {
+            MaskShape::Rect { left, top, right, bottom } => {
+                u >= *left && u <= *right && v >= *top && v <= *bottom
+            }
+            MaskShape::Ellipse { cx, cy, rx, ry } => {
+                let rx = rx.max(1e-6);
+                let ry = ry.max(1e-6);
+                let du = (u - cx) / rx;
+                let dv = (v - cy) / ry;
+                du * du + dv * dv <= 1.0
+            }
+            MaskShape::Polygon { points } => point_in_polygon(u, v, points),
+        }
+    }
+
+    /// Signed-distance-style margin: positive when the point is well
+    /// inside the shape, 0 at the edge, negative outside. Returned in
+    /// the SAME units as `u`, `v` (UV 0..1). The preview pipeline uses
+    /// it to compute feathered alpha:
+    ///   `alpha = clamp(margin / feather + 0.5, 0, 1)`
+    pub fn signed_margin_uv(&self, u: f32, v: f32) -> f32 {
+        match self {
+            MaskShape::Rect { left, top, right, bottom } => {
+                let dx = (u - *left).min(*right - u);
+                let dy = (v - *top).min(*bottom - v);
+                dx.min(dy)
+            }
+            MaskShape::Ellipse { cx, cy, rx, ry } => {
+                let rx = rx.max(1e-6);
+                let ry = ry.max(1e-6);
+                let du = (u - cx) / rx;
+                let dv = (v - cy) / ry;
+                // Convert "1 - r" into a UV-scaled distance by
+                // multiplying by the average radius — close enough for
+                // a soft feather and avoids a square-root per pixel.
+                let r = (du * du + dv * dv).sqrt();
+                (1.0 - r) * 0.5 * (rx + ry)
+            }
+            MaskShape::Polygon { points } => {
+                let inside = point_in_polygon(u, v, points);
+                let d = polygon_min_edge_dist(u, v, points);
+                if inside { d } else { -d }
+            }
+        }
+    }
+}
+
+#[inline]
+fn point_in_polygon(u: f32, v: f32, pts: &[[f32; 2]]) -> bool {
+    if pts.len() < 3 { return false; }
+    let mut inside = false;
+    let n = pts.len();
+    let mut j = n - 1;
+    for i in 0..n {
+        let pi = pts[i];
+        let pj = pts[j];
+        if ((pi[1] > v) != (pj[1] > v))
+            && (u < (pj[0] - pi[0]) * (v - pi[1]) / (pj[1] - pi[1] + 1e-12) + pi[0])
+        {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
+#[inline]
+fn polygon_min_edge_dist(u: f32, v: f32, pts: &[[f32; 2]]) -> f32 {
+    if pts.len() < 2 { return 1.0; }
+    let mut best = f32::MAX;
+    let n = pts.len();
+    for i in 0..n {
+        let a = pts[i];
+        let b = pts[(i + 1) % n];
+        let d = point_to_segment_dist(u, v, a, b);
+        if d < best { best = d; }
+    }
+    best
+}
+
+#[inline]
+fn point_to_segment_dist(px: f32, py: f32, a: [f32; 2], b: [f32; 2]) -> f32 {
+    let dx = b[0] - a[0];
+    let dy = b[1] - a[1];
+    let l2 = dx * dx + dy * dy;
+    if l2 <= 1e-12 {
+        let qx = px - a[0];
+        let qy = py - a[1];
+        return (qx * qx + qy * qy).sqrt();
+    }
+    let t = ((px - a[0]) * dx + (py - a[1]) * dy) / l2;
+    let t = t.clamp(0.0, 1.0);
+    let qx = px - (a[0] + t * dx);
+    let qy = py - (a[1] + t * dy);
+    (qx * qx + qy * qy).sqrt()
 }
 
 impl Default for EffectKind {
@@ -155,6 +305,7 @@ impl EffectKind {
             EffectKind::Glitch { .. } => "Glitch",
             EffectKind::Bloom { .. } => "Bloom",
             EffectKind::Crop { .. } => "Crop",
+            EffectKind::Mask { .. } => "Mask",
         }
     }
 }
@@ -201,6 +352,35 @@ impl Effect {
             top: 0.0,
             right: 0.0,
             bottom: 0.0,
+        })
+    }
+    /// Rectangular mask preset. Intentionally larger than `crop()` so
+    /// the picture is still visible after the effect lands and the
+    /// user can edit the bounds via the canvas mask tool.
+    pub fn mask_rect() -> Self {
+        Self::new(EffectKind::Mask {
+            shape: MaskShape::rect_full(),
+            feather: 0.0,
+            invert: false,
+        })
+    }
+    pub fn mask_ellipse() -> Self {
+        Self::new(EffectKind::Mask {
+            shape: MaskShape::ellipse_full(),
+            feather: 0.05,
+            invert: false,
+        })
+    }
+    pub fn mask_freehand() -> Self {
+        // Default to a tiny diamond-ish shape so the effect renders
+        // *something* immediately even before the user paints.
+        let pts = vec![
+            [0.5, 0.15], [0.85, 0.5], [0.5, 0.85], [0.15, 0.5],
+        ];
+        Self::new(EffectKind::Mask {
+            shape: MaskShape::Polygon { points: pts },
+            feather: 0.0,
+            invert: false,
         })
     }
 
@@ -296,6 +476,14 @@ impl Effect {
                 right: self.sample_param_at(t_local, "p2", *right).clamp(0.0, 0.49),
                 bottom: self.sample_param_at(t_local, "p3", *bottom).clamp(0.0, 0.49),
             },
+            // Mask shape geometry is not a scalar so it is never
+            // sampled from `param_kfs`. Feather is the only animatable
+            // scalar exposed for `Mask`.
+            K::Mask { shape, feather, invert } => K::Mask {
+                shape: shape.clone(),
+                feather: self.sample_param_at(t_local, "p0", *feather).clamp(0.0, 0.5),
+                invert: *invert,
+            },
             // Kinds without numeric parameters pass through unchanged.
             K::Grayscale | K::Sepia | K::Invert | K::MirrorH | K::MirrorV
                 | K::OldFilm | K::Vhs => self.kind.clone(),
@@ -333,5 +521,8 @@ pub fn all_effect_presets() -> Vec<Effect> {
         Effect::glitch(),
         Effect::bloom(),
         Effect::crop(),
+        Effect::mask_rect(),
+        Effect::mask_ellipse(),
+        Effect::mask_freehand(),
     ]
 }

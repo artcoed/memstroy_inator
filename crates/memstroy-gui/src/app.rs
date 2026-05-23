@@ -615,27 +615,99 @@ impl App {
                     );
                 }
             }
-            // Ctrl+V = paste every clipboard item, each onto its own
-            // brand-new top layer.
+            // Ctrl+V = paste. First try the SYSTEM clipboard so a
+            // screenshot or "copy image" from the browser lands on the
+            // canvas / library directly. When no image is available we
+            // fall through to the in-process clipboard so duplicates
+            // of canvas / layer-panel selections still work via the
+            // same shortcut.
             if ctrl && i.key_pressed(egui::Key::V) {
-                let n = self.state.paste_clipboard();
-                if n > 0 {
-                    self.state.status = format!(
-                        "\u{1F4CB} Pasted {} item{} to new top layer{}",
-                        n,
-                        if n == 1 { "" } else { "s" },
-                        if n == 1 { "" } else { "s" },
-                    );
+                let pasted_image = self.try_paste_image_from_system_clipboard();
+                if !pasted_image {
+                    let n = self.state.paste_clipboard();
+                    if n > 0 {
+                        self.state.status = format!(
+                            "\u{1F4CB} Pasted {} item{} at the playhead",
+                            n,
+                            if n == 1 { "" } else { "s" },
+                        );
+                    } else {
+                        self.state.status =
+                            "\u{1F4CB} Clipboard is empty".into();
+                    }
                 }
             }
             // Escape clears the canvas multi-selection so the user can
             // exit a marquee paint without affecting other shortcuts.
+            // It also disarms any mask / crop tool so the user can fall
+            // back to the default transform mode without hunting for
+            // the toolbar button.
             if i.key_pressed(egui::Key::Escape) {
                 if !self.state.canvas_selection.is_empty() {
                     self.state.canvas_selection.clear();
                 }
+                if self.state.mask_tool != crate::state::MaskTool::None {
+                    self.state.mask_tool = crate::state::MaskTool::None;
+                    self.state.mask_draft_points.clear();
+                    self.state.status = "Mask tool cancelled".into();
+                }
             }
         });
+    }
+
+    /// Try to paste an image from the OS clipboard onto the canvas.
+    /// Returns `true` when an image was actually consumed (so the
+    /// caller skips the in-process clipboard fallback). Returns
+    /// `false` when there is no image on the clipboard, when the
+    /// clipboard backend is unavailable on this platform, or when the
+    /// PNG encode / library write fails — the user gets a status
+    /// message describing the cause and the regular Ctrl+V keeps
+    /// working for in-app duplication.
+    ///
+    /// On success the function:
+    ///   1. Encodes the clipboard pixels to a fresh PNG inside
+    ///      `assets/images/clipboard_<ts>.png`.
+    ///   2. Refreshes the library so the file shows up on the Images tab.
+    ///   3. Spawns an [`Overlay::Image`] at the current playhead, on
+    ///      the first empty video lane (or a brand-new lane at the top
+    ///      when every lane is busy).
+    ///   4. Switches the library tab + selection to the new entry so
+    ///      the user immediately sees what they pasted.
+    fn try_paste_image_from_system_clipboard(&mut self) -> bool {
+        let mut clipboard = match arboard::Clipboard::new() {
+            Ok(c) => c,
+            Err(err) => {
+                tracing::debug!(?err, "system clipboard unavailable");
+                return false;
+            }
+        };
+        let image = match clipboard.get_image() {
+            Ok(img) => img,
+            Err(err) => {
+                tracing::debug!(?err, "clipboard does not contain an image");
+                return false;
+            }
+        };
+        let width = image.width as u32;
+        let height = image.height as u32;
+        let bytes: Vec<u8> = image.bytes.into_owned();
+        let asset = match self
+            .state
+            .save_clipboard_image_to_library(&bytes, width, height)
+        {
+            Ok(a) => a,
+            Err(err) => {
+                self.state.status = format!("Clipboard image save failed: {}", err);
+                return true; // we tried; don't fall through to internal paste
+            }
+        };
+        let _idx = self.state.add_image_overlay_at_playhead(&asset);
+        self.state.library_tab = crate::state::LibraryTab::Images;
+        self.state.status = format!(
+            "\u{1F4CB} Pasted clipboard image \u{2192} {} ({}\u{00D7}{})",
+            asset.label, width, height
+        );
+        true
     }
 
     fn delete_selected(&mut self) {

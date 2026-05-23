@@ -439,6 +439,20 @@ pub struct EditorState {
     /// screen-rect intersects the marquee.
     pub timeline_marquee: Option<TimelineMarquee>,
 
+    // ─── Mask / crop drawing tools ──────────────────────────────────
+    /// Currently armed mask / crop drawing tool. `None` = transform mode
+    /// (default — clicks on the canvas select / move / resize the
+    /// element). When set, click-drag inside the selected element's
+    /// bounding box paints a mask shape into the element's effects
+    /// stack on release. The toolbar above the canvas toggles this
+    /// field; pressing Escape clears it.
+    pub mask_tool: MaskTool,
+    /// Polyline accumulated while the freehand mask tool is in flight.
+    /// UV coords (0..1) inside the selected element's bounding box.
+    /// Cleared on commit / cancel. Lives on the editor state because
+    /// `CanvasDragMode` derives `Copy` and can't store a Vec.
+    pub mask_draft_points: Vec<[f32; 2]>,
+
     /// State for the "Shared" library tab — talks to a separate
     /// `memstroy-assets-server` instance over HTTP and lazily streams
     /// previews / files into the editor.
@@ -1374,6 +1388,10 @@ impl EditorState {
         }
         let buf = self.clipboard.clone();
         let mut new_selections: Vec<Selection> = Vec::new();
+        // Snapshot the playhead once so every pasted item is anchored
+        // to the same time, even if a side-effect (track insertion,
+        // selection update) shifts editor state mid-loop.
+        let playhead = self.playhead;
         // Take a single undo snapshot for the whole paste batch.
         self.last_drag_group = None;
         self.undo.push(&self.scene);
@@ -1382,38 +1400,64 @@ impl EditorState {
             match item {
                 ClipboardItem::Actor(mut a) => {
                     a.id = unique_actor_id(&self.scene.actors, &a.id);
+                    // Re-anchor the duplicate to the current playhead so
+                    // it lands where the user expects to see it. The
+                    // original clip-local duration is preserved.
+                    let dur = match (a.t_in, a.t_out) {
+                        (Some(ti), Some(to)) => (to - ti).max(0.1),
+                        _ => self.scene.output.duration.max(0.1),
+                    };
+                    a.t_in = Some(playhead);
+                    a.t_out = Some(playhead + dur);
                     let new_idx = self.scene.actors.len();
                     self.scene.actors.push(a);
-                    // Each pasted actor goes onto a brand-new video
-                    // track inserted at the very TOP of the panel so
-                    // the duplicate stacks above the source.
-                    let new_track = self.insert_video_track_at_top();
+                    // Each pasted actor lands on the first empty video
+                    // lane at the playhead — only when none is free do
+                    // we spawn a fresh track at the top. Mirrors the
+                    // canvas-drop behaviour and matches the user's
+                    // mental model of "paste shows up on whichever
+                    // empty layer is closest right now".
+                    let new_track = self.pick_or_create_empty_video_lane_at(playhead);
                     self.actor_track_assignments.insert(new_idx, new_track);
                     new_selections.push(Selection::Actor(new_idx));
                 }
                 ClipboardItem::Overlay(mut o) => {
+                    let (orig_t_in, orig_t_out) = match &o {
+                        memstroy_core::Overlay::Text(t) => (t.t_in, t.t_out),
+                        memstroy_core::Overlay::Image(im) => (im.t_in, im.t_out),
+                        memstroy_core::Overlay::Video(v) => (v.t_in, v.t_out),
+                    };
+                    let dur = (orig_t_out - orig_t_in).max(0.1);
+                    let new_t_in = playhead;
+                    let new_t_out = playhead + dur;
                     match &mut o {
                         memstroy_core::Overlay::Text(t) => {
                             t.id = unique_overlay_id(&self.scene.overlays, &t.id);
+                            t.t_in = new_t_in;
+                            t.t_out = new_t_out;
                         }
                         memstroy_core::Overlay::Image(im) => {
                             im.id = unique_overlay_id(&self.scene.overlays, &im.id);
+                            im.t_in = new_t_in;
+                            im.t_out = new_t_out;
                         }
                         memstroy_core::Overlay::Video(v) => {
                             v.id = unique_overlay_id(&self.scene.overlays, &v.id);
+                            v.t_in = new_t_in;
+                            v.t_out = new_t_out;
                         }
                     }
                     let new_idx = self.scene.overlays.len();
                     self.scene.overlays.push(o);
-                    let new_track = self.insert_video_track_at_top();
+                    let new_track = self.pick_or_create_empty_video_lane_at(playhead);
                     self.overlay_track_assignments.insert(new_idx, new_track);
                     new_selections.push(Selection::Overlay(new_idx));
                 }
                 ClipboardItem::Background(mut bg) => {
                     bg.id = unique_background_id(&self.scene.backgrounds, &bg.id);
-                    let new_idx = self.scene.backgrounds.len();
+                    bg.start = playhead;
+                    new_selections.push(Selection::Background(self.scene.backgrounds.len()));
                     self.scene.backgrounds.push(bg);
-                    new_selections.push(Selection::Background(new_idx));
                 }
                 ClipboardItem::Audio(mut au) => {
                     au.id = unique_audio_id(&self.scene.audio, &au.id);
@@ -1421,6 +1465,7 @@ impl EditorState {
                     // binding, otherwise the duplicate would shadow the
                     // source's actor sync logic.
                     au.parent_actor = None;
+                    au.t_in = playhead;
                     let new_idx = self.scene.audio.len();
                     self.scene.audio.push(au);
                     let new_track = self.insert_audio_track_at_top();
@@ -1439,6 +1484,112 @@ impl EditorState {
         self.canvas_selection = new_selections.clone();
 
         new_selections.len()
+    }
+
+    // ─── System-clipboard image paste ───────────────────────────────
+
+    /// Save raw RGBA pixels from the system clipboard into the project's
+    /// image library and return the resulting [`LibraryAsset`]. Used by
+    /// the Ctrl+V handler when the OS clipboard contains a bitmap (e.g.
+    /// a PrintScreen capture or a "copy image" from a browser).
+    ///
+    /// The PNG ends up in `assets/images/clipboard_<timestamp>.png` so
+    /// repeated pastes don't fight over a single filename. The library
+    /// listing is refreshed before the function returns so the new
+    /// asset shows up on the panel immediately.
+    pub fn save_clipboard_image_to_library(
+        &mut self,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Result<LibraryAsset, String> {
+        if width == 0 || height == 0 {
+            return Err("clipboard image is empty".into());
+        }
+        let expected = (width as usize) * (height as usize) * 4;
+        if rgba.len() < expected {
+            return Err(format!(
+                "clipboard image buffer too small: {} < {}",
+                rgba.len(),
+                expected
+            ));
+        }
+        let dir = self.images_dir();
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            return Err(format!("create {}: {}", dir.display(), e));
+        }
+        // Filename: `clipboard_<unix-millis>.png` — millisecond
+        // resolution avoids collisions across rapid pastes while still
+        // being trivially sortable in a file manager.
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let mut filename = format!("clipboard_{}.png", stamp);
+        let mut path = dir.join(&filename);
+        let mut suffix = 1u32;
+        while path.exists() {
+            filename = format!("clipboard_{}_{}.png", stamp, suffix);
+            path = dir.join(&filename);
+            suffix += 1;
+            if suffix > 1000 { break; }
+        }
+        let buf = image::RgbaImage::from_raw(width, height, rgba.to_vec())
+            .ok_or_else(|| "failed to wrap clipboard image".to_string())?;
+        buf.save(&path)
+            .map_err(|e| format!("save {}: {}", path.display(), e))?;
+        let id = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("clipboard")
+            .to_string();
+        let asset = LibraryAsset {
+            id: id.clone(),
+            path: path.clone(),
+            label: id,
+            thumbnail: Some(path),
+        };
+        // Refresh the library listing so the new file shows up on the
+        // Images tab with a thumbnail.
+        self.reload_library();
+        Ok(asset)
+    }
+
+    /// Spawn an `Overlay::Image` for the supplied library asset at the
+    /// current playhead, anchored to the first empty video lane (or a
+    /// freshly-spawned one). Returns the overlay index of the new
+    /// element so the caller can push it into the selection. Used by
+    /// the Ctrl+V system-clipboard handler — pasting an image from the
+    /// OS turns into "image now lives in the library AND on the canvas
+    /// at the current time" in a single gesture.
+    pub fn add_image_overlay_at_playhead(&mut self, asset: &LibraryAsset) -> usize {
+        let t = self.playhead;
+        let dur = self.scene.output.duration.max(0.1);
+        let t_in = t;
+        let t_out = (t + 3.0).min(dur).max(t + 0.1);
+        let overlay = memstroy_core::Overlay::Image(memstroy_core::ImageOverlay {
+            id: unique_overlay_id(&self.scene.overlays, &asset.id),
+            source: asset.path.clone(),
+            t_in,
+            t_out,
+            layout: vec![memstroy_core::Keyframe::new(
+                0.0,
+                memstroy_core::OverlayState::default(),
+            )],
+            modifiers: Vec::new(),
+            skeleton_attachment: None,
+            effects: Vec::new(),
+            animated_params: Default::default(),
+        });
+        self.last_drag_group = None;
+        self.undo.push(&self.scene);
+        let new_idx = self.scene.overlays.len();
+        self.scene.overlays.push(overlay);
+        let new_track = self.pick_or_create_empty_video_lane_at(t);
+        self.overlay_track_assignments.insert(new_idx, new_track);
+        self.selection = Selection::Overlay(new_idx);
+        self.canvas_selection.clear();
+        new_idx
     }
 }
 
@@ -1698,6 +1849,47 @@ pub enum ClipboardItem {
     Audio(memstroy_core::AudioTrack),
 }
 
+/// Currently armed mask / crop tool. Used by the canvas to dispatch
+/// pointer-drag input to the mask painter instead of the regular
+/// transform handlers. Stored on [`EditorState`] so the toolbar above
+/// the canvas, the inspector, and the input pipeline can all read /
+/// flip the same bit.
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MaskTool {
+    /// Default: transform mode — clicks select / move / resize.
+    #[default]
+    None,
+    /// Rectangle crop. Drag-defines a rectangle; on release pushes
+    /// `EffectKind::Crop` onto the selected element with insets
+    /// matching the drawn rectangle (in element-local UV).
+    Crop,
+    /// Rectangle mask. Same gesture as Crop but commits an
+    /// `EffectKind::Mask { shape: Rect }` so the bounded picture is
+    /// preserved (vs being trimmed away) and feathered edges stay
+    /// editable later from the inspector.
+    RectMask,
+    /// Ellipse mask. Drag from one corner of the bounding box to the
+    /// opposite corner; the inscribed ellipse becomes the mask.
+    EllipseMask,
+    /// Freehand polygon mask. Each pointer move during the drag
+    /// appends a new vertex; on release the polyline is closed back
+    /// to its first point.
+    FreehandMask,
+}
+
+impl MaskTool {
+    pub fn is_active(self) -> bool { self != MaskTool::None }
+    pub fn label(self) -> &'static str {
+        match self {
+            MaskTool::None => "Select",
+            MaskTool::Crop => "Crop",
+            MaskTool::RectMask => "Rect mask",
+            MaskTool::EllipseMask => "Ellipse mask",
+            MaskTool::FreehandMask => "Freehand mask",
+        }
+    }
+}
+
 /// Active marquee (rubber-band) selection on the canvas. Both corners
 /// live in world-pixel coordinates so the same rectangle stays anchored
 /// regardless of pan / zoom while the user drags.
@@ -1768,5 +1960,20 @@ pub enum CanvasDragMode {
         initial_rot_deg: f32,
         center_screen: [f32; 2],
         start_angle_rad: f32,
+    },
+    /// Drawing a mask shape on top of the selected element. The
+    /// pointer's start position (in element-local UV space, 0..1) is
+    /// captured in `start_uv`; freehand mode also accumulates the
+    /// per-frame pointer trail in `EditorState.mask_draft_points`. On
+    /// release the active drag commits the resulting shape to the
+    /// element's `effects` stack (as `EffectKind::Crop` for the crop
+    /// tool, or `EffectKind::Mask` otherwise).
+    DrawMask {
+        tool: MaskTool,
+        start_uv: [f32; 2],
+        /// Element selection the drag was started against. Captured on
+        /// pointer-down so the commit lands on the same element even if
+        /// the user clicks elsewhere mid-drag.
+        target: Selection,
     },
 }
