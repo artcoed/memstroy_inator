@@ -53,6 +53,28 @@
 //!    table and ship it back through `set_fonts(...)` only when the
 //!    set of loaded families actually grew.
 //!
+//!    A second crash class shows up here, separate from the
+//!    "malformed font bytes" one fixed by `validate_font_for_egui`:
+//!    egui's documented contract for `Context::set_fonts(...)` is
+//!    *"The new fonts will become active at the start of the next
+//!    frame."* — i.e. the registration we do in this function does
+//!    NOT take effect during the current pass. If we naively report
+//!    `true` to the caller right after `set_fonts(...)` and the same
+//!    frame's canvas paint then references the freshly-registered
+//!    `FontFamily::Name(<family>)`, epaint's `Fonts::font(...)`
+//!    can't find it and panics with `"FontFamily::Name(\"…\") is not
+//!    bound to any fonts"`. Under `panic = "abort"` (set in
+//!    `[profile.release]`) that aborts the process via `__fastfail`
+//!    and Windows surfaces it as `STATUS_STACK_BUFFER_OVERRUN`
+//!    (`0xC0000409`) — the exact "крашится при выборе системного
+//!    шрифта" report. We therefore keep newly-registered families in
+//!    a `pending` map keyed by `ctx.frame_nr()` and only promote
+//!    them to `families` once the frame counter has advanced (i.e.
+//!    egui has actually begun a new pass and the new
+//!    `FontDefinitions` are live). Until then `ensure_font_loaded`
+//!    returns `false` and the caller paints with the bundled
+//!    `FontFamily::Proportional`, which is always bound and safe.
+//!
 //!    The custom family is registered **only** under
 //!    `FontFamily::Name(<family>)` — we deliberately do NOT push it
 //!    into the bundled `FontFamily::Proportional` / `Monospace`
@@ -285,9 +307,17 @@ fn validate_font_for_egui(bytes: &[u8]) -> bool {
     //    assert panics. With `panic = "abort"` that becomes
     //    `STATUS_STACK_BUFFER_OVERRUN`. Reject those fonts here so
     //    the picker silently falls back to Proportional instead.
-    let ascender = face.ascender();
-    let descender = face.descender();
-    if ascender == 0 && descender == 0 {
+    //
+    //    The full safety condition is `ascent - descent > 0` (a
+    //    strictly positive em-height in font units), not just
+    //    "either metric is non-zero": e.g. a malformed font that
+    //    reports `ascender = -50, descender = -50` has both metrics
+    //    non-zero yet still produces a zero `height`, and a font
+    //    with `ascender < descender` produces a negative `height`
+    //    that propagates as a negative `font_scaling` and trips the
+    //    same `scale_in_pixels > 0.0` assert. Cast to `i32` before
+    //    subtracting so two `i16::MIN`-shaped extremes can't wrap.
+    if (face.ascender() as i32) - (face.descender() as i32) <= 0 {
         return false;
     }
 
@@ -339,6 +369,25 @@ struct Loaded {
     /// instead of re-reading and re-rejecting the same broken file
     /// every frame from the inspector / canvas painter.
     rejected: BTreeSet<String>,
+    /// Families we shipped to egui via `ctx.set_fonts(...)` whose
+    /// new `FontDefinitions` haven't taken effect yet. Egui swaps in
+    /// the new font set only at the start of the **next** frame
+    /// (see `Context::set_fonts` docs), so any text laid out in the
+    /// same frame as registration would reference an unbound
+    /// `FontFamily::Name(...)` and panic deep in
+    /// `epaint::Fonts::font(...)`. Under `panic = "abort"` that
+    /// surfaces as `STATUS_STACK_BUFFER_OVERRUN` (`0xC0000409`) on
+    /// Windows — the exact crash users report when picking a system
+    /// font.
+    ///
+    /// Maps `family_name` → `ctx.frame_nr()` at registration time.
+    /// On a subsequent `ensure_font_loaded` call, once
+    /// `ctx.frame_nr()` has advanced, the entry is promoted into
+    /// `families` and the family is reported as loaded. Until then,
+    /// callers receive `false` and fall back to the bundled
+    /// `FontFamily::Proportional`, which is always bound and
+    /// therefore safe to lay out.
+    pending: BTreeMap<String, u64>,
     /// Cached FontDefinitions to extend. We keep the most recent
     /// version we shipped to egui so the "add another family" path
     /// is just `defs.font_data.insert + defs.families.insert` and
@@ -365,12 +414,20 @@ pub fn install_default_definitions(ctx: &egui::Context) {
 
 /// Lazily ensure a custom font family identified by `family_name` is
 /// available in `ctx`. After this call, paint code can reference it
-/// via `egui::FontFamily::Name(family_name.into())`. Returns `true`
-/// when the family resolved successfully (or was already loaded),
-/// `false` when no matching TTF was found, when its bytes failed
-/// validation, or when `available_families()` hasn't completed its
-/// background scan yet — in all of those cases callers fall back to
-/// the bundled `Proportional` family.
+/// via `egui::FontFamily::Name(family_name.into())` **once the
+/// function has returned `true`** — see the deferred-promotion logic
+/// below. Returns `true` only when the family is truly bound in
+/// egui's currently-active `FontDefinitions`; returns `false` when
+/// no matching TTF was found, when its bytes failed validation, when
+/// `available_families()` hasn't completed its background scan yet,
+/// or — crucially — when the family was registered earlier in the
+/// **same frame** as this call (egui's new font definitions only
+/// activate at the start of the next frame; reporting `true` here
+/// would let the caller hand epaint an unbound `FontFamily::Name`
+/// and trigger a paint-time panic that, under `panic = "abort"`,
+/// aborts the process via `__fastfail` and surfaces on Windows as
+/// `STATUS_STACK_BUFFER_OVERRUN`, `0xC0000409`). In all of those
+/// cases callers fall back to the bundled `Proportional` family.
 ///
 /// The function is **idempotent and cheap** for already-loaded (or
 /// already-rejected) families — it short-circuits on a `BTreeSet`
@@ -379,12 +436,40 @@ pub fn ensure_font_loaded(ctx: &egui::Context, family_name: &str) -> bool {
     if family_name.is_empty() {
         return false;
     }
+
+    // The frame counter is the only signal we have that egui has
+    // begun a new pass since the last `set_fonts(...)` call. Read it
+    // once up front so the lock-protected promotion check below uses
+    // a coherent value.
+    let now = ctx.frame_nr();
+
     {
-        let state = loaded_state().lock().unwrap();
+        let mut state = loaded_state().lock().unwrap();
         if state.families.contains(family_name) {
             return true;
         }
         if state.rejected.contains(family_name) {
+            return false;
+        }
+        // Pending → loaded promotion. We registered the family with
+        // egui in an earlier `set_fonts(...)` call, but at the time
+        // egui's font swap had not happened yet. If the frame
+        // counter has advanced strictly past `registered_at`, egui
+        // has begun a new pass and the new `FontDefinitions` are
+        // now active — it is safe to report success.
+        if let Some(&registered_at) = state.pending.get(family_name) {
+            if now > registered_at {
+                state.pending.remove(family_name);
+                state.families.insert(family_name.to_string());
+                return true;
+            }
+            // Same frame as `set_fonts(...)` — the new family is
+            // not yet bound in egui's active font table. Schedule
+            // another paint so we can promote next frame, and tell
+            // the caller "not ready" so it falls back to the
+            // bundled Proportional family this frame instead of
+            // panicking on an unbound `FontFamily::Name`.
+            ctx.request_repaint();
             return false;
         }
     }
@@ -428,6 +513,24 @@ pub fn ensure_font_loaded(ctx: &egui::Context, family_name: &str) -> bool {
     }
 
     let mut state = loaded_state().lock().unwrap();
+    // Re-check inside the lock: another thread may have raced us
+    // through the load path between the early-return check above
+    // and here. If the family is already known (loaded, pending, or
+    // rejected) we must not duplicate the `set_fonts(...)` work and
+    // we must not stomp the existing pending frame counter.
+    if state.families.contains(family_name) {
+        return true;
+    }
+    if state.rejected.contains(family_name) {
+        return false;
+    }
+    if state.pending.contains_key(family_name) {
+        // Another thread already registered the same family; defer
+        // to the standard pending-promotion path on the next call.
+        ctx.request_repaint();
+        return false;
+    }
+
     let mut defs = state
         .defs
         .clone()
@@ -460,6 +563,19 @@ pub fn ensure_font_loaded(ctx: &egui::Context, family_name: &str) -> bool {
 
     ctx.set_fonts(defs.clone());
     state.defs = Some(defs);
-    state.families.insert(family_name.to_string());
-    true
+
+    // Defer "loaded" until egui has actually swapped in the new
+    // `FontDefinitions` (start of the next frame, per the documented
+    // contract of `Context::set_fonts`). Recording the current
+    // `frame_nr()` here lets the next call recognise that a new
+    // pass has begun and promote the family from `pending` to
+    // `families`. Crucially, we return `false` from THIS call so
+    // the same-frame canvas paint does not reach for an unbound
+    // `FontFamily::Name(...)` and panic.
+    state.pending.insert(family_name.to_string(), now);
+    // Repaint next frame so the canvas re-runs `ensure_font_loaded`,
+    // promotes the family, and renders the user's selection — without
+    // this, an idle UI would stall on `Proportional` forever.
+    ctx.request_repaint();
+    false
 }
