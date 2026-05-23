@@ -649,13 +649,38 @@ pub(crate) fn add_library_asset_at_playhead(
     let dur = state.scene.output.duration;
     match kind {
         AssetDragKind::Sound => {
+            // Probe the audio file's duration so the new clip carries an
+            // explicit `t_out`. Two things follow from this:
+            //   1. The timeline auto-length pass (run every frame in
+            //      `timeline()`) will now extend `scene.output.duration`
+            //      to fit the sound when it's longer than the current
+            //      timeline — same behaviour video clips already get.
+            //   2. The lane-picker below can do a real range-overlap
+            //      check instead of falling back to a single-point one.
+            // `probe_video_duration` shells out to `ffprobe -show_entries
+            // format=duration`, which works for any media container,
+            // audio included.
+            let clip_duration = probe_video_duration(&asset.path);
+            let t_in = t.max(0.0);
+            let t_out = t_in + clip_duration.max(0.1);
             state.scene.audio.push(memstroy_core::AudioTrack {
                 id: asset.id.clone(),
                 source: asset.path.clone(),
-                t_in: t,
+                t_in,
+                t_out: Some(t_out),
                 ..Default::default()
             });
-            state.selection = Selection::Audio(state.scene.audio.len() - 1);
+            let new_idx = state.scene.audio.len() - 1;
+            // Always pin the new sound onto its own free lane so it
+            // never overlaps something already on the timeline; if
+            // every existing audio lane is busy at this range (or
+            // there are no audio lanes yet), insert a fresh A-lane
+            // right after the video stack and use that. Same rule
+            // canvas-dropped images / particles / video clips already
+            // follow, applied to audio.
+            let lane = state.pick_or_create_empty_audio_lane_for_range(t_in, t_out);
+            state.audio_track_assignments.insert(new_idx, lane);
+            state.selection = Selection::Audio(new_idx);
             state.status = format!("Added sound: {}", asset.id);
         }
         AssetDragKind::Image => {
