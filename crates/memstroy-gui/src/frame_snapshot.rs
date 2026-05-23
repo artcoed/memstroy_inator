@@ -26,37 +26,45 @@
 //! `Overlay::Image` layer is added at the playhead pointing at it,
 //! mirroring the existing Ctrl+V "paste image from clipboard" flow.
 //!
-//! ## What's covered (v1)
+//! ## What's covered
 //!
-//! - Image overlays — full effect stack (blur, hue shift, crop, mask,
-//!   colour-key, …), opacity, scale, rotation, flip.
-//! - Actors — chroma key + colour correction + effect stack, opacity,
-//!   scale, rotation, flip (static `flip_horizontal` plus animated
-//!   `flip_x_anim` / `flip_y_anim`).
-//! - Backgrounds — solid colour fill across the render frame.
+//! - **Image overlays** — full effect stack (blur, hue shift, crop,
+//!   mask, colour-key, …), opacity, scale, rotation, flip.
+//! - **Actors** — chroma key + colour correction + effect stack,
+//!   opacity, scale, rotation, flip (static `flip_horizontal` plus
+//!   animated `flip_x_anim` / `flip_y_anim`).
+//! - **Text overlays** — full plate (solid / gradient / outline-only
+//!   / per-line wrap), corner radius, asymmetric padding, glyph
+//!   stroke, alignment, italic, opacity, scale, rotation and flip.
+//!   Routed through `memstroy_render::rasterize_text_overlay` so the
+//!   snapshot is glyph-for-glyph identical to the MP4 export.
+//! - **Video overlays** — single-frame extraction via ffmpeg at
+//!   `(t - t_in) * speed + source_start` (with `loop_source` wrap),
+//!   followed by chroma key + effect stack, then placed exactly like
+//!   an image overlay.
+//! - **Backgrounds** — solid colour fills the render frame; image
+//!   and video backgrounds are loaded / extracted and composited
+//!   under the supplied `Fit` mode (Cover / Contain / Original /
+//!   Stretch), matching what the export filter graph produces.
 //!
-//! ## What's deferred (v1)
+//! ## Skip cases (reflected in the status string)
 //!
-//! - Text overlays — `memstroy_render::rasterize_text_overlay` would
-//!   slot in here but adds a font-loading dependency we're keeping
-//!   out of the snapshot path for now. They are silently skipped
-//!   when present in the subset (and a status message reports the
-//!   skip count).
-//! - Video overlays — preview frame caches are indexed per actor
-//!   today; video overlays don't have one yet, so they're skipped
-//!   the same way as text overlays.
-//! - Image / video backgrounds — only solid-colour backgrounds are
-//!   painted; image/video backgrounds are skipped.
+//! Each background / overlay paint reports success or failure; only
+//! genuine failures bump the skip counters. Typical causes:
 //!
-//! Both deferrals are documented in the status string the user sees
-//! after extraction so they aren't surprised by a "missing" layer.
+//! - missing or undecodable image / font file,
+//! - ffmpeg / ffprobe not on `PATH` (so video frame extraction can't
+//!   run),
+//! - empty text body (silently treated as success — there's nothing
+//!   to draw).
 
 use std::path::Path;
 
 use image::{Rgba, RgbaImage};
 use memstroy_core::{
     canvas::WorldPos, effects::Effect, keyframe, ChromaKeyParams, ColorCorrection,
-    ImageOverlay, MediaSource, Overlay, RenderFrame, RenderFrameState, Scene,
+    Fit, ImageOverlay, MediaSource, Overlay, RenderFrame, RenderFrameState, Scene,
+    TextOverlay, VideoOverlay,
 };
 
 use crate::image_effects;
@@ -194,8 +202,18 @@ fn compose_frame(
             MediaSource::SolidColor { color } => {
                 paint_solid_background(&mut canvas, *color, &rf_state, rw, rh);
             }
-            MediaSource::Image { .. } | MediaSource::Video { .. } => {
-                summary.skipped_image_bg += 1;
+            MediaSource::Image { path } => {
+                if !paint_image_background(&mut canvas, path, bg.fit, rw, rh) {
+                    summary.skipped_image_bg += 1;
+                }
+            }
+            MediaSource::Video { path, r#loop, start_at } => {
+                let local = (t - bg.start).max(0.0) + *start_at;
+                if !paint_video_background(
+                    &mut canvas, path, local, *r#loop, bg.fit, rw, rh,
+                ) {
+                    summary.skipped_image_bg += 1;
+                }
             }
         }
     }
@@ -301,11 +319,18 @@ fn compose_frame(
                             t,
                         );
                     }
-                    Overlay::Text(_) => {
-                        summary.skipped_text += 1;
+                    Overlay::Text(txt) => {
+                        if !paint_text_overlay(&mut canvas, &txt, &rf_state, rw, rh, t)
+                        {
+                            summary.skipped_text += 1;
+                        }
                     }
-                    Overlay::Video(_) => {
-                        summary.skipped_video += 1;
+                    Overlay::Video(vid) => {
+                        if !paint_video_overlay(
+                            &mut canvas, &vid, &rf_state, rw, rh, t,
+                        ) {
+                            summary.skipped_video += 1;
+                        }
                     }
                 }
             }
@@ -852,6 +877,383 @@ fn sample_bilinear(img: &RgbaImage, x: f32, y: f32) -> [u8; 4] {
             .clamp(0.0, 255.0) as u8
     };
     [blend(0), blend(1), blend(2), blend(3)]
+}
+
+// ─── IMAGE BACKGROUND ──────────────────────────────────────────────
+
+/// Decode the still at `path` and composite it onto the full output
+/// canvas using the supplied `fit` mode. Returns `false` when the
+/// file can't be decoded (so the caller can record the skip in the
+/// status message).
+fn paint_image_background(
+    canvas: &mut RgbaImage,
+    path: &Path,
+    fit: Fit,
+    rw: u32,
+    rh: u32,
+) -> bool {
+    let layer = match image::open(path) {
+        Ok(img) => img.to_rgba8(),
+        Err(_) => return false,
+    };
+    if layer.width() == 0 || layer.height() == 0 {
+        return false;
+    }
+    composite_fit_image(canvas, &layer, fit, rw, rh);
+    true
+}
+
+// ─── VIDEO BACKGROUND ──────────────────────────────────────────────
+
+/// Pull a single frame from `path` at clip-local `t_local` (already
+/// includes the `start_at` offset) and composite it onto the full
+/// output canvas under `fit`. When `looping` is set the seek time
+/// wraps around the source's probed duration so the snapshot
+/// matches the export's loop semantics; when off, a seek past EOF
+/// is treated as "skipped" instead of holding the last frame
+/// (the export's `r#loop=false` clamps too).
+fn paint_video_background(
+    canvas: &mut RgbaImage,
+    path: &Path,
+    t_local: f32,
+    looping: bool,
+    fit: Fit,
+    rw: u32,
+    rh: u32,
+) -> bool {
+    let seek = if looping {
+        match probe_video_duration_sync(path) {
+            Some(dur) if dur > 0.001 => t_local.rem_euclid(dur),
+            _ => t_local.max(0.0),
+        }
+    } else {
+        t_local.max(0.0)
+    };
+    let (rgba, w, h) = match extract_video_frame_sync(path, seek) {
+        Some(f) => f,
+        None => return false,
+    };
+    let layer = match RgbaImage::from_raw(w, h, rgba) {
+        Some(img) => img,
+        None => return false,
+    };
+    composite_fit_image(canvas, &layer, fit, rw, rh);
+    true
+}
+
+// ─── TEXT OVERLAY ──────────────────────────────────────────────────
+
+/// Compose a text overlay at the playhead. Returns `true` when the
+/// glyphs were drawn (or the layer was outside its visible window /
+/// the body was empty — both are considered "successfully handled");
+/// `false` when rasterisation failed (missing font, write error, …).
+///
+/// Text scale + flip + rotation come from `ov_state`. The PNG
+/// produced by the rasterizer is anchored on the **text-block**
+/// centre, not the plate centre — that anchor's offset relative to
+/// the PNG's geometric centre is honoured here so an asymmetric
+/// `box_extra_left/right` plate doesn't shift the visible text away
+/// from the user's authored position.
+fn paint_text_overlay(
+    canvas: &mut RgbaImage,
+    txt: &TextOverlay,
+    rf_state: &RenderFrameState,
+    rw: u32,
+    rh: u32,
+    t: f32,
+) -> bool {
+    if t < txt.t_in || t > txt.t_out {
+        return true;
+    }
+    let sample_t = t - txt.t_in;
+    let mut ov_state = keyframe::sample(&txt.layout, sample_t).unwrap_or_default();
+    let mod_delta = keyframe::evaluate_modifiers(&txt.modifiers, sample_t);
+    ov_state.scale = (ov_state.scale + mod_delta.d_scale).max(0.001);
+    ov_state.rotation_deg += mod_delta.d_rotation_deg;
+
+    // Route through the same rasteriser the MP4 export uses so the
+    // snapshot matches the rendered video glyph-for-glyph.
+    let raster = match memstroy_render::rasterize_text_overlay(txt, rw, rh) {
+        Ok(Some(r)) => r,
+        Ok(None) => return true, // empty body — nothing to draw
+        Err(_) => return false,
+    };
+    let layer = match image::open(&raster.png_path).map(|i| i.to_rgba8()) {
+        Ok(img) => img,
+        Err(_) => {
+            let _ = std::fs::remove_file(&raster.png_path);
+            return false;
+        }
+    };
+    let png_w = raster.width as f32;
+    let png_h = raster.height as f32;
+    if png_w < 1.0 || png_h < 1.0 {
+        let _ = std::fs::remove_file(&raster.png_path);
+        return true;
+    }
+
+    // Anchor the text-block centre at the user-space pos.
+    let world_w = (rw as f32) / rf_state.zoom.max(1.0e-3);
+    let world_h = (rh as f32) / rf_state.zoom.max(1.0e-3);
+    let frame_tl_x = rf_state.pos.x - world_w * 0.5;
+    let frame_tl_y = rf_state.pos.y - world_h * 0.5;
+    let world_pos = WorldPos {
+        x: frame_tl_x + ov_state.pos[0] * world_w + mod_delta.dx,
+        y: frame_tl_y + ov_state.pos[1] * world_h + mod_delta.dy,
+    };
+    let (cx, cy) = world_to_output(world_pos, rf_state, rw, rh);
+
+    let abs_fx = ov_state.flip_x_anim.abs().max(0.02);
+    let abs_fy = ov_state.flip_y_anim.abs().max(0.02);
+    let scale_x = ov_state.scale * abs_fx * rf_state.zoom;
+    let scale_y = ov_state.scale * ov_state.scale_y * abs_fy * rf_state.zoom;
+    let out_w = png_w * scale_x;
+    let out_h = png_h * scale_y;
+
+    // Anchor offset inside the PNG, signed from the PNG centre.
+    // Flipping the layer mirrors the visible content, so the anchor
+    // moves with it — flip the offset sign before transforming.
+    let mut local_dx = raster.anchor_dx_from_left - png_w * 0.5;
+    let mut local_dy = raster.anchor_dy_from_top - png_h * 0.5;
+    let flip_x = ov_state.flip_x_anim < 0.0;
+    let flip_y = ov_state.flip_y_anim < 0.0;
+    if flip_x {
+        local_dx = -local_dx;
+    }
+    if flip_y {
+        local_dy = -local_dy;
+    }
+    let out_dx = local_dx * scale_x;
+    let out_dy = local_dy * scale_y;
+
+    let rotation_rad = (ov_state.rotation_deg - rf_state.rotation_deg).to_radians();
+    let cos_r = rotation_rad.cos();
+    let sin_r = rotation_rad.sin();
+    let rot_dx = out_dx * cos_r - out_dy * sin_r;
+    let rot_dy = out_dx * sin_r + out_dy * cos_r;
+
+    paint_layer_rgba(
+        canvas,
+        &layer,
+        cx - rot_dx,
+        cy - rot_dy,
+        out_w,
+        out_h,
+        rotation_rad,
+        flip_x,
+        flip_y,
+        ov_state.opacity,
+    );
+
+    // Clean up the temp file the rasteriser dropped in /tmp.
+    let _ = std::fs::remove_file(&raster.png_path);
+    true
+}
+
+// ─── VIDEO OVERLAY ─────────────────────────────────────────────────
+
+/// Compose a video overlay at the playhead — extract a single frame
+/// from the source via ffmpeg, optionally apply chroma key + the
+/// effect stack, then composite under the layer's keyframed
+/// transform. Returns `false` when ffmpeg can't deliver a frame.
+fn paint_video_overlay(
+    canvas: &mut RgbaImage,
+    vid: &VideoOverlay,
+    rf_state: &RenderFrameState,
+    rw: u32,
+    rh: u32,
+    t: f32,
+) -> bool {
+    if t < vid.t_in || t > vid.t_out {
+        return true;
+    }
+    let sample_t = t - vid.t_in;
+    let mut ov_state = keyframe::sample(&vid.layout, sample_t).unwrap_or_default();
+    let mod_delta = keyframe::evaluate_modifiers(&vid.modifiers, sample_t);
+    ov_state.scale = (ov_state.scale + mod_delta.d_scale).max(0.001);
+    ov_state.rotation_deg += mod_delta.d_rotation_deg;
+
+    // Source-clip seek time. `speed > 1.0` advances the source faster
+    // than the timeline (matching `Actor::speed` semantics); looping
+    // wraps the seek modulo the source duration so the user gets the
+    // same frame the export would produce.
+    let speed = vid.speed.max(1.0e-4);
+    let raw_seek = sample_t * speed + vid.source_start;
+    let seek = if vid.loop_source {
+        match probe_video_duration_sync(&vid.source) {
+            Some(dur) if dur > 0.001 => raw_seek.rem_euclid(dur),
+            _ => raw_seek.max(0.0),
+        }
+    } else {
+        raw_seek.max(0.0)
+    };
+    let (mut frame_buf, src_w, src_h) =
+        match extract_video_frame_sync(&vid.source, seek) {
+            Some(f) => f,
+            None => return false,
+        };
+
+    // Apply chroma key + effect stack only when the user has actually
+    // set them — bypassing the per-pixel CPU loop entirely on a plain
+    // overlay matches the image-overlay path's "no-op when None" rule
+    // and avoids a needless premultiplied round-trip.
+    let baked_effects: Vec<Effect> =
+        vid.effects.iter().map(|e| e.sampled_at(sample_t)).collect();
+    if vid.chroma_key.is_some() || !baked_effects.is_empty() {
+        let ck = vid.chroma_key.clone().unwrap_or_else(ChromaKeyParams::default);
+        let cc = ColorCorrection::default();
+        apply_actor_processing(
+            &mut frame_buf, src_w, src_h, &ck, &cc, &baked_effects,
+        );
+    }
+
+    let layer = match RgbaImage::from_raw(src_w, src_h, frame_buf) {
+        Some(img) => img,
+        None => return false,
+    };
+
+    let world_w = (rw as f32) / rf_state.zoom.max(1.0e-3);
+    let world_h = (rh as f32) / rf_state.zoom.max(1.0e-3);
+    let frame_tl_x = rf_state.pos.x - world_w * 0.5;
+    let frame_tl_y = rf_state.pos.y - world_h * 0.5;
+    let world_pos = WorldPos {
+        x: frame_tl_x + ov_state.pos[0] * world_w + mod_delta.dx,
+        y: frame_tl_y + ov_state.pos[1] * world_h + mod_delta.dy,
+    };
+    let (cx, cy) = world_to_output(world_pos, rf_state, rw, rh);
+
+    let abs_fx = ov_state.flip_x_anim.abs().max(0.02);
+    let abs_fy = ov_state.flip_y_anim.abs().max(0.02);
+    let out_w = (src_w as f32) * ov_state.scale * abs_fx * rf_state.zoom;
+    let out_h =
+        (src_h as f32) * ov_state.scale * ov_state.scale_y * abs_fy * rf_state.zoom;
+    let rotation_rad = (ov_state.rotation_deg - rf_state.rotation_deg).to_radians();
+    let flip_x = ov_state.flip_x_anim < 0.0;
+    let flip_y = ov_state.flip_y_anim < 0.0;
+
+    paint_layer_rgba(
+        canvas,
+        &layer,
+        cx,
+        cy,
+        out_w,
+        out_h,
+        rotation_rad,
+        flip_x,
+        flip_y,
+        ov_state.opacity,
+    );
+    true
+}
+
+// ─── FFMPEG HELPERS ────────────────────────────────────────────────
+
+/// Probe the duration (in seconds) of the video at `path` via
+/// ffprobe. Returns `None` when ffprobe isn't on `PATH` or the
+/// probe fails.
+fn probe_video_duration_sync(path: &Path) -> Option<f32> {
+    let ffmpeg = memstroy_render::ffmpeg_binary();
+    let mut ffprobe = ffmpeg.clone();
+    ffprobe.set_file_name("ffprobe");
+    if !ffprobe.exists() {
+        ffprobe = std::path::PathBuf::from("ffprobe");
+    }
+    let out = std::process::Command::new(&ffprobe)
+        .args([
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+        ])
+        .arg(path)
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&out.stdout);
+    s.trim().parse::<f32>().ok()
+}
+
+/// Extract a single PNG frame at `time_secs` from `path` via ffmpeg
+/// and return it as raw RGBA8 bytes. Returns `None` on any failure
+/// — caller folds that into the skip counter so the user gets a
+/// clean status message instead of a hard error.
+///
+/// The temp PNG written by ffmpeg is removed before returning,
+/// regardless of success.
+fn extract_video_frame_sync(path: &Path, time_secs: f32) -> Option<(Vec<u8>, u32, u32)> {
+    let ffmpeg = memstroy_render::ffmpeg_binary();
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    let out_path = std::env::temp_dir()
+        .join(format!("memstroy_snapshot_frame_{}_{}.png", pid, stamp));
+
+    // `-ss` AFTER `-i` performs an accurate decode-up-to seek instead
+    // of the demuxer's keyframe-based fast seek — we want the exact
+    // frame the user is parked on, not the closest preceding keyframe.
+    let status = std::process::Command::new(&ffmpeg)
+        .args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
+        .arg(path)
+        .args(["-ss", &format!("{:.3}", time_secs.max(0.0))])
+        .args(["-frames:v", "1", "-vcodec", "png"])
+        .arg(&out_path)
+        .status();
+
+    let ok = matches!(status, Ok(s) if s.success());
+    let result = if ok {
+        image::open(&out_path).ok().map(|img| {
+            let rgba = img.to_rgba8();
+            let w = rgba.width();
+            let h = rgba.height();
+            (rgba.into_raw(), w, h)
+        })
+    } else {
+        None
+    };
+    let _ = std::fs::remove_file(&out_path);
+    result
+}
+
+// ─── FIT-COMPOSITE ─────────────────────────────────────────────────
+
+/// Composite `layer` onto the full `rw × rh` output canvas applying
+/// the supplied `Fit` mode. Mirrors the export filter graph's
+/// `scale` + `crop`/`pad` pipeline:
+///
+/// - **Cover** — scale up to cover the output, crop overflow.
+/// - **Contain** — scale down to fit, leave the canvas's existing
+///   pixels untouched outside the picture (= letterboxing using
+///   the scene's `background_color` in full-frame mode, or a
+///   transparent margin in subset mode).
+/// - **Stretch** — scale to exactly the output dimensions.
+/// - **Original** — keep the source resolution and centre it.
+///
+/// The render frame's own rotation is intentionally not applied —
+/// backgrounds fill the rendered output uniformly the same way the
+/// MP4 export pipeline produces them.
+fn composite_fit_image(canvas: &mut RgbaImage, layer: &RgbaImage, fit: Fit, rw: u32, rh: u32) {
+    let lw = layer.width() as f32;
+    let lh = layer.height() as f32;
+    if lw < 1.0 || lh < 1.0 || rw == 0 || rh == 0 {
+        return;
+    }
+    let (out_w, out_h) = match fit {
+        Fit::Stretch => (rw as f32, rh as f32),
+        Fit::Original => (lw, lh),
+        Fit::Cover => {
+            let s = (rw as f32 / lw).max(rh as f32 / lh);
+            (lw * s, lh * s)
+        }
+        Fit::Contain => {
+            let s = (rw as f32 / lw).min(rh as f32 / lh);
+            (lw * s, lh * s)
+        }
+    };
+    let cx = rw as f32 * 0.5;
+    let cy = rh as f32 * 0.5;
+    paint_layer_rgba(
+        canvas, layer, cx, cy, out_w, out_h, 0.0, false, false, 1.0,
+    );
 }
 
 // Suppress unused-import warning when `Path` only appears in the
