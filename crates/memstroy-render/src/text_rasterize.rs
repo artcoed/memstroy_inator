@@ -224,12 +224,30 @@ pub fn rasterize_text_overlay(
                     draw_rounded_rect(&mut img, pl_x, pl_y, pl_w, pl_h, radius, primary);
                 }
             }
+            TextBoxKind::FitText => {
+                // Plate hugs the text block as tightly as possible —
+                // exactly `max_line_w` × `total_h`, ignoring
+                // box_padding / box_extra_left/right entirely. The
+                // glyph block already starts at `text_block_left`,
+                // `text_block_top`; we re-anchor on those so the
+                // plate sits right under the text regardless of
+                // alignment-driven positioning.
+                draw_rounded_rect(
+                    &mut img,
+                    text_block_left,
+                    text_block_top,
+                    max_line_w,
+                    total_h,
+                    radius,
+                    primary,
+                );
+            }
         }
 
         // Plate border (any non-Wrap, non-OutlineOnly variant — Wrap
         // and OutlineOnly already handle borders themselves).
         if style.box_outline_width > 0.0
-            && !matches!(style.box_kind, TextBoxKind::OutlineOnly | TextBoxKind::Wrap)
+            && !matches!(style.box_kind, TextBoxKind::OutlineOnly | TextBoxKind::Wrap | TextBoxKind::FitText)
         {
             let border_rgb = style.box_outline_color.unwrap_or([0, 0, 0]);
             let border_color = Rgba([border_rgb[0], border_rgb[1], border_rgb[2], box_alpha]);

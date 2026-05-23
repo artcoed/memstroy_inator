@@ -1813,8 +1813,49 @@ fn draw_text_overlay(
     // Scale is now reserved for the **background plate** (padding,
     // corner radius, asymmetric extras): glyphs follow `font_size`
     // alone, the plate around them follows `scale`.
+    // ── Effective font size ──
+    //
+    // The previous build pinned glyph size to `font_size * zoom`
+    // alone, so on-canvas resize handles (which write to
+    // `ov_state.scale`) only changed the plate padding and never the
+    // visible text — the user reported it as "текст при изменении
+    // размеров на холсте ведёт себя неадекватно". Image overlays
+    // scale their pixel rect by the same `scale` channel, so we now
+    // mirror that behaviour for text too: dragging a corner handle
+    // resizes both the glyphs and the surrounding plate uniformly.
+    //
+    // Anisotropic Y stretch (driven by `scale_y` independently of
+    // `scale`) is folded into the per-glyph mesh transform inside
+    // `paint_text_line_flipped`, so we can author it without
+    // requesting an anisotropic font from egui (egui's FontId only
+    // exposes a single size).
     let zoom = state.canvas_viewport.zoom;
-    let effective_size = (style.font_size * zoom).clamp(4.0, 1024.0);
+    let elem_scale = ov_state.scale.max(0.001);
+    let elem_scale_y = ov_state.scale_y.max(0.001);
+    // ── Continuous flip channels (match image-overlay semantics) ──
+    //
+    // For images, `flip_x_anim` doubles as a signed scale factor
+    // around the X axis — its absolute value shrinks the picture as
+    // it crosses 0, while its sign mirrors the texture. Text used to
+    // collapse these into a boolean (`< 0.0 ⇒ mirrored, otherwise
+    // full size`), giving only two visual states and breaking
+    // mid-flight animations. We now treat them the same way: the
+    // sign drives the mirror, and the magnitude scales the text /
+    // plate along that axis. `min(0.02)` keeps the plate from
+    // disappearing exactly at the crossover point.
+    let flip_x_factor = if ov_state.flip_x_anim.abs() < 1.0e-3 {
+        if ov_state.flip_x_anim < 0.0 { -0.02 } else { 0.02 }
+    } else {
+        ov_state.flip_x_anim
+    };
+    let flip_y_factor = if ov_state.flip_y_anim.abs() < 1.0e-3 {
+        if ov_state.flip_y_anim < 0.0 { -0.02 } else { 0.02 }
+    } else {
+        ov_state.flip_y_anim
+    };
+    // Glyph base size — uniform via `elem_scale`. Anisotropic stretch
+    // (and the flip mirror itself) is added in the per-glyph mesh.
+    let effective_size = (style.font_size * zoom * elem_scale).clamp(4.0, 1024.0);
     // Italic is faked via a horizontal skew on each glyph row. Slightly
     // larger than the previous 0.18 so the slant reads at small sizes.
     let italic_skew = if style.italic { 0.22 } else { 0.0 };
@@ -1899,25 +1940,33 @@ fn draw_text_overlay(
     let alpha_factor = match display_mode { DisplayMode::Active => 1.0, _ => 0.5 };
     let plate_opacity = style.box_opacity.clamp(0.0, 1.0) * ov_state.opacity * alpha_factor;
 
-    // Flip channels — passed through to `paint_text_line_flipped` so
-    // each line's glyph quads get mirrored around the row centre when
-    // the user pulls the Flip X / Flip Y slider negative. Mirrors the
-    // semantics already in place for actor / image overlays.
-    let flip_x = ov_state.flip_x_anim < 0.0;
-    let flip_y = ov_state.flip_y_anim < 0.0;
-    // Combined screen-space transform for plate corners: first mirror
-    // around `center_pos`, then rotate around the same pivot. Glyph
-    // text uses an equivalent transform inside `paint_text_line_flipped`,
-    // so the plate and the text always travel together — that is what
-    // closes the "reflection should rotate the background like an
-    // image" gap the user reported.
+    // Flip channels — `flip_x_factor` and `flip_y_factor` carry both
+    // sign (mirror) and magnitude (continuous scale) so the on-canvas
+    // text behaves the same way image overlays do when the user drags
+    // the Flip X / Flip Y slider through 0 (squash → mirror →
+    // un-squash) instead of a binary "either upright or fully
+    // mirrored" jump. The same factors are passed to the per-line
+    // glyph mesh below so the plate and the text deform together —
+    // this is what the user reported as "у текста отражение должно
+    // работать как у изображений".
+    //
+    // `elem_scale_y` is folded into the Y stretch only (image
+    // overlays already scale their height by `scale_y`); the X axis
+    // is already covered by `effective_size` having `elem_scale`
+    // baked in.
+    let stretch_x = flip_x_factor;
+    let stretch_y = flip_y_factor * elem_scale_y;
+    // Combined screen-space transform for plate corners: scale around
+    // `center_pos` first (handles both the flip mirror and the
+    // continuous-scale magnitude), then rotate around the same pivot.
+    // Glyph text uses the *same* pivot + factor pair inside
+    // `paint_text_line_flipped`, so plate and text stay glued
+    // together through any transform.
     let cos_r = rotation_rad.cos();
     let sin_r = rotation_rad.sin();
     let xform_pt = |p: Pos2| -> Pos2 {
-        let mut dx = p.x - center_pos.x;
-        let mut dy = p.y - center_pos.y;
-        if flip_x { dx = -dx; }
-        if flip_y { dy = -dy; }
+        let dx = (p.x - center_pos.x) * stretch_x;
+        let dy = (p.y - center_pos.y) * stretch_y;
         if !rotated {
             return Pos2::new(center_pos.x + dx, center_pos.y + dy);
         }
@@ -1926,9 +1975,14 @@ fn draw_text_overlay(
             center_pos.y + dx * sin_r + dy * cos_r,
         )
     };
-    // True when *anything* (rotation or flip) means we must draw the
-    // plate as a polygon rather than as an axis-aligned `rect_filled`.
-    let needs_polygon_plate = rotated || flip_x || flip_y;
+    // True when *anything* (rotation or anisotropic scale or flip)
+    // means we must draw the plate as a polygon rather than as an
+    // axis-aligned `rect_filled`. Allow a tiny epsilon either side of
+    // 1.0 so floating-point round-off in the default state still
+    // takes the cheap rect path.
+    let stretch_x_neutral = (stretch_x - 1.0).abs() < 1.0e-3;
+    let stretch_y_neutral = (stretch_y - 1.0).abs() < 1.0e-3;
+    let needs_polygon_plate = rotated || !stretch_x_neutral || !stretch_y_neutral;
 
     // Per-line plate rects (used for `TextBoxKind::Wrap`). Each rect
     // hugs its own line's width while sharing the block's vertical
@@ -2034,7 +2088,7 @@ fn draw_text_overlay(
             } else {
                 match kind {
                     TextBoxKind::None => {}
-                    TextBoxKind::Solid | TextBoxKind::Wrap => {
+                    TextBoxKind::Solid | TextBoxKind::Wrap | TextBoxKind::FitText => {
                         painter.rect_filled(rect, Rounding::same(radius), primary);
                     }
                     TextBoxKind::Gradient => {
@@ -2074,6 +2128,22 @@ fn draw_text_overlay(
             for r in &line_plate_rects {
                 paint_one_plate(*r, TextBoxKind::Wrap);
             }
+        } else if matches!(style.box_kind, TextBoxKind::FitText) {
+            // Tight halo around the text glyphs only — no padding /
+            // extras. We synthesise a plate rect that hugs the text
+            // block exactly and paint it as a regular `Solid`-like
+            // plate. Using `Solid` here (rather than passing
+            // `FitText` through) keeps the polygon-vs-rect dispatch
+            // inside `paint_one_plate` straightforward; the *kind*
+            // field only controls rendering mode, not geometry.
+            let half_text = max_line_w * 0.5;
+            let text_min_y = plate_rect.center().y - total_h * 0.5;
+            let text_max_y = plate_rect.center().y + total_h * 0.5;
+            let text_plate = Rect::from_min_max(
+                Pos2::new(center_pos.x - half_text, text_min_y),
+                Pos2::new(center_pos.x + half_text, text_max_y),
+            );
+            paint_one_plate(text_plate, TextBoxKind::Solid);
         } else {
             paint_one_plate(plate_rect, style.box_kind);
         }
@@ -2099,12 +2169,15 @@ fn draw_text_overlay(
         &[0.0]
     };
 
-    // Flip channels — passed through to `paint_text_line_flipped` so
-    // each line's glyph quads get mirrored around the row centre when
-    // the user pulls the Flip X / Flip Y slider negative. Mirrors the
-    // semantics already in place for actor / image overlays.
-    let flip_x = ov_state.flip_x_anim < 0.0;
-    let flip_y = ov_state.flip_y_anim < 0.0;
+    // Flip channels — same continuous factors used for the plate
+    // above. The per-line glyph mesh in `paint_text_line_flipped`
+    // applies them around `center_pos`, mirroring the plate's
+    // `xform_pt` so the text and its background stay glued through
+    // any flip / scale / rotation animation. The previous build
+    // used `flip_x_anim < 0.0` here as a boolean toggle, which is
+    // the "two visual states" bug the user reported.
+    let line_flip_x = stretch_x;
+    let line_flip_y = stretch_y;
 
     for (li, galley) in galleys.iter().enumerate() {
         let line_w = galley.size().x;
@@ -2127,7 +2200,7 @@ fn draw_text_overlay(
                     let off = Vec2::new(theta.cos() * stroke_w, theta.sin() * stroke_w);
                     paint_text_line_flipped(
                         painter, pos + off, &lines[li], font_id.clone(),
-                        stroke_color, rotation_rad, center_pos, flip_x, flip_y,
+                        stroke_color, rotation_rad, center_pos, line_flip_x, line_flip_y,
                     );
                 }
             }
@@ -2139,7 +2212,7 @@ fn draw_text_overlay(
             let p = if dx > 0.0 { pos + Vec2::new(dx, 0.0) } else { pos };
             paint_text_line_flipped(
                 painter, p, &lines[li], font_id.clone(), glyph_color,
-                rotation_rad, center_pos, flip_x, flip_y,
+                rotation_rad, center_pos, line_flip_x, line_flip_y,
             );
         }
         y += line_h;
@@ -2185,18 +2258,28 @@ fn draw_text_overlay(
 }
 
 /// Paint a single line of text, optionally rotated around `pivot` by
-/// `flip_x` / `flip_y` mirror the rendered glyphs around the line's
-/// own centre when the corresponding flip channel is < 0. egui's
-/// `TextShape` has no per-axis flip field, so to actually mirror the
-/// glyph shapes (not just the layout direction) we build a custom
-/// `Mesh` from the galley's per-row tessellated mesh, then reflect
-/// each vertex's screen position around `row.rect`. UVs are kept the
-/// same — the position flip combined with unchanged texture sampling
-/// is what gives a visually mirrored glyph.
+/// `rotation_rad` and scaled around the same pivot by `flip_x_factor`
+/// / `flip_y_factor`.
 ///
-/// When no flip is requested we fall back to the cheap painter.text
-/// (no rotation) or to TextShape::with_angle (rotation only) paths
-/// to avoid building the per-glyph mesh on every frame.
+/// The factors carry both **sign** (mirror, when negative) and
+/// **magnitude** (continuous scale around the pivot). 1.0 means no
+/// transform along that axis; -1.0 is a pure mirror; values between
+/// 0 and ±1 squash the glyphs as the slider crosses zero — this
+/// matches what image overlays do with `flip_x_anim` / `flip_y_anim`
+/// and replaces the previous boolean "either upright or fully
+/// mirrored" semantics that the user reported as broken for text.
+///
+/// Egui's `TextShape` has no per-axis flip / scale field, so to
+/// actually deform the glyph shapes (not just the layout direction)
+/// we build a custom `Mesh` from the galley's per-row tessellated
+/// mesh, then transform each vertex's screen position around `pivot`.
+/// UVs are kept the same — the position transform combined with
+/// unchanged texture sampling is what gives a visually mirrored /
+/// stretched glyph.
+///
+/// When the requested transform is identity (rotation ≈ 0, factors ≈
+/// 1) we fall back to the cheap `painter.text` path so the typical
+/// case stays cheap.
 #[allow(clippy::too_many_arguments)]
 fn paint_text_line_flipped(
     painter: &egui::Painter,
@@ -2206,10 +2289,12 @@ fn paint_text_line_flipped(
     color: Color32,
     rotation_rad: f32,
     pivot: Pos2,
-    flip_x: bool,
-    flip_y: bool,
+    flip_x_factor: f32,
+    flip_y_factor: f32,
 ) {
-    if !flip_x && !flip_y {
+    let identity_x = (flip_x_factor - 1.0).abs() < 1.0e-3;
+    let identity_y = (flip_y_factor - 1.0).abs() < 1.0e-3;
+    if identity_x && identity_y {
         if rotation_rad.abs() < 0.001 {
             painter.text(pos, egui::Align2::LEFT_TOP, text, font_id, color);
             return;
@@ -2231,11 +2316,10 @@ fn paint_text_line_flipped(
         return;
     }
 
-    // Flip path: build a custom Mesh where each glyph quad is reflected
-    // around the row's logical rectangle. This mirrors the GLYPH SHAPES
-    // (not just their order) — that's what the user's "Flip" axis means
-    // on actor / image layers, and we want consistent semantics for
-    // text overlays too.
+    // Transform path: build a custom Mesh where each glyph quad is
+    // scaled (possibly with a mirror) around `pivot` along each axis.
+    // Both plate and glyphs use the same pivot + factor pair, so the
+    // background and the text deform together.
     let job = egui::text::LayoutJob::simple_singleline(text.to_string(), font_id, color);
     let galley = painter.layout_job(job);
 
@@ -2253,30 +2337,17 @@ fn paint_text_line_flipped(
         if row.visuals.mesh.is_empty() {
             continue;
         }
-        let row_rect = row.rect;
-        let row_left = row_rect.min.x;
-        let row_right = row_rect.max.x;
-        let row_top = row_rect.min.y;
-        let row_bottom = row_rect.max.y;
 
         let idx_offset = mesh.vertices.len() as u32;
         for &i in &row.visuals.mesh.indices {
             mesh.indices.push(i + idx_offset);
         }
         for vtx in &row.visuals.mesh.vertices {
-            let mut local_x = vtx.pos.x;
-            let mut local_y = vtx.pos.y;
-            if flip_x {
-                local_x = row_right - (local_x - row_left);
-            }
-            if flip_y {
-                local_y = row_bottom - (local_y - row_top);
-            }
-            // Translate to absolute then rotate around pivot.
-            let abs_x = pos.x + local_x;
-            let abs_y = pos.y + local_y;
-            let dx = abs_x - pivot.x;
-            let dy = abs_y - pivot.y;
+            // Translate to absolute position then scale around pivot.
+            let abs_x = pos.x + vtx.pos.x;
+            let abs_y = pos.y + vtx.pos.y;
+            let dx = (abs_x - pivot.x) * flip_x_factor;
+            let dy = (abs_y - pivot.y) * flip_y_factor;
             let rx = pivot.x + dx * cos_r - dy * sin_r;
             let ry = pivot.y + dx * sin_r + dy * cos_r;
 
@@ -2469,7 +2540,30 @@ fn draw_selection_gizmo(
 
     // Drag state machine
     if response.drag_started() {
-        if let Some(start) = response.interact_pointer_pos() {
+        if let Some(start_resp) = response.interact_pointer_pos() {
+            // ── Use the EXACT press location, not the drift-after-egui-
+            // ── decided-it's-a-drag location.
+            //
+            // egui only flips `drag_started()` once the pointer has
+            // moved past its drag-threshold (~6 px) from the press
+            // origin. By that point `response.interact_pointer_pos()`
+            // returns the *current* pointer position, which can be
+            // several pixels away from where the user actually
+            // clicked. For a press right at the edge of a resize
+            // handle (where the visible hover cursor already showed
+            // "resize"), the post-drift position can fall outside our
+            // hit-test radius — so the drag mode resolved to a
+            // marquee instead of a handle resize. The user reported
+            // this as: "hovering shows the resize cursor but pressing
+            // starts a multi-select; only pressing exactly on the
+            // edge works".
+            //
+            // `i.pointer.press_origin()` carries the press location
+            // we want; we still fall back to the post-drift position
+            // when the pointer state is somehow unavailable.
+            let start = ui
+                .input(|i| i.pointer.press_origin())
+                .unwrap_or(start_resp);
             let local = [start.x - full_rect.min.x, start.y - full_rect.min.y];
             let world = state.canvas_viewport.screen_to_world(local, viewport_size);
             let modifiers = ui.input(|i| i.modifiers);
@@ -2588,7 +2682,32 @@ fn draw_selection_gizmo(
             let click_world = state.canvas_viewport.screen_to_world(local, viewport_size);
             let modifiers = ui.input(|i| i.modifiers);
             let extend = modifiers.ctrl || modifiers.shift || modifiers.command;
-            try_select_at(state, click_world);
+            // ── Render-frame center handle has top priority ──
+            //
+            // Clicking the central marker of the render frame should
+            // always select the render frame itself, regardless of
+            // any actor / overlay that happens to be drawn underneath
+            // the same point. The handle is painted on top of every
+            // other layer (`draw_render_frame` runs last), so the
+            // selection hit-test follows the same z-order — without
+            // this priority the click fell through to whichever
+            // actor / overlay covered the centre, and the user
+            // reported "нажатие на центральную точку рендера должно
+            // выделять элемент рендера".
+            let rf_state = sample_render_frame(&state.scene.render_frame, state.playhead);
+            let center_screen = state
+                .canvas_viewport
+                .world_to_screen(rf_state.pos, viewport_size);
+            let rf_center = Pos2::new(
+                full_rect.min.x + center_screen[0],
+                full_rect.min.y + center_screen[1],
+            );
+            let rf_center_hit = (mouse - rf_center).length() < RF_CENTER_RADIUS * 2.5;
+            if rf_center_hit {
+                state.selection = Selection::RenderFrame;
+            } else {
+                try_select_at(state, click_world);
+            }
             if extend {
                 // Ctrl/Shift+click toggles the clicked element in the
                 // canvas multi-selection. Empty hits (Selection::None)
@@ -2649,7 +2768,10 @@ fn decide_drag_mode(
     //    user clicks the small circle floating above the bbox.
     if let Some(elem_rect) = selected_element_screen_rect(state, full_rect, viewport_size) {
         let handle_pos = rotation_handle_screen_pos(elem_rect);
-        if (start - handle_pos).length() < ROTATION_HANDLE_RADIUS * 2.5 {
+        // Same 3.0× hit-radius rationale as for the resize handles —
+        // press should always succeed where hover advertised the
+        // gesture, accounting for egui's drag-start drift.
+        if (start - handle_pos).length() < ROTATION_HANDLE_RADIUS * 3.0 {
             let center = elem_rect.center();
             let initial_rot_deg = current_selection_rotation(state).unwrap_or(0.0);
             let dx = start.x - center.x;
@@ -2702,7 +2824,15 @@ fn decide_drag_mode(
         ];
 
         for (handle_pos, handle_id, anchor_world) in handle_specs.iter() {
-            if (start - *handle_pos).length() < ELEM_HANDLE_SIZE * 2.5 {
+            // Hit radius is intentionally a touch larger than the
+            // visible handle so users don't have to land exactly on
+            // the dot — and crucially, larger than `update_hover_cursor`'s
+            // 2.0× radius so anywhere the cursor *advertised* a
+            // resize affordance also commits as a resize on press
+            // (3.0× = 21 px > the 14 px hover radius + egui's ~6 px
+            // drag-start drift). This is what closes the "hover
+            // shows resize but press triggers multi-select" gap.
+            if (start - *handle_pos).length() < ELEM_HANDLE_SIZE * 3.0 {
                 let initial_scale = current_selection_scale(state).unwrap_or(1.0);
                 let initial_scale_y = current_selection_scale_y(state).unwrap_or(1.0);
                 let initial_pos_world = current_selection_world_center(state)
@@ -2761,7 +2891,12 @@ fn decide_drag_mode(
     // 4. Click on a render frame corner → ResizeRenderFrame.
     let rf_corners = render_frame_corners_screen(state, full_rect, viewport_size);
     for corner in &rf_corners {
-        if (start - *corner).length() < RF_HANDLE_SIZE * 2.5 {
+        // Same 3.0× hit-radius rationale as the regular element
+        // resize handles above — keep it strictly larger than the
+        // hover advertise threshold (`update_hover_cursor` uses
+        // 2.0×) so a press anywhere the cursor showed "resize"
+        // commits as ResizeRenderFrame.
+        if (start - *corner).length() < RF_HANDLE_SIZE * 3.0 {
             let anchor_distance = (start - rf_center).length().max(1.0);
             return CanvasDragMode::ResizeRenderFrame {
                 initial_zoom: rf_state.zoom,
@@ -4701,15 +4836,18 @@ fn overlay_bbox(overlay: &Overlay, ov_state: &OverlayState) -> (f32, f32) {
             let lines: Vec<&str> = if txt.text.is_empty() { vec![" "] } else { txt.text.lines().collect() };
             let max_chars = lines.iter().map(|l| l.chars().count()).max().unwrap_or(1) as f32;
             let font = style.font_size;
-            // Glyphs are sized by `font_size` alone — `scale` only
-            // governs the background plate (padding / extras / corner
-            // radius). See draw_text_overlay for the matching change.
-            let text_w = (max_chars.max(1.0)) * font * 0.55;
-            let text_h = (lines.len() as f32) * font * 1.2;
-            // Symmetric padding + asymmetric extras on the horizontal axis.
-            // Resize handles need the FULL plate size so they snap to the
-            // visible edges; padding scales with `ov_state.scale` so the
-            // plate itself can be enlarged without touching the glyphs.
+            // Glyphs are now scaled by `ov_state.scale` (and `scale_y`
+            // along the vertical axis) so the resize handles snap to
+            // the visibly-stretched plate edges. The previous build
+            // pinned glyph width to `font_size * 0.55` regardless of
+            // scale, which is what made on-canvas text resize feel
+            // sticky — handles drifted with `scale` while glyphs
+            // stayed the same size, so the bbox the gizmos used and
+            // the visible plate rapidly diverged.
+            let text_w = (max_chars.max(1.0)) * font * 0.55 * sx;
+            let text_h = (lines.len() as f32) * font * 1.2 * sy;
+            // Plate padding scales uniformly with `ov_state.scale`
+            // (matches `draw_text_overlay`).
             let pad_w = (style.box_padding * 2.0
                 + style.box_extra_left
                 + style.box_extra_right)
@@ -5917,10 +6055,10 @@ fn snap_world_center(
         }
     }
     if best_x < thresh {
-        guides.push(crate::state::SnapGuide {
-            axis: crate::state::SnapAxis::Vertical,
-            world: snapped_x,
-        });
+        guides.push(crate::state::SnapGuide::axis_aligned(
+            crate::state::SnapAxis::Vertical,
+            snapped_x,
+        ));
     }
 
     let mut snapped_y = proposed_y;
@@ -5933,13 +6071,124 @@ fn snap_world_center(
         }
     }
     if best_y < thresh {
-        guides.push(crate::state::SnapGuide {
-            axis: crate::state::SnapAxis::Horizontal,
-            world: snapped_y,
-        });
+        guides.push(crate::state::SnapGuide::axis_aligned(
+            crate::state::SnapAxis::Horizontal,
+            snapped_y,
+        ));
+    }
+
+    // ── Rotated render-frame edge snap ──
+    //
+    // When the render frame is rotated, its left/right edges are no
+    // longer vertical lines and its top/bottom edges are no longer
+    // horizontal lines, so the axis-aligned `xs` / `ys` collection
+    // above silently stops covering them. The user reported this as
+    // "только центр области рендера снапит, к краям тоже надо, и не
+    // забывай про rotation". Below we additionally snap to each of
+    // the four edges as actual oriented lines: we project the
+    // (already axis-snapped) candidate onto each line, accept the
+    // closest hit as the new snapped point, and emit a `Line` guide
+    // so the user sees a guideline that actually follows the rotated
+    // edge instead of an axis-aligned approximation.
+    let (snapped_x, snapped_y, line_guide) =
+        snap_to_render_frame_rotated_edges(state, snapped_x, snapped_y, thresh);
+    if let Some(g) = line_guide {
+        guides.push(g);
     }
 
     (snapped_x, snapped_y, guides)
+}
+
+/// Snap a proposed point to the closest rotated edge of the render
+/// frame, when the frame's rotation makes axis-aligned edge snap
+/// inadequate. Returns `(x, y, Some(guide))` when an edge was within
+/// `thresh` (world units) of the proposed point — caller pushes the
+/// guide onto the active list so it's drawn on top of the canvas.
+///
+/// At rotation 0 this is a no-op: the axis-aligned x/y snap above
+/// already covers vertical / horizontal edges, and we'd just emit a
+/// duplicate guide otherwise.
+fn snap_to_render_frame_rotated_edges(
+    state: &EditorState,
+    proposed_x: f32,
+    proposed_y: f32,
+    thresh: f32,
+) -> (f32, f32, Option<crate::state::SnapGuide>) {
+    let rf = &state.scene.render_frame;
+    let rf_state = sample_render_frame_eased(rf, state.playhead);
+    let rad = rf_state.rotation_deg.to_radians();
+    if rad.abs() < 1.0e-3 {
+        // Frame is axis-aligned — caller's xs/ys snap already covers it.
+        return (proposed_x, proposed_y, None);
+    }
+
+    let [rw, rh] = rf.resolution;
+    let world_w = rw as f32 / rf_state.zoom.max(1e-6);
+    let world_h = rh as f32 / rf_state.zoom.max(1e-6);
+    let cx = rf_state.pos.x;
+    let cy = rf_state.pos.y;
+
+    // Project (proposed - centre) into the frame's local axes.
+    // `lx` is along the rotated horizontal axis, `ly` along the
+    // rotated vertical axis. Distance to each edge is just the local
+    // coordinate offset from ±half_extent.
+    let cs = rad.cos();
+    let sn = rad.sin();
+    let dx = proposed_x - cx;
+    let dy = proposed_y - cy;
+    let lx = dx * cs + dy * sn;
+    let ly = -dx * sn + dy * cs;
+    let half_w = world_w * 0.5;
+    let half_h = world_h * 0.5;
+
+    // For each of the four edges, perpendicular distance in the
+    // frame's local frame is just |lx ± half_w| or |ly ± half_h|.
+    let candidates: [(f32, f32, [f32; 2], f32); 4] = [
+        // (signed local target axis, distance, line origin in local,
+        //  line angle_rad in world)
+        // Left edge:   local x = -half_w, line direction = local Y axis
+        ( -half_w - lx,                      (-half_w - lx).abs(),  [-half_w, 0.0], rad + std::f32::consts::FRAC_PI_2 ),
+        // Right edge:  local x = +half_w, line direction = local Y axis
+        ( half_w  - lx,                      (half_w  - lx).abs(),  [ half_w, 0.0], rad + std::f32::consts::FRAC_PI_2 ),
+        // Top edge:    local y = -half_h, line direction = local X axis
+        ( -half_h - ly,                      (-half_h - ly).abs(),  [0.0, -half_h], rad ),
+        // Bottom edge: local y = +half_h, line direction = local X axis
+        ( half_h  - ly,                      (half_h  - ly).abs(),  [0.0,  half_h], rad ),
+    ];
+
+    let mut best_idx: Option<usize> = None;
+    let mut best_dist = thresh;
+    for (i, (_, dist, _, _)) in candidates.iter().enumerate() {
+        if *dist < best_dist {
+            best_dist = *dist;
+            best_idx = Some(i);
+        }
+    }
+
+    let Some(idx) = best_idx else {
+        return (proposed_x, proposed_y, None);
+    };
+    let (signed, _, local_origin, line_angle) = candidates[idx];
+
+    // Apply the snap by moving along the perpendicular of the edge
+    // (i.e. along the local X axis for left/right edges; along the
+    // local Y axis for top/bottom). Convert that delta back to world.
+    let (dlx, dly) = if idx < 2 {
+        (signed, 0.0)
+    } else {
+        (0.0, signed)
+    };
+    let snapped_dx = dlx * cs - dly * sn;
+    let snapped_dy = dlx * sn + dly * cs;
+    let snapped_x = proposed_x + snapped_dx;
+    let snapped_y = proposed_y + snapped_dy;
+
+    // Convert the line origin from local to world for the guide.
+    let world_origin_x = cx + local_origin[0] * cs - local_origin[1] * sn;
+    let world_origin_y = cy + local_origin[0] * sn + local_origin[1] * cs;
+
+    let guide = crate::state::SnapGuide::line([world_origin_x, world_origin_y], line_angle);
+    (snapped_x, snapped_y, Some(guide))
 }
 
 /// Collect every world-space X (vertical-line) and Y (horizontal-line) snap
@@ -5959,12 +6208,22 @@ fn collect_snap_targets(
     let world_h = rh as f32 / rf_state.zoom.max(0.0001);
     let cx = rf_state.pos.x;
     let cy = rf_state.pos.y;
-    xs.push(cx - world_w * 0.5);
+    // Centre snaps regardless of rotation — the centre point of a
+    // rectangle is invariant under rotation.
     xs.push(cx);
-    xs.push(cx + world_w * 0.5);
-    ys.push(cy - world_h * 0.5);
     ys.push(cy);
-    ys.push(cy + world_h * 0.5);
+    // Edges only contribute axis-aligned snap targets when the frame
+    // itself is axis-aligned (rotation ≈ 0). When the frame is
+    // rotated, `cx ± world_w/2` no longer corresponds to a visible
+    // edge, so we skip these and let `snap_to_render_frame_rotated_edges`
+    // emit proper rotated-line guides instead.
+    let rf_rad = rf_state.rotation_deg.to_radians();
+    if rf_rad.abs() < 1.0e-3 {
+        xs.push(cx - world_w * 0.5);
+        xs.push(cx + world_w * 0.5);
+        ys.push(cy - world_h * 0.5);
+        ys.push(cy + world_h * 0.5);
+    }
 
     // Other actors' centres.
     let t = state.playhead;
@@ -6042,6 +6301,32 @@ fn draw_snap_guides(
                         Stroke::new(1.0, col),
                     );
                 }
+            }
+            crate::state::SnapAxis::Line => {
+                // Free-orientation guide (rotated render-frame edge).
+                // Compute two world-space points far enough apart in
+                // either direction along the line that the resulting
+                // segment certainly crosses the entire visible
+                // canvas, then convert to screen coords. egui's
+                // painter clips against `full_rect` for us, so we
+                // can be generous with the segment length without
+                // worrying about overdraw.
+                let len: f32 = 1.0e6;
+                let dir_x = guide.line_angle_rad.cos();
+                let dir_y = guide.line_angle_rad.sin();
+                let p1_world = WorldPos {
+                    x: guide.line_origin[0] - dir_x * len,
+                    y: guide.line_origin[1] - dir_y * len,
+                };
+                let p2_world = WorldPos {
+                    x: guide.line_origin[0] + dir_x * len,
+                    y: guide.line_origin[1] + dir_y * len,
+                };
+                let p1 = state.canvas_viewport.world_to_screen(p1_world, viewport_size);
+                let p2 = state.canvas_viewport.world_to_screen(p2_world, viewport_size);
+                let p1s = Pos2::new(full_rect.min.x + p1[0], full_rect.min.y + p1[1]);
+                let p2s = Pos2::new(full_rect.min.x + p2[0], full_rect.min.y + p2[1]);
+                painter.line_segment([p1s, p2s], Stroke::new(1.0, col));
             }
         }
     }
