@@ -1093,24 +1093,24 @@ impl<'a> FilterGraphBuilder<'a> {
         let cy_expr = make_expr(|c| c.center[1]);
         let rot_expr = make_expr(|c| c.rotation_deg);
 
-        // Strategy: use crop to select a sub-region of the composite,
-        // then scale back up to output resolution. This simulates zoom + pan.
+        // Strategy: same camera viewport semantics as
+        // `emit_render_frame_camera` — pad → un-rotate → centre crop
+        // → scale. See that method for the full rationale; the only
+        // difference here is that the centre is `(cx, cy)` (in
+        // normalised coords) instead of always `(0.5, 0.5)`.
         //
-        // crop_w = W / zoom, crop_h = H / zoom
-        // crop_x = center_x * W - crop_w / 2
-        // crop_y = center_y * H - crop_h / 2
-        //
-        // Then scale the cropped region back to WxH.
+        // crop_w = W / zoom, crop_h = H / zoom, clamped to source dims
+        // crop_x = cx*W - crop_w/2, crop_y = cy*H - crop_h/2
 
-        let crop_w = format!("floor({w}/({zoom})/2)*2", w = w, zoom = zoom_expr);
-        let crop_h = format!("floor({h}/({zoom})/2)*2", h = h, zoom = zoom_expr);
+        let crop_w = format!("min(iw,max(2,floor({w}/({zoom})/2)*2))", w = w, zoom = zoom_expr);
+        let crop_h = format!("min(ih,max(2,floor({h}/({zoom})/2)*2))", h = h, zoom = zoom_expr);
         let crop_x = format!(
-            "max(0,min({w}-floor({w}/({zoom})/2)*2, floor(({cx})*{w}-floor({w}/({zoom})/2)*2/2)))",
-            w = w, zoom = zoom_expr, cx = cx_expr
+            "max(0,min(iw-({cw}), floor(({cx})*iw-({cw})/2)))",
+            cw = crop_w, cx = cx_expr,
         );
         let crop_y = format!(
-            "max(0,min({h}-floor({h}/({zoom})/2)*2, floor(({cy})*{h}-floor({h}/({zoom})/2)*2/2)))",
-            h = h, zoom = zoom_expr, cy = cy_expr
+            "max(0,min(ih-({ch}), floor(({cy})*ih-({ch})/2)))",
+            ch = crop_h, cy = cy_expr,
         );
 
         let cam_label = self.alloc_label("cam");
@@ -1119,17 +1119,25 @@ impl<'a> FilterGraphBuilder<'a> {
         let has_rotation = camera.iter().any(|kf| kf.value.rotation_deg.abs() > 0.01);
 
         if has_rotation {
-            // With rotation: use rotate filter before crop. Wrap the
-            // angle expression in single quotes — when keyframes
-            // produce piecewise `if(lt(t,…),…,…)` expressions the
-            // commas inside would otherwise be parsed as filter-chain
-            // separators by FFmpeg, breaking the entire graph with
-            // "No option name near 'none:ow=iw:oh=ih'".
-            let rot_rad = format!("({})*PI/180", rot_expr);
+            // Match the v2 render-frame camera: pad to hypot before
+            // rotating so corners survive, and use **negative**
+            // rotation so the camera's "tilt" un-rotates the world
+            // into an axis-aligned output. Wrap the angle in single
+            // quotes — when keyframes produce piecewise
+            // `if(lt(t,…),…,…)` expressions the commas inside would
+            // otherwise be parsed as filter-chain separators by
+            // FFmpeg, breaking the entire graph.
+            let rot_rad = format!("(-({}))*PI/180", rot_expr);
+            let pad_label = self.alloc_label("campad");
+            self.chunks.push(format!(
+                "{cur}pad=w='hypot(iw\\,ih)':h='hypot(iw\\,ih)':x='(ow-iw)/2':y='(oh-ih)/2':color=#00000000{out}",
+                cur = self.cursor,
+                out = pad_label,
+            ));
             let rot_label = self.alloc_label("rot");
             self.chunks.push(format!(
-                "{cur}rotate='{rad}':ow=iw:oh=ih:c=none{out}",
-                cur = self.cursor,
+                "{pad}rotate='{rad}':ow=iw:oh=ih:c=none{out}",
+                pad = pad_label,
                 rad = rot_rad,
                 out = rot_label,
             ));
@@ -1182,35 +1190,80 @@ impl<'a> FilterGraphBuilder<'a> {
         let zoom_expr = make_rf_expr(|s| s.zoom);
         let rot_expr = make_rf_expr(|s| s.rotation_deg);
 
-        // For the render frame, crop_w = W/zoom, crop_h = H/zoom
-        // Center is at render_frame pos which is in world pixels — for now
-        // we normalise relative to output res (legacy compatibility)
-        let crop_w = format!("floor({w}/({zoom})/2)*2", w = w, zoom = zoom_expr);
-        let crop_h = format!("floor({h}/({zoom})/2)*2", h = h, zoom = zoom_expr);
-        // Center crop at 0.5,0.5 (canvas elements are already placed relative to frame)
-        let crop_x = format!(
-            "max(0,floor(({w}-floor({w}/({zoom})/2)*2)/2))",
-            w = w, zoom = zoom_expr
+        // ── Camera viewport semantics ──
+        //
+        // The composite at this point is a `W×H` canvas, axis-aligned
+        // with world axes, with `rf.pos` translated to the canvas
+        // centre `(W/2, H/2)` by every overlay's `centre_x_expr` /
+        // `centre_y_expr`. The render frame is a tilted / scaled
+        // rectangle in world space; the export must show the world
+        // content captured by that rectangle, with the rectangle
+        // straightened to the output's axis-aligned `W×H`.
+        //
+        // The pipeline is therefore:
+        //
+        //   1. Pad the `W×H` composite to `hypot(W,H) × hypot(W,H)`.
+        //      Rotating in place with `ow=iw:oh=ih` would chop ~14%
+        //      off every corner at a 30° tilt — which the user
+        //      reported as "при повёрнутой области рендера клип не
+        //      рендерится". The hypot pad guarantees that any rotation
+        //      of the original `W×H` content fits in the output frame
+        //      without clipping.
+        //
+        //   2. Rotate the padded composite by **`-rf.rotation_deg`**.
+        //      A positive `rotation_deg` tilts the rf rectangle CW in
+        //      world space, so producing an axis-aligned output of
+        //      "what's inside the rectangle" requires UN-rotating the
+        //      world by the same angle. The previous build applied
+        //      `+rf.rotation_deg` here, which produced the mirror
+        //      image of the camera view — text, images and clips ended
+        //      up tilted in the OPPOSITE direction from what the canvas
+        //      showed.
+        //
+        //   3. Crop a centred `W/zoom × H/zoom` region. With `zoom > 1`
+        //      this captures less canvas (zoom-in); with `zoom < 1`
+        //      we'd want to capture more, but the composite never
+        //      extends past `hypot(W,H)`, so we clamp via `min(iw,…)`.
+        //
+        //   4. Scale the cropped region back to `W×H`.
+        let crop_w = format!(
+            "min(iw,max(2,floor({w}/({zoom})/2)*2))",
+            w = w, zoom = zoom_expr,
         );
-        let crop_y = format!(
-            "max(0,floor(({h}-floor({h}/({zoom})/2)*2)/2))",
-            h = h, zoom = zoom_expr
+        let crop_h = format!(
+            "min(ih,max(2,floor({h}/({zoom})/2)*2))",
+            h = h, zoom = zoom_expr,
         );
+        let crop_x = format!("max(0,(iw-({cw}))/2)", cw = crop_w);
+        let crop_y = format!("max(0,(ih-({ch}))/2)", ch = crop_h);
 
         let cam_label = self.alloc_label("rfcam");
 
         let has_rotation = rf.layout.iter().any(|kf| kf.value.rotation_deg.abs() > 0.01);
         if has_rotation {
-            // Wrap the angle expression in single quotes so the
-            // piecewise `if(lt(t,…),…,…)` commas don't get parsed as
-            // filter-chain separators. Without the quotes FFmpeg fails
-            // with "No option name near 'none:ow=iw:oh=ih'" the moment
-            // the user keyframes a non-zero render-frame rotation.
-            let rot_rad = format!("({})*PI/180", rot_expr);
+            // Pad → rotate → crop → scale. Sign flip: `-rotation_deg`
+            // un-rotates the world so the rf rectangle becomes axis-
+            // aligned in the output. `c=#00000000` keeps the corners
+            // transparent so backgrounds composited later (or the
+            // default chroma-key base) bleed through cleanly.
+            //
+            // Wrap the angle in single quotes — when the user
+            // keyframes the rotation the piecewise expression contains
+            // `if(lt(t,…),…,…)` whose commas would otherwise be
+            // parsed as filter-chain separators by ffmpeg, breaking
+            // the entire graph with "No option name near
+            // 'none:ow=iw:oh=ih'".
+            let rot_rad = format!("(-({}))*PI/180", rot_expr);
+            let pad_label = self.alloc_label("rfpad");
+            self.chunks.push(format!(
+                "{cur}pad=w='hypot(iw\\,ih)':h='hypot(iw\\,ih)':x='(ow-iw)/2':y='(oh-ih)/2':color=#00000000{out}",
+                cur = self.cursor,
+                out = pad_label,
+            ));
             let rot_label = self.alloc_label("rfrot");
             self.chunks.push(format!(
-                "{cur}rotate='{rad}':ow=iw:oh=ih:c=none{out}",
-                cur = self.cursor, rad = rot_rad, out = rot_label,
+                "{pad}rotate='{rad}':ow=iw:oh=ih:c=none{out}",
+                pad = pad_label, rad = rot_rad, out = rot_label,
             ));
             self.chunks.push(format!(
                 "{rot}crop=w='{cw}':h='{ch}':x='{cx}':y='{cy}',scale={w}:{h}{out}",
@@ -1219,6 +1272,8 @@ impl<'a> FilterGraphBuilder<'a> {
                 w = w, h = h, out = cam_label,
             ));
         } else {
+            // No rotation → no need to pad; cropping a centred region
+            // of the `W×H` composite + scaling to `W×H` is enough.
             self.chunks.push(format!(
                 "{cur}crop=w='{cw}':h='{ch}':x='{cx}':y='{cy}',scale={w}:{h}{out}",
                 cur = self.cursor,

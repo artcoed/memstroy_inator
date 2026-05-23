@@ -99,12 +99,16 @@ pub struct CanvasLayout {
     pub keyframes: Vec<Keyframe<CanvasTransform>>,
 }
 
-fn default_format_version() -> u32 { 1 }
+/// Current scene-format version. Bumped to 2 when legacy normalised
+/// element positions were decoupled from the live render frame
+/// (`migrate_decouple_render_frame`). Older scenes loaded from disk
+/// are upgraded in place via `Scene::upgrade_legacy`.
+fn default_format_version() -> u32 { 2 }
 
 impl Default for Scene {
     fn default() -> Self {
         Self {
-            format_version: 1,
+            format_version: 2,
             output: OutputSpec::default(),
             backgrounds: Vec::new(),
             camera: Vec::new(),
@@ -115,6 +119,130 @@ impl Default for Scene {
             canvas_layouts: Vec::new(),
             skeleton_templates: Vec::new(),
         }
+    }
+}
+
+impl Scene {
+    /// Apply every one-shot legacy upgrade in the right order.
+    ///
+    /// Called from every `Scene` load path (YAML/JSON/`.memstroy`).
+    /// Upgrades run BEFORE `backfill_animated_params` because the
+    /// migration touches keyframe values themselves; the backfill only
+    /// inspects them and must see the final post-migration shape.
+    pub fn upgrade_legacy(&mut self) {
+        self.migrate_decouple_render_frame();
+        self.backfill_animated_params();
+    }
+
+    /// One-time migration to format_version 2: decouple legacy
+    /// normalised element positions from the live render frame.
+    ///
+    /// **Why this exists.** Before v2, every actor / overlay's `pos`
+    /// (a `[0..1]` vector inside its `layout` keyframes) was
+    /// interpreted relative to the render-frame's instantaneous rect:
+    ///
+    /// ```text
+    /// world_x = rf.pos.x + (pos.x - 0.5) * (out_w / rf.zoom)
+    /// world_y = rf.pos.y + (pos.y - 0.5) * (out_h / rf.zoom)
+    /// ```
+    ///
+    /// Because the formula depends on `rf.pos` / `rf.zoom`, every
+    /// edit of the render-frame parameters dragged every child element
+    /// along on the canvas — the user's report
+    /// "при изменении параметров области рендера зачем-то некоторые
+    /// изменения на холсте каким-то другим элементам тоже начинают
+    /// применяться, например тексту". The render frame was supposed
+    /// to be a self-contained "camera" element that doesn't perturb
+    /// other layers; this migration delivers that contract.
+    ///
+    /// **What v2 means.** From v2 onwards, the same `pos` field is
+    /// interpreted against a FIXED reference rectangle of size
+    /// `output.resolution` anchored at world (0,0):
+    ///
+    /// ```text
+    /// world_x = pos.x * out_w
+    /// world_y = pos.y * out_h
+    /// ```
+    ///
+    /// The render frame is now a pure viewport / camera over the world
+    /// — moving / resizing / rotating it changes only what part of the
+    /// world the export captures, never where world-space layers sit.
+    ///
+    /// **Migration math.** To preserve the user's existing layout, we
+    /// walk every legacy keyframe, sample the render frame at the
+    /// keyframe's *scene*-time, recompute the OLD world coordinate via
+    /// the v1 formula, and rewrite `pos` so the v2 formula returns the
+    /// same world coordinate. After this rewrite the scene looks
+    /// identical to the user but every element is now world-anchored
+    /// — render-frame edits no longer move children, the export
+    /// matches the canvas's "what's inside the rectangle" view, and
+    /// rotated render frames no longer chop corners off the clip.
+    ///
+    /// Idempotent — re-running on an already-v2 scene is a no-op.
+    pub fn migrate_decouple_render_frame(&mut self) {
+        if self.format_version >= 2 {
+            return;
+        }
+        let [out_w, out_h] = self.output.resolution;
+        let out_w = (out_w.max(1)) as f32;
+        let out_h = (out_h.max(1)) as f32;
+
+        // Snapshot the rf layout — we sample it via the immutable
+        // copy while iterating mutably over `actors` / `overlays`.
+        let rf_layout = self.render_frame.layout.clone();
+        let old_world = |scene_t: f32, norm: [f32; 2]| -> [f32; 2] {
+            let s = crate::keyframe::sample(&rf_layout, scene_t).unwrap_or_default();
+            let world_w = out_w / s.zoom.max(1.0e-6);
+            let world_h = out_h / s.zoom.max(1.0e-6);
+            let frame_tl_x = s.pos.x - world_w * 0.5;
+            let frame_tl_y = s.pos.y - world_h * 0.5;
+            [
+                frame_tl_x + norm[0] * world_w,
+                frame_tl_y + norm[1] * world_h,
+            ]
+        };
+        let new_norm = |world_xy: [f32; 2]| -> [f32; 2] {
+            [world_xy[0] / out_w, world_xy[1] / out_h]
+        };
+
+        for actor in &mut self.actors {
+            let t_in = actor.t_in.unwrap_or(0.0);
+            for kf in &mut actor.layout {
+                let scene_t = t_in + kf.t;
+                kf.value.pos = new_norm(old_world(scene_t, kf.value.pos));
+            }
+        }
+
+        for ov in &mut self.overlays {
+            match ov {
+                Overlay::Text(o) => migrate_overlay_layout_pos(
+                    &mut o.layout, o.t_in, &old_world, &new_norm,
+                ),
+                Overlay::Image(o) => migrate_overlay_layout_pos(
+                    &mut o.layout, o.t_in, &old_world, &new_norm,
+                ),
+                Overlay::Video(o) => migrate_overlay_layout_pos(
+                    &mut o.layout, o.t_in, &old_world, &new_norm,
+                ),
+            }
+        }
+
+        self.format_version = 2;
+    }
+}
+
+fn migrate_overlay_layout_pos<F, G>(
+    layout: &mut [Keyframe<OverlayState>],
+    t_in: f32,
+    old_world: &F,
+    new_norm: &G,
+) where
+    F: Fn(f32, [f32; 2]) -> [f32; 2],
+    G: Fn([f32; 2]) -> [f32; 2],
+{
+    for kf in layout.iter_mut() {
+        let scene_t = t_in + kf.t;
+        kf.value.pos = new_norm(old_world(scene_t, kf.value.pos));
     }
 }
 

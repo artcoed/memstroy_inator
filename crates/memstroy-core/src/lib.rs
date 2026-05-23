@@ -67,11 +67,14 @@ impl Scene {
             }
             other => return Err(SceneError::UnknownFormat(other.unwrap_or("").into())),
         };
-        // Back-fill `animated_params` for scenes saved before per-param
-        // animation toggles existed. This inspects the layout vec and
-        // marks every parameter that has actual variation across kfs as
-        // animated, so loading an old project preserves its animations.
-        scene.backfill_animated_params();
+        // Apply every legacy-format upgrade in the right order:
+        //   1. `migrate_decouple_render_frame` rewrites legacy
+        //      normalised positions so render-frame edits stop
+        //      perturbing other elements;
+        //   2. `backfill_animated_params` marks parameters that
+        //      already vary across keyframes as animated, preserving
+        //      animations authored before the per-param toggle existed.
+        scene.upgrade_legacy();
         Ok(scene)
     }
 
