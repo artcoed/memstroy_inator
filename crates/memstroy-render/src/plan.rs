@@ -18,6 +18,13 @@ pub struct FfmpegPlan {
     pub fps: u32,
     pub resolution: [u32; 2],
     pub duration: f32,
+    /// Auxiliary files the builder generated on disk that should be
+    /// deleted after FFmpeg finishes — currently used for the alpha
+    /// PNGs that back `EffectKind::Mask` exports. The runner walks
+    /// this list at the end of the render (success or failure) and
+    /// best-effort removes each entry. Empty for plans that don't
+    /// rely on generated assets.
+    pub cleanup_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -96,7 +103,7 @@ impl FfmpegPlan {
 pub fn build_plan(scene: &Scene, output: &Path, assets_root: &Path) -> Result<FfmpegPlan> {
     let mut builder = FilterGraphBuilder::new(scene, assets_root);
     builder.build()?;
-    let (filter, inputs, map_video, map_audio) = builder.finish();
+    let (filter, inputs, map_video, map_audio, cleanup_paths) = builder.finish();
     Ok(FfmpegPlan {
         inputs,
         filter_complex: filter,
@@ -106,5 +113,6 @@ pub fn build_plan(scene: &Scene, output: &Path, assets_root: &Path) -> Result<Ff
         fps: scene.output.fps,
         resolution: scene.output.resolution,
         duration: scene.output.duration,
+        cleanup_paths,
     })
 }
