@@ -1539,7 +1539,7 @@ impl EditorState {
             .ok_or_else(|| ".memstroy file missing \"scene\" key".to_string())?;
         let mut scene: Scene = serde_json::from_value(scene_value)
             .map_err(|e| format!("invalid scene in .memstroy: {e}"))?;
-        scene.backfill_animated_params();
+        scene.upgrade_legacy();
         // Apply layout if present (it's optional).
         if let Some(layout) = bundle.get("layout") {
             self.apply_layout_json(layout);
