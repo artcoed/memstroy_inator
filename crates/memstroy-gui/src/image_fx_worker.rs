@@ -165,3 +165,65 @@ fn run_bake(
         crop: [crop.0, crop.1, crop.2, crop.3],
     })
 }
+
+
+/// Look up an effect-baked texture for `(path, effects)`, dispatching
+/// a background bake on a cache miss. Mirrors the helper that the
+/// canvas-preview path uses so secondary surfaces (e.g. the image
+/// editor's preview) can reuse the *same* baked texture without
+/// re-implementing the lookup-or-dispatch dance.
+///
+/// Returns `Some((handle, crop_inset))` when the cache holds a
+/// `Ready` slot for this exact `(path, sig)`. Returns `None` for
+/// `Pending` / `Failed` / `Miss` — in those cases the caller is
+/// expected to fall back to the unprocessed image while the worker
+/// completes (or after a permanent failure).
+///
+/// The `crop_inset` is `(left, top, right, bottom)` in normalised
+/// 0..1 — the caller's mesh / preview rect should shrink to this
+/// rectangle so the user sees the same crop the export will produce.
+pub fn lookup_or_dispatch_image_fx(
+    state: &crate::state::EditorState,
+    path: &std::path::Path,
+    effects: &[Effect],
+    egui_ctx: &egui::Context,
+) -> Option<(egui::TextureHandle, [f32; 4])> {
+    use crate::image_fx_cache::LookupOutcome;
+
+    let sig = crate::image_effects::signature(effects);
+
+    match state.image_fx_cache.lookup(path, sig) {
+        LookupOutcome::Ready(slot) => {
+            return Some((slot.texture, slot.crop));
+        }
+        LookupOutcome::Pending => {
+            // A worker is already baking this exact (path, sig).
+            // Caller will fall back to the unprocessed image.
+            egui_ctx.request_repaint_after(std::time::Duration::from_millis(33));
+            return None;
+        }
+        LookupOutcome::Failed => {
+            // Bake previously failed; don't keep retrying every frame.
+            return None;
+        }
+        LookupOutcome::Miss => {
+            // Fall through and dispatch a fresh bake.
+        }
+    }
+
+    if let (Some(handle), Some(tx)) =
+        (state.tokio_handle.as_ref(), state.image_fx_tx.as_ref())
+    {
+        submit_image_fx_job(
+            handle,
+            tx,
+            &state.image_fx_cache,
+            egui_ctx,
+            path.to_path_buf(),
+            effects.to_vec(),
+            sig,
+        );
+        egui_ctx.request_repaint_after(std::time::Duration::from_millis(33));
+    }
+    None
+}
