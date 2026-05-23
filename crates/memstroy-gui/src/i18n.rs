@@ -111,8 +111,8 @@ fn ru_lookup(key: &str) -> Option<&'static str> {
         // Render menu
         "Render" => "Рендер",
         "\u{1F3AC} Render" => "\u{1F3AC} Рендер",
-        "Render full clip..." => "Рендер всего ролика…",
-        "\u{1F3A5} Render full clip..." => "\u{1F3A5} Рендер всего ролика…",
+        "Render full clip..." => "Рендер ролика…",
+        "\u{1F3A5} Render full clip..." => "\u{1F3A5} Рендер ролика…",
 
         // Tools menu
         // Note: the leading glyphs are gear/spanner (U+2699 / U+2692)
@@ -122,9 +122,25 @@ fn ru_lookup(key: &str) -> Option<&'static str> {
         "Tools" => "Инструменты",
         "\u{1F9E0} Tools" => "\u{1F9E0} Инструменты",
         "\u{2699} Tools" => "\u{2699} Инструменты",
-        "Skeleton Constructor..." => "Конструктор скелета…",
-        "\u{1F9B4} Skeleton Constructor..." => "\u{1F9B4} Конструктор скелета…",
-        "\u{2692} Skeleton Constructor..." => "\u{2692} Конструктор скелета…",
+        "Skeleton Constructor..." => "Скелет…",
+        "\u{1F9B4} Skeleton Constructor..." => "\u{1F9B4} Скелет…",
+        "\u{2692} Skeleton Constructor..." => "\u{2692} Скелет…",
+        "Web Image Search..." => "Поиск картинок…",
+        "\u{1F310} Web Image Search..." => "\u{1F310} Поиск картинок…",
+
+        // ── View menu ───────────────────────────────────────────
+        "View" => "Вид",
+        "\u{1F441} View" => "\u{1F441} Вид",
+        "Web Image Search" => "Поиск картинок",
+        "\u{1F310} Web Image Search" => "\u{1F310} Поиск картинок",
+        "Node Editor" => "Редактор узлов",
+        "\u{1F517} Node Editor" => "\u{1F517} Редактор узлов",
+        "Curve Editor" => "Редактор кривых",
+        "\u{1F4C8} Curve Editor" => "\u{1F4C8} Редактор кривых",
+        "Clip Editor" => "Редактор клипа",
+        "\u{2702} Clip Editor" => "\u{2702} Редактор клипа",
+        "Skeleton Editor" => "Редактор скелета",
+        "\u{2692} Skeleton Editor" => "\u{2692} Редактор скелета",
 
         // ── Top-bar status ──────────────────────────────────────
         "refreshing..." => "обновление…",
@@ -177,29 +193,166 @@ fn ru_lookup(key: &str) -> Option<&'static str> {
         "Position" => "Позиция",
         "Position X" => "Позиция X",
         "Position Y" => "Позиция Y",
+        "Position & Scale" => "Позиция и масштаб",
         "Scale" => "Масштаб",
+        "Scale X:" => "Масштаб X:",
+        "Scale Y:" => "Масштаб Y:",
+        "Scale (multiplier)" => "Масштаб (×)",
         "Stretch Y" => "Растяжение Y",
         "Rotation" => "Поворот",
         "Opacity" => "Прозрачность",
+        "Opacity:" => "Прозрачность:",
         "Flip X" => "Отражение X",
         "Flip Y" => "Отражение Y",
+        "Flip X:" => "Отр. X:",
+        "Flip Y:" => "Отр. Y:",
+        "Flip X all" => "Отр. X у всех",
+        "Flip Y all" => "Отр. Y у всех",
+        "Toggle horizontal flip on every selected element" =>
+            "Переключить горизонт. отражение для всех выбранных",
         "Visible" => "Видимо",
         "Source" => "Источник",
         "Color correction" => "Цветокоррекция",
+        "Color Correction" => "Цветокоррекция",
         "Brightness" => "Яркость",
         "Contrast" => "Контраст",
         "Saturation" => "Насыщенность",
         "Temperature" => "Температура",
         "Chroma key" => "Хромакей",
+        "Chroma Key" => "Хромакей",
         "Similarity" => "Допуск",
         "Blend" => "Смягчение",
         "Spill" => "Подавление цвета",
+        "Eyedropper" => "Пипетка",
+        "Pick color from preview" => "Взять цвет с превью",
+        "Click preview to pick color..." =>
+            "Кликните по превью, чтобы выбрать цвет…",
+        "Key:" => "Цвет:",
         "Toggle animation for this parameter" =>
             "Переключить анимацию параметра",
         "+ kf at playhead" => "+ кадр на позиции",
         "Add a keyframe at the current playhead" =>
             "Добавить ключевой кадр на текущей позиции",
         "Clear kfs" => "Очистить кадры",
+        "Static value (no keyframes yet)" =>
+            "Статическое значение (нет ключей)",
+        "Reset" => "Сброс",
+        "Reset all" => "Сбросить всё",
+        "Reset to 1.0x" => "Сбросить до 1.0x",
+        "Output" => "Вывод",
+        "Output resolution" => "Разрешение вывода",
+        "Render Frame" => "Кадр рендера",
+        "The output region. Move/resize/rotate it like any element." =>
+            "Область вывода. Двигайте/масштабируйте/поворачивайте как любой элемент.",
+        "Render frame has no keyframes." => "У кадра рендера нет ключей.",
+        "Camera editing coming soon." => "Редактирование камеры скоро.",
+        "elements selected" => "выбрано элементов",
+        "Edits below are applied as deltas to every element." =>
+            "Изменения применяются как дельта ко всем выделенным.",
+
+        // ── Color Correction inspector ─────────────────────────
+        "Basic" => "Базовые",
+        "Wheels" => "Колёса",
+        "Curves" => "Кривые",
+        "Master" => "Общий",
+        "Red" => "Красный",
+        "Green" => "Зелёный",
+        "Blue" => "Синий",
+        "Lift" => "Тени",
+        "Gamma" => "Гамма",
+        "Gain" => "Света",
+        "Click empty area: add point  •  Drag: move  •  Right-click: remove" =>
+            "Клик: добавить точку  •  Перетаскивание: двигать  •  ПКМ: удалить",
+
+        // ── Modifiers ──────────────────────────────────────────
+        "Animation Modifiers" => "Модификаторы анимации",
+        "No modifiers. Add one to perturb the animation \
+                 (wobble/shake/pulse/spin)." =>
+            "Нет модификаторов. Добавьте один, чтобы оживить анимацию (покач./тряска/пульс/вращ.).",
+        "Range" => "Диапазон",
+        "Always active" => "Всегда активно",
+        "Remove modifier" => "Удалить модификатор",
+        "+ Wobble" => "+ Покач.",
+        "+ Shake" => "+ Тряска",
+        "+ Pulse" => "+ Пульс",
+        "+ Spin" => "+ Вращ.",
+        "+ Walk" => "+ Шаг",
+        "Smooth sinusoidal sway" => "Плавное синусоидальное покачивание",
+        "High-frequency jitter" => "Высокочастотная тряска",
+        "Periodic scale breathing" => "Периодическое дыхание масштаба",
+        "Continuous rotation" => "Непрерывное вращение",
+        "Pendulum rotation imitating a walking gait (rocks left/right around upright)" =>
+            "Маятниковое покачивание, имитирующее шаги (наклоны влево/вправо)",
+        "Freq Hz" => "Частота, Гц",
+        "Cadence Hz" => "Шаг, Гц",
+        "Amp X (px)" => "Амп. X (px)",
+        "Amp Y (px)" => "Амп. Y (px)",
+        "Amp Rot \u{00B0}" => "Амп. поворота \u{00B0}",
+        "Amp Scale" => "Амп. масштаба",
+        "Phase" => "Фаза",
+        "Seed" => "Сид",
+        "Speed \u{00B0}/s" => "Скорость \u{00B0}/с",
+        "Sway \u{00B0}" => "Покач. \u{00B0}",
+        "Bob Y (px)" => "Подскок Y (px)",
+
+        // ── Effect stack ───────────────────────────────────────
+        "+ Add effect:" => "+ Добавить эффект:",
+        "No parameters." => "Без параметров.",
+        "Remove effect" => "Удалить эффект",
+        "Move up" => "Выше",
+        "Move down" => "Ниже",
+        "Remove all effects" => "Удалить все эффекты",
+        "clear" => "очистить",
+
+        // ── Text overlay inspector ─────────────────────────────
+        "Text:" => "Текст:",
+        "Font" => "Шрифт",
+        "Family:" => "Семейство:",
+        "Size:" => "Размер:",
+        "Color:" => "Цвет:",
+        "Width:" => "Толщина:",
+        "Bold" => "Жирный",
+        "Italic" => "Курсив",
+        "Align:" => "Выравн.:",
+        "Left" => "Слева",
+        "Center" => "По центру",
+        "Right" => "Справа",
+        "Stroke" => "Обводка",
+        "Stroke text" => "Обводка текста",
+        "Background plate" => "Подложка",
+        "Enable plate" => "Включить подложку",
+        "Type:" => "Тип:",
+        "Solid" => "Сплошная",
+        "Gradient" => "Градиент",
+        "Outline only" => "Только рамка",
+        "None (text only)" => "Нет (только текст)",
+        "Padding" => "Отступ",
+        "Corner radius" => "Скругление",
+        "Asymmetric width (px)" => "Асимм. ширина (px)",
+        "Extra left" => "Доб. слева",
+        "Extra right" => "Доб. справа",
+        "Plate border" => "Рамка подложки",
+        "Gradient end:" => "Конец градиента:",
+        "Decrease (-4)" => "Уменьшить (-4)",
+        "Increase (+4)" => "Увеличить (+4)",
+        "Synthesised on the bundled font by repainting glyphs \
+                     with sub-pixel offsets" =>
+            "Синтез жирного на встроенном шрифте через сдвиг подпикселей",
+        "Slants glyphs ~13° to the right" => "Наклон глифов ~13° вправо",
+
+        // ── Render frame / output ──────────────────────────────
+        "X:" => "X:",
+        "Y:" => "Y:",
+        "W:" => "Ш:",
+        "H:" => "В:",
+        "In:" => "Вход:",
+        "Out:" => "Выход:",
+        "Start:" => "Старт:",
+        "Duration:" => "Длит.:",
+        "Actor" => "Актёр",
+        "Image" => "Картинка",
+        "Video" => "Видео",
+        "Background" => "Фон",
 
         // ── Audio inspector ────────────────────────────────────
         "Audio" => "Аудио",
@@ -232,14 +385,32 @@ fn ru_lookup(key: &str) -> Option<&'static str> {
         "Timeline" => "Таймлайн",
         "Play" => "Воспроизвести",
         "Pause" => "Пауза",
+        "Play (Space)" => "Воспроизвести (Space)",
+        "Pause (Space)" => "Пауза (Space)",
         "Stop" => "Стоп",
-        "Loop" => "Зацикливание",
+        "Loop" => "Цикл",
         "\u{25B6} Playing" => "\u{25B6} Воспроизведение",
         "\u{23F8} Paused" => "\u{23F8} Пауза",
         "Snap" => "Привязка",
         "Razor" => "Лезвие",
         "Split at playhead" => "Разрезать в точке",
+        "Split tool: click anywhere on a clip to cut it at that position" =>
+            "Лезвие: кликните по клипу, чтобы разрезать его в этой точке",
+        "Add text overlay at playhead" => "Добавить текст на позиции воспроизведения",
+        "Loop preview: Shift+click on the ruler to set loop start, Shift+click again for end. \
+                Shift+drag = define a region." =>
+            "Зацикл. превью: Shift+клик по линейке — старт, ещё раз — конец. \
+             Shift+drag — выделить регион.",
         "Merge with next" => "Объединить со следующим",
+        "+ V Layer" => "+ V-слой",
+        "+ A Layer" => "+ A-слой",
+        "Add a new empty video layer at the top of the panel" =>
+            "Добавить пустой видео-слой сверху",
+        "Add a new empty audio layer below the existing audio block" =>
+            "Добавить пустой аудио-слой снизу",
+        "\u{2728} New video layer." => "\u{2728} Новый видео-слой.",
+        "\u{2728} New audio layer." => "\u{2728} Новый аудио-слой.",
+        "Clear multi-selection" => "Сбросить мульти-выделение",
 
         // ── Library panel ──────────────────────────────────────
         "Library" => "Библиотека",
@@ -257,6 +428,21 @@ fn ru_lookup(key: &str) -> Option<&'static str> {
         "Drop files here to import" => "Перетащите файлы сюда для импорта",
         "TG channel" => "TG-канал",
         "Limit" => "Лимит",
+        "Drag a clip onto the canvas or timeline. The library auto-updates from the assets-server (which periodically ingests from Telegram)." =>
+            "Перетащите клип на холст или таймлайн. Библиотека обновляется с сервера ассетов (он периодически тянет из Telegram).",
+        "User-imported videos. Drop a video file from your file manager into this panel to add it. Drag a row onto the canvas or timeline to spawn an actor." =>
+            "Импортированные видео. Перетащите видеофайл из проводника в эту панель, чтобы добавить. Затем — на холст или таймлайн, чтобы создать актёра.",
+        "Drop a sound onto the timeline to add it as an audio track. Drop audio files from your file manager here to import." =>
+            "Перетащите звук на таймлайн, чтобы добавить как аудио-дорожку. Аудиофайлы из проводника также импортируются сюда.",
+        "Drag a sticker onto the canvas to add it as an image overlay. Drop image files from your file manager here to import." =>
+            "Перетащите стикер на холст — добавится как картинка-оверлей. Файлы из проводника тоже импортируются сюда.",
+        "Drag a particle onto the canvas — it spawns with spin + pulse modifiers." =>
+            "Перетащите частицу на холст — добавится с модификаторами вращения и пульса.",
+        "No clips yet — start typing in the search box or scroll to fetch from the server." =>
+            "Клипов пока нет — начните печатать в поиске или прокрутите вниз, чтобы подгрузить с сервера.",
+        "Local (your imports)" => "Локальная (ваши импорты)",
+        "Global (built-in / browser)" => "Общая (встроенная / браузер)",
+        "server" => "сервер",
 
         // ── Misc / status messages ─────────────────────────────
         "\u{1F389} Refresh done!" => "\u{1F389} Обновление выполнено!",

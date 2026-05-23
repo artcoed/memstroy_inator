@@ -11,6 +11,11 @@ pub struct Track {
     pub kind: TrackKind,
     pub muted: bool,
     pub locked: bool,
+    /// Reserved for an upcoming "hide track from preview" toggle that
+    /// the timeline UI will surface next to `locked`. Kept on the
+    /// struct so existing scene-state files round-trip without losing
+    /// the field.
+    #[allow(dead_code)]
     pub visible: bool,
     /// Height in pixels (can be resized).
     pub height: f32,
@@ -737,6 +742,11 @@ impl EditorState {
         self.assets_root.join("assets").join("mellstroy")
     }
 
+    /// Path to a sidecar state file for the clips directory. Reserved
+    /// for an upcoming per-folder cache of last-used filters / scroll
+    /// position that other parts of the GUI haven't started writing
+    /// yet, but a couple of exporter scripts already read.
+    #[allow(dead_code)]
     pub fn state_path(&self) -> PathBuf {
         self.clips_dir().join("state.json")
     }
@@ -1894,6 +1904,7 @@ pub enum MaskTool {
 }
 
 impl MaskTool {
+    #[allow(dead_code)]
     pub fn is_active(self) -> bool { self != MaskTool::None }
     pub fn label(self) -> &'static str {
         match self {
