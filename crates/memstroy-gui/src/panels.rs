@@ -6319,7 +6319,7 @@ fn sel_for_victim(victim: VictimKind) -> Selection {
 /// entries with key == `removed` are deleted, and entries with key
 /// > `removed` are re-keyed down by one — same scheme used by
 /// `EditorState::insert_video_track_at_*` for inserts, but in reverse.
-fn shift_assignments_after_remove(
+pub(crate) fn shift_assignments_after_remove(
     map: &mut std::collections::HashMap<usize, usize>,
     removed: usize,
 ) {
@@ -11195,6 +11195,15 @@ pub(crate) fn remove_audio_bound_to_actor(state: &mut EditorState, actor_id: &st
     while i < state.scene.audio.len() {
         if state.scene.audio[i].parent_actor.as_deref() == Some(actor_id) {
             state.scene.audio.remove(i);
+            // Same-index side-tables (waveforms, extract results) and
+            // the {idx -> track} assignment map all need to slide down
+            // by one or the next-actor's audio renders / draws under
+            // the wrong row. Mirrors the bookkeeping `apply_remove`
+            // does for timeline-driven removals.
+            if i < state.audio_waveforms.len() {
+                state.audio_waveforms.remove(i);
+            }
+            shift_assignments_after_remove(&mut state.audio_track_assignments, i);
             removed.push(i);
         } else {
             i += 1;
@@ -11349,10 +11358,10 @@ fn probe_video_duration(path: &PathBuf) -> f32 {
         p.set_file_name("ffprobe");
         if !p.exists() { PathBuf::from("ffprobe") } else { p }
     };
-    match std::process::Command::new(&ffprobe)
-        .args(["-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1"])
-        .arg(path).output()
-    {
+    let mut cmd = std::process::Command::new(&ffprobe);
+    cmd.args(["-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1"])
+        .arg(path);
+    match memstroy_render::hide_console_std(&mut cmd).output() {
         Ok(out) => String::from_utf8_lossy(&out.stdout).trim().parse::<f32>().unwrap_or(5.0),
         Err(_) => 5.0,
     }

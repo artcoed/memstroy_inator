@@ -4071,23 +4071,17 @@ fn compensate_children_after_render_frame_change(state: &mut EditorState, t: f32
                 else if t < t_in { 0.0 } else { (t_out - t_in).max(0.0) };
             let new_norm_x = (world_xy[0] - frame_tl_x) / world_w;
             let new_norm_y = (world_xy[1] - frame_tl_y) / world_h;
-            // Find or create the keyframe nearest sample_t (overlay
-            // keyframes are clip-local). Mutate the closest one so the
-            // compensation lands on the kf the user is currently
-            // viewing rather than spawning a fresh kf per frame.
+            // Insert a kf at sample_t (seeded with the current eased
+            // value) when one isn't already there, then write the
+            // compensated pos to it. The previous "closest within 0.5s"
+            // heuristic silently no-op'd whenever the playhead sat in
+            // the middle of a long segment, which is the bug the user
+            // saw as "elements drift along with the render frame".
+            ensure_overlay_kf_at_playhead(layout, sample_t);
             let eps = 1.0e-3;
-            if let Some(kf) = layout
-                .iter_mut()
-                .min_by(|a, b| {
-                    (a.t - sample_t).abs()
-                        .partial_cmp(&(b.t - sample_t).abs())
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-            {
-                if (kf.t - sample_t).abs() < 0.5 + eps {
-                    kf.value.pos[0] = new_norm_x;
-                    kf.value.pos[1] = new_norm_y;
-                }
+            if let Some(kf) = layout.iter_mut().find(|kf| (kf.t - sample_t).abs() < eps) {
+                kf.value.pos[0] = new_norm_x;
+                kf.value.pos[1] = new_norm_y;
             }
         }
     }
@@ -4098,17 +4092,15 @@ fn compensate_children_after_render_frame_change(state: &mut EditorState, t: f32
         if let Some(actor) = state.scene.actors.get_mut(idx) {
             let new_norm_x = (world_xy[0] - frame_tl_x) / world_w;
             let new_norm_y = (world_xy[1] - frame_tl_y) / world_h;
-            // Actor legacy kfs are scene-time anchored; pick the
-            // nearest one to the drag-start playhead.
-            if let Some(kf) = actor
-                .layout
-                .iter_mut()
-                .min_by(|a, b| {
-                    (a.t - t).abs()
-                        .partial_cmp(&(b.t - t).abs())
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-            {
+            // Same upsert pattern — guarantee a kf at scene-time `t`
+            // before writing so compensation always lands on the right
+            // moment instead of polluting whatever kf happened to be
+            // closest. Without this the actor's first kf would be
+            // mutated even when the playhead is many seconds away,
+            // which made the actor visibly snap to a new spot at t=0.
+            ensure_actor_kf_at_playhead(&mut actor.layout, t);
+            let eps = 1.0e-3;
+            if let Some(kf) = actor.layout.iter_mut().find(|kf| (kf.t - t).abs() < eps) {
                 kf.value.pos[0] = new_norm_x;
                 kf.value.pos[1] = new_norm_y;
             }
