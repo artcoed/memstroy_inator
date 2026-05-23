@@ -1024,6 +1024,61 @@ fn inspector_overlay_param_strip<F>(
     }
 }
 
+/// Per-param keyframe strip for the render frame inspector. Mirrors
+/// `inspector_actor_param_strip` — render-frame keyframes are stored in
+/// scene-time so we don't need the t_in offset.
+fn inspector_render_frame_param_strip<F>(
+    ui: &mut egui::Ui,
+    layout: &mut Vec<Keyframe<memstroy_core::RenderFrameState>>,
+    playhead_scene: f32,
+    get: F,
+    salt: impl std::hash::Hash + Copy,
+) where
+    F: Fn(&memstroy_core::RenderFrameState) -> f32,
+{
+    if layout.len() < 2 {
+        return;
+    }
+    const EPS: f32 = 1.0e-4;
+    let mut indices: Vec<usize> = Vec::with_capacity(layout.len());
+    indices.push(0);
+    for i in 1..layout.len() {
+        if (get(&layout[i].value) - get(&layout[i - 1].value)).abs() > EPS {
+            indices.push(i);
+        }
+    }
+    if indices.len() < 2 {
+        return;
+    }
+    let times: Vec<f32> = indices.iter().map(|&i| layout[i].t.max(0.0)).collect();
+    let easings: Vec<memstroy_core::Easing> =
+        indices.iter().map(|&i| layout[i].easing).collect();
+
+    let max_kf_t = times.iter().cloned().fold(0.0_f32, f32::max);
+    let dur = max_kf_t.max(playhead_scene).max(1.0);
+
+    let interaction = crate::kf_anim::keyframe_strip(
+        ui,
+        &times,
+        &easings,
+        dur,
+        Some(playhead_scene.max(0.0)),
+        salt,
+    );
+
+    if let Some((strip_idx, new_t)) = interaction.dragged_idx_to {
+        if let Some(&kf_idx) = indices.get(strip_idx) {
+            layout[kf_idx].t = new_t.max(0.0);
+            layout.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
+        }
+    }
+    if let Some((strip_idx, easing)) = interaction.easing_changed {
+        if let Some(&kf_idx) = indices.get(strip_idx) {
+            layout[kf_idx].easing = easing;
+        }
+    }
+}
+
 
 fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
     use crate::kf_anim;
@@ -3606,13 +3661,30 @@ fn inspector_render_frame(ui: &mut egui::Ui, state: &mut EditorState) {
         ui.add_space(4.0);
 
         // ─── Rotation ────────────────────────────────────────────
-        ui.add(
-            egui::Slider::new(&mut kf.value.rotation_deg, -180.0..=180.0)
-                .text("Rotation")
-                .step_by(0.1)
-                .fixed_decimals(1)
-                .smart_aim(false),
-        );
+        let mut new_rot = kf.value.rotation_deg;
+        ui.horizontal(|ui| {
+            ui.label("Rotation");
+            let prev_rot = new_rot;
+            circular_rotation_widget(ui, ("rf_rot",), &mut new_rot, 80.0);
+            let mut dial_changed = (new_rot - prev_rot).abs() > 1.0e-4;
+            ui.vertical(|ui| {
+                let r = ui.add(
+                    egui::DragValue::new(&mut new_rot)
+                        .range(-3600.0..=3600.0)
+                        .speed(0.5)
+                        .suffix("\u{00B0}")
+                        .fixed_decimals(1),
+                );
+                if r.changed() { dial_changed = true; }
+                if ui.small_button("0\u{00B0}").clicked() {
+                    new_rot = 0.0;
+                    dial_changed = true;
+                }
+            });
+            if dial_changed {
+                kf.value.rotation_deg = new_rot;
+            }
+        });
         ui.add_space(4.0);
 
         // ─── Scale ──────────────────────────────────────────────
@@ -3640,6 +3712,25 @@ fn inspector_render_frame(ui: &mut egui::Ui, state: &mut EditorState) {
                 .color(COL_TEXT_DIM),
         );
     }
+
+    // ─── Per-param keyframe strips ──────────────────────────────
+    // Render-frame keyframes show up in the inspector exactly like a
+    // regular video element's: one strip per animated parameter, with
+    // a diamond per keyframe at its scene-time. The strips appear
+    // automatically as soon as `layout` has more than one keyframe.
+    ui.add_space(6.0);
+    inspector_render_frame_param_strip(
+        ui, &mut rf.layout, rf_t_local, |s| s.pos.x, ("rf_strip_px",),
+    );
+    inspector_render_frame_param_strip(
+        ui, &mut rf.layout, rf_t_local, |s| s.pos.y, ("rf_strip_py",),
+    );
+    inspector_render_frame_param_strip(
+        ui, &mut rf.layout, rf_t_local, |s| s.zoom, ("rf_strip_zoom",),
+    );
+    inspector_render_frame_param_strip(
+        ui, &mut rf.layout, rf_t_local, |s| s.rotation_deg, ("rf_strip_rot",),
+    );
 
     ui.add_space(8.0);
     ui.separator();
@@ -4280,6 +4371,333 @@ pub(crate) enum MovedClipKind {
     Overlay(usize),
     Audio(usize),
     Background(usize),
+}
+
+impl MovedClipKind {
+    fn to_pending(self) -> crate::state::PendingOverlapMover {
+        use crate::state::PendingOverlapMover as P;
+        match self {
+            MovedClipKind::Actor(i) => P::Actor(i),
+            MovedClipKind::Overlay(i) => P::Overlay(i),
+            MovedClipKind::Audio(i) => P::Audio(i),
+            MovedClipKind::Background(i) => P::Background(i),
+        }
+    }
+}
+
+impl From<crate::state::PendingOverlapMover> for MovedClipKind {
+    fn from(p: crate::state::PendingOverlapMover) -> Self {
+        use crate::state::PendingOverlapMover as P;
+        match p {
+            P::Actor(i) => MovedClipKind::Actor(i),
+            P::Overlay(i) => MovedClipKind::Overlay(i),
+            P::Audio(i) => MovedClipKind::Audio(i),
+            P::Background(i) => MovedClipKind::Background(i),
+        }
+    }
+}
+
+/// Defer a mover's overlap-trim pass to the end of the drag. The
+/// caller supplies the same `MovedClipKind` it would otherwise pass
+/// to `enforce_no_overlap_on_layer`; we record it on the timeline
+/// drag state and the timeline panel's pointer-up handler drains the
+/// queue, calling `enforce_no_overlap_on_layer` once per unique
+/// mover. This keeps neighbouring clips intact while the user is
+/// still dragging — they're only trimmed on release, the moment the
+/// final position is committed.
+fn defer_overlap_resolution(state: &mut EditorState, mover: MovedClipKind) {
+    state.timeline_drag.pending_overlap.push(mover.to_pending());
+}
+
+// ─── TIMELINE MARQUEE (RUBBER-BAND) SELECTION ────────────────────────
+//
+// Drag from an empty area of the tracks viewport to lasso a group of
+// clips. Pressing Ctrl/Shift while starting the drag *adds* to the
+// existing multi-selection; otherwise it replaces the set. Implemented
+// in screen-space because the timeline already operates in screen
+// pixels — there's no benefit to converting through a world-space
+// anchor like the canvas marquee uses.
+
+/// Compute the X-range of a clip on the timeline given its (t_in, t_out)
+/// in scene-time. Returns `Some((x0, x1))` when at least part of the clip
+/// is visible on the current scroll / zoom; otherwise `None`.
+fn clip_screen_x_range(
+    t_in: f32,
+    t_out: f32,
+    scroll: f32,
+    pps: f32,
+    track_left: f32,
+    track_right: f32,
+) -> Option<(f32, f32)> {
+    let x0 = (t_in - scroll) * pps + track_left;
+    let x1 = (t_out - scroll) * pps + track_left;
+    let x0c = x0.clamp(track_left, track_right);
+    let x1c = x1.clamp(track_left, track_right);
+    if x1c > x0c + 0.001 {
+        Some((x0c, x1c))
+    } else {
+        None
+    }
+}
+
+/// Iterate every clip on the timeline (actors, overlays, audio,
+/// backgrounds, render frame) and call `f(selection, screen_rect)`
+/// when the clip has a visible screen rectangle on the current
+/// scroll / zoom. Used by the marquee commit pass.
+fn for_each_clip_screen_rect(
+    state: &EditorState,
+    track_rows: &[(f32, f32)],
+    tracks_rect: egui::Rect,
+    rf_row_h: f32,
+    v_scroll: f32,
+    pps: f32,
+    track_left: f32,
+    track_right: f32,
+    mut f: impl FnMut(Selection, egui::Rect),
+) {
+    let scene_dur = state.scene.output.duration.max(0.0);
+
+    // ── Render frame row sits above all real tracks ──
+    {
+        let row_top = tracks_rect.min.y - v_scroll;
+        let row_bot = row_top + rf_row_h;
+        if row_bot > tracks_rect.min.y - 1.0 && row_top < tracks_rect.max.y + 1.0 {
+            if let Some((x0, x1)) =
+                clip_screen_x_range(0.0, scene_dur, state.timeline_scroll, pps, track_left, track_right)
+            {
+                f(
+                    Selection::RenderFrame,
+                    egui::Rect::from_min_max(
+                        egui::pos2(x0, row_top),
+                        egui::pos2(x1, row_bot),
+                    ),
+                );
+            }
+        }
+    }
+
+    let video_indices: Vec<usize> = state.video_track_indices();
+    let default_overlay_lane = if video_indices.len() >= 2 {
+        video_indices[1]
+    } else {
+        video_indices.first().copied().unwrap_or(0)
+    };
+    let first_video_lane = video_indices.first().copied().unwrap_or(0);
+
+    // ── Backgrounds (pinned to the topmost video lane in the panel) ──
+    if let Some(&(top, bot)) = track_rows.first() {
+        for (bi, bg) in state.scene.backgrounds.iter().enumerate() {
+            if let Some((x0, x1)) = clip_screen_x_range(
+                bg.start,
+                bg.start + bg.duration,
+                state.timeline_scroll,
+                pps,
+                track_left,
+                track_right,
+            ) {
+                f(
+                    Selection::Background(bi),
+                    egui::Rect::from_min_max(egui::pos2(x0, top), egui::pos2(x1, bot)),
+                );
+            }
+        }
+        let _ = first_video_lane; // currently unused beyond the assignment
+    }
+
+    // ── Actors ──
+    for (ai, actor) in state.scene.actors.iter().enumerate() {
+        let lane = state
+            .actor_track_assignments
+            .get(&ai)
+            .copied()
+            .unwrap_or(first_video_lane);
+        let Some(&(top, bot)) = track_rows.get(lane) else { continue; };
+        let t_in = actor.t_in.unwrap_or(0.0);
+        let t_out = actor.t_out.unwrap_or(scene_dur);
+        if let Some((x0, x1)) = clip_screen_x_range(
+            t_in, t_out, state.timeline_scroll, pps, track_left, track_right,
+        ) {
+            f(
+                Selection::Actor(ai),
+                egui::Rect::from_min_max(egui::pos2(x0, top), egui::pos2(x1, bot)),
+            );
+        }
+    }
+
+    // ── Overlays ──
+    for (oi, ov) in state.scene.overlays.iter().enumerate() {
+        let lane = state
+            .overlay_track_assignments
+            .get(&oi)
+            .copied()
+            .unwrap_or(default_overlay_lane);
+        let Some(&(top, bot)) = track_rows.get(lane) else { continue; };
+        let (t_in, t_out) = match ov {
+            Overlay::Text(t) => (t.t_in, t.t_out),
+            Overlay::Image(im) => (im.t_in, im.t_out),
+            Overlay::Video(v) => (v.t_in, v.t_out),
+        };
+        if let Some((x0, x1)) = clip_screen_x_range(
+            t_in, t_out, state.timeline_scroll, pps, track_left, track_right,
+        ) {
+            f(
+                Selection::Overlay(oi),
+                egui::Rect::from_min_max(egui::pos2(x0, top), egui::pos2(x1, bot)),
+            );
+        }
+    }
+
+    // ── Audio ──
+    let audio_indices: Vec<usize> = state.audio_track_indices();
+    for (aui, au) in state.scene.audio.iter().enumerate() {
+        let lane = state
+            .audio_track_assignments
+            .get(&aui)
+            .copied()
+            .unwrap_or_else(|| {
+                if audio_indices.is_empty() {
+                    0
+                } else {
+                    audio_indices[aui % audio_indices.len()]
+                }
+            });
+        let Some(&(top, bot)) = track_rows.get(lane) else { continue; };
+        let t_in = au.t_in;
+        let t_out = au.t_out.unwrap_or(scene_dur);
+        if let Some((x0, x1)) = clip_screen_x_range(
+            t_in, t_out, state.timeline_scroll, pps, track_left, track_right,
+        ) {
+            f(
+                Selection::Audio(aui),
+                egui::Rect::from_min_max(egui::pos2(x0, top), egui::pos2(x1, bot)),
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn timeline_marquee_update(
+    ui: &mut egui::Ui,
+    state: &mut EditorState,
+    tracks_rect: egui::Rect,
+    track_rows: &[(f32, f32)],
+    rf_row_h: f32,
+    v_scroll: f32,
+    pps: f32,
+    track_left: f32,
+    track_right: f32,
+) {
+    // Don't compete for the pointer with active clip / asset drags.
+    let drag_in_flight = state.timeline_drag.dragging_clip.is_some()
+        || state.asset_drag.dragging.is_some();
+
+    let id = egui::Id::new(("timeline_marquee_interact",));
+    let resp = ui.interact(tracks_rect, id, egui::Sense::click_and_drag());
+
+    // Start a marquee gesture only if no other timeline drag picked up
+    // the press first this frame.
+    if state.timeline_marquee.is_none()
+        && resp.drag_started()
+        && !drag_in_flight
+    {
+        if let Some(p) = resp.interact_pointer_pos() {
+            // Reject presses on the header column / scrollbars by
+            // checking that the press point lies inside the tracks
+            // rectangle proper.
+            if tracks_rect.contains(p) {
+                let extend = ui.input(|i| {
+                    i.modifiers.ctrl || i.modifiers.shift || i.modifiers.command
+                });
+                state.timeline_marquee = Some(crate::state::TimelineMarquee {
+                    start: p,
+                    end: p,
+                });
+                if !extend {
+                    // Replace gesture: clear any old multi-selection
+                    // when the marquee begins; the commit pass below
+                    // will re-populate it. We do NOT touch the primary
+                    // `selection` until commit so a tiny accidental
+                    // drag (smaller than 2 px) leaves it intact.
+                    state.canvas_selection.clear();
+                }
+            }
+        }
+    }
+
+    // Update / draw the live marquee while dragging.
+    if let Some(mut m) = state.timeline_marquee {
+        if let Some(p) = ui
+            .input(|i| i.pointer.interact_pos().or_else(|| i.pointer.hover_pos()))
+        {
+            m.end = p;
+            state.timeline_marquee = Some(m);
+        }
+        let painter = ui.painter_at(tracks_rect);
+        let rect = m.rect();
+        painter.rect_filled(
+            rect,
+            Rounding::ZERO,
+            Color32::from_rgba_premultiplied(255, 220, 80, 30),
+        );
+        painter.rect_stroke(
+            rect,
+            Rounding::ZERO,
+            Stroke::new(1.0, Color32::from_rgb(255, 220, 80)),
+        );
+    }
+
+    // Commit on pointer release.
+    let any_pointer_down = ui.input(|i| i.pointer.any_down());
+    if !any_pointer_down {
+        if let Some(m) = state.timeline_marquee.take() {
+            let rect = m.rect();
+            // Reject zero-size lassos — treat as a click that just
+            // clears the selection (the canvas marquee uses the same
+            // 2-px threshold for parity).
+            if rect.width().abs() < 2.0 || rect.height().abs() < 2.0 {
+                return;
+            }
+            let extend = ui.input(|i| {
+                i.modifiers.ctrl || i.modifiers.shift || i.modifiers.command
+            });
+            if !extend {
+                state.canvas_selection.clear();
+            }
+            let mut hits: Vec<Selection> = Vec::new();
+            for_each_clip_screen_rect(
+                state,
+                track_rows,
+                tracks_rect,
+                rf_row_h,
+                v_scroll,
+                pps,
+                track_left,
+                track_right,
+                |sel, clip_rect| {
+                    if rect.intersects(clip_rect) {
+                        hits.push(sel);
+                    }
+                },
+            );
+            for h in hits {
+                if !state.canvas_selection.contains(&h) {
+                    state.canvas_selection.push(h);
+                }
+            }
+            // Update the primary selection so the inspector still has
+            // a focused element. Prefer keeping the existing primary
+            // when it's still in the new set; otherwise pick the
+            // first hit (which corresponds to the topmost / scene-
+            // earliest clip caught by the lasso).
+            if state.canvas_selection.is_empty() {
+                if !extend {
+                    state.selection = Selection::None;
+                }
+            } else if !state.canvas_selection.iter().any(|s| *s == state.selection) {
+                state.selection = state.canvas_selection[0];
+            }
+        }
+    }
 }
 
 /// Enforce the "one clip per layer at a time" rule for the given
@@ -5502,6 +5920,12 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     let v_zoom = state.timeline_v_zoom.max(0.1);
     let num_tracks = state.tracks.len();
 
+    // Height of the dedicated Render Frame row pinned to the top of the
+    // tracks viewport. Mirrors the base track height so it visually
+    // matches the rest of the panel.
+    const RF_ROW_BASE_H: f32 = 40.0;
+    let rf_row_h: f32 = RF_ROW_BASE_H * v_zoom;
+
     // ── Pre-compute per-track row rectangles for vertical drag-resolution ──
     // (used by clip-drag handlers below to figure out which track the pointer
     // currently hovers over, and whether the user is dragging above the
@@ -5511,7 +5935,10 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     // hit-test recognises the whole row as one lane.
     let mut track_rows: Vec<(f32, f32)> = Vec::with_capacity(num_tracks);
     {
-        let mut acc = 0.0_f32;
+        // Reserve space for the Render Frame row at the top — every
+        // real track is shifted down by `rf_row_h` so the layout
+        // stays consistent.
+        let mut acc = rf_row_h;
         for (ti, tk) in state.tracks.iter().enumerate() {
             let h = tk.height * v_zoom + selected_layer_expansion(state, ti, v_zoom);
             let top = tracks_rect.min.y + acc - state.timeline_v_scroll;
@@ -5631,9 +6058,11 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
 
     // Total scaled height needed to fit all tracks at the current v_zoom,
     // including any per-param keyframe-row expansion on the selected layer.
-    let total_tracks_h: f32 = (0..num_tracks)
-        .map(|i| state.tracks[i].height * v_zoom + selected_layer_expansion(state, i, v_zoom))
-        .sum();
+    // The dedicated Render Frame row is added once at the top.
+    let total_tracks_h: f32 = rf_row_h
+        + (0..num_tracks)
+            .map(|i| state.tracks[i].height * v_zoom + selected_layer_expansion(state, i, v_zoom))
+            .sum::<f32>();
     let max_v_scroll = (total_tracks_h - viewport_h).max(0.0);
     state.timeline_v_scroll = state.timeline_v_scroll.max(0.0).min(max_v_scroll);
     let v_scroll = state.timeline_v_scroll;
@@ -5643,7 +6072,101 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     // the clip-draw / drag handlers above.
     let mut param_row_clicks: Vec<(crate::kf_anim::SelectedLayer, ParamRowClick)> = Vec::new();
 
-    let mut acc_y = 0.0_f32;
+    // ── Render Frame row (always at the top of the panel) ──
+    // The render frame is the "where do we crop the output" rectangle,
+    // not a regular layer — but the user thinks of it as one and
+    // expects to see its keyframes in the timeline. We give it its own
+    // dedicated row above all tracks. The row scrolls with the rest of
+    // the timeline (it's not sticky) so users with very tall scenes
+    // can still scroll past it.
+    {
+        let row_top = tracks_rect.min.y - v_scroll;
+        let row_bot = row_top + rf_row_h;
+
+        if row_bot >= tracks_rect.min.y - 1.0 && row_top <= tracks_rect.max.y + 1.0 {
+            let row_rect = egui::Rect::from_min_max(
+                egui::pos2(tracks_rect.min.x, row_top),
+                egui::pos2(tracks_rect.max.x, row_bot),
+            );
+            let painter_rf = &tracks_painter;
+            let rf_selected = state.selection == Selection::RenderFrame;
+            let bg_color = if rf_selected {
+                Color32::from_rgb(58, 38, 38)
+            } else {
+                Color32::from_rgb(40, 28, 32)
+            };
+            painter_rf.rect_filled(row_rect, Rounding::ZERO, bg_color);
+            // Top/bottom separators so the row stands out from the
+            // ruler and the regular tracks.
+            painter_rf.line_segment(
+                [
+                    egui::pos2(tracks_rect.min.x, row_top),
+                    egui::pos2(tracks_rect.max.x, row_top),
+                ],
+                Stroke::new(1.0, Color32::from_rgb(120, 60, 60)),
+            );
+            painter_rf.line_segment(
+                [
+                    egui::pos2(tracks_rect.min.x, row_bot),
+                    egui::pos2(tracks_rect.max.x, row_bot),
+                ],
+                Stroke::new(1.0, Color32::from_rgb(120, 60, 60)),
+            );
+
+            // Header label on the left column.
+            let hdr_rect = egui::Rect::from_min_max(
+                egui::pos2(header_col_rect.min.x, row_top),
+                egui::pos2(header_col_rect.max.x, row_bot),
+            );
+            header_painter.rect_filled(
+                hdr_rect,
+                Rounding::ZERO,
+                Color32::from_rgb(60, 30, 30),
+            );
+            header_painter.text(
+                hdr_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "Render Frame",
+                egui::FontId::proportional(11.0),
+                Color32::from_rgb(255, 180, 180),
+            );
+
+            // Diamond row showing every render-frame keyframe at its
+            // scene-time. Re-uses the same renderer used for actor /
+            // overlay clip-bars so the diamonds look identical.
+            let content_rect_rf = egui::Rect::from_min_max(
+                egui::pos2(tracks_rect.min.x, row_top + 1.0),
+                egui::pos2(tracks_rect.max.x, row_bot - 1.0),
+            );
+            let scene_dur = state.scene.output.duration.max(0.0);
+            let rf_layout = state.scene.render_frame.layout.clone();
+            draw_keyframe_diamonds(
+                painter_rf,
+                content_rect_rf,
+                0.0,
+                scene_dur,
+                &rf_layout,
+                state.timeline_scroll,
+                pps,
+                track_left,
+                track_right,
+                rf_selected,
+                true, // render-frame kfs are scene-time anchored
+            );
+
+            // Click anywhere inside the render-frame row to select it.
+            // We allocate a click sense over the row content area so
+            // the click interaction is independent of any sub-clip
+            // hit-test.
+            let row_id = egui::Id::new(("timeline_rf_row",));
+            let row_resp = ui.interact(content_rect_rf, row_id, Sense::click());
+            if row_resp.clicked() {
+                to_select = Some(Selection::RenderFrame);
+            }
+        }
+    }
+
+    let mut acc_y = rf_row_h;
     for track_idx in 0..num_tracks {
         let track = &state.tracks[track_idx];
         let track_h = track.height * v_zoom;
@@ -5769,15 +6292,9 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                     s.backgrounds[bi].start = new_start;
                                     s.backgrounds[bi].duration = dur;
                                 });
-                                let updated = enforce_no_overlap_on_layer(
-                                    state,
-                                    MovedClipKind::Background(bi),
-                                    token,
-                                );
-                                let bi_eff = match updated {
-                                    MovedClipKind::Background(i) => i,
-                                    _ => bi,
-                                };
+                                // Defer overlap-trim until the drag ends.
+                                defer_overlap_resolution(state, MovedClipKind::Background(bi));
+                                let bi_eff = bi;
                                 to_select = Some(Selection::Background(bi_eff));
                             } else if state.split_tool_active {
                                 to_select = Some(Selection::Background(bi));
@@ -5846,17 +6363,11 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                     ));
                                 }
                             });
-                            // Trim/split/remove any neighbours we now
-                            // overlap on the same lane.
-                            let updated = enforce_no_overlap_on_layer(
-                                state,
-                                MovedClipKind::Actor(ai),
-                                token,
-                            );
-                            let ai_eff = match updated {
-                                MovedClipKind::Actor(i) => i,
-                                _ => ai,
-                            };
+                            // Defer overlap-trim until the drag ends —
+                            // neighbours stay intact while the clip is
+                            // still being moved.
+                            defer_overlap_resolution(state, MovedClipKind::Actor(ai));
+                            let ai_eff = ai;
                             // Bound audio: shift its in-edge by the same delta and
                             // advance source_start so the playback head doesn't slip.
                             sync_audio_to_actor(state, ai_eff);
@@ -6297,18 +6808,11 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                     }
                                 }
                             }
-                            // Trim/split/remove neighbours that this
-                            // overlay just collided with on its (now
-                            // possibly-different) lane.
-                            let updated = enforce_no_overlap_on_layer(
-                                state,
-                                MovedClipKind::Overlay(oi),
-                                token,
-                            );
-                            let oi_eff = match updated {
-                                MovedClipKind::Overlay(i) => i,
-                                _ => oi,
-                            };
+                            // Defer overlap-trim until the drag ends —
+                            // neighbours stay intact while the overlay
+                            // is still being moved.
+                            defer_overlap_resolution(state, MovedClipKind::Overlay(oi));
+                            let oi_eff = oi;
                             to_select = Some(Selection::Overlay(oi_eff));
                         } else if state.split_tool_active {
                             to_select = Some(Selection::Overlay(oi));
@@ -6563,18 +7067,11 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                     }
                                 }
                             }
-                            // Trim/split/remove neighbours that the
-                            // audio just collided with on its (now
-                            // possibly-different) lane.
-                            let updated = enforce_no_overlap_on_layer(
-                                state,
-                                MovedClipKind::Audio(aui),
-                                token,
-                            );
-                            let aui_eff = match updated {
-                                MovedClipKind::Audio(i) => i,
-                                _ => aui,
-                            };
+                            // Defer overlap-trim until the drag ends —
+                            // neighbours stay intact while the audio is
+                            // still being moved.
+                            defer_overlap_resolution(state, MovedClipKind::Audio(aui));
+                            let aui_eff = aui;
                             to_select = Some(Selection::Audio(aui_eff));
                         } else {
                             to_select = Some(Selection::Audio(aui));
@@ -7103,6 +7600,25 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     // ── Reset drag state when mouse is released (no active drag) ──
     let any_dragging = ui.input(|i| i.pointer.any_down());
     if !any_dragging {
+        // Drain any deferred overlap-resolution requests collected
+        // during the gesture and apply them once. We dedupe so the
+        // same clip isn't resolved repeatedly when the user drags
+        // through several track positions.
+        let pending = std::mem::take(&mut state.timeline_drag.pending_overlap);
+        if !pending.is_empty() {
+            let drop_token = EditorState::drag_token("overlap_resolve_end", 0);
+            state.mutate_drag(drop_token, |_| {});
+            let mut seen: std::collections::HashSet<crate::state::PendingOverlapMover> =
+                std::collections::HashSet::new();
+            // The mover indices may shift as enforce_* deletes / splits
+            // neighbours; for a single mover we just apply once.
+            for entry in pending {
+                if !seen.insert(entry) { continue; }
+                let _ = enforce_no_overlap_on_layer(state, entry.into(), drop_token);
+            }
+            state.end_drag_group();
+        }
+
         state.timeline_drag.dragging_clip = None;
         state.timeline_drag.pending_new_lane = None;
         state.timeline_drag.start_pointer_y = None;
@@ -7116,6 +7632,25 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             state.element_drag.label.clear();
         }
     }
+
+    // ── Marquee (rubber-band) selection on the timeline ──
+    // Mirrors the canvas marquee but in screen coords. Triggered when
+    // the user starts dragging on an empty area of the tracks viewport
+    // (no clip / asset / clip-trim drag in flight). On release, every
+    // clip whose screen rectangle intersects the lasso is added to
+    // `state.canvas_selection` (the same multi-selection set used by
+    // the canvas, so Ctrl+C copies them all together).
+    timeline_marquee_update(
+        ui,
+        state,
+        tracks_rect,
+        track_rows.as_slice(),
+        rf_row_h,
+        v_scroll,
+        pps,
+        track_left,
+        track_right,
+    );
 }
 
 
@@ -7950,6 +8485,13 @@ fn keyframe_times_for_layer(state: &EditorState, sel: Selection) -> Vec<f32> {
                 Overlay::Video(v) => v.layout.iter().map(|kf| kf.t).collect(),
             })
             .unwrap_or_default(),
+        Selection::RenderFrame => state
+            .scene
+            .render_frame
+            .layout
+            .iter()
+            .map(|kf| kf.t)
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -8066,11 +8608,47 @@ fn compute_param_change_points(
             }
         }
         _ => {
-            // RenderFrame / unknown layers fall through with an empty
-            // map. The per-param rows only render for actors and
-            // overlays right now (selected_layer_animated_params already
-            // filters those upstream), so this is a no-op for them.
+            // RenderFrame is handled below; any other selection (None,
+            // Background, Audio, Camera) has no per-param strip in the
+            // timeline expansion area, so it falls through with an
+            // empty map.
         }
+    }
+
+    // Render frame keyframes are scene-time anchored (no t_in/t_out)
+    // and the four animatable parameters mirror the inspector.
+    if matches!(sel, Selection::RenderFrame) {
+        let rf = &state.scene.render_frame;
+        let layout: &[Keyframe<RenderFrameState>] = &rf.layout;
+
+        fn changed_rf<F>(layout: &[Keyframe<RenderFrameState>], get: F) -> Vec<f32>
+        where
+            F: Fn(&RenderFrameState) -> f32,
+        {
+            const EPS: f32 = 1.0e-4;
+            if layout.len() < 2 { return Vec::new(); }
+            let mut times: Vec<f32> = Vec::new();
+            times.push(layout[0].t);
+            for win in layout.windows(2) {
+                let (prev, cur) = (&win[0].value, &win[1].value);
+                if (get(cur) - get(prev)).abs() > EPS {
+                    times.push(win[1].t);
+                }
+            }
+            times
+        }
+
+        out.insert(p::POS_X.to_string(),
+            pairs(changed_rf(layout, |s| s.pos.x), sel));
+        out.insert(p::POS_Y.to_string(),
+            pairs(changed_rf(layout, |s| s.pos.y), sel));
+        // The render frame uses `zoom` instead of `scale` internally;
+        // expose it under the SCALE param id so existing inspector /
+        // timeline pipes treat it like the actor / overlay scale row.
+        out.insert(p::SCALE.to_string(),
+            pairs(changed_rf(layout, |s| s.zoom), sel));
+        out.insert(p::ROTATION.to_string(),
+            pairs(changed_rf(layout, |s| s.rotation_deg), sel));
     }
     out
 }
@@ -8850,13 +9428,12 @@ pub(crate) fn add_actor_from_clip_at_canvas(
     };
     let actor_id = state.scene.actors[new_actor_idx].id.clone();
 
-    // Drop the actor onto the topmost video lane by default — same default
-    // as the timeline drop-handler when no specific lane is targeted.
-    let assigned = state
-        .video_track_indices()
-        .first()
-        .copied()
-        .unwrap_or_else(|| state.insert_video_track_at_bottom());
+    // Drop the actor onto the first EMPTY video lane at the current
+    // playhead — falls back to inserting a brand-new top lane when
+    // every existing lane already has something on it. This makes
+    // canvas drops always create a clean layer instead of stacking
+    // on top of whatever's on V1.
+    let assigned = state.pick_or_create_empty_video_lane_at(t);
     state.actor_track_assignments.insert(new_actor_idx, assigned);
 
     use memstroy_core::{CanvasLayout, Keyframe, CanvasTransform, WorldPos};
