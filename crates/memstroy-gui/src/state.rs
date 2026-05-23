@@ -444,6 +444,25 @@ pub struct EditorState {
     /// screen-rect intersects the marquee.
     pub timeline_marquee: Option<TimelineMarquee>,
 
+    /// Press position recorded while we wait to see whether a fresh
+    /// timeline pointer-press will grow into a real marquee or stay a
+    /// click. The marquee handler only promotes this into
+    /// `timeline_marquee` once the pointer has travelled past the
+    /// drag-threshold, and consumes it on pointer release (where it
+    /// becomes the "click on empty space → clear selection" gesture).
+    /// Cleared on every release.
+    pub timeline_marquee_pending: Option<egui::Pos2>,
+
+    /// True while the user is actively scrubbing the timeline by
+    /// dragging the playhead vertical line in the tracks area
+    /// (separate from the ruler scrubbing). The flag is set on the
+    /// initial press if the press lands within a few pixels of the
+    /// playhead's screen-X, and cleared on release. While set, the
+    /// per-clip drag handlers and the marquee both bow out so the
+    /// playhead drag stays the ONLY active gesture — even when the
+    /// playhead line visually overlaps a clip bar.
+    pub timeline_scrubbing_playhead: bool,
+
     // ─── Mask / crop drawing tools ──────────────────────────────────
     /// Currently armed mask / crop drawing tool. `None` = transform mode
     /// (default — clicks on the canvas select / move / resize the

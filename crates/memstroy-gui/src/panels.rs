@@ -4545,6 +4545,13 @@ const BUNDLED_FONTS: &[&str] = &[
 fn inspector_render_frame(ui: &mut egui::Ui, state: &mut EditorState) {
     let rf_t_local = state.playhead;
     let rf = &mut state.scene.render_frame;
+    // Output resolution is fixed at 1080x1920 — every export goes through
+    // `app.rs` which overrides the scene's resolution to that value, and
+    // exposing a per-scene W/H knob misled users into thinking they were
+    // changing the export size when in reality it only altered the
+    // editor preview's logical extent. Force-reset any stale value the
+    // user may have saved into the scene file from earlier builds.
+    rf.resolution = [1080, 1920];
     let [rw, rh] = rf.resolution;
 
     ui.label(
@@ -4559,6 +4566,11 @@ fn inspector_render_frame(ui: &mut egui::Ui, state: &mut EditorState) {
             .size(10.0)
             .color(COL_TEXT_DIM),
     );
+    ui.label(
+        RichText::new(format!("\u{2192} Output: {}\u{00D7}{} (fixed)", rw, rh))
+            .size(10.0)
+            .color(COL_TEXT_DIM),
+    );
     ui.add_space(8.0);
 
     if let Some(kf) = rf.layout.first_mut() {
@@ -4569,40 +4581,6 @@ fn inspector_render_frame(ui: &mut egui::Ui, state: &mut EditorState) {
             ui.label(t("Y:"));
             ui.add(egui::DragValue::new(&mut kf.value.pos.y).speed(0.5));
         });
-        ui.add_space(4.0);
-
-        // ─── Size (width × height in world pixels) ──────────────
-        // The frame's world extent = resolution * scale. Editing the
-        // width here updates `scale` so the displayed resolution stays
-        // fixed. The height field stays in lock-step with the aspect
-        // ratio of the output resolution.
-        let zoom_clamped = kf.value.zoom.max(0.0001);
-        let mut world_w = rw as f32 / zoom_clamped;
-        let mut world_h = rh as f32 / zoom_clamped;
-        let aspect = (rw as f32 / rh.max(1) as f32).max(0.0001);
-
-        ui.horizontal(|ui| {
-            ui.label(t("W:"));
-            if ui
-                .add(egui::DragValue::new(&mut world_w).range(8.0..=200_000.0).speed(0.5))
-                .changed()
-            {
-                kf.value.zoom = (rw as f32 / world_w.max(1.0)).clamp(0.001, 1000.0);
-            }
-            ui.label(t("H:"));
-            if ui
-                .add(egui::DragValue::new(&mut world_h).range(8.0..=200_000.0).speed(0.5))
-                .changed()
-            {
-                let new_w = world_h * aspect;
-                kf.value.zoom = (rw as f32 / new_w.max(1.0)).clamp(0.001, 1000.0);
-            }
-        });
-        ui.label(
-            RichText::new(format!("aspect locked to {}\u{00D7}{} output", rw, rh))
-                .size(10.0)
-                .color(COL_TEXT_DIM),
-        );
         ui.add_space(4.0);
 
         // ─── Rotation ────────────────────────────────────────────
@@ -4680,27 +4658,12 @@ fn inspector_render_frame(ui: &mut egui::Ui, state: &mut EditorState) {
     ui.add_space(8.0);
     ui.separator();
     ui.add_space(4.0);
-    ui.label(
-        RichText::new(t("Output resolution"))
-            .size(11.0)
-            .strong()
-            .color(Color32::from_rgb(180, 180, 220)),
-    );
-    ui.horizontal(|ui| {
-        let mut w = rw;
-        let mut h = rh;
-        ui.label(t("W:"));
-        let cw = ui
-            .add(egui::DragValue::new(&mut w).range(64..=8192))
-            .changed();
-        ui.label(t("H:"));
-        let ch = ui
-            .add(egui::DragValue::new(&mut h).range(64..=8192))
-            .changed();
-        if cw || ch {
-            rf.resolution = [w, h];
-        }
-    });
+    // Output resolution / W,H widgets removed: render is always
+    // performed at 1080x1920 and per-scene resolution edits were a
+    // common source of "exported video doesn't match preview"
+    // confusion. The legacy `rf.resolution` field is force-reset to
+    // [1080, 1920] above so legacy scene files can no longer carry
+    // a stale value through the inspector.
 
     // Animation modifiers (wobble/shake/pulse/spin) — perturb the
     // render-frame's eased keyframe state at preview/export time so the
@@ -5579,19 +5542,27 @@ fn timeline_marquee_update(
         || state.asset_drag.dragging.is_some();
 
     let id = egui::Id::new(("timeline_marquee_interact",));
-    // Use `Sense::drag()` (not `click_and_drag`) so a *click* on a clip
-    // is NOT swallowed by this full-width interactor. The marquee only
-    // needs the press → drag-out → release path; ordinary clicks on
-    // clips must propagate to the per-clip widgets registered earlier
-    // in the frame so single-select and the split tool work again.
-    let resp = ui.interact(tracks_rect, id, egui::Sense::drag());
+    // Use `Sense::click_and_drag()` so a click on empty timeline space
+    // can clear the selection (per user request: "если кликаем по
+    // свободному пространству то отменить все выделения элементов"),
+    // while a drag from empty space starts the multi-select lasso.
+    // Single clicks on clips still propagate to the per-clip
+    // interactors registered earlier in the frame, because we
+    // explicitly bail out below when the press point lands on top of
+    // any existing clip rectangle.
+    let resp = ui.interact(tracks_rect, id, egui::Sense::click_and_drag());
 
-    // Start a marquee gesture only if no other timeline drag picked up
-    // the press first this frame, AND the press point lies on empty
-    // space — i.e. NOT inside any existing clip's screen rect.
-    // Marquee-on-clip used to make it impossible to drag a clip to a
-    // different lane / re-trim it because the press was always
-    // swallowed by the marquee interactor.
+    // ── Marquee start guard ──
+    //
+    // The user explicitly does NOT want the marquee firing on a single
+    // click — only on a deliberate drag from empty space. egui's
+    // `drag_started` already debounces by an internal pixel threshold,
+    // but we add an extra ~5 px of slack on top so a tiny twitch
+    // between press and release stays a click and never paints a
+    // 1×1 lasso that wipes the selection. The lasso is still committed
+    // on release with the standard 2-px corner test.
+    const MARQUEE_MIN_TRAVEL_PX: f32 = 5.0;
+
     if state.timeline_marquee.is_none()
         && resp.drag_started()
         && !drag_in_flight
@@ -5621,22 +5592,40 @@ fn timeline_marquee_update(
                         }
                     },
                 );
-                if !on_clip {
-                    let extend = ui.input(|i| {
-                        i.modifiers.ctrl || i.modifiers.shift || i.modifiers.command
-                    });
+                // Also reject presses that land on the playhead-scrub
+                // strip — that gesture owns the press already.
+                let on_playhead = state.timeline_scrubbing_playhead;
+                if !on_clip && !on_playhead {
+                    // Defer the actual marquee start until the user
+                    // has moved more than MARQUEE_MIN_TRAVEL_PX away
+                    // from the press origin. Until then we just
+                    // remember the press point in
+                    // `timeline_marquee_pending` so a quick click
+                    // gets handled by the click branch below without
+                    // ever materialising a lasso. The selection is
+                    // NOT cleared here — the click branch below
+                    // handles "clear on empty click", and the commit
+                    // branch handles "replace on lasso end" — so a
+                    // micro-drag-then-release leaves the existing
+                    // selection intact.
+                    state.timeline_marquee_pending = Some(p);
+                }
+            }
+        }
+    }
+
+    // Promote a pending press into a real marquee once the pointer has
+    // travelled past the threshold.
+    if state.timeline_marquee.is_none() {
+        if let Some(start) = state.timeline_marquee_pending {
+            if let Some(p) = ui
+                .input(|i| i.pointer.interact_pos().or_else(|| i.pointer.hover_pos()))
+            {
+                if (p - start).length() > MARQUEE_MIN_TRAVEL_PX {
                     state.timeline_marquee = Some(crate::state::TimelineMarquee {
-                        start: p,
+                        start,
                         end: p,
                     });
-                    if !extend {
-                        // Replace gesture: clear any old multi-selection
-                        // when the marquee begins; the commit pass below
-                        // will re-populate it. We do NOT touch the primary
-                        // `selection` until commit so a tiny accidental
-                        // drag (smaller than 2 px) leaves it intact.
-                        state.canvas_selection.clear();
-                    }
                 }
             }
         }
@@ -5667,6 +5656,8 @@ fn timeline_marquee_update(
     // Commit on pointer release.
     let any_pointer_down = ui.input(|i| i.pointer.any_down());
     if !any_pointer_down {
+        // Drop any pending press that never grew into a real marquee.
+        let pending = state.timeline_marquee_pending.take();
         if let Some(m) = state.timeline_marquee.take() {
             let rect = m.rect();
             // Reject zero-size lassos — treat as a click that just
@@ -5713,6 +5704,39 @@ fn timeline_marquee_update(
                 }
             } else if !state.canvas_selection.iter().any(|s| *s == state.selection) {
                 state.selection = state.canvas_selection[0];
+            }
+            return;
+        }
+        // No marquee was ever started — but if the user pressed-and-
+        // released on empty space (no clip, no playhead, no scrollbar
+        // hit), treat that as "click to clear selection" per the
+        // explicit user request. We re-run the on-clip check using
+        // the captured pending press position so the clip click
+        // handlers — which fired on the same press during their own
+        // `interact()` calls — keep ownership of clip clicks.
+        if let Some(p) = pending {
+            if tracks_rect.contains(p) {
+                let mut on_clip = false;
+                for_each_clip_screen_rect(
+                    state,
+                    track_rows,
+                    tracks_rect,
+                    rf_row_h,
+                    v_scroll,
+                    pps,
+                    track_left,
+                    track_right,
+                    |_sel, clip_rect| {
+                        if clip_rect.contains(p) {
+                            on_clip = true;
+                        }
+                    },
+                );
+                if !on_clip {
+                    state.canvas_selection.clear();
+                    state.multi_select.clear();
+                    state.selection = Selection::None;
+                }
             }
         }
     }
@@ -6961,6 +6985,87 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     }
 
 
+    // ── Playhead scrub strip in the tracks viewport ──
+    //
+    // The playhead is a thin vertical line that crosses every track
+    // row. The user wants to grab it directly to scrub the timeline
+    // — even when the line visually overlaps a clip bar — instead of
+    // accidentally selecting / dragging the clip below it. We do this
+    // BEFORE the per-clip / marquee interactors run so the press is
+    // captured by the scrub before any other widget claims it.
+    //
+    // The strip is ~7 px wide on either side of the playhead screen-X
+    // (covering one full pixel-width of slop on both sides of the
+    // 1.5 px line, plus an extra few for fingers and trackpads). Its
+    // hit-test is registered persistently across frames so a drag
+    // continues to scrub even after the playhead has moved away from
+    // the original press position.
+    {
+        let pps_now = state.timeline_zoom;
+        let any_pointer_down = ui.input(|i| i.pointer.any_down());
+        let press_origin = ui.input(|i| i.pointer.press_origin());
+
+        // Latch the scrub mode on the first frame of a press where the
+        // press point sits inside the strip and on the tracks viewport.
+        // We use the playhead's screen-X AT PRESS TIME (not the moving
+        // playhead) so the strip is the same logical handle the user
+        // visually grabbed.
+        if !state.timeline_scrubbing_playhead {
+            if let (Some(ph_x_initial), Some(p)) = (
+                time_to_x(state.playhead, state.timeline_scroll, pps_now, track_left, track_right),
+                press_origin,
+            ) {
+                let strip_half = 7.0_f32;
+                if any_pointer_down
+                    && (p.x - ph_x_initial).abs() <= strip_half
+                    && p.y >= tracks_rect.min.y
+                    && p.y <= tracks_rect.max.y
+                    // Skip when an asset / clip drag is already in
+                    // flight from a previous frame.
+                    && state.timeline_drag.dragging_clip.is_none()
+                    && state.asset_drag.dragging.is_none()
+                {
+                    state.timeline_scrubbing_playhead = true;
+                }
+            }
+        }
+
+        // While scrubbing, drive the playhead from the live pointer
+        // position. Force a repaint so motion stays smooth even when
+        // the egui reactive scheduler would otherwise sleep.
+        if state.timeline_scrubbing_playhead {
+            ui.ctx().request_repaint();
+            if let Some(p) = ui.input(|i| {
+                i.pointer.interact_pos().or_else(|| i.pointer.hover_pos())
+            }) {
+                let new_t = x_to_time(p.x, state.timeline_scroll, pps_now, track_left)
+                    .clamp(0.0, duration);
+                state.playhead = new_t;
+            }
+            // Tell every per-clip interactor below to bow out for the
+            // rest of this frame so the press isn't double-handled
+            // (e.g. clip select, drag, trim). Cleared at the end of
+            // the timeline function.
+            ui.data_mut(|d| {
+                d.insert_temp::<bool>(egui::Id::new("timeline_input_lock"), true);
+            });
+            // Clear on release.
+            if !any_pointer_down {
+                state.timeline_scrubbing_playhead = false;
+            }
+        }
+    }
+
+    // Pre-frame: ensure the input lock starts each frame fresh. The
+    // scrubbing block above re-asserts it when needed; downstream
+    // per-clip interactors observe the latest value.
+    if !state.timeline_scrubbing_playhead {
+        ui.data_mut(|d| {
+            d.insert_temp::<bool>(egui::Id::new("timeline_input_lock"), false);
+        });
+    }
+
+
     // ── Track rows ──
     let mut to_select: Option<Selection> = None;
 
@@ -6979,7 +7084,11 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     // topmost video / below the bottommost audio so we can auto-create a new
     // layer in that direction). The "expansion" added by the per-param
     // keyframe rows of the currently-selected layer is included here so the
-    // hit-test recognises the whole row as one lane.
+    // hit-test recognises the whole row as one lane. The `mask_above`
+    // strip on layers with animated mask params is ALSO included here —
+    // earlier this only summed `tk.height + expansion`, so dropping a
+    // clip onto the mask-row strip was misclassified as a gap (potentially
+    // creating a stray new layer) instead of landing on the host row.
     let mut track_rows: Vec<(f32, f32)> = Vec::with_capacity(num_tracks);
     {
         // Reserve space for the Render Frame row at the top — every
@@ -6987,7 +7096,9 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
         // stays consistent.
         let mut acc = rf_row_h;
         for (ti, tk) in state.tracks.iter().enumerate() {
-            let h = tk.height * v_zoom + selected_layer_expansion(state, ti, v_zoom);
+            let h = tk.height * v_zoom
+                + selected_layer_mask_above_height(state, ti, v_zoom)
+                + selected_layer_expansion(state, ti, v_zoom);
             let top = tracks_rect.min.y + acc - state.timeline_v_scroll;
             let bot = top + h;
             track_rows.push((top, bot));
@@ -7108,12 +7219,14 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     // The dedicated Render Frame row is added once at the top.
     //
     // We pad the total with `BOTTOM_GUTTER` so the user can ALWAYS scroll
-    // the bottom-most lane fully into the visible area, with a small
-    // empty band beneath it. Without this gutter, expanding a track via
-    // per-param keyframe rows could push the last row's bottom edge
-    // exactly to the viewport bottom — sometimes unreachable depending
-    // on the v_zoom rounding — and the user couldn't scroll any further.
-    const BOTTOM_GUTTER: f32 = 16.0;
+    // the bottom-most lane fully into the visible area, with a generous
+    // empty band beneath it. Without enough gutter the last row's
+    // bottom edge sits exactly at the viewport bottom — combined with
+    // sub-pixel rounding inside the scrollbar's pan-fraction round-trip
+    // this caused the last layer to "пропадать" (disappear) at maximum
+    // scroll. A full row-height of empty space keeps the last lane
+    // visible regardless of v_zoom rounding.
+    const BOTTOM_GUTTER: f32 = 80.0;
     let total_tracks_h: f32 = rf_row_h
         + (0..num_tracks)
             .map(|i| {
@@ -8941,7 +9054,12 @@ fn stretchable_scrollbar(
 
     let track_len = if horizontal { rect.width() } else { rect.height() }.max(1.0);
     let cross = if horizontal { rect.height() } else { rect.width() };
-    let edge_zone = (cross * 0.6).max(6.0);
+    // Bigger edge-grip zone — the user explicitly called out that
+    // grabbing the resize ends of the local-zoom thumb was difficult.
+    // 12 px of slack on each side comfortably catches imprecise
+    // targeting on standard 14-px scrollbars without overlapping into
+    // the thumb's body for short windows.
+    let edge_zone = (cross * 0.9).max(12.0);
     let min_window_frac = (10.0 / track_len).min(0.5);
 
     let a = view_a_frac.clamp(0.0, 1.0);
@@ -8953,7 +9071,19 @@ fn stretchable_scrollbar(
         rect.min.y as i32,
         horizontal,
     ));
-    let resp = ui.interact(rect, id, Sense::click_and_drag());
+    // Expand the interaction rect on the cross-axis (and a few pixels
+    // on the main axis) so users can click slightly outside the
+    // visual bar and still grab it. The painter still draws inside
+    // `rect`, so the visual thickness is unchanged. 6 px on each side
+    // of the cross-axis turns a 14-px bar into a 26-px hit area.
+    let hit_pad_cross = 6.0_f32;
+    let hit_pad_main = 2.0_f32;
+    let hit_rect = if horizontal {
+        rect.expand2(Vec2::new(hit_pad_main, hit_pad_cross))
+    } else {
+        rect.expand2(Vec2::new(hit_pad_cross, hit_pad_main))
+    };
+    let resp = ui.interact(hit_rect, id, Sense::click_and_drag());
 
     // Compute thumb pixel range along the primary axis.
     let main_min = if horizontal { rect.min.x } else { rect.min.y };
@@ -9224,13 +9354,39 @@ fn draw_clip(
     let sense = if locked { Sense::hover() } else { Sense::click_and_drag() };
     let resp = ui.interact(bar_rect, id, sense);
 
+    // ── Global gestures that lock out per-clip interaction ──
+    //
+    // The timeline function may have already claimed the press for
+    // higher-priority gestures (playhead scrubbing, in-flight asset
+    // drag). Bail out early so the user sees the dragged playhead /
+    // dropped asset instead of the clip stealing the click. We still
+    // returned the `resp` above so egui's hover-cursor logic on lower
+    // widgets keeps working.
+    let global_lock = ui
+        .data(|d| d.get_temp::<bool>(egui::Id::new("timeline_input_lock")))
+        .unwrap_or(false);
+    if global_lock {
+        return None;
+    }
+
     // Edge detection for hover cursor (purely cosmetic; the actual drag mode
     // is captured once at drag_started below and locked for the rest of the
     // drag, so the cursor flicker doesn't affect behaviour).
     let hover_pos = ui.input(|i| i.pointer.hover_pos());
 
-    let near_left_edge = hover_pos.map(|p| (p.x - bar_rect.min.x).abs() < 5.0).unwrap_or(false);
-    let near_right_edge = hover_pos.map(|p| (p.x - bar_rect.max.x).abs() < 5.0).unwrap_or(false);
+    // Generous hit zone: 9 px on each side of the bar's edge so the
+    // resize handles are easy to grab on regular and touch displays.
+    // Keeping the visual handle width at 5 px (drawn below) keeps the
+    // bar looking clean while the hit-test forgives small targeting
+    // mistakes — addresses the explicit user feedback that the
+    // stretch handles were "очень трудно схватиться".
+    const TRIM_HIT_HALFWIDTH: f32 = 9.0;
+    let near_left_edge = hover_pos
+        .map(|p| (p.x - bar_rect.min.x).abs() < TRIM_HIT_HALFWIDTH)
+        .unwrap_or(false);
+    let near_right_edge = hover_pos
+        .map(|p| (p.x - bar_rect.max.x).abs() < TRIM_HIT_HALFWIDTH)
+        .unwrap_or(false);
 
     if resp.hovered() && !locked {
         if split_mode {
@@ -9284,9 +9440,11 @@ fn draw_clip(
             .input(|i| i.pointer.press_origin())
             .map(|p| p.x)
             .unwrap_or(bar_rect.center().x);
-        let mode = if (press_x - bar_rect.min.x).abs() < 6.0 {
+        // Match the visible hover hit zone (TRIM_HIT_HALFWIDTH = 9 px)
+        // so the cursor and the actual drag-mode capture stay in sync.
+        let mode = if (press_x - bar_rect.min.x).abs() < TRIM_HIT_HALFWIDTH {
             ClipDragMode::TrimLeft
-        } else if (press_x - bar_rect.max.x).abs() < 6.0 {
+        } else if (press_x - bar_rect.max.x).abs() < TRIM_HIT_HALFWIDTH {
             ClipDragMode::TrimRight
         } else {
             ClipDragMode::Move
