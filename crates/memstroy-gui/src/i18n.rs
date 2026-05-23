@@ -185,6 +185,18 @@ fn ru_lookup(key: &str) -> Option<&'static str> {
         "\u{25AD} Rectangle" => "\u{25AD} Прямоугольник",
         "\u{2B2D} Ellipse" => "\u{2B2D} Эллипс",
         "\u{270D} Freehand" => "\u{270D} От руки",
+        "\u{2B20} Segment selection" => "\u{2B20} Выделение сегментами",
+        "\u{1F4A7} Eyedropper" => "\u{1F4A7} Пипетка",
+        "Click on the canvas to plant polygon vertices; click near the first point or double-click to close. Right-click pops the last vertex." =>
+            "Кликайте по холсту, чтобы расставлять вершины полигона; клик рядом с первой точкой или двойной клик закрывает контур. ПКМ удаляет последнюю вершину.",
+        "Click on the canvas to plant new polygon vertices; click near the first or double-click to close." =>
+            "Кликайте по холсту, чтобы расставить новые вершины; клик рядом с первой или двойной клик закрывает контур.",
+        "Click on the canvas to pick a colour to mask out (works on actors and image overlays)." =>
+            "Кликните по холсту, чтобы выбрать цвет для маскирования (работает с актёрами и картинками-наложениями).",
+        "Drag a continuous trail across the canvas to redraw this polygon." =>
+            "Протяните курсором по холсту, чтобы перерисовать полигон одним движением.",
+        "freehand" => "от руки",
+        "segments" => "сегментами",
         "\u{2702} Crop" => "\u{2702} Кадр",
         "Bottom" => "Снизу",
         "Hue \u{00B0}" => "Оттенок \u{00B0}",
