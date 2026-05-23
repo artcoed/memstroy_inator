@@ -2750,6 +2750,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "ttf-parser",
  "wgpu 22.1.0",
 ]
 
@@ -2757,6 +2758,7 @@ dependencies = [
 name = "memstroy-render"
 version = "0.1.0"
 dependencies = [
+ "ab_glyph",
  "anyhow",
  "image",
  "memstroy-core",
@@ -2766,6 +2768,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "ttf-parser",
 ]
 
 [[package]]

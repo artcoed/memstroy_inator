@@ -17,3 +17,13 @@ serde_json = { workspace = true }
 memstroy-core = { workspace = true }
 memstroy-vision = { path = "../memstroy-vision" }
 image = { workspace = true }
+# Pure-Rust glyph layout + rasterisation for the text-overlay
+# rasteriser. Same crate egui uses internally, so it's already in the
+# workspace's transitive graph and the binary impact is essentially
+# zero. We rasterise text+plate to a PNG and route it through the
+# existing image-overlay path so render output matches preview byte-
+# for-byte (rather than relying on ffmpeg's drawtext, which can't
+# render the gradient / corner-radius / asymmetric padding / per-line
+# Wrap plates the canvas preview uses).
+ab_glyph = "0.2"
+ttf-parser = "0.25"

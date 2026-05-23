@@ -30,6 +30,7 @@ mod panels;
 mod settings;
 mod skeleton_editor;
 mod state;
+mod system_fonts;
 mod title_templates;
 mod undo;
 mod video_cache;
@@ -80,6 +81,14 @@ fn main() -> Result<()> {
         opts,
         Box::new(move |cc| {
             egui_extras::install_image_loaders(&cc.egui_ctx);
+            // Seed the egui font table with the default bundled set
+            // so subsequent on-demand `ensure_font_loaded` calls can
+            // extend it instead of clobbering the built-in
+            // Proportional / Monospace families. The actual scan of
+            // system fonts happens lazily on first picker open — the
+            // cost is otherwise paid for every cold start even when
+            // the user never opens a text overlay.
+            system_fonts::install_default_definitions(&cc.egui_ctx);
             Ok(Box::new(app::App::new(runtime)))
         }),
     )

@@ -868,23 +868,35 @@ pub fn inspector(ui: &mut egui::Ui, state: &mut EditorState) {
     // Wrap everything below the header in a vertical scroll area so the
     // inspector remains usable when a layer has more parameters than the
     // panel can show in one go (long Effects lists, animated_params,
-    // etc.). `auto_shrink([false; 2])` keeps the scrollbar pinned to the
-    // panel's right edge regardless of content height.
+    // etc.). `auto_shrink([true, false])` lets the panel shrink
+    // HORIZONTALLY when the user drags the divider in (the previous
+    // `[false; 2]` pinned the inner content to the panel's available
+    // width AND propagated the content's intrinsic min back outward,
+    // which combined with `slider_width = avail - 88` produced a
+    // self-reinforcing growth loop — once stretched, the panel could
+    // not be dragged narrower without immediately popping back open).
     egui::ScrollArea::vertical()
         .id_source("inspector_scroll")
-        .auto_shrink([false; 2])
+        .auto_shrink([true, false])
         .show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-            // Reserve ample horizontal real estate for sliders so the
-            // per-row Scale / Rotation / Opacity sliders are wide enough
-            // to drag comfortably even when the inspector panel is narrow
-            // and a few extra widgets (animatable diamond, link button,
-            // numeric DragValue) live on the same horizontal row.
-            // Without this override the default `slider_width` is ~100
-            // px which made the local scale sliders extremely fiddly to
-            // hit precisely.
+            // Cap the inner content's max width so a long DragValue /
+            // ComboBox / Slider row cannot push the parent SidePanel
+            // wider than its own `width_range`. Without this cap, egui
+            // honours the inner UI's measured min-width and the panel
+            // grows past 620 px and refuses to shrink back.
             let avail = ui.available_width();
-            ui.spacing_mut().slider_width = (avail - 88.0).max(140.0);
+            ui.set_max_width(avail);
+            // Reserve a sane slider width for parameter rows. The
+            // previous `(avail - 88).max(140)` formula assumed no
+            // sibling widgets on the row; in practice every animatable
+            // row contains: diamond toggle (~14 px) + label (~80 px) +
+            // slider + DragValue (~64 px) + small spacing (~24 px),
+            // so the slider's intrinsic min was `avail` itself —
+            // that's what made the panel grow on every frame.
+            // Cap at a smaller value so the row's measured min is
+            // always strictly less than `avail`.
+            ui.spacing_mut().slider_width =
+                (avail * 0.55).clamp(110.0, 240.0);
             inspector_body(ui, state);
         });
 }
@@ -4268,7 +4280,14 @@ fn inspector_text_overlay(
     ui.add(
         egui::TextEdit::multiline(&mut t.text)
             .desired_rows(2)
-            .desired_width(ui.available_width()),
+            // Subtract a small epsilon from `available_width` so the
+            // multiline widget never measures *exactly* equal to the
+            // panel's available width — egui rounds widget sizes up,
+            // and a 1-px overrun re-pumps the inspector's SidePanel
+            // wider on the next frame, which is what made the Inspector
+            // panel drift wider every time the user clicked on a text
+            // overlay.
+            .desired_width((ui.available_width() - 4.0).max(80.0)),
     );
     ui.add_space(8.0);
 
@@ -4288,18 +4307,42 @@ fn inspector_text_overlay(
     ).default_open(true).show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.label(crate::i18n::t("Family:"));
-            // The bundled font set only exposes a proportional and a
-            // monospace family today, so the picker is restricted to
-            // those two until the editor learns to load custom TTFs.
-            // The `font` string is preserved exactly as authored so
-            // existing project files round-trip unchanged.
+            // The picker now enumerates every TTF/OTF found on the OS
+            // (Windows / macOS / Linux), groups by the human-readable
+            // family name from each file's `name` table, and lazily
+            // loads the chosen face into egui so the canvas preview
+            // can actually render it. The bundled `Default` /
+            // `Monospace` entries are kept at the top as quick fallbacks.
+            let avail_w = ui.available_width();
             egui::ComboBox::from_id_source("text_font_family")
                 .selected_text(t.style.font.clone())
+                .width((avail_w - 8.0).clamp(80.0, 320.0))
                 .show_ui(ui, |ui| {
-                    for fam in COMMON_FONTS {
+                    // Bundled families first.
+                    for fam in BUNDLED_FONTS {
                         ui.selectable_value(&mut t.style.font, fam.to_string(), *fam);
                     }
+                    let system = crate::system_fonts::available_families();
+                    if !system.is_empty() {
+                        ui.separator();
+                        ui.label(
+                            RichText::new(crate::i18n::t("System fonts"))
+                                .size(10.0)
+                                .color(Color32::from_rgb(140, 140, 160)),
+                        );
+                        for entry in system {
+                            ui.selectable_value(
+                                &mut t.style.font,
+                                entry.family.clone(),
+                                &entry.family,
+                            );
+                        }
+                    }
                 });
+            // Lazily register the chosen family with egui so the canvas
+            // preview can pick it up next frame. Cheap (idempotent
+            // hashmap lookup) for already-loaded families.
+            let _ = crate::system_fonts::ensure_font_loaded(ui.ctx(), &t.style.font);
         });
 
         // ── Size: compact "−  [drag value]  +" trio.
@@ -4391,11 +4434,21 @@ fn inspector_text_overlay(
                         ui.selectable_value(&mut t.style.box_kind, TextBoxKind::Solid, crate::i18n::t("Solid"));
                         ui.selectable_value(&mut t.style.box_kind, TextBoxKind::Gradient, crate::i18n::t("Gradient"));
                         ui.selectable_value(&mut t.style.box_kind, TextBoxKind::OutlineOnly, crate::i18n::t("Outline only"));
+                        ui.selectable_value(
+                            &mut t.style.box_kind,
+                            TextBoxKind::Wrap,
+                            crate::i18n::t("Wrap (per-line)"),
+                        )
+                        .on_hover_text(crate::i18n::t(
+                            "Each line of text gets its own plate hugging that line's width — \
+                             produces the uneven, line-following background look used on \
+                             title-card memes.",
+                        ));
                         ui.selectable_value(&mut t.style.box_kind, TextBoxKind::None, crate::i18n::t("None (text only)"));
                     });
             });
 
-            if matches!(t.style.box_kind, TextBoxKind::Solid | TextBoxKind::Gradient) {
+            if matches!(t.style.box_kind, TextBoxKind::Solid | TextBoxKind::Gradient | TextBoxKind::Wrap) {
                 if let Some(bc) = t.style.box_color.as_mut() {
                     ui.horizontal(|ui| {
                         ui.label(crate::i18n::t("Color:")); color_edit_u8(ui, bc);
@@ -4475,13 +4528,13 @@ fn inspector_text_overlay(
     None
 }
 
-// Logical font-family options. The bundled font set today only ships
-// proportional + monospace, so picking anything else is a no-op visually
-// (the field is preserved on disk so the export pipeline / a future
-// font-loading PR can still consume it). Until custom-TTF loading lands,
-// keeping this list tight prevents the user from picking "Impact" and
-// wondering why nothing changed.
-const COMMON_FONTS: &[&str] = &[
+// Logical font-family options always shown at the top of the picker,
+// regardless of what's installed on the host. They map to egui's
+// built-in `FontFamily::{Proportional, Monospace}` and are guaranteed
+// to render even when no TTFs are installed (e.g. headless CI).
+// System fonts discovered by `system_fonts::available_families()` are
+// appended below these in `inspector_text_overlay`.
+const BUNDLED_FONTS: &[&str] = &[
     "Default",
     "Monospace",
 ];
@@ -7034,7 +7087,21 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     const BOTTOM_GUTTER: f32 = 16.0;
     let total_tracks_h: f32 = rf_row_h
         + (0..num_tracks)
-            .map(|i| state.tracks[i].height * v_zoom + selected_layer_expansion(state, i, v_zoom))
+            .map(|i| {
+                // Match the per-frame layout exactly:
+                //   effective_track_h = mask_above + track_h + expansion
+                // Earlier this only summed `track_h + expansion`, so any
+                // selected actor/overlay with animated mask params (which
+                // contributes `mask_above`) would push the actual content
+                // taller than the scroll budget — making the bottom rows
+                // unreachable and causing the scrollbar thumb to jump
+                // when switching between layers with vs. without mask
+                // animations (e.g. clicking from an animated actor onto
+                // an audio clip below).
+                state.tracks[i].height * v_zoom
+                    + selected_layer_mask_above_height(state, i, v_zoom)
+                    + selected_layer_expansion(state, i, v_zoom)
+            })
             .sum::<f32>()
         + BOTTOM_GUTTER;
     let max_v_scroll = (total_tracks_h - viewport_h).max(0.0);
@@ -8480,6 +8547,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             + (0..num_tracks)
                 .map(|i| {
                     state.tracks[i].height * new_v_zoom
+                        + selected_layer_mask_above_height(state, i, new_v_zoom)
                         + selected_layer_expansion(state, i, new_v_zoom)
                 })
                 .sum::<f32>()
