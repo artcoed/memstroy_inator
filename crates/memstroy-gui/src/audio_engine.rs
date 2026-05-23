@@ -510,11 +510,28 @@ impl AudioEngine {
 }
 
 /// Resolve a scene audio path to something rodio can decode without
-/// panicking. Plain audio files are returned unchanged. Video containers
-/// (mp4 / mov / mkv / webm / avi / m4v) are pre-extracted to a temp WAV
-/// using ffmpeg the first time they're seen — rodio 0.19's symphonia
-/// adapter is known to panic during probe on some valid mp4s, and falling
-/// back to ffmpeg sidesteps that bug entirely.
+/// panicking.
+///
+/// Policy: **whitelist** the codecs whose `symphonia` adapters we trust
+/// to probe + decode in-process without panicking, and route everything
+/// else (every MP4-family container — `m4a` / `mp4` / `mov` / `m4v` /
+/// `3gp` / `3g2` — plus matroska, webm, AVI, FLV, opus, aiff, caf, and
+/// any unknown extension) through ffmpeg → WAV first.
+///
+/// Why a whitelist rather than a blacklist: rodio 0.19's
+/// `symphonia-isomp4` adapter is known to panic during *probe* (and
+/// occasionally mid-decode) on some valid MP4 files — and `m4a` is just
+/// MP4 with an audio-only track, so it hits the same code path. Because
+/// the release profile is built with `panic = "abort"`, any panic that
+/// escapes the worker thread (including any panic raised on rodio's
+/// own internal playback thread, which we cannot wrap in
+/// `catch_unwind`) takes the whole editor down. Pre-extracting to PCM
+/// WAV via ffmpeg sidesteps the buggy probe path entirely and gives
+/// every downstream stage a stable, well-formed source.
+///
+/// The extracted WAV is cached under the OS temp dir keyed on
+/// (stem, size, mtime), so the cost is paid only on the first import
+/// of each file.
 fn resolve_audio_source(src: &Path) -> Option<PathBuf> {
     let ext = src
         .extension()
@@ -522,11 +539,13 @@ fn resolve_audio_source(src: &Path) -> Option<PathBuf> {
         .map(str::to_ascii_lowercase)
         .unwrap_or_default();
 
-    let needs_extract = matches!(
-        ext.as_str(),
-        "mp4" | "mov" | "mkv" | "webm" | "avi" | "m4v" | "flv"
-    );
-    if !needs_extract {
+    // Stable native decoders: raw single-stream containers whose
+    // symphonia adapters have been reliable across our test corpus.
+    // Anything outside this list — notably `m4a` and other MP4-family
+    // audio — falls through to the ffmpeg pre-extract below.
+    let safe_native =
+        matches!(ext.as_str(), "mp3" | "wav" | "flac" | "ogg" | "oga" | "aac");
+    if safe_native {
         return Some(src.to_path_buf());
     }
 
