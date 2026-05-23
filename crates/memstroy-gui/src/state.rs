@@ -516,6 +516,16 @@ pub struct EditorState {
     pub image_fx_textures: std::sync::Mutex<
         std::collections::HashMap<(PathBuf, u64), ImageFxSlot>,
     >,
+
+    // ─── Web image search ──────────────────────────────────────────
+    /// Whether the floating "Web Image Search" window is visible.
+    /// Persisted in the layout file alongside the other floating-
+    /// window toggles.
+    pub web_image_search_open: bool,
+    /// Per-panel state for the web image search (current query,
+    /// in-flight flag, the last batch of results). Kept on the editor
+    /// state so the user's search persists across show/hide cycles.
+    pub web_image_search: crate::web_image_search::WebImageSearchState,
 }
 
 /// Cached state for one image-overlay source. `Loading` is held only
@@ -1112,6 +1122,8 @@ impl EditorState {
             "curve_editor_open": self.curve_editor_open,
             "curve_editor_property": self.curve_editor_property,
             "clip_editor_open": self.clip_editor_open,
+            "web_image_search_open": self.web_image_search_open,
+            "web_image_search_query": self.web_image_search.query,
         });
         if let Ok(json_str) = serde_json::to_string_pretty(&data) {
             let _ = std::fs::write(path, json_str);
@@ -1153,6 +1165,12 @@ impl EditorState {
         if let Some(clip_open) = data.get("clip_editor_open").and_then(|v| v.as_bool()) {
             self.clip_editor_open = clip_open;
         }
+        if let Some(open) = data.get("web_image_search_open").and_then(|v| v.as_bool()) {
+            self.web_image_search_open = open;
+        }
+        if let Some(q) = data.get("web_image_search_query").and_then(|v| v.as_str()) {
+            self.web_image_search.query = q.to_string();
+        }
         if let Some(split) = data.get("library_split").and_then(|v| v.as_f64()) {
             self.library_split = (split as f32).clamp(0.05, 0.95);
         }
@@ -1169,6 +1187,8 @@ impl EditorState {
             "curve_editor_open": self.curve_editor_open,
             "curve_editor_property": self.curve_editor_property,
             "clip_editor_open": self.clip_editor_open,
+            "web_image_search_open": self.web_image_search_open,
+            "web_image_search_query": self.web_image_search.query,
             "library_split": self.library_split,
         })
     }
