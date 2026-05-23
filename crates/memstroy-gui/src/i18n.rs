@@ -115,10 +115,16 @@ fn ru_lookup(key: &str) -> Option<&'static str> {
         "\u{1F3A5} Render full clip..." => "\u{1F3A5} Рендер всего ролика…",
 
         // Tools menu
+        // Note: the leading glyphs are gear/spanner (U+2699 / U+2692)
+        // because the previous brain (U+1F9E0) / bone (U+1F9B4) chars
+        // are absent from egui's bundled font set and rendered as
+        // missing-glyph boxes ("null smileys").
         "Tools" => "Инструменты",
         "\u{1F9E0} Tools" => "\u{1F9E0} Инструменты",
+        "\u{2699} Tools" => "\u{2699} Инструменты",
         "Skeleton Constructor..." => "Конструктор скелета…",
         "\u{1F9B4} Skeleton Constructor..." => "\u{1F9B4} Конструктор скелета…",
+        "\u{2692} Skeleton Constructor..." => "\u{2692} Конструктор скелета…",
 
         // ── Top-bar status ──────────────────────────────────────
         "refreshing..." => "обновление…",

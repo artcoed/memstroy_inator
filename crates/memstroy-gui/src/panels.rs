@@ -773,40 +773,16 @@ pub fn inspector(ui: &mut egui::Ui, state: &mut EditorState) {
 
 fn inspector_body(ui: &mut egui::Ui, state: &mut EditorState) {
     // ── Multi-select short-circuit ──
-    // When the user has lassoed more than one element on the canvas,
-    // the inspector intentionally hides the per-element parameters and
-    // just reports the count. Move / scale / rotate gizmos on the canvas
-    // still apply to every element in `canvas_selection` (relative to
-    // each element's own drag-start state) — see canvas_preview's
-    // broadcast_multi_* helpers.
+    // When the user has lassoed more than one element on the canvas (or
+    // Ctrl-clicked clips on the timeline), the inspector switches into
+    // a relative-edit mode. We display widgets for the parameters that
+    // are common to every element in the set (position, scale,
+    // rotation, opacity, flip), but their semantics is *delta*: edits
+    // are broadcast as offsets / multipliers to every member, so two
+    // elements with different starting positions both move by the same
+    // amount instead of snapping to identical absolute values.
     if state.canvas_selection.len() > 1 {
-        let n = state.canvas_selection.len();
-        ui.add_space(20.0);
-        ui.vertical_centered(|ui| {
-            ui.label(
-                RichText::new(format!("{} elements selected", n))
-                    .size(14.0)
-                    .strong()
-                    .color(Color32::from_rgb(255, 200, 80)),
-            );
-            ui.add_space(6.0);
-            ui.label(
-                RichText::new(
-                    "Use the canvas to move, scale, or rotate them as a group."
-                )
-                .italics()
-                .size(11.0)
-                .color(COL_TEXT_DIM),
-            );
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new(
-                    "Click a single element (or press Esc) to edit one at a time."
-                )
-                .size(10.0)
-                .color(COL_TEXT_DIM),
-            );
-        });
+        inspector_multiselect(ui, state);
         return;
     }
 
@@ -861,6 +837,361 @@ fn inspector_nothing(ui: &mut egui::Ui, state: &mut EditorState) {
     ui.add_space(4.0);
 
     let _ = state; // currently unused beyond the labels
+}
+
+/// Multi-select inspector. Shows the parameters that are common to
+/// every element in `state.canvas_selection`, with edits applied as
+/// *deltas* (offset for position / rotation / opacity, multiplier for
+/// scale) so each element keeps its individual starting value relative
+/// to the group. Only the focused (`state.selection`) element drives
+/// the displayed slider position; while the user drags, every selected
+/// element moves by the same delta as the focused one.
+fn inspector_multiselect(ui: &mut egui::Ui, state: &mut EditorState) {
+    let n = state.canvas_selection.len();
+    let playhead = state.playhead;
+
+    // Header.
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(format!("{} elements selected", n))
+                .size(14.0)
+                .strong()
+                .color(Color32::from_rgb(255, 200, 80)),
+        );
+        if ui.small_button("Esc").on_hover_text("Clear multi-selection").clicked() {
+            state.canvas_selection.clear();
+        }
+    });
+    ui.add_space(2.0);
+    ui.label(
+        RichText::new("Edits below are applied as deltas to every element.")
+            .italics()
+            .size(10.0)
+            .color(COL_TEXT_DIM),
+    );
+    ui.add_space(8.0);
+
+    // Persistent "session" values. Each accumulates as the user drags
+    // the corresponding widget across frames; on every change we
+    // compute the delta vs the previous frame's value and broadcast it.
+    let pos_x_id = ui.make_persistent_id("multi_pos_x");
+    let pos_y_id = ui.make_persistent_id("multi_pos_y");
+    let scale_id = ui.make_persistent_id("multi_scale");
+    let rot_id = ui.make_persistent_id("multi_rot");
+    let op_id = ui.make_persistent_id("multi_op");
+
+    let mut pos_x_last: f32 = ui.data(|d| d.get_temp(pos_x_id).unwrap_or(0.0_f32));
+    let mut pos_y_last: f32 = ui.data(|d| d.get_temp(pos_y_id).unwrap_or(0.0_f32));
+    let mut scale_last: f32 = ui.data(|d| d.get_temp(scale_id).unwrap_or(1.0_f32));
+    let mut rot_last: f32 = ui.data(|d| d.get_temp(rot_id).unwrap_or(0.0_f32));
+    let mut op_last: f32 = ui.data(|d| d.get_temp(op_id).unwrap_or(0.0_f32));
+
+    // ── Position ──
+    ui.label(RichText::new("Position").size(11.0).strong());
+    ui.horizontal(|ui| {
+        ui.label("ΔX:");
+        let mut cur = pos_x_last;
+        let r = ui.add(egui::DragValue::new(&mut cur).speed(0.005).fixed_decimals(3));
+        if r.changed() {
+            let delta = cur - pos_x_last;
+            if delta.abs() > 1.0e-7 {
+                multi_apply_pos_delta(state, delta, 0.0, playhead);
+            }
+            pos_x_last = cur;
+            ui.data_mut(|d| d.insert_temp(pos_x_id, pos_x_last));
+        }
+        ui.label("ΔY:");
+        let mut cur = pos_y_last;
+        let r = ui.add(egui::DragValue::new(&mut cur).speed(0.005).fixed_decimals(3));
+        if r.changed() {
+            let delta = cur - pos_y_last;
+            if delta.abs() > 1.0e-7 {
+                multi_apply_pos_delta(state, 0.0, delta, playhead);
+            }
+            pos_y_last = cur;
+            ui.data_mut(|d| d.insert_temp(pos_y_id, pos_y_last));
+        }
+        if ui.small_button("Reset").clicked() {
+            ui.data_mut(|d| {
+                d.insert_temp(pos_x_id, 0.0_f32);
+                d.insert_temp(pos_y_id, 0.0_f32);
+            });
+        }
+    });
+
+    ui.add_space(4.0);
+
+    // ── Scale (multiplicative) ──
+    ui.label(RichText::new("Scale (multiplier)").size(11.0).strong());
+    ui.horizontal(|ui| {
+        ui.label("×:");
+        let mut cur = scale_last.max(0.01);
+        let r = ui.add(egui::Slider::new(&mut cur, 0.1..=10.0).logarithmic(true));
+        if r.changed() && cur > 0.0 {
+            let factor = cur / scale_last.max(0.0001);
+            if (factor - 1.0).abs() > 1.0e-5 {
+                multi_apply_scale_factor(state, factor, playhead);
+            }
+            scale_last = cur;
+            ui.data_mut(|d| d.insert_temp(scale_id, scale_last));
+        }
+        if ui.small_button("Reset").clicked() {
+            ui.data_mut(|d| d.insert_temp(scale_id, 1.0_f32));
+        }
+    });
+
+    ui.add_space(4.0);
+
+    // ── Rotation (additive degrees) ──
+    ui.label(RichText::new("Rotation").size(11.0).strong());
+    ui.horizontal(|ui| {
+        ui.label("Δ\u{00B0}:");
+        let mut cur = rot_last;
+        let r = ui.add(
+            egui::DragValue::new(&mut cur)
+                .range(-3600.0..=3600.0)
+                .speed(0.5)
+                .suffix("\u{00B0}"),
+        );
+        if r.changed() {
+            let delta = cur - rot_last;
+            if delta.abs() > 1.0e-4 {
+                multi_apply_rotation_delta(state, delta, playhead);
+            }
+            rot_last = cur;
+            ui.data_mut(|d| d.insert_temp(rot_id, rot_last));
+        }
+        if ui.small_button("Reset").clicked() {
+            ui.data_mut(|d| d.insert_temp(rot_id, 0.0_f32));
+        }
+    });
+
+    ui.add_space(4.0);
+
+    // ── Opacity (additive 0..1) ──
+    ui.label(RichText::new("Opacity").size(11.0).strong());
+    ui.horizontal(|ui| {
+        ui.label("Δ:");
+        let mut cur = op_last;
+        let r = ui.add(egui::Slider::new(&mut cur, -1.0..=1.0));
+        if r.changed() {
+            let delta = cur - op_last;
+            if delta.abs() > 1.0e-5 {
+                multi_apply_opacity_delta(state, delta, playhead);
+            }
+            op_last = cur;
+            ui.data_mut(|d| d.insert_temp(op_id, op_last));
+        }
+        if ui.small_button("Reset").clicked() {
+            ui.data_mut(|d| d.insert_temp(op_id, 0.0_f32));
+        }
+    });
+
+    ui.add_space(8.0);
+    ui.separator();
+    ui.add_space(4.0);
+
+    // Quick toggles broadcasting absolute values (these don't need a
+    // delta semantic — Visible / Flip are boolean enough to apply uniformly).
+    ui.horizontal(|ui| {
+        if ui.button("Flip X all").on_hover_text("Toggle horizontal flip on every selected element").clicked() {
+            multi_toggle_flip_x(state, playhead);
+        }
+        if ui.button("Flip Y all").clicked() {
+            multi_toggle_flip_y(state, playhead);
+        }
+    });
+}
+
+/// Apply a position delta (in normalised scene coords) to every
+/// element in `state.canvas_selection`, writing through the same
+/// keyframe path that single-element edits use so the per-param
+/// animation toggles continue to behave correctly.
+fn multi_apply_pos_delta(state: &mut EditorState, dx: f32, dy: f32, playhead: f32) {
+    use crate::kf_anim;
+    use memstroy_core::param_ids;
+    let targets: Vec<Selection> = state.canvas_selection.clone();
+    for sel in targets {
+        match sel {
+            Selection::Actor(ai) => {
+                if let Some(a) = state.scene.actors.get_mut(ai) {
+                    if dx.abs() > 1.0e-7 {
+                        kf_anim::write_actor_param(&mut a.layout, &mut a.animated_params,
+                            playhead, param_ids::POS_X, false,
+                            |s| s.pos[0] += dx);
+                    }
+                    if dy.abs() > 1.0e-7 {
+                        kf_anim::write_actor_param(&mut a.layout, &mut a.animated_params,
+                            playhead, param_ids::POS_Y, false,
+                            |s| s.pos[1] += dy);
+                    }
+                }
+            }
+            Selection::Overlay(oi) => {
+                if let Some(ov) = state.scene.overlays.get_mut(oi) {
+                    let (layout, animated) = overlay_layout_and_params(ov);
+                    if dx.abs() > 1.0e-7 {
+                        kf_anim::write_overlay_param(layout, animated,
+                            playhead, param_ids::POS_X, false,
+                            |s| s.pos[0] += dx);
+                    }
+                    if dy.abs() > 1.0e-7 {
+                        kf_anim::write_overlay_param(layout, animated,
+                            playhead, param_ids::POS_Y, false,
+                            |s| s.pos[1] += dy);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn multi_apply_scale_factor(state: &mut EditorState, factor: f32, playhead: f32) {
+    use crate::kf_anim;
+    use memstroy_core::param_ids;
+    let targets: Vec<Selection> = state.canvas_selection.clone();
+    for sel in targets {
+        match sel {
+            Selection::Actor(ai) => {
+                if let Some(a) = state.scene.actors.get_mut(ai) {
+                    kf_anim::write_actor_param(&mut a.layout, &mut a.animated_params,
+                        playhead, param_ids::SCALE, false,
+                        |s| s.scale = (s.scale * factor).clamp(0.01, 50.0));
+                }
+            }
+            Selection::Overlay(oi) => {
+                if let Some(ov) = state.scene.overlays.get_mut(oi) {
+                    let (layout, animated) = overlay_layout_and_params(ov);
+                    kf_anim::write_overlay_param(layout, animated,
+                        playhead, param_ids::SCALE, false,
+                        |s| s.scale = (s.scale * factor).clamp(0.01, 50.0));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn multi_apply_rotation_delta(state: &mut EditorState, ddeg: f32, playhead: f32) {
+    use crate::kf_anim;
+    use memstroy_core::param_ids;
+    let targets: Vec<Selection> = state.canvas_selection.clone();
+    for sel in targets {
+        match sel {
+            Selection::Actor(ai) => {
+                if let Some(a) = state.scene.actors.get_mut(ai) {
+                    kf_anim::write_actor_param(&mut a.layout, &mut a.animated_params,
+                        playhead, param_ids::ROTATION, false,
+                        |s| s.rotation_deg += ddeg);
+                }
+            }
+            Selection::Overlay(oi) => {
+                if let Some(ov) = state.scene.overlays.get_mut(oi) {
+                    let (layout, animated) = overlay_layout_and_params(ov);
+                    kf_anim::write_overlay_param(layout, animated,
+                        playhead, param_ids::ROTATION, false,
+                        |s| s.rotation_deg += ddeg);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn multi_apply_opacity_delta(state: &mut EditorState, dop: f32, playhead: f32) {
+    use crate::kf_anim;
+    use memstroy_core::param_ids;
+    let targets: Vec<Selection> = state.canvas_selection.clone();
+    for sel in targets {
+        match sel {
+            Selection::Actor(ai) => {
+                if let Some(a) = state.scene.actors.get_mut(ai) {
+                    kf_anim::write_actor_param(&mut a.layout, &mut a.animated_params,
+                        playhead, param_ids::OPACITY, false,
+                        |s| s.opacity = (s.opacity + dop).clamp(0.0, 1.0));
+                }
+            }
+            Selection::Overlay(oi) => {
+                if let Some(ov) = state.scene.overlays.get_mut(oi) {
+                    let (layout, animated) = overlay_layout_and_params(ov);
+                    kf_anim::write_overlay_param(layout, animated,
+                        playhead, param_ids::OPACITY, false,
+                        |s| s.opacity = (s.opacity + dop).clamp(0.0, 1.0));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn multi_toggle_flip_x(state: &mut EditorState, playhead: f32) {
+    use crate::kf_anim;
+    use memstroy_core::param_ids;
+    let targets: Vec<Selection> = state.canvas_selection.clone();
+    for sel in targets {
+        match sel {
+            Selection::Actor(ai) => {
+                if let Some(a) = state.scene.actors.get_mut(ai) {
+                    kf_anim::write_actor_param(&mut a.layout, &mut a.animated_params,
+                        playhead, param_ids::FLIP_X, false,
+                        |s| s.flip_x_anim = -s.flip_x_anim);
+                }
+            }
+            Selection::Overlay(oi) => {
+                if let Some(ov) = state.scene.overlays.get_mut(oi) {
+                    let (layout, animated) = overlay_layout_and_params(ov);
+                    kf_anim::write_overlay_param(layout, animated,
+                        playhead, param_ids::FLIP_X, false,
+                        |s| s.flip_x_anim = -s.flip_x_anim);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn multi_toggle_flip_y(state: &mut EditorState, playhead: f32) {
+    use crate::kf_anim;
+    use memstroy_core::param_ids;
+    let targets: Vec<Selection> = state.canvas_selection.clone();
+    for sel in targets {
+        match sel {
+            Selection::Actor(ai) => {
+                if let Some(a) = state.scene.actors.get_mut(ai) {
+                    kf_anim::write_actor_param(&mut a.layout, &mut a.animated_params,
+                        playhead, param_ids::FLIP_Y, false,
+                        |s| s.flip_y_anim = -s.flip_y_anim);
+                }
+            }
+            Selection::Overlay(oi) => {
+                if let Some(ov) = state.scene.overlays.get_mut(oi) {
+                    let (layout, animated) = overlay_layout_and_params(ov);
+                    kf_anim::write_overlay_param(layout, animated,
+                        playhead, param_ids::FLIP_Y, false,
+                        |s| s.flip_y_anim = -s.flip_y_anim);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Helper: get a mutable reference to an overlay's layout vector and
+/// animated_params set (the three Overlay variants store them under
+/// different field names, but every variant has both).
+fn overlay_layout_and_params(
+    ov: &mut Overlay,
+) -> (
+    &mut Vec<Keyframe<OverlayState>>,
+    &mut std::collections::BTreeSet<String>,
+) {
+    match ov {
+        Overlay::Text(t) => (&mut t.layout, &mut t.animated_params),
+        Overlay::Image(im) => (&mut im.layout, &mut im.animated_params),
+        Overlay::Video(v) => (&mut v.layout, &mut v.animated_params),
+    }
 }
 
 fn inspector_actor(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
@@ -1204,22 +1535,40 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
         kf_anim::animated_toggle(ui, &mut a.animated_params, param_ids::SCALE_Y, ("act_sy", i));
         ui.label(param_label(highlight.is_active(param_ids::SCALE_Y), "Scale Y:"))
             .on_hover_text("Independent Y-axis scale. Linked to Scale X by default.");
-        let r = ui.add(egui::Slider::new(&mut new_scale_y, 0.1..=5.0).logarithmic(true));
-        if r.changed() {
-            kf_anim::write_actor_param(
-                &mut a.layout, &mut a.animated_params, playhead,
-                param_ids::SCALE_Y, false,
-                |s| s.scale_y = new_scale_y);
-            if linked {
-                let target_y = new_scale_y * cur.scale;
+        if linked {
+            // ── Linked mode: the Y slider mirrors the uniform Scale X.
+            //
+            // The previous code wrote `scale_y = 1.0` *and* `scale =
+            // new_sy * cur.scale` on every frame. Because `new_sy` was
+            // taken from `cur.scale_y` (which we kept resetting to 1.0)
+            // the displayed value was always 1.0 — but the slider
+            // detected each tiny pointer motion as a fresh change of
+            // scale_y, so each frame multiplied scale by ~1.01 and the
+            // image grew without bound, eventually filling the canvas
+            // (the "Scale Y bug fills background" report).
+            //
+            // Correct behaviour: in linked mode the slider value IS the
+            // uniform scale. Drag → set scale to that value, scale_y
+            // stays at 1.0.
+            let mut linked_scale = cur.scale;
+            let r = ui.add(egui::Slider::new(&mut linked_scale, 0.05..=5.0).logarithmic(true));
+            if r.changed() && linked_scale.is_finite() && linked_scale > 0.0 {
+                kf_anim::write_actor_param(
+                    &mut a.layout, &mut a.animated_params, playhead,
+                    param_ids::SCALE, false,
+                    |s| s.scale = linked_scale);
                 kf_anim::write_actor_param(
                     &mut a.layout, &mut a.animated_params, playhead,
                     param_ids::SCALE_Y, false,
                     |s| s.scale_y = 1.0);
+            }
+        } else {
+            let r = ui.add(egui::Slider::new(&mut new_scale_y, 0.1..=5.0).logarithmic(true));
+            if r.changed() {
                 kf_anim::write_actor_param(
                     &mut a.layout, &mut a.animated_params, playhead,
-                    param_ids::SCALE, false,
-                    |s| s.scale = target_y);
+                    param_ids::SCALE_Y, false,
+                    |s| s.scale_y = new_scale_y);
             }
         }
     });
@@ -3243,21 +3592,23 @@ fn inspector_overlay_state_widgets(
     ui.horizontal(|ui| {
         kf_anim::animated_toggle(ui, animated_params, param_ids::SCALE_Y, (salt_kind, "sy", salt_idx));
         ui.label(param_label(highlight.is_active(param_ids::SCALE_Y), "Scale Y:"));
-        let r = ui.add(egui::Slider::new(&mut new_sy, 0.1..=5.0).logarithmic(true));
-        if r.changed() {
-            kf_anim::write_overlay_param(layout, animated_params, playhead,
-                param_ids::SCALE_Y, false, |s| s.scale_y = new_sy);
-            if linked {
-                // Editing Y with the lock on: bump the uniform `scale`
-                // so the visible Y grows by the typed factor while X
-                // tracks it. We compute the "effective" Y the user sees
-                // (`scale * scale_y`) and rebalance: keep scale_y = 1.0,
-                // set scale = effective.
-                let target_y = new_sy * cur.scale;
+        if linked {
+            // Linked mode: the Y slider edits the *uniform* scale.
+            // See actor inspector for the rationale (the previous
+            // multiplicative formula caused exponential runaway).
+            let mut linked_scale = cur.scale;
+            let r = ui.add(egui::Slider::new(&mut linked_scale, 0.05..=5.0).logarithmic(true));
+            if r.changed() && linked_scale.is_finite() && linked_scale > 0.0 {
+                kf_anim::write_overlay_param(layout, animated_params, playhead,
+                    param_ids::SCALE, false, |s| s.scale = linked_scale);
                 kf_anim::write_overlay_param(layout, animated_params, playhead,
                     param_ids::SCALE_Y, false, |s| s.scale_y = 1.0);
+            }
+        } else {
+            let r = ui.add(egui::Slider::new(&mut new_sy, 0.1..=5.0).logarithmic(true));
+            if r.changed() {
                 kf_anim::write_overlay_param(layout, animated_params, playhead,
-                    param_ids::SCALE, false, |s| s.scale = target_y);
+                    param_ids::SCALE_Y, false, |s| s.scale_y = new_sy);
             }
         }
     });
@@ -3816,12 +4167,17 @@ fn inspector_audio(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
         let t_local = (state.playhead - audio.t_in).max(0.0);
 
         // ── Volume ───────────────────────────────────────────────────────
-        inspector_audio_param(
+        // Volume uses the *numeric* widget (DragValue) so the user can
+        // type / drag a precise value, matching how Speed works. The
+        // earlier Slider version was the user's "volume should not be
+        // a slider, it should be a value like Speed" complaint.
+        inspector_audio_param_ex(
             ui,
             t("Volume"),
             "volume",
-            0.0..=2.0,
+            0.0..=4.0,
             false, // not logarithmic
+            true,  // numeric DragValue
             t_local,
             &mut audio.volume,
             &mut audio.volume_kfs,
@@ -4210,6 +4566,30 @@ fn inspector_audio_param(
     kfs: &mut Vec<memstroy_core::Keyframe<f32>>,
     animated: &mut std::collections::BTreeSet<String>,
 ) {
+    inspector_audio_param_ex(
+        ui, label, param_id, range, logarithmic, false, t_local,
+        static_value, kfs, animated,
+    );
+}
+
+/// Extended audio param row that lets the caller request a numeric
+/// `DragValue` widget instead of the default `Slider`. The user wants
+/// volume to behave the same way as Speed — a precise typed/dragged
+/// value rather than a constrained slider — so we keep a thin
+/// dispatch on top of the legacy 9-arg helper for backward compat.
+#[allow(clippy::too_many_arguments)]
+fn inspector_audio_param_ex(
+    ui: &mut egui::Ui,
+    label: &str,
+    param_id: &str,
+    range: std::ops::RangeInclusive<f32>,
+    logarithmic: bool,
+    numeric: bool,
+    t_local: f32,
+    static_value: &mut f32,
+    kfs: &mut Vec<memstroy_core::Keyframe<f32>>,
+    animated: &mut std::collections::BTreeSet<String>,
+) {
     let is_animated = animated.contains(param_id);
 
     // Display value: when animated, sample the kf track at the playhead
@@ -4247,14 +4627,27 @@ fn inspector_audio_param(
 
         ui.label(label);
 
-        let mut slider = egui::Slider::new(&mut display, range.clone());
-        if logarithmic {
-            slider = slider.logarithmic(true);
-            if param_id == "speed" {
-                slider = slider.suffix("x");
+        let resp = if numeric {
+            // Numeric mode (e.g. Volume): expose the value via DragValue
+            // so the user can type or drag without being constrained to
+            // the slider's visual gradient. Mirrors the Speed widget.
+            let r = ui.add(
+                egui::DragValue::new(&mut display)
+                    .range(range.clone())
+                    .speed(0.01)
+                    .fixed_decimals(3),
+            );
+            r
+        } else {
+            let mut slider = egui::Slider::new(&mut display, range.clone());
+            if logarithmic {
+                slider = slider.logarithmic(true);
+                if param_id == "speed" {
+                    slider = slider.suffix("x");
+                }
             }
-        }
-        let resp = ui.add(slider);
+            ui.add(slider)
+        };
 
         if resp.changed() {
             if is_animated {
@@ -4592,7 +4985,12 @@ fn timeline_marquee_update(
         || state.asset_drag.dragging.is_some();
 
     let id = egui::Id::new(("timeline_marquee_interact",));
-    let resp = ui.interact(tracks_rect, id, egui::Sense::click_and_drag());
+    // Use `Sense::drag()` (not `click_and_drag`) so a *click* on a clip
+    // is NOT swallowed by this full-width interactor. The marquee only
+    // needs the press → drag-out → release path; ordinary clicks on
+    // clips must propagate to the per-clip widgets registered earlier
+    // in the frame so single-select and the split tool work again.
+    let resp = ui.interact(tracks_rect, id, egui::Sense::drag());
 
     // Start a marquee gesture only if no other timeline drag picked up
     // the press first this frame.
@@ -6301,7 +6699,18 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                 state.playhead = clicked;
                                 state.status = "__SPLIT_AT_PLAYHEAD__".into();
                             } else {
-                                to_select = Some(Selection::Background(bi));
+                                let ctrl_held = ui.input(|i| i.modifiers.ctrl || i.modifiers.mac_cmd);
+                                let target_sel = Selection::Background(bi);
+                                if ctrl_held {
+                                    if let Some(pos) = state.canvas_selection.iter().position(|&s| s == target_sel) {
+                                        state.canvas_selection.remove(pos);
+                                    } else {
+                                        state.canvas_selection.push(target_sel);
+                                    }
+                                } else {
+                                    state.canvas_selection.clear();
+                                }
+                                to_select = Some(target_sel);
                             }
                         }
                     }
@@ -6568,18 +6977,36 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             state.status = "__SPLIT_AT_PLAYHEAD__".into();
                         } else {
                             // ── Ctrl+click multi-select ──
+                            //
+                            // Two stores have to stay in sync:
+                            //   * `multi_select` — the legacy actor-only set,
+                            //     kept for backward compatibility.
+                            //   * `canvas_selection` — the cross-element set
+                            //     read by the inspector and the canvas
+                            //     gizmos. Without keeping this in sync, the
+                            //     inspector still showed the "N elements
+                            //     selected" banner from a previous marquee
+                            //     after the user single-clicked a clip in
+                            //     the layer panel (bug: regular select
+                            //     "stopped working").
                             let ctrl_held = ui.input(|i| i.modifiers.ctrl || i.modifiers.mac_cmd);
+                            let target_sel = Selection::Actor(ai);
                             if ctrl_held {
-                                // Toggle in multi_select
                                 if let Some(pos) = state.multi_select.iter().position(|&x| x == ai) {
                                     state.multi_select.remove(pos);
                                 } else {
                                     state.multi_select.push(ai);
                                 }
+                                if let Some(pos) = state.canvas_selection.iter().position(|&s| s == target_sel) {
+                                    state.canvas_selection.remove(pos);
+                                } else {
+                                    state.canvas_selection.push(target_sel);
+                                }
                             } else {
                                 state.multi_select.clear();
+                                state.canvas_selection.clear();
                             }
-                            to_select = Some(Selection::Actor(ai));
+                            to_select = Some(target_sel);
                         }
                     }
 
@@ -6819,7 +7246,23 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             state.playhead = clicked;
                             state.status = "__SPLIT_AT_PLAYHEAD__".into();
                         } else {
-                            to_select = Some(Selection::Overlay(oi));
+                            // Plain click clears the cross-element
+                            // multi-selection so the inspector returns
+                            // to single-element mode (Ctrl+click below
+                            // toggles the clicked overlay in/out of
+                            // the canvas_selection set instead).
+                            let ctrl_held = ui.input(|i| i.modifiers.ctrl || i.modifiers.mac_cmd);
+                            let target_sel = Selection::Overlay(oi);
+                            if ctrl_held {
+                                if let Some(pos) = state.canvas_selection.iter().position(|&s| s == target_sel) {
+                                    state.canvas_selection.remove(pos);
+                                } else {
+                                    state.canvas_selection.push(target_sel);
+                                }
+                            } else {
+                                state.canvas_selection.clear();
+                            }
+                            to_select = Some(target_sel);
                         }
                     }
                     // The overlay click handler may have removed
@@ -7074,7 +7517,22 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             let aui_eff = aui;
                             to_select = Some(Selection::Audio(aui_eff));
                         } else {
-                            to_select = Some(Selection::Audio(aui));
+                            // Plain click clears the cross-element
+                            // multi-selection so the inspector returns
+                            // to single-element mode (Ctrl+click toggles
+                            // this audio track in/out of the canvas_selection set).
+                            let ctrl_held = ui.input(|i| i.modifiers.ctrl || i.modifiers.mac_cmd);
+                            let target_sel = Selection::Audio(aui);
+                            if ctrl_held {
+                                if let Some(pos) = state.canvas_selection.iter().position(|&s| s == target_sel) {
+                                    state.canvas_selection.remove(pos);
+                                } else {
+                                    state.canvas_selection.push(target_sel);
+                                }
+                            } else {
+                                state.canvas_selection.clear();
+                            }
+                            to_select = Some(target_sel);
                         }
                     }
                 }
@@ -7317,10 +7775,37 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
 
     // Vertical scrollbar drives both pan (timeline_v_scroll in pixels) and
     // local zoom (timeline_v_zoom multiplier on track heights).
-    let total_unscaled_h: f32 = state.tracks.iter().map(|t| t.height).sum::<f32>().max(1.0);
-    let total_v = (total_unscaled_h * v_zoom).max(viewport_h);
-    let view_a_v = (state.timeline_v_scroll / total_v).clamp(0.0, 1.0);
-    let view_b_v = ((state.timeline_v_scroll + viewport_h) / total_v).clamp(view_a_v, 1.0);
+    //
+    // Two invariants the previous implementation got wrong:
+    //
+    //   (a) The thumb size must reflect the LOCAL ZOOM only, not the
+    //       ratio of the panel's height to the content's height. So
+    //       resizing the layers panel does NOT shrink/grow the thumb
+    //       (bug 2). The thumb size is `1 / v_zoom` clamped to a sane
+    //       range.
+    //
+    //   (b) The thumb's max travel must be the FULL scrollable range —
+    //       which includes the Render Frame row and any per-param
+    //       expansion of the selected layer, not just the bare track
+    //       sum. Previously `total_v` ignored those, so when the user
+    //       scrolled to the bottom the thumb's `view_b_v` clamped to
+    //       1.0 while `view_a_v` kept growing → thumb shrank (bug 1)
+    //       and audio rows past the synthetic limit were unreachable
+    //       (bug 4).
+    //
+    // We therefore drive the scrollbar with two fully decoupled signals:
+    // pan progress through `max_v_scroll`, and zoom-derived thumb size.
+    let max_v_scroll = (total_tracks_h - viewport_h).max(0.0);
+    const V_ZOOM_MIN: f32 = 1.0;
+    const V_ZOOM_MAX: f32 = 8.0;
+    let thumb_size_frac = (1.0_f32 / v_zoom).clamp(1.0 / V_ZOOM_MAX, 1.0);
+    let pan_frac = if max_v_scroll > 0.0 {
+        (state.timeline_v_scroll / max_v_scroll).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let view_a_v = pan_frac * (1.0 - thumb_size_frac);
+    let view_b_v = (view_a_v + thumb_size_frac).min(1.0);
     let (new_a_v, new_b_v) = stretchable_scrollbar(
         ui,
         v_sb_rect,
@@ -7329,16 +7814,26 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
         view_b_v,
     );
     {
-        let new_window_pixels = ((new_b_v - new_a_v) * total_v).max(20.0);
-        // viewport_h must equal v_zoom * total_unscaled_h * (new_b_v - new_a_v)
-        // → v_zoom = viewport_h / (total_unscaled_h * (new_b_v - new_a_v))
-        let denom = (total_unscaled_h * (new_b_v - new_a_v)).max(0.0001);
-        let new_v_zoom = (viewport_h / denom).clamp(0.25, 8.0);
+        let new_thumb_size = (new_b_v - new_a_v).clamp(1.0 / V_ZOOM_MAX, 1.0);
+        let new_v_zoom = (1.0 / new_thumb_size).clamp(V_ZOOM_MIN, V_ZOOM_MAX);
         state.timeline_v_zoom = new_v_zoom;
-        // Recompute v_scroll using the NEW total height (so position stays consistent).
-        let new_total_v = (total_unscaled_h * new_v_zoom).max(viewport_h);
-        state.timeline_v_scroll = (new_a_v * new_total_v).max(0.0);
-        let _ = new_window_pixels; // silence unused
+
+        // Recompute total content height with the NEW v_zoom, then map
+        // the (possibly updated) pan fraction back onto the new
+        // scrollable range. This keeps the visible top-of-viewport
+        // anchored to the same content fraction across zoom changes,
+        // and makes "drag thumb to bottom" reliably hit the last row.
+        let new_total_tracks_h: f32 = RF_ROW_BASE_H * new_v_zoom
+            + (0..num_tracks)
+                .map(|i| {
+                    state.tracks[i].height * new_v_zoom
+                        + selected_layer_expansion(state, i, new_v_zoom)
+                })
+                .sum::<f32>();
+        let new_max_v_scroll = (new_total_tracks_h - viewport_h).max(0.0);
+        let denom = (1.0 - new_thumb_size).max(1.0e-4);
+        let new_pan_frac = (new_a_v / denom).clamp(0.0, 1.0);
+        state.timeline_v_scroll = (new_pan_frac * new_max_v_scroll).max(0.0);
     }
 
     if let Some(sel) = to_select {
