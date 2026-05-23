@@ -880,6 +880,17 @@ impl App {
             return;
         }
 
+        // Don't fire main-canvas plain-key shortcuts (Space, Delete,
+        // Esc) while the skeleton editor window is open. Its own
+        // `handle_input` already consumed the relevant keys earlier
+        // this frame, but we belt-and-brace gate the block too so a
+        // future edit that adds another plain-key shortcut (M, T, …)
+        // doesn't accidentally double-handle while the user is in
+        // the skeleton editor.
+        if self.state.skeleton_editor.open {
+            return;
+        }
+
         ctx.input(|i| {
             // Space = Play/Pause
             if i.key_pressed(egui::Key::Space) {
@@ -2367,8 +2378,21 @@ impl eframe::App for App {
             }
         }
 
+        // ── Skeleton-editor keyboard handling ──
+        // The skeleton editor is a floating window with its own
+        // transport. When it's open, Space / arrow keys / Home / End
+        // must drive its playhead, not the main canvas's. We consume
+        // those keys here BEFORE `handle_shortcuts` runs so the main
+        // app's `key_pressed(...)` checks no longer see them.
+        let skeleton_consumed_keys = if self.state.skeleton_editor.open {
+            crate::skeleton_editor::handle_input(ctx, &mut self.state)
+        } else {
+            false
+        };
+
         // Keyboard shortcuts
         self.handle_shortcuts(ctx);
+        let _ = skeleton_consumed_keys;
 
         // ── Auto-rescan local asset directories ──
         // Cheap mtime-fingerprint poll (debounced to ~2 s) that picks
