@@ -179,6 +179,9 @@ pub fn apply_effect_stack(
             EffectKind::Mask { shape, feather, invert } => {
                 apply_mask_alpha(rgba, w, h, shape, *feather, *invert, i);
             }
+            EffectKind::ColorKey { color, similarity, blend, spill, invert } => {
+                apply_color_key_alpha(rgba, w, h, *color, *similarity, *blend, *spill, *invert, i);
+            }
         }
     }
     crop
@@ -230,6 +233,14 @@ pub fn signature(effects: &[Effect]) -> u64 {
                 ((feather * 1000.0) as i32).hash(&mut h);
                 invert.hash(&mut h);
                 hash_mask_shape(shape, &mut h);
+            }
+            EffectKind::ColorKey { color, similarity, blend, spill, invert } => {
+                26u8.hash(&mut h);
+                color.hash(&mut h);
+                ((similarity * 1000.0) as i32).hash(&mut h);
+                ((blend * 1000.0) as i32).hash(&mut h);
+                ((spill * 1000.0) as i32).hash(&mut h);
+                invert.hash(&mut h);
             }
         }
     }
@@ -315,6 +326,100 @@ pub(crate) fn sample_mask_alpha(
         keep = if margin >= 0.0 { 1.0 } else { 0.0 };
     }
     if invert { 1.0 - keep } else { keep }
+}
+
+// ─── COLOUR-KEY MASK (eyedropper) ─────────────────────────────────────
+//
+// Mirrors `memstroy_vision::HsvChromaKey` in pure CPU code so the live
+// preview matches what the export pipeline produces. We keep the same
+// HSV similarity / blend semantics so a single picked colour produces
+// the same alpha map regardless of which renderer the user is looking
+// at. Spill suppression is NOT applied here — the preview's purpose
+// is to show the user where the key cuts; the export-side
+// `chromakey` filter already handles spill suppression downstream.
+
+/// Apply a colour-key mask to an RGBA8 image in place. Pixels close
+/// to `key_color` (in HSV space) get their alpha multiplied by 0;
+/// pixels far from it keep their alpha. `similarity` and `blend`
+/// follow the same semantics as `HsvChromaKey`. `invert` flips the
+/// keep / remove polarity. `intensity` blends between "no keying"
+/// and "full keying" so the master envelope can fade the effect in.
+pub(crate) fn apply_color_key_alpha(
+    rgba: &mut Vec<u8>,
+    w: u32,
+    h: u32,
+    key_color: [u8; 3],
+    similarity: f32,
+    blend: f32,
+    _spill: f32,
+    invert: bool,
+    intensity: f32,
+) {
+    if rgba.len() < (w as usize) * (h as usize) * 4 { return; }
+    let i = intensity.clamp(0.0, 1.0);
+    let key_hsv = rgb_to_hsv_local(key_color);
+    let hue_tol_deg = 60.0 * similarity.clamp(0.0, 1.0);
+    let sv_tol = 0.5 * similarity.clamp(0.0, 1.0);
+    let blend = blend.clamp(0.0, 1.0);
+    let total = (w as usize) * (h as usize);
+    for px in 0..total {
+        let idx = px * 4;
+        let r = rgba[idx];
+        let g = rgba[idx + 1];
+        let b = rgba[idx + 2];
+        let hsv = rgb_to_hsv_local([r, g, b]);
+        let dh = hue_distance_deg_local(hsv.0, key_hsv.0);
+        let ds = (hsv.1 - key_hsv.1).abs();
+        let dv = (hsv.2 - key_hsv.2).abs();
+        // Match HsvChromaKey alpha: 0 inside core, 1 outside,
+        // soft edge between core and core+blend.
+        let mut alpha_keep = 1.0_f32;
+        if dh < hue_tol_deg && ds < sv_tol && dv < sv_tol {
+            alpha_keep = 0.0;
+        } else if dh < hue_tol_deg + 360.0 * blend
+            && ds < sv_tol + blend
+            && dv < sv_tol + blend
+        {
+            let edge = ((dh - hue_tol_deg) / (360.0 * blend + f32::EPSILON))
+                .max((ds - sv_tol) / (blend + f32::EPSILON))
+                .max((dv - sv_tol) / (blend + f32::EPSILON));
+            alpha_keep = edge.clamp(0.0, 1.0);
+        }
+        if invert { alpha_keep = 1.0 - alpha_keep; }
+        let orig = rgba[idx + 3] as f32;
+        let target = orig * alpha_keep;
+        let out = orig + (target - orig) * i;
+        rgba[idx + 3] = out.clamp(0.0, 255.0) as u8;
+    }
+}
+
+#[inline]
+fn rgb_to_hsv_local(rgb: [u8; 3]) -> (f32, f32, f32) {
+    let r = rgb[0] as f32 / 255.0;
+    let g = rgb[1] as f32 / 255.0;
+    let b = rgb[2] as f32 / 255.0;
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let delta = max - min;
+    let h = if delta == 0.0 {
+        0.0
+    } else if max == r {
+        60.0 * (((g - b) / delta) % 6.0)
+    } else if max == g {
+        60.0 * ((b - r) / delta + 2.0)
+    } else {
+        60.0 * ((r - g) / delta + 4.0)
+    };
+    let h = if h < 0.0 { h + 360.0 } else { h };
+    let s = if max == 0.0 { 0.0 } else { delta / max };
+    let v = max;
+    (h, s, v)
+}
+
+#[inline]
+fn hue_distance_deg_local(a: f32, b: f32) -> f32 {
+    let d = (a - b).abs() % 360.0;
+    d.min(360.0 - d)
 }
 
 // ─── PIXEL OPS ──────────────────────────────────────────────────────
