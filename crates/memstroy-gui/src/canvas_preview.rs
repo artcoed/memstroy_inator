@@ -5462,7 +5462,15 @@ fn draw_mask_toolbar(
         (MaskTool::RectMask, "\u{25A1}", "Rectangle mask / crop — drag to define a rectangular region. Combines the legacy Rectangle and Crop tools."),
         (MaskTool::EllipseMask, "\u{25CB}", "Ellipse mask — drag to mask outside the ellipse"),
         (MaskTool::FreehandMask, "\u{270F}", "Freehand mask — paint a closed polygon"),
-        (MaskTool::Eyedropper, "\u{1F4A7}", "Eyedropper colour-key mask — click on the picture to pick a colour, every pixel close to that colour gets masked out. Works on actors AND image overlays."),
+        // Segment selection mask. Click-by-click polygon construction
+        // with an eyedropper-style crosshair: each click plants a
+        // vertex, click near the first vertex (≥ 3 placed) or
+        // double-click closes the shape. Replaces the colour-key
+        // Eyedropper button on the canvas toolbar — that tool now
+        // lives only in the inspector "Masks" panel where the
+        // similarity / blend / spill sliders sit alongside it, so
+        // colour picking and tuning happen in one place.
+        (MaskTool::SegmentMask, "\u{2B20}", "Segment selection mask — click on the canvas to plant polygon vertices, click near the first point or double-click to close. Right-click pops the last vertex; Esc cancels."),
     ];
     for (i, (tool, glyph, hint)) in tools.iter().enumerate() {
         let rect = Rect::from_min_size(
@@ -5652,6 +5660,18 @@ pub(crate) fn handle_mask_draw_input(
         return true;
     }
 
+    // Segment selection mask — multi-click polygon construction.
+    // Like the eyedropper it lives outside the drag commit pipeline:
+    // each click appends a vertex (or closes the shape) and the
+    // commit fires when the user clicks near the first vertex,
+    // double-clicks, or presses Enter. Routing this BEFORE the
+    // generic drag handlers keeps a vertex-click from being mistaken
+    // for a marquee or transform drag.
+    if state.mask_tool == MaskTool::SegmentMask {
+        handle_segment_mask_input(ui, response, state, full_rect, viewport_size);
+        return true;
+    }
+
     // The crop / rect / ellipse / freehand tools all dispatch through
     // the same code path; a single `CanvasDragMode::DrawMask` carries
     // the active tool tag.
@@ -5721,10 +5741,183 @@ pub(crate) fn handle_mask_draw_input(
     true
 }
 
+/// Closure-detection radius for the segment mask, expressed in UV
+/// (image-local, 0..1) coordinates. ~2.5 % of the element extent
+/// translates to roughly 10 px on a 400-px-wide layer — comfortably
+/// large enough that the user doesn't have to pixel-hunt the first
+/// vertex, but tight enough that a deliberate vertex placed nearby
+/// won't accidentally close the polygon. Tuned by feel with a 1080×
+/// reference frame; if users complain we can promote it to a setting.
+const SEGMENT_MASK_CLOSE_RADIUS_UV: f32 = 0.025;
+
+/// Click-by-click polygon construction for `MaskTool::SegmentMask`.
+///
+/// The handler keeps polygon state in `EditorState::mask_draft_points`
+/// (the in-progress vertex list) and `EditorState::canvas_drag.mode`
+/// (the `DrawMask { tool: SegmentMask, .. }` carrier that captures
+/// the target element + the very first vertex). The carrier doubles
+/// as a sentinel: while it sits in `DrawMask` mode, every subsequent
+/// click is interpreted as a polygon vertex, never as a marquee /
+/// transform start. The carrier is cleared on commit / cancel so the
+/// regular transform pipeline can take over again.
+///
+/// Closure rules — any of these commits the polygon:
+///   * left-click within `SEGMENT_MASK_CLOSE_RADIUS_UV` of the first
+///     vertex, with at least three vertices already placed,
+///   * double-click anywhere (≥ 3 vertices required),
+///   * Enter / Return key (≥ 3 vertices required).
+///
+/// Right-click pops the most-recently placed vertex; popping the
+/// last remaining vertex resets the drag carrier so the next
+/// left-click starts a fresh polygon. Esc is wired up in `app.rs`
+/// alongside the other mask tools.
+///
+/// `mask_segment_cursor_uv` is updated every frame to the cursor's
+/// element-local UV (or `None` when the cursor leaves the element).
+/// `draw_mask_draft` reads it to render the rubber-band line from
+/// the last placed vertex to the live cursor and the dashed close
+/// preview from the cursor back to the first vertex — without that
+/// the user has no way to see where the next segment will land.
+fn handle_segment_mask_input(
+    ui: &egui::Ui,
+    response: &egui::Response,
+    state: &mut EditorState,
+    full_rect: Rect,
+    viewport_size: [f32; 2],
+) {
+    use crate::state::CanvasDragMode;
+
+    // Crosshair cursor + per-frame repaint so the rubber-band tracks
+    // smoothly even between input events.
+    ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+    ui.ctx().request_repaint();
+
+    let pointer = ui.input(|i| i.pointer.hover_pos());
+
+    // Maintain the live cursor UV. We resolve it through
+    // `screen_to_element_uv` so it inherits the same rotation /
+    // bounding-box math the eventual click would. When the cursor is
+    // off-element (no UV) we clear the field — the renderer then
+    // skips the rubber-band so it doesn't visually "stick" to the
+    // last in-bounds position. Computed in a separate `let` so the
+    // immutable borrow of `state` ends before we assign back.
+    let new_cursor_uv = pointer.and_then(|p| {
+        screen_to_element_uv(state, full_rect, viewport_size, p).map(|(uv, _, _)| uv)
+    });
+    state.mask_segment_cursor_uv = new_cursor_uv;
+
+    // Right-click → pop the last vertex (undo single segment). When
+    // the polygon empties out we drop the drag carrier so the next
+    // primary click starts a brand-new polygon.
+    if response.secondary_clicked() {
+        if state.mask_draft_points.pop().is_some() {
+            state.status = "Segment mask: removed last vertex".into();
+        }
+        if state.mask_draft_points.is_empty() {
+            state.canvas_drag.mode = CanvasDragMode::None;
+        }
+        return;
+    }
+
+    // Helper: commit the in-flight polygon via `commit_mask_draft`,
+    // then reset the carrier + draft.
+    fn commit_segment(state: &mut EditorState) {
+        if let CanvasDragMode::DrawMask { tool, start_uv, target } = state.canvas_drag.mode {
+            commit_mask_draft(state, tool, start_uv, target);
+        }
+        state.canvas_drag.mode = CanvasDragMode::None;
+        state.mask_draft_points.clear();
+        state.mask_segment_cursor_uv = None;
+    }
+
+    // Double-click → commit (≥ 3 vertices). Checked BEFORE the click
+    // branch so the second click of the double doesn't first land
+    // as an extra vertex.
+    if response.double_clicked() {
+        if state.mask_draft_points.len() >= 3 {
+            commit_segment(state);
+        }
+        return;
+    }
+
+    // Enter / Return → commit (≥ 3 vertices). Lets the user finish
+    // the polygon from the keyboard if a clean closure click is
+    // awkward (e.g. when the first vertex is occluded by other UI).
+    let enter_pressed = ui.input(|i| {
+        i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Space)
+    });
+    if enter_pressed && state.mask_draft_points.len() >= 3 {
+        commit_segment(state);
+        return;
+    }
+
+    // Left-click → place a vertex (or close the polygon).
+    if response.clicked() {
+        let Some(p) = pointer else { return; };
+        let Some((uv, target, _rect)) =
+            screen_to_element_uv(state, full_rect, viewport_size, p)
+        else {
+            // No element selected (or click was outside its bounding
+            // box). Surface a hint instead of silently swallowing the
+            // click — the user otherwise gets no feedback for why
+            // their vertex didn't appear.
+            state.status =
+                "Segment mask: select an actor or image overlay first, then click on it.".into();
+            return;
+        };
+
+        // First click — arm the carrier and seed the vertex list.
+        if state.mask_draft_points.is_empty() {
+            state.canvas_drag.mode = CanvasDragMode::DrawMask {
+                tool: MaskTool::SegmentMask,
+                start_uv: uv,
+                target,
+            };
+            state.mask_draft_points.push(uv);
+            state.status = "Segment mask: vertex 1 placed — keep clicking, double-click or click the first point to close.".into();
+            return;
+        }
+
+        // Subsequent clicks — check for closure first so the user
+        // doesn't have to be perfectly on the first vertex (a small
+        // hand wobble would otherwise plant a duplicate vertex on
+        // top of the start).
+        if state.mask_draft_points.len() >= 3 {
+            let first = state.mask_draft_points[0];
+            let dx = uv[0] - first[0];
+            let dy = uv[1] - first[1];
+            if (dx * dx + dy * dy).sqrt() < SEGMENT_MASK_CLOSE_RADIUS_UV {
+                commit_segment(state);
+                return;
+            }
+        }
+
+        // Defensive: don't accumulate duplicate vertices when the
+        // user clicks the same spot twice (would create zero-length
+        // segments that polygon-fill rasterisers cope with poorly).
+        if let Some(last) = state.mask_draft_points.last() {
+            let dx = uv[0] - last[0];
+            let dy = uv[1] - last[1];
+            if (dx * dx + dy * dy).sqrt() < 0.001 {
+                return;
+            }
+        }
+
+        state.mask_draft_points.push(uv);
+        state.status = format!(
+            "Segment mask: vertex {} placed — click first point or double-click to close.",
+            state.mask_draft_points.len(),
+        );
+    }
+}
+
 /// Push the painted shape onto the target element's `effects` stack.
 /// Builds an `EffectKind::Mask` carrying the matching shape; the
 /// eyedropper tool short-circuits before reaching this commit and
-/// uses `handle_eyedropper_mask_click` instead.
+/// uses `handle_eyedropper_mask_click` instead. The segment-mask
+/// tool also routes through here — its commit shape is identical
+/// to a freehand polygon so the FFmpeg / preview sampler already
+/// handles it without a new code path.
 fn commit_mask_draft(
     state: &mut EditorState,
     tool: MaskTool,
@@ -5740,8 +5933,17 @@ fn commit_mask_draft(
     let rx = start_uv[0].max(last_uv[0]).clamp(0.0, 1.0);
     let ty = start_uv[1].min(last_uv[1]).clamp(0.0, 1.0);
     let by = start_uv[1].max(last_uv[1]).clamp(0.0, 1.0);
-    if (rx - lx).abs() < 0.005 && (by - ty).abs() < 0.005 && tool != MaskTool::FreehandMask {
+    if (rx - lx).abs() < 0.005
+        && (by - ty).abs() < 0.005
+        && tool != MaskTool::FreehandMask
+        && tool != MaskTool::SegmentMask
+    {
         // Treat tiny gestures as a misclick — don't commit anything.
+        // Polygon-style tools (freehand and segment) skip this guard
+        // because they're inherently multi-point: the start/last UV
+        // pair only describes the carrier's first/most-recent click,
+        // which may legitimately be close together while the polygon
+        // body is large (e.g. lassoing a thin diagonal strip).
         return;
     }
 
@@ -5777,6 +5979,26 @@ fn commit_mask_draft(
             ))
         }
         MaskTool::FreehandMask => {
+            if pts.len() < 3 { None } else {
+                let clamped: Vec<[f32; 2]> = pts
+                    .into_iter()
+                    .map(|p| [p[0].clamp(0.0, 1.0), p[1].clamp(0.0, 1.0)])
+                    .collect();
+                Some(memstroy_core::Effect::new(
+                    memstroy_core::EffectKind::Mask {
+                        shape: memstroy_core::MaskShape::Polygon { points: clamped },
+                        feather: 0.0,
+                        invert: false,
+                    },
+                ))
+            }
+        }
+        MaskTool::SegmentMask => {
+            // Same polygon shape as freehand — the difference is
+            // purely how the points were authored. Reuse the same
+            // clamp + minimum-vertex check so the resulting mask is
+            // guaranteed to fall inside the source UV (matches what
+            // the renderer / FFmpeg expects).
             if pts.len() < 3 { None } else {
                 let clamped: Vec<[f32; 2]> = pts
                     .into_iter()
@@ -6085,9 +6307,60 @@ fn draw_mask_draft(
         MaskTool::Eyedropper => {
             // The eyedropper commits on click via
             // `handle_eyedropper_mask_click` — there is no drag draft
-            // to draw. The cursor reticle is painted by
-            // `draw_eyedropper_reticle` separately so it stays
-            // visible even when the gesture has not yet started.
+            // to draw. The crosshair cursor (set by
+            // `handle_mask_draw_input`) is the only visual hint, and
+            // the inspector swatch reflects the picked colour as
+            // soon as the click lands.
+        }
+        MaskTool::SegmentMask => {
+            // Solid lines between every consecutive committed vertex
+            // pair. Drawn first so the vertex dots paint over any
+            // segment endpoints (which they share).
+            if state.mask_draft_points.len() >= 2 {
+                let mut prev = to_screen(state.mask_draft_points[0]);
+                for &uv in state.mask_draft_points.iter().skip(1) {
+                    let cur = to_screen(uv);
+                    painter.line_segment([prev, cur], stroke_main);
+                    prev = cur;
+                }
+            }
+            // Vertex dots — small filled circles with a dark outline
+            // so they read on light AND dark layers. The first
+            // vertex gets a larger blue halo so the user can see the
+            // closure target at a glance.
+            for (i, &uv) in state.mask_draft_points.iter().enumerate() {
+                let p = to_screen(uv);
+                if i == 0 {
+                    painter.circle_stroke(
+                        p,
+                        8.0,
+                        Stroke::new(1.5, Color32::from_rgb(120, 220, 255)),
+                    );
+                }
+                painter.circle_filled(p, 4.0, Color32::from_rgb(255, 200, 50));
+                painter.circle_stroke(p, 4.0, Stroke::new(1.0, Color32::from_rgb(40, 30, 0)));
+            }
+            // Rubber-band line from the last placed vertex to the
+            // current cursor, plus a dashed close-preview from the
+            // cursor back to the first vertex (only once we have
+            // ≥ 2 vertices placed — before that there's nothing to
+            // close back to). The cursor UV is updated every frame
+            // by `handle_segment_mask_input` and stays `None` while
+            // the cursor is off the element so the rubber-band
+            // doesn't visually lock onto the last in-bounds spot.
+            if let (Some(&first), Some(&last), Some(cursor_uv)) = (
+                state.mask_draft_points.first(),
+                state.mask_draft_points.last(),
+                state.mask_segment_cursor_uv,
+            ) {
+                let cursor_screen = to_screen(cursor_uv);
+                let last_screen = to_screen(last);
+                painter.line_segment([last_screen, cursor_screen], stroke_dash);
+                if state.mask_draft_points.len() >= 2 {
+                    let first_screen = to_screen(first);
+                    painter.line_segment([cursor_screen, first_screen], stroke_dash);
+                }
+            }
         }
         MaskTool::None => {}
     }
