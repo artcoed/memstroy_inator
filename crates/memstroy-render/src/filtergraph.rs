@@ -311,18 +311,21 @@ impl<'a> FilterGraphBuilder<'a> {
 
             let key = actor.chroma_key.key_color;
             let key_hex = format!("0x{:02X}{:02X}{:02X}", key[0], key[1], key[2]);
-            // Build the full preview-faithful transform: canvas_layouts
-            // (when present) overrides position; render_frame motion
-            // shifts the composite; modifiers / easing / per-frame
-            // rotation / opacity / flip are all honoured. See
+            // Build the full preview-faithful transform: skeleton
+            // attachments (when bound) override world position; then
+            // canvas_layouts, then legacy normalised; render_frame
+            // motion shifts the composite; modifiers / easing / per-
+            // frame rotation / opacity / flip are all honoured. See
             // `expr::build_element_transform` for the contract.
             let t_in_clip = actor.t_in.unwrap_or(0.0);
+            let t_out_clip = actor.t_out.unwrap_or(self.scene.output.duration);
             let xform = crate::expr::build_element_transform(
                 self.scene,
                 &actor.id,
                 &actor.layout,
                 &actor.modifiers,
                 t_in_clip,
+                actor.skeleton_attachments.first(),
             );
             if xform.opacity_animated {
                 tracing::debug!(
@@ -379,7 +382,7 @@ impl<'a> FilterGraphBuilder<'a> {
                 }
                 let pre_label = self.alloc_label("actorPre");
                 self.chunks.push(format!("{prefix}{pre_label}", prefix = prefix, pre_label = pre_label));
-                let after_fx = self.apply_effect_stack(pre_label, &actor.effects)?;
+                let after_fx = self.apply_effect_stack(pre_label, &actor.effects, t_in_clip, t_out_clip)?;
                 let mut tail_filters: Vec<String> = Vec::new();
                 if let Some(s) = speed_part { tail_filters.push(s); }
                 tail_filters.push(scale_part);
@@ -424,7 +427,7 @@ impl<'a> FilterGraphBuilder<'a> {
                     chain.push(',');
                     chain.push_str(cc);
                 }
-                for snippet in effect_stack_filters(&actor.effects) {
+                for snippet in effect_stack_filters(&actor.effects, t_in_clip, t_out_clip) {
                     chain.push(',');
                     chain.push_str(&snippet);
                 }
@@ -671,6 +674,7 @@ impl<'a> FilterGraphBuilder<'a> {
             &t.layout,
             &t.modifiers,
             t.t_in,
+            t.skeleton_attachment.as_ref(),
         );
         let scale_part = format!(
             "scale=w='iw*{sx}':h='ih*{sy}':eval=frame",
@@ -811,6 +815,7 @@ impl<'a> FilterGraphBuilder<'a> {
             &ov.layout,
             &ov.modifiers,
             ov.t_in,
+            ov.skeleton_attachment.as_ref(),
         );
         if xform.opacity_animated {
             tracing::debug!(
@@ -853,7 +858,7 @@ impl<'a> FilterGraphBuilder<'a> {
                 prefix = prefix,
                 pre_label = pre_label,
             ));
-            let after_fx = self.apply_effect_stack(pre_label, &ov.effects)?;
+            let after_fx = self.apply_effect_stack(pre_label, &ov.effects, ov.t_in, ov.t_out)?;
             let mut tail: Vec<String> = vec![scale_part];
             if let Some(rot) = &xform.rot_expr {
                 tail.push(format!(
@@ -884,7 +889,7 @@ impl<'a> FilterGraphBuilder<'a> {
             // Apply the user-defined effect stack before the layout scale,
             // matching the actor pipeline so e.g. blur / hue shift work in
             // the image's native pixel space (before the on-canvas resize).
-            for snippet in effect_stack_filters(&ov.effects) {
+            for snippet in effect_stack_filters(&ov.effects, ov.t_in, ov.t_out) {
                 chain.push(',');
                 chain.push_str(&snippet);
             }
@@ -936,6 +941,7 @@ impl<'a> FilterGraphBuilder<'a> {
             &ov.layout,
             &ov.modifiers,
             ov.t_in,
+            ov.skeleton_attachment.as_ref(),
         );
         if xform.opacity_animated {
             tracing::debug!(
@@ -971,7 +977,7 @@ impl<'a> FilterGraphBuilder<'a> {
             if xform.vflip { prefix.push_str(",vflip"); }
             let pre_label = self.alloc_label("vidPre");
             self.chunks.push(format!("{prefix}{pre_label}", prefix = prefix, pre_label = pre_label));
-            let after_fx = self.apply_effect_stack(pre_label, &ov.effects)?;
+            let after_fx = self.apply_effect_stack(pre_label, &ov.effects, ov.t_in, ov.t_out)?;
             let mut tail: Vec<String> = Vec::new();
             if let Some(s) = speed_part { tail.push(s); }
             tail.push(scale_part);
@@ -1000,7 +1006,7 @@ impl<'a> FilterGraphBuilder<'a> {
             if xform.vflip { chain.push_str(",vflip"); }
             // Apply the user-defined effect stack — same convention as
             // images / actors so the export matches what the canvas previews.
-            for snippet in effect_stack_filters(&ov.effects) {
+            for snippet in effect_stack_filters(&ov.effects, ov.t_in, ov.t_out) {
                 chain.push(',');
                 chain.push_str(&snippet);
             }
@@ -1284,16 +1290,37 @@ impl<'a> FilterGraphBuilder<'a> {
     /// own labelled stage, then emits an alphamerge sub-graph and
     /// returns the new label so subsequent effects continue from
     /// there. Returns the label of the final stream.
-    fn apply_effect_stack(&mut self, mut current: String, effects: &[Effect]) -> Result<String> {
+    ///
+    /// `t_in` / `t_out` define the host clip's visible window —
+    /// passed through to `effect_animated_filter_chain` so per-
+    /// parameter keyframes are honoured for non-mask effects on the
+    /// stack. Mask geometry is not animated by the model so it falls
+    /// through to the static path either way.
+    fn apply_effect_stack(
+        &mut self,
+        mut current: String,
+        effects: &[Effect],
+        t_in: f32,
+        t_out: f32,
+    ) -> Result<String> {
         let mut buffer: Vec<String> = Vec::new();
         for eff in effects {
             if !eff.enabled { continue; }
-            let i = eff.intensity.clamp(0.0, 1.0);
-            if i <= 0.001 { continue; }
+            // Mask carries no per-parameter keyframes the renderer
+            // honours, so it stays on the static intensity path.
+            // Animated mask intensity is not modelled either; the
+            // `:001` clamp matches the historical fast path.
+            let i_static = eff.intensity.clamp(0.0, 1.0);
             if let EffectKind::Mask { shape, feather, invert } = &eff.kind {
+                if i_static <= 0.001 { continue; }
                 current = self.flush_effect_buffer(current, &mut buffer);
-                current = self.emit_mask_alphamerge(current, shape, *feather, *invert, i)?;
-            } else if let Some(snippet) = effect_to_filter(&eff.kind, i) {
+                current = self.emit_mask_alphamerge(current, shape, *feather, *invert, i_static)?;
+            } else if let Some(snippet) = crate::expr::effect_animated_filter_chain(
+                eff,
+                t_in,
+                t_out,
+                |kind, intensity| effect_to_filter(kind, intensity),
+            ) {
                 buffer.push(snippet);
             }
         }
@@ -1667,13 +1694,16 @@ fn build_anchor_position_expr(
 // continuous "fade in / out" of every effect — a 0.0 intensity always
 // renders as a no-op.
 
-fn effect_stack_filters(effects: &[Effect]) -> Vec<String> {
+fn effect_stack_filters(effects: &[Effect], t_in: f32, t_out: f32) -> Vec<String> {
     let mut out = Vec::with_capacity(effects.len());
     for eff in effects {
         if !eff.enabled { continue; }
-        let i = eff.intensity.clamp(0.0, 1.0);
-        if i <= 0.001 { continue; }
-        if let Some(s) = effect_to_filter(&eff.kind, i) {
+        if let Some(s) = crate::expr::effect_animated_filter_chain(
+            eff,
+            t_in,
+            t_out,
+            |kind, intensity| effect_to_filter(kind, intensity),
+        ) {
             out.push(s);
         }
     }
@@ -1698,13 +1728,19 @@ fn effect_to_filter(kind: &EffectKind, i: f32) -> Option<String> {
     use EffectKind as K;
     Some(match kind {
         K::Blur { radius } => format!("boxblur=luma_radius={r}:luma_power=1", r = (radius * i).max(0.5) as i32),
-        K::Sharpen { amount } => format!("unsharp=5:5:{}:5:5:0", (amount * i).clamp(0.0, 3.0)),
+        K::Sharpen { amount } => format!(
+            "unsharp=lx=5:ly=5:la={la:.4}:cx=5:cy=5:ca=0",
+            la = (amount * i).clamp(0.0, 3.0),
+        ),
         K::Grayscale => format!(
-            "colorchannelmixer=.299*{i}+1-{i}:.587*{i}:.114*{i}:0:.299*{i}:.587*{i}+1-{i}:.114*{i}:0:.299*{i}:.587*{i}:.114*{i}+1-{i}",
+            // Keyed `colorchannelmixer` form so the per-segment
+            // animation path can append `:enable=...` without colliding
+            // with the legacy positional argument list.
+            "colorchannelmixer=rr=.299*{i}+1-{i}:rg=.587*{i}:rb=.114*{i}:ra=0:gr=.299*{i}:gg=.587*{i}+1-{i}:gb=.114*{i}:ga=0:br=.299*{i}:bg=.587*{i}:bb=.114*{i}+1-{i}:ba=0",
             i = i,
         ),
         K::Sepia => format!(
-            "colorchannelmixer={a}:{b}:{c}:0:{d}:{e}:{f}:0:{g}:{h}:{j}:0",
+            "colorchannelmixer=rr={a}:rg={b}:rb={c}:ra=0:gr={d}:gg={e}:gb={f}:ga=0:br={g}:bg={h}:bb={j}:ba=0",
             a = 0.393 * i + (1.0 - i), b = 0.769 * i, c = 0.189 * i,
             d = 0.349 * i, e = 0.686 * i + (1.0 - i), f = 0.168 * i,
             g = 0.272 * i, h = 0.534 * i, j = 0.131 * i + (1.0 - i),
@@ -1719,12 +1755,15 @@ fn effect_to_filter(kind: &EffectKind, i: f32) -> Option<String> {
             )
         }
         K::HueShift { degrees } => format!("hue=h={}", degrees * i),
-        K::Vignette { strength } => format!("vignette=PI/3*{}:mode=forward", (strength * i).clamp(0.0, 1.0)),
+        K::Vignette { strength } => format!(
+            "vignette=angle=PI/3*{s:.4}:mode=forward",
+            s = (strength * i).clamp(0.0, 1.0),
+        ),
         K::Pixelate { block_size } => {
             // Down/up scale via neighbour sampling for the pixelation look.
             let bs = (block_size * i).max(1.0) as i32;
             format!(
-                "scale=iw/{bs}:ih/{bs}:flags=neighbor,scale=iw*{bs}:ih*{bs}:flags=neighbor",
+                "scale=w=iw/{bs}:h=ih/{bs}:flags=neighbor,scale=w=iw*{bs}:h=ih*{bs}:flags=neighbor",
                 bs = bs.max(1)
             )
         }
@@ -1766,8 +1805,8 @@ fn effect_to_filter(kind: &EffectKind, i: f32) -> Option<String> {
             return None;
         }
         K::OldFilm => format!(
-            "colorchannelmixer=.393:.769:.189:0:.349:.686:.168:0:.272:.534:.131:0,vignette=PI/3*0.7,noise=alls={}:allf=t",
-            (i * 12.0) as i32,
+            "colorchannelmixer=rr=.393:rg=.769:rb=.189:ra=0:gr=.349:gg=.686:gb=.168:ga=0:br=.272:bg=.534:bb=.131:ba=0,vignette=angle=PI/3*0.7,noise=alls={n}:allf=t",
+            n = (i * 12.0) as i32,
         ),
         K::Vhs => format!(
             "rgbashift=rh=-{o}:bh={o},noise=alls={n}:allf=t",
@@ -1824,6 +1863,11 @@ fn effect_to_filter(kind: &EffectKind, i: f32) -> Option<String> {
             // already runs spill suppression for the source colour;
             // the effect-stack ColorKey is meant for compositing
             // touch-ups where spill rarely matters.
+            //
+            // Named-argument form (`color=` / `similarity=` / `blend=`)
+            // is required so the per-segment animation path can append
+            // `:enable='between(t,a,b)'` without the parser
+            // mis-reading it as a fourth positional arg.
             let key_hex = format!(
                 "0x{:02X}{:02X}{:02X}",
                 color[0], color[1], color[2],
@@ -1831,9 +1875,19 @@ fn effect_to_filter(kind: &EffectKind, i: f32) -> Option<String> {
             let sim = (similarity * i).clamp(0.0, 1.0);
             let blend = blend.clamp(0.0, 1.0);
             if *invert {
-                format!("chromahold={}:{}:{}", key_hex, sim, blend)
+                format!(
+                    "chromahold=color={hex}:similarity={sim:.4}:blend={blend:.4}",
+                    hex = key_hex,
+                    sim = sim,
+                    blend = blend,
+                )
             } else {
-                format!("chromakey={}:{}:{}", key_hex, sim, blend)
+                format!(
+                    "chromakey=color={hex}:similarity={sim:.4}:blend={blend:.4}",
+                    hex = key_hex,
+                    sim = sim,
+                    blend = blend,
+                )
             }
         }
     })
