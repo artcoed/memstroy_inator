@@ -18,7 +18,6 @@ const COL_RENDER_FRAME: Color32 = Color32::from_rgb(255, 80, 80);
 const COL_ELEMENT_BORDER: Color32 = Color32::from_rgb(180, 180, 200);
 const COL_SELECTED_BORDER: Color32 = Color32::from_rgb(255, 220, 80);
 const COL_INACTIVE_TINT: Color32 = Color32::from_rgba_premultiplied(255, 255, 255, 100);
-const COL_OVERLAY_TEXT: Color32 = Color32::from_rgb(80, 200, 120);
 const COL_OVERLAY_IMAGE: Color32 = Color32::from_rgb(100, 180, 255);
 const COL_OVERLAY_VIDEO: Color32 = Color32::from_rgb(200, 100, 255);
 const COL_BACKGROUND: Color32 = Color32::from_rgb(60, 130, 220);

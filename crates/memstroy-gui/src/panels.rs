@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use egui::{Color32, Pos2, Rect, RichText, Rounding, Sense, Stroke, Vec2};
 use memstroy_core::*;
 
+use crate::i18n::t;
 use crate::state::{AssetDragKind, EditorState, LibraryTab, Selection, TrackKind};
 
 
@@ -106,11 +107,11 @@ pub fn library(ui: &mut egui::Ui, state: &mut EditorState, _request_refresh: imp
     ui.add_space(2.0);
 
     let hint_text = match state.library_tab {
-        LibraryTab::Clips => "Drag a clip onto the canvas or timeline. The library auto-updates from the assets-server (which periodically ingests from Telegram).",
-        LibraryTab::Videos => "User-imported videos. Drop a video file from your file manager into this panel to add it. Drag a row onto the canvas or timeline to spawn an actor.",
-        LibraryTab::Sounds => "Drop a sound onto the timeline to add it as an audio track. Drop audio files from your file manager here to import.",
-        LibraryTab::Images => "Drag a sticker onto the canvas to add it as an image overlay. Drop image files from your file manager here to import.",
-        LibraryTab::Particles => "Drag a particle onto the canvas — it spawns with spin + pulse modifiers.",
+        LibraryTab::Clips => t("Drag a clip onto the canvas or timeline. The library auto-updates from the assets-server (which periodically ingests from Telegram)."),
+        LibraryTab::Videos => t("User-imported videos. Drop a video file from your file manager into this panel to add it. Drag a row onto the canvas or timeline to spawn an actor."),
+        LibraryTab::Sounds => t("Drop a sound onto the timeline to add it as an audio track. Drop audio files from your file manager here to import."),
+        LibraryTab::Images => t("Drag a sticker onto the canvas to add it as an image overlay. Drop image files from your file manager here to import."),
+        LibraryTab::Particles => t("Drag a particle onto the canvas — it spawns with spin + pulse modifiers."),
     };
     ui.label(
         RichText::new(hint_text)
@@ -173,7 +174,7 @@ fn library_split_panel<L, G>(
 
     // ─── Local section header + body ─────────────────────────────────
     ui.label(
-        RichText::new("Local (your imports)")
+        RichText::new(t("Local (your imports)"))
             .size(10.0)
             .strong()
             .color(Color32::from_rgb(180, 220, 180)),
@@ -233,7 +234,7 @@ fn library_split_panel<L, G>(
 
     // ─── Global section header + body ────────────────────────────────
     ui.label(
-        RichText::new("Global (built-in / browser)")
+        RichText::new(t("Global (built-in / browser)"))
             .size(10.0)
             .strong()
             .color(Color32::from_rgb(180, 200, 255)),
@@ -259,7 +260,7 @@ fn library_clips_tab(ui: &mut egui::Ui, state: &mut EditorState) {
     let search_lower = state.library_search.to_lowercase();
     let clip_count = state.library.mellstroy_clips.len();
     ui.label(
-        RichText::new(format!("Clips ({})", clip_count))
+        RichText::new(format!("{} ({})", t("Clips"), clip_count))
             .size(12.0)
             .strong()
             .color(Color32::from_rgb(220, 130, 50)),
@@ -294,7 +295,7 @@ fn library_clips_tab(ui: &mut egui::Ui, state: &mut EditorState) {
         .show(ui, |ui| {
             if state.library.mellstroy_clips.is_empty() {
                 ui.label(
-                    RichText::new("No clips yet — start typing in the search box or scroll to fetch from the server.")
+                    RichText::new(t("No clips yet — start typing in the search box or scroll to fetch from the server."))
                         .italics()
                         .color(COL_TEXT_DIM)
                         .size(11.0),
@@ -811,7 +812,7 @@ fn inspector_body(ui: &mut egui::Ui, state: &mut EditorState) {
             }
         }
         Selection::Camera(_) => {
-            ui.label("Camera editing coming soon.");
+            ui.label(t("Camera editing coming soon."));
         }
         Selection::RenderFrame => {
             inspector_render_frame(ui, state);
@@ -831,7 +832,7 @@ fn inspector_nothing(ui: &mut egui::Ui, state: &mut EditorState) {
     // FPS and duration are intentionally not user-editable here: FPS is
     // pinned by the format and the scene's duration grows automatically
     // to fit whatever is on the timeline.
-    ui.label(RichText::new("Output").size(14.0).strong().color(Color32::from_rgb(100, 200, 255)));
+    ui.label(RichText::new(t("Output")).size(14.0).strong().color(Color32::from_rgb(100, 200, 255)));
     ui.add_space(4.0);
     ui.label(RichText::new("1080x1920 (9:16)").size(12.0).color(COL_TEXT_DIM));
     ui.add_space(4.0);
@@ -854,18 +855,18 @@ fn inspector_multiselect(ui: &mut egui::Ui, state: &mut EditorState) {
     ui.add_space(8.0);
     ui.horizontal(|ui| {
         ui.label(
-            RichText::new(format!("{} elements selected", n))
+            RichText::new(format!("{} {}", n, t("elements selected")))
                 .size(14.0)
                 .strong()
                 .color(Color32::from_rgb(255, 200, 80)),
         );
-        if ui.small_button("Esc").on_hover_text("Clear multi-selection").clicked() {
+        if ui.small_button("Esc").on_hover_text(t("Clear multi-selection")).clicked() {
             state.canvas_selection.clear();
         }
     });
     ui.add_space(2.0);
     ui.label(
-        RichText::new("Edits below are applied as deltas to every element.")
+        RichText::new(t("Edits below are applied as deltas to every element."))
             .italics()
             .size(10.0)
             .color(COL_TEXT_DIM),
@@ -888,7 +889,7 @@ fn inspector_multiselect(ui: &mut egui::Ui, state: &mut EditorState) {
     let mut op_last: f32 = ui.data(|d| d.get_temp(op_id).unwrap_or(0.0_f32));
 
     // ── Position ──
-    ui.label(RichText::new("Position").size(11.0).strong());
+    ui.label(RichText::new(t("Position")).size(11.0).strong());
     ui.horizontal(|ui| {
         ui.label("ΔX:");
         let mut cur = pos_x_last;
@@ -912,7 +913,7 @@ fn inspector_multiselect(ui: &mut egui::Ui, state: &mut EditorState) {
             pos_y_last = cur;
             ui.data_mut(|d| d.insert_temp(pos_y_id, pos_y_last));
         }
-        if ui.small_button("Reset").clicked() {
+        if ui.small_button(t("Reset")).clicked() {
             ui.data_mut(|d| {
                 d.insert_temp(pos_x_id, 0.0_f32);
                 d.insert_temp(pos_y_id, 0.0_f32);
@@ -923,7 +924,7 @@ fn inspector_multiselect(ui: &mut egui::Ui, state: &mut EditorState) {
     ui.add_space(4.0);
 
     // ── Scale (multiplicative) ──
-    ui.label(RichText::new("Scale (multiplier)").size(11.0).strong());
+    ui.label(RichText::new(t("Scale (multiplier)")).size(11.0).strong());
     ui.horizontal(|ui| {
         ui.label("×:");
         let mut cur = scale_last.max(0.01);
@@ -936,7 +937,7 @@ fn inspector_multiselect(ui: &mut egui::Ui, state: &mut EditorState) {
             scale_last = cur;
             ui.data_mut(|d| d.insert_temp(scale_id, scale_last));
         }
-        if ui.small_button("Reset").clicked() {
+        if ui.small_button(t("Reset")).clicked() {
             ui.data_mut(|d| d.insert_temp(scale_id, 1.0_f32));
         }
     });
@@ -944,7 +945,7 @@ fn inspector_multiselect(ui: &mut egui::Ui, state: &mut EditorState) {
     ui.add_space(4.0);
 
     // ── Rotation (additive degrees) ──
-    ui.label(RichText::new("Rotation").size(11.0).strong());
+    ui.label(RichText::new(t("Rotation")).size(11.0).strong());
     ui.horizontal(|ui| {
         ui.label("Δ\u{00B0}:");
         let mut cur = rot_last;
@@ -962,7 +963,7 @@ fn inspector_multiselect(ui: &mut egui::Ui, state: &mut EditorState) {
             rot_last = cur;
             ui.data_mut(|d| d.insert_temp(rot_id, rot_last));
         }
-        if ui.small_button("Reset").clicked() {
+        if ui.small_button(t("Reset")).clicked() {
             ui.data_mut(|d| d.insert_temp(rot_id, 0.0_f32));
         }
     });
@@ -970,7 +971,7 @@ fn inspector_multiselect(ui: &mut egui::Ui, state: &mut EditorState) {
     ui.add_space(4.0);
 
     // ── Opacity (additive 0..1) ──
-    ui.label(RichText::new("Opacity").size(11.0).strong());
+    ui.label(RichText::new(t("Opacity")).size(11.0).strong());
     ui.horizontal(|ui| {
         ui.label("Δ:");
         let mut cur = op_last;
@@ -983,7 +984,7 @@ fn inspector_multiselect(ui: &mut egui::Ui, state: &mut EditorState) {
             op_last = cur;
             ui.data_mut(|d| d.insert_temp(op_id, op_last));
         }
-        if ui.small_button("Reset").clicked() {
+        if ui.small_button(t("Reset")).clicked() {
             ui.data_mut(|d| d.insert_temp(op_id, 0.0_f32));
         }
     });
@@ -995,10 +996,10 @@ fn inspector_multiselect(ui: &mut egui::Ui, state: &mut EditorState) {
     // Quick toggles broadcasting absolute values (these don't need a
     // delta semantic — Visible / Flip are boolean enough to apply uniformly).
     ui.horizontal(|ui| {
-        if ui.button("Flip X all").on_hover_text("Toggle horizontal flip on every selected element").clicked() {
+        if ui.button(t("Flip X all")).on_hover_text(t("Toggle horizontal flip on every selected element")).clicked() {
             multi_toggle_flip_x(state, playhead);
         }
-        if ui.button("Flip Y all").clicked() {
+        if ui.button(t("Flip Y all")).clicked() {
             multi_toggle_flip_y(state, playhead);
         }
     });
@@ -1201,7 +1202,7 @@ fn inspector_actor(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
     // Header with name (delete button removed — use Delete/Backspace shortcut
     // or right-click on the timeline clip instead).
     ui.horizontal(|ui| {
-        ui.label(RichText::new(format!("Actor: {}", state.scene.actors[i].id))
+        ui.label(RichText::new(format!("{}: {}", t("Actor"), state.scene.actors[i].id))
             .strong().size(14.0).color(COL_CLIP_ACTOR));
     });
     ui.add_space(2.0);
@@ -1212,8 +1213,8 @@ fn inspector_actor(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
 
     // Tab bar: Transform | Effects
     ui.horizontal(|ui| {
-        if ui.selectable_label(state.inspector_tab == 0, "Transform").clicked() { state.inspector_tab = 0; }
-        if ui.selectable_label(state.inspector_tab == 2, "Effects").clicked() { state.inspector_tab = 2; }
+        if ui.selectable_label(state.inspector_tab == 0, t("Transform")).clicked() { state.inspector_tab = 0; }
+        if ui.selectable_label(state.inspector_tab == 2, t("Effects")).clicked() { state.inspector_tab = 2; }
     });
     ui.separator();
     ui.add_space(4.0);
@@ -1418,7 +1419,7 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
     let playhead = state.playhead;
     let a = &mut state.scene.actors[i];
 
-    ui.label(RichText::new("Position & Scale").size(12.0).strong());
+    ui.label(RichText::new(t("Position & Scale")).size(12.0).strong());
     ui.add_space(4.0);
 
     // Sample the eased current value at the playhead — this is read-only
@@ -1429,7 +1430,7 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
     let kf_count = a.layout.len();
     if kf_count <= 1 {
         ui.label(
-            RichText::new("Static value (no keyframes yet)")
+            RichText::new(t("Static value (no keyframes yet)"))
                 .size(9.0).color(COL_TEXT_DIM).italics(),
         );
     } else {
@@ -1453,7 +1454,7 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
     let mut new_y = cur.pos[1];
     ui.horizontal(|ui| {
         kf_anim::animated_toggle(ui, &mut a.animated_params, param_ids::POS_X, ("act_pos_x", i));
-        ui.label(param_label(highlight.is_active(param_ids::POS_X), "X:"));
+        ui.label(param_label(highlight.is_active(param_ids::POS_X), t("X:")));
         let r = ui.add(egui::DragValue::new(&mut new_x).range(-2.0..=3.0).speed(0.005));
         if r.changed() {
             kf_anim::write_actor_param(
@@ -1462,7 +1463,7 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
                 |s| s.pos[0] = new_x);
         }
         kf_anim::animated_toggle(ui, &mut a.animated_params, param_ids::POS_Y, ("act_pos_y", i));
-        ui.label(param_label(highlight.is_active(param_ids::POS_Y), "Y:"));
+        ui.label(param_label(highlight.is_active(param_ids::POS_Y), t("Y:")));
         let r = ui.add(egui::DragValue::new(&mut new_y).range(-2.0..=3.0).speed(0.005));
         if r.changed() {
             kf_anim::write_actor_param(
@@ -1686,36 +1687,17 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
 }
 
 /// Color a param label gold when its kf was just clicked from the timeline.
-fn param_label(highlighted: bool, text: &str) -> RichText {
+/// The label is automatically run through `i18n::t()` so call sites can
+/// keep passing English source strings.
+fn param_label(highlighted: bool, text: &'static str) -> RichText {
+    let translated = t(text);
     if highlighted {
-        RichText::new(text).size(11.0).strong()
+        RichText::new(translated).size(11.0).strong()
             .color(Color32::from_rgb(255, 220, 80))
             .background_color(Color32::from_rgba_premultiplied(80, 60, 0, 80))
     } else {
-        RichText::new(text).size(11.0)
+        RichText::new(translated).size(11.0)
     }
-}
-
-/// Inspector-side mirror of `ensure_actor_kf_at_playhead` from canvas_preview.rs.
-/// **NOTE:** kept as a no-op stub for now (kf insertion was the source of
-/// the infinite-keyframe bug during playback / timeline scrubbing). The
-/// new authoring path is `kf_anim::write_actor_param`, which only runs
-/// when the user actually edits a parameter. Left here so the existing
-/// callers compile until they're migrated.
-#[allow(dead_code)]
-fn ensure_actor_kf_at_playhead_inspector(
-    _layout: &mut Vec<Keyframe<ActorState>>,
-    _t: f32,
-) -> Option<usize> {
-    None
-}
-
-#[allow(dead_code)]
-fn ensure_overlay_kf_at_playhead_inspector(
-    _layout: &mut Vec<Keyframe<OverlayState>>,
-    _t: f32,
-) -> Option<usize> {
-    None
 }
 
 /// Compact circular rotation dial. The pointer angle relative to the
@@ -1771,7 +1753,7 @@ fn circular_rotation_widget(
     }
 
     // Marker line from centre to the current angle.
-    let rad = (deg.to_radians() - std::f32::consts::FRAC_PI_2);
+    let rad = deg.to_radians() - std::f32::consts::FRAC_PI_2;
     let tip = center + Vec2::new(rad.cos(), rad.sin()) * (radius - 4.0);
     painter.line_segment([center, tip], Stroke::new(2.5, Color32::from_rgb(255, 220, 80)));
     painter.circle_filled(tip, 4.0, Color32::from_rgb(255, 220, 80));
@@ -1797,17 +1779,17 @@ fn inspector_modifiers(
     salt: impl std::hash::Hash + Copy,
 ) {
     egui::CollapsingHeader::new(
-        RichText::new("Animation Modifiers").size(12.0).strong()
+        RichText::new(t("Animation Modifiers")).size(12.0).strong()
             .color(Color32::from_rgb(150, 200, 255)),
     )
     .id_source(("modifier_collapse", salt))
     .default_open(false)
     .show(ui, |ui| {
         if modifiers.is_empty() {
-            ui.label(RichText::new(
+            ui.label(RichText::new(t(
                 "No modifiers. Add one to perturb the animation \
                  (wobble/shake/pulse/spin).",
-            ).size(10.0).color(COL_TEXT_DIM).italics());
+            )).size(10.0).color(COL_TEXT_DIM).italics());
         } else {
             let mut to_remove: Option<usize> = None;
             for (mi, m) in modifiers.iter_mut().enumerate() {
@@ -1829,14 +1811,14 @@ fn inspector_modifiers(
                             ui.checkbox(&mut m.enabled, "");
                             ui.label(RichText::new(kind_label).strong().size(11.0).color(header_color));
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.small_button("x").on_hover_text("Remove modifier").clicked() {
+                                if ui.small_button("x").on_hover_text(t("Remove modifier")).clicked() {
                                     to_remove = Some(mi);
                                 }
                             });
                         });
                         ui.add_space(2.0);
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new("Range").size(10.0).color(COL_TEXT_DIM));
+                            ui.label(RichText::new(t("Range")).size(10.0).color(COL_TEXT_DIM));
                             ui.add(egui::DragValue::new(&mut m.t_start)
                                 .range(0.0..=600.0).speed(0.05).suffix("s"));
                             ui.label("\u{2192}");
@@ -1848,7 +1830,7 @@ fn inspector_modifiers(
                             } else {
                                 ui.add(egui::DragValue::new(&mut m.t_end)
                                     .range(0.0..=600.0).speed(0.05).suffix("s"));
-                                if ui.small_button("\u{221E}").on_hover_text("Always active").clicked() {
+                                if ui.small_button("\u{221E}").on_hover_text(t("Always active")).clicked() {
                                     m.t_end = f32::MAX;
                                 }
                             }
@@ -1856,33 +1838,33 @@ fn inspector_modifiers(
                         ui.add_space(2.0);
                         match &mut m.kind {
                             ModifierKind::Wobble { freq_hz, amp_x, amp_y, amp_rot_deg, phase } => {
-                                ui.add(egui::Slider::new(freq_hz, 0.1..=10.0).text("Freq Hz"));
-                                ui.add(egui::Slider::new(amp_x, 0.0..=120.0).text("Amp X (px)"));
-                                ui.add(egui::Slider::new(amp_y, 0.0..=120.0).text("Amp Y (px)"));
-                                ui.add(egui::Slider::new(amp_rot_deg, 0.0..=45.0).text("Amp Rot \u{00B0}"));
-                                ui.add(egui::Slider::new(phase, 0.0..=std::f32::consts::TAU).text("Phase"));
+                                ui.add(egui::Slider::new(freq_hz, 0.1..=10.0).text(t("Freq Hz")));
+                                ui.add(egui::Slider::new(amp_x, 0.0..=120.0).text(t("Amp X (px)")));
+                                ui.add(egui::Slider::new(amp_y, 0.0..=120.0).text(t("Amp Y (px)")));
+                                ui.add(egui::Slider::new(amp_rot_deg, 0.0..=45.0).text(t("Amp Rot \u{00B0}")));
+                                ui.add(egui::Slider::new(phase, 0.0..=std::f32::consts::TAU).text(t("Phase")));
                             }
                             ModifierKind::Shake { freq_hz, amp_x, amp_y, seed } => {
-                                ui.add(egui::Slider::new(freq_hz, 1.0..=40.0).text("Freq Hz"));
-                                ui.add(egui::Slider::new(amp_x, 0.0..=80.0).text("Amp X (px)"));
-                                ui.add(egui::Slider::new(amp_y, 0.0..=80.0).text("Amp Y (px)"));
+                                ui.add(egui::Slider::new(freq_hz, 1.0..=40.0).text(t("Freq Hz")));
+                                ui.add(egui::Slider::new(amp_x, 0.0..=80.0).text(t("Amp X (px)")));
+                                ui.add(egui::Slider::new(amp_y, 0.0..=80.0).text(t("Amp Y (px)")));
                                 ui.horizontal(|ui| {
-                                    ui.label(RichText::new("Seed").size(10.0));
+                                    ui.label(RichText::new(t("Seed")).size(10.0));
                                     ui.add(egui::DragValue::new(seed).range(0..=u32::MAX).speed(1.0));
                                 });
                             }
                             ModifierKind::Pulse { freq_hz, amp_scale } => {
-                                ui.add(egui::Slider::new(freq_hz, 0.1..=10.0).text("Freq Hz"));
-                                ui.add(egui::Slider::new(amp_scale, -0.5..=0.5).text("Amp Scale"));
+                                ui.add(egui::Slider::new(freq_hz, 0.1..=10.0).text(t("Freq Hz")));
+                                ui.add(egui::Slider::new(amp_scale, -0.5..=0.5).text(t("Amp Scale")));
                             }
                             ModifierKind::Spin { speed_dps } => {
-                                ui.add(egui::Slider::new(speed_dps, -720.0..=720.0).text("Speed \u{00B0}/s"));
+                                ui.add(egui::Slider::new(speed_dps, -720.0..=720.0).text(t("Speed \u{00B0}/s")));
                             }
                             ModifierKind::Walk { freq_hz, amp_deg, bob_y, phase } => {
-                                ui.add(egui::Slider::new(freq_hz, 0.2..=6.0).text("Cadence Hz"));
-                                ui.add(egui::Slider::new(amp_deg, 0.0..=45.0).text("Sway \u{00B0}"));
-                                ui.add(egui::Slider::new(bob_y, 0.0..=40.0).text("Bob Y (px)"));
-                                ui.add(egui::Slider::new(phase, 0.0..=std::f32::consts::TAU).text("Phase"));
+                                ui.add(egui::Slider::new(freq_hz, 0.2..=6.0).text(t("Cadence Hz")));
+                                ui.add(egui::Slider::new(amp_deg, 0.0..=45.0).text(t("Sway \u{00B0}")));
+                                ui.add(egui::Slider::new(bob_y, 0.0..=40.0).text(t("Bob Y (px)")));
+                                ui.add(egui::Slider::new(phase, 0.0..=std::f32::consts::TAU).text(t("Phase")));
                             }
                         }
                     });
@@ -1895,28 +1877,28 @@ fn inspector_modifiers(
 
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            if ui.button(RichText::new("+ Wobble").size(10.0)).on_hover_text(
-                "Smooth sinusoidal sway"
+            if ui.button(RichText::new(t("+ Wobble")).size(10.0)).on_hover_text(
+                t("Smooth sinusoidal sway")
             ).clicked() {
                 modifiers.push(TrackModifier::wobble());
             }
-            if ui.button(RichText::new("+ Shake").size(10.0)).on_hover_text(
-                "High-frequency jitter"
+            if ui.button(RichText::new(t("+ Shake")).size(10.0)).on_hover_text(
+                t("High-frequency jitter")
             ).clicked() {
                 modifiers.push(TrackModifier::shake());
             }
-            if ui.button(RichText::new("+ Pulse").size(10.0)).on_hover_text(
-                "Periodic scale breathing"
+            if ui.button(RichText::new(t("+ Pulse")).size(10.0)).on_hover_text(
+                t("Periodic scale breathing")
             ).clicked() {
                 modifiers.push(TrackModifier::pulse());
             }
-            if ui.button(RichText::new("+ Spin").size(10.0)).on_hover_text(
-                "Continuous rotation"
+            if ui.button(RichText::new(t("+ Spin")).size(10.0)).on_hover_text(
+                t("Continuous rotation")
             ).clicked() {
                 modifiers.push(TrackModifier::spin());
             }
-            if ui.button(RichText::new("+ Walk").size(10.0)).on_hover_text(
-                "Pendulum rotation imitating a walking gait (rocks left/right around upright)"
+            if ui.button(RichText::new(t("+ Walk")).size(10.0)).on_hover_text(
+                t("Pendulum rotation imitating a walking gait (rocks left/right around upright)")
             ).clicked() {
                 modifiers.push(TrackModifier::walk());
             }
@@ -2452,31 +2434,31 @@ fn inspector_actor_speed(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
 fn inspector_actor_effects(ui: &mut egui::Ui, state: &mut EditorState, i: usize, _actor_count: usize, _cache_count: usize) {
     let a = &mut state.scene.actors[i];
 
-    ui.label(RichText::new("Chroma Key").size(12.0).strong().color(Color32::from_rgb(100, 255, 100)));
+    ui.label(RichText::new(t("Chroma Key")).size(12.0).strong().color(Color32::from_rgb(100, 255, 100)));
     ui.add_space(4.0);
 
     // Eyedropper
     let mut chroma_changed = false;
     ui.horizontal(|ui| {
         if state.eyedropper_active {
-            ui.label(RichText::new("Click preview to pick color...").color(Color32::from_rgb(255, 200, 50)).size(11.0));
-        } else if ui.button("Eyedropper").on_hover_text("Pick color from preview").clicked() {
+            ui.label(RichText::new(t("Click preview to pick color...")).color(Color32::from_rgb(255, 200, 50)).size(11.0));
+        } else if ui.button(t("Eyedropper")).on_hover_text(t("Pick color from preview")).clicked() {
             state.eyedropper_active = true;
         }
-        ui.label("Key:");
+        ui.label(t("Key:"));
         if color_edit_u8(ui, &mut a.chroma_key.key_color) {
             chroma_changed = true;
         }
     });
 
     ui.add_space(4.0);
-    if ui.add(egui::Slider::new(&mut a.chroma_key.similarity, 0.0..=1.0).text("Similarity")).changed() {
+    if ui.add(egui::Slider::new(&mut a.chroma_key.similarity, 0.0..=1.0).text(t("Similarity"))).changed() {
         chroma_changed = true;
     }
-    if ui.add(egui::Slider::new(&mut a.chroma_key.blend, 0.0..=1.0).text("Blend")).changed() {
+    if ui.add(egui::Slider::new(&mut a.chroma_key.blend, 0.0..=1.0).text(t("Blend"))).changed() {
         chroma_changed = true;
     }
-    if ui.add(egui::Slider::new(&mut a.chroma_key.spill, 0.0..=1.0).text("Spill")).changed() {
+    if ui.add(egui::Slider::new(&mut a.chroma_key.spill, 0.0..=1.0).text(t("Spill"))).changed() {
         chroma_changed = true;
     }
 
@@ -2492,7 +2474,7 @@ fn inspector_actor_effects(ui: &mut egui::Ui, state: &mut EditorState, i: usize,
 
     // Color Correction — pro-grade inspector.
     egui::CollapsingHeader::new(
-        RichText::new("Color Correction").size(12.0).strong().color(Color32::from_rgb(200, 180, 255))
+        RichText::new(t("Color Correction")).size(12.0).strong().color(Color32::from_rgb(200, 180, 255))
     ).default_open(true).show(ui, |ui| {
         color_correction_inspector(ui, state, i);
     });
@@ -2629,25 +2611,25 @@ fn color_correction_inspector(ui: &mut egui::Ui, state: &mut EditorState, actor_
 
     ui.horizontal(|ui| {
         if ui
-            .selectable_label(tab == CcTab::Basic, RichText::new("Basic").size(11.0))
+            .selectable_label(tab == CcTab::Basic, RichText::new(t("Basic")).size(11.0))
             .clicked()
         {
             tab = CcTab::Basic;
         }
         if ui
-            .selectable_label(tab == CcTab::Wheels, RichText::new("Wheels").size(11.0))
+            .selectable_label(tab == CcTab::Wheels, RichText::new(t("Wheels")).size(11.0))
             .clicked()
         {
             tab = CcTab::Wheels;
         }
         if ui
-            .selectable_label(tab == CcTab::Curves, RichText::new("Curves").size(11.0))
+            .selectable_label(tab == CcTab::Curves, RichText::new(t("Curves")).size(11.0))
             .clicked()
         {
             tab = CcTab::Curves;
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.small_button("Reset all").clicked() {
+            if ui.small_button(t("Reset all")).clicked() {
                 state.scene.actors[actor_idx].color_correction =
                     memstroy_core::ColorCorrection::default();
             }
@@ -2664,32 +2646,32 @@ fn color_correction_inspector(ui: &mut egui::Ui, state: &mut EditorState, actor_
     match tab {
         CcTab::Basic => {
             inspector_cc_anim_slider(
-                ui, cc, "brightness", "Brightness", -1.0..=1.0, cc_t_local, ("cc_b", actor_idx));
+                ui, cc, "brightness", t("Brightness"), -1.0..=1.0, cc_t_local, ("cc_b", actor_idx));
             inspector_cc_anim_slider(
-                ui, cc, "contrast", "Contrast", 0.0..=3.0, cc_t_local, ("cc_c", actor_idx));
+                ui, cc, "contrast", t("Contrast"), 0.0..=3.0, cc_t_local, ("cc_c", actor_idx));
             inspector_cc_anim_slider(
-                ui, cc, "saturation", "Saturation", 0.0..=3.0, cc_t_local, ("cc_s", actor_idx));
+                ui, cc, "saturation", t("Saturation"), 0.0..=3.0, cc_t_local, ("cc_s", actor_idx));
             inspector_cc_anim_slider(
-                ui, cc, "temperature", "Temperature", -1.0..=1.0, cc_t_local, ("cc_t", actor_idx));
+                ui, cc, "temperature", t("Temperature"), -1.0..=1.0, cc_t_local, ("cc_t", actor_idx));
         }
         CcTab::Wheels => {
             // Lift wheel: neutral 0, range ±0.5
-            color_wheel_widget(ui, "Lift",  &mut cc.lift,  [0.0; 3], 0.5, -0.5..=0.5);
+            color_wheel_widget(ui, t("Lift"),  &mut cc.lift,  [0.0; 3], 0.5, -0.5..=0.5);
             ui.add_space(6.0);
-            color_wheel_widget(ui, "Gamma", &mut cc.gamma, [1.0; 3], 1.0,  0.2..=4.0);
+            color_wheel_widget(ui, t("Gamma"), &mut cc.gamma, [1.0; 3], 1.0,  0.2..=4.0);
             ui.add_space(6.0);
-            color_wheel_widget(ui, "Gain",  &mut cc.gain,  [1.0; 3], 1.0,  0.0..=4.0);
+            color_wheel_widget(ui, t("Gain"),  &mut cc.gain,  [1.0; 3], 1.0,  0.0..=4.0);
         }
         CcTab::Curves => {
-            curve_editor_widget(ui, "Master", &mut cc.curves.master, Color32::from_rgb(220, 220, 220));
+            curve_editor_widget(ui, t("Master"), &mut cc.curves.master, Color32::from_rgb(220, 220, 220));
             ui.add_space(4.0);
-            curve_editor_widget(ui, "Red",    &mut cc.curves.red,    Color32::from_rgb(255, 100, 100));
+            curve_editor_widget(ui, t("Red"),    &mut cc.curves.red,    Color32::from_rgb(255, 100, 100));
             ui.add_space(4.0);
-            curve_editor_widget(ui, "Green",  &mut cc.curves.green,  Color32::from_rgb(100, 220, 120));
+            curve_editor_widget(ui, t("Green"),  &mut cc.curves.green,  Color32::from_rgb(100, 220, 120));
             ui.add_space(4.0);
-            curve_editor_widget(ui, "Blue",   &mut cc.curves.blue,   Color32::from_rgb(100, 160, 255));
+            curve_editor_widget(ui, t("Blue"),   &mut cc.curves.blue,   Color32::from_rgb(100, 160, 255));
             ui.add_space(2.0);
-            ui.label(RichText::new("Click empty area: add point  •  Drag: move  •  Right-click: remove")
+            ui.label(RichText::new(t("Click empty area: add point  •  Drag: move  •  Right-click: remove"))
                 .size(9.0).color(COL_TEXT_DIM));
         }
     }
@@ -3424,7 +3406,7 @@ fn inspector_overlay(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
             let _ = inspector_text_overlay(ui, t, i, overlay_count, duration, playhead);
         }
         Overlay::Image(im) => {
-            ui.label(RichText::new(format!("Image: {}", im.id)).strong().size(14.0).color(COL_CLIP_OVERLAY));
+            ui.label(RichText::new(format!("{}: {}", t("Image"), im.id)).strong().size(14.0).color(COL_CLIP_OVERLAY));
             ui.add_space(4.0);
             // The In / Out time controls were intentionally removed
             // from the inspector — the user adjusts an image's visible
@@ -3442,12 +3424,12 @@ fn inspector_overlay(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
             inspector_effect_stack(ui, &mut im.effects, ("img_fx", i), fx_t_local);
         }
         Overlay::Video(v) => {
-            ui.label(RichText::new(format!("Video: {}", v.id)).strong().size(14.0).color(COL_CLIP_OVERLAY));
+            ui.label(RichText::new(format!("{}: {}", t("Video"), v.id)).strong().size(14.0).color(COL_CLIP_OVERLAY));
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.label("In:");
+                ui.label(t("In:"));
                 ui.add(egui::DragValue::new(&mut v.t_in).range(0.0..=duration).speed(0.02).suffix("s"));
-                ui.label("Out:");
+                ui.label(t("Out:"));
                 ui.add(egui::DragValue::new(&mut v.t_out).range(0.0..=duration).speed(0.02).suffix("s"));
             });
 
@@ -3751,7 +3733,7 @@ fn inspector_text_overlay(
     ui.add_space(4.0);
 
     // Text content
-    ui.label(RichText::new("Text:").size(11.0).strong());
+    ui.label(RichText::new(crate::i18n::t("Text:")).size(11.0).strong());
     ui.add(
         egui::TextEdit::multiline(&mut t.text)
             .desired_rows(2)
@@ -3771,10 +3753,10 @@ fn inspector_text_overlay(
 
     // ─── Font ─────────────────────────────────────────────────────
     egui::CollapsingHeader::new(
-        RichText::new("Font").size(12.0).strong().color(Color32::from_rgb(180, 220, 255)),
+        RichText::new(crate::i18n::t("Font")).size(12.0).strong().color(Color32::from_rgb(180, 220, 255)),
     ).default_open(true).show(ui, |ui| {
         ui.horizontal(|ui| {
-            ui.label("Family:");
+            ui.label(crate::i18n::t("Family:"));
             // The bundled font set only exposes a proportional and a
             // monospace family today, so the picker is restricted to
             // those two until the editor learns to load custom TTFs.
@@ -3793,8 +3775,8 @@ fn inspector_text_overlay(
         // The "Preset:" row was removed — the −/+ buttons cover quick
         // adjustments and the drag value covers the full range.
         ui.horizontal(|ui| {
-            ui.label("Size:");
-            if ui.small_button("\u{2212}").on_hover_text("Decrease (-4)").clicked() {
+            ui.label(crate::i18n::t("Size:"));
+            if ui.small_button("\u{2212}").on_hover_text(crate::i18n::t("Decrease (-4)")).clicked() {
                 t.style.font_size = (t.style.font_size - 4.0).max(8.0);
             }
             ui.add(
@@ -3803,39 +3785,39 @@ fn inspector_text_overlay(
                     .speed(0.5)
                     .suffix(" px"),
             );
-            if ui.small_button("+").on_hover_text("Increase (+4)").clicked() {
+            if ui.small_button("+").on_hover_text(crate::i18n::t("Increase (+4)")).clicked() {
                 t.style.font_size = (t.style.font_size + 4.0).min(512.0);
             }
         });
 
         ui.horizontal(|ui| {
-            ui.checkbox(&mut t.style.bold, "Bold")
-                .on_hover_text(
+            ui.checkbox(&mut t.style.bold, crate::i18n::t("Bold"))
+                .on_hover_text(crate::i18n::t(
                     "Synthesised on the bundled font by repainting glyphs \
                      with sub-pixel offsets",
-                );
-            ui.checkbox(&mut t.style.italic, "Italic")
-                .on_hover_text("Slants glyphs ~13° to the right");
+                ));
+            ui.checkbox(&mut t.style.italic, crate::i18n::t("Italic"))
+                .on_hover_text(crate::i18n::t("Slants glyphs ~13° to the right"));
         });
         ui.horizontal(|ui| {
-            ui.label("Color:");
+            ui.label(crate::i18n::t("Color:"));
             color_edit_u8(ui, &mut t.style.color);
         });
         ui.horizontal(|ui| {
-            ui.label("Align:");
-            ui.selectable_value(&mut t.style.align, TextAlign::Left, "Left");
-            ui.selectable_value(&mut t.style.align, TextAlign::Center, "Center");
-            ui.selectable_value(&mut t.style.align, TextAlign::Right, "Right");
+            ui.label(crate::i18n::t("Align:"));
+            ui.selectable_value(&mut t.style.align, TextAlign::Left, crate::i18n::t("Left"));
+            ui.selectable_value(&mut t.style.align, TextAlign::Center, crate::i18n::t("Center"));
+            ui.selectable_value(&mut t.style.align, TextAlign::Right, crate::i18n::t("Right"));
         });
     });
     ui.add_space(4.0);
 
     // ─── Stroke (glyph outline) ───────────────────────────────────
     egui::CollapsingHeader::new(
-        RichText::new("Stroke").size(12.0).strong().color(Color32::from_rgb(255, 200, 120)),
+        RichText::new(crate::i18n::t("Stroke")).size(12.0).strong().color(Color32::from_rgb(255, 200, 120)),
     ).default_open(true).show(ui, |ui| {
         let mut has_outline = t.style.outline.is_some();
-        ui.checkbox(&mut has_outline, "Stroke text");
+        ui.checkbox(&mut has_outline, crate::i18n::t("Stroke text"));
         if has_outline && t.style.outline.is_none() {
             t.style.outline = Some([0, 0, 0]);
             if t.style.outline_width <= 0.0 { t.style.outline_width = 4.0; }
@@ -3846,9 +3828,9 @@ fn inspector_text_overlay(
 
         if let Some(oc) = t.style.outline.as_mut() {
             ui.horizontal(|ui| {
-                ui.label("Color:");
+                ui.label(crate::i18n::t("Color:"));
                 color_edit_u8(ui, oc);
-                ui.label("Width:");
+                ui.label(crate::i18n::t("Width:"));
                 ui.add(egui::DragValue::new(&mut t.style.outline_width)
                     .range(0.0..=20.0).speed(0.1));
             });
@@ -3858,10 +3840,10 @@ fn inspector_text_overlay(
 
     // ─── Background plate ─────────────────────────────────────────
     egui::CollapsingHeader::new(
-        RichText::new("Background plate").size(12.0).strong().color(Color32::from_rgb(180, 255, 180)),
+        RichText::new(crate::i18n::t("Background plate")).size(12.0).strong().color(Color32::from_rgb(180, 255, 180)),
     ).default_open(true).show(ui, |ui| {
         let mut has_box = t.style.box_color.is_some();
-        ui.checkbox(&mut has_box, "Enable plate");
+        ui.checkbox(&mut has_box, crate::i18n::t("Enable plate"));
         if has_box && t.style.box_color.is_none() {
             t.style.box_color = Some([255, 255, 255]);
         }
@@ -3875,17 +3857,17 @@ fn inspector_text_overlay(
                 egui::ComboBox::from_id_source("text_box_kind")
                     .selected_text(format!("{:?}", t.style.box_kind))
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut t.style.box_kind, TextBoxKind::Solid, "Solid");
-                        ui.selectable_value(&mut t.style.box_kind, TextBoxKind::Gradient, "Gradient");
-                        ui.selectable_value(&mut t.style.box_kind, TextBoxKind::OutlineOnly, "Outline only");
-                        ui.selectable_value(&mut t.style.box_kind, TextBoxKind::None, "None (text only)");
+                        ui.selectable_value(&mut t.style.box_kind, TextBoxKind::Solid, crate::i18n::t("Solid"));
+                        ui.selectable_value(&mut t.style.box_kind, TextBoxKind::Gradient, crate::i18n::t("Gradient"));
+                        ui.selectable_value(&mut t.style.box_kind, TextBoxKind::OutlineOnly, crate::i18n::t("Outline only"));
+                        ui.selectable_value(&mut t.style.box_kind, TextBoxKind::None, crate::i18n::t("None (text only)"));
                     });
             });
 
             if matches!(t.style.box_kind, TextBoxKind::Solid | TextBoxKind::Gradient) {
                 if let Some(bc) = t.style.box_color.as_mut() {
                     ui.horizontal(|ui| {
-                        ui.label("Color:"); color_edit_u8(ui, bc);
+                        ui.label(crate::i18n::t("Color:")); color_edit_u8(ui, bc);
                     });
                 }
             }
@@ -3895,14 +3877,14 @@ fn inspector_text_overlay(
                 }
                 if let Some(end) = t.style.box_gradient_end.as_mut() {
                     ui.horizontal(|ui| {
-                        ui.label("Gradient end:"); color_edit_u8(ui, end);
+                        ui.label(crate::i18n::t("Gradient end:")); color_edit_u8(ui, end);
                     });
                 }
             }
 
-            ui.add(egui::Slider::new(&mut t.style.box_opacity, 0.0..=1.0).text("Opacity"));
-            ui.add(egui::Slider::new(&mut t.style.box_padding, 0.0..=80.0).text("Padding"));
-            ui.add(egui::Slider::new(&mut t.style.box_corner_radius, 0.0..=80.0).text("Corner radius"));
+            ui.add(egui::Slider::new(&mut t.style.box_opacity, 0.0..=1.0).text(crate::i18n::t("Opacity")));
+            ui.add(egui::Slider::new(&mut t.style.box_padding, 0.0..=80.0).text(crate::i18n::t("Padding")));
+            ui.add(egui::Slider::new(&mut t.style.box_corner_radius, 0.0..=80.0).text(crate::i18n::t("Corner radius")));
 
             // Asymmetric horizontal extension: widens the plate to the
             // left or to the right WITHOUT changing the text scale.
@@ -3911,22 +3893,22 @@ fn inspector_text_overlay(
             // exactly the use-case the previous "scale only" controls
             // couldn't address.
             ui.label(
-                RichText::new("Asymmetric width (px)")
+                RichText::new(crate::i18n::t("Asymmetric width (px)"))
                     .size(10.0)
                     .color(COL_TEXT_DIM),
             );
             ui.add(
                 egui::Slider::new(&mut t.style.box_extra_left, 0.0..=400.0)
-                    .text("Extra left"),
+                    .text(crate::i18n::t("Extra left")),
             );
             ui.add(
                 egui::Slider::new(&mut t.style.box_extra_right, 0.0..=400.0)
-                    .text("Extra right"),
+                    .text(crate::i18n::t("Extra right")),
             );
 
             // Plate border (independent of glyph stroke)
             let mut has_border = t.style.box_outline_color.is_some() || t.style.box_outline_width > 0.0;
-            ui.checkbox(&mut has_border, "Plate border");
+            ui.checkbox(&mut has_border, crate::i18n::t("Plate border"));
             if has_border && t.style.box_outline_color.is_none() {
                 t.style.box_outline_color = Some([0, 0, 0]);
             }
@@ -3936,8 +3918,8 @@ fn inspector_text_overlay(
             }
             if let Some(boc) = t.style.box_outline_color.as_mut() {
                 ui.horizontal(|ui| {
-                    ui.label("Color:"); color_edit_u8(ui, boc);
-                    ui.label("Width:");
+                    ui.label(crate::i18n::t("Color:")); color_edit_u8(ui, boc);
+                    ui.label(crate::i18n::t("Width:"));
                     ui.add(egui::DragValue::new(&mut t.style.box_outline_width)
                         .range(0.0..=20.0).speed(0.1));
                 });
@@ -3982,14 +3964,14 @@ fn inspector_render_frame(ui: &mut egui::Ui, state: &mut EditorState) {
     let [rw, rh] = rf.resolution;
 
     ui.label(
-        RichText::new("Render Frame")
+        RichText::new(t("Render Frame"))
             .strong()
             .size(14.0)
             .color(Color32::from_rgb(255, 120, 120)),
     );
     ui.add_space(2.0);
     ui.label(
-        RichText::new("The output region. Move/resize/rotate it like any element.")
+        RichText::new(t("The output region. Move/resize/rotate it like any element."))
             .size(10.0)
             .color(COL_TEXT_DIM),
     );
@@ -3998,9 +3980,9 @@ fn inspector_render_frame(ui: &mut egui::Ui, state: &mut EditorState) {
     if let Some(kf) = rf.layout.first_mut() {
         // ─── Position (world pixels) ────────────────────────────
         ui.horizontal(|ui| {
-            ui.label("X:");
+            ui.label(t("X:"));
             ui.add(egui::DragValue::new(&mut kf.value.pos.x).speed(0.5));
-            ui.label("Y:");
+            ui.label(t("Y:"));
             ui.add(egui::DragValue::new(&mut kf.value.pos.y).speed(0.5));
         });
         ui.add_space(4.0);
@@ -4016,14 +3998,14 @@ fn inspector_render_frame(ui: &mut egui::Ui, state: &mut EditorState) {
         let aspect = (rw as f32 / rh.max(1) as f32).max(0.0001);
 
         ui.horizontal(|ui| {
-            ui.label("W:");
+            ui.label(t("W:"));
             if ui
                 .add(egui::DragValue::new(&mut world_w).range(8.0..=200_000.0).speed(0.5))
                 .changed()
             {
                 kf.value.zoom = (rw as f32 / world_w.max(1.0)).clamp(0.001, 1000.0);
             }
-            ui.label("H:");
+            ui.label(t("H:"));
             if ui
                 .add(egui::DragValue::new(&mut world_h).range(8.0..=200_000.0).speed(0.5))
                 .changed()
@@ -4042,7 +4024,7 @@ fn inspector_render_frame(ui: &mut egui::Ui, state: &mut EditorState) {
         // ─── Rotation ────────────────────────────────────────────
         let mut new_rot = kf.value.rotation_deg;
         ui.horizontal(|ui| {
-            ui.label("Rotation");
+            ui.label(t("Rotation"));
             let prev_rot = new_rot;
             circular_rotation_widget(ui, ("rf_rot",), &mut new_rot, 80.0);
             let mut dial_changed = (new_rot - prev_rot).abs() > 1.0e-4;
@@ -4077,7 +4059,7 @@ fn inspector_render_frame(ui: &mut egui::Ui, state: &mut EditorState) {
         if ui
             .add(
                 egui::Slider::new(&mut scale, 0.1..=20.0)
-                    .text("Scale")
+                    .text(t("Scale"))
                     .logarithmic(true),
             )
             .changed()
@@ -4086,7 +4068,7 @@ fn inspector_render_frame(ui: &mut egui::Ui, state: &mut EditorState) {
         }
     } else {
         ui.label(
-            RichText::new("Render frame has no keyframes.")
+            RichText::new(t("Render frame has no keyframes."))
                 .italics()
                 .color(COL_TEXT_DIM),
         );
@@ -4115,7 +4097,7 @@ fn inspector_render_frame(ui: &mut egui::Ui, state: &mut EditorState) {
     ui.separator();
     ui.add_space(4.0);
     ui.label(
-        RichText::new("Output resolution")
+        RichText::new(t("Output resolution"))
             .size(11.0)
             .strong()
             .color(Color32::from_rgb(180, 180, 220)),
@@ -4123,11 +4105,11 @@ fn inspector_render_frame(ui: &mut egui::Ui, state: &mut EditorState) {
     ui.horizontal(|ui| {
         let mut w = rw;
         let mut h = rh;
-        ui.label("W:");
+        ui.label(t("W:"));
         let cw = ui
             .add(egui::DragValue::new(&mut w).range(64..=8192))
             .changed();
-        ui.label("H:");
+        ui.label(t("H:"));
         let ch = ui
             .add(egui::DragValue::new(&mut h).range(64..=8192))
             .changed();
@@ -4148,12 +4130,12 @@ fn inspector_render_frame(ui: &mut egui::Ui, state: &mut EditorState) {
 
 fn inspector_background(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
     let b = &mut state.scene.backgrounds[i];
-    ui.label(RichText::new(format!("Background: {}", b.id)).strong().size(14.0).color(COL_CLIP_BG));
+    ui.label(RichText::new(format!("{}: {}", t("Background"), b.id)).strong().size(14.0).color(COL_CLIP_BG));
     ui.add_space(4.0);
     ui.horizontal(|ui| {
-        ui.label("Start:");
+        ui.label(t("Start:"));
         ui.add(egui::DragValue::new(&mut b.start).speed(0.02).suffix("s"));
-        ui.label("Duration:");
+        ui.label(t("Duration:"));
         ui.add(egui::DragValue::new(&mut b.duration).speed(0.02).suffix("s"));
     });
     egui::ComboBox::from_label("Fit")
@@ -5959,7 +5941,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
         // a single, unambiguous transport control; the playhead can be
         // rewound by clicking the timeline ruler or pressing Home.
         let play_glyph = if state.playing { "\u{23F8}" } else { "\u{25B6}" }; // ⏸ / ▶
-        let play_label = if state.playing { "Pause (Space)" } else { "Play (Space)" };
+        let play_label = if state.playing { t("Pause (Space)") } else { t("Play (Space)") };
         let play_color = if state.playing {
             Color32::from_rgb(255, 200, 80)
         } else {
@@ -5972,9 +5954,9 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
         if ui.add(play_btn).on_hover_text(play_label).clicked() {
             state.playing = !state.playing;
             state.status = if state.playing {
-                "\u{25B6} Playing".into()
+                t("\u{25B6} Playing").into()
             } else {
-                "\u{23F8} Paused".into()
+                t("\u{23F8} Paused").into()
             };
         }
 
@@ -5994,7 +5976,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
         // Split tool — when armed, clicking on a clip cuts it at the click position.
         let split_color = if state.split_tool_active { Color32::from_rgb(255, 80, 80) } else { COL_TEXT };
         if ui.button(RichText::new("\u{2702}").color(split_color))
-            .on_hover_text("Split tool: click anywhere on a clip to cut it at that position")
+            .on_hover_text(t("Split tool: click anywhere on a clip to cut it at that position"))
             .clicked()
         {
             state.split_tool_active = !state.split_tool_active;
@@ -6002,7 +5984,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
 
         // Add Text tool
         if ui.button(RichText::new("\u{1F520} +T").color(Color32::from_rgb(140, 220, 255)))
-            .on_hover_text("Add text overlay at playhead")
+            .on_hover_text(t("Add text overlay at playhead"))
             .clicked()
         {
             add_text_overlay(state);
@@ -6013,11 +5995,11 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
         // Loop preview toggle
         let loop_color = if state.loop_mode { Color32::from_rgb(255, 180, 80) } else { COL_TEXT_DIM };
         if ui
-            .button(RichText::new("\u{1F501} Loop").size(11.0).color(loop_color))
-            .on_hover_text(
+            .button(RichText::new(format!("\u{1F501} {}", t("Loop"))).size(11.0).color(loop_color))
+            .on_hover_text(t(
                 "Loop preview: Shift+click on the ruler to set loop start, Shift+click again for end. \
                 Shift+drag = define a region.",
-            )
+            ))
             .clicked()
         {
             state.loop_mode = !state.loop_mode;
@@ -6038,22 +6020,22 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
         // These buttons remove the "max 1 new layer per session" feel
         // by giving an unconditional, repeatable creation path.
         if ui
-            .button(RichText::new("+ V Layer").size(11.0).color(Color32::from_rgb(140, 220, 255)))
-            .on_hover_text("Add a new empty video layer at the top of the panel")
+            .button(RichText::new(t("+ V Layer")).size(11.0).color(Color32::from_rgb(140, 220, 255)))
+            .on_hover_text(t("Add a new empty video layer at the top of the panel"))
             .clicked()
         {
             state.mutate(|_| {});
             let _ = state.insert_video_track_at_top();
-            state.status = "\u{2728} New video layer.".into();
+            state.status = t("\u{2728} New video layer.").into();
         }
         if ui
-            .button(RichText::new("+ A Layer").size(11.0).color(Color32::from_rgb(120, 220, 200)))
-            .on_hover_text("Add a new empty audio layer below the existing audio block")
+            .button(RichText::new(t("+ A Layer")).size(11.0).color(Color32::from_rgb(120, 220, 200)))
+            .on_hover_text(t("Add a new empty audio layer below the existing audio block"))
             .clicked()
         {
             state.mutate(|_| {});
             state.add_audio_track();
-            state.status = "\u{2728} New audio layer.".into();
+            state.status = t("\u{2728} New audio layer.").into();
         }
 
         // Zoom display (read-only — adjust via scrollbar handles)
@@ -8990,6 +8972,12 @@ fn selected_layer_expansion(state: &EditorState, track_idx: usize, v_zoom: f32) 
 /// the typed layout. We currently use the same `Vec<Keyframe<…>>` for
 /// every param of the layer, so the times are shared — the per-param
 /// row only differs in label / colour.
+///
+/// Currently unused: the inline kf strips inside the inspector took
+/// over this responsibility. Kept around so the timeline-track-row
+/// keyframe markers can be re-introduced without rediscovering the
+/// per-layer time list math.
+#[allow(dead_code)]
 fn keyframe_times_for_layer(state: &EditorState, sel: Selection) -> Vec<f32> {
     match sel {
         Selection::Actor(ai) => state

@@ -535,6 +535,13 @@ pub fn apply_strip_to_f32_kfs(
 /// Note: when multiple parameters are co-animated at the same kf,
 /// dragging shifts all of them together — that's a pragmatic
 /// compromise for the shared-layout schema.
+///
+/// Currently unused: every actor / overlay strip in the inspector
+/// uses the inline path inside `inspector_actor_param_strip` /
+/// `inspector_overlay_param_strip` instead. Kept public so a future
+/// "param-bag-style" strip helper that doesn't need typed access can
+/// reuse it without re-deriving the sort / index dance.
+#[allow(dead_code)]
 pub fn apply_strip_to_kfs<T>(
     kfs: &mut Vec<memstroy_core::Keyframe<T>>,
     interaction: &KfStripInteraction,

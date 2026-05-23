@@ -19,10 +19,11 @@ vertical videos. The workflow is:
    chroma-keyed actors, attached props, text overlays and camera moves.
 4. **Render** out a 1080×1920 / 60 fps MP4 ready for Shorts/Reels/TikTok.
 
-> Status: skeleton in place. The downloader, scene model, FFmpeg-based
-> renderer and the GUI shell compile and run. Pose detection, GPU
-> preview compositor and timeline drag-editing are queued for the next
-> iterations (see *Roadmap* below).
+The editor UI is fully bilingual — English / Russian — and the
+language picker lives in `Settings → Language`. Every parameter,
+button, modifier and inspector tab has been translated, so a Russian
+release build is comfortable to use without falling back to English
+for "just one more setting".
 
 ## Repository layout
 
@@ -30,24 +31,122 @@ vertical videos. The workflow is:
 memstroy-inator/                # was: memstroy_generator/
 ├── Cargo.toml                 # workspace root
 ├── crates/
-│   ├── memstroy-core/         # Scene + animation model (serde-driven)
-│   ├── memstroy-tg/           # Public-channel scraper + downloader
-│   ├── memstroy-vision/       # Chroma key (CPU) + pose-anchor trait
-│   ├── memstroy-render/       # Scene → FFmpeg filter graph → MP4
-│   ├── memstroy-cli/          # `memstroy` CLI binary
-│   └── memstroy-gui/          # `memstroy-gui` editor (eframe/egui)
-└── examples/
-    └── scene.yaml             # starter scene
+│   ├── memstroy-core/             # Scene + animation model (serde-driven)
+│   ├── memstroy-tg/               # Public-channel scraper + downloader
+│   ├── memstroy-vision/           # Chroma key (CPU) + pose-anchor trait
+│   ├── memstroy-render/           # Scene → FFmpeg filter graph → MP4
+│   ├── memstroy-cli/              # `memstroy` CLI binary
+│   ├── memstroy-assets-server/    # HTTP backend that indexes/serves assets
+│   └── memstroy-gui/              # `memstroy-gui` editor (eframe/egui)
+├── examples/
+│   └── scene.yaml                 # starter scene
+└── scripts/
+    ├── package-client.sh          # build + bundle a client release
+    ├── package-client.ps1         # same, on Windows PowerShell
+    ├── start-server.sh            # launch the standalone backend
+    └── start-server.ps1           # same, on Windows PowerShell
 ```
 
 ## Build prerequisites
 
-- Rust **stable** toolchain (`rustup install stable`).
+- **Rust** stable toolchain (`rustup install stable`). See
+  `rust-toolchain.toml` — the workspace pins `channel = "stable"`,
+  so `rustup show` is enough.
 - A C toolchain (`gcc`, `pkg-config`) and `openssl-devel` (or
   equivalent) for the dependent crates.
-- **FFmpeg 6+** in `$PATH` or pointed to via `MEMSTROY_FFMPEG`.
-- Linux GUI: X11 or Wayland, plus `libxkbcommon`. On a server use the
-  CLI; the GUI needs a display.
+- **ALSA dev headers** on Linux (e.g. `alsa-lib-devel` on Fedora /
+  Amazon Linux, `libasound2-dev` on Debian / Ubuntu) — `rodio` links
+  against ALSA for desktop audio.
+- **FFmpeg 6+** in `$PATH` or pointed to via the `MEMSTROY_FFMPEG`
+  environment variable. Used both by the renderer and by the GUI's
+  preview-frame extractor.
+- **Linux GUI**: an X11 or Wayland session, plus `libxkbcommon`. On
+  a server use the CLI; the GUI needs a display.
+
+## How it fits together: GUI ↔ backend
+
+The editor (`memstroy-gui`) and the headless renderer
+(`memstroy-render`) both talk to a small HTTP backend
+(`memstroy-assets-server`) that owns the on-disk asset library
+(clips / videos / images / sounds / particles / text snippets).
+
+By default the GUI **auto-spawns** that backend in-process, on the
+same Tokio runtime, listening on `127.0.0.1:8765` and indexing
+`./assets/` from the directory where the editor was started. Users
+typically don't need to launch the server by hand — opening
+`memstroy-gui` is enough.
+
+The standalone server is still useful when:
+
+- two or more developers share a single asset library over a LAN,
+- a render farm pulls clips without booting the GUI,
+- you want to re-ingest from Telegram on a schedule without leaving
+  the editor open.
+
+In those cases run the binary directly (see the *Backend* section
+below) and point the GUI at the network address through
+`Settings → Server URL`.
+
+## Packaging the client (release build)
+
+The `scripts/` directory ships a self-contained packager that
+produces a release-stripped, asset-bundled folder ready to be
+zipped and shipped:
+
+```bash
+# Linux / macOS
+scripts/package-client.sh                        # → dist/memstroy-inator-<os>-<ver>/
+
+# Windows PowerShell
+pwsh scripts/package-client.ps1                  # → dist\memstroy-inator-windows-<ver>\
+```
+
+What the script does:
+
+1. `cargo build --release -p memstroy-gui -p memstroy-assets-server -p memstroy-cli`.
+2. Copies the three release binaries into `dist/<bundle-name>/bin/`.
+3. Mirrors the runtime asset skeleton (`assets/images`,
+   `assets/sounds`, `assets/particles`, `assets/clips`,
+   `assets/videos`, `assets/text`) so the GUI has somewhere to put
+   downloaded clips on first launch.
+4. Drops an `examples/` copy, the README and a top-level
+   launcher script (`memstroy-inator.sh` / `memstroy-inator.bat`).
+
+Override the output directory with `--out <path>` and the bundle
+name with `--name <name>` if you want to ship a specific build to a
+specific environment.
+
+## Running the backend (assets-server)
+
+Use the provided launcher:
+
+```bash
+# Linux / macOS — defaults: 0.0.0.0:8765, asset root = ./assets
+scripts/start-server.sh
+
+# bind a different address / asset root
+scripts/start-server.sh --addr 127.0.0.1:9000 --root /var/lib/memstroy/assets
+
+# Windows PowerShell
+pwsh scripts/start-server.ps1 -Addr 127.0.0.1:9000 -Root C:\memstroy\assets
+```
+
+Or invoke the binary directly:
+
+```bash
+cargo run -p memstroy-assets-server --release -- \
+    --addr 0.0.0.0:8765 \
+    --root ./assets
+```
+
+The server creates any missing kind subdirectories (`clips/`,
+`videos/`, `images/`, `sounds/`, `particles/`, `text/`) on startup
+and re-indexes after every successful Telegram ingest. The HTTP
+surface is documented in
+[`crates/memstroy-assets-server/src/lib.rs`](crates/memstroy-assets-server/src/lib.rs).
+
+The default tracing filter is `info`. Override it with
+`RUST_LOG=memstroy_assets_server=debug` for ingest debugging.
 
 ## CLI usage
 
@@ -67,8 +166,9 @@ cargo run -p memstroy-cli --release -- preview my_scene.yaml \
     -o frame.png -t 2.0
 ```
 
-`memstroy download --help` documents every flag (filter, page cap,
-concurrency, catalog-only mode).
+`memstroy --help` and `memstroy <subcommand> --help` document every
+flag (filter, page cap, concurrency, catalog-only mode, ML matting
+model path, …).
 
 ## GUI
 
@@ -78,20 +178,23 @@ cargo run -p memstroy-gui --release
 
 The editor opens with five regions:
 
-- **Top menu** — File / Channel / Render / Tools.
-- **Library (left)** — clips found in `assets/mellstroy/`,
-  backgrounds in `assets/backgrounds/`, props in `assets/props/`.
-  Click `+` to add an asset to the scene.
-- **Preview (centre)** — a 9:16 placeholder at the output ratio.
-  *Render → Render preview frame* asks FFmpeg for a still at the
-  current playhead and shows it here.
-- **Inspector (right)** — properties for the selected actor, overlay
-  or background. Animation keyframes are added/edited inline.
-- **Timeline (bottom)** — list of layers + a playhead slider. Real
-  drag-to-edit timeline tracks are coming next.
+- **Top menu** — File / Render / Tools / View.
+- **Library (left)** — `Clips`, `Videos`, `Sounds`, `Images`,
+  `Particles`. The Clips tab is server-driven; the others scan the
+  matching `assets/<kind>/` directory directly. Drag a row onto the
+  canvas or the timeline to add it to the scene.
+- **Preview (centre)** — a 9:16 canvas at the output ratio with
+  live transform handles, chroma-key picker and effect stack.
+- **Inspector (right)** — properties for the selected actor, overlay,
+  background or audio track. Animation keyframes are added/edited
+  inline; modifiers (wobble / shake / pulse / spin / walk) and the
+  professional colour-correction panel (lift / gamma / gain wheels +
+  master / R / G / B curves) live here too.
+- **Timeline (bottom)** — multi-lane timeline with razor, snap,
+  loop, video-/audio-layer creation buttons, and per-parameter
+  keyframe strips.
 
-Channel → Download from Telegram opens a dialog that runs the same
-scraper as the CLI in the background and refreshes the library.
+Use `Settings → Language` to switch between English and Русский.
 
 ## Scene format (excerpt)
 
@@ -112,16 +215,6 @@ layout:
 `pos` is in normalised scene coordinates (`[0, 1]`), so the same scene
 re-renders correctly at any output resolution.
 
-## Roadmap
+## License
 
-| Iteration | Scope                                                                  |
-|----------:|------------------------------------------------------------------------|
-|         1 | **(this commit)** Workspace skeleton, scraper, scene model, GUI shell, FFmpeg filter graph render, CLI |
-|         2 | Pose estimation backend (ONNX Runtime + MoveNet/YOLO11-pose), anchor JSON cache, `Detect anchors` tool in GUI |
-|         3 | Pose-driven attachment compositor (props follow head/wrists), spill suppression, frame-pump fallback for complex animations |
-|         4 | Camera moves (zoom/pan kf), `Snap` and `Slide*` transitions, audio mixer UI |
-|         5 | Real timeline drag-editing in the GUI, drag-and-drop import, undo/redo |
-|         6 | GPU preview compositor (wgpu) for live scrubbing without round-tripping FFmpeg |
-
-Each iteration is a small enough chunk that we can ship a runnable
-binary at the end of it.
+MIT. See per-crate `Cargo.toml` for the canonical declaration.
