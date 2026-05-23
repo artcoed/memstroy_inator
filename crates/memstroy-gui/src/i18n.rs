@@ -285,6 +285,77 @@ fn ru_lookup(key: &str) -> Option<&'static str> {
         "Reset rotation to 0°" => "Сбросить поворот в 0°",
         "\u{2194} Mirror H" => "\u{2194} Отразить по горизонтали",
         "\u{2195} Mirror V" => "\u{2195} Отразить по вертикали",
+        // ── New mask / eyedropper / preset / aspect-ratio strings ─
+        "Rect" => "Прямоугольник",
+        "Ellipse" => "Эллипс",
+        // Note: "Eyedropper" already maps higher up in the canvas
+        // mask-tool block — reusing the same key keeps the Russian
+        // toolbar consistent without producing a duplicate match
+        // arm (which the compiler flags as unreachable).
+        "Rectangle mask — drag a rectangle and bake it as a soft-edge mask shape (use Feather / Invert below to tune)" =>
+            "Прямоугольная маска — протяните прямоугольник и зафиксируйте как маску с мягким краем (настройте Размытие / Инверсию ниже)",
+        "Ellipse mask — drag a rectangle to define the ellipse's bounding box (use Feather / Invert below to tune)" =>
+            "Эллипс-маска — протяните прямоугольник, чтобы задать рамку эллипса (настройте Размытие / Инверсию ниже)",
+        "Eyedropper — click on the preview to sample a colour and chroma-key away every pixel close to it" =>
+            "Пипетка — кликните по превью, чтобы взять цвет и сделать прозрачными все близкие к нему пиксели",
+        "Drag on the preview to define a rectangular mask region." =>
+            "Протяните по превью, чтобы задать прямоугольную область маски.",
+        "Drag on the preview to define an elliptical mask region." =>
+            "Протяните по превью, чтобы задать эллиптическую область маски.",
+        "Click on the preview to sample a colour and chroma-key it." =>
+            "Кликните по превью, чтобы взять цвет и применить как chroma-key.",
+        "\u{1F4A7} Eyedropper picked colour:" => "\u{1F4A7} Пипетка взяла цвет:",
+        "\u{274C} Eyedropper decode failed:" => "\u{274C} Не удалось прочитать изображение для пипетки:",
+        // Effects overview
+        "Active effects" => "Активные эффекты",
+        "Reset all effects" => "Сбросить все эффекты",
+        "Remove every effect on this image. The picture returns to the original decoded pixels." =>
+            "Удалить все эффекты у изображения. Картинка вернётся к исходному виду.",
+        "Mute all" => "Выключить все",
+        "Unmute all" => "Включить все",
+        "Disable every effect without removing it. Click again on individual rows to re-enable." =>
+            "Отключить все эффекты без удаления. Включить обратно — кликом по строке.",
+        "Mute / un-mute this effect without removing it." =>
+            "Включить / выключить эффект без удаления.",
+        "Remove this effect" => "Удалить этот эффект",
+        "Move down (later in stack)" => "Сдвинуть ниже (позже в стеке)",
+        "Move up (earlier in stack)" => "Сдвинуть выше (раньше в стеке)",
+        "Master intensity" => "Общая интенсивность",
+        // Aspect-ratio crop
+        "Aspect ratio crop" => "Обрезка под пропорции",
+        "Crop the picture to a target aspect ratio (centred)." =>
+            "Обрезать картинку до заданных пропорций (по центру).",
+        "Apply a centred crop to land on this aspect ratio." =>
+            "Применить центрированную обрезку до этого соотношения сторон.",
+        // Lookbook / presets
+        "Lookbook / Presets" => "Пресеты / Стили",
+        "One-click multi-effect looks. Each preset replaces the entries it cares about; other effects stay." =>
+            "Готовые комбинации эффектов одной кнопкой. Пресет заменяет только нужные эффекты, остальные остаются.",
+        "Apply this preset's effects (replaces matching entries; leaves other effects alone)." =>
+            "Применить эффекты пресета (заменяет совпадающие, остальные не трогает).",
+        "Cinematic" => "Кинематографичный",
+        "Warm" => "Тёплый",
+        "Cool" => "Холодный",
+        "Punchy" => "Сочный",
+        "Faded" => "Выцветший",
+        "Vintage" => "Винтаж",
+        "Dramatic" => "Драматичный",
+        "Dreamy" => "Мечтательный",
+        "B&W high contrast" => "Ч/Б с высоким контрастом",
+        "Sketch" => "Набросок",
+        "Cyberpunk" => "Киберпанк",
+        "Pastel" => "Пастель",
+        // Colour-key (eyedropper) section
+        "Colour key (eyedropper)" => "Цветовой ключ (пипетка)",
+        "Click on the preview with the Eyedropper tool armed to sample a colour and add a colour-key mask." =>
+            "Активируйте инструмент Пипетка и кликните по превью, чтобы взять цвет и добавить цветовую маску.",
+        "Remove colour key" => "Удалить цветовой ключ",
+        "How wide a colour band around the key counts as a match." =>
+            "Насколько широкую полосу цветов считать совпадением.",
+        "Soften the edge of the keyed region." =>
+            "Смягчить край замаскированной области.",
+        "De-spill: pulls the keyed colour out of remaining edges (export-only)." =>
+            "Подавление цвета: убирает остатки цвета по краям (только при экспорте).",
         "Skeleton Editor" => "Редактор скелета",
         "\u{2692} Skeleton Editor" => "\u{2692} Редактор скелета",
 
