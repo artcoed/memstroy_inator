@@ -64,15 +64,23 @@ pub fn library(ui: &mut egui::Ui, state: &mut EditorState, _request_refresh: imp
     ui.label(RichText::new(crate::i18n::t("Library")).size(16.0).strong());
     ui.add_space(4.0);
 
-    // Tab bar — Clips / Videos / Sounds / Images / Particles.
+    // Tab bar — Clips / Videos / Sounds / Images. The legacy
+    // "Particles" tab was retired (per user request) but the on-disk
+    // particles folder is still scanned in case existing scenes
+    // reference assets from there.
     ui.horizontal_wrapped(|ui| {
-        let tabs: [(LibraryTab, &str, &'static str); 5] = [
+        let tabs: [(LibraryTab, &str, &'static str); 4] = [
             (LibraryTab::Clips,     "\u{1F3AC} ", "Clips"),
             (LibraryTab::Videos,    "\u{1F4FD} ", "Videos"),
             (LibraryTab::Sounds,    "\u{1F50A} ", "Sounds"),
             (LibraryTab::Images,    "\u{1F5BC} ", "Images"),
-            (LibraryTab::Particles, "\u{2728} ",  "Particles"),
         ];
+        // Migrate any session that's still pointed at the now-hidden
+        // Particles tab back to Images so the panel doesn't end up
+        // blank.
+        if state.library_tab == LibraryTab::Particles {
+            state.library_tab = LibraryTab::Images;
+        }
         for (tab, icon, key) in tabs {
             let label = format!("{}{}", icon, crate::i18n::t(key));
             if ui.selectable_label(state.library_tab == tab, label).clicked() {
@@ -605,6 +613,7 @@ pub(crate) fn add_library_asset_at_playhead(
                 skeleton_attachment: None,
                 effects: Vec::new(),
                 animated_params: Default::default(),
+                chroma_key: None,
             });
             state.scene.overlays.push(overlay);
             let new_idx = state.scene.overlays.len() - 1;
@@ -651,6 +660,7 @@ pub(crate) fn add_library_asset_at_playhead(
                 skeleton_attachment: None,
                 effects: Vec::new(),
                 animated_params: Default::default(),
+                chroma_key: None,
             });
             state.scene.overlays.push(overlay);
             let new_idx = state.scene.overlays.len() - 1;
@@ -2652,7 +2662,12 @@ fn inspector_masks_section(
         .num_columns(2)
         .spacing([6.0, 6.0])
         .show(ui, |ui| {
-            if ui.button(crate::i18n::t("\u{25AD} Rectangle")).clicked() {
+            // Rectangle mask serves as both "rectangle" and "crop" in the
+            // unified tool set — the legacy Crop button used to push an
+            // EffectKind::Crop here, but the two were nearly identical
+            // from the user's POV so we kept the more flexible mask
+            // form.
+            if ui.button(crate::i18n::t("\u{25AD} Rectangle / Crop")).clicked() {
                 effects.push(Effect::mask_rect());
                 *mask_tool = MaskTool::RectMask;
             }
@@ -2664,10 +2679,6 @@ fn inspector_masks_section(
             if ui.button(crate::i18n::t("\u{270D} Freehand")).clicked() {
                 effects.push(memstroy_core::Effect::mask_freehand());
                 *mask_tool = MaskTool::FreehandMask;
-            }
-            if ui.button(crate::i18n::t("\u{2702} Crop")).clicked() {
-                effects.push(Effect::crop());
-                *mask_tool = MaskTool::Crop;
             }
             ui.end_row();
         });
@@ -6788,6 +6799,12 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     // end of the loop. Avoids interleaving mutable borrows of state with
     // the clip-draw / drag handlers above.
     let mut param_row_clicks: Vec<(crate::kf_anim::SelectedLayer, ParamRowClick)> = Vec::new();
+    // Easing-change requests collected from the per-param kf rows
+    // (right-click menu). Drained at the bottom of the timeline
+    // pass so we never hold a mutable borrow on `state` while the
+    // row is being drawn.
+    let mut param_row_easing_changes: Vec<(crate::kf_anim::SelectedLayer, ParamRowEasingChange)> =
+        Vec::new();
 
     // ── Render Frame row (always at the top of the panel) ──
     // The render frame is the "where do we crop the output" rectangle,
@@ -7351,20 +7368,15 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                         track_right,
                     );
 
-                    // Keyframe diamonds on the clip bar — one per layout keyframe.
-                    draw_keyframe_diamonds(
-                        painter,
-                        content_rect,
-                        clip_start,
-                        clip_end,
-                        &state.scene.actors[ai].layout,
-                        state.timeline_scroll,
-                        pps,
-                        track_left,
-                        track_right,
-                        sel,
-                        true, // actor kfs are stored in scene-time
-                    );
+                    // Keyframe diamonds on the clip bar were removed
+                    // per user request: they used to aggregate every
+                    // layer keyframe (regardless of which parameter
+                    // owned it), giving the misleading impression that
+                    // *all* parameters were animated together. The
+                    // per-parameter rows in the expansion area below
+                    // already show the keyframes that actually belong
+                    // to each parameter — see `draw_param_kf_rows`.
+                    let _ = (clip_start, clip_end);
                 }
 
                 // Draw overlays assigned to this video track. Overlays
@@ -7588,25 +7600,17 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                     // colliding overlays via overlap-resolution; bail
                     // out before reading the (possibly invalid) index.
                     if oi >= state.scene.overlays.len() { continue; }
-                    // Keyframe diamonds for overlays too.
-                    let layout_ref: &[Keyframe<OverlayState>] = match &state.scene.overlays[oi] {
+                    // Keyframe diamonds for overlays were also retired
+                    // (see actor branch above for the reasoning) — the
+                    // per-parameter rows in the expansion area carry
+                    // the diamonds for the parameters the user
+                    // actually animated.
+                    let _ = (clip_start, clip_end);
+                    let _ = match &state.scene.overlays[oi] {
                         Overlay::Text(t) => &t.layout,
                         Overlay::Image(im) => &im.layout,
                         Overlay::Video(v) => &v.layout,
                     };
-                    draw_keyframe_diamonds(
-                        painter,
-                        content_rect,
-                        clip_start,
-                        clip_end,
-                        layout_ref,
-                        state.timeline_scroll,
-                        pps,
-                        track_left,
-                        track_right,
-                        sel,
-                        false, // overlay kfs are clip-local
-                    );
                 }
             }
             TrackKind::Audio => {
@@ -7914,6 +7918,9 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                 for hit in outcome.click_hits {
                     param_row_clicks.push((layer_label.clone(), hit));
                 }
+                for ec in outcome.easing_changes {
+                    param_row_easing_changes.push((layer_label.clone(), ec));
+                }
             }
         }
 
@@ -7951,6 +7958,28 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             } else {
                 state.selected_keyframes.clear();
                 state.selected_keyframes.push(entry);
+            }
+        }
+    }
+
+    // ── Per-param keyframe row right-click → easing change ──
+    if !param_row_easing_changes.is_empty() {
+        let selected_kfs = state.selected_keyframes.clone();
+        for (layer_label, change) in &param_row_easing_changes {
+            // Build the list of (layer, t) pairs the change should
+            // touch. Right-clicking a kf that's part of the current
+            // multi-selection batches the easing onto every selected
+            // kf; otherwise it's a one-off edit.
+            let mut targets: Vec<(crate::kf_anim::SelectedLayer, f32)> = Vec::new();
+            if change.apply_to_selection && !selected_kfs.is_empty() {
+                for sk in &selected_kfs {
+                    targets.push((sk.layer.clone(), sk.t));
+                }
+            } else {
+                targets.push((layer_label.clone(), change.t));
+            }
+            for (layer, t) in targets {
+                apply_easing_to_layer_kf(state, &layer, t, change.easing);
             }
         }
     }
@@ -9515,6 +9544,51 @@ fn kf_scene_time(state: &EditorState, sel: Selection, kf_t: f32) -> f32 {
     kf_time_to_scene_time(state, sel, kf_t)
 }
 
+/// Apply `easing` to the keyframe at time `kf_t` in the given layer's
+/// layout. Used by the per-param row context menu and the multi-edit
+/// path (when a batch of kfs is selected, the easing is broadcast to
+/// every entry). Time matching uses an ε of 1ms to absorb fp drift.
+fn apply_easing_to_layer_kf(
+    state: &mut EditorState,
+    layer: &crate::kf_anim::SelectedLayer,
+    kf_t: f32,
+    easing: memstroy_core::Easing,
+) {
+    let eps = 1.0e-3;
+    match layer {
+        crate::kf_anim::SelectedLayer::Actor(ai) => {
+            if let Some(a) = state.scene.actors.get_mut(*ai) {
+                if let Some(kf) = a.layout.iter_mut().find(|k| (k.t - kf_t).abs() < eps) {
+                    kf.easing = easing;
+                }
+            }
+        }
+        crate::kf_anim::SelectedLayer::Overlay(oi) => {
+            if let Some(ov) = state.scene.overlays.get_mut(*oi) {
+                let layout: &mut Vec<Keyframe<OverlayState>> = match ov {
+                    Overlay::Text(t) => &mut t.layout,
+                    Overlay::Image(im) => &mut im.layout,
+                    Overlay::Video(v) => &mut v.layout,
+                };
+                if let Some(kf) = layout.iter_mut().find(|k| (k.t - kf_t).abs() < eps) {
+                    kf.easing = easing;
+                }
+            }
+        }
+        crate::kf_anim::SelectedLayer::RenderFrame => {
+            if let Some(kf) = state
+                .scene
+                .render_frame
+                .layout
+                .iter_mut()
+                .find(|k| (k.t - kf_t).abs() < eps)
+            {
+                kf.easing = easing;
+            }
+        }
+    }
+}
+
 /// Remove every keyframe currently flagged in `state.selected_keyframes`
 /// from the matching layer's layout vec, then clear the selection. Used
 /// by the Delete / Backspace key handler in the timeline. Time
@@ -9753,7 +9827,7 @@ fn draw_param_kf_rows(
                 Vec2::new(half * 2.5, row_h.min(20.0)),
             );
             let id = ui.id().with(("param_kf", sel_layer_label, param_id, local_t.to_bits()));
-            let r = ui.interact(hit, id, Sense::click());
+            let r = ui.interact(hit, id, Sense::click_and_drag());
             if r.clicked() {
                 outcome.click_hits.push(ParamRowClick {
                     param_id: param_id.clone(),
@@ -9765,6 +9839,42 @@ fn draw_param_kf_rows(
             if r.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
+            // Right-click context menu — pick the interpolation curve
+            // ("transition") used to ease INTO this keyframe. When the
+            // user has multiple keyframes already selected (Ctrl+click
+            // before right-click) the choice applies to every selected
+            // kf so they can re-flag a whole batch of "make these
+            // step-holds" or "linearise these" in one shot.
+            let kf_in_selection = is_selected;
+            r.context_menu(|ui| {
+                ui.label(
+                    egui::RichText::new(crate::i18n::t("Transition into kf"))
+                        .size(10.0)
+                        .strong(),
+                );
+                ui.separator();
+                let easings: [(memstroy_core::Easing, &str); 6] = [
+                    (memstroy_core::Easing::Linear, "Linear"),
+                    (memstroy_core::Easing::Step, "Step (instant)"),
+                    (memstroy_core::Easing::EaseIn, "Ease in"),
+                    (memstroy_core::Easing::EaseOut, "Ease out"),
+                    (memstroy_core::Easing::EaseInOut, "Ease in/out"),
+                    (memstroy_core::Easing::Cubic, "Cubic"),
+                ];
+                for (e, label) in easings {
+                    if ui
+                        .selectable_label(false, crate::i18n::t(label))
+                        .clicked()
+                    {
+                        outcome.easing_changes.push(ParamRowEasingChange {
+                            t: local_t,
+                            easing: e,
+                            apply_to_selection: kf_in_selection,
+                        });
+                        ui.close_menu();
+                    }
+                }
+            });
         }
     }
 
@@ -9776,6 +9886,12 @@ fn draw_param_kf_rows(
 #[derive(Default)]
 struct ParamRowOutcome {
     click_hits: Vec<ParamRowClick>,
+    /// Easing changes requested via the right-click menu on a kf
+    /// diamond. Each entry carries the local kf time, the new easing
+    /// to apply, and whether the change should be replicated to every
+    /// currently-selected keyframe of the same layer (so the user can
+    /// "make these 5 step-holds" in one shot).
+    easing_changes: Vec<ParamRowEasingChange>,
 }
 
 struct ParamRowClick {
@@ -9789,6 +9905,18 @@ struct ParamRowClick {
     extend: bool,
     /// Resolved scene-time for the playhead seek.
     seek_to: f32,
+}
+
+struct ParamRowEasingChange {
+    /// Local kf time (the row coordinate space) of the kf the user
+    /// right-clicked on.
+    t: f32,
+    /// Replacement easing.
+    easing: memstroy_core::Easing,
+    /// When true the change is broadcast to every currently-selected
+    /// keyframe of the layer (multi-edit). Otherwise it only applies
+    /// to the kf at `t`.
+    apply_to_selection: bool,
 }
 
 

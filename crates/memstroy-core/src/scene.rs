@@ -868,6 +868,13 @@ pub struct ImageOverlay {
     /// **Animated parameter set** — see Actor::animated_params.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub animated_params: BTreeSet<String>,
+    /// **Eyedropper mask** — optional chroma-key parameters that mask
+    /// out pixels matching `key_color`. Mirrors the field on
+    /// VideoOverlay / Actor; lets the user pick a colour with the
+    /// canvas eyedropper and have it instantly apply as a mask. `None`
+    /// means no keying (default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chroma_key: Option<ChromaKeyParams>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

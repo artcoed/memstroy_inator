@@ -328,6 +328,10 @@ pub struct EditorState {
     pub curve_editor_open: bool,
     /// Which property is selected in curve editor (0=scale, 1=pos_x, 2=pos_y, 3=opacity, 4=rotation)
     pub curve_editor_property: usize,
+    /// Index into the curve editor's candidate-target list — used when
+    /// the user has multiple compatible elements multi-selected and
+    /// picks one in the in-window dropdown.
+    pub curve_editor_active_idx: usize,
     /// Whether image editor window is open (image-only filters / crop).
     pub image_editor_open: bool,
 
@@ -679,6 +683,7 @@ impl EditorState {
         // New window states
         s.curve_editor_open = false;
         s.curve_editor_property = 0;
+        s.curve_editor_active_idx = 0;
         s.image_editor_open = false;
 
         s.editing_text_overlay = None;
@@ -1607,6 +1612,7 @@ impl EditorState {
             skeleton_attachment: None,
             effects: Vec::new(),
             animated_params: Default::default(),
+            chroma_key: None,
         });
         self.last_drag_group = None;
         self.undo.push(&self.scene);
