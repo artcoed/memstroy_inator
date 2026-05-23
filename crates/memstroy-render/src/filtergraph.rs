@@ -1533,5 +1533,30 @@ fn effect_to_filter(kind: &EffectKind, i: f32) -> Option<String> {
                 tp = t / (1.0 - t - b).max(0.001),
             )
         }
+        K::ColorKey { color, similarity, blend, spill: _, invert } => {
+            // FFmpeg's `chromakey` filter does the same HSV-distance
+            // alpha keying we run on the CPU preview side, so the
+            // exported video matches the live editor frame exactly.
+            // `intensity` (the master envelope) scales the similarity
+            // distance: a faded effect keys a smaller core. `invert`
+            // is achieved by swapping `chromakey` for `chromahold`,
+            // which keeps the keyed region instead of cutting it.
+            // De-spill is intentionally omitted — the existing per-
+            // element `chromakey` filter at the actor / overlay level
+            // already runs spill suppression for the source colour;
+            // the effect-stack ColorKey is meant for compositing
+            // touch-ups where spill rarely matters.
+            let key_hex = format!(
+                "0x{:02X}{:02X}{:02X}",
+                color[0], color[1], color[2],
+            );
+            let sim = (similarity * i).clamp(0.0, 1.0);
+            let blend = blend.clamp(0.0, 1.0);
+            if *invert {
+                format!("chromahold={}:{}:{}", key_hex, sim, blend)
+            } else {
+                format!("chromakey={}:{}:{}", key_hex, sim, blend)
+            }
+        }
     })
 }

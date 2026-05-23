@@ -2189,13 +2189,62 @@ fn inspector_effect_kind_params(
                 ui, eff, "p3", "Crop bottom", 0.0..=0.49, false, t_local, ("eff_crop_b", ei));
         }
         K::Mask { .. } => {
-            // Mask: feather slider + invert toggle + a "Repaint" button
-            // that arms the matching canvas tool so the user can
-            // overwrite the shape geometry without leaving the
-            // inspector. The shape itself is drawn directly on the
-            // canvas while painting, not through this widget.
+            // Mask: feather slider + invert toggle + per-shape geometry
+            // sliders. Each geometry slider is animatable through the
+            // same diamond+slider widget the rest of the effect-stack
+            // already uses, so an animated `rect_left` on a Mask
+            // produces a Rect whose left edge is sampled from
+            // `param_kfs["rect_left"]` at every frame. The "Repaint"
+            // button arms the matching canvas tool so the user can
+            // overwrite the geometry with a fresh drag.
             inspector_effect_anim_slider(
                 ui, eff, "p0", "Feather", 0.0..=0.5, false, t_local, ("eff_mask_f", ei));
+            // Snapshot the shape variant up front so the animatable
+            // sliders below can call back into eff (which the
+            // `if let &mut` borrow would otherwise pin).
+            let shape_kind = match &eff.kind {
+                memstroy_core::EffectKind::Mask { shape, .. } => match shape {
+                    memstroy_core::MaskShape::Rect { .. } => 0,
+                    memstroy_core::MaskShape::Ellipse { .. } => 1,
+                    memstroy_core::MaskShape::Polygon { .. } => 2,
+                },
+                _ => 0,
+            };
+            match shape_kind {
+                0 => {
+                    inspector_effect_anim_slider(
+                        ui, eff, "rect_left",   "Left",   0.0..=1.0, false, t_local, ("eff_mask_rl", ei));
+                    inspector_effect_anim_slider(
+                        ui, eff, "rect_top",    "Top",    0.0..=1.0, false, t_local, ("eff_mask_rt", ei));
+                    inspector_effect_anim_slider(
+                        ui, eff, "rect_right",  "Right",  0.0..=1.0, false, t_local, ("eff_mask_rr", ei));
+                    inspector_effect_anim_slider(
+                        ui, eff, "rect_bottom", "Bottom", 0.0..=1.0, false, t_local, ("eff_mask_rb", ei));
+                }
+                1 => {
+                    inspector_effect_anim_slider(
+                        ui, eff, "ellipse_cx", "Center X", 0.0..=1.0, false, t_local, ("eff_mask_ecx", ei));
+                    inspector_effect_anim_slider(
+                        ui, eff, "ellipse_cy", "Center Y", 0.0..=1.0, false, t_local, ("eff_mask_ecy", ei));
+                    inspector_effect_anim_slider(
+                        ui, eff, "ellipse_rx", "Radius X", 0.0..=1.0, false, t_local, ("eff_mask_erx", ei));
+                    inspector_effect_anim_slider(
+                        ui, eff, "ellipse_ry", "Radius Y", 0.0..=1.0, false, t_local, ("eff_mask_ery", ei));
+                }
+                _ => {
+                    // Polygon: per-vertex animation isn't wired —
+                    // surface a hint so the user knows where they
+                    // stand instead of staring at an empty section.
+                    ui.label(
+                        RichText::new(crate::i18n::t(
+                            "Freehand polygon vertices animate as a fixed shape; per-vertex keyframes are a future addition.",
+                        ))
+                        .size(10.0)
+                        .italics()
+                        .color(COL_TEXT_DIM),
+                    );
+                }
+            }
             if let memstroy_core::EffectKind::Mask { invert, shape, .. } = &mut eff.kind {
                 ui.horizontal(|ui| {
                     ui.checkbox(invert, "Invert");
@@ -2211,6 +2260,34 @@ fn inspector_effect_kind_params(
                             .size(10.0)
                             .color(COL_TEXT_DIM),
                     );
+                });
+            }
+        }
+        K::ColorKey { .. } => {
+            // Colour-key mask: similarity / blend / spill sliders +
+            // the picked colour swatch + invert. The colour itself
+            // is set by the canvas eyedropper tool — the inspector
+            // exposes a swatch so the user can fine-tune by hand.
+            inspector_effect_anim_slider(
+                ui, eff, "p0", "Similarity", 0.0..=1.0, false, t_local, ("eff_ck_sim", ei));
+            inspector_effect_anim_slider(
+                ui, eff, "p1", "Blend",      0.0..=1.0, false, t_local, ("eff_ck_blend", ei));
+            inspector_effect_anim_slider(
+                ui, eff, "p2", "Spill",      0.0..=1.0, false, t_local, ("eff_ck_spill", ei));
+            if let memstroy_core::EffectKind::ColorKey { color, invert, .. } = &mut eff.kind {
+                ui.horizontal(|ui| {
+                    let mut rgb = [
+                        color[0] as f32 / 255.0,
+                        color[1] as f32 / 255.0,
+                        color[2] as f32 / 255.0,
+                    ];
+                    ui.label("Key colour");
+                    if ui.color_edit_button_rgb(&mut rgb).changed() {
+                        color[0] = (rgb[0] * 255.0).round().clamp(0.0, 255.0) as u8;
+                        color[1] = (rgb[1] * 255.0).round().clamp(0.0, 255.0) as u8;
+                        color[2] = (rgb[2] * 255.0).round().clamp(0.0, 255.0) as u8;
+                    }
+                    ui.checkbox(invert, "Invert");
                 });
             }
         }
@@ -2251,6 +2328,20 @@ fn effect_kind_param_get(
         K::Crop { right, .. } if key == "p2" => Some(*right),
         K::Crop { bottom, .. } if key == "p3" => Some(*bottom),
         K::Mask { feather, .. } if key == "p0" => Some(*feather),
+        // Per-shape scalars on a Mask. The keys mirror the param ids
+        // sampled in `Effect::sampled_at` so animating any of these
+        // makes the geometry vary over time.
+        K::Mask { shape: memstroy_core::MaskShape::Rect { left, .. }, .. } if key == "rect_left" => Some(*left),
+        K::Mask { shape: memstroy_core::MaskShape::Rect { top, .. }, .. } if key == "rect_top" => Some(*top),
+        K::Mask { shape: memstroy_core::MaskShape::Rect { right, .. }, .. } if key == "rect_right" => Some(*right),
+        K::Mask { shape: memstroy_core::MaskShape::Rect { bottom, .. }, .. } if key == "rect_bottom" => Some(*bottom),
+        K::Mask { shape: memstroy_core::MaskShape::Ellipse { cx, .. }, .. } if key == "ellipse_cx" => Some(*cx),
+        K::Mask { shape: memstroy_core::MaskShape::Ellipse { cy, .. }, .. } if key == "ellipse_cy" => Some(*cy),
+        K::Mask { shape: memstroy_core::MaskShape::Ellipse { rx, .. }, .. } if key == "ellipse_rx" => Some(*rx),
+        K::Mask { shape: memstroy_core::MaskShape::Ellipse { ry, .. }, .. } if key == "ellipse_ry" => Some(*ry),
+        K::ColorKey { similarity, .. } if key == "p0" => Some(*similarity),
+        K::ColorKey { blend, .. } if key == "p1" => Some(*blend),
+        K::ColorKey { spill, .. } if key == "p2" => Some(*spill),
         _ => None,
     }
 }
@@ -2289,6 +2380,44 @@ fn effect_kind_param_set(
         K::Crop { right, .. } if key == "p2" => *right = new_val.clamp(0.0, 0.49),
         K::Crop { bottom, .. } if key == "p3" => *bottom = new_val.clamp(0.0, 0.49),
         K::Mask { feather, .. } if key == "p0" => *feather = new_val.clamp(0.0, 0.5),
+        // Per-shape scalars on a Mask. UV-coordinate clamps mirror
+        // `MaskShape::contains_uv` semantics — the rect edges live in
+        // 0..1 and the ellipse centres / radii are unconstrained on
+        // the upper end so users can pull the shape briefly outside
+        // the frame for animation overshoots.
+        K::Mask { shape: memstroy_core::MaskShape::Rect { left, .. }, .. } if key == "rect_left" => {
+            *left = new_val.clamp(0.0, 1.0);
+        }
+        K::Mask { shape: memstroy_core::MaskShape::Rect { top, .. }, .. } if key == "rect_top" => {
+            *top = new_val.clamp(0.0, 1.0);
+        }
+        K::Mask { shape: memstroy_core::MaskShape::Rect { right, .. }, .. } if key == "rect_right" => {
+            *right = new_val.clamp(0.0, 1.0);
+        }
+        K::Mask { shape: memstroy_core::MaskShape::Rect { bottom, .. }, .. } if key == "rect_bottom" => {
+            *bottom = new_val.clamp(0.0, 1.0);
+        }
+        K::Mask { shape: memstroy_core::MaskShape::Ellipse { cx, .. }, .. } if key == "ellipse_cx" => {
+            *cx = new_val.clamp(-0.5, 1.5);
+        }
+        K::Mask { shape: memstroy_core::MaskShape::Ellipse { cy, .. }, .. } if key == "ellipse_cy" => {
+            *cy = new_val.clamp(-0.5, 1.5);
+        }
+        K::Mask { shape: memstroy_core::MaskShape::Ellipse { rx, .. }, .. } if key == "ellipse_rx" => {
+            *rx = new_val.clamp(0.0, 1.5);
+        }
+        K::Mask { shape: memstroy_core::MaskShape::Ellipse { ry, .. }, .. } if key == "ellipse_ry" => {
+            *ry = new_val.clamp(0.0, 1.5);
+        }
+        K::ColorKey { similarity, .. } if key == "p0" => {
+            *similarity = new_val.clamp(0.0, 1.0);
+        }
+        K::ColorKey { blend, .. } if key == "p1" => {
+            *blend = new_val.clamp(0.0, 1.0);
+        }
+        K::ColorKey { spill, .. } if key == "p2" => {
+            *spill = new_val.clamp(0.0, 1.0);
+        }
         _ => {}
     }
 }
@@ -2560,6 +2689,7 @@ fn inspector_masks_section(
                 MaskShape::Polygon { .. } => crate::i18n::t("Freehand mask"),
             },
             EffectKind::Crop { .. } => crate::i18n::t("Crop"),
+            EffectKind::ColorKey { .. } => crate::i18n::t("Color key mask"),
             _ => continue,
         };
         egui::Frame::none()
@@ -2624,12 +2754,59 @@ fn inspector_masks_section(
                             ui.label(crate::i18n::t("Bottom"));
                             ui.add(egui::Slider::new(bottom, 0.0..=0.49));
                         });
-                        if ui.button(format!(
-                            "\u{270E} {} {}",
-                            crate::i18n::t("Repaint"),
-                            crate::i18n::t("Crop"),
-                        )).clicked() {
-                            *mask_tool = MaskTool::Crop;
+                        // No "Repaint" button for legacy crop entries
+                        // — the dedicated rectangle-crop canvas tool
+                        // was retired in favour of the unified
+                        // Rectangle mask. Sliders remain so old scenes
+                        // can still adjust their crop insets in place.
+                    }
+                    EffectKind::ColorKey { color, similarity, blend, spill, invert } => {
+                        // Compact per-entry editor for colour-key
+                        // masks. The picked colour is shown as a
+                        // swatch — clicking it opens the standard
+                        // egui colour picker so the user can fine-
+                        // tune what the eyedropper sampled. The
+                        // similarity / blend / spill sliders mirror
+                        // the FFmpeg `chromakey` filter parameters.
+                        ui.horizontal(|ui| {
+                            ui.label(crate::i18n::t("Key colour"));
+                            let mut rgb = [
+                                color[0] as f32 / 255.0,
+                                color[1] as f32 / 255.0,
+                                color[2] as f32 / 255.0,
+                            ];
+                            if ui.color_edit_button_rgb(&mut rgb).changed() {
+                                color[0] = (rgb[0] * 255.0).round().clamp(0.0, 255.0) as u8;
+                                color[1] = (rgb[1] * 255.0).round().clamp(0.0, 255.0) as u8;
+                                color[2] = (rgb[2] * 255.0).round().clamp(0.0, 255.0) as u8;
+                            }
+                            ui.label(format!("#{:02X}{:02X}{:02X}", color[0], color[1], color[2]));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label(crate::i18n::t("Similarity"));
+                            ui.add(egui::Slider::new(similarity, 0.0..=1.0));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label(crate::i18n::t("Blend"));
+                            ui.add(egui::Slider::new(blend, 0.0..=1.0));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label(crate::i18n::t("Spill"));
+                            ui.add(egui::Slider::new(spill, 0.0..=1.0));
+                        });
+                        ui.checkbox(invert, crate::i18n::t("Invert (keep matching)"));
+                        // "Repick" arms the eyedropper so the user
+                        // can resample the colour without leaving
+                        // the inspector. The next click on the
+                        // canvas overwrites this entry's colour.
+                        if ui
+                            .button(format!("\u{1F4A7} {}", crate::i18n::t("Re-pick")))
+                            .on_hover_text(crate::i18n::t(
+                                "Arms the eyedropper — next click on the canvas resamples this mask's colour.",
+                            ))
+                            .clicked()
+                        {
+                            *mask_tool = MaskTool::Eyedropper;
                         }
                     }
                     _ => {}
@@ -2641,7 +2818,7 @@ fn inspector_masks_section(
         effects.remove(idx);
     }
 
-    if effects.iter().all(|e| !matches!(e.kind, EffectKind::Mask { .. } | EffectKind::Crop { .. })) {
+    if effects.iter().all(|e| !matches!(e.kind, EffectKind::Mask { .. } | EffectKind::Crop { .. } | EffectKind::ColorKey { .. })) {
         ui.label(
             RichText::new(crate::i18n::t("No masks yet."))
                 .size(10.5)
@@ -2679,6 +2856,22 @@ fn inspector_masks_section(
             if ui.button(crate::i18n::t("\u{270D} Freehand")).clicked() {
                 effects.push(memstroy_core::Effect::mask_freehand());
                 *mask_tool = MaskTool::FreehandMask;
+            }
+            // Eyedropper colour-key mask. Clicking arms the canvas
+            // tool AND pushes a placeholder ColorKey effect so the
+            // user can already tweak similarity / blend without
+            // having to commit a click first; the eyedropper click
+            // later overwrites the placeholder colour with the
+            // picked pixel.
+            if ui
+                .button(crate::i18n::t("\u{1F4A7} Eyedropper"))
+                .on_hover_text(crate::i18n::t(
+                    "Click on the canvas to pick a colour to mask out (works on actors and image overlays).",
+                ))
+                .clicked()
+            {
+                effects.push(memstroy_core::Effect::color_key());
+                *mask_tool = MaskTool::Eyedropper;
             }
             ui.end_row();
         });
@@ -6904,8 +7097,13 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     for track_idx in 0..num_tracks {
         let track = &state.tracks[track_idx];
         let track_h = track.height * v_zoom;
+        // Animated mask params (if any) get their own diamond rows
+        // ABOVE the clip bar — mirroring the transform-param rows
+        // below. Layers without animated mask params yield 0 here so
+        // the existing layout is unchanged in the common case.
+        let mask_above = selected_layer_mask_above_height(state, track_idx, v_zoom);
         let expansion = selected_layer_expansion(state, track_idx, v_zoom);
-        let effective_track_h = track_h + expansion;
+        let effective_track_h = mask_above + track_h + expansion;
         let track_kind = track.kind;
         let track_name = track.name.clone();
         let track_muted = track.muted;
@@ -6945,13 +7143,14 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             if track_muted { COL_TEXT_DIM } else { COL_TEXT },
         );
 
-        // Clip area = top portion of the row (excludes the param-row
-        // expansion below). draw_clip / draw_keyframe_diamonds only draw
-        // inside this rect so the per-param sub-rows have a clean area
-        // beneath them.
+        // Clip area = portion of the row between the mask-row strip
+        // (above) and the per-param expansion (below). draw_clip /
+        // draw_keyframe_diamonds only draw inside this rect so the
+        // sub-rows on either side have clean space.
+        let clip_top = row_top + mask_above;
         let content_rect = egui::Rect::from_min_max(
-            egui::pos2(tracks_rect.min.x, row_top + 1.0),
-            egui::pos2(tracks_rect.max.x, row_top + track_h - 1.0),
+            egui::pos2(tracks_rect.min.x, clip_top + 1.0),
+            egui::pos2(tracks_rect.max.x, clip_top + track_h - 1.0),
         );
 
         // Draw clips on this track
@@ -7904,7 +8103,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                     &layer_label,
                     &params,
                     &param_kf_pairs,
-                    row_top + track_h,
+                    clip_top + track_h,
                     expansion,
                     track_left,
                     track_right,
@@ -7920,6 +8119,59 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                 }
                 for ec in outcome.easing_changes {
                     param_row_easing_changes.push((layer_label.clone(), ec));
+                }
+            }
+        }
+
+        // ── Per-mask keyframe rows (above the clip). Mirrors the
+        // transform-row block but draws into the strip we already
+        // reserved at the top of the row via `mask_above`. Layers
+        // with no animated mask params reserve no space and so this
+        // block is a no-op for the common case.
+        if mask_above > 4.0 {
+            if let Some((sel_layer, rows)) = selected_layer_mask_param_rows(state, track_idx) {
+                if !rows.is_empty() {
+                    let layer_label = match sel_layer {
+                        Selection::Actor(ai) => crate::kf_anim::SelectedLayer::Actor(ai),
+                        Selection::Overlay(oi) => crate::kf_anim::SelectedLayer::Overlay(oi),
+                        _ => crate::kf_anim::SelectedLayer::RenderFrame,
+                    };
+                    let (clip_start_t, clip_end_t) = match sel_layer {
+                        Selection::Actor(ai) => {
+                            let a = &state.scene.actors[ai];
+                            (a.t_in.unwrap_or(0.0), a.t_out.unwrap_or(duration))
+                        }
+                        Selection::Overlay(oi) => {
+                            match &state.scene.overlays[oi] {
+                                Overlay::Text(t) => (t.t_in, t.t_out),
+                                Overlay::Image(im) => (im.t_in, im.t_out),
+                                Overlay::Video(v) => (v.t_in, v.t_out),
+                            }
+                        }
+                        _ => (0.0, duration),
+                    };
+                    let clip_x_start =
+                        (clip_start_t - state.timeline_scroll) * pps + track_left;
+                    let clip_x_end = (clip_end_t - state.timeline_scroll) * pps + track_left;
+                    let outcome = draw_mask_param_kf_rows(
+                        ui,
+                        painter,
+                        &layer_label,
+                        &rows,
+                        row_top,
+                        mask_above,
+                        track_left,
+                        track_right,
+                        pps,
+                        state.timeline_scroll,
+                        state.playhead,
+                        &state.selected_keyframes,
+                        clip_x_start,
+                        clip_x_end,
+                    );
+                    for hit in outcome.click_hits {
+                        param_row_clicks.push((layer_label.clone(), hit));
+                    }
                 }
             }
         }
@@ -9322,6 +9574,159 @@ fn selected_layer_expansion(state: &EditorState, track_idx: usize, v_zoom: f32) 
     (params.len() as f32) * PARAM_ROW_BASE * v_zoom + 4.0
 }
 
+// ─── MASK PARAM ROWS (above the clip) ────────────────────────────────
+//
+// The mask system treats each animated `Mask` / `ColorKey` parameter
+// as its own diamond row, painted ABOVE the clip bar so the user
+// reads them as "mask edits to the clip" — visually distinct from
+// the transform rows below. The data model: every entry in
+// `effect.param_kfs` whose key is also in `effect.animated_params`
+// becomes a row with one diamond per keyframe time.
+
+/// One diamond-row's worth of mask-related animation data attached
+/// to the currently-selected layer.
+#[derive(Clone)]
+struct MaskParamRow {
+    /// Index of the effect inside the layer's `effects` vec — used
+    /// for the row's gutter colour key (multiple effects on the
+    /// same layer get distinct colours so the user can tell them
+    /// apart at a glance).
+    effect_idx: usize,
+    /// Param key inside the effect (e.g. "rect_left", "p0").
+    param_key: String,
+    /// Pre-formatted gutter label — "Mask · Left", "Color key · Blend"…
+    label: String,
+    /// Per-kf `(local_t, scene_t)` pairs. `local_t` matches the
+    /// underlying `Keyframe.t`; `scene_t` is what the timeline ruler
+    /// uses for its X math (= `local_t + t_in` for overlays,
+    /// `= local_t` for actors).
+    times: Vec<(f32, f32)>,
+}
+
+/// Walk the selected layer's effect stack and collect a `MaskParamRow`
+/// for every animated parameter on every `Mask` / `ColorKey` entry.
+/// Returns `None` when the selected layer doesn't live on
+/// `track_idx`, or there is no selectable layer at all.
+fn selected_layer_mask_param_rows(
+    state: &EditorState,
+    track_idx: usize,
+) -> Option<(Selection, Vec<MaskParamRow>)> {
+    let video_tracks: Vec<usize> = state.video_track_indices();
+    let default_overlay_track = if video_tracks.len() >= 2 {
+        video_tracks[1]
+    } else {
+        video_tracks.first().copied().unwrap_or(0)
+    };
+
+    let (effects, t_in): (&Vec<memstroy_core::Effect>, f32) = match state.selection {
+        Selection::Actor(ai) => {
+            let assigned = state
+                .actor_track_assignments
+                .get(&ai)
+                .copied()
+                .unwrap_or_else(|| video_tracks.first().copied().unwrap_or(0));
+            if assigned != track_idx {
+                return None;
+            }
+            let a = state.scene.actors.get(ai)?;
+            (&a.effects, 0.0)
+        }
+        Selection::Overlay(oi) => {
+            let assigned = state
+                .overlay_track_assignments
+                .get(&oi)
+                .copied()
+                .unwrap_or(default_overlay_track);
+            if assigned != track_idx {
+                return None;
+            }
+            let ov = state.scene.overlays.get(oi)?;
+            match ov {
+                Overlay::Text(t) => (&t.effects, t.t_in),
+                Overlay::Image(im) => (&im.effects, im.t_in),
+                Overlay::Video(v) => (&v.effects, v.t_in),
+            }
+        }
+        _ => return None,
+    };
+
+    let mut rows: Vec<MaskParamRow> = Vec::new();
+    for (ei, eff) in effects.iter().enumerate() {
+        if !matches!(
+            eff.kind,
+            memstroy_core::EffectKind::Mask { .. } | memstroy_core::EffectKind::ColorKey { .. }
+        ) {
+            continue;
+        }
+        // Sort keys for stable ordering across frames so the rows
+        // don't shuffle as the user toggles diamonds.
+        let mut keys: Vec<String> = eff.animated_params.iter().cloned().collect();
+        keys.sort();
+        for key in keys {
+            let kfs = match eff.param_kfs.get(&key) {
+                Some(v) if !v.is_empty() => v,
+                _ => continue,
+            };
+            let times: Vec<(f32, f32)> =
+                kfs.iter().map(|kf| (kf.t, t_in + kf.t)).collect();
+            let label = mask_row_label(&eff.kind, &key);
+            rows.push(MaskParamRow {
+                effect_idx: ei,
+                param_key: key,
+                label,
+                times,
+            });
+        }
+    }
+
+    Some((state.selection, rows))
+}
+
+/// Pretty-print a mask param key into a gutter label. Falls back to
+/// the raw key for unknown variants so the row stays readable.
+fn mask_row_label(kind: &memstroy_core::EffectKind, key: &str) -> String {
+    use memstroy_core::EffectKind as K;
+    let prefix = match kind {
+        K::Mask { .. } => "Mask",
+        K::ColorKey { .. } => "Color key",
+        _ => "Effect",
+    };
+    let suffix: &str = match key {
+        "p0" if matches!(kind, K::Mask { .. }) => "Feather",
+        "rect_left" => "Left",
+        "rect_top" => "Top",
+        "rect_right" => "Right",
+        "rect_bottom" => "Bottom",
+        "ellipse_cx" => "Center X",
+        "ellipse_cy" => "Center Y",
+        "ellipse_rx" => "Radius X",
+        "ellipse_ry" => "Radius Y",
+        "p0" => "Similarity",
+        "p1" => "Blend",
+        "p2" => "Spill",
+        "intensity" => "Intensity",
+        other => other,
+    };
+    format!("{prefix} · {suffix}")
+}
+
+/// Vertical space the mask-row strip needs above the clip on a track.
+/// Returns 0.0 when the selected layer has no animated mask params,
+/// so the existing layout is unchanged in the common case.
+fn selected_layer_mask_above_height(
+    state: &EditorState,
+    track_idx: usize,
+    v_zoom: f32,
+) -> f32 {
+    let Some((_, rows)) = selected_layer_mask_param_rows(state, track_idx) else {
+        return 0.0;
+    };
+    if rows.is_empty() {
+        return 0.0;
+    }
+    (rows.len() as f32) * PARAM_ROW_BASE * v_zoom + 4.0
+}
+
 /// Sample-and-extract the keyframe times for a given (layer, param) so
 /// the timeline can render a diamond per kf without needing access to
 /// the typed layout. We currently use the same `Vec<Keyframe<…>>` for
@@ -9662,6 +10067,167 @@ fn delete_selected_keyframes(state: &mut EditorState) {
 /// for actors); `scene_t` is the scene-time used to position the diamond
 /// on the timeline ruler.
 ///
+/// Diamonds are clickable (seek + select). Returns the click hits the
+/// user produced this frame so the caller can fold them into the
+/// keyframe-selection list without nested borrows.
+#[allow(clippy::too_many_arguments)]
+fn draw_mask_param_kf_rows(
+    ui: &mut egui::Ui,
+    painter: &egui::Painter,
+    sel_layer_label: &crate::kf_anim::SelectedLayer,
+    rows: &[MaskParamRow],
+    strip_top: f32,
+    strip_height: f32,
+    track_left: f32,
+    track_right: f32,
+    pps: f32,
+    scroll: f32,
+    state_playhead: f32,
+    selected_kfs: &[crate::kf_anim::SelectedKeyframe],
+    clip_x_start: f32,
+    clip_x_end: f32,
+) -> ParamRowOutcome {
+    let row_h = (strip_height / rows.len().max(1) as f32).max(10.0);
+    let mut outcome = ParamRowOutcome::default();
+
+    let strip_x_start = clip_x_start.max(track_left);
+    let strip_x_end = clip_x_end.min(track_right);
+    let strip_visible = strip_x_end - strip_x_start > 1.0;
+
+    // Bottom separator so the mask strip reads as a "section above"
+    // rather than blending into the clip's top edge.
+    painter.line_segment(
+        [
+            egui::pos2(track_left, strip_top + strip_height),
+            egui::pos2(track_right, strip_top + strip_height),
+        ],
+        Stroke::new(1.0, Color32::from_rgb(140, 90, 50)),
+    );
+    // Faint top edge as a visual cap.
+    painter.line_segment(
+        [
+            egui::pos2(track_left, strip_top),
+            egui::pos2(track_right, strip_top),
+        ],
+        Stroke::new(1.0, Color32::from_rgba_premultiplied(140, 90, 50, 120)),
+    );
+
+    let ctrl_held = ui.input(|i| i.modifiers.ctrl || i.modifiers.mac_cmd);
+    let shift_held = ui.input(|i| i.modifiers.shift);
+
+    for (ri, row) in rows.iter().enumerate() {
+        let row_top = strip_top + (ri as f32) * row_h;
+        let row_bot = row_top + row_h;
+
+        // Distinct warm tint per effect index so the user can tell
+        // multiple masks on the same layer apart at a glance. The
+        // colour rotates through 5 hues so even crowded layers stay
+        // readable.
+        let palette = [
+            Color32::from_rgba_premultiplied(255, 200, 80, 36),
+            Color32::from_rgba_premultiplied(255, 130, 130, 36),
+            Color32::from_rgba_premultiplied(160, 200, 255, 36),
+            Color32::from_rgba_premultiplied(170, 230, 170, 36),
+            Color32::from_rgba_premultiplied(220, 170, 255, 36),
+        ];
+        let bg = palette[row.effect_idx % palette.len()];
+        if strip_visible {
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(strip_x_start, row_top),
+                    egui::pos2(strip_x_end, row_bot),
+                ),
+                Rounding::ZERO,
+                bg,
+            );
+        }
+
+        // Gutter label.
+        painter.text(
+            egui::pos2(track_left + 4.0, row_top + row_h * 0.5),
+            egui::Align2::LEFT_CENTER,
+            &row.label,
+            egui::FontId::proportional(9.0),
+            Color32::from_rgb(255, 220, 180),
+        );
+
+        // One diamond per keyframe time, clickable.
+        let half = 4.5_f32;
+        let synth_param_id = format!("fx_{}_{}", row.effect_idx, row.param_key);
+        for &(local_t, scene_t) in row.times.iter() {
+            let x = (scene_t - scroll) * pps + track_left;
+            if !strip_visible {
+                continue;
+            }
+            if x < strip_x_start - half || x > strip_x_end + half {
+                continue;
+            }
+            let cy = row_top + row_h * 0.5;
+
+            let is_selected = selected_kfs.iter().any(|sk| {
+                &sk.layer == sel_layer_label
+                    && sk.param_id == synth_param_id
+                    && (sk.t - local_t).abs() < 1.0e-3
+            });
+            let at_playhead =
+                (scene_t - state_playhead).abs() < (0.5 / pps.max(1.0)).max(0.005);
+
+            // Slightly different fill so mask diamonds read as
+            // "different concept" from transform-row diamonds below.
+            let fill = if is_selected {
+                Color32::from_rgb(255, 220, 80)
+            } else if at_playhead {
+                Color32::from_rgb(255, 160, 80)
+            } else {
+                Color32::from_rgb(255, 200, 120)
+            };
+            let pts = vec![
+                egui::pos2(x, cy - half),
+                egui::pos2(x + half, cy),
+                egui::pos2(x, cy + half),
+                egui::pos2(x - half, cy),
+            ];
+            painter.add(egui::Shape::convex_polygon(
+                pts,
+                fill,
+                Stroke::new(1.0, Color32::from_rgb(20, 20, 30)),
+            ));
+            if at_playhead && !is_selected {
+                painter.circle_stroke(
+                    egui::pos2(x, cy),
+                    half + 2.5,
+                    Stroke::new(1.0, Color32::from_rgb(255, 160, 80)),
+                );
+            }
+
+            let hit = egui::Rect::from_center_size(
+                egui::pos2(x, cy),
+                Vec2::new(half * 2.5, row_h.min(20.0)),
+            );
+            let id = ui.id().with((
+                "mask_kf",
+                sel_layer_label,
+                &synth_param_id,
+                local_t.to_bits(),
+            ));
+            let r = ui.interact(hit, id, Sense::click_and_drag());
+            if r.clicked() {
+                outcome.click_hits.push(ParamRowClick {
+                    param_id: synth_param_id.clone(),
+                    t: local_t,
+                    extend: ctrl_held || shift_held,
+                    seek_to: scene_t,
+                });
+            }
+            if r.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+        }
+    }
+
+    outcome
+}
+
 /// Diamonds are clickable (seek + select). Returns the click hits the
 /// user produced this frame so the caller can fold them into the
 /// keyframe-selection list without nested borrows.

@@ -1892,14 +1892,12 @@ pub enum MaskTool {
     /// Default: transform mode — clicks select / move / resize.
     #[default]
     None,
-    /// Rectangle crop. Drag-defines a rectangle; on release pushes
-    /// `EffectKind::Crop` onto the selected element with insets
-    /// matching the drawn rectangle (in element-local UV).
-    Crop,
-    /// Rectangle mask. Same gesture as Crop but commits an
-    /// `EffectKind::Mask { shape: Rect }` so the bounded picture is
-    /// preserved (vs being trimmed away) and feathered edges stay
-    /// editable later from the inspector.
+    /// Rectangle mask. Drag-defines a rectangle; on release pushes
+    /// `EffectKind::Mask { shape: Rect }` onto the selected element.
+    /// Replaces the legacy "Crop" tool — both used to live side by
+    /// side and produced visually-equivalent results, so they were
+    /// merged into a single rectangle gesture. Old scenes that still
+    /// carry `EffectKind::Crop` continue to render unchanged.
     RectMask,
     /// Ellipse mask. Drag from one corner of the bounding box to the
     /// opposite corner; the inscribed ellipse becomes the mask.
@@ -1908,6 +1906,12 @@ pub enum MaskTool {
     /// appends a new vertex; on release the polyline is closed back
     /// to its first point.
     FreehandMask,
+    /// Eyedropper colour-key mask. A single click on the canvas
+    /// samples the underlying pixel colour and pushes a fresh
+    /// `EffectKind::ColorKey` entry onto the layer's effect stack.
+    /// Works on actors (sampled from the decoded frame cache) and
+    /// image overlays (sampled from the source PNG) alike.
+    Eyedropper,
 }
 
 impl MaskTool {
@@ -1916,10 +1920,10 @@ impl MaskTool {
     pub fn label(self) -> &'static str {
         match self {
             MaskTool::None => "Select",
-            MaskTool::Crop => "Crop",
             MaskTool::RectMask => "Rect mask",
             MaskTool::EllipseMask => "Ellipse mask",
             MaskTool::FreehandMask => "Freehand mask",
+            MaskTool::Eyedropper => "Eyedropper mask",
         }
     }
 }
@@ -2000,8 +2004,8 @@ pub enum CanvasDragMode {
     /// captured in `start_uv`; freehand mode also accumulates the
     /// per-frame pointer trail in `EditorState.mask_draft_points`. On
     /// release the active drag commits the resulting shape to the
-    /// element's `effects` stack (as `EffectKind::Crop` for the crop
-    /// tool, or `EffectKind::Mask` otherwise).
+    /// element's `effects` stack as the matching `EffectKind::Mask`
+    /// or `EffectKind::ColorKey` entry.
     DrawMask {
         tool: MaskTool,
         start_uv: [f32; 2],

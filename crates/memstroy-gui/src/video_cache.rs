@@ -501,6 +501,13 @@ fn hash_effect_kind<H: std::hash::Hasher>(kind: &memstroy_core::EffectKind, h: &
             invert.hash(h);
             hash_mask_shape(shape, h);
         }
+        K::ColorKey { color, similarity, blend, spill, invert } => {
+            color.hash(h);
+            bits(*similarity).hash(h);
+            bits(*blend).hash(h);
+            bits(*spill).hash(h);
+            invert.hash(h);
+        }
     }
 }
 
@@ -771,6 +778,17 @@ fn apply_single_effect(
         K::Mask { shape, feather, invert } => {
             apply_mask_color_image(img, shape, *feather, *invert, intensity)
         }
+        K::ColorKey { color, similarity, blend, spill, invert } => {
+            apply_color_key_color_image(
+                img,
+                *color,
+                *similarity,
+                *blend,
+                *spill,
+                *invert,
+                intensity,
+            )
+        }
     }
 }
 
@@ -812,6 +830,87 @@ fn apply_mask_color_image(
         }
     }
     out
+}
+
+/// Apply a colour-key mask by attenuating alpha for pixels close to
+/// `key_color` in HSV space. Mirrors `image_effects::apply_color_key_alpha`
+/// but works on the `ColorImage` buffer used by the video preview
+/// pipeline. The kernel is intentionally identical to the keyframe
+/// preview so the user sees the same alpha map regardless of which
+/// path produced the frame.
+fn apply_color_key_color_image(
+    img: &ColorImage,
+    key_color: [u8; 3],
+    similarity: f32,
+    blend: f32,
+    _spill: f32,
+    invert: bool,
+    intensity: f32,
+) -> ColorImage {
+    let mut out = img.clone();
+    let w = img.size[0];
+    let h = img.size[1];
+    if w == 0 || h == 0 { return out; }
+    let i = intensity.clamp(0.0, 1.0);
+    let key_hsv = rgb_to_hsv_local_vc(key_color);
+    let hue_tol_deg = 60.0 * similarity.clamp(0.0, 1.0);
+    let sv_tol = 0.5 * similarity.clamp(0.0, 1.0);
+    let blend = blend.clamp(0.0, 1.0);
+    for px in 0..(w * h) {
+        if px >= out.pixels.len() { break; }
+        let p = out.pixels[px];
+        let hsv = rgb_to_hsv_local_vc([p.r(), p.g(), p.b()]);
+        let dh = hue_distance_deg_vc(hsv.0, key_hsv.0);
+        let ds = (hsv.1 - key_hsv.1).abs();
+        let dv = (hsv.2 - key_hsv.2).abs();
+        let mut alpha_keep = 1.0_f32;
+        if dh < hue_tol_deg && ds < sv_tol && dv < sv_tol {
+            alpha_keep = 0.0;
+        } else if dh < hue_tol_deg + 360.0 * blend
+            && ds < sv_tol + blend
+            && dv < sv_tol + blend
+        {
+            let edge = ((dh - hue_tol_deg) / (360.0 * blend + f32::EPSILON))
+                .max((ds - sv_tol) / (blend + f32::EPSILON))
+                .max((dv - sv_tol) / (blend + f32::EPSILON));
+            alpha_keep = edge.clamp(0.0, 1.0);
+        }
+        if invert { alpha_keep = 1.0 - alpha_keep; }
+        let orig = p.a() as f32;
+        let target = orig * alpha_keep;
+        let new_a = (orig + (target - orig) * i).clamp(0.0, 255.0) as u8;
+        out.pixels[px] = egui::Color32::from_rgba_unmultiplied(p.r(), p.g(), p.b(), new_a);
+    }
+    out
+}
+
+#[inline]
+fn rgb_to_hsv_local_vc(rgb: [u8; 3]) -> (f32, f32, f32) {
+    let r = rgb[0] as f32 / 255.0;
+    let g = rgb[1] as f32 / 255.0;
+    let b = rgb[2] as f32 / 255.0;
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let delta = max - min;
+    let h = if delta == 0.0 {
+        0.0
+    } else if max == r {
+        60.0 * (((g - b) / delta) % 6.0)
+    } else if max == g {
+        60.0 * ((b - r) / delta + 2.0)
+    } else {
+        60.0 * ((r - g) / delta + 4.0)
+    };
+    let h = if h < 0.0 { h + 360.0 } else { h };
+    let s = if max == 0.0 { 0.0 } else { delta / max };
+    let v = max;
+    (h, s, v)
+}
+
+#[inline]
+fn hue_distance_deg_vc(a: f32, b: f32) -> f32 {
+    let d = (a - b).abs() % 360.0;
+    d.min(360.0 - d)
 }
 
 /// Apply a Crop effect by zeroing the alpha channel outside the visible
