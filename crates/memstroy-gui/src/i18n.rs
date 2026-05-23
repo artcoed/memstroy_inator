@@ -459,6 +459,13 @@ fn ru_lookup(key: &str) -> Option<&'static str> {
         "Split tool: click anywhere on a clip to cut it at that position" =>
             "Лезвие: кликните по клипу, чтобы разрезать его в этой точке",
         "Add text overlay at playhead" => "Добавить текст на позиции воспроизведения",
+        "Extract current frame as image layer at playhead" =>
+            "Извлечь текущий кадр как слой-картинку на позиции воспроизведения",
+        "Extract selected layer as image at playhead" =>
+            "Извлечь выбранный слой как картинку на позиции воспроизведения",
+        "Extract selected layers as image at playhead" =>
+            "Извлечь выбранные слои как одну картинку на позиции воспроизведения",
+        "Extract frame failed" => "Не удалось извлечь кадр",
         "Loop preview: Shift+click on the ruler to set loop start, Shift+click again for end. \
                 Shift+drag = define a region." =>
             "Зацикл. превью: Shift+клик по линейке — старт, ещё раз — конец. \
