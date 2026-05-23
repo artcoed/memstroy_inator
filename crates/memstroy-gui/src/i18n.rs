@@ -502,6 +502,10 @@ fn ru_lookup(key: &str) -> Option<&'static str> {
             "Перетащите частицу на холст — добавится с модификаторами вращения и пульса.",
         "No clips yet — start typing in the search box or scroll to fetch from the server." =>
             "Клипов пока нет — начните печатать в поиске или прокрутите вниз, чтобы подгрузить с сервера.",
+        "No clips yet — click Refresh from Telegram above to fetch the latest ones." =>
+            "Клипов пока нет — нажмите «Обновить из Telegram» выше, чтобы загрузить последние.",
+        "Fetching clips from the server..." =>
+            "Загружаем клипы с сервера…",
         "Local (your imports)" => "Локальная (ваши импорты)",
         "Global (built-in / browser)" => "Общая (встроенная / браузер)",
         "server" => "сервер",
