@@ -133,6 +133,49 @@ What ends up in the bundle:
 3. A top-level launcher (`memstroy-inator.sh` / `memstroy-inator.bat`)
    that simply execs the GUI binary.
 
+## Building a single-file installer
+
+The packagers above produce a *bundle directory*. To turn that into a
+single-file installer that end users can double-click — with a Start
+Menu entry, a desktop shortcut and a registered uninstaller — run the
+matching `make-installer` script. The script will build (or reuse) a
+client bundle and wrap it.
+
+```bash
+# Linux: produces a self-extracting .run installer (no extra deps)
+scripts/make-installer.sh --server-url https://assets.your-domain.example
+# → dist/memstroy-inator-linux-<arch>-<ver>.run
+
+# Windows PowerShell: requires Inno Setup 6 (https://jrsoftware.org/isinfo.php)
+pwsh scripts/make-installer.ps1 -ServerUrl https://assets.your-domain.example
+# → dist\memstroy-inator-windows-<arch>-<ver>-Setup.exe
+```
+
+Both scripts print the absolute path of the produced installer at the
+end of the run. Distribute that single file as-is.
+
+If you have already produced a bundle and just want to wrap it
+without rebuilding, point the script at it:
+
+```bash
+scripts/make-installer.sh --bundle-dir dist/memstroy-inator-linux-x86_64-0.1.0
+pwsh scripts/make-installer.ps1 -BundleDir .\dist\memstroy-inator-windows-amd64-0.1.0
+```
+
+Default install layout the produced installers create on the target
+machine:
+
+- **Windows.** `%ProgramFiles%\memstroy-inator\` (admin install) or
+  `%LocalAppData%\Programs\memstroy-inator\` (per-user). A Start Menu
+  group **memstroy-inator** with the editor and the uninstaller, a
+  desktop shortcut, and a standard entry in *Settings → Apps →
+  Installed apps* for removal.
+- **Linux.** `/opt/memstroy-inator/` when run with `sudo`, otherwise
+  `~/.local/share/memstroy-inator/`. A `.desktop` entry in the
+  applications menu, a desktop shortcut on `~/Desktop/` (per-user
+  install only), a `memstroy-gui` symlink on PATH, and an
+  `uninstall.sh` script in the install directory.
+
 ## Running the backend (assets-server)
 
 Use the provided launcher:
