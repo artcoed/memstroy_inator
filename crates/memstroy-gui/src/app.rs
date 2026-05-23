@@ -38,6 +38,38 @@ pub struct App {
     /// "did we add a track" debug checks; the live-update logic itself
     /// uses the signature above.
     prev_audio_source_count: usize,
+
+    /// Number of V-key release events to ignore as "already-handled
+    /// Ctrl+V chords". See [`Self::handle_shortcuts`] for why this
+    /// exists — short version: `egui-winit` suppresses the V key
+    /// PRESS event on Ctrl+V *when the OS clipboard contains no
+    /// text* (e.g. screenshot-only data), so we synthesise paste
+    /// from the V *release* event. When egui-winit DID push an
+    /// `Event::Paste` (clipboard had text), the matching V release
+    /// will arrive a few frames later and would otherwise trigger
+    /// a second paste — so for every Paste we observe we reserve a
+    /// release-skip slot here, decremented when that release lands.
+    pending_v_release_skips: u32,
+
+    /// Track whether Ctrl/Cmd was held during the most recent frames.
+    /// Used as a fallback when the user releases Ctrl *before* V —
+    /// the V release event then has `modifiers.command == false`,
+    /// but we still want to treat that as a Ctrl+V chord. Counted
+    /// down each frame; reset to a small grace window every frame
+    /// where Ctrl is observed held.
+    ctrl_held_grace_frames: u32,
+
+    /// Wall-clock instant of the most recent internal Ctrl+C / Ctrl+X
+    /// inside this app, used as the "last action wins" tiebreaker on
+    /// Ctrl+V: when the OS clipboard contains BOTH an image and our
+    /// in-app clipboard is non-empty (e.g. user copied an image in a
+    /// browser, then immediately did Ctrl+C in our app to copy a
+    /// canvas selection), the user's expectation is that the LATEST
+    /// copy wins. If `last_internal_copy_at` is recent enough we
+    /// duplicate the in-app clipboard items first; otherwise the OS
+    /// clipboard image takes priority. `None` = no internal copy in
+    /// this session, so OS clipboard always wins.
+    last_internal_copy_at: Option<std::time::Instant>,
 }
 
 impl App {
@@ -122,6 +154,9 @@ impl App {
             prev_playhead: 0.0,
             prev_audio_signature: 0,
             prev_audio_source_count: 0,
+            pending_v_release_skips: 0,
+            ctrl_held_grace_frames: 0,
+            last_internal_copy_at: None,
         }
     }
 
@@ -804,23 +839,60 @@ impl App {
             }
         }
 
-        // ── Ctrl+C / Ctrl+X / Ctrl+V — handled via BOTH the synthetic
-        //    Copy/Cut/Paste events AND the raw Ctrl+C/Ctrl+V key
-        //    chords, then deduplicated for the frame so a single
-        //    physical keypress only invokes the handler once.
+        // ── Ctrl+C / Ctrl+X / Ctrl+V — handled via THREE complementary
+        //    paths that, together, work around a long-standing bug in
+        //    egui-winit's Ctrl+V handling.
         //
-        //    `swallow_clipboard_events` removes every Copy / Cut /
-        //    Paste(_) event from the input queue and tells us how
-        //    many we drained for each kind. If a TextEdit is also
-        //    visible on screen it will not see them, which kills the
-        //    "type into the title overlay's caption field, then
-        //    Ctrl+V on the canvas pastes raw text into the caption
-        //    instead of dropping the clipboard image as a layer"
-        //    confusion the user kept hitting.
+        //    The bug, copied verbatim from `egui-winit-0.28.1::lib.rs`:
         //
-        //    The chord-based fallbacks via `consume_key` cover the
-        //    rare paths where the OS / IME delivered a plain
-        //    `Event::Key` without the matching synthetic event.
+        //        if is_paste_command(modifiers, active_key) {
+        //            if let Some(contents) = self.clipboard.get() {
+        //                if !contents.is_empty() {
+        //                    push Event::Paste(contents);
+        //                }
+        //            }
+        //            return;          // <-- key event NOT pushed
+        //        }
+        //
+        //    When the OS clipboard contains ONLY image bytes (a
+        //    screenshot, "Copy image" from a browser, a bitmap from
+        //    Telegram/Figma, …) `clipboard.get()` returns an empty
+        //    string and egui-winit pushes NEITHER `Event::Paste` NOR
+        //    `Event::Key { key: V, pressed: true, … }`. The user's
+        //    Ctrl+V is invisible to egui — the previous chord-only and
+        //    drained-only fixes both saw nothing and silently ignored
+        //    the chord.
+        //
+        //    The dual-path workaround:
+        //
+        //      A. `swallow_clipboard_events` drains every synthetic
+        //         `Event::Copy` / `Event::Cut` / `Event::Paste(_)` so a
+        //         focused TextEdit can't steal the chord and so we can
+        //         tell on the press frame "egui-winit produced a paste
+        //         event for this Ctrl+V" (clipboard had text).
+        //
+        //      B. `consume_key(.., Key::V)` chord fallback — covers
+        //         the rare case where the OS / IME delivers a real key
+        //         event without the synthetic counterpart.
+        //
+        //      C. **V-key RELEASE detection** — the actual fix for the
+        //         "no text in clipboard" path. egui-winit's early
+        //         `return` only happens inside `if pressed`, so the
+        //         RELEASE event for V is ALWAYS pushed. When we see a
+        //         V release with the Ctrl/Cmd modifier (or while Ctrl
+        //         was held in a recent frame) and we have NOT just
+        //         consumed an `Event::Paste` for this chord, we treat
+        //         it as the Ctrl+V we missed and fire the paste
+        //         handler. A small `pending_v_release_skips` counter
+        //         dedupes against the matching release that arrives
+        //         after a successful drained-Paste path.
+        //
+        //    The same dedupe trick is NOT needed for Copy / Cut: those
+        //    are idempotent (re-copying the same selection has no
+        //    visible effect), and egui-winit ALWAYS pushes
+        //    `Event::Copy` / `Event::Cut` regardless of clipboard
+        //    state — there is no `if !contents.is_empty()` gate on
+        //    that path.
         let drained = swallow_clipboard_events(ctx);
         let chord_copy = ctrl
             && !modifiers.shift
@@ -837,11 +909,69 @@ impl App {
             && ctx.input_mut(|i| {
                 i.consume_key(egui::Modifiers::COMMAND, egui::Key::V)
             });
+
+        // ── Path C: V-key RELEASE fallback ─────────────────────────
+        //
+        // Update the "Ctrl was held recently" grace window so we still
+        // recognise Ctrl+V chords when the user releases Ctrl *before*
+        // V. Without this, V's release event has `modifiers.command =
+        // false` and we'd miss the chord.
+        if ctrl {
+            self.ctrl_held_grace_frames = 4;
+        } else if self.ctrl_held_grace_frames > 0 {
+            self.ctrl_held_grace_frames -= 1;
+        }
+        let ctrl_recently_held = self.ctrl_held_grace_frames > 0;
+
+        // Count V-release events delivered this frame whose modifier
+        // state OR our recent-history grace window indicates a Ctrl+V
+        // chord. We don't `consume_key` these — they're not chord
+        // events from egui's POV, they're plain key releases — so we
+        // count them by inspecting the raw event vec.
+        let v_release_count: u32 = ctx.input(|i| {
+            i.events
+                .iter()
+                .filter(|ev| match ev {
+                    egui::Event::Key {
+                        key: egui::Key::V,
+                        pressed: false,
+                        modifiers: m,
+                        ..
+                    } => m.command || m.ctrl || ctrl_recently_held,
+                    _ => false,
+                })
+                .count() as u32
+        });
+
+        // For every `Event::Paste` we just drained, the matching V
+        // release will land in this or a later frame. Reserve a skip
+        // slot so we don't double-fire the paste handler when that
+        // release shows up.
+        //
+        // ── Order matters ──
+        // Match *existing* `pending_v_release_skips` against the
+        // V-release events we observed THIS frame BEFORE incrementing
+        // for `drained.pasted`. Otherwise, in the rapid-succession
+        // case `[image-only Ctrl+V][text Ctrl+V]` where Release 1 and
+        // the second drained Paste arrive in the same frame, the
+        // freshly-incremented skip would consume Release 1 and the
+        // image-only paste would silently disappear.
+        let matched_releases =
+            self.pending_v_release_skips.min(v_release_count);
+        self.pending_v_release_skips -= matched_releases;
+        let unmatched_v_releases = v_release_count - matched_releases;
+        let release_paste = unmatched_v_releases > 0;
+
+        if drained.pasted {
+            self.pending_v_release_skips =
+                self.pending_v_release_skips.saturating_add(1);
+        }
+
         // Suppress double-fire when both the synthetic Event::Copy
         // and the raw Ctrl+C key arrived for the same physical press.
         let do_copy = drained.copied || chord_copy;
         let do_cut = drained.cut || chord_cut;
-        let do_paste = drained.pasted || chord_paste;
+        let do_paste = drained.pasted || chord_paste || release_paste;
 
         if do_copy || do_cut {
             let n = self.state.copy_selection_to_clipboard();
@@ -851,6 +981,16 @@ impl App {
                     n,
                     if n == 1 { "" } else { "s" }
                 );
+                // Remember when this copy happened so the next Ctrl+V
+                // knows to prefer our in-app clipboard over an OS
+                // clipboard image — covers the "user copied an image
+                // in a browser, then did Ctrl+C in our app to grab a
+                // canvas selection, expects Ctrl+V to duplicate the
+                // canvas selection, not paste the older browser
+                // image" workflow.
+                self.last_internal_copy_at =
+                    Some(std::time::Instant::now());
+
                 if do_cut {
                     // Ctrl+X = copy + delete primary / multi-selection.
                     self.delete_selected();
@@ -859,8 +999,27 @@ impl App {
         }
 
         if do_paste {
-            let pasted_image = self.try_paste_image_from_system_clipboard();
-            if !pasted_image {
+            // Decide which clipboard wins when BOTH the OS clipboard
+            // contains an image AND our in-app clipboard is non-empty.
+            //
+            // "Last action wins" — if the user did Ctrl+C inside our
+            // app within the last 30 seconds we duplicate the in-app
+            // clipboard items first; otherwise the OS clipboard image
+            // takes priority. This matches the behaviour the user
+            // expects from Figma / Telegram-style paste while still
+            // letting them duplicate the canvas selection they JUST
+            // copied without an unrelated browser screenshot
+            // hijacking the chord.
+            const INTERNAL_COPY_PRIORITY_WINDOW: std::time::Duration =
+                std::time::Duration::from_secs(30);
+            let prefer_internal = !self.state.clipboard.is_empty()
+                && self
+                    .last_internal_copy_at
+                    .map(|t| t.elapsed() < INTERNAL_COPY_PRIORITY_WINDOW)
+                    .unwrap_or(false);
+
+            let mut handled = false;
+            if prefer_internal {
                 let n = self.state.paste_clipboard();
                 if n > 0 {
                     self.state.status = format!(
@@ -868,10 +1027,34 @@ impl App {
                         n,
                         if n == 1 { "" } else { "s" },
                     );
-                } else {
-                    self.state.status =
-                        "\u{1F4CB} Clipboard is empty".into();
+                    handled = true;
                 }
+            }
+            if !handled {
+                let pasted_image =
+                    self.try_paste_image_from_system_clipboard();
+                if pasted_image {
+                    handled = true;
+                }
+            }
+            if !handled {
+                // Fallback: in-app clipboard (covers the common
+                // "user did Ctrl+C in our app, then Ctrl+V some
+                // time later" case where the priority window has
+                // expired but no OS clipboard image is available).
+                let n = self.state.paste_clipboard();
+                if n > 0 {
+                    self.state.status = format!(
+                        "\u{1F4CB} Pasted {} item{} at the playhead",
+                        n,
+                        if n == 1 { "" } else { "s" },
+                    );
+                    handled = true;
+                }
+            }
+            if !handled {
+                self.state.status =
+                    "\u{1F4CB} Clipboard is empty".into();
             }
         }
 
