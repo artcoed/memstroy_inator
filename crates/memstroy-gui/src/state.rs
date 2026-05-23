@@ -464,6 +464,13 @@ pub struct EditorState {
     pub curve_editor_active_idx: usize,
     /// Whether image editor window is open (image-only filters / crop).
     pub image_editor_open: bool,
+    /// Interactive-brush state for the image editor's preview area —
+    /// holds the currently armed tool, in-progress polygon points
+    /// (sampled in source-image UV 0..1), and the parameters the
+    /// commit step bakes into a new `EffectKind::Mask` / `Crop`
+    /// entry on the selected image overlay. Only consulted while the
+    /// image editor window is open.
+    pub image_brush: ImageEditorBrush,
 
     /// Index of text overlay currently being inline-edited on the preview
     pub editing_text_overlay: Option<usize>,
@@ -707,6 +714,57 @@ pub struct EditorState {
     pub web_image_search: crate::web_image_search::WebImageSearchState,
 }
 
+/// Brush / interactive-tool state owned by the image editor floating
+/// window. Lives on `EditorState` (instead of being module-local) so
+/// it persists across show/hide cycles of the window and so the
+/// (potentially many) painted polygon points round-trip with the
+/// surrounding mutable state without per-frame `egui` memory
+/// shuffling.
+///
+/// All in-progress points are sampled in **source-image UV (0..1)**.
+/// On commit they are baked into the selected overlay's effect stack
+/// as either an `EffectKind::Mask { Polygon, .. }` or an
+/// `EffectKind::Crop { .. }` entry depending on the active tool.
+#[derive(Clone, Default)]
+pub struct ImageEditorBrush {
+    pub tool: ImageBrushTool,
+    /// Soft edge applied to a freshly committed polygon mask
+    /// (UV-space fraction 0..0.5).
+    pub feather: f32,
+    /// When set, the freshly committed mask uses `invert: true`. The
+    /// "Cutout" tool flips this on automatically; the "Brush" tool
+    /// leaves it off.
+    pub invert: bool,
+    /// Live polygon being painted by the user. Cleared on every
+    /// pointer release (after commit) and on tool changes.
+    pub draft: Vec<[f32; 2]>,
+    /// Anchor point for rectangle-style drags (Crop). Stored in
+    /// source-image UV. `None` outside an active drag.
+    pub crop_drag_start: Option<[f32; 2]>,
+}
+
+/// Image-editor brush mode. Mirrors the tool buttons in the
+/// floating window's toolbar; selecting `None` is the "no
+/// interactive tool" fallback that lets the preview behave as a
+/// passive thumbnail.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub enum ImageBrushTool {
+    /// Default — preview is non-interactive.
+    #[default]
+    None,
+    /// Freehand brush: the painted polygon becomes the visible
+    /// region (`invert: false`). Pixels outside the polygon are
+    /// masked away.
+    Brush,
+    /// Cutout brush: the painted polygon becomes the *masked* region
+    /// (`invert: true`). Useful for erasing watermarks / unwanted
+    /// objects without leaving the editor.
+    Cutout,
+    /// Rectangle drag — the rectangle painted by the user is baked
+    /// into the overlay's `EffectKind::Crop` entry.
+    Crop,
+}
+
 /// Cached state for one image-overlay source. `Loading` is held only
 /// briefly while the synchronous decode runs (we keep it as a state
 /// rather than `Option<Result<...>>` so future async loaders can fit
@@ -852,6 +910,7 @@ impl EditorState {
         s.curve_editor_property = 0;
         s.curve_editor_active_idx = 0;
         s.image_editor_open = false;
+        s.image_brush = ImageEditorBrush::default();
 
         s.editing_text_overlay = None;
 
