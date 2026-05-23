@@ -75,7 +75,15 @@ struct ListQuery {
 }
 
 const DEFAULT_LIMIT: u64 = 24;
-const MAX_LIMIT: u64 = 200;
+// Lifted from 200 → 5000 because the GUI's "Refresh from Telegram"
+// flow asks for the **whole** clip catalogue (`?kind=clip&limit=…`)
+// in a single call so it can mirror new files into its local cache.
+// With a 200-row cap, channels that contained 400+ clips silently
+// got truncated and the user only ever saw the first 200 — exactly
+// the "клипы с сервера не подгружаются" symptom they reported.
+// 5000 is a comfortable headroom for any single Telegram channel
+// while still keeping a single response under a few MB.
+const MAX_LIMIT: u64 = 5000;
 
 #[derive(Debug, Serialize)]
 struct ListResponse {
@@ -228,7 +236,14 @@ struct TgIngestRequest {
 }
 
 fn default_ingest_limit() -> u32 {
-    32
+    // Default catalog depth for a fresh ingest. The previous default
+    // of 32 capped channels at the most recent ~32 posts, which made
+    // the "Refresh from Telegram" button feel anaemic on rich
+    // channels that already have hundreds of clips. 500 is enough to
+    // pull the typical multi-year backlog while still respecting
+    // Telegram's preview-page rate (≈16 posts per page → ~32 page
+    // fetches with the existing 250 ms delay between pages).
+    500
 }
 
 async fn post_ingest_tg(
