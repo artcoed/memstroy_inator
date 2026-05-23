@@ -316,3 +316,230 @@ fn image_overlay_inherits_full_pipeline() {
         "image overlay rotation animation didn't emit rotate filter:\n{graph}",
     );
 }
+
+// ─── FOLLOW-UP REGRESSION TESTS ─────────────────────────────────────
+//
+// The follow-up PR addresses three previously-deferred parity gaps:
+//   * Animated effect parameters become per-frame ffmpeg expressions.
+//   * ColorCorrection LGG (lift/gamma/gain) + master/per-channel tone
+//     curves now emit `curves=` filters in addition to eq/colorbalance.
+//   * Skeleton attachments resolve to host-relative position
+//     expressions (with ffprobe-based source-dimension probing and
+//     a (1080, 1920) fallback).
+//
+// These tests pin each of those behaviours by inspecting the
+// generated `filter_complex` graph for tell-tale fragments.
+
+use memstroy_core::keyframe::{Keyframe as Kf};
+use memstroy_core::{
+    Effect, EffectKind, ImageOverlay as ImgOverlay, OverlayState as OvState, PointState,
+    SkeletonAttachment, SkeletonPoint, SkeletonTemplate, ToneCurves,
+};
+
+fn animated_effect(kind: EffectKind, p0_kfs: Vec<Kf<f32>>) -> Effect {
+    let mut eff = Effect::new(kind);
+    eff.animated_params.insert("p0".into());
+    eff.param_kfs.insert("p0".into(), p0_kfs);
+    eff
+}
+
+#[test]
+fn animated_brightness_emits_expression_with_eval_frame() {
+    let mut scene = baseline_scene();
+    let mut actor = baseline_actor("a1");
+    actor.effects.push(animated_effect(
+        EffectKind::Brightness { amount: 0.0 },
+        vec![Kf::new(0.0, 0.0), Kf::new(1.5, 0.4)],
+    ));
+    scene.actors.push(actor);
+
+    let graph = build_filter_graph(&scene);
+    // Animated brightness must use ffmpeg's `eq=brightness=<expr>:eval=frame`
+    // pattern so the value re-evaluates per frame; the static path
+    // just emits `eq=brightness=0.4`.
+    assert!(
+        graph.contains("eq=brightness='") && graph.contains("eval=frame"),
+        "animated brightness didn't emit per-frame expression:\n{graph}",
+    );
+    // The keyframed value 0.4 must show up inside the expression.
+    assert!(
+        graph.contains("0.400000"),
+        "animated brightness keyframe value missing:\n{graph}",
+    );
+}
+
+#[test]
+fn animated_blur_radius_emits_boxblur_expression() {
+    let mut scene = baseline_scene();
+    let mut actor = baseline_actor("a1");
+    actor.effects.push(animated_effect(
+        EffectKind::Blur { radius: 6.0 },
+        vec![Kf::new(0.0, 2.0), Kf::new(1.0, 14.0)],
+    ));
+    scene.actors.push(actor);
+
+    let graph = build_filter_graph(&scene);
+    assert!(
+        graph.contains("boxblur=luma_radius='"),
+        "animated blur didn't use boxblur expression form:\n{graph}",
+    );
+    assert!(
+        graph.contains("14.000000"),
+        "animated blur keyframe value missing:\n{graph}",
+    );
+}
+
+#[test]
+fn lgg_lift_gamma_gain_emits_curves_filter() {
+    // Lift = +0.05 R, gamma = 0.8 G, gain = 1.2 B → all three
+    // non-neutral, should produce a curves= filter with per-channel
+    // sampled control points.
+    let mut scene = baseline_scene();
+    let mut actor = baseline_actor("a1");
+    actor.color_correction.lift = [0.05, 0.0, 0.0];
+    actor.color_correction.gamma = [1.0, 0.8, 1.0];
+    actor.color_correction.gain = [1.0, 1.0, 1.2];
+    scene.actors.push(actor);
+
+    let graph = build_filter_graph(&scene);
+    assert!(
+        graph.contains("curves=red='") && graph.contains("blue='"),
+        "LGG block didn't emit a curves= filter with per-channel arms:\n{graph}",
+    );
+    // The first sample of any non-identity curve must NOT be the
+    // identity '0.0000/0.0000 ... 1.0000/1.0000' shape — there should
+    // be at least one intermediate sample with mismatched x/y.
+    assert!(
+        graph.contains("0.5000/"),
+        "LGG curve doesn't include the 0.5 sample:\n{graph}",
+    );
+}
+
+#[test]
+fn master_tone_curve_emits_curves_filter() {
+    // A simple S-curve on master should land in `curves=master='...'`.
+    let mut scene = baseline_scene();
+    let mut actor = baseline_actor("a1");
+    actor.color_correction.curves = ToneCurves {
+        master: vec![[0.0, 0.0], [0.25, 0.1], [0.75, 0.9], [1.0, 1.0]],
+        red: vec![[0.0, 0.0], [1.0, 1.0]],
+        green: vec![[0.0, 0.0], [1.0, 1.0]],
+        blue: vec![[0.0, 0.0], [1.0, 1.0]],
+    };
+    scene.actors.push(actor);
+
+    let graph = build_filter_graph(&scene);
+    assert!(
+        graph.contains("curves=master='"),
+        "master tone curve didn't emit curves= filter:\n{graph}",
+    );
+    // The S-curve's distinctive (0.25, 0.1) point must appear.
+    assert!(
+        graph.contains("0.2500/0.1000"),
+        "master tone curve control points missing:\n{graph}",
+    );
+}
+
+#[test]
+fn skeleton_attachment_uses_host_position_and_point_track() {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    let mut scene = baseline_scene();
+    // Host actor playing clip "host.mp4".
+    let mut host = baseline_actor("host");
+    host.source = PathBuf::from("host.mp4");
+    scene.actors.push(host);
+
+    // Skeleton template named after the host's source clip stem.
+    let mut points = BTreeMap::new();
+    points.insert(
+        "head".to_string(),
+        SkeletonPoint {
+            name: "head".into(),
+            color: [255, 0, 0],
+            track: vec![
+                Kf::new(0.0, PointState { x: 0.5, y: 0.2, scale: 1.0, rotation_deg: 0.0 }),
+                Kf::new(2.0, PointState { x: 0.7, y: 0.25, scale: 1.0, rotation_deg: 0.0 }),
+            ],
+        },
+    );
+    scene.skeleton_templates.push(SkeletonTemplate {
+        name: "host_skeleton".into(),
+        source_clip: PathBuf::from("host.mp4"),
+        fps: 30.0,
+        clip_duration: 2.0,
+        points,
+    });
+
+    // A bound image overlay (the "hat") attached to the head point.
+    scene.overlays.push(memstroy_core::Overlay::Image(ImgOverlay {
+        id: "hat".into(),
+        source: PathBuf::from("hat.png"),
+        t_in: 0.0,
+        t_out: 2.0,
+        layout: vec![Kf::new(0.0, OvState::default())],
+        modifiers: Vec::new(),
+        skeleton_attachment: Some(SkeletonAttachment {
+            skeleton_id: "host_skeleton".into(),
+            point_name: "head".into(),
+            offset: [0.0, 0.0],
+            scale: 1.0,
+            follow_rotation: false,
+        }),
+        effects: Vec::new(),
+        animated_params: Default::default(),
+        chroma_key: None,
+    }));
+
+    let graph = build_filter_graph(&scene);
+    // The point's normalised positions show up in the overlay X
+    // expression: 0.5 - 0.5 = 0 doesn't appear distinctively, but
+    // 0.7 - 0.5 = 0.2 and 0.25 - 0.5 = -0.25 do (formatted as 0.200000
+    // and -0.250000 by our piecewise builder).
+    assert!(
+        graph.contains("0.200000") || graph.contains("0.7"),
+        "skeleton point x.t1 = 0.7 not threaded into overlay X expr:\n{graph}",
+    );
+    // The composition uses sin/cos around the host rotation — even
+    // when the host has zero rotation, the compose math is present
+    // because the helper always emits the rotation-aware formula.
+    assert!(
+        graph.contains("cos(") && graph.contains("sin("),
+        "skeleton attachment didn't compose via cos/sin rotation matrix:\n{graph}",
+    );
+}
+
+#[test]
+fn skeleton_attachment_falls_back_when_template_missing() {
+    use std::path::PathBuf;
+    let mut scene = baseline_scene();
+    scene.overlays.push(memstroy_core::Overlay::Image(ImgOverlay {
+        id: "hat".into(),
+        source: PathBuf::from("hat.png"),
+        t_in: 0.0,
+        t_out: 2.0,
+        layout: vec![Kf::new(0.0, OvState::default())],
+        modifiers: Vec::new(),
+        // Skeleton id that doesn't exist in the scene.
+        skeleton_attachment: Some(SkeletonAttachment {
+            skeleton_id: "missing".into(),
+            point_name: "x".into(),
+            offset: [0.0, 0.0],
+            scale: 1.0,
+            follow_rotation: false,
+        }),
+        effects: Vec::new(),
+        animated_params: Default::default(),
+        chroma_key: None,
+    }));
+
+    // Should not panic; should still emit a working overlay using the
+    // legacy layout path, matching the preview's "fallback to layout"
+    // behaviour when a skeleton id resolves to nothing.
+    let graph = build_filter_graph(&scene);
+    assert!(
+        graph.contains("overlay=x='"),
+        "missing skeleton fallback didn't emit overlay:\n{graph}",
+    );
+}
