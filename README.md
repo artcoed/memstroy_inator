@@ -191,27 +191,11 @@ scripts/start-server.sh --addr 127.0.0.1:9000 --root /var/lib/memstroy/assets
 pwsh scripts/start-server.ps1 -Addr 127.0.0.1:9000 -Root C:\memstroy\assets
 ```
 
-Or invoke the binary directly. **bash / zsh** (line continuations
-with `\`):
+Or invoke the binary directly:
 
 ```bash
 cargo run -p memstroy-assets-server --release -- \
     --addr 0.0.0.0:8765 \
-    --root ./assets
-```
-
-**Windows PowerShell** — line continuations are backticks, not
-backslashes; the easiest path is one line:
-
-```powershell
-cargo run --release -p memstroy-assets-server -- --addr 0.0.0.0:8765 --root ./assets
-```
-
-…or with explicit continuations:
-
-```powershell
-cargo run --release -p memstroy-assets-server -- `
-    --addr 0.0.0.0:8765 `
     --root ./assets
 ```
 
