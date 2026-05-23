@@ -6,6 +6,12 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "egui/eframe editor for memstroy-inator scenes"
+# `build.rs` bakes two compile-time signals into the binary: the
+# obfstr-wrapped default assets-server URL, and a flag that flips the
+# editor between developer defaults (cwd-relative `./assets/`,
+# in-process server bootstrap) and client-distribution defaults
+# (per-user cache dir, remote-only server). See `build.rs` for details.
+build = "build.rs"
 
 [[bin]]
 name = "memstroy-gui"
@@ -43,3 +49,11 @@ reqwest = { workspace = true, features = ["json"] }
 # feature pulls in the `get_image` API; the rest of the default
 # features (notification icon helpers etc.) are not needed.
 arboard = { version = "3", default-features = false, features = ["image-data"] }
+# Compile-time string obfuscation. Used by `build_info.rs` (and the
+# generated `$OUT_DIR/build_info.rs`) to XOR-encode the default
+# assets-server URL so `strings(1)` over a shipped binary does not
+# reveal the operator's backend address. This is a defence-in-depth
+# measure — the string is still recoverable by anyone running the
+# binary under a debugger — but it eliminates the trivial
+# "grep the artefact" attack and matches Level-1 hardening.
+obfstr = "0.4"
