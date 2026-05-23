@@ -230,6 +230,7 @@ impl App {
     }
 
     fn pump_events(&mut self, ctx: &egui::Context) {
+        use crate::i18n::t;
         while let Ok(ev) = self.rx.try_recv() {
             match ev {
                 JobEvent::Status(s) => self.state.status = s,
@@ -253,13 +254,13 @@ impl App {
                     }
                 }
                 JobEvent::RenderFinished(Ok(p)) => {
-                    self.state.status = format!("\u{2705} Rendered: {}", p.display());
+                    self.state.status = format!("{} {}", t("\u{2705} Rendered:"), p.display());
                     if let Some(rp) = self.state.render_progress.as_mut() {
                         rp.done = true;
                     }
                 }
                 JobEvent::RenderFinished(Err(e)) => {
-                    self.state.status = format!("\u{274C} Render failed: {}", e);
+                    self.state.status = format!("{} {}", t("\u{274C} Render failed:"), e);
                     if let Some(rp) = self.state.render_progress.as_mut() {
                         rp.done = true;
                         rp.error = Some(e);
@@ -284,8 +285,10 @@ impl App {
                     self.state.refreshing = false;
                     self.state.reload_library();
                     self.state.status = format!(
-                        "\u{1F389} Refresh done! {} new clips, {} total in library",
-                        summary.new_clips, summary.total_clips
+                        "{} {} {} {} {}",
+                        t("\u{1F389} Refresh done!"),
+                        summary.new_clips, t("new clips,"),
+                        summary.total_clips, t("total in library"),
                     );
                     if summary.failed > 0 {
                         self.state.status.push_str(&format!(
@@ -296,7 +299,7 @@ impl App {
                 }
                 JobEvent::RefreshFinished(Err(e)) => {
                     self.state.refreshing = false;
-                    self.state.status = format!("\u{274C} Refresh failed: {}", e);
+                    self.state.status = format!("{} {}", t("\u{274C} Refresh failed:"), e);
                 }
                 JobEvent::WebSearchFinished {
                     page_offset,
@@ -387,7 +390,8 @@ impl App {
                             // the Images tab (matches Ctrl+V flow).
                             self.state.reload_library();
                             self.state.web_image_search.status = format!(
-                                "\u{2705} Saved \u{2192} {}",
+                                "{} \u{2192} {}",
+                                t("\u{2705} Saved"),
                                 asset.label,
                             );
                             if place_on_canvas {
@@ -396,14 +400,15 @@ impl App {
                                 self.state.library_tab =
                                     crate::state::LibraryTab::Images;
                                 self.state.status = format!(
-                                    "\u{1F310} Web image \u{2192} {}",
+                                    "{} \u{2192} {}",
+                                    t("\u{1F310} Web image"),
                                     asset.label,
                                 );
                             }
                         }
                         Err(e) => {
                             self.state.web_image_search.status =
-                                format!("\u{274C} Download failed: {}", e);
+                                format!("{} {}", t("\u{274C} Download failed:"), e);
                         }
                     }
                 }
@@ -701,7 +706,7 @@ impl App {
                                     self.state.scene_tabs[self.state.active_tab].scene = self.state.scene.clone();
                                 }
                             }
-                            Err(e) => self.state.status = format!("\u{274C} Open failed: {e}"),
+                            Err(e) => self.state.status = format!("{} {e}", t("\u{274C} Open failed:")),
                         }
                     }
                     ui.close_menu();
@@ -785,6 +790,7 @@ impl App {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        use crate::i18n::t;
         // Two-tier gating:
         //
         // 1. **Plain-key shortcuts** (Space, Delete, Esc) only fire
@@ -977,9 +983,8 @@ impl App {
             let n = self.state.copy_selection_to_clipboard();
             if n > 0 {
                 self.state.status = format!(
-                    "\u{1F4CB} Copied {} item{} to clipboard",
-                    n,
-                    if n == 1 { "" } else { "s" }
+                    "{} {} {}",
+                    t("\u{1F4CB} Copied"), n, t("item(s) to clipboard")
                 );
                 // Remember when this copy happened so the next Ctrl+V
                 // knows to prefer our in-app clipboard over an OS
@@ -1023,9 +1028,8 @@ impl App {
                 let n = self.state.paste_clipboard();
                 if n > 0 {
                     self.state.status = format!(
-                        "\u{1F4CB} Pasted {} item{} at the playhead",
-                        n,
-                        if n == 1 { "" } else { "s" },
+                        "{} {} {}",
+                        t("\u{1F4CB} Pasted"), n, t("item(s) at the playhead"),
                     );
                     handled = true;
                 }
@@ -1045,16 +1049,15 @@ impl App {
                 let n = self.state.paste_clipboard();
                 if n > 0 {
                     self.state.status = format!(
-                        "\u{1F4CB} Pasted {} item{} at the playhead",
-                        n,
-                        if n == 1 { "" } else { "s" },
+                        "{} {} {}",
+                        t("\u{1F4CB} Pasted"), n, t("item(s) at the playhead"),
                     );
                     handled = true;
                 }
             }
             if !handled {
                 self.state.status =
-                    "\u{1F4CB} Clipboard is empty".into();
+                    t("\u{1F4CB} Clipboard is empty").to_string();
             }
         }
 
@@ -1079,9 +1082,9 @@ impl App {
             if i.key_pressed(egui::Key::Space) {
                 self.state.playing = !self.state.playing;
                 if self.state.playing {
-                    self.state.status = "\u{25B6} Playing".into();
+                    self.state.status = t("\u{25B6} Playing").to_string();
                 } else {
-                    self.state.status = "\u{23F8} Paused".into();
+                    self.state.status = t("\u{23F8} Paused").to_string();
                 }
             }
             // Delete key = remove selected element (only when no
@@ -1121,7 +1124,7 @@ impl App {
                         self.state.canvas_drag.mode =
                             crate::state::CanvasDragMode::None;
                     }
-                    self.state.status = "Mask tool cancelled".into();
+                    self.state.status = t("Mask tool cancelled").to_string();
                 }
             }
         });
@@ -1146,6 +1149,7 @@ impl App {
     ///   4. Switches the library tab + selection to the new entry so
     ///      the user immediately sees what they pasted.
     fn try_paste_image_from_system_clipboard(&mut self) -> bool {
+        use crate::i18n::t;
         let mut clipboard = match arboard::Clipboard::new() {
             Ok(c) => c,
             Err(err) => {
@@ -1169,14 +1173,15 @@ impl App {
         {
             Ok(a) => a,
             Err(err) => {
-                self.state.status = format!("Clipboard image save failed: {}", err);
+                self.state.status = format!("{} {}", t("Clipboard image save failed:"), err);
                 return true; // we tried; don't fall through to internal paste
             }
         };
         let _idx = self.state.add_image_overlay_at_playhead(&asset);
         self.state.library_tab = crate::state::LibraryTab::Images;
         self.state.status = format!(
-            "\u{1F4CB} Pasted clipboard image \u{2192} {} ({}\u{00D7}{})",
+            "{} \u{2192} {} ({}\u{00D7}{})",
+            t("\u{1F4CB} Pasted clipboard image"),
             asset.label, width, height
         );
         true
@@ -2114,6 +2119,7 @@ impl App {
 
     /// Poll for waveform extraction completion across all audio tracks.
     fn poll_waveform_extraction(&mut self) {
+        use crate::i18n::t;
         for audio_idx in 0..self.waveform_extract_results.len() {
             if audio_idx >= self.state.audio_waveforms.len() { break; }
             if self.state.audio_waveforms[audio_idx].ready { continue; }
@@ -2125,7 +2131,8 @@ impl App {
                     self.state.audio_waveforms[audio_idx].ready = true;
                     self.state.audio_waveforms[audio_idx].extracting = false;
                     self.state.status = format!(
-                        "\u{2705} Waveform ready (audio {}): {:.1}s",
+                        "{} {}): {:.1}s",
+                        t("\u{2705} Waveform ready (audio"),
                         audio_idx, duration
                     );
                 }
@@ -2186,19 +2193,21 @@ impl App {
             );
         }
 
-        self.state.status = "\u{1F3AC} Extracting preview frames...".into();
+        self.state.status = crate::i18n::t("\u{1F3AC} Extracting preview frames...").to_string();
     }
 
     /// Poll for frame extraction completion across all actors.
     fn poll_frame_extraction(&mut self) {
+        use crate::i18n::t;
         for actor_idx in 0..self.frame_extract_results.len() {
             if let Ok(mut slot) = self.frame_extract_results[actor_idx].lock() {
                 if let Some((duration, frame_count, cache_dir)) = slot.take() {
                     if let Some(fc) = self.state.frame_caches.get_mut(actor_idx) {
                         fc.set_ready(duration, frame_count, cache_dir);
                         self.state.status = format!(
-                            "\u{2705} Preview ready (actor {}): {} frames ({:.1}s)",
-                            actor_idx, frame_count, duration
+                            "{} {}): {} {} ({:.1}s)",
+                            t("\u{2705} Preview ready (actor"),
+                            actor_idx, frame_count, t("frames"), duration
                         );
                     }
                 }
@@ -2207,6 +2216,7 @@ impl App {
     }
 
     fn save_scene(&mut self) {
+        use crate::i18n::t;
         if let Some(path) = self.state.scene_path.clone() {
             let is_memstroy = path
                 .extension()
@@ -2216,19 +2226,19 @@ impl App {
             if is_memstroy {
                 match self.state.save_memstroy(&path) {
                     Ok(()) => {
-                        self.state.status = "\u{2705} Saved (.memstroy).".into();
+                        self.state.status = t("\u{2705} Saved (.memstroy).").to_string();
                     }
-                    Err(e) => self.state.status = format!("\u{274C} Save failed: {e}"),
+                    Err(e) => self.state.status = format!("{} {e}", t("\u{274C} Save failed:")),
                 }
             } else {
                 match self.state.scene.save(&path) {
                     Ok(()) => {
-                        self.state.status = "\u{2705} Saved.".into();
+                        self.state.status = t("\u{2705} Saved.").to_string();
                         // Save layout alongside scene
                         let layout_path = path.with_extension("layout.json");
                         self.state.save_layout(&layout_path);
                     }
-                    Err(e) => self.state.status = format!("\u{274C} Save failed: {e}"),
+                    Err(e) => self.state.status = format!("{} {e}", t("\u{274C} Save failed:")),
                 }
             }
         } else {
@@ -2237,6 +2247,7 @@ impl App {
     }
 
     fn save_as(&mut self) {
+        use crate::i18n::t;
         if let Some(path) = rfd::FileDialog::new()
             // .memstroy is the project-native bundle (scene + layout in
             // a single JSON file). YAML / JSON remain available for
@@ -2269,7 +2280,7 @@ impl App {
             match result {
                 Ok(()) => {
                     self.state.scene_path = Some(path.clone());
-                    self.state.status = "\u{2705} Saved.".into();
+                    self.state.status = t("\u{2705} Saved.").to_string();
                     if self.state.active_tab < self.state.scene_tabs.len() {
                         let name = path
                             .file_stem()
@@ -2281,12 +2292,13 @@ impl App {
                             Some(path.clone());
                     }
                 }
-                Err(e) => self.state.status = format!("\u{274C} Save failed: {e}"),
+                Err(e) => self.state.status = format!("{} {e}", t("\u{274C} Save failed:")),
             }
         }
     }
 
     fn run_render(&mut self) {
+        use crate::i18n::t;
         let Some(path) = rfd::FileDialog::new()
             .add_filter("MP4", &["mp4"])
             .save_file()
@@ -2315,15 +2327,16 @@ impl App {
             self.state.assets_root.clone(),
             path,
         );
-        self.state.status = "\u{1F3A5} Rendering at 1080x1920...".into();
+        self.state.status = t("\u{1F3A5} Rendering at 1080x1920...").to_string();
     }
 
     fn run_refresh(&mut self) {
+        use crate::i18n::t;
         if self.state.refreshing {
             return;
         }
         self.state.refreshing = true;
-        self.state.status = "\u{1F504} Refreshing clips via assets-server...".into();
+        self.state.status = t("\u{1F504} Refreshing clips via assets-server...").to_string();
         spawn_refresh(
             self.rt.handle(),
             self.tx.clone(),
@@ -2506,10 +2519,10 @@ impl App {
                 self.state.last_autosave = Some(std::time::Instant::now());
                 self.state.autosave_toast_until =
                     Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
-                self.state.status = "\u{1F4BE} Auto-saved".into();
+                self.state.status = crate::i18n::t("\u{1F4BE} Auto-saved").to_string();
             }
             Err(e) => {
-                self.state.status = format!("\u{26A0} Autosave failed: {e}");
+                self.state.status = format!("{} {e}", crate::i18n::t("\u{26A0} Autosave failed:"));
             }
         }
     }
@@ -2577,18 +2590,18 @@ impl App {
                 Ok(scene) => {
                     self.state.scene = scene;
                     self.state.scene_path = None;
-                    self.state.status = "\u{2705} Recovered scene loaded.".into();
+                    self.state.status = crate::i18n::t("\u{2705} Recovered scene loaded.").to_string();
                 }
                 Err(e) => {
-                    self.state.status = format!("\u{274C} Recovery failed: {e}");
+                    self.state.status = format!("{} {e}", crate::i18n::t("\u{274C} Recovery failed:"));
                 }
             },
             Some("no") => {
                 let _ = std::fs::remove_file(&autosave_path);
-                self.state.status = "\u{1F5D1} Recovery discarded.".into();
+                self.state.status = crate::i18n::t("\u{1F5D1} Recovery discarded.").to_string();
             }
             Some("later") => {
-                self.state.status = "Recovery postponed.".into();
+                self.state.status = crate::i18n::t("Recovery postponed.").to_string();
             }
             _ => {}
         }
@@ -2693,7 +2706,7 @@ impl App {
                     );
                 });
                 self.state.selection = Selection::Overlay(new_idx_out);
-                self.state.status = format!("\u{2728} Added title: {}", tpl.name);
+                self.state.status = format!("{} {}", crate::i18n::t("\u{2728} Added title:"), tpl.name);
                 self.state.title_picker_open = false;
             }
         }
@@ -3089,7 +3102,7 @@ impl eframe::App for App {
                 };
                 if let Err(err) = std::fs::create_dir_all(&dest_dir) {
                     self.state.status =
-                        format!("Couldn't create {}: {}", dest_dir.display(), err);
+                        format!("{} {}: {}", crate::i18n::t("Couldn't create"), dest_dir.display(), err);
                     continue;
                 }
                 let file_name = path
@@ -3131,7 +3144,8 @@ impl eframe::App for App {
                         Ok(_) => true,
                         Err(err) => {
                             self.state.status = format!(
-                                "Couldn't import {}: {}",
+                                "{} {}: {}",
+                                crate::i18n::t("Couldn't import"),
                                 path.display(),
                                 err
                             );
@@ -3160,7 +3174,8 @@ impl eframe::App for App {
                         self.state.library_tab
                     };
                     self.state.status = format!(
-                        "Imported into library: {}",
+                        "{} {}",
+                        crate::i18n::t("Imported into library:"),
                         dest.display()
                     );
                     // Drop landed inside the library panel — no scene
@@ -3208,7 +3223,12 @@ impl eframe::App for App {
                     let lane = self.state.pick_or_create_empty_video_lane_at(t);
                     self.state.overlay_track_assignments.insert(new_idx, lane);
                     self.state.selection = Selection::Overlay(new_idx);
-                    self.state.status = format!("Dropped image: {} (saved to library)", id);
+                    self.state.status = format!(
+                        "{} {} {}",
+                        crate::i18n::t("Dropped image:"),
+                        id,
+                        crate::i18n::t("(saved to library)")
+                    );
                 } else if is_audio {
                     let id = dest.file_stem().and_then(|s| s.to_str())
                         .map(|s| s.to_string())
@@ -3220,7 +3240,12 @@ impl eframe::App for App {
                         ..Default::default()
                     });
                     self.state.selection = Selection::Audio(self.state.scene.audio.len() - 1);
-                    self.state.status = format!("Dropped audio: {} (saved to library)", id);
+                    self.state.status = format!(
+                        "{} {} {}",
+                        crate::i18n::t("Dropped audio:"),
+                        id,
+                        crate::i18n::t("(saved to library)")
+                    );
                 }
             }
         }

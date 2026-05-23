@@ -702,7 +702,7 @@ pub(crate) fn add_library_asset_at_playhead(
             let lane = state.pick_or_create_empty_audio_lane_for_range(t_in, t_out);
             state.audio_track_assignments.insert(new_idx, lane);
             state.selection = Selection::Audio(new_idx);
-            state.status = format!("Added sound: {}", asset.id);
+            state.status = format!("{} {}", crate::i18n::t("Added sound:"), asset.id);
         }
         AssetDragKind::Image => {
             let overlay = Overlay::Image(ImageOverlay {
@@ -725,7 +725,7 @@ pub(crate) fn add_library_asset_at_playhead(
             let lane = state.pick_or_create_empty_video_lane_at(t);
             state.overlay_track_assignments.insert(new_idx, lane);
             state.selection = Selection::Overlay(new_idx);
-            state.status = format!("Added image: {}", asset.id);
+            state.status = format!("{} {}", crate::i18n::t("Added image:"), asset.id);
         }
         AssetDragKind::Particle => {
             // Particle = image overlay with a spin + pulse + wobble preset
@@ -771,7 +771,7 @@ pub(crate) fn add_library_asset_at_playhead(
             let lane = state.pick_or_create_empty_video_lane_at(t);
             state.overlay_track_assignments.insert(new_idx, lane);
             state.selection = Selection::Overlay(new_idx);
-            state.status = format!("Added particle: {}", asset.id);
+            state.status = format!("{} {}", crate::i18n::t("Added particle:"), asset.id);
         }
         AssetDragKind::Video => {
             // Treat a Video drop the same way as a Clip from the
@@ -907,7 +907,7 @@ pub fn inspector(ui: &mut egui::Ui, state: &mut EditorState) {
         ui.label(RichText::new(crate::i18n::t("Inspector")).size(16.0).strong());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if state.eyedropper_active {
-                ui.label(RichText::new("PICK").size(10.0).color(Color32::from_rgb(255, 200, 50)));
+                ui.label(RichText::new(t("PICK")).size(10.0).color(Color32::from_rgb(255, 200, 50)));
             }
         });
     });
@@ -1668,7 +1668,7 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
     ui.horizontal(|ui| {
         kf_anim::animated_toggle(ui, &mut a.animated_params, param_ids::SCALE_Y, ("act_sy", i));
         ui.label(param_label(highlight.is_active(param_ids::SCALE_Y), "Scale Y:"))
-            .on_hover_text("Independent Y-axis scale. Linked to Scale X by default.");
+            .on_hover_text(t("Independent Y-axis scale. Linked to Scale X by default."));
         if linked {
             // ── Linked mode: the Y slider mirrors the uniform Scale X.
             //
@@ -2101,16 +2101,16 @@ fn inspector_effect_stack(
                                 ui.label(RichText::new(label).strong().size(11.0)
                                     .color(Color32::from_rgb(255, 200, 240)));
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if ui.small_button("x").on_hover_text("Remove effect").clicked() {
+                                    if ui.small_button("x").on_hover_text(t("Remove effect")).clicked() {
                                         to_remove = Some(ei);
                                     }
                                     if ei + 1 < count {
-                                        if ui.small_button("\u{2193}").on_hover_text("Move down").clicked() {
+                                        if ui.small_button("\u{2193}").on_hover_text(t("Move down")).clicked() {
                                             to_swap = Some((ei, ei + 1));
                                         }
                                     }
                                     if ei > 0 {
-                                        if ui.small_button("\u{2191}").on_hover_text("Move up").clicked() {
+                                        if ui.small_button("\u{2191}").on_hover_text(t("Move up")).clicked() {
                                             to_swap = Some((ei, ei - 1));
                                         }
                                     }
@@ -2149,7 +2149,7 @@ fn inspector_effect_stack(
             // a ComboBox keeps the width compact even with 20+ entries —
             // a horizontal grid of buttons would wrap awkwardly.
             ui.horizontal(|ui| {
-                ui.label(RichText::new("+ Add effect:").size(11.0).strong());
+                ui.label(RichText::new(t("+ Add effect:")).size(11.0).strong());
                 let mut to_add: Option<usize> = None;
                 // Hide masks from the generic effect picker — they live
                 // in the dedicated "Masks" inspector tool now and the
@@ -2177,7 +2177,7 @@ fn inspector_effect_stack(
                         effects.push(p.clone());
                     }
                 }
-                if ui.small_button("clear").on_hover_text("Remove all effects").clicked() {
+                if ui.small_button(t("clear")).on_hover_text(t("Remove all effects")).clicked() {
                     effects.clear();
                 }
             });
@@ -2215,7 +2215,7 @@ fn inspector_effect_kind_params(
         K::Grayscale | K::Sepia | K::Invert | K::MirrorH | K::MirrorV | K::OldFilm | K::Vhs
     ) {
         ui.label(
-            RichText::new("No parameters.")
+            RichText::new(t("No parameters."))
                 .size(10.0)
                 .color(COL_TEXT_DIM)
                 .italics(),
@@ -2333,7 +2333,7 @@ fn inspector_effect_kind_params(
             }
             if let memstroy_core::EffectKind::Mask { invert, shape, .. } = &mut eff.kind {
                 ui.horizontal(|ui| {
-                    ui.checkbox(invert, "Invert");
+                    ui.checkbox(invert, t("Invert"));
                     let kind_label = match shape {
                         memstroy_core::MaskShape::Rect { .. } => "Rectangle".to_string(),
                         memstroy_core::MaskShape::Ellipse { .. } => "Ellipse".to_string(),
@@ -2367,13 +2367,13 @@ fn inspector_effect_kind_params(
                         color[1] as f32 / 255.0,
                         color[2] as f32 / 255.0,
                     ];
-                    ui.label("Key colour");
+                    ui.label(t("Key colour"));
                     if ui.color_edit_button_rgb(&mut rgb).changed() {
                         color[0] = (rgb[0] * 255.0).round().clamp(0.0, 255.0) as u8;
                         color[1] = (rgb[1] * 255.0).round().clamp(0.0, 255.0) as u8;
                         color[2] = (rgb[2] * 255.0).round().clamp(0.0, 255.0) as u8;
                     }
-                    ui.checkbox(invert, "Invert");
+                    ui.checkbox(invert, t("Invert"));
                 });
             }
         }
@@ -2793,7 +2793,7 @@ fn inspector_masks_section(
                             .color(Color32::from_rgb(255, 220, 180)),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("x").on_hover_text("Remove mask").clicked() {
+                        if ui.small_button("x").on_hover_text(crate::i18n::t("Remove mask")).clicked() {
                             to_remove = Some(ei);
                         }
                     });
@@ -3389,7 +3389,7 @@ fn color_wheel_widget(
         // in sync when the user uses the wheel.
         ui.vertical(|ui| {
             let mut master = (rgb[0] + rgb[1] + rgb[2]) / 3.0;
-            ui.label(RichText::new("Master").size(10.0).color(COL_TEXT_DIM));
+            ui.label(RichText::new(crate::i18n::t("Master")).size(10.0).color(COL_TEXT_DIM));
             let resp = ui.add(
                 egui::Slider::new(&mut master, master_range.clone())
                     .show_value(true)
@@ -3406,7 +3406,7 @@ fn color_wheel_widget(
             ui.label(RichText::new(format!("R {:.2}", rgb[0])).size(9.0).color(Color32::from_rgb(255, 120, 120)));
             ui.label(RichText::new(format!("G {:.2}", rgb[1])).size(9.0).color(Color32::from_rgb(120, 220, 130)));
             ui.label(RichText::new(format!("B {:.2}", rgb[2])).size(9.0).color(Color32::from_rgb(120, 170, 255)));
-            if ui.small_button("Reset").clicked() {
+            if ui.small_button(crate::i18n::t("Reset")).clicked() {
                 *rgb = neutral;
             }
         });
@@ -3596,7 +3596,7 @@ fn hsv_to_color32(h: f32, s: f32, v: f32) -> Color32 {
 /// the followee actor's id is referenced via `skeleton_id`.
 fn inspector_actor_skeleton_attachments(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
     egui::CollapsingHeader::new(
-        RichText::new("Skeleton Attachment Points").size(12.0).strong()
+        RichText::new(crate::i18n::t("Skeleton Attachment Points")).size(12.0).strong()
             .color(Color32::from_rgb(180, 120, 255))
     ).default_open(true).show(ui, |ui| {
         // Resolve which templates apply to this actor's source clip. A
@@ -3661,7 +3661,7 @@ fn inspector_actor_skeleton_attachments(ui: &mut egui::Ui, state: &mut EditorSta
             let mut commit_pick: Option<(crate::state::AttachableElement, String, String)> = None;
 
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("Layer:").size(10.0).color(COL_TEXT_DIM));
+                ui.label(RichText::new(crate::i18n::t("Layer:")).size(10.0).color(COL_TEXT_DIM));
                 egui::ComboBox::from_id_source(("skel_layer_pick", i))
                     .selected_text(element_options[pick_idx].1.clone())
                     .show_ui(ui, |ui| {
@@ -3700,12 +3700,12 @@ fn inspector_actor_skeleton_attachments(ui: &mut egui::Ui, state: &mut EditorSta
 
             if let Some((src, skel_id, point_name)) = commit_pick {
                 attach_element_to_skeleton_point(state, src, &skel_id, &point_name);
-                state.status = format!("Attached to {}.{}", skel_id, point_name);
+                state.status = format!("{} {}.{}", crate::i18n::t("Attached to"), skel_id, point_name);
             }
         }
         ui.add_space(6.0);
         ui.label(
-            RichText::new("Tip: Alt+drag a clip on the timeline → drop on a point row to attach.")
+            RichText::new(crate::i18n::t("Tip: Alt+drag a clip on the timeline \u{2192} drop on a point row to attach."))
                 .size(9.0)
                 .color(COL_TEXT_DIM)
                 .italics(),
@@ -3736,7 +3736,7 @@ fn inspector_actor_skeleton_attachments(ui: &mut egui::Ui, state: &mut EditorSta
                     .size(11.0).strong().color(Color32::from_rgb(220, 200, 255)),
             );
             if point_keys.is_empty() {
-                ui.label(RichText::new("  (no points defined)").size(9.0)
+                ui.label(RichText::new(crate::i18n::t("  (no points defined)")).size(9.0)
                     .italics().color(COL_TEXT_DIM));
                 continue;
             }
@@ -3895,7 +3895,7 @@ fn inspector_actor_skeleton_attachments(ui: &mut egui::Ui, state: &mut EditorSta
             attach_element_to_skeleton_point(state, src, &skel_id, &point_name);
             state.element_drag.source = None;
             state.element_drag.label.clear();
-            state.status = format!("Attached to {}.{}", skel_id, point_name);
+            state.status = format!("{} {}.{}", crate::i18n::t("Attached to"), skel_id, point_name);
         }
 
         // Clear any stale drag once the pointer is up — handles the case
@@ -4511,7 +4511,7 @@ fn inspector_text_overlay(
 
         if t.style.box_color.is_some() {
             ui.horizontal(|ui| {
-                ui.label("Type:");
+                ui.label(crate::i18n::t("Type:"));
                 egui::ComboBox::from_id_source("text_box_kind")
                     .selected_text(format!("{:?}", t.style.box_kind))
                     .show_ui(ui, |ui| {
@@ -4836,20 +4836,20 @@ fn inspector_background(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
         ui.label(t("Duration:"));
         ui.add(egui::DragValue::new(&mut b.duration).speed(0.02).suffix("s"));
     });
-    egui::ComboBox::from_label("Fit")
+    egui::ComboBox::from_label(t("Fit"))
         .selected_text(format!("{:?}", b.fit))
         .show_ui(ui, |ui| {
-            ui.selectable_value(&mut b.fit, Fit::Cover, "Cover");
-            ui.selectable_value(&mut b.fit, Fit::Contain, "Contain");
-            ui.selectable_value(&mut b.fit, Fit::Stretch, "Stretch");
-            ui.selectable_value(&mut b.fit, Fit::Original, "Original");
+            ui.selectable_value(&mut b.fit, Fit::Cover, t("Cover"));
+            ui.selectable_value(&mut b.fit, Fit::Contain, t("Contain"));
+            ui.selectable_value(&mut b.fit, Fit::Stretch, t("Stretch"));
+            ui.selectable_value(&mut b.fit, Fit::Original, t("Original"));
         });
-    egui::ComboBox::from_label("Transition")
+    egui::ComboBox::from_label(t("Transition"))
         .selected_text(format!("{:?}", b.transition))
         .show_ui(ui, |ui| {
-            ui.selectable_value(&mut b.transition, Transition::Cut, "Cut");
-            ui.selectable_value(&mut b.transition, Transition::Snap, "Snap");
-            ui.selectable_value(&mut b.transition, Transition::Fade, "Fade");
+            ui.selectable_value(&mut b.transition, Transition::Cut, t("Cut"));
+            ui.selectable_value(&mut b.transition, Transition::Snap, t("Snap"));
+            ui.selectable_value(&mut b.transition, Transition::Fade, t("Fade"));
         });
 }
 
@@ -9184,33 +9184,33 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                 NewLaneIntent::VideoTopForActor(actor_idx) => {
                     let new_idx = state.insert_video_track_at_top();
                     state.actor_track_assignments.insert(actor_idx, new_idx);
-                    state.status = "\u{2728} New video layer created on top.".into();
+                    state.status = t("\u{2728} New video layer created on top.").to_string();
                 }
                 NewLaneIntent::VideoBottomForActor(actor_idx) => {
                     let new_idx = state.insert_video_track_at_bottom();
                     state.actor_track_assignments.insert(actor_idx, new_idx);
-                    state.status = "\u{2728} New video layer created.".into();
+                    state.status = t("\u{2728} New video layer created.").to_string();
                 }
                 NewLaneIntent::VideoTopForOverlay(overlay_idx) => {
                     let new_idx = state.insert_video_track_at_top();
                     state.overlay_track_assignments.insert(overlay_idx, new_idx);
-                    state.status = "\u{2728} New video layer created on top.".into();
+                    state.status = t("\u{2728} New video layer created on top.").to_string();
                 }
                 NewLaneIntent::VideoBottomForOverlay(overlay_idx) => {
                     let new_idx = state.insert_video_track_at_bottom();
                     state.overlay_track_assignments.insert(overlay_idx, new_idx);
-                    state.status = "\u{2728} New video layer created.".into();
+                    state.status = t("\u{2728} New video layer created.").to_string();
                 }
                 NewLaneIntent::AudioTopForAudio(audio_idx) => {
                     let new_idx = state.insert_audio_track_at_top();
                     state.audio_track_assignments.insert(audio_idx, new_idx);
-                    state.status = "\u{2728} New audio layer created.".into();
+                    state.status = t("\u{2728} New audio layer created.").to_string();
                 }
                 NewLaneIntent::AudioBottomForAudio(audio_idx) => {
                     state.add_audio_track();
                     let new_track_idx = state.tracks.len() - 1;
                     state.audio_track_assignments.insert(audio_idx, new_track_idx);
-                    state.status = "\u{2728} New audio layer created at bottom.".into();
+                    state.status = t("\u{2728} New audio layer created at bottom.").to_string();
                 }
             }
         }
@@ -11211,7 +11211,7 @@ fn delete_selected_keyframes(state: &mut EditorState) {
 
     state.selected_keyframes.clear();
     if removed > 0 {
-        state.status = format!("Deleted {} keyframe(s)", removed);
+        state.status = format!("{} {}", t("Deleted keyframes:"), removed);
     }
 }
 
@@ -12031,7 +12031,7 @@ pub fn add_text_overlay(state: &mut EditorState) -> usize {
     state.overlay_track_assignments.insert(idx, new_track);
 
     state.selection = Selection::Overlay(idx);
-    state.status = format!("Added text: {} (new layer)", id);
+    state.status = format!("{} {} {}", t("Added text:"), id, t("(new layer)"));
     idx
 }
 
@@ -12087,7 +12087,7 @@ pub(crate) fn add_actor_from_clip_at_time(state: &mut EditorState, path: &PathBu
     push_audio_track_for_actor(state, &id, path, t_in, Some(t_out), 0.0);
 
     state.selection = Selection::Actor(new_actor_idx);
-    state.status = format!("Dropped actor: {}", id);
+    state.status = format!("{} {}", crate::i18n::t("Dropped actor:"), id);
 }
 
 /// Probe a media file and return its duration in seconds (5.0s fallback
@@ -12148,7 +12148,8 @@ pub(crate) fn add_actor_from_clip_at_canvas(
 
     state.selection = Selection::Actor(new_actor_idx);
     state.status = format!(
-        "Dropped on canvas at ({:.0}, {:.0})",
+        "{} ({:.0}, {:.0})",
+        crate::i18n::t("Dropped on canvas at"),
         world_pos[0], world_pos[1]
     );
 }

@@ -203,7 +203,7 @@ fn handle_eyedropper_click(
             handle_eyedropper_click_overlay(ui, state, full_rect, viewport_size, click_pos, idx);
         }
         _ => {
-            state.status = "Eyedropper: select an actor or image overlay first.".into();
+            state.status = crate::i18n::t("Eyedropper: select an actor or image overlay first.").to_string();
         }
     }
 }
@@ -227,14 +227,14 @@ fn handle_eyedropper_click_actor(
     let elem_rect = match actor_screen_rect(state, full_rect, viewport_size, idx) {
         Some(r) => r,
         None => {
-            state.status = "Eyedropper: cannot resolve actor rect.".into();
+            state.status = crate::i18n::t("Eyedropper: cannot resolve actor rect.").to_string();
             return;
         }
     };
 
     // Click must be inside the actor's rect — otherwise we have no UV.
     if !elem_rect.contains(click_pos) {
-        state.status = "Eyedropper: click on the actor's image.".into();
+        state.status = crate::i18n::t("Eyedropper: click on the actor's image.").to_string();
         return;
     }
 
@@ -269,12 +269,12 @@ fn handle_eyedropper_click_actor(
             let src = state.scene.actors[idx].source.clone();
             let chroma = state.scene.actors[idx].chroma_key.clone();
             let _ = chroma.save_alongside_clip(&src);
-            state.status = format!("Picked chroma key #{:02X}{:02X}{:02X}", key[0], key[1], key[2]);
+            state.status = format!("{} #{:02X}{:02X}{:02X}", crate::i18n::t("Picked chroma key"), key[0], key[1], key[2]);
             ui.ctx().request_repaint();
             return;
         }
     }
-    state.status = "Eyedropper: frame not yet decoded — try again in a moment.".into();
+    state.status = crate::i18n::t("Eyedropper: frame not yet decoded \u{2014} try again in a moment.").to_string();
 }
 
 /// Eyedropper handler for image overlays. Loads the source image
@@ -300,18 +300,18 @@ fn handle_eyedropper_click_overlay(
         Overlay::Image(im) => im.source.clone(),
         _ => {
             state.status =
-                "Eyedropper: overlay must be an image (text / video not supported here)."
-                    .into();
+                crate::i18n::t("Eyedropper: overlay must be an image (text / video not supported here).")
+                    .to_string();
             return;
         }
     };
     let elem_rect = selected_element_screen_rect(state, full_rect, viewport_size);
     let Some(elem_rect) = elem_rect else {
-        state.status = "Eyedropper: cannot resolve overlay rect.".into();
+        state.status = crate::i18n::t("Eyedropper: cannot resolve overlay rect.").to_string();
         return;
     };
     if !elem_rect.contains(click_pos) {
-        state.status = "Eyedropper: click on the overlay's image.".into();
+        state.status = crate::i18n::t("Eyedropper: click on the overlay's image.").to_string();
         return;
     }
     // Account for rotation just like the mask painter does — without
@@ -346,7 +346,7 @@ fn handle_eyedropper_click_overlay(
             let w = rgba.width() as usize;
             let h = rgba.height() as usize;
             if w == 0 || h == 0 {
-                state.status = "Eyedropper: overlay image has zero size.".into();
+                state.status = crate::i18n::t("Eyedropper: overlay image has zero size.").to_string();
                 return;
             }
             let px = ((u * w as f32) as usize).min(w - 1);
@@ -370,13 +370,14 @@ fn handle_eyedropper_click_overlay(
                 im.chroma_key = Some(ck);
             }
             state.status = format!(
-                "Picked overlay key #{:02X}{:02X}{:02X}",
+                "{} #{:02X}{:02X}{:02X}",
+                crate::i18n::t("Picked overlay key"),
                 key[0], key[1], key[2]
             );
             ui.ctx().request_repaint();
         }
         Err(e) => {
-            state.status = format!("Eyedropper: failed to read overlay image — {}", e);
+            state.status = format!("{} {}", crate::i18n::t("Eyedropper: failed to read overlay image \u{2014}"), e);
         }
     }
 }
@@ -5296,7 +5297,7 @@ fn draw_viewport_controls(
         btn_size,
     );
     let fit_resp = ui.put(fit_rect, egui::Button::new("F").small());
-    if fit_resp.on_hover_text("Fit render frame in view").clicked() {
+    if fit_resp.on_hover_text(crate::i18n::t("Fit render frame in view")).clicked() {
         let rf = &state.scene.render_frame;
         let rf_state = sample_render_frame(rf, state.playhead);
         state.canvas_viewport.fit_render_frame(
@@ -5312,7 +5313,7 @@ fn draw_viewport_controls(
         btn_size,
     );
     let zin_resp = ui.put(zin_rect, egui::Button::new("+").small());
-    if zin_resp.on_hover_text("Zoom in").clicked() {
+    if zin_resp.on_hover_text(crate::i18n::t("Zoom in")).clicked() {
         state.canvas_viewport.zoom = (state.canvas_viewport.zoom * 1.3).min(50.0);
     }
 
@@ -5322,7 +5323,7 @@ fn draw_viewport_controls(
         btn_size,
     );
     let zout_resp = ui.put(zout_rect, egui::Button::new("-").small());
-    if zout_resp.on_hover_text("Zoom out").clicked() {
+    if zout_resp.on_hover_text(crate::i18n::t("Zoom out")).clicked() {
         state.canvas_viewport.zoom = (state.canvas_viewport.zoom / 1.3).max(0.01);
     }
 
@@ -5716,7 +5717,7 @@ fn handle_segment_mask_input(
     // primary click starts a brand-new polygon.
     if response.secondary_clicked() {
         if state.mask_draft_points.pop().is_some() {
-            state.status = "Segment mask: removed last vertex".into();
+            state.status = crate::i18n::t("Segment mask: removed last vertex").to_string();
         }
         if state.mask_draft_points.is_empty() {
             state.canvas_drag.mode = CanvasDragMode::None;
@@ -5767,7 +5768,7 @@ fn handle_segment_mask_input(
             // click — the user otherwise gets no feedback for why
             // their vertex didn't appear.
             state.status =
-                "Segment mask: select an actor or image overlay first, then click on it.".into();
+                crate::i18n::t("Segment mask: select an actor or image overlay first, then click on it.").to_string();
             return;
         };
 
@@ -5779,7 +5780,7 @@ fn handle_segment_mask_input(
                 target,
             };
             state.mask_draft_points.push(uv);
-            state.status = "Segment mask: vertex 1 placed — keep clicking, double-click or click the first point to close.".into();
+            state.status = crate::i18n::t("Segment mask: vertex 1 placed \u{2014} keep clicking, double-click or click the first point to close.").to_string();
             return;
         }
 
@@ -5810,8 +5811,10 @@ fn handle_segment_mask_input(
 
         state.mask_draft_points.push(uv);
         state.status = format!(
-            "Segment mask: vertex {} placed — click first point or double-click to close.",
+            "{} {} {}",
+            crate::i18n::t("Segment mask: vertex"),
             state.mask_draft_points.len(),
+            crate::i18n::t("placed \u{2014} click first point or double-click to close."),
         );
     }
 }
@@ -5951,7 +5954,7 @@ fn commit_mask_draft(
             _ => {}
         }
     });
-    state.status = format!("\u{2702} {} applied", tool.label());
+    state.status = format!("\u{2702} {} {}", tool.label(), crate::i18n::t("applied"));
 }
 
 /// Eyedropper colour-key mask — the click handler for
@@ -5982,14 +5985,14 @@ fn handle_eyedropper_mask_click(
     let Some((uv, target, _rect)) =
         screen_to_element_uv(state, full_rect, viewport_size, pointer)
     else {
-        state.status = "Eyedropper mask: select an element first.".into();
+        state.status = crate::i18n::t("Eyedropper mask: select an element first.").to_string();
         return;
     };
     // The UV math returns a clamped value in [-0.5, 1.5] so the user
     // can paint near the edges; for sampling we need a real pixel
     // inside the source so a click outside the picture is rejected.
     if uv[0] < 0.0 || uv[0] > 1.0 || uv[1] < 0.0 || uv[1] > 1.0 {
-        state.status = "Eyedropper mask: click on the picture itself.".into();
+        state.status = crate::i18n::t("Eyedropper mask: click on the picture itself.").to_string();
         return;
     }
 
@@ -6004,14 +6007,15 @@ fn handle_eyedropper_mask_click(
     };
     let Some(rgb) = picked else {
         state.status =
-            "Eyedropper mask: source frame not yet decoded — try again in a moment.".into();
+            crate::i18n::t("Eyedropper mask: source frame not yet decoded \u{2014} try again in a moment.").to_string();
         return;
     };
 
     // Apply the picked colour: overwrite the latest ColorKey entry on
     // the layer if there is one, otherwise push a fresh one.
     let label = format!(
-        "\u{1F4A7} Color key: #{:02X}{:02X}{:02X}",
+        "{} #{:02X}{:02X}{:02X}",
+        crate::i18n::t("\u{1F4A7} Color key:"),
         rgb[0], rgb[1], rgb[2],
     );
     state.mutate(|scene| {

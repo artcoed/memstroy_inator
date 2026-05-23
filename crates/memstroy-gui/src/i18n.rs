@@ -700,6 +700,182 @@ fn ru_lookup(key: &str) -> Option<&'static str> {
         "\u{26A0} Select an element with a next sibling to merge." =>
             "\u{26A0} Выберите элемент со следующим соседом для объединения.",
 
+        // ── Panels (extra) ─────────────────────────────────────
+        "PICK" => "ВЫБОР",
+        "Independent Y-axis scale. Linked to Scale X by default." =>
+            "Независимый масштаб по Y. По умолчанию связан с Масштабом X.",
+        "Key colour" => "Ключевой цвет",
+        "Remove mask" => "Удалить маску",
+        "Skeleton Attachment Points" => "Точки крепления скелета",
+        "Layer:" => "Слой:",
+        "Tip: Alt+drag a clip on the timeline \u{2192} drop on a point row to attach." =>
+            "Подсказка: Alt+перетащите клип на таймлайне \u{2192} отпустите над строкой точки, чтобы прикрепить.",
+        "  (no points defined)" => "  (точки не заданы)",
+        "Attached to" => "Прикреплено к",
+        "Cover" => "Заполнить",
+        "Contain" => "Уместить",
+        "Stretch" => "Растянуть",
+        "Original" => "Оригинал",
+        "Transition" => "Переход",
+        "Cut" => "Срез",
+        "Fade" => "Затухание",
+        "Added sound:" => "Добавлен звук:",
+        "Added image:" => "Добавлена картинка:",
+        "Added particle:" => "Добавлена частица:",
+        "Added text:" => "Добавлен текст:",
+        "(new layer)" => "(новый слой)",
+        "Dropped actor:" => "Добавлен актёр:",
+        "Dropped on canvas at" => "Размещено на холсте:",
+        "Deleted keyframes:" => "Удалено кейфреймов:",
+        "\u{2728} New video layer created on top." =>
+            "\u{2728} Новый видео-слой создан сверху.",
+        "\u{2728} New video layer created." =>
+            "\u{2728} Новый видео-слой создан.",
+        "\u{2728} New audio layer created." =>
+            "\u{2728} Новый аудио-слой создан.",
+        "\u{2728} New audio layer created at bottom." =>
+            "\u{2728} Новый аудио-слой создан снизу.",
+
+        // ── App-level status messages ──────────────────────────
+        "\u{2705} Rendered:" => "\u{2705} Отрендерено:",
+        "\u{274C} Render failed:" => "\u{274C} Ошибка рендера:",
+        "\u{274C} Refresh failed:" => "\u{274C} Ошибка обновления:",
+        "new clips," => "новых клипов,",
+        "total in library" => "всего в библиотеке",
+        "\u{2705} Saved" => "\u{2705} Сохранено",
+        "\u{1F310} Web image" => "\u{1F310} Картинка из сети",
+        "\u{274C} Download failed:" => "\u{274C} Ошибка загрузки:",
+        "\u{1F4CB} Copied" => "\u{1F4CB} Скопировано",
+        "item(s) to clipboard" => "элементов в буфер",
+        "\u{1F4CB} Pasted" => "\u{1F4CB} Вставлено",
+        "item(s) at the playhead" => "элементов на позиции воспроизведения",
+        "\u{1F4CB} Clipboard is empty" => "\u{1F4CB} Буфер обмена пуст",
+        "Mask tool cancelled" => "Инструмент маски отменён",
+        "Clipboard image save failed:" => "Ошибка сохранения картинки из буфера:",
+        "\u{1F4CB} Pasted clipboard image" => "\u{1F4CB} Вставлена картинка из буфера",
+        "\u{2705} Waveform ready (audio" =>
+            "\u{2705} Волна готова (аудио",
+        "\u{2705} Preview ready (actor" =>
+            "\u{2705} Превью готово (актёр",
+        "frames" => "кадров",
+        "\u{274C} Save failed:" => "\u{274C} Ошибка сохранения:",
+        "\u{1F3A5} Rendering at 1080x1920..." =>
+            "\u{1F3A5} Рендер в 1080\u{00D7}1920…",
+        "\u{1F504} Refreshing clips via assets-server..." =>
+            "\u{1F504} Обновление клипов через сервер ассетов…",
+        "\u{26A0} Autosave failed:" => "\u{26A0} Ошибка автосохранения:",
+        "\u{2705} Recovered scene loaded." =>
+            "\u{2705} Восстановленная сцена загружена.",
+        "\u{274C} Recovery failed:" => "\u{274C} Ошибка восстановления:",
+        "\u{1F5D1} Recovery discarded." => "\u{1F5D1} Восстановление отброшено.",
+        "Recovery postponed." => "Восстановление отложено.",
+        "\u{2728} Added title:" => "\u{2728} Добавлен заголовок:",
+        "Couldn't create" => "Не удалось создать",
+        "Couldn't import" => "Не удалось импортировать",
+        "Imported into library:" => "Импортировано в библиотеку:",
+        "Dropped image:" => "Добавлена картинка:",
+        "Dropped audio:" => "Добавлено аудио:",
+        "(saved to library)" => "(сохранено в библиотеку)",
+        "\u{274C} Open failed:" => "\u{274C} Ошибка открытия:",
+        "\u{1F3AC} Extracting preview frames..." => "\u{1F3AC} Извлечение кадров для превью…",
+        "Extracting preview frames..." => "Извлечение кадров для превью…",
+        "Frame" => "Кадр",
+
+        // ── Canvas preview status messages ─────────────────────
+        "Eyedropper: select an actor or image overlay first." =>
+            "Пипетка: сначала выберите актёра или картинку-наложение.",
+        "Eyedropper: cannot resolve actor rect." =>
+            "Пипетка: не удаётся определить область актёра.",
+        "Eyedropper: click on the actor's image." =>
+            "Пипетка: кликните по изображению актёра.",
+        "Picked chroma key" => "Выбран хромакей",
+        "Eyedropper: frame not yet decoded \u{2014} try again in a moment." =>
+            "Пипетка: кадр ещё не декодирован \u{2014} попробуйте через мгновение.",
+        "Eyedropper: overlay must be an image (text / video not supported here)." =>
+            "Пипетка: слой должен быть картинкой (текст / видео здесь не поддерживаются).",
+        "Eyedropper: cannot resolve overlay rect." =>
+            "Пипетка: не удаётся определить область слоя.",
+        "Eyedropper: click on the overlay's image." =>
+            "Пипетка: кликните по изображению слоя.",
+        "Eyedropper: overlay image has zero size." =>
+            "Пипетка: изображение слоя имеет нулевой размер.",
+        "Picked overlay key" => "Выбран ключ слоя",
+        "Eyedropper: failed to read overlay image \u{2014}" =>
+            "Пипетка: не удалось прочитать изображение слоя \u{2014}",
+        "Fit render frame in view" => "Вписать кадр рендера в окно",
+        "Segment mask: removed last vertex" =>
+            "Сегментная маска: удалена последняя вершина",
+        "Segment mask: select an actor or image overlay first, then click on it." =>
+            "Сегментная маска: сначала выберите актёра или картинку, затем кликните по ней.",
+        "Segment mask: vertex 1 placed \u{2014} keep clicking, double-click or click the first point to close." =>
+            "Сегментная маска: вершина 1 установлена \u{2014} продолжайте кликать, двойной клик или клик по первой точке закрывает контур.",
+        "Segment mask: vertex" => "Сегментная маска: вершина",
+        "placed \u{2014} click first point or double-click to close." =>
+            "установлена \u{2014} клик по первой точке или двойной клик закрывает контур.",
+        "applied" => "применено",
+        "Eyedropper mask: select an element first." =>
+            "Маска-пипетка: сначала выберите элемент.",
+        "Eyedropper mask: click on the picture itself." =>
+            "Маска-пипетка: кликните по самому изображению.",
+        "Eyedropper mask: source frame not yet decoded \u{2014} try again in a moment." =>
+            "Маска-пипетка: кадр ещё не декодирован \u{2014} попробуйте через мгновение.",
+        "\u{1F4A7} Color key:" => "\u{1F4A7} Цветовой ключ:",
+
+        // ── Skeleton editor ────────────────────────────────────
+        "Skeleton Constructor" => "Скелет",
+        "Clip:" => "Клип:",
+        "\u{1F50D} search clip..." => "\u{1F50D} поиск клипа…",
+        "(no matches)" => "(совпадений нет)",
+        "+ Create Skeleton" => "+ Создать скелет",
+        "Save" => "Сохранить",
+        "Save skeleton to <clip>.skeleton.json" =>
+            "Сохранить скелет в <клип>.skeleton.json",
+        "Skeleton template created." => "Шаблон скелета создан.",
+        "Skeleton saved:" => "Скелет сохранён:",
+        "Save failed:" => "Ошибка сохранения:",
+        "First frame" => "Первый кадр",
+        "Previous frame" => "Предыдущий кадр",
+        "Play / Pause (drag a point during playback to record keyframes)" =>
+            "Воспроизведение / Пауза (перетащите точку во время воспроизведения, чтобы записать кейфреймы)",
+        "Next frame" => "Следующий кадр",
+        "Last frame" => "Последний кадр",
+        "\u{25CB} stop tracking" => "\u{25CB} остановить отслеживание",
+        "Loop playback (wrap to start at end of clip)" =>
+            "Зациклить воспроизведение (в конце клипа возврат к началу)",
+        "transition:" => "переход:",
+        "delete kf" => "удалить кейфрейм",
+        "Points" => "Точки",
+        "+ Add point" => "+ Добавить точку",
+        "Add a new point with an auto-generated name and start placing it" =>
+            "Добавить новую точку с автоматически сгенерированным именем и начать её размещение",
+        "No points yet \u{2014} press \"+ Add point\"." =>
+            "Точек пока нет \u{2014} нажмите «+ Добавить точку».",
+        "Remove point" => "Удалить точку",
+        "Stop tracking" => "Остановить отслеживание",
+        "Track: loop playback over this point's keyframe range" =>
+            "Отслеживать: зациклить воспроизведение по диапазону кейфреймов точки",
+        "Guide image is set \u{2014} drag a different\nimage from the Images library to replace it." =>
+            "Эталон установлен \u{2014} перетащите другую\nкартинку из библиотеки, чтобы заменить.",
+        "Removed point:" => "Точка удалена:",
+        "Guide image set for" => "Эталон установлен для",
+        "Guide image" => "Эталон",
+        "Drag an image from the Images library onto a point row above or into the box below. Visual aid only \u{2014} not saved to the template." =>
+            "Перетащите картинку из библиотеки на строку точки выше или в поле ниже. Только визуальный эталон \u{2014} не сохраняется в шаблон.",
+        "Select a point first." => "Сначала выберите точку.",
+        "Remove the guide image" => "Удалить эталонное изображение",
+        "Added point:" => "Добавлена точка:",
+        "Click on the frame to place it." =>
+            "Кликните по кадру, чтобы её разместить.",
+
+        // ── Web image search ───────────────────────────────────
+        "(untitled)" => "(без названия)",
+        "Tokio runtime missing \u{2014} search disabled." =>
+            "Среда выполнения Tokio не запущена \u{2014} поиск отключён.",
+        "\u{1F50D} Searching for" => "\u{1F50D} Поиск",
+        "\u{2B07} Loading page" => "\u{2B07} Загрузка страницы",
+        "Downloading" => "Загружаем",
+        "Type a search query first." => "Сначала введите поисковый запрос.",
+
         _ => return None,
     })
 }
