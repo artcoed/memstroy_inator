@@ -22,6 +22,27 @@ enum ClipDragMode {
     TrimRight,
 }
 
+// `draw_clip` / `draw_audio_clip` overload an `Option<f32>` to encode four
+// possible interaction outcomes: trim-left (`+INF`), trim-right (`-INF`),
+// move-drag (negative number whose magnitude is the new clip start), and
+// click-select (non-negative click time).
+//
+// The naive encoding `-(target_start)` collapses on the boundary
+// `target_start == 0` — `-0.0` compares equal to `0.0`, so the caller
+// classified the frame as a fresh click instead of a drag, dropping the
+// drag context every time the user pulled a clip past the left edge of
+// the timeline. The user reported this as "drag gets thrown off when
+// trying to move an element to the very left, you have to try several
+// times".
+//
+// To keep the move-drag value strictly negative for ALL valid target
+// starts (>= 0), we bias the encoding by 1.0 second. Real timelines
+// always store clip starts in seconds so this constant is comfortably
+// outside any meaningful click-time, and the `clicked < 0.0` test in
+// callers continues to work because move-drag now always returns a
+// number `<= -1.0`.
+const MOVE_DRAG_BIAS: f32 = 1.0;
+
 
 // ─── COLORS ──────────────────────────────────────────────────────────
 
@@ -7806,7 +7827,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                 };
                                 to_select = Some(Selection::Background(bi_eff));
                             } else if clicked < 0.0 {
-                                let new_start = (-clicked).max(0.0);
+                                let new_start = (-clicked - MOVE_DRAG_BIAS).max(0.0);
                                 let dur = clip_end - clip_start;
                                 let token = EditorState::drag_token("move_bg", bi);
                                 state.mutate_drag(token, |s| {
@@ -7970,7 +7991,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             to_select = Some(Selection::Actor(ai_eff));
                         } else if clicked < 0.0 {
                             // Drag: move the actor's time window
-                            let mut new_start = (-clicked).max(0.0);
+                            let mut new_start = (-clicked - MOVE_DRAG_BIAS).max(0.0);
                             let dur = clip_end - clip_start;
 
                             // ── Undo snapshot is now handled by mutate_drag below.
@@ -8312,7 +8333,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             to_select = Some(Selection::Overlay(oi_eff));
                         } else if clicked < 0.0 {
                             // Drag: move the overlay's time window.
-                            let new_start = (-clicked).max(0.0);
+                            let new_start = (-clicked - MOVE_DRAG_BIAS).max(0.0);
                             let dur = clip_end - clip_start;
                             let new_end = new_start + dur;
                             // Track active drag for lane-lock & new-lane intents.
@@ -8523,7 +8544,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             to_select = Some(Selection::Audio(aui_eff));
                         } else if clicked < 0.0 {
                             // Drag: move the audio clip horizontally.
-                            let new_start = (-clicked).max(0.0);
+                            let new_start = (-clicked - MOVE_DRAG_BIAS).max(0.0);
                             let dur = clip_end - clip_start;
                             // Track active drag for lane-lock & new-lane intents.
                             if state.timeline_drag.dragging_clip.is_none() {
@@ -9033,8 +9054,44 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     // Stretching the thumb (resize via the edges) is reinterpreted as
     // a zoom change such that the new size matches the new content /
     // viewport ratio. Dragging the thumb middle pans as before.
-    const V_ZOOM_MIN: f32 = 1.0;
+    //
+    // ── Dynamic V_ZOOM_MIN ──
+    //
+    // The user reported that the vertical scrollbar thumb cannot
+    // stretch all the way to fill the track — i.e. there's no
+    // single-gesture way to "zoom out enough to see every layer at
+    // once". Previously V_ZOOM_MIN was hard-coded to 1.0, which means
+    // when natural content already overflows the viewport (lots of
+    // tracks, or a short panel), the user could never compress
+    // everything into view: stretching the thumb past
+    // `viewport_h / total_tracks_h` would clamp v_zoom back up to
+    // 1.0 and snap the thumb back. The fix is to compute V_ZOOM_MIN
+    // such that at the minimum zoom, total content height equals
+    // (or is slightly below) the viewport. We keep an absolute floor
+    // (`V_ZOOM_HARD_MIN`) so rows never collapse to zero pixels.
+    //
+    // total_tracks_h is essentially linear in v_zoom (every row, the
+    // RF row, and every expansion contribute `* v_zoom` terms; the
+    // only v_zoom-independent components are `BOTTOM_GUTTER` plus a
+    // few small `+ 4.0` paddings inside the expansion helpers — those
+    // are tiny enough to fold into the linear approximation without
+    // affecting one-pixel UI feel). So:
+    //   total(v') ≈ (total(v_zoom) - C) * (v' / v_zoom) + C
+    // where C is the v_zoom-independent residual we model as
+    // BOTTOM_GUTTER. Solving total(v_zoom_min) = viewport_h:
+    //   v_zoom_min = (viewport_h - C) * v_zoom / (total - C)
+    const V_ZOOM_HARD_MIN: f32 = 0.05;
     const V_ZOOM_MAX: f32 = 8.0;
+    let zoom_invariant_h = BOTTOM_GUTTER;
+    let zoom_scaled_h = (total_tracks_h - zoom_invariant_h).max(1.0e-4);
+    // Target a viewport that's ever-so-slightly larger than the
+    // content so the user gets a true 100%-thumb when fully zoomed
+    // out. The 0.5 px slack soaks up sub-pixel rounding inside the
+    // pan-fraction round-trip below.
+    let target_viewport = (viewport_h - zoom_invariant_h).max(20.0) + 0.5;
+    let v_zoom_fit = (target_viewport * v_zoom / zoom_scaled_h)
+        .clamp(V_ZOOM_HARD_MIN, 1.0);
+    let v_zoom_min = v_zoom_fit;
     let max_v_scroll = (total_tracks_h - viewport_h).max(0.0);
     // Smallest thumb the widget will let the user produce when dragging
     // the resize grips — kept consistent with the v_zoom upper bound
@@ -9070,7 +9127,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
         let zoom_changed = (new_thumb_size - thumb_size_frac).abs() > 1.0e-4;
         let new_v_zoom = if zoom_changed {
             let zoom_ratio = thumb_size_frac / new_thumb_size.max(1.0e-4);
-            (v_zoom * zoom_ratio).clamp(V_ZOOM_MIN, V_ZOOM_MAX)
+            (v_zoom * zoom_ratio).clamp(v_zoom_min, V_ZOOM_MAX)
         } else {
             v_zoom
         };
@@ -9686,9 +9743,13 @@ fn stretchable_scrollbar(
 
 /// Draw a single clip bar on the timeline. Returns Some(time) if clicked (for split or select).
 /// Returns special sentinel values for edge-trim drags:
+///
 /// - `f32::INFINITY` signals "trim left edge"
 /// - `f32::NEG_INFINITY` signals "trim right edge"
-/// - Negative values signal whole-clip drag (new start time encoded as `-new_start`)
+/// - Values `<= -MOVE_DRAG_BIAS` signal whole-clip drag (new start time
+///   encoded as `(-clicked - MOVE_DRAG_BIAS).max(0.0)`).
+/// - Non-negative values signal a click at that scene-time.
+///
 /// Shows ResizeHorizontal cursor when hovering within 5px of left/right edge.
 ///
 /// `clip_id` MUST be stable across frames for the same clip (do not include the
@@ -9713,16 +9774,27 @@ fn draw_clip(
     locked: bool,
     split_mode: bool,
 ) -> Option<f32> {
-    let x_start = (clip_start - scroll) * pps + track_left;
-    let x_end = (clip_end - scroll) * pps + track_left;
+    let x_start_full = (clip_start - scroll) * pps + track_left;
+    let x_end_full = (clip_end - scroll) * pps + track_left;
 
     // Clip is off-screen
-    if x_end < track_left || x_start > track_right { return None; }
+    if x_end_full < track_left || x_start_full > track_right { return None; }
 
-    let x_start = x_start.max(track_left);
-    let x_end = x_end.min(track_right);
+    let x_start = x_start_full.max(track_left);
+    let x_end = x_end_full.min(track_right);
 
     if x_end - x_start < 2.0 { return None; }
+
+    // The bar's visible left/right edge equals the clip's logical
+    // start/end only when the clip wasn't clipped against the timeline
+    // viewport. We use this below to decide whether a press near the
+    // visible edge is a real trim handle (logical edge under cursor)
+    // or just the timeline border masking the bar (in which case it
+    // must be treated as a Move). Without this, the user could not
+    // grab a clip that was scrolled partially off the left of the
+    // viewport without accidentally trimming its in-edge.
+    let visible_left_is_logical = x_start_full >= track_left - 0.5;
+    let visible_right_is_logical = x_end_full <= track_right + 0.5;
 
     let bar_rect = egui::Rect::from_min_max(
         egui::pos2(x_start, content_rect.min.y + 2.0),
@@ -9801,13 +9873,24 @@ fn draw_clip(
     // bar looking clean while the hit-test forgives small targeting
     // mistakes — addresses the explicit user feedback that the
     // stretch handles were "очень трудно схватиться".
+    //
+    // Edge zones are suppressed when the visible bar edge is just the
+    // timeline viewport boundary (`!visible_*_is_logical`), because in
+    // that case the cursor is logically *inside* the clip — it should
+    // grab-and-move, not trim. This is the second half of the "drag
+    // to the very left edge gets stuck" fix: when the clip extends
+    // off-screen left, every press near the visible left edge used to
+    // be classified as TrimLeft, leaving the user no way to grab the
+    // clip body until they scrolled the timeline.
     const TRIM_HIT_HALFWIDTH: f32 = 9.0;
-    let near_left_edge = hover_pos
-        .map(|p| (p.x - bar_rect.min.x).abs() < TRIM_HIT_HALFWIDTH)
-        .unwrap_or(false);
-    let near_right_edge = hover_pos
-        .map(|p| (p.x - bar_rect.max.x).abs() < TRIM_HIT_HALFWIDTH)
-        .unwrap_or(false);
+    let near_left_edge = visible_left_is_logical
+        && hover_pos
+            .map(|p| (p.x - bar_rect.min.x).abs() < TRIM_HIT_HALFWIDTH)
+            .unwrap_or(false);
+    let near_right_edge = visible_right_is_logical
+        && hover_pos
+            .map(|p| (p.x - bar_rect.max.x).abs() < TRIM_HIT_HALFWIDTH)
+            .unwrap_or(false);
 
     if resp.hovered() && !locked {
         if split_mode {
@@ -9863,9 +9946,19 @@ fn draw_clip(
             .unwrap_or(bar_rect.center().x);
         // Match the visible hover hit zone (TRIM_HIT_HALFWIDTH = 9 px)
         // so the cursor and the actual drag-mode capture stay in sync.
-        let mode = if (press_x - bar_rect.min.x).abs() < TRIM_HIT_HALFWIDTH {
+        // The `visible_*_is_logical` guards mirror the hover-cursor
+        // logic above: when the bar is clipped at the viewport edge,
+        // the visible edge is NOT the clip's real start/end, so
+        // pressing near it must remain a Move (otherwise scrolled-
+        // off-screen clips become un-grabbable from the visible edge
+        // without an inadvertent trim).
+        let mode = if visible_left_is_logical
+            && (press_x - bar_rect.min.x).abs() < TRIM_HIT_HALFWIDTH
+        {
             ClipDragMode::TrimLeft
-        } else if (press_x - bar_rect.max.x).abs() < TRIM_HIT_HALFWIDTH {
+        } else if visible_right_is_logical
+            && (press_x - bar_rect.max.x).abs() < TRIM_HIT_HALFWIDTH
+        {
             ClipDragMode::TrimRight
         } else {
             ClipDragMode::Move
@@ -9894,7 +9987,21 @@ fn draw_clip(
                 ClipDragMode::TrimRight => return Some(f32::NEG_INFINITY),
                 ClipDragMode::Move => {
                     let total_dt = total_dx / pps;
-                    return Some(-(os + total_dt));
+                    // Pre-clamp the target start to 0 here (instead of
+                    // in the caller) and bias the encoding by
+                    // MOVE_DRAG_BIAS so the returned value stays
+                    // STRICTLY negative — even when the user has
+                    // dragged the cursor far enough left that
+                    // `os + total_dt <= 0`. Without the clamp+bias,
+                    // crossing t=0 made `-(os+total_dt)` turn
+                    // non-negative, which the caller's
+                    // `else if clicked < 0.0` test rejected, so the
+                    // drag silently degraded into a click and the
+                    // user lost their grip on the clip at the very
+                    // left edge. Encoding contract is documented next
+                    // to the constant.
+                    let target_start = (os + total_dt).max(0.0);
+                    return Some(-target_start - MOVE_DRAG_BIAS);
                 }
             }
         }
@@ -10134,8 +10241,18 @@ fn draw_audio_clip(
     let resp = ui.interact(bar_rect, id, sense);
 
     let hover_pos = ui.input(|i| i.pointer.hover_pos());
-    let near_left_edge = hover_pos.map(|p| (p.x - bar_rect.min.x).abs() < 5.0).unwrap_or(false);
-    let near_right_edge = hover_pos.map(|p| (p.x - bar_rect.max.x).abs() < 5.0).unwrap_or(false);
+    // Match `draw_clip`: only treat the visible bar edge as a logical
+    // clip edge when the bar wasn't clipped against the viewport. We
+    // recompute it here cheaply from the *_full values that are still
+    // in scope. Without this, audio clips scrolled partially off the
+    // left of the viewport had the same un-grabbable-near-edge bug
+    // the video-clip drag fix addresses.
+    let visible_left_is_logical = x_start_full >= track_left - 0.5;
+    let visible_right_is_logical = x_end_full <= track_right + 0.5;
+    let near_left_edge = visible_left_is_logical
+        && hover_pos.map(|p| (p.x - bar_rect.min.x).abs() < 5.0).unwrap_or(false);
+    let near_right_edge = visible_right_is_logical
+        && hover_pos.map(|p| (p.x - bar_rect.max.x).abs() < 5.0).unwrap_or(false);
 
     if resp.hovered() && !locked {
         if near_left_edge || near_right_edge {
@@ -10161,9 +10278,11 @@ fn draw_audio_clip(
             .input(|i| i.pointer.press_origin())
             .map(|p| p.x)
             .unwrap_or(bar_rect.center().x);
-        let mode = if (press_x - bar_rect.min.x).abs() < 6.0 {
+        // See draw_clip's matching block for why the visibility guards
+        // are required.
+        let mode = if visible_left_is_logical && (press_x - bar_rect.min.x).abs() < 6.0 {
             ClipDragMode::TrimLeft
-        } else if (press_x - bar_rect.max.x).abs() < 6.0 {
+        } else if visible_right_is_logical && (press_x - bar_rect.max.x).abs() < 6.0 {
             ClipDragMode::TrimRight
         } else {
             ClipDragMode::Move
@@ -10190,7 +10309,11 @@ fn draw_audio_clip(
             return match mode {
                 ClipDragMode::TrimLeft => Some(f32::INFINITY),
                 ClipDragMode::TrimRight => Some(f32::NEG_INFINITY),
-                ClipDragMode::Move => Some(-(os + total_dt)),
+                ClipDragMode::Move => {
+                    // See draw_clip for why we clamp+bias the encoding.
+                    let target_start = (os + total_dt).max(0.0);
+                    Some(-target_start - MOVE_DRAG_BIAS)
+                }
             };
         }
         return Some(clip_start);
