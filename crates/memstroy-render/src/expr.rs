@@ -348,10 +348,16 @@ where
     let half_h = out_h as f32 * 0.5;
 
     // ── Render-frame expressions ─────────────────────────────────────
+    //
+    // Only `rf.pos` (with its modifier offsets) feeds the camera-
+    // centring step below. `rf.zoom` and `rf.rotation_deg` are now
+    // applied EXCLUSIVELY by the `emit_render_frame_camera` pass on
+    // the composite — they no longer leak into element world
+    // positions because every overlay / actor uses the v2 decoupled
+    // formula (see `Scene::migrate_decouple_render_frame`).
     let rf = &scene.render_frame;
     let rf_pos_x_kf = piecewise(&rf.layout, |s: &RenderFrameState| s.pos.x);
     let rf_pos_y_kf = piecewise(&rf.layout, |s: &RenderFrameState| s.pos.y);
-    let rf_zoom_kf = piecewise(&rf.layout, |s: &RenderFrameState| s.zoom.max(1e-4));
     let rf_mods = build_modifier_expr(&rf.modifiers, 0.0);
     let rf_pos_x = if rf_mods.dx_is_zero() {
         rf_pos_x_kf.clone()
@@ -384,25 +390,28 @@ where
             piecewise(&cl.keyframes, |t: &CanvasTransform| t.pos.y),
         )
     } else {
-        // Legacy normalised pos → world pixels relative to render frame.
-        // world_size_x(t) = out_w / rf_zoom(t)
-        // world_x(t) = rf_pos_x(t) + (pos_x(t) - 0.5) * world_size_x(t)
+        // ── Legacy normalised pos → world pixels (decoupled from rf) ──
+        //
+        // From scene format_version 2 onwards (see
+        // `Scene::migrate_decouple_render_frame` in
+        // memstroy-core/scene.rs) the legacy `[0..1]` normalised pos
+        // is interpreted against a FIXED reference rectangle of size
+        // `output.resolution` anchored at world (0, 0). The render
+        // frame is now a pure camera viewport — its `pos` / `zoom` /
+        // `rotation` drive the composite centring and the camera pass
+        // below, but they no longer feed into the world-pixel layout
+        // of any element. Result: editing the render frame in the
+        // inspector / on canvas no longer drags every overlay along
+        // (the v1 bug "при изменении параметров области рендера
+        // зачем-то некоторые изменения на холсте каким-то другим
+        // элементам тоже начинают применяться, например тексту").
+        //
+        //     world_x(t) = pos_x(t) * out_w
+        //     world_y(t) = pos_y(t) * out_h
         let pos_x = piecewise(legacy_layout, |s: &S| s.pos()[0]);
         let pos_y = piecewise(legacy_layout, |s: &S| s.pos()[1]);
-        let wx = format!(
-            "(({rfx})+({px}-0.5)*({W}/({rfz})))",
-            rfx = rf_pos_x,
-            px = pos_x,
-            W = out_w as f32,
-            rfz = rf_zoom_kf,
-        );
-        let wy = format!(
-            "(({rfy})+({py}-0.5)*({H}/({rfz})))",
-            rfy = rf_pos_y,
-            py = pos_y,
-            H = out_h as f32,
-            rfz = rf_zoom_kf,
-        );
+        let wx = format!("(({px})*{W:.4})", px = pos_x, W = out_w as f32);
+        let wy = format!("(({py})*{H:.4})", py = pos_y, H = out_h as f32);
         (wx, wy)
     };
 
@@ -821,21 +830,6 @@ fn find_host_actor<'a>(scene: &'a Scene, template: &SkeletonTemplate) -> Option<
 /// form, and inlining keeps the public API single-pass.
 fn host_world_pos(scene: &Scene, host: &Actor) -> (String, String) {
     let [out_w, out_h] = scene.output.resolution;
-    let rf = &scene.render_frame;
-    let rf_pos_x_kf = piecewise(&rf.layout, |s: &RenderFrameState| s.pos.x);
-    let rf_pos_y_kf = piecewise(&rf.layout, |s: &RenderFrameState| s.pos.y);
-    let rf_zoom_kf = piecewise(&rf.layout, |s: &RenderFrameState| s.zoom.max(1e-4));
-    let rf_mods = build_modifier_expr(&rf.modifiers, 0.0);
-    let rf_pos_x = if rf_mods.dx_is_zero() {
-        rf_pos_x_kf.clone()
-    } else {
-        format!("(({})+({}))", rf_pos_x_kf, rf_mods.dx)
-    };
-    let rf_pos_y = if rf_mods.dy_is_zero() {
-        rf_pos_y_kf.clone()
-    } else {
-        format!("(({})+({}))", rf_pos_y_kf, rf_mods.dy)
-    };
 
     if let Some(cl) = scene.canvas_layouts.iter().find(|cl| cl.element_id == host.id) {
         return (
@@ -843,22 +837,18 @@ fn host_world_pos(scene: &Scene, host: &Actor) -> (String, String) {
             piecewise(&cl.keyframes, |t: &CanvasTransform| t.pos.y),
         );
     }
+
+    // ── Legacy normalised pos → world pixels (decoupled from rf) ──
+    //
+    // Mirrors the v2 contract in `build_element_transform`: the host
+    // actor's `[0..1]` normalised `pos` is interpreted against a FIXED
+    // reference rectangle of size `output.resolution` — the live render
+    // frame no longer feeds into world coordinates. See
+    // `Scene::migrate_decouple_render_frame` for the full rationale.
     let pos_x = piecewise(&host.layout, |s: &ActorState| s.pos[0]);
     let pos_y = piecewise(&host.layout, |s: &ActorState| s.pos[1]);
-    let wx = format!(
-        "(({rfx})+({px}-0.5)*({W}/({rfz})))",
-        rfx = rf_pos_x,
-        px = pos_x,
-        W = out_w as f32,
-        rfz = rf_zoom_kf,
-    );
-    let wy = format!(
-        "(({rfy})+({py}-0.5)*({H}/({rfz})))",
-        rfy = rf_pos_y,
-        py = pos_y,
-        H = out_h as f32,
-        rfz = rf_zoom_kf,
-    );
+    let wx = format!("(({px})*{W:.4})", px = pos_x, W = out_w as f32);
+    let wy = format!("(({py})*{H:.4})", py = pos_y, H = out_h as f32);
     (wx, wy)
 }
 
