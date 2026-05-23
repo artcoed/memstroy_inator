@@ -136,6 +136,12 @@ impl Scene {
                 Overlay::Video(v) => backfill_overlay_video(v),
             }
         }
+        // Render frame uses the same animated_params model now that
+        // its inspector has per-param diamond toggles. Existing scene
+        // files saved before the diamonds existed won't have the set
+        // populated even when the layout already varies, so back-fill
+        // it the same way we do for actors / overlays.
+        backfill_render_frame(&mut self.render_frame);
     }
 }
 
@@ -182,6 +188,34 @@ fn backfill_overlay_video(o: &mut VideoOverlay) {
 }
 fn backfill_overlay_text(o: &mut TextOverlay) {
     backfill_overlay_layout(&o.layout, &mut o.animated_params);
+}
+
+fn backfill_render_frame(rf: &mut crate::canvas::RenderFrame) {
+    if rf.layout.len() < 2 {
+        return;
+    }
+    use param_ids::*;
+    let mark = |s: &mut BTreeSet<String>, id: &str, vary: bool| {
+        if vary {
+            s.insert(id.to_string());
+        }
+    };
+    let v = &rf.layout;
+    // POS_X / POS_Y are reused from the actor / overlay param-id
+    // module so the diamond toggle widget can call into the same
+    // helper (`kf_anim::animated_toggle`) without inventing a new
+    // namespace. ROTATION is shared too. The render frame's "scale"
+    // is stored as the inverse of `zoom` in the inspector, but the
+    // animation flag is on the underlying zoom value — that's the
+    // field the keyframes actually carry.
+    mark(&mut rf.animated_params, POS_X,
+         varies(v.iter().map(|kf| kf.value.pos.x)));
+    mark(&mut rf.animated_params, POS_Y,
+         varies(v.iter().map(|kf| kf.value.pos.y)));
+    mark(&mut rf.animated_params, ROTATION,
+         varies(v.iter().map(|kf| kf.value.rotation_deg)));
+    mark(&mut rf.animated_params, SCALE,
+         varies(v.iter().map(|kf| kf.value.zoom)));
 }
 
 fn backfill_overlay_layout(layout: &[Keyframe<OverlayState>], set: &mut BTreeSet<String>) {
@@ -759,6 +793,16 @@ pub enum TextBoxKind {
     /// once per text line at that line's measured width instead of
     /// one rectangle around the whole block.
     Wrap,
+    /// Plate hugs the text **as tightly as possible**: width is the
+    /// max measured glyph-line width with no horizontal padding, and
+    /// height is the total measured text height with no vertical
+    /// padding. Useful when the user wants the background to be a
+    /// minimal halo around the glyphs themselves, distinct from
+    /// `Solid` (which always extends to fill the symmetric padding +
+    /// asymmetric extras and feels "container-shaped"). The user
+    /// explicitly asked for this mode: "режим фона облегающий по
+    /// ширине текста" alongside the existing container-width mode.
+    FitText,
 }
 
 impl Default for TextBoxKind {
