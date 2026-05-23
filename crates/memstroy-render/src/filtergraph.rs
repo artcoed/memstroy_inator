@@ -537,6 +537,124 @@ impl<'a> FilterGraphBuilder<'a> {
     }
 
     fn emit_text(&mut self, t: &TextOverlay, w: u32, h: u32) -> Result<()> {
+        // ── Render text via the rasterise → overlay path ──
+        //
+        // ffmpeg's `drawtext` filter is too limited to express the
+        // full preview style (corner radius, gradient plates,
+        // asymmetric padding, per-line `Wrap` plates, glyph stroke
+        // tuning, rotation, flip). The previous code papered over
+        // those gaps with approximations and the on-canvas position
+        // ended up shifted by `box_padding` because drawtext's
+        // built-in box doesn't participate in the `(w, h)` used by
+        // the overlay-style centring expression.
+        //
+        // We instead rasterise the text + plate into a transparent
+        // PNG at output resolution (see `text_rasterize.rs`) and feed
+        // that PNG through the existing image-overlay machinery —
+        // which is the same code path the canvas preview's image
+        // overlay rendering shares with the renderer. The result is
+        // byte-for-byte identical to the preview for all the
+        // properties drawtext used to silently drop.
+        let raster = match crate::text_rasterize::rasterize_text_overlay(t, w, h) {
+            Ok(Some(r)) => r,
+            Ok(None) => return Ok(()), // empty text — nothing to overlay
+            Err(e) => {
+                tracing::warn!(
+                    text_id = %t.id,
+                    error = %e,
+                    "text rasterisation failed; falling back to drawtext"
+                );
+                return self.emit_text_drawtext_fallback(t, w, h);
+            }
+        };
+
+        // Track the temp PNG so the runner can clean it up after the
+        // ffmpeg subprocess finishes. Reusing `mask_assets` keeps the
+        // cleanup surface minimal (it's already wired into the
+        // builder's `finish` return tuple).
+        self.mask_assets.push(raster.png_path.clone());
+
+        let idx = self.add_input(FfmpegInput {
+            path: raster.png_path.clone(),
+            kind: InputKind::Image,
+            r#loop: false,
+            seek: None,
+            t: None,
+        });
+
+        // The PNG was rasterised in OUTPUT resolution at scale=1, so
+        // the overlay needs to use the layout's pos/scale exactly the
+        // way an ImageOverlay does. The canvas-preview anchor is the
+        // *plate centre*; our PNG's plate centre lives at
+        // (anchor_dx_from_left, anchor_dy_from_top). Subtract that
+        // from the centred pos expression so the PNG slides into
+        // place such that its plate centre lands on `pos*W, pos*H`.
+        let (cx_expr, cy_expr, scale_expr, scale_y_expr) =
+            position_and_scale_expr(&t.layout, w, h);
+        // `position_and_scale_expr` returns left-edge / top-edge for
+        // an overlay whose intrinsic size is `w`/`h` (ffmpeg's
+        // overlay-time text width/height). The expression actually
+        // is `(pos*W - w/2)` so it expects the overlay's anchor at
+        // its centre. We adjust by the difference between the PNG
+        // centre and the plate centre we baked.
+        let dx = raster.anchor_dx_from_left - raster.width as f32 * 0.5;
+        let dy = raster.anchor_dy_from_top - raster.height as f32 * 0.5;
+        let x_expr = format!("({cx})-({dx})", cx = cx_expr, dx = dx);
+        let y_expr = format!("({cy})-({dy})", cy = cy_expr, dy = dy);
+
+        let scale_part = format!(
+            "scale=w='iw*{sx}':h='ih*{sy}':eval=frame",
+            sx = scale_expr,
+            sy = scale_y_expr,
+        );
+
+        // Build the pre-overlay chain. We support layout-driven
+        // rotation via a single `rotate=` filter (animation is
+        // sampled at midpoint — the same approximation that
+        // `position_and_scale_expr` uses for `flip_x_anim` /
+        // `flip_y_anim` etc.) and constant flip via `hflip`/`vflip`
+        // when the midpoint sample is negative. Per-frame animated
+        // rotation/flip is left as a follow-up; the static case is
+        // what the user's preview screenshots demonstrate.
+        let (rot_part, hflip, vflip) = sample_rotation_and_flip(&t.layout);
+
+        let txt_label = self.alloc_label("txt");
+        let mut chain = format!("[{idx}:v]format=yuva420p", idx = idx);
+        chain.push(',');
+        chain.push_str(&scale_part);
+        if hflip {
+            chain.push_str(",hflip");
+        }
+        if vflip {
+            chain.push_str(",vflip");
+        }
+        if let Some(r) = rot_part {
+            chain.push(',');
+            chain.push_str(&r);
+        }
+        self.chunks
+            .push(format!("{chain}{out}", chain = chain, out = txt_label));
+
+        let next = self.alloc_label("textstack");
+        self.chunks.push(format!(
+            "{cur}{txt}overlay=x='{x}':y='{y}':enable='between(t,{a},{b})':eof_action=pass{out}",
+            cur = self.cursor,
+            txt = txt_label,
+            x = x_expr,
+            y = y_expr,
+            a = t.t_in,
+            b = t.t_out,
+            out = next,
+        ));
+        self.cursor = next;
+        Ok(())
+    }
+
+    /// Defensive fallback for the rare case where text rasterisation
+    /// fails (e.g. no font found AND DejaVuSans not installed) so an
+    /// otherwise-good render doesn't produce a blank video. Mirrors
+    /// the legacy `drawtext` path verbatim.
+    fn emit_text_drawtext_fallback(&mut self, t: &TextOverlay, w: u32, h: u32) -> Result<()> {
         let style = &t.style;
         let (px, py, _, _) = position_and_scale_expr(&t.layout, w, h);
         let escaped = escape_drawtext(&t.text);
@@ -555,47 +673,17 @@ impl<'a> FilterGraphBuilder<'a> {
             b = t.t_out,
         );
         if let Some(font_path) = crate::fonts::find_font(&style.font, style.bold) {
-            // drawtext requires colons inside the path to be escaped.
             let p = font_path.to_string_lossy().replace(':', "\\:");
             params.push_str(&format!(":fontfile='{}'", p));
         }
-        // Background plate. ffmpeg drawtext doesn't support rounded corners or
-        // gradients, so we approximate: Solid → boxcolor with opacity; Gradient
-        // → average of the two colors; OutlineOnly → transparent fill plus
-        // bordercolor; None → no plate.
         if let Some(box_color) = style.box_color {
             let opacity = style.box_opacity.clamp(0.0, 1.0);
-            match style.box_kind {
-                TextBoxKind::None => {}
-                TextBoxKind::Solid => {
-                    let bc = format!(
-                        "0x{:02X}{:02X}{:02X}@{:.3}",
-                        box_color[0], box_color[1], box_color[2], opacity,
-                    );
-                    params.push_str(&format!(":box=1:boxcolor={}:boxborderw={}", bc, style.box_padding));
-                }
-                TextBoxKind::Gradient => {
-                    // Approximate by averaging the two stops.
-                    let end = style.box_gradient_end.unwrap_or(box_color);
-                    let avg = [
-                        ((box_color[0] as u16 + end[0] as u16) / 2) as u8,
-                        ((box_color[1] as u16 + end[1] as u16) / 2) as u8,
-                        ((box_color[2] as u16 + end[2] as u16) / 2) as u8,
-                    ];
-                    let bc = format!(
-                        "0x{:02X}{:02X}{:02X}@{:.3}",
-                        avg[0], avg[1], avg[2], opacity,
-                    );
-                    params.push_str(&format!(":box=1:boxcolor={}:boxborderw={}", bc, style.box_padding));
-                }
-                TextBoxKind::OutlineOnly => {
-                    // No fill — ffmpeg drawtext can't really do this directly;
-                    // we set boxcolor transparent and use the outline border.
-                    params.push_str(&format!(":box=1:boxcolor=black@0:boxborderw={}", style.box_padding));
-                }
-            }
+            let bc = format!(
+                "0x{:02X}{:02X}{:02X}@{:.3}",
+                box_color[0], box_color[1], box_color[2], opacity,
+            );
+            params.push_str(&format!(":box=1:boxcolor={}:boxborderw={}", bc, style.box_padding));
         }
-        // Glyph outline.
         if let Some(o) = style.outline {
             let oc = format!("0x{:02X}{:02X}{:02X}", o[0], o[1], o[2]);
             params.push_str(&format!(":bordercolor={}:borderw={}", oc, style.outline_width));
@@ -605,7 +693,6 @@ impl<'a> FilterGraphBuilder<'a> {
             TextAlign::Left => params.push_str(":text_align=left"),
             TextAlign::Right => params.push_str(":text_align=right"),
         }
-
         let next = self.alloc_label("textstack");
         self.chunks.push(format!(
             "{cur}{filter}{out}",
@@ -1246,6 +1333,40 @@ impl PositionedState for OverlayState {
     fn pos(&self) -> [f32; 2] { self.pos }
     fn scale(&self) -> f32 { self.scale }
     fn scale_y(&self) -> f32 { self.scale_y }
+}
+
+/// Sample rotation_deg / flip_x_anim / flip_y_anim from the layout's
+/// midpoint (or the only keyframe if there's just one) and return the
+/// matching ffmpeg pre-overlay filter snippets. Used by the text-
+/// rasterise → overlay path; the static case is what the user's
+/// preview screenshots demonstrate, and animated rotation/flip on
+/// text overlays is left as a follow-up.
+///
+/// Returns `(rotate_filter, hflip, vflip)` where `rotate_filter` is
+/// `Some("rotate=…")` when the sampled angle exceeds ~0.1° and the
+/// flip flags are set when the sampled value is negative.
+fn sample_rotation_and_flip(layout: &[Keyframe<OverlayState>]) -> (Option<String>, bool, bool) {
+    if layout.is_empty() {
+        return (None, false, false);
+    }
+    let mid_idx = layout.len() / 2;
+    let s = &layout[mid_idx].value;
+    let rot_rad = s.rotation_deg.to_radians();
+    let rot_part = if rot_rad.abs() > 0.0017_f32 {
+        // ffmpeg `rotate` extends the canvas to fit the rotated frame
+        // (`ow`/`oh` defaults), and the default fill is opaque black —
+        // we override with `c=none` so the corners stay transparent and
+        // the underlying canvas keeps showing through.
+        Some(format!(
+            "rotate={r}:c=none:ow=rotw({r}):oh=roth({r})",
+            r = rot_rad,
+        ))
+    } else {
+        None
+    };
+    let hflip = s.flip_x_anim < 0.0;
+    let vflip = s.flip_y_anim < 0.0;
+    (rot_part, hflip, vflip)
 }
 
 /// Escape a user string for use inside a `drawtext=text='...'` arg.

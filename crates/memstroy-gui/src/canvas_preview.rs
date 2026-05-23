@@ -1821,15 +1821,26 @@ fn draw_text_overlay(
     let rotation_rad = ov_state.rotation_deg.to_radians();
     let rotated = rotation_rad.abs() > 0.001;
 
-    // Logical font family: "Monospace" → bundled mono font, anything
-    // else → bundled proportional. Real custom-font loading still needs
-    // bundled TTFs (deferred); the field is kept so existing scenes
-    // round-trip unchanged.
+    // Logical font family resolution:
+    //   * "Monospace" / "Courier" / "Hack" → bundled monospace family.
+    //   * "Default" / "Proportional"      → bundled proportional family.
+    //   * Anything else                    → ensure the matching system
+    //     TTF is loaded (lazy, idempotent) and reference it via
+    //     `FontFamily::Name(<family>)`. If the load fails (no TTF on
+    //     disk or parse error) we fall back to Proportional so the
+    //     glyphs still render in *some* font instead of disappearing.
     let family = if style.font.eq_ignore_ascii_case("Monospace")
         || style.font.eq_ignore_ascii_case("Courier")
         || style.font.eq_ignore_ascii_case("Hack")
     {
         egui::FontFamily::Monospace
+    } else if style.font.eq_ignore_ascii_case("Default")
+        || style.font.eq_ignore_ascii_case("Proportional")
+        || style.font.is_empty()
+    {
+        egui::FontFamily::Proportional
+    } else if crate::system_fonts::ensure_font_loaded(painter.ctx(), &style.font) {
+        egui::FontFamily::Name(style.font.clone().into())
     } else {
         egui::FontFamily::Proportional
     };
@@ -1888,14 +1899,89 @@ fn draw_text_overlay(
     let alpha_factor = match display_mode { DisplayMode::Active => 1.0, _ => 0.5 };
     let plate_opacity = style.box_opacity.clamp(0.0, 1.0) * ov_state.opacity * alpha_factor;
 
-    // Helper: rotate a point around `center_pos` by `rotation_rad`.
-    let rotate = |p: Pos2| -> Pos2 {
-        if !rotated { return p; }
-        let dx = p.x - center_pos.x;
-        let dy = p.y - center_pos.y;
-        let c = rotation_rad.cos();
-        let s = rotation_rad.sin();
-        Pos2::new(center_pos.x + dx * c - dy * s, center_pos.y + dx * s + dy * c)
+    // Flip channels — passed through to `paint_text_line_flipped` so
+    // each line's glyph quads get mirrored around the row centre when
+    // the user pulls the Flip X / Flip Y slider negative. Mirrors the
+    // semantics already in place for actor / image overlays.
+    let flip_x = ov_state.flip_x_anim < 0.0;
+    let flip_y = ov_state.flip_y_anim < 0.0;
+    // Combined screen-space transform for plate corners: first mirror
+    // around `center_pos`, then rotate around the same pivot. Glyph
+    // text uses an equivalent transform inside `paint_text_line_flipped`,
+    // so the plate and the text always travel together — that is what
+    // closes the "reflection should rotate the background like an
+    // image" gap the user reported.
+    let cos_r = rotation_rad.cos();
+    let sin_r = rotation_rad.sin();
+    let xform_pt = |p: Pos2| -> Pos2 {
+        let mut dx = p.x - center_pos.x;
+        let mut dy = p.y - center_pos.y;
+        if flip_x { dx = -dx; }
+        if flip_y { dy = -dy; }
+        if !rotated {
+            return Pos2::new(center_pos.x + dx, center_pos.y + dy);
+        }
+        Pos2::new(
+            center_pos.x + dx * cos_r - dy * sin_r,
+            center_pos.y + dx * sin_r + dy * cos_r,
+        )
+    };
+    // True when *anything* (rotation or flip) means we must draw the
+    // plate as a polygon rather than as an axis-aligned `rect_filled`.
+    let needs_polygon_plate = rotated || flip_x || flip_y;
+
+    // Per-line plate rects (used for `TextBoxKind::Wrap`). Each rect
+    // hugs its own line's width while sharing the block's vertical
+    // padding, so consecutive lines get touching plates with subtly
+    // different widths — the look the user requested in
+    // "неравномерный фон должен в другом режиме".
+    let line_plate_rects: Vec<Rect> = if matches!(style.box_kind, TextBoxKind::Wrap) {
+        let mut out = Vec::with_capacity(galleys.len());
+        let mut y_top = plate_rect.min.y;
+        for galley in &galleys {
+            let line_w = galley.size().x;
+            let line_total_w = line_w + padding * 2.0;
+            let half = line_total_w * 0.5;
+            // Per-line horizontal anchor follows the text alignment so
+            // the plate sits under the line wherever the line itself
+            // is drawn (Left → flush left of the block, Right → flush
+            // right, Center → centred). Asymmetric L/R extras still
+            // bleed onto the line's left/right edge so the user can
+            // make all per-line plates wider on one side at once.
+            let line_center_x = match style.align {
+                TextAlign::Left => plate_rect.min.x + padding + line_w * 0.5,
+                TextAlign::Right => plate_rect.max.x - padding - line_w * 0.5,
+                TextAlign::Center => center_pos.x,
+            };
+            let lp = Rect::from_min_max(
+                Pos2::new(line_center_x - half - pad_extra_l, y_top),
+                Pos2::new(line_center_x + half + pad_extra_r, y_top + line_h + padding * 0.0),
+            );
+            // Each line plate height = line_h + small vertical pad
+            // so neighbouring lines visually touch but the plate
+            // still has breathing room. We use 0 vertical extension
+            // here because consecutive lines already share boundaries;
+            // the block's outer top/bottom padding is added below.
+            out.push(lp);
+            y_top += line_h;
+        }
+        // Apply the block's top/bottom padding to the first/last
+        // plate so the block as a whole looks padded vertically.
+        if let (Some(first), Some(last)) =
+            (out.first_mut().map(|r| *r), out.last_mut().map(|r| *r))
+        {
+            let first_idx = 0;
+            let last_idx = out.len() - 1;
+            let mut f = first;
+            f.min.y -= padding;
+            out[first_idx] = f;
+            let mut l = last;
+            l.max.y += padding;
+            out[last_idx] = l;
+        }
+        out
+    } else {
+        Vec::new()
     };
 
     // ─── Plate background ────────────────────────────────────────
@@ -1905,72 +1991,91 @@ fn draw_text_overlay(
             (plate_opacity * 255.0) as u8,
         );
 
-        if rotated {
-            // Rotated plate: draw as a 4-vertex convex polygon. Rounded
-            // corners and gradients are deliberately dropped here — they
-            // are not worth approximating in screen space when rotated.
-            if !matches!(style.box_kind, TextBoxKind::None | TextBoxKind::OutlineOnly) {
-                let pts = vec![
-                    rotate(plate_rect.left_top()),
-                    rotate(plate_rect.right_top()),
-                    rotate(plate_rect.right_bottom()),
-                    rotate(plate_rect.left_bottom()),
-                ];
-                painter.add(egui::Shape::convex_polygon(pts, primary, Stroke::NONE));
-            }
-
-            // Plate border (rotated)
-            if style.box_outline_width > 0.0 || matches!(style.box_kind, TextBoxKind::OutlineOnly) {
-                let border_color_rgb = style.box_outline_color.unwrap_or([0, 0, 0]);
-                let border_color = Color32::from_rgba_unmultiplied(
-                    border_color_rgb[0], border_color_rgb[1], border_color_rgb[2],
-                    (plate_opacity * 255.0) as u8,
-                );
-                let bw = if style.box_outline_width > 0.0 {
-                    style.box_outline_width * zoom
-                } else {
-                    2.0
-                };
-                let pts = vec![
-                    rotate(plate_rect.left_top()),
-                    rotate(plate_rect.right_top()),
-                    rotate(plate_rect.right_bottom()),
-                    rotate(plate_rect.left_bottom()),
-                    rotate(plate_rect.left_top()),
-                ];
-                for w in pts.windows(2) {
-                    painter.line_segment([w[0], w[1]], Stroke::new(bw, border_color));
+        // Helper closure: paint one rect's plate fill+border, applying
+        // the rotation+flip transform when needed. Used for both the
+        // single-block plate and (in Wrap mode) each per-line plate.
+        let paint_one_plate = |rect: Rect, kind: TextBoxKind| {
+            if needs_polygon_plate {
+                if !matches!(kind, TextBoxKind::None | TextBoxKind::OutlineOnly) {
+                    let pts = vec![
+                        xform_pt(rect.left_top()),
+                        xform_pt(rect.right_top()),
+                        xform_pt(rect.right_bottom()),
+                        xform_pt(rect.left_bottom()),
+                    ];
+                    painter.add(egui::Shape::convex_polygon(pts, primary, Stroke::NONE));
                 }
-            }
-        } else {
-            match style.box_kind {
-                TextBoxKind::None => {}
-                TextBoxKind::Solid => {
-                    painter.rect_filled(plate_rect, Rounding::same(radius), primary);
-                }
-                TextBoxKind::Gradient => {
-                    let end_color_rgb = style.box_gradient_end.unwrap_or(box_color);
-                    let end = Color32::from_rgba_unmultiplied(
-                        end_color_rgb[0], end_color_rgb[1], end_color_rgb[2],
+                if style.box_outline_width > 0.0
+                    || matches!(kind, TextBoxKind::OutlineOnly)
+                {
+                    let border_color_rgb = style.box_outline_color.unwrap_or([0, 0, 0]);
+                    let border_color = Color32::from_rgba_unmultiplied(
+                        border_color_rgb[0],
+                        border_color_rgb[1],
+                        border_color_rgb[2],
                         (plate_opacity * 255.0) as u8,
                     );
-                    draw_vertical_gradient(painter, plate_rect, radius, primary, end);
+                    let bw = if style.box_outline_width > 0.0 {
+                        style.box_outline_width * zoom
+                    } else {
+                        2.0
+                    };
+                    let pts = vec![
+                        xform_pt(rect.left_top()),
+                        xform_pt(rect.right_top()),
+                        xform_pt(rect.right_bottom()),
+                        xform_pt(rect.left_bottom()),
+                        xform_pt(rect.left_top()),
+                    ];
+                    for w in pts.windows(2) {
+                        painter.line_segment([w[0], w[1]], Stroke::new(bw, border_color));
+                    }
                 }
-                TextBoxKind::OutlineOnly => {}
+            } else {
+                match kind {
+                    TextBoxKind::None => {}
+                    TextBoxKind::Solid | TextBoxKind::Wrap => {
+                        painter.rect_filled(rect, Rounding::same(radius), primary);
+                    }
+                    TextBoxKind::Gradient => {
+                        let end_color_rgb = style.box_gradient_end.unwrap_or(box_color);
+                        let end = Color32::from_rgba_unmultiplied(
+                            end_color_rgb[0],
+                            end_color_rgb[1],
+                            end_color_rgb[2],
+                            (plate_opacity * 255.0) as u8,
+                        );
+                        draw_vertical_gradient(painter, rect, radius, primary, end);
+                    }
+                    TextBoxKind::OutlineOnly => {}
+                }
+                if style.box_outline_width > 0.0 {
+                    let border_color_rgb = style.box_outline_color.unwrap_or([0, 0, 0]);
+                    let border_color = Color32::from_rgba_unmultiplied(
+                        border_color_rgb[0],
+                        border_color_rgb[1],
+                        border_color_rgb[2],
+                        (plate_opacity * 255.0) as u8,
+                    );
+                    painter.rect_stroke(
+                        rect,
+                        Rounding::same(radius),
+                        Stroke::new(style.box_outline_width * zoom, border_color),
+                    );
+                } else if matches!(kind, TextBoxKind::OutlineOnly) {
+                    painter.rect_stroke(rect, Rounding::same(radius), Stroke::new(2.0, primary));
+                }
             }
+        };
 
-            if style.box_outline_width > 0.0 {
-                let border_color_rgb = style.box_outline_color.unwrap_or([0, 0, 0]);
-                let border_color = Color32::from_rgba_unmultiplied(
-                    border_color_rgb[0], border_color_rgb[1], border_color_rgb[2],
-                    (plate_opacity * 255.0) as u8,
-                );
-                painter.rect_stroke(plate_rect, Rounding::same(radius),
-                    Stroke::new(style.box_outline_width * zoom, border_color));
-            } else if matches!(style.box_kind, TextBoxKind::OutlineOnly) {
-                painter.rect_stroke(plate_rect, Rounding::same(radius),
-                    Stroke::new(2.0, primary));
+        if matches!(style.box_kind, TextBoxKind::Wrap) {
+            // Per-line plates. Each behaves like a `Solid` plate at the
+            // line's width.
+            for r in &line_plate_rects {
+                paint_one_plate(*r, TextBoxKind::Wrap);
             }
+        } else {
+            paint_one_plate(plate_rect, style.box_kind);
         }
     }
 
@@ -2043,13 +2148,13 @@ fn draw_text_overlay(
     // ─── Selection border ─────────────────────────────────────────
     let is_selected = state.selection == Selection::Overlay(idx);
     if is_selected {
-        if rotated {
+        if needs_polygon_plate {
             let pts = vec![
-                rotate(plate_rect.left_top()),
-                rotate(plate_rect.right_top()),
-                rotate(plate_rect.right_bottom()),
-                rotate(plate_rect.left_bottom()),
-                rotate(plate_rect.left_top()),
+                xform_pt(plate_rect.left_top()),
+                xform_pt(plate_rect.right_top()),
+                xform_pt(plate_rect.right_bottom()),
+                xform_pt(plate_rect.left_bottom()),
+                xform_pt(plate_rect.left_top()),
             ];
             for w in pts.windows(2) {
                 painter.line_segment([w[0], w[1]], Stroke::new(2.0, COL_SELECTED_BORDER));
@@ -2058,7 +2163,7 @@ fn draw_text_overlay(
             painter.rect_stroke(plate_rect.expand(2.0), Rounding::same(radius + 2.0),
                 Stroke::new(2.0, COL_SELECTED_BORDER));
         }
-    } else if display_mode == DisplayMode::Active && !rotated {
+    } else if display_mode == DisplayMode::Active && !needs_polygon_plate {
         painter.rect_stroke(plate_rect, Rounding::same(radius),
             Stroke::new(0.5, Color32::from_rgba_unmultiplied(120, 200, 140, 60)));
     }
