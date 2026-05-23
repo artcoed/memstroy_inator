@@ -496,6 +496,38 @@ fn hash_effect_kind<H: std::hash::Hasher>(kind: &memstroy_core::EffectKind, h: &
             bits(*right).hash(h);
             bits(*bottom).hash(h);
         }
+        K::Mask { shape, feather, invert } => {
+            bits(*feather).hash(h);
+            invert.hash(h);
+            hash_mask_shape(shape, h);
+        }
+    }
+}
+
+fn hash_mask_shape<H: std::hash::Hasher>(shape: &memstroy_core::MaskShape, h: &mut H) {
+    use memstroy_core::MaskShape as M;
+    use std::hash::Hash;
+    std::mem::discriminant(shape).hash(h);
+    match shape {
+        M::Rect { left, top, right, bottom } => {
+            bits(*left).hash(h);
+            bits(*top).hash(h);
+            bits(*right).hash(h);
+            bits(*bottom).hash(h);
+        }
+        M::Ellipse { cx, cy, rx, ry } => {
+            bits(*cx).hash(h);
+            bits(*cy).hash(h);
+            bits(*rx).hash(h);
+            bits(*ry).hash(h);
+        }
+        M::Polygon { points } => {
+            (points.len() as u32).hash(h);
+            for p in points {
+                bits(p[0]).hash(h);
+                bits(p[1]).hash(h);
+            }
+        }
     }
 }
 
@@ -736,7 +768,50 @@ fn apply_single_effect(
             (*right * intensity).clamp(0.0, 0.49),
             (*bottom * intensity).clamp(0.0, 0.49),
         ),
+        K::Mask { shape, feather, invert } => {
+            apply_mask_color_image(img, shape, *feather, *invert, intensity)
+        }
     }
+}
+
+/// Apply a [`memstroy_core::MaskShape`] to a `ColorImage`'s alpha
+/// channel. Mirrors `image_effects::apply_mask_alpha` but operates on
+/// the live frame buffer used by the video preview pipeline.
+fn apply_mask_color_image(
+    img: &ColorImage,
+    shape: &memstroy_core::MaskShape,
+    feather: f32,
+    invert: bool,
+    intensity: f32,
+) -> ColorImage {
+    let mut out = img.clone();
+    let w = img.size[0];
+    let h = img.size[1];
+    if w == 0 || h == 0 { return out; }
+    let inv_w = 1.0 / (w as f32);
+    let inv_h = 1.0 / (h as f32);
+    let i = intensity.clamp(0.0, 1.0);
+    for y in 0..h {
+        let v = (y as f32 + 0.5) * inv_h;
+        let row = y * w;
+        for x in 0..w {
+            let u = (x as f32 + 0.5) * inv_w;
+            let keep = crate::image_effects::sample_mask_alpha(
+                shape, u, v, feather, invert,
+            );
+            let idx = row + x;
+            if idx < out.pixels.len() {
+                let p = out.pixels[idx];
+                let orig = p.a() as f32;
+                let target = orig * keep;
+                let new_a = (orig + (target - orig) * i).clamp(0.0, 255.0) as u8;
+                out.pixels[idx] = egui::Color32::from_rgba_unmultiplied(
+                    p.r(), p.g(), p.b(), new_a,
+                );
+            }
+        }
+    }
+    out
 }
 
 /// Apply a Crop effect by zeroing the alpha channel outside the visible
