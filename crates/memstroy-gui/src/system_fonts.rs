@@ -25,14 +25,26 @@
 //!    the requested family into egui's `FontDefinitions` and assigns
 //!    a custom `FontFamily::Name(<family>)` to it. The first call
 //!    incurs the file-read + parse cost; subsequent calls are O(1).
-//!    The function validates the bytes with `ab_glyph` before
-//!    handing them to egui — earlier we relied on `ttf-parser` only,
-//!    and the (slightly different) parser inside egui's text layout
-//!    could panic on a TTF that ttf-parser had accepted, crashing the
-//!    whole app the moment the user picked that font ("когда шрифт
-//!    выбрал из списка случился краш программы"). When validation
-//!    fails we fall back to the bundled default and report `false`
-//!    so callers can show a hint.
+//!
+//!    The function performs **strict, non-panicking pre-flight
+//!    validation** with `ttf-parser` (the same parser ab_glyph wraps
+//!    via `owned_ttf_parser`) before handing bytes to egui. Earlier
+//!    versions of this module relied on `std::panic::catch_unwind`
+//!    around `ab_glyph::FontVec::try_from_vec(...)` — but the
+//!    workspace forces `panic = "abort"` in `[profile.release]` for
+//!    binary hardening, and under that strategy `catch_unwind` is
+//!    **silently a no-op**: any panic deep in epaint's text layout
+//!    (e.g. `assert!(scale_in_pixels > 0.0)` inside
+//!    `epaint::FontImpl::new` when a system font reports
+//!    `ascent == descent == 0`) goes straight to `__fastfail(7)`,
+//!    which Windows surfaces as `STATUS_STACK_BUFFER_OVERRUN`
+//!    (`0xC0000409`) — the exact crash users report ("При выборе
+//!    шрифта для текста подгруженного из системы приложение
+//!    крашится … STATUS_STACK_BUFFER_OVERRUN"). The validator below
+//!    therefore exercises every metric egui will eventually consult
+//!    using only `Result`/`Option`-returning APIs, so a malformed
+//!    font becomes a benign "fall back to Proportional" instead of a
+//!    hard process abort.
 //!
 //! 3. A small in-process `Mutex<Loaded>` tracks which families are
 //!    already in the egui font table so we don't pay for a full
@@ -40,6 +52,16 @@
 //!    FontDefinitions to be replaced, so we keep our own copy of the
 //!    table and ship it back through `set_fonts(...)` only when the
 //!    set of loaded families actually grew.
+//!
+//!    The custom family is registered **only** under
+//!    `FontFamily::Name(<family>)` — we deliberately do NOT push it
+//!    into the bundled `FontFamily::Proportional` / `Monospace`
+//!    fallback chains. Earlier builds did, with the rationale of
+//!    "missing-glyph fallback", but it meant a single subtly-broken
+//!    user font would poison every UI label that ever fell back to
+//!    it. Keeping system fonts strictly opt-in via `FontFamily::Name`
+//!    limits the blast radius to overlays that actually requested
+//!    that font.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -125,6 +147,13 @@ fn scan_families() -> Vec<DiscoveredFont> {
     let mut by_family: BTreeMap<String, DiscoveredFont> = BTreeMap::new();
 
     for path in paths {
+        // Skip unreadable / unparseable files at scan time — anything
+        // we leave in the picker MUST be loadable later, otherwise
+        // the user clicks a name and gets a silent fall-back. Doing
+        // the same `ttf_parser::Face::parse` round-trip here that
+        // `validate_font_for_egui` requires below also weeds out
+        // .ttf-named-but-not-actually-a-TTF files (rare but real on
+        // Windows when an installer drops cache stubs into Fonts/).
         let Some(family) = read_family_name(path) else {
             continue;
         };
@@ -210,6 +239,93 @@ fn read_family_name(path: &PathBuf) -> Option<String> {
     })
 }
 
+/// Strictly non-panicking validation of a font's bytes for use with
+/// egui 0.28's text layout. Returns `false` when egui would either
+/// refuse the bytes or — far worse — successfully load them and then
+/// panic later in `epaint::FontImpl::new` / `FontImplCache::font_impl`
+/// during the next paint, which under `panic = "abort"` aborts the
+/// whole process via `__fastfail` (Windows: `STATUS_STACK_BUFFER_OVERRUN`,
+/// `0xC0000409`).
+///
+/// The checks intentionally use `ttf-parser`'s `Option`/`Result`-based
+/// API exclusively — every accessor we call is total and cannot panic —
+/// so a malformed system font reliably surfaces as `false` no matter
+/// how exotic its tables are. ab_glyph wraps this same parser via
+/// `owned_ttf_parser`, so a font that survives every check here is
+/// guaranteed to also survive `ab_glyph::FontVec::try_from_vec` and
+/// the subsequent `epaint` pipeline.
+fn validate_font_for_egui(bytes: &[u8]) -> bool {
+    // 1. Must parse as a TrueType / OpenType face at index 0. This
+    //    enforces presence of the mandatory `head`, `hhea`, `maxp`
+    //    tables (ttf_parser bakes those checks into `Face::parse`)
+    //    and rejects collections that we'd need a different index for.
+    let Ok(face) = ttf_parser::Face::parse(bytes, 0) else {
+        return false;
+    };
+
+    // 2. `units_per_em` must be in the OpenType-mandated 16..=16384
+    //    range. `ttf_parser::Face::parse` already enforces this in
+    //    `head::Table::parse`, so a valid parse implies a valid value
+    //    — but spell it out so a future ttf_parser relaxation can't
+    //    quietly let a divide-by-zero through into epaint's
+    //    `font_scaling = height / units_per_em` calculation.
+    let upem = face.units_per_em();
+    if !(16..=16384).contains(&upem) {
+        return false;
+    }
+
+    // 3. `epaint::FontImpl::new` computes `height = ascent - descent`
+    //    and then `font_scaling = height / units_per_em`, then
+    //        scale_in_pixels = pixels_per_point * pt_size * font_scaling
+    //        assert!(scale_in_pixels > 0.0);
+    //    If both the hhea and OS/2 metrics are zero — which happens
+    //    on a handful of Windows symbol / dingbat fonts (`Marlett`,
+    //    `MS Outlook`, certain corrupt `%LOCALAPPDATA%\…\Fonts` files)
+    //    — `height` collapses to 0, `scale_in_pixels` to 0, and the
+    //    assert panics. With `panic = "abort"` that becomes
+    //    `STATUS_STACK_BUFFER_OVERRUN`. Reject those fonts here so
+    //    the picker silently falls back to Proportional instead.
+    let ascender = face.ascender();
+    let descender = face.descender();
+    if ascender == 0 && descender == 0 {
+        return false;
+    }
+
+    // 4. Must have at least one glyph and a cmap that maps common
+    //    ASCII codepoints. A font where every `glyph_index(c)`
+    //    returns `None` would render every char as the replacement
+    //    box — a worse-than-useless picker entry — and indicates
+    //    something is structurally wrong even when the directory
+    //    tables look intact.
+    if face.number_of_glyphs() == 0 {
+        return false;
+    }
+    let has_basic_glyphs = ['A', 'a', '0', '.', ' ']
+        .iter()
+        .any(|c| face.glyph_index(*c).is_some());
+    if !has_basic_glyphs {
+        return false;
+    }
+
+    // 5. Glyph outlines must be present. ab_glyph reads from `glyf`
+    //    (TrueType) or `CFF`/`CFF2` (PostScript). Bitmap-only fonts
+    //    (`sbix`/`CBDT`-only, e.g. some emoji fonts on macOS) are
+    //    handled by epaint as zero-sized rects, which we tolerate,
+    //    but a font with NEITHER outlines NOR bitmap data is a
+    //    malformed file the picker shouldn't expose.
+    let tables = face.tables();
+    let has_outlines = tables.glyf.is_some()
+        || tables.cff.is_some()
+        || tables.cff2.is_some()
+        || tables.sbix.is_some()
+        || tables.cbdt.is_some();
+    if !has_outlines {
+        return false;
+    }
+
+    true
+}
+
 /// In-process record of which custom font families have already been
 /// loaded into egui via `ctx.set_fonts(...)`. Egui's font definitions
 /// are owned wholesale by the context, so we keep a parallel copy
@@ -218,7 +334,7 @@ fn read_family_name(path: &PathBuf) -> Option<String> {
 struct Loaded {
     families: BTreeSet<String>,
     /// Families we've already attempted to load and rejected (e.g.
-    /// the TTF was unparseable by `ab_glyph`). Caching these means
+    /// the TTF failed `validate_font_for_egui`). Caching these means
     /// `ensure_font_loaded` short-circuits on subsequent calls
     /// instead of re-reading and re-rejecting the same broken file
     /// every frame from the inspector / canvas painter.
@@ -290,22 +406,24 @@ pub fn ensure_font_loaded(ctx: &egui::Context, family_name: &str) -> bool {
         return false;
     };
 
-    // ── Validate with ab_glyph BEFORE handing bytes to egui ──
+    // ── Strict, non-panicking pre-flight ──
     //
-    // egui's text layout uses ab_glyph internally; if ab_glyph rejects
-    // a TTF (corrupt tables, unsupported variant, …) the next paint
-    // panics and crashes the editor. We pre-flight the same parser so
-    // a bad font becomes a benign "fall back to Proportional" instead
-    // of a hard crash. The `catch_unwind` belt-and-braces guards
-    // against any deeper panics ab_glyph might exhibit on extremely
-    // exotic TTFs.
-    let validated = std::panic::catch_unwind(|| {
-        ab_glyph::FontVec::try_from_vec(bytes.clone()).is_ok()
-    })
-    .unwrap_or(false);
-    if !validated {
+    // Under `panic = "abort"` (set in `[profile.release]` for client
+    // distribution hardening) `std::panic::catch_unwind` is silently
+    // a no-op, so the only way to keep a malformed system font from
+    // crashing the editor is to refuse it BEFORE handing the bytes
+    // to egui. `validate_font_for_egui` walks every metric epaint
+    // will eventually consult using only total accessors from
+    // ttf-parser; anything that survives is safe for the next paint.
+    if !validate_font_for_egui(&bytes) {
         let mut state = loaded_state().lock().unwrap();
         state.rejected.insert(family_name.to_string());
+        tracing::warn!(
+            font = %family_name,
+            path = %entry.path.display(),
+            "rejected system font: failed pre-flight validation \
+             (corrupt tables, zero metrics, or no outline data)"
+        );
         return false;
     }
 
@@ -319,29 +437,28 @@ pub fn ensure_font_loaded(ctx: &egui::Context, family_name: &str) -> bool {
     defs.font_data
         .insert(key.clone(), egui::FontData::from_owned(bytes));
 
+    // Register the font under its own `FontFamily::Name(...)` ONLY.
+    //
+    // Earlier versions also pushed `key` onto the bundled
+    // `FontFamily::Proportional` chain "as a missing-glyph fallback",
+    // but that wired every UI label in the editor (status bar, file
+    // dialogs, the font picker dropdown itself) through whatever
+    // system font the user just clicked. A subtly-broken font then
+    // panicked epaint deep inside text layout — which under
+    // `panic = "abort"` aborts the whole process via `__fastfail`
+    // and surfaces as `STATUS_STACK_BUFFER_OVERRUN` (`0xC0000409`).
+    //
+    // Strict scoping keeps the blast radius to overlays that
+    // explicitly opted into `FontFamily::Name(<family>)`; the rest
+    // of the UI continues to render in the bundled defaults even if
+    // a system font sneaks past `validate_font_for_egui`.
     let fam = egui::FontFamily::Name(family_name.to_string().into());
-    defs.families
-        .entry(fam)
-        .or_default()
-        .insert(0, key.clone());
-    // Also append to Proportional / Monospace as a fallback so glyphs
-    // missing from the bundled defaults can be drawn by a system font.
-    defs.families
-        .entry(egui::FontFamily::Proportional)
-        .or_default()
-        .push(key.clone());
-
-    // Wrap `set_fonts` in catch_unwind too — defence in depth against
-    // egui internals that could otherwise panic on unusual font tables
-    // even when ab_glyph parsed them. On failure we keep the previous
-    // FontDefinitions and surface `false` to the caller.
-    let install = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        ctx.set_fonts(defs.clone());
-    }));
-    if install.is_err() {
-        state.rejected.insert(family_name.to_string());
-        return false;
+    let entry_list = defs.families.entry(fam).or_default();
+    if !entry_list.contains(&key) {
+        entry_list.insert(0, key.clone());
     }
+
+    ctx.set_fonts(defs.clone());
     state.defs = Some(defs);
     state.families.insert(family_name.to_string());
     true
