@@ -461,6 +461,7 @@ fn cmd_add_image(args: &[String], scene: &mut Scene) -> Result<(), String> {
         skeleton_attachment: None,
         effects: Vec::new(),
         animated_params: Default::default(),
+        chroma_key: None,
     }));
     Ok(())
 }

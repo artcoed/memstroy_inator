@@ -112,16 +112,43 @@ async fn run_args<F: FnMut(&str)>(args: &[String], on_log: &mut F) -> Result<()>
 
     let mut child = cmd.spawn().with_context(|| format!("spawn {}", bin.display()))?;
 
+    // Keep a sliding window of the last few stderr lines so the error
+    // we surface includes ffmpeg's actual complaint instead of just an
+    // opaque exit code. The previous `ExitStatus(429)`-style errors
+    // gave the user nothing to act on; this tail is what makes the
+    // failure self-diagnosing.
+    const TAIL_LINES: usize = 8;
+    let mut tail: std::collections::VecDeque<String> =
+        std::collections::VecDeque::with_capacity(TAIL_LINES);
+
     let stderr = child.stderr.take().unwrap();
     let mut reader = BufReader::new(stderr).lines();
     while let Some(line) = reader.next_line().await? {
         on_log(&line);
+        if tail.len() == TAIL_LINES {
+            tail.pop_front();
+        }
+        tail.push_back(line);
     }
 
     let status = child.wait().await?;
     if !status.success() {
         warn!(code = status.code(), "ffmpeg exited with non-zero status");
-        return Err(anyhow!("ffmpeg failed: {:?}", status));
+        // The `ExitStatus` Debug impl on Unix prints the raw wait
+        // status (e.g. "ExitStatus(429)") which is meaningless to
+        // most users. Prefer the cooked exit code or signal name when
+        // available, falling back to the raw form only if neither
+        // resolves.
+        let status_str = match status.code() {
+            Some(code) => format!("exit code {code}"),
+            None => format!("{:?}", status),
+        };
+        let tail_str = if tail.is_empty() {
+            String::new()
+        } else {
+            format!(" (last log: {})", tail.iter().cloned().collect::<Vec<_>>().join(" | "))
+        };
+        return Err(anyhow!("ffmpeg failed: {}{}", status_str, tail_str));
     }
     Ok(())
 }
