@@ -1506,8 +1506,32 @@ fn draw_canvas_overlays(
                     );
                     let center = center + centre_offset;
                     let corners_local = [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]];
-                    let (uv_l, uv_r) = if ov_state.flip_x_anim < 0.0 { (1.0, 0.0) } else { (0.0, 1.0) };
-                    let (uv_t, uv_b) = if ov_state.flip_y_anim < 0.0 { (1.0, 0.0) } else { (0.0, 1.0) };
+                    // ── UV inset by crop ──
+                    //
+                    // Without the inset, the on-canvas rectangle was
+                    // shrunk to the cropped extent BUT the full 0..1
+                    // texture was still mapped onto it — so the picture
+                    // got *squished* into a narrower box instead of
+                    // being cropped (the user's "crop compresses
+                    // instead of cuts" report). Mapping the uncropped
+                    // sub-rectangle of the texture to the cropped on-
+                    // canvas rectangle restores true crop semantics:
+                    // pixels outside the crop region are simply not
+                    // shown, the visible pixels keep their aspect ratio.
+                    let uv_l_base = crop_inset[0].clamp(0.0, 0.99);
+                    let uv_t_base = crop_inset[1].clamp(0.0, 0.99);
+                    let uv_r_base = (1.0 - crop_inset[2]).clamp(uv_l_base + 1.0e-3, 1.0);
+                    let uv_b_base = (1.0 - crop_inset[3]).clamp(uv_t_base + 1.0e-3, 1.0);
+                    let (uv_l, uv_r) = if ov_state.flip_x_anim < 0.0 {
+                        (uv_r_base, uv_l_base)
+                    } else {
+                        (uv_l_base, uv_r_base)
+                    };
+                    let (uv_t, uv_b) = if ov_state.flip_y_anim < 0.0 {
+                        (uv_b_base, uv_t_base)
+                    } else {
+                        (uv_t_base, uv_b_base)
+                    };
                     let uv_corners = [
                         Pos2::new(uv_l, uv_t), Pos2::new(uv_r, uv_t),
                         Pos2::new(uv_r, uv_b), Pos2::new(uv_l, uv_b),
@@ -1830,6 +1854,13 @@ fn draw_text_overlay(
         &[0.0]
     };
 
+    // Flip channels — passed through to `paint_text_line_flipped` so
+    // each line's glyph quads get mirrored around the row centre when
+    // the user pulls the Flip X / Flip Y slider negative. Mirrors the
+    // semantics already in place for actor / image overlays.
+    let flip_x = ov_state.flip_x_anim < 0.0;
+    let flip_y = ov_state.flip_y_anim < 0.0;
+
     for (li, galley) in galleys.iter().enumerate() {
         let line_w = galley.size().x;
         let line_x_left = match style.align {
@@ -1849,8 +1880,10 @@ fn draw_text_overlay(
                 for step in 0..n_steps {
                     let theta = (step as f32) / (n_steps as f32) * std::f32::consts::TAU;
                     let off = Vec2::new(theta.cos() * stroke_w, theta.sin() * stroke_w);
-                    paint_text_line_rot(painter, pos + off, &lines[li], font_id.clone(),
-                        stroke_color, italic_skew, rotation_rad, center_pos);
+                    paint_text_line_flipped(
+                        painter, pos + off, &lines[li], font_id.clone(),
+                        stroke_color, rotation_rad, center_pos, flip_x, flip_y,
+                    );
                 }
             }
         }
@@ -1859,8 +1892,10 @@ fn draw_text_overlay(
         // weight on the bundled font.
         for &dx in bold_offsets {
             let p = if dx > 0.0 { pos + Vec2::new(dx, 0.0) } else { pos };
-            paint_text_line_rot(painter, p, &lines[li], font_id.clone(), glyph_color,
-                italic_skew, rotation_rad, center_pos);
+            paint_text_line_flipped(
+                painter, p, &lines[li], font_id.clone(), glyph_color,
+                rotation_rad, center_pos, flip_x, flip_y,
+            );
         }
         y += line_h;
     }
@@ -1905,36 +1940,117 @@ fn draw_text_overlay(
 }
 
 /// Paint a single line of text, optionally rotated around `pivot` by
-/// `rotation_rad`. When rotation is ~0 we fall back to the cheap
-/// `painter.text` call to avoid the galley/TextShape detour.
-fn paint_text_line_rot(
+/// `flip_x` / `flip_y` mirror the rendered glyphs around the line's
+/// own centre when the corresponding flip channel is < 0. egui's
+/// `TextShape` has no per-axis flip field, so to actually mirror the
+/// glyph shapes (not just the layout direction) we build a custom
+/// `Mesh` from the galley's per-row tessellated mesh, then reflect
+/// each vertex's screen position around `row.rect`. UVs are kept the
+/// same — the position flip combined with unchanged texture sampling
+/// is what gives a visually mirrored glyph.
+///
+/// When no flip is requested we fall back to the cheap painter.text
+/// (no rotation) or to TextShape::with_angle (rotation only) paths
+/// to avoid building the per-glyph mesh on every frame.
+#[allow(clippy::too_many_arguments)]
+fn paint_text_line_flipped(
     painter: &egui::Painter,
     pos: Pos2,
     text: &str,
     font_id: egui::FontId,
     color: Color32,
-    _italic_skew: f32,
     rotation_rad: f32,
     pivot: Pos2,
+    flip_x: bool,
+    flip_y: bool,
 ) {
-    if rotation_rad.abs() < 0.001 {
-        painter.text(pos, egui::Align2::LEFT_TOP, text, font_id, color);
+    if !flip_x && !flip_y {
+        if rotation_rad.abs() < 0.001 {
+            painter.text(pos, egui::Align2::LEFT_TOP, text, font_id, color);
+            return;
+        }
+
+        // Rotate the anchor `pos` around `pivot`, then ask egui to render the
+        // glyphs themselves at that rotation via TextShape::with_angle.
+        let dx = pos.x - pivot.x;
+        let dy = pos.y - pivot.y;
+        let c = rotation_rad.cos();
+        let s = rotation_rad.sin();
+        let rotated_pos = Pos2::new(pivot.x + dx * c - dy * s, pivot.y + dx * s + dy * c);
+
+        let job = egui::text::LayoutJob::simple_singleline(text.to_string(), font_id, color);
+        let galley = painter.layout_job(job);
+        let mut shape = egui::epaint::TextShape::new(rotated_pos, galley, color);
+        shape.angle = rotation_rad;
+        painter.add(egui::Shape::Text(shape));
         return;
     }
 
-    // Rotate the anchor `pos` around `pivot`, then ask egui to render the
-    // glyphs themselves at that rotation via TextShape::with_angle.
-    let dx = pos.x - pivot.x;
-    let dy = pos.y - pivot.y;
-    let c = rotation_rad.cos();
-    let s = rotation_rad.sin();
-    let rotated_pos = Pos2::new(pivot.x + dx * c - dy * s, pivot.y + dx * s + dy * c);
-
+    // Flip path: build a custom Mesh where each glyph quad is reflected
+    // around the row's logical rectangle. This mirrors the GLYPH SHAPES
+    // (not just their order) — that's what the user's "Flip" axis means
+    // on actor / image layers, and we want consistent semantics for
+    // text overlays too.
     let job = egui::text::LayoutJob::simple_singleline(text.to_string(), font_id, color);
     let galley = painter.layout_job(job);
-    let mut shape = egui::epaint::TextShape::new(rotated_pos, galley, color);
-    shape.angle = rotation_rad;
-    painter.add(egui::Shape::Text(shape));
+
+    let font_tex_size: [usize; 2] = painter.ctx().fonts(|f| f.font_image_size());
+    let uv_norm = Vec2::new(
+        1.0 / font_tex_size[0].max(1) as f32,
+        1.0 / font_tex_size[1].max(1) as f32,
+    );
+
+    let cos_r = rotation_rad.cos();
+    let sin_r = rotation_rad.sin();
+
+    let mut mesh = egui::Mesh::with_texture(egui::TextureId::default());
+    for row in &galley.rows {
+        if row.visuals.mesh.is_empty() {
+            continue;
+        }
+        let row_rect = row.rect;
+        let row_left = row_rect.min.x;
+        let row_right = row_rect.max.x;
+        let row_top = row_rect.min.y;
+        let row_bottom = row_rect.max.y;
+
+        let idx_offset = mesh.vertices.len() as u32;
+        for &i in &row.visuals.mesh.indices {
+            mesh.indices.push(i + idx_offset);
+        }
+        for vtx in &row.visuals.mesh.vertices {
+            let mut local_x = vtx.pos.x;
+            let mut local_y = vtx.pos.y;
+            if flip_x {
+                local_x = row_right - (local_x - row_left);
+            }
+            if flip_y {
+                local_y = row_bottom - (local_y - row_top);
+            }
+            // Translate to absolute then rotate around pivot.
+            let abs_x = pos.x + local_x;
+            let abs_y = pos.y + local_y;
+            let dx = abs_x - pivot.x;
+            let dy = abs_y - pivot.y;
+            let rx = pivot.x + dx * cos_r - dy * sin_r;
+            let ry = pivot.y + dx * sin_r + dy * cos_r;
+
+            let resolved_color = if vtx.color == Color32::PLACEHOLDER {
+                color
+            } else {
+                vtx.color
+            };
+
+            mesh.vertices.push(egui::epaint::Vertex {
+                pos: Pos2::new(rx, ry),
+                uv: (vtx.uv.to_vec2() * uv_norm).to_pos2(),
+                color: resolved_color,
+            });
+        }
+    }
+    if !mesh.indices.is_empty() {
+        painter.add(egui::Shape::Mesh(mesh));
+    }
 }
 
 /// Apply a per-state opacity factor to a base color.
