@@ -1,4 +1,16 @@
 //! Entry point for the desktop editor.
+//
+// On Windows release builds we suppress the OS-allocated console
+// window: the GUI is a normal end-user app, not a CLI tool, and the
+// flicker of `cmd.exe` opening behind the editor is noisy and
+// confuses non-technical users (it also looks unprofessional in a
+// packaged installer build).
+//
+// Debug builds keep the console so `tracing` output is visible
+// during development; toggling on `not(debug_assertions)` means the
+// console only disappears in `cargo build --release` artefacts —
+// which is exactly what `scripts/package-client.ps1` ships.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
 mod audio_engine;
