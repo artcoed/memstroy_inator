@@ -18,6 +18,7 @@ mod build_info;
 mod canvas_preview;
 mod curve_editor;
 
+mod frame_snapshot;
 mod gpu_preview;
 mod i18n;
 mod image_editor;

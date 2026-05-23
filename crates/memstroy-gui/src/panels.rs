@@ -6600,6 +6600,35 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             add_text_overlay(state);
         }
 
+        // Extract Frame tool — bake the canvas at the current playhead
+        // into a fresh image asset + image overlay layer. Honours the
+        // canvas multi-selection: when the user has Ctrl-clicked /
+        // marquee-selected a subset of layers, only those are
+        // composited (transparent background); otherwise the whole
+        // frame is captured (including the scene background colour).
+        let extract_hover = if !state.canvas_selection.is_empty() {
+            t("Extract selected layers as image at playhead")
+        } else if !matches!(state.selection, Selection::None | Selection::RenderFrame) {
+            t("Extract selected layer as image at playhead")
+        } else {
+            t("Extract current frame as image layer at playhead")
+        };
+        if ui.button(RichText::new("\u{1F4F8}").color(Color32::from_rgb(255, 200, 120)))
+            .on_hover_text(extract_hover)
+            .clicked()
+        {
+            match crate::frame_snapshot::extract_frame_to_image_layer(state) {
+                Ok(_idx) => {
+                    // Status string is set inside the extractor with
+                    // a contextual summary (full frame vs subset, plus
+                    // a count of any layers we had to skip).
+                }
+                Err(e) => {
+                    state.status = format!("\u{274C} {}: {}", t("Extract frame failed"), e);
+                }
+            }
+        }
+
         ui.separator();
 
         // Loop preview toggle
