@@ -156,6 +156,15 @@ $Version = (Select-String -Path "Cargo.toml" -Pattern '^version\s*=\s*"([^"]+)"'
     | Select-Object -First 1).Matches[0].Groups[1].Value
 if ([string]::IsNullOrWhiteSpace($Version)) { $Version = "0.0.0" }
 
+# Inno Setup's `VersionInfoVersion` / `VersionInfoProductVersion`
+# directives expect a 4-part dotted version (Win32 VS_VERSIONINFO
+# format: "major.minor.patch.build"). The workspace version is
+# usually 3-part SemVer ("0.1.0"); pad missing components with "0".
+$VersionParts = @($Version -split '\.')
+while ($VersionParts.Count -lt 4) { $VersionParts += '0' }
+$VersionInfoVersion = ($VersionParts[0..3]) -join '.'
+
+$Year            = (Get-Date).Year
 $AppId           = "{{B5A4F3A2-9A01-4E69-9E2E-MEMSTROYINATOR}}"  # stable GUID for upgrades
 $AppName         = "memstroy-inator"
 $AppPublisher    = "memstroy-inator contributors"
@@ -188,7 +197,16 @@ $IssLines = @(
     "DefaultGroupName=$AppName"
     "OutputDir=$Out"
     "OutputBaseFilename=$InstallerStem"
-    'Compression=lzma2/ultra'
+    # ── Installer compression ───────────────────────────────────────
+    # We deliberately do NOT use `lzma2/ultra`. The combination of an
+    # ultra-LZMA2 self-extracting payload + an unsigned PE looks, to
+    # several AV heuristics (notably Microsoft Defender's Wacatac.B!ml
+    # and Skyhigh's `BehavesLike.ObfuscatedPoly`), exactly like a
+    # crypter / packer artefact, and reliably triggers false
+    # positives on VirusTotal even though the contents are a stock
+    # Rust release binary. `lzma2/normal` keeps installer size within
+    # ~10–15% of ultra while substantially reducing payload entropy.
+    'Compression=lzma2/normal'
     'SolidCompression=yes'
     'WizardStyle=modern'
     'PrivilegesRequired=lowest'
@@ -196,6 +214,19 @@ $IssLines = @(
     'ArchitecturesInstallIn64BitMode=x64'
     'UninstallDisplayName=memstroy-inator'
     "UninstallDisplayIcon={app}\bin\$AppExeName"
+    # ── PE VersionInfo block ─────────────────────────────────────────
+    # Populates the Properties → Details tab of the generated
+    # Setup.exe. A blank VersionInfo block is itself a heuristic
+    # signal for AV ML models ("unsigned PE with no metadata"), so
+    # filling these fields is one of the cheapest ways to cut the
+    # false-positive rate without paying for code-signing.
+    "VersionInfoVersion=$VersionInfoVersion"
+    "VersionInfoProductVersion=$VersionInfoVersion"
+    "VersionInfoCompany=$AppPublisher"
+    "VersionInfoProductName=$AppName"
+    "VersionInfoDescription=$AppName installer"
+    "VersionInfoOriginalFileName=$InstallerStem.exe"
+    "VersionInfoCopyright=Copyright (c) $Year $AppPublisher"
     ''
     '[Languages]'
     'Name: "en"; MessagesFile: "compiler:Default.isl"'
