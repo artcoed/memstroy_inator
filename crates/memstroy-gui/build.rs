@@ -1,24 +1,41 @@
 //! Build script for `memstroy-gui`.
 //!
-//! Bakes two compile-time signals into the binary:
+//! Two responsibilities:
 //!
-//! * **`default_server_url()`** — base URL of the
-//!   `memstroy-assets-server` instance the editor connects to on
-//!   first launch. Set `MEMSTROY_DEFAULT_SERVER_URL` when packaging
-//!   for clients (e.g. `https://assets.your-domain.example`); when
-//!   unset (developer builds), the loopback default
-//!   `http://127.0.0.1:8765` is used.
-//! * **`IS_CLIENT_BUILD`** — `true` iff `MEMSTROY_CLIENT_BUILD` is set
-//!   to a truthy value (`1`, `true`, `yes`, `on`). The runtime uses
-//!   this flag to switch between developer defaults (cwd-relative
-//!   `./assets/`, in-process assets-server bootstrap) and
-//!   client-distribution defaults (per-user cache directory, no
-//!   in-process server — assets come exclusively from the remote one).
+//! 1. **Bake compile-time signals into the binary** via a generated
+//!    `$OUT_DIR/build_info.rs`:
 //!
-//! Both values are emitted into `$OUT_DIR/build_info.rs` and pulled
-//! into the crate via `src/build_info.rs`. The server URL is wrapped
-//! through `obfstr::obfstr!` so it does not appear verbatim in
-//! `strings(1)` on the shipped binary.
+//!    * `default_server_url() -> String` — base URL of the
+//!      `memstroy-assets-server` instance the editor connects to on
+//!      first launch. Set `MEMSTROY_DEFAULT_SERVER_URL` when packaging
+//!      for clients (e.g. `https://assets.your-domain.example`); when
+//!      unset (developer builds), the loopback default
+//!      `http://127.0.0.1:8765` is used.
+//!
+//!      When the `obfuscate-server-url` feature is enabled the URL is
+//!      wrapped through `obfstr::obfstr!` so it does not appear
+//!      verbatim in `strings(1)` over the shipped binary. The feature
+//!      is OFF by default because the XOR-decoder loop it leaves in
+//!      `.text` is one of the patterns AV ML heuristics
+//!      (Microsoft's `Wacatac.B!ml`, Skyhigh's
+//!      `BehavesLike.ObfuscatedPoly`) match on for unsigned PE
+//!      installers, and it provides only trivial defence (anyone
+//!      with a debugger recovers the URL in seconds).
+//!
+//!    * `IS_CLIENT_BUILD` — `true` iff `MEMSTROY_CLIENT_BUILD` is set
+//!      to a truthy value (`1`, `true`, `yes`, `on`). The runtime uses
+//!      this flag to switch between developer defaults
+//!      (cwd-relative `./assets/`, in-process assets-server bootstrap)
+//!      and client-distribution defaults (per-user cache directory,
+//!      no in-process server — assets come exclusively from the
+//!      remote one).
+//!
+//! 2. **On Windows, embed a VS_VERSIONINFO resource** into the linked
+//!    `.exe` via `winresource`. Populating CompanyName / ProductName
+//!    / FileDescription / FileVersion / OriginalFilename eliminates
+//!    a per-binary heuristic signal that AV ML classifiers (notably
+//!    Microsoft Defender's `Wacatac.B!ml`) weight when scoring
+//!    unsigned setups.
 
 use std::env;
 use std::fs;
@@ -28,6 +45,21 @@ fn main() {
     println!("cargo:rerun-if-env-changed=MEMSTROY_DEFAULT_SERVER_URL");
     println!("cargo:rerun-if-env-changed=MEMSTROY_CLIENT_BUILD");
 
+    emit_build_info();
+
+    // Windows-only: embed VS_VERSIONINFO into the produced .exe.
+    // Guarded by `target_os` so cross-builds from non-Windows hosts
+    // for non-Windows targets remain unaffected, and the
+    // `winresource` build-dep only ever resolves on Windows targets
+    // (see the matching `[target.'cfg(windows)'.build-dependencies]`
+    // section in Cargo.toml).
+    #[cfg(target_os = "windows")]
+    embed_windows_version_info();
+}
+
+/// Generate `$OUT_DIR/build_info.rs` with `default_server_url()` and
+/// `IS_CLIENT_BUILD`. Re-included by `src/build_info.rs`.
+fn emit_build_info() {
     let server_url = env::var("MEMSTROY_DEFAULT_SERVER_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:8765".to_string());
 
@@ -36,22 +68,44 @@ fn main() {
         Ok("1") | Ok("true") | Ok("yes") | Ok("on") | Ok("TRUE") | Ok("YES") | Ok("ON"),
     );
 
+    // Cargo exposes enabled features to build scripts as
+    // `CARGO_FEATURE_<UPPERCASED_NAME_WITH_UNDERSCORES>=1`. We use
+    // this to decide which form of `default_server_url()` to emit —
+    // referencing the `obfstr` crate from the generated code only
+    // when the dependency is actually compiled in.
+    let obfuscate = env::var("CARGO_FEATURE_OBFUSCATE_SERVER_URL").is_ok();
+
     // Rust's `Debug` impl for `&str` produces a syntactically valid
     // escaped string literal (with surrounding quotes), which is
     // exactly what we need to splice into a generated source file.
     let url_literal = format!("{:?}", server_url);
 
+    let url_fn = if obfuscate {
+        format!(
+            "// `obfuscate-server-url` feature is ON: route the URL\n\
+             // through `obfstr::obfstr!` so it is XOR-encoded in the\n\
+             // .rdata segment instead of sitting there in plain ASCII.\n\
+             // Decoded once at startup, then cached on `EditorState`.\n\
+             pub fn default_server_url() -> String {{\n\
+            \x20   obfstr::obfstr!({url_literal}).to_string()\n\
+             }}\n",
+        )
+    } else {
+        format!(
+            "// `obfuscate-server-url` feature is OFF: the URL is\n\
+             // emitted as a plain `&'static str`. The XOR-decoder\n\
+             // loop the obfstr path leaves in .text is a known AV\n\
+             // ML heuristic trigger on unsigned installers, so it is\n\
+             // intentionally absent from default release builds.\n\
+             pub fn default_server_url() -> String {{\n\
+            \x20   {url_literal}.to_string()\n\
+             }}\n",
+        )
+    };
+
     let generated = format!(
         "// AUTO-GENERATED by build.rs — do not edit.\n\
-         //\n\
-         // The server URL passes through `obfstr::obfstr!` so its\n\
-         // literal bytes are XOR-encoded in the binary instead of\n\
-         // sitting in the read-only data segment in plain ASCII.\n\
-         // Decoded once at startup, then cached on `EditorState`.\n\
-         pub fn default_server_url() -> String {{\n\
-        \x20   obfstr::obfstr!({url_literal}).to_string()\n\
-         }}\n\
-         \n\
+         {url_fn}\n\
          /// `true` when this binary was produced with\n\
          /// `MEMSTROY_CLIENT_BUILD=1` set in the build environment.\n\
          /// Drives the cwd-vs-cache asset-root choice and whether the\n\
@@ -62,4 +116,69 @@ fn main() {
     let out_dir = env::var("OUT_DIR").expect("OUT_DIR is set by cargo");
     let dest = Path::new(&out_dir).join("build_info.rs");
     fs::write(dest, generated).expect("write build_info.rs");
+}
+
+/// Programmatically build a Win32 VS_VERSIONINFO resource and link it
+/// into the produced `.exe`. Populating these fields is one of the
+/// cheapest ways to lower the AV false-positive rate on unsigned
+/// installers (see crate-level docs).
+///
+/// Best-effort: if `rc.exe` / `windres` is not available on the build
+/// host (rare on real Windows, possible in some containerised CI
+/// images) we emit a `cargo:warning=` and continue — the binary still
+/// links, it just lacks the version resource.
+#[cfg(target_os = "windows")]
+fn embed_windows_version_info() {
+    // Pull version components from cargo. `CARGO_PKG_VERSION_*` are
+    // set by cargo for every build script.
+    let major: u16 = env::var("CARGO_PKG_VERSION_MAJOR")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let minor: u16 = env::var("CARGO_PKG_VERSION_MINOR")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let patch: u16 = env::var("CARGO_PKG_VERSION_PATCH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let build: u16 = 0;
+
+    // VS_VERSIONINFO encodes FILEVERSION / PRODUCTVERSION as a
+    // packed u64: high-to-low 16-bit fields are major / minor /
+    // patch / build. See `WindowsResource::set_version_info`.
+    let packed: u64 = ((major as u64) << 48)
+        | ((minor as u64) << 32)
+        | ((patch as u64) << 16)
+        | (build as u64);
+
+    let pkg_version = env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".to_string());
+
+    let mut res = winresource::WindowsResource::new();
+    res.set("CompanyName", "memstroy-inator contributors");
+    res.set("FileDescription", "memstroy-inator editor");
+    res.set("ProductName", "memstroy-inator");
+    res.set("InternalName", "memstroy-gui");
+    res.set("OriginalFilename", "memstroy-gui.exe");
+    res.set("FileVersion", &pkg_version);
+    res.set("ProductVersion", &pkg_version);
+    res.set(
+        "LegalCopyright",
+        "Copyright (c) memstroy-inator contributors",
+    );
+    res.set_version_info(winresource::VersionInfo::FILEVERSION, packed);
+    res.set_version_info(winresource::VersionInfo::PRODUCTVERSION, packed);
+
+    if let Err(err) = res.compile() {
+        // A missing resource compiler is not fatal — the binary
+        // builds, it just won't have the version block. Surface
+        // the reason so the operator sees it in `cargo build`
+        // output.
+        println!(
+            "cargo:warning=winresource: could not embed VS_VERSIONINFO ({err}); \
+             the produced memstroy-gui.exe will have a blank Properties → Details tab. \
+             Install the Windows SDK (rc.exe) or a MinGW toolchain (windres.exe) to fix."
+        );
+    }
 }
