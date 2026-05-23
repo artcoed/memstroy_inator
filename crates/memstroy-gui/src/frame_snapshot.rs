@@ -444,13 +444,21 @@ fn paint_image_overlay(
     };
 
     // Compute the layer's centre and effective output size.
-    let world_w = (rw as f32) / rf_state.zoom.max(1.0e-3);
-    let world_h = (rh as f32) / rf_state.zoom.max(1.0e-3);
-    let frame_tl_x = rf_state.pos.x - world_w * 0.5;
-    let frame_tl_y = rf_state.pos.y - world_h * 0.5;
+    //
+    // ── World position is decoupled from the live render frame ──
+    //
+    // `pos` is interpreted against a FIXED reference rectangle of size
+    // `render_frame.resolution` anchored at world (0, 0). The render
+    // frame's own pos / zoom / rotation feed into `world_to_output`
+    // below as the camera transform; they never shift the overlay's
+    // world position. This mirrors `canvas_preview` and the FFmpeg
+    // export, so the snapshot, the canvas, and the rendered MP4 all
+    // place this image at the same spot.
+    let world_w = rw as f32;
+    let world_h = rh as f32;
     let world_pos = WorldPos {
-        x: frame_tl_x + ov_state.pos[0] * world_w + mod_delta.dx,
-        y: frame_tl_y + ov_state.pos[1] * world_h + mod_delta.dy,
+        x: ov_state.pos[0] * world_w + mod_delta.dx,
+        y: ov_state.pos[1] * world_h + mod_delta.dy,
     };
     let (cx, cy) = world_to_output(world_pos, rf_state, rw, rh);
 
@@ -574,14 +582,17 @@ fn paint_actor(
     // attachments are an advanced editor feature and the snapshot
     // can fall back to the keyframed centre.
     let world_pos = element_world_pos(scene, &actor.id, t).unwrap_or_else(|| {
-        let world_w = (rw as f32) / rf_state.zoom.max(1.0e-3);
-        let world_h = (rh as f32) / rf_state.zoom.max(1.0e-3);
-        let frame_tl_x = rf_state.pos.x - world_w * 0.5;
-        let frame_tl_y = rf_state.pos.y - world_h * 0.5;
+        // Decoupled-from-rf legacy fallback: `pos` is a `[0..1]`
+        // vector against a FIXED reference rectangle of size
+        // `render_frame.resolution`. See
+        // `canvas_preview::get_element_world_pos` and
+        // `Scene::migrate_decouple_render_frame` for the v2 contract.
+        let world_w = rw as f32;
+        let world_h = rh as f32;
         let layout_state = keyframe::sample(&actor.layout, t).unwrap_or_default();
         WorldPos {
-            x: frame_tl_x + layout_state.pos[0] * world_w,
-            y: frame_tl_y + layout_state.pos[1] * world_h,
+            x: layout_state.pos[0] * world_w,
+            y: layout_state.pos[1] * world_h,
         }
     });
     let world_pos_with_mod = WorldPos {
@@ -993,13 +1004,13 @@ fn paint_text_overlay(
     }
 
     // Anchor the text-block centre at the user-space pos.
-    let world_w = (rw as f32) / rf_state.zoom.max(1.0e-3);
-    let world_h = (rh as f32) / rf_state.zoom.max(1.0e-3);
-    let frame_tl_x = rf_state.pos.x - world_w * 0.5;
-    let frame_tl_y = rf_state.pos.y - world_h * 0.5;
+    //
+    // Decoupled-from-rf world position (see `Scene::migrate_decouple_render_frame`).
+    let world_w = rw as f32;
+    let world_h = rh as f32;
     let world_pos = WorldPos {
-        x: frame_tl_x + ov_state.pos[0] * world_w + mod_delta.dx,
-        y: frame_tl_y + ov_state.pos[1] * world_h + mod_delta.dy,
+        x: ov_state.pos[0] * world_w + mod_delta.dx,
+        y: ov_state.pos[1] * world_h + mod_delta.dy,
     };
     let (cx, cy) = world_to_output(world_pos, rf_state, rw, rh);
 
@@ -1112,13 +1123,15 @@ fn paint_video_overlay(
         None => return false,
     };
 
-    let world_w = (rw as f32) / rf_state.zoom.max(1.0e-3);
-    let world_h = (rh as f32) / rf_state.zoom.max(1.0e-3);
-    let frame_tl_x = rf_state.pos.x - world_w * 0.5;
-    let frame_tl_y = rf_state.pos.y - world_h * 0.5;
+    // Decoupled-from-rf world position. The render frame is a pure
+    // camera viewport — its pos / zoom / rotation drive
+    // `world_to_output` below as the camera transform but never shift
+    // this overlay's authored world coordinate.
+    let world_w = rw as f32;
+    let world_h = rh as f32;
     let world_pos = WorldPos {
-        x: frame_tl_x + ov_state.pos[0] * world_w + mod_delta.dx,
-        y: frame_tl_y + ov_state.pos[1] * world_h + mod_delta.dy,
+        x: ov_state.pos[0] * world_w + mod_delta.dx,
+        y: ov_state.pos[1] * world_h + mod_delta.dy,
     };
     let (cx, cy) = world_to_output(world_pos, rf_state, rw, rh);
 
