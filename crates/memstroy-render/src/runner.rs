@@ -3,7 +3,7 @@ use std::process::Stdio;
 
 use anyhow::{anyhow, Context, Result};
 use memstroy_core::Scene;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tracing::{info, warn};
 
@@ -122,14 +122,22 @@ async fn run_args<F: FnMut(&str)>(args: &[String], on_log: &mut F) -> Result<()>
         std::collections::VecDeque::with_capacity(TAIL_LINES);
 
     let stderr = child.stderr.take().unwrap();
-    let mut reader = BufReader::new(stderr).lines();
-    while let Some(line) = reader.next_line().await? {
-        on_log(&line);
+    // ffmpeg writes its periodic progress line ("frame=  120 fps=…
+    // time=00:00:04.00 bitrate=…") and overwrites it in-place with a
+    // bare carriage return — only emitting `\n` between phases. The
+    // previous `BufReader::lines()` reader only fired on `\n`, which
+    // meant the GUI saw zero progress events for the entire encode
+    // and the bar jumped 0% → 100% at the end. We instead read raw
+    // bytes and split on EITHER `\r` or `\n`, which surfaces every
+    // progress refresh as its own log line.
+    read_stderr_progress(stderr, |line| {
+        on_log(line);
         if tail.len() == TAIL_LINES {
             tail.pop_front();
         }
-        tail.push_back(line);
-    }
+        tail.push_back(line.to_string());
+    })
+    .await?;
 
     let status = child.wait().await?;
     if !status.success() {
@@ -151,4 +159,58 @@ async fn run_args<F: FnMut(&str)>(args: &[String], on_log: &mut F) -> Result<()>
         return Err(anyhow!("ffmpeg failed: {}{}", status_str, tail_str));
     }
     Ok(())
+}
+
+/// Stream ffmpeg's stderr, splitting on EITHER `\r` or `\n`.
+///
+/// ffmpeg's progress line ("frame=  120 fps= 30 q=28.0 size=… time=…
+/// bitrate=… speed=…") is repeatedly overwritten using a bare
+/// carriage return — never `\n` until the encode actually transitions
+/// to a new phase. This means a `BufReader::lines()` reader buffers
+/// the entire encode into a single line and `on_log` is invoked
+/// exactly once at the end, leaving the GUI's progress bar stuck
+/// at 0%. Splitting on both `\r` and `\n` surfaces every refresh
+/// as its own logical "line", letting the GUI parse the embedded
+/// `time=` token and update the bar at sub-second cadence.
+///
+/// `R: AsyncRead + Unpin` keeps the function generic over `tokio`'s
+/// `ChildStderr` and `Stdin`/test streams without committing to a
+/// concrete type.
+async fn read_stderr_progress<R, F>(mut reader: R, mut emit: F) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    F: FnMut(&str),
+{
+    let mut buf = [0u8; 1024];
+    let mut acc: Vec<u8> = Vec::with_capacity(2048);
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            // Flush any trailing partial line so the very last
+            // progress refresh of a clean encode is still emitted.
+            if !acc.is_empty() {
+                let s = String::from_utf8_lossy(&acc);
+                let trimmed = s.trim();
+                if !trimmed.is_empty() {
+                    emit(trimmed);
+                }
+                acc.clear();
+            }
+            return Ok(());
+        }
+        for &b in &buf[..n] {
+            if b == b'\r' || b == b'\n' {
+                if !acc.is_empty() {
+                    let s = String::from_utf8_lossy(&acc);
+                    let trimmed = s.trim();
+                    if !trimmed.is_empty() {
+                        emit(trimmed);
+                    }
+                    acc.clear();
+                }
+            } else {
+                acc.push(b);
+            }
+        }
+    }
 }

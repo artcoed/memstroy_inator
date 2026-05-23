@@ -752,6 +752,13 @@ pub enum TextBoxKind {
     Gradient,
     /// Only an outlined rectangle, no fill.
     OutlineOnly,
+    /// Per-line solid plates that hug each line of text individually
+    /// (uneven background, mimicking title overlays where each row gets
+    /// its own width). The plate uses the same `box_color`,
+    /// `box_padding` and `box_corner_radius` as `Solid`, but is drawn
+    /// once per text line at that line's measured width instead of
+    /// one rectangle around the whole block.
+    Wrap,
 }
 
 impl Default for TextBoxKind {

@@ -57,3 +57,9 @@ arboard = { version = "3", default-features = false, features = ["image-data"] }
 # binary under a debugger — but it eliminates the trivial
 # "grep the artefact" attack and matches Level-1 hardening.
 obfstr = "0.4"
+# TTF/OTF face name extraction. Used by `system_fonts.rs` to read the
+# `name` table of every TTF/OTF on disk so the font picker / canvas
+# preview show real family names ("Arial", "Inter", …) instead of just
+# the file stem ("ARIALBD"). `ttf-parser` is already transitively
+# present in the egui graph, so the binary cost is essentially zero.
+ttf-parser = "0.25"

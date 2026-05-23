@@ -251,20 +251,69 @@ impl App {
                     self.state.refreshing = false;
                     self.state.status = format!("\u{274C} Refresh failed: {}", e);
                 }
-                JobEvent::WebSearchFinished(res) => {
+                JobEvent::WebSearchFinished {
+                    page_offset,
+                    result,
+                } => {
                     self.state.web_image_search.searching = false;
-                    match res {
-                        Ok(hits) => {
+                    match result {
+                        Ok((mut hits, next_offset)) => {
+                            // Reject responses that come back at the
+                            // same start offset we already loaded —
+                            // happens when DDG echoes the same `s` in
+                            // its `next` field at end-of-results, and
+                            // would otherwise grow `results` forever.
                             let n = hits.len();
-                            self.state.web_image_search.results = hits;
-                            self.state.web_image_search.status = if n == 0 {
-                                "\u{1F50D} No results.".to_string()
+                            let is_first_page = page_offset == 0;
+                            if is_first_page {
+                                self.state.web_image_search.results = hits;
                             } else {
+                                // Append, but keep the total bounded.
+                                let cap = crate::web_image_search::MAX_TOTAL_RESULTS;
+                                let cur = self.state.web_image_search.results.len();
+                                if cur < cap {
+                                    let take = (cap - cur).min(hits.len());
+                                    if take < hits.len() {
+                                        hits.truncate(take);
+                                    }
+                                    self.state
+                                        .web_image_search
+                                        .results
+                                        .extend(hits);
+                                }
+                            }
+                            // Advance the cursor only if it differs
+                            // from the request's offset; otherwise we
+                            // treat it as "no more pages".
+                            self.state.web_image_search.next_offset = next_offset
+                                .filter(|&o| o != page_offset);
+                            if !is_first_page {
+                                self.state.web_image_search.page_count += 1;
+                            }
+                            self.state.web_image_search.status = if n == 0 {
+                                if is_first_page {
+                                    "\u{1F50D} No results.".to_string()
+                                } else {
+                                    "(no more results)".to_string()
+                                }
+                            } else if is_first_page {
                                 format!("\u{2705} Got {} result(s).", n)
+                            } else {
+                                format!(
+                                    "\u{2795} +{} (total {})",
+                                    n,
+                                    self.state.web_image_search.results.len()
+                                )
                             };
                         }
                         Err(e) => {
-                            self.state.web_image_search.results.clear();
+                            if page_offset == 0 {
+                                self.state.web_image_search.results.clear();
+                            }
+                            // On a paged-fetch error keep existing
+                            // results but stop offering "Load more"
+                            // for this query.
+                            self.state.web_image_search.next_offset = None;
                             self.state.web_image_search.status =
                                 format!("\u{274C} {}", e);
                         }
@@ -1679,6 +1728,148 @@ impl App {
 
     // ─── AUTO-SAVE / RECOVERY ────────────────────────────────────────
 
+    /// Render the floating "Render progress" window.
+    ///
+    /// Surfaces a big progress bar, elapsed time, the most recent
+    /// ffmpeg status line, and a clear done / failed indicator. Was
+    /// added because the user reported "должен быть виден прогресс
+    /// рендера" — the previous status-bar progress bar was easy to
+    /// miss and, due to the ffmpeg `\r`-line bug fixed in
+    /// `runner.rs::read_stderr_progress`, never updated until the
+    /// encode finished anyway.
+    ///
+    /// The window auto-opens when a render starts (i.e.
+    /// `state.render_progress` is `Some(_)`), shows the live `progress`
+    /// fraction parsed from ffmpeg's stderr, and becomes a "result
+    /// dialog" with a Close button once the render completes / fails.
+    /// Closing clears `state.render_progress`.
+    fn show_render_progress_window(&mut self, ctx: &egui::Context) {
+        // Snapshot the progress so we don't hold an immutable borrow
+        // through the whole closure (we need to reassign on dismiss).
+        let Some(rp) = self.state.render_progress.clone() else {
+            return;
+        };
+        let elapsed = rp.started.elapsed();
+        let elapsed_secs = elapsed.as_secs_f32();
+        let progress = rp.progress.clamp(0.0, 1.0);
+        let mut dismiss = false;
+
+        let title = if rp.error.is_some() {
+            format!("\u{274C} {}", crate::i18n::t("Render failed"))
+        } else if rp.done {
+            format!("\u{2705} {}", crate::i18n::t("Render complete"))
+        } else {
+            format!("\u{1F3AC} {}", crate::i18n::t("Rendering..."))
+        };
+
+        egui::Window::new(title)
+            .id(egui::Id::new("render_progress_window"))
+            .anchor(egui::Align2::RIGHT_TOP, [-16.0, 16.0])
+            .default_size([360.0, 180.0])
+            .min_width(280.0)
+            .max_width(520.0)
+            .collapsible(true)
+            .resizable(true)
+            .show(ctx, |ui| {
+                use egui::{Color32, RichText};
+                ui.add_space(4.0);
+                // Big progress bar (full width, ~22 px tall) with
+                // percentage label inside — matches the visibility the
+                // user asked for.
+                let pct_label = if rp.done {
+                    "100%".to_string()
+                } else {
+                    format!("{:.0}%", progress * 100.0)
+                };
+                let bar = egui::ProgressBar::new(if rp.done { 1.0 } else { progress })
+                    .desired_width(ui.available_width())
+                    .text(RichText::new(&pct_label).strong().size(14.0));
+                ui.add(bar);
+                ui.add_space(6.0);
+
+                // Elapsed time + estimated total. ETA is only computed
+                // once we have a non-trivial progress fraction (≥ 5%)
+                // so the early-frame number isn't dominated by ffmpeg
+                // initialisation cost.
+                let elapsed_str = format_elapsed(elapsed_secs);
+                let eta_str = if rp.done || rp.error.is_some() {
+                    String::new()
+                } else if progress >= 0.05 && progress < 0.999 {
+                    let total = elapsed_secs / progress.max(0.001);
+                    let remaining = (total - elapsed_secs).max(0.0);
+                    format!(" \u{2014} ETA {}", format_elapsed(remaining))
+                } else {
+                    String::new()
+                };
+                ui.label(
+                    RichText::new(format!(
+                        "{} {}{}",
+                        crate::i18n::t("Elapsed"),
+                        elapsed_str,
+                        eta_str,
+                    ))
+                    .size(11.0)
+                    .color(Color32::from_rgb(180, 180, 200)),
+                );
+                ui.add_space(4.0);
+
+                // Most recent ffmpeg status line. Truncated so an
+                // ultra-long path inside the line doesn't blow the
+                // window's width back open.
+                let last = rp.last_log.clone();
+                if !last.is_empty() {
+                    let trimmed: String = if last.chars().count() > 200 {
+                        let mut s: String = last.chars().take(197).collect();
+                        s.push_str("...");
+                        s
+                    } else {
+                        last
+                    };
+                    ui.label(
+                        RichText::new(trimmed)
+                            .size(10.0)
+                            .italics()
+                            .color(Color32::from_rgb(150, 150, 170)),
+                    );
+                }
+
+                // Error detail.
+                if let Some(err) = rp.error.as_ref() {
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(err)
+                            .size(11.0)
+                            .color(Color32::from_rgb(255, 140, 140)),
+                    );
+                }
+
+                // Close / dismiss button. While the render is still in
+                // flight the button is disabled — clicking through it
+                // would orphan the rendering subprocess but leave its
+                // result silently uncollected, which is worse than
+                // forcing the user to wait.
+                ui.add_space(8.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let can_close = rp.done || rp.error.is_some();
+                    if ui
+                        .add_enabled(
+                            can_close,
+                            egui::Button::new(crate::i18n::t("Close")),
+                        )
+                        .clicked()
+                    {
+                        dismiss = true;
+                    }
+                });
+            });
+
+        if dismiss {
+            self.state.render_progress = None;
+        }
+    }
+
+    // ─── AUTO-SAVE / RECOVERY ────────────────────────────────────────
+
     /// Periodically saves the current scene to `~/.memstroy/autosave.scene.yaml`.
     /// Triggered from `update()`. Updates `last_autosave` and shows a 2 s toast.
     fn tick_autosave(&mut self) {
@@ -1926,6 +2117,21 @@ fn parse_ffmpeg_frame(line: &str) -> Option<u32> {
     let after = &line[idx + frame_prefix.len()..];
     let num_str = after.trim_start().split_whitespace().next().unwrap_or("");
     num_str.parse().ok()
+}
+
+/// Format a wall-clock duration like `0:42`, `2:13`, `1:05:21`. Used
+/// by the render-progress window to show elapsed time and ETA without
+/// pulling in the `humantime` crate just for this.
+fn format_elapsed(secs: f32) -> String {
+    let total = secs.max(0.0).floor() as u64;
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    if h > 0 {
+        format!("{}:{:02}:{:02}", h, m, s)
+    } else {
+        format!("{}:{:02}", m, s)
+    }
 }
 
 impl eframe::App for App {
@@ -2530,6 +2736,15 @@ impl eframe::App for App {
         if self.state.web_image_search_open {
             crate::web_image_search::show_window(ctx, &mut self.state, &self.tx);
         }
+
+        // Render-progress floating window. Surfaces a big, clearly-
+        // visible progress bar with elapsed time, ffmpeg's most recent
+        // status line and an explicit done/failed state, so the user
+        // never has to hunt for the tiny menu-bar bar (which was the
+        // user's complaint — "должен быть виден прогресс рендера").
+        // Self-closes when `render_progress` is None or after the user
+        // dismisses a finished/failed render.
+        self.show_render_progress_window(ctx);
 
         // Repaint scheduling:
         // - When playing with ready frame cache: 16ms (~60fps)
