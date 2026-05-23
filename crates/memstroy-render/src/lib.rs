@@ -21,6 +21,7 @@ pub mod runner;
 pub mod fonts;
 pub mod text_rasterize;
 pub mod proc;
+mod expr;
 
 pub use plan::*;
 pub use filtergraph::*;
