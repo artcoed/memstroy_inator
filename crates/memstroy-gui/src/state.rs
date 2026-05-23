@@ -509,13 +509,20 @@ pub struct EditorState {
         std::collections::HashMap<PathBuf, ImageTextureSlot>,
     >,
     /// Cache of effects-baked image textures keyed by
-    /// `(source_path, effects_signature)`. Refreshed when the user
-    /// edits the effect stack and reused frame-to-frame for stable
-    /// playback. Effects are baked on the CPU via
-    /// `crate::image_effects::apply_effect_stack`.
-    pub image_fx_textures: std::sync::Mutex<
-        std::collections::HashMap<(PathBuf, u64), ImageFxSlot>,
-    >,
+    /// `(source_path, effects_signature)`. The actual cache lives in
+    /// `crate::image_fx_cache::ImageFxCache` — a two-layer LRU with a
+    /// Pending/Ready/Failed state machine that lets the canvas draw
+    /// the unprocessed picture while the effect stack bakes on a
+    /// worker thread (see `crate::image_fx_worker`). Wrapped in `Arc`
+    /// so the worker can share ownership without cloning the cache
+    /// state itself.
+    pub image_fx_cache: std::sync::Arc<crate::image_fx_cache::ImageFxCache>,
+
+    /// Sender used by the canvas paint loop to dispatch background
+    /// image-effects bake jobs back to the App's `pump_events` drain.
+    /// Wired up by `App::new`; `None` only inside unit tests that
+    /// don't bring up an App.
+    pub image_fx_tx: Option<std::sync::mpsc::Sender<crate::jobs::JobEvent>>,
 
     // ─── Web image search ──────────────────────────────────────────
     /// Whether the floating "Web Image Search" window is visible.
@@ -541,17 +548,6 @@ pub enum ImageTextureSlot {
     /// Decode failed (missing file, unsupported format, etc.). Cached
     /// so we don't keep retrying on every frame.
     Failed,
-}
-
-/// Cached effects-processed texture for an image overlay. Stored
-/// alongside the Crop UV inset so the renderer can shrink the picture's
-/// visible rectangle to match a Crop entry on the effect stack.
-#[derive(Clone)]
-pub struct ImageFxSlot {
-    pub texture: egui::TextureHandle,
-    pub size: [u32; 2],
-    /// (left, top, right, bottom) crop inset in normalised 0..1.
-    pub crop: [f32; 4],
 }
 
 /// A single scene tab with its own file path and name.
