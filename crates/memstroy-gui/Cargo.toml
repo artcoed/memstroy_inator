@@ -13,6 +13,23 @@ description = "egui/eframe editor for memstroy-inator scenes"
 # (per-user cache dir, remote-only server). See `build.rs` for details.
 build = "build.rs"
 
+[features]
+# Default features intentionally empty: client and dev builds share
+# the same default surface. The `obfuscate-server-url` feature is an
+# explicit opt-in (see below).
+default = []
+
+# Wrap the compile-time-baked assets-server URL through `obfstr` so
+# its bytes are XOR-encoded in the .rdata segment instead of sitting
+# there as plain ASCII. This is *defence in depth only* — anyone with
+# a debugger recovers the URL trivially — and the XOR-decode loop it
+# leaves in the binary is part of what trips Microsoft Defender's
+# Wacatac.B!ml / Skyhigh's BehavesLike.ObfuscatedPoly heuristics on
+# unsigned setups, so it is OFF by default. Pass
+# `--features obfuscate-server-url` to the packaging scripts when you
+# want the obfuscation back.
+obfuscate-server-url = ["dep:obfstr"]
+
 [[bin]]
 name = "memstroy-gui"
 path = "src/main.rs"
@@ -56,10 +73,31 @@ arboard = { version = "3", default-features = false, features = ["image-data"] }
 # measure — the string is still recoverable by anyone running the
 # binary under a debugger — but it eliminates the trivial
 # "grep the artefact" attack and matches Level-1 hardening.
-obfstr = "0.4"
+#
+# Gated behind the `obfuscate-server-url` feature: leaving the
+# XOR-decode loop in default release builds was a major contributor
+# to AV false positives on the unsigned Setup.exe (Microsoft's
+# `Wacatac.B!ml`, Skyhigh's `BehavesLike.ObfuscatedPoly`). Opt back
+# in via `cargo build --features obfuscate-server-url` when needed.
+obfstr = { version = "0.4", optional = true }
 # TTF/OTF face name extraction. Used by `system_fonts.rs` to read the
 # `name` table of every TTF/OTF on disk so the font picker / canvas
 # preview show real family names ("Arial", "Inter", …) instead of just
 # the file stem ("ARIALBD"). `ttf-parser` is already transitively
 # present in the egui graph, so the binary cost is essentially zero.
 ttf-parser = "0.25"
+
+# ── Windows-only build dependency: PE VersionInfo resource ──────────
+# `winresource` programmatically generates and links a Win32
+# VS_VERSIONINFO resource into the produced `.exe`, populating the
+# Properties → Details tab with CompanyName / FileDescription /
+# ProductName / FileVersion etc. A blank VersionInfo block is itself
+# a heuristic signal for AV ML models on unsigned PEs, so populating
+# it is one of the cheapest ways to lower the VirusTotal false-
+# positive rate without paying for a code-signing certificate.
+#
+# Lives under `[target.'cfg(windows)'.build-dependencies]` so it is
+# only resolved when actually targeting Windows; cross-builds from
+# Linux / macOS for any other target ignore it entirely.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
