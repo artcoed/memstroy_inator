@@ -236,10 +236,14 @@ fn image_editor_content(ui: &mut egui::Ui, state: &mut EditorState) {
     ui.add_space(4.0);
     ui.separator();
 
-    // ── Brush parameters (only relevant while a brush tool is armed) ──
-    if state.image_brush.tool == ImageBrushTool::Brush
-        || state.image_brush.tool == ImageBrushTool::Cutout
-    {
+    // ── Brush parameters (only relevant while a mask-painting tool is armed) ──
+    if matches!(
+        state.image_brush.tool,
+        ImageBrushTool::Brush
+            | ImageBrushTool::Cutout
+            | ImageBrushTool::RectMask
+            | ImageBrushTool::EllipseMask
+    ) {
         brush_params_section(ui, state);
         ui.add_space(2.0);
         ui.separator();
@@ -258,17 +262,50 @@ fn image_editor_content(ui: &mut egui::Ui, state: &mut EditorState) {
             // onto the effects vec.
             geometry_section(ui, state, i);
 
+            // Some sections want auxiliary state (source pixel size for
+            // aspect-ratio crop) or want to arm an interactive tool
+            // (colour-key Re-pick → Eyedropper). Read / decide that
+            // up-front while we still hold an immutable borrow of
+            // `state`, then act on the flags AFTER the effects-stack
+            // mutation block so the borrow checker stays happy.
+            let source_size = source_pixel_size(state, i);
+
             let effects: &mut Vec<Effect> = match &mut state.scene.overlays[i] {
                 Overlay::Image(im) => &mut im.effects,
                 _ => unreachable!(),
             };
 
+            // Effects overview comes first so the user can see (and
+            // disable / remove) every applied effect at a glance.
+            effects_overview_section(ui, effects, i);
+
+            // Order the remaining sections from broad → narrow:
+            // - Lookbook (one-click multi-effect presets)
+            // - Quick colour (single-knob tone)
+            // - Crop + Aspect ratios (geometry framing)
+            // - Stylize / Distortion / Retro / Filters (single-fx)
+            // - Colour key (eyedropper-driven chroma key)
+            presets_section(ui, effects, i);
             quick_colour_section(ui, effects, i);
             crop_section(ui, effects, i);
+            aspect_ratio_section(ui, effects, source_size, i);
             stylize_section(ui, effects, i);
             distortion_section(ui, effects, i);
             retro_section(ui, effects, i);
             filters_section(ui, effects, i);
+
+            // Colour-key section returns whether the user clicked
+            // "Re-pick" (which arms the Eyedropper tool); we apply
+            // that side-effect once the `effects` borrow is dropped.
+            let arm_eyedropper = color_key_section(ui, effects, i);
+            // Drop the mutable borrow on effects implicitly here, then
+            // hand control back to `state` for the eyedropper toggle.
+            let _ = effects; // keep borrow alive until here
+            if arm_eyedropper {
+                state.image_brush.tool = ImageBrushTool::Eyedropper;
+                state.image_brush.draft.clear();
+                state.image_brush.crop_drag_start = None;
+            }
         });
 }
 
@@ -401,41 +438,78 @@ fn paint_preview(
 // ─── BRUSH TOOLBAR ────────────────────────────────────────────────────
 
 fn brush_toolbar(ui: &mut egui::Ui, state: &mut EditorState) {
-    ui.horizontal(|ui| {
+    // Two-row toolbar: row 1 hosts the seven interactive tools
+    // (View, Brush, Cutout, Crop, RectMask, EllipseMask, Eyedropper)
+    // grouped into "View / Mask painting / Geometry crop / Colour key";
+    // row 2 hosts the contextual hint that mirrors the active tool so
+    // the user knows what dragging on the preview will do.
+    //
+    // Tool buttons use translated text labels rather than emoji
+    // glyphs — several useful glyphs (✂, 🖌, ⭮ …) are outside the
+    // bundled font's coverage and rendered as missing-glyph boxes
+    // on Windows builds, which the user reported as "иконки которые
+    // не отрисовываются". Plain text labels render everywhere.
+    let tools: [(ImageBrushTool, &str, &str); 7] = [
+        (
+            ImageBrushTool::None,
+            "View",
+            "View only — no interactive painting",
+        ),
+        (
+            ImageBrushTool::Brush,
+            "Brush",
+            "Brush — paint a freehand mask: pixels INSIDE the painted shape are kept, the rest is masked away",
+        ),
+        (
+            ImageBrushTool::Cutout,
+            "Cutout",
+            "Cutout — paint a freehand mask: pixels INSIDE the painted shape are masked away (erase a region)",
+        ),
+        (
+            ImageBrushTool::Crop,
+            "Crop",
+            "Crop — drag a rectangle to set the crop bounds",
+        ),
+        (
+            ImageBrushTool::RectMask,
+            "Rect",
+            "Rectangle mask — drag a rectangle and bake it as a soft-edge mask shape (use Feather / Invert below to tune)",
+        ),
+        (
+            ImageBrushTool::EllipseMask,
+            "Ellipse",
+            "Ellipse mask — drag a rectangle to define the ellipse's bounding box (use Feather / Invert below to tune)",
+        ),
+        (
+            ImageBrushTool::Eyedropper,
+            "Eyedropper",
+            "Eyedropper — click on the preview to sample a colour and chroma-key away every pixel close to it",
+        ),
+    ];
+
+    ui.horizontal_wrapped(|ui| {
         ui.label(
             RichText::new(crate::i18n::t("Tool:"))
                 .size(11.0)
                 .color(Color32::from_rgb(170, 170, 200)),
         );
-        // Tool buttons use translated text labels rather than the
-        // previous emoji glyphs (✂, 🖌, ⭮ …) — several of those
-        // codepoints are outside the bundled font's coverage and
-        // rendered as missing-glyph boxes on Windows builds, which
-        // the user reported as "иконки которые не отрисовываются".
-        let tools: [(ImageBrushTool, &str, &str); 4] = [
-            (
-                ImageBrushTool::None,
-                "View",
-                "View only — no interactive painting",
-            ),
-            (
-                ImageBrushTool::Brush,
-                "Brush",
-                "Brush — paint a freehand mask: pixels INSIDE the painted shape are kept, the rest is masked away",
-            ),
-            (
-                ImageBrushTool::Cutout,
-                "Cutout",
-                "Cutout — paint a freehand mask: pixels INSIDE the painted shape are masked away (erase a region)",
-            ),
-            (
-                ImageBrushTool::Crop,
-                "Crop",
-                "Crop — drag a rectangle to set the crop bounds",
-            ),
-        ];
         for (tool, label, hint) in tools {
             let active = state.image_brush.tool == tool;
+            // Tint the buttons by tool family so the toolbar reads at
+            // a glance (mask = violet, crop = blue, eyedropper =
+            // yellow, view = grey). Active button keeps the strong
+            // violet to match the previous look.
+            let family_tint = match tool {
+                ImageBrushTool::None => Color32::from_rgb(50, 50, 64),
+                ImageBrushTool::Brush | ImageBrushTool::Cutout => {
+                    Color32::from_rgb(48, 40, 64)
+                }
+                ImageBrushTool::Crop => Color32::from_rgb(40, 50, 70),
+                ImageBrushTool::RectMask | ImageBrushTool::EllipseMask => {
+                    Color32::from_rgb(50, 42, 72)
+                }
+                ImageBrushTool::Eyedropper => Color32::from_rgb(70, 60, 36),
+            };
             let btn = egui::Button::new(
                 RichText::new(crate::i18n::t(label))
                     .size(11.5)
@@ -448,7 +522,7 @@ fn brush_toolbar(ui: &mut egui::Ui, state: &mut EditorState) {
             .fill(if active {
                 Color32::from_rgb(120, 90, 180)
             } else {
-                Color32::from_rgb(40, 40, 56)
+                family_tint
             })
             .stroke(Stroke::new(1.0, Color32::from_rgb(80, 70, 100)))
             .rounding(Rounding::same(4.0))
@@ -461,10 +535,11 @@ fn brush_toolbar(ui: &mut egui::Ui, state: &mut EditorState) {
                 state.image_brush.tool = if active { ImageBrushTool::None } else { tool };
                 state.image_brush.draft.clear();
                 state.image_brush.crop_drag_start = None;
-                // Cutout implies invert; Brush leaves invert alone so
-                // the user can flip it manually if they want a slim
-                // "punch out" via the brush tool. The tool button just
-                // picks a sensible default.
+                // Sensible defaults for `invert` based on tool:
+                // - Cutout always cuts out (invert = true).
+                // - Brush always keeps inside (invert = false).
+                // - Rect / Ellipse mask leave invert alone so the
+                //   user keeps whatever toggle they last set.
                 if state.image_brush.tool == ImageBrushTool::Cutout {
                     state.image_brush.invert = true;
                 } else if state.image_brush.tool == ImageBrushTool::Brush {
@@ -472,29 +547,36 @@ fn brush_toolbar(ui: &mut egui::Ui, state: &mut EditorState) {
                 }
             }
         }
-
-        ui.separator();
-        // Status hint that mirrors the active tool so the user knows
-        // they can drag on the preview now.
-        let hint = match state.image_brush.tool {
-            ImageBrushTool::None => crate::i18n::t("Pick a tool to draw on the preview."),
-            ImageBrushTool::Brush => {
-                crate::i18n::t("Drag on the preview to paint a mask polygon.")
-            }
-            ImageBrushTool::Cutout => {
-                crate::i18n::t("Drag on the preview to paint an erase region.")
-            }
-            ImageBrushTool::Crop => {
-                crate::i18n::t("Drag on the preview to define the crop rectangle.")
-            }
-        };
-        ui.label(
-            RichText::new(hint)
-                .size(10.5)
-                .italics()
-                .color(Color32::from_rgb(140, 140, 170)),
-        );
     });
+
+    // Contextual hint row.
+    let hint = match state.image_brush.tool {
+        ImageBrushTool::None => crate::i18n::t("Pick a tool to draw on the preview."),
+        ImageBrushTool::Brush => {
+            crate::i18n::t("Drag on the preview to paint a mask polygon.")
+        }
+        ImageBrushTool::Cutout => {
+            crate::i18n::t("Drag on the preview to paint an erase region.")
+        }
+        ImageBrushTool::Crop => {
+            crate::i18n::t("Drag on the preview to define the crop rectangle.")
+        }
+        ImageBrushTool::RectMask => {
+            crate::i18n::t("Drag on the preview to define a rectangular mask region.")
+        }
+        ImageBrushTool::EllipseMask => {
+            crate::i18n::t("Drag on the preview to define an elliptical mask region.")
+        }
+        ImageBrushTool::Eyedropper => {
+            crate::i18n::t("Click on the preview to sample a colour and chroma-key it.")
+        }
+    };
+    ui.label(
+        RichText::new(hint)
+            .size(10.5)
+            .italics()
+            .color(Color32::from_rgb(140, 140, 170)),
+    );
 }
 
 fn brush_params_section(ui: &mut egui::Ui, state: &mut EditorState) {
@@ -812,7 +894,14 @@ fn handle_brush_input(
                 commit_brush_polygon(state, overlay_idx);
             }
         }
-        ImageBrushTool::Crop => {
+        ImageBrushTool::Crop
+        | ImageBrushTool::RectMask
+        | ImageBrushTool::EllipseMask => {
+            // All three tools share the same drag-rectangle
+            // workflow: anchor on press, update the second point on
+            // drag, commit on release. The shape produced by the
+            // commit step differs (`Crop` inset / `Mask{Rect}` /
+            // `Mask{Ellipse}`) — see `commit_drag_rectangle`.
             if just_pressed {
                 if let Some(p) = pointer {
                     if let Some(uv) = screen_to_source_uv(p, img_rect, crop_inset) {
@@ -836,7 +925,21 @@ fn handle_brush_input(
                 ui.ctx().request_repaint();
             }
             if primary_released {
-                commit_brush_crop(state, overlay_idx);
+                commit_drag_rectangle(state, overlay_idx);
+            }
+        }
+        ImageBrushTool::Eyedropper => {
+            // Single-click sample: read the source pixel under the
+            // cursor and write it into a `ColorKey` effect entry.
+            // Using `clicked()` (rather than `drag_started()`) gives
+            // us the standard click semantics so a fast tap is
+            // enough to trigger the sampler.
+            if response.clicked() {
+                if let Some(p) = pointer {
+                    if let Some(uv) = screen_to_source_uv(p, img_rect, crop_inset) {
+                        commit_eyedropper(state, overlay_idx, uv);
+                    }
+                }
             }
         }
     }
@@ -901,7 +1004,10 @@ fn commit_brush_polygon(state: &mut EditorState, overlay_idx: usize) {
     }
 }
 
-fn commit_brush_crop(state: &mut EditorState, overlay_idx: usize) {
+fn commit_drag_rectangle(state: &mut EditorState, overlay_idx: usize) {
+    // Pulls the drag draft out, validates that the user actually
+    // drew something larger than a misclick, and dispatches to the
+    // shape-specific commit step based on the active tool.
     let pts = std::mem::take(&mut state.image_brush.draft);
     state.image_brush.crop_drag_start = None;
     if pts.len() < 2 {
@@ -916,36 +1022,176 @@ fn commit_brush_crop(state: &mut EditorState, overlay_idx: usize) {
     if (rx - lx).abs() < 0.005 || (by - ty).abs() < 0.005 {
         return;
     }
-    // Convert the rect drawn on the picture into Crop-effect insets:
-    // we discard the bands OUTSIDE [lx..rx] × [ty..by]. Each value
-    // is clamped to 0..0.49 to match `EffectKind::Crop`'s contract.
-    let left = lx.clamp(0.0, 0.49);
-    let top = ty.clamp(0.0, 0.49);
-    let right = (1.0 - rx).clamp(0.0, 0.49);
-    let bottom = (1.0 - by).clamp(0.0, 0.49);
 
-    if let Some(Overlay::Image(im)) = state.scene.overlays.get_mut(overlay_idx) {
-        let kind = EffectKind::Crop {
-            left,
-            top,
-            right,
-            bottom,
-        };
-        if let Some(idx) = im
-            .effects
-            .iter()
-            .position(|e| matches!(e.kind, EffectKind::Crop { .. }))
-        {
-            im.effects[idx].kind = kind;
-        } else {
-            im.effects.push(Effect::new(kind));
+    match state.image_brush.tool {
+        ImageBrushTool::Crop => {
+            // Convert the rect drawn on the picture into Crop-effect
+            // insets: we discard the bands OUTSIDE [lx..rx] × [ty..by].
+            // Each value is clamped to 0..0.49 to match
+            // `EffectKind::Crop`'s contract.
+            let left = lx.clamp(0.0, 0.49);
+            let top = ty.clamp(0.0, 0.49);
+            let right = (1.0 - rx).clamp(0.0, 0.49);
+            let bottom = (1.0 - by).clamp(0.0, 0.49);
+            if let Some(Overlay::Image(im)) = state.scene.overlays.get_mut(overlay_idx) {
+                let kind = EffectKind::Crop {
+                    left,
+                    top,
+                    right,
+                    bottom,
+                };
+                if let Some(idx) = im
+                    .effects
+                    .iter()
+                    .position(|e| matches!(e.kind, EffectKind::Crop { .. }))
+                {
+                    im.effects[idx].kind = kind;
+                } else {
+                    im.effects.push(Effect::new(kind));
+                }
+            }
         }
+        ImageBrushTool::RectMask => {
+            let feather = state.image_brush.feather.clamp(0.0, 0.5);
+            let invert = state.image_brush.invert;
+            if let Some(Overlay::Image(im)) = state.scene.overlays.get_mut(overlay_idx) {
+                // Replace the most recent Rect mask if any so
+                // successive drags redraw the same shape — leave
+                // ellipse / polygon mask entries alone (they're a
+                // different authoring surface).
+                if let Some(idx) = im.effects.iter().position(|e| {
+                    matches!(
+                        &e.kind,
+                        EffectKind::Mask {
+                            shape: MaskShape::Rect { .. },
+                            ..
+                        }
+                    )
+                }) {
+                    im.effects.remove(idx);
+                }
+                im.effects.push(Effect::new(EffectKind::Mask {
+                    shape: MaskShape::Rect {
+                        left: lx,
+                        top: ty,
+                        right: rx,
+                        bottom: by,
+                    },
+                    feather,
+                    invert,
+                }));
+            }
+        }
+        ImageBrushTool::EllipseMask => {
+            let feather = state.image_brush.feather.clamp(0.0, 0.5);
+            let invert = state.image_brush.invert;
+            let cx = (lx + rx) * 0.5;
+            let cy = (ty + by) * 0.5;
+            let rxx = ((rx - lx) * 0.5).max(0.005);
+            let ryy = ((by - ty) * 0.5).max(0.005);
+            if let Some(Overlay::Image(im)) = state.scene.overlays.get_mut(overlay_idx) {
+                if let Some(idx) = im.effects.iter().position(|e| {
+                    matches!(
+                        &e.kind,
+                        EffectKind::Mask {
+                            shape: MaskShape::Ellipse { .. },
+                            ..
+                        }
+                    )
+                }) {
+                    im.effects.remove(idx);
+                }
+                im.effects.push(Effect::new(EffectKind::Mask {
+                    shape: MaskShape::Ellipse {
+                        cx,
+                        cy,
+                        rx: rxx,
+                        ry: ryy,
+                    },
+                    feather,
+                    invert,
+                }));
+            }
+        }
+        _ => {}
     }
 }
 
-/// Paint the in-progress polygon / rect on top of the preview so the
-/// user can see what the next mouse-release will commit. Uses
-/// crop-aware mapping (UV → screen) symmetric with the input handler.
+/// Decode the source image, sample the pixel at `uv`, and push (or
+/// update) an `EffectKind::ColorKey` entry on the overlay's effect
+/// stack. The decode is one-shot per click so we don't carry the
+/// raw pixel buffer around in `EditorState` — sampling once on
+/// commit is plenty fast for the small overlay PNGs the editor
+/// targets, and skipping the cache keeps the eyedropper path
+/// independent of the texture / FX caches.
+fn commit_eyedropper(state: &mut EditorState, overlay_idx: usize, uv: [f32; 2]) {
+    let source = match state.scene.overlays.get(overlay_idx) {
+        Some(Overlay::Image(im)) => im.source.clone(),
+        _ => return,
+    };
+    let img = match image::open(&source) {
+        Ok(i) => i.to_rgba8(),
+        Err(e) => {
+            state.status = format!(
+                "{} {}",
+                crate::i18n::t("\u{274C} Eyedropper decode failed:"),
+                e,
+            );
+            return;
+        }
+    };
+    let w = img.width();
+    let h = img.height();
+    if w == 0 || h == 0 {
+        return;
+    }
+    let px = ((uv[0] * w as f32) as u32).min(w - 1);
+    let py = ((uv[1] * h as f32) as u32).min(h - 1);
+    let p = img.get_pixel(px, py);
+    let rgb = [p[0], p[1], p[2]];
+
+    if let Some(Overlay::Image(im)) = state.scene.overlays.get_mut(overlay_idx) {
+        let invert = state.image_brush.invert;
+        if let Some(idx) = im
+            .effects
+            .iter()
+            .position(|e| matches!(e.kind, EffectKind::ColorKey { .. }))
+        {
+            // Keep the user's tuned similarity / blend / spill
+            // values — only the colour and the invert flag move on
+            // resample, so a "re-pick" doesn't reset the dial.
+            if let EffectKind::ColorKey {
+                color,
+                invert: existing_invert,
+                ..
+            } = &mut im.effects[idx].kind
+            {
+                *color = rgb;
+                *existing_invert = invert;
+            }
+        } else {
+            im.effects.push(Effect::new(EffectKind::ColorKey {
+                color: rgb,
+                similarity: 0.18,
+                blend: 0.10,
+                spill: 0.0,
+                invert,
+            }));
+        }
+    }
+    state.status = format!(
+        "{} #{:02X}{:02X}{:02X}",
+        crate::i18n::t("\u{1F4A7} Eyedropper picked colour:"),
+        rgb[0],
+        rgb[1],
+        rgb[2],
+    );
+}
+
+/// Paint the in-progress polygon / rect / ellipse on top of the
+/// preview so the user can see what the next mouse-release will
+/// commit. Uses crop-aware mapping (UV → screen) symmetric with the
+/// input handler.
 fn draw_brush_overlay(
     painter: &egui::Painter,
     img_rect: Rect,
@@ -970,6 +1216,10 @@ fn draw_brush_overlay(
     let stroke_col = match state.image_brush.tool {
         ImageBrushTool::Cutout => Color32::from_rgb(255, 120, 120),
         ImageBrushTool::Crop => Color32::from_rgb(120, 220, 255),
+        ImageBrushTool::RectMask | ImageBrushTool::EllipseMask => {
+            Color32::from_rgb(200, 140, 255)
+        }
+        ImageBrushTool::Eyedropper => Color32::from_rgb(255, 220, 80),
         _ => Color32::from_rgb(255, 220, 80),
     };
 
@@ -986,18 +1236,54 @@ fn draw_brush_overlay(
                 painter.circle_filled(*last, 3.0, stroke_col);
             }
         }
-        ImageBrushTool::Crop => {
+        ImageBrushTool::Crop | ImageBrushTool::RectMask => {
             if state.image_brush.draft.len() >= 2 {
                 let a = to_screen(state.image_brush.draft[0]);
                 let b = to_screen(state.image_brush.draft[state.image_brush.draft.len() - 1]);
                 let r = Rect::from_two_pos(a, b);
                 painter.rect_stroke(r, Rounding::same(2.0), Stroke::new(1.5, stroke_col));
-                painter.rect_filled(
-                    r,
-                    Rounding::same(2.0),
-                    Color32::from_rgba_unmultiplied(120, 220, 255, 30),
-                );
+                let fill = match state.image_brush.tool {
+                    ImageBrushTool::Crop => {
+                        Color32::from_rgba_unmultiplied(120, 220, 255, 30)
+                    }
+                    _ => Color32::from_rgba_unmultiplied(200, 140, 255, 30),
+                };
+                painter.rect_filled(r, Rounding::same(2.0), fill);
             }
+        }
+        ImageBrushTool::EllipseMask => {
+            if state.image_brush.draft.len() >= 2 {
+                let a = to_screen(state.image_brush.draft[0]);
+                let b = to_screen(state.image_brush.draft[state.image_brush.draft.len() - 1]);
+                let r = Rect::from_two_pos(a, b);
+                let center = r.center();
+                let radius = Vec2::new(r.width().abs() * 0.5, r.height().abs() * 0.5);
+                // Approximate the ellipse with a polyline so we don't
+                // need an egui ellipse primitive (which doesn't exist
+                // at the `Shape` level). 48 segments is plenty smooth
+                // at typical preview sizes.
+                let n = 48;
+                let mut pts: Vec<Pos2> = Vec::with_capacity(n + 1);
+                for i in 0..=n {
+                    let theta = (i as f32 / n as f32) * std::f32::consts::TAU;
+                    pts.push(Pos2::new(
+                        center.x + radius.x * theta.cos(),
+                        center.y + radius.y * theta.sin(),
+                    ));
+                }
+                painter.add(egui::Shape::line(pts, Stroke::new(1.5, stroke_col)));
+                // Crosshair on the centre so the user sees where the
+                // ellipse will land.
+                painter.circle_stroke(center, 2.0, Stroke::new(1.0, stroke_col));
+            }
+        }
+        ImageBrushTool::Eyedropper => {
+            // Draw a crosshair at the cursor so the user knows the
+            // tool is armed and which pixel will be sampled. The
+            // hover position is read from the painter's clip rect via
+            // egui's input layer in the top-level `image_editor_content`,
+            // but we don't have it here — leave the indicator passive
+            // (just a hint label outside).
         }
         ImageBrushTool::None => {}
     }
@@ -1603,4 +1889,561 @@ fn filter_button(
             }
         }
     }
+}
+
+
+// ─── EFFECTS OVERVIEW ────────────────────────────────────────────────
+
+/// Read the source image's pixel dimensions from the texture cache.
+/// Returns `None` when the image hasn't been decoded yet — callers
+/// fall back to a 1:1 assumption in that case so the editor doesn't
+/// stall on a first-paint race.
+fn source_pixel_size(state: &EditorState, overlay_idx: usize) -> Option<[u32; 2]> {
+    let source = match state.scene.overlays.get(overlay_idx) {
+        Some(Overlay::Image(im)) => im.source.clone(),
+        _ => return None,
+    };
+    state
+        .image_textures
+        .lock()
+        .ok()
+        .and_then(|map| match map.get(&source) {
+            Some(crate::state::ImageTextureSlot::Loaded { size, .. }) => Some(*size),
+            _ => None,
+        })
+}
+
+/// Render a compact, top-of-scroll-area list of every currently-applied
+/// effect on the selected overlay, with per-row enable / disable
+/// toggles, intensity slider, and a delete button. The remaining
+/// section panels still expose richer parameter controls — this view's
+/// job is to give the user a single place to *see* what's stacked
+/// (otherwise a collapsed section would hide that an effect is on),
+/// to mute / un-mute entries without losing their tuned parameters,
+/// and to remove an effect cleanly without hunting through sections.
+///
+/// Renders nothing when the stack is empty so the editor's first
+/// impression remains the preview pane and the tool toolbar.
+fn effects_overview_section(ui: &mut egui::Ui, effects: &mut Vec<Effect>, salt: usize) {
+    if effects.is_empty() {
+        // Skip the header entirely so an unedited image gets a clean
+        // first impression. The downstream sections still let the
+        // user add effects.
+        return;
+    }
+    let count = effects.len();
+    egui::CollapsingHeader::new(
+        RichText::new(format!(
+            "{} ({})",
+            crate::i18n::t("Active effects"),
+            count,
+        ))
+        .size(12.0)
+        .strong()
+        .color(Color32::from_rgb(220, 230, 255)),
+    )
+    .id_source(("image_editor_overview", salt))
+    .default_open(false)
+    .show(ui, |ui| {
+        // Header row: "Reset all" + "Mute all" / "Unmute all".
+        let mut reset_all = false;
+        let mut mute_all = false;
+        let mut unmute_all = false;
+        ui.horizontal(|ui| {
+            if ui
+                .button(
+                    RichText::new(crate::i18n::t("Reset all effects"))
+                        .color(Color32::from_rgb(255, 160, 160)),
+                )
+                .on_hover_text(crate::i18n::t(
+                    "Remove every effect on this image. The picture returns to the original decoded pixels.",
+                ))
+                .clicked()
+            {
+                reset_all = true;
+            }
+            if ui
+                .button(crate::i18n::t("Mute all"))
+                .on_hover_text(crate::i18n::t(
+                    "Disable every effect without removing it. Click again on individual rows to re-enable.",
+                ))
+                .clicked()
+            {
+                mute_all = true;
+            }
+            if ui.button(crate::i18n::t("Unmute all")).clicked() {
+                unmute_all = true;
+            }
+        });
+        ui.add_space(4.0);
+
+        if reset_all {
+            effects.clear();
+            return;
+        }
+        if mute_all {
+            for e in effects.iter_mut() {
+                e.enabled = false;
+            }
+        }
+        if unmute_all {
+            for e in effects.iter_mut() {
+                e.enabled = true;
+            }
+        }
+
+        // Per-effect rows. Build a deletion / reorder index outside
+        // the loop so we don't mutate `effects` while iterating.
+        let mut to_remove: Option<usize> = None;
+        let mut to_move_up: Option<usize> = None;
+        let mut to_move_down: Option<usize> = None;
+        for (idx, eff) in effects.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut eff.enabled, "")
+                    .on_hover_text(crate::i18n::t(
+                        "Mute / un-mute this effect without removing it.",
+                    ));
+                ui.label(
+                    RichText::new(eff.kind.label())
+                        .size(11.0)
+                        .color(if eff.enabled {
+                            Color32::from_rgb(220, 220, 240)
+                        } else {
+                            Color32::from_rgb(120, 120, 140)
+                        }),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .small_button("\u{1F5D1}")
+                        .on_hover_text(crate::i18n::t("Remove this effect"))
+                        .clicked()
+                    {
+                        to_remove = Some(idx);
+                    }
+                    if ui
+                        .small_button("\u{2193}")
+                        .on_hover_text(crate::i18n::t("Move down (later in stack)"))
+                        .clicked()
+                    {
+                        to_move_down = Some(idx);
+                    }
+                    if ui
+                        .small_button("\u{2191}")
+                        .on_hover_text(crate::i18n::t("Move up (earlier in stack)"))
+                        .clicked()
+                    {
+                        to_move_up = Some(idx);
+                    }
+                    // Master intensity slider is universal across all
+                    // effect kinds — gives the user a single dial to
+                    // fade an entry up/down without re-tuning its
+                    // inner parameters.
+                    ui.add(
+                        egui::Slider::new(&mut eff.intensity, 0.0..=1.0)
+                            .show_value(false),
+                    )
+                    .on_hover_text(crate::i18n::t("Master intensity"));
+                });
+            });
+        }
+        if let Some(i) = to_remove {
+            if i < effects.len() {
+                effects.remove(i);
+            }
+        }
+        if let Some(i) = to_move_up {
+            if i > 0 && i < effects.len() {
+                effects.swap(i, i - 1);
+            }
+        }
+        if let Some(i) = to_move_down {
+            if i + 1 < effects.len() {
+                effects.swap(i, i + 1);
+            }
+        }
+    });
+}
+
+// ─── ASPECT-RATIO QUICK CROP ─────────────────────────────────────────
+
+/// Quick-crop section: one-click buttons that crop the image to a
+/// fixed aspect ratio (1:1, 4:3, 3:4, 16:9, 9:16, 5:4, 4:5, 21:9,
+/// "Story", "Square") relative to the source pixel dimensions.
+///
+/// The button computes the inset needed to land on the target ratio
+/// while keeping the picture centred (left/right or top/bottom inset
+/// is split evenly), then writes a single `EffectKind::Crop` entry
+/// — replacing any previous crop so successive clicks cleanly switch
+/// between aspect ratios. The crop sliders above stay live so the
+/// user can still nudge the rectangle off-centre afterwards.
+fn aspect_ratio_section(
+    ui: &mut egui::Ui,
+    effects: &mut Vec<Effect>,
+    source_size: Option<[u32; 2]>,
+    salt: usize,
+) {
+    egui::CollapsingHeader::new(
+        RichText::new(crate::i18n::t("Aspect ratio crop"))
+            .size(12.0)
+            .strong()
+            .color(Color32::from_rgb(140, 200, 255)),
+    )
+    .id_source(("image_editor_aspect", salt))
+    .default_open(false)
+    .show(ui, |ui| {
+        ui.label(
+            RichText::new(crate::i18n::t(
+                "Crop the picture to a target aspect ratio (centred).",
+            ))
+            .size(10.5)
+            .italics()
+            .color(Color32::from_rgb(140, 140, 170)),
+        );
+        ui.add_space(2.0);
+        // (label, target_w, target_h) — sorted in the canonical
+        // sticker / story / cinema order so the user finds the most
+        // common ratios near the top.
+        const PRESETS: &[(&str, f32, f32)] = &[
+            ("1:1", 1.0, 1.0),
+            ("4:5", 4.0, 5.0),
+            ("5:4", 5.0, 4.0),
+            ("4:3", 4.0, 3.0),
+            ("3:4", 3.0, 4.0),
+            ("3:2", 3.0, 2.0),
+            ("2:3", 2.0, 3.0),
+            ("16:9", 16.0, 9.0),
+            ("9:16", 9.0, 16.0),
+            ("21:9", 21.0, 9.0),
+        ];
+        // Source size — fallback to (1, 1) when the image hasn't
+        // decoded yet so the math still produces a sane inset.
+        let (sw, sh) = match source_size {
+            Some([w, h]) if w > 0 && h > 0 => (w as f32, h as f32),
+            _ => (1.0_f32, 1.0_f32),
+        };
+        ui.horizontal_wrapped(|ui| {
+            for (label, tw, th) in PRESETS {
+                if ui
+                    .button(crate::i18n::t(label))
+                    .on_hover_text(crate::i18n::t(
+                        "Apply a centred crop to land on this aspect ratio.",
+                    ))
+                    .clicked()
+                {
+                    apply_aspect_ratio_crop(effects, sw, sh, *tw, *th);
+                }
+            }
+        });
+    });
+}
+
+/// Compute the centred Crop inset needed to make the image's visible
+/// rectangle match `(target_w, target_h)` aspect, then upsert it on
+/// the effect stack. Replaces any existing Crop entry so successive
+/// aspect-ratio clicks cleanly switch the framing instead of
+/// stacking inset on top of inset. Removes the entry entirely when
+/// the target matches the source aspect (no crop needed).
+fn apply_aspect_ratio_crop(
+    effects: &mut Vec<Effect>,
+    source_w: f32,
+    source_h: f32,
+    target_w: f32,
+    target_h: f32,
+) {
+    let src_aspect = (source_w / source_h.max(1.0)).max(1e-3);
+    let tgt_aspect = (target_w / target_h.max(1.0)).max(1e-3);
+    let (mut left, mut top, mut right, mut bottom) = (0.0_f32, 0.0_f32, 0.0_f32, 0.0_f32);
+    if (tgt_aspect - src_aspect).abs() < 1e-3 {
+        // Same aspect — clear any existing crop.
+    } else if tgt_aspect > src_aspect {
+        // Target is wider than source → trim top/bottom evenly.
+        let visible_v_frac = (src_aspect / tgt_aspect).clamp(0.02, 1.0);
+        let crop_each = ((1.0 - visible_v_frac) * 0.5).clamp(0.0, 0.49);
+        top = crop_each;
+        bottom = crop_each;
+    } else {
+        // Target is taller than source → trim left/right evenly.
+        let visible_h_frac = (tgt_aspect / src_aspect).clamp(0.02, 1.0);
+        let crop_each = ((1.0 - visible_h_frac) * 0.5).clamp(0.0, 0.49);
+        left = crop_each;
+        right = crop_each;
+    }
+    let no_crop = left == 0.0 && top == 0.0 && right == 0.0 && bottom == 0.0;
+    let kind = EffectKind::Crop {
+        left,
+        top,
+        right,
+        bottom,
+    };
+    if let Some(idx) = effects
+        .iter()
+        .position(|e| matches!(e.kind, EffectKind::Crop { .. }))
+    {
+        if no_crop {
+            effects.remove(idx);
+        } else {
+            effects[idx].kind = kind;
+        }
+    } else if !no_crop {
+        effects.push(Effect::new(kind));
+    }
+}
+
+// ─── LOOKBOOK / FILTER PRESETS ───────────────────────────────────────
+
+/// One-click multi-effect filter combinations. Each preset writes a
+/// curated set of single-fx entries that together produce a
+/// recognisable look (cinematic warm grade, faded film, punchy pop,
+/// dramatic high-contrast, …). Re-clicking the same preset overwrites
+/// its constituent entries with the preset's tuned values, so the
+/// user can iterate by tweaking sliders and then "snap back" to the
+/// preset's defaults without rebuilding the stack from scratch.
+///
+/// Presets compose with the user's other settings — they only touch
+/// the kinds they care about, leaving Crop / Mask / Mirror / etc.
+/// alone. The dedicated "Reset all effects" button in the overview
+/// section is the escape hatch when the user wants to start fresh.
+fn presets_section(ui: &mut egui::Ui, effects: &mut Vec<Effect>, salt: usize) {
+    egui::CollapsingHeader::new(
+        RichText::new(crate::i18n::t("Lookbook / Presets"))
+            .size(12.0)
+            .strong()
+            .color(Color32::from_rgb(255, 200, 220)),
+    )
+    .id_source(("image_editor_presets", salt))
+    .default_open(false)
+    .show(ui, |ui| {
+        ui.label(
+            RichText::new(crate::i18n::t(
+                "One-click multi-effect looks. Each preset replaces the entries it cares about; other effects stay.",
+            ))
+            .size(10.5)
+            .italics()
+            .color(Color32::from_rgb(140, 140, 170)),
+        );
+        ui.add_space(3.0);
+        ui.horizontal_wrapped(|ui| {
+            preset_button(ui, effects, "Cinematic", &[
+                EffectKind::Contrast { amount: 0.25 },
+                EffectKind::Saturation { amount: -0.15 },
+                EffectKind::HueShift { degrees: -10.0 },
+                EffectKind::Vignette { strength: 0.4 },
+            ]);
+            preset_button(ui, effects, "Warm", &[
+                EffectKind::HueShift { degrees: 12.0 },
+                EffectKind::Saturation { amount: 0.18 },
+                EffectKind::Brightness { amount: 0.05 },
+            ]);
+            preset_button(ui, effects, "Cool", &[
+                EffectKind::HueShift { degrees: -18.0 },
+                EffectKind::Saturation { amount: 0.05 },
+                EffectKind::Brightness { amount: 0.02 },
+            ]);
+            preset_button(ui, effects, "Punchy", &[
+                EffectKind::Contrast { amount: 0.4 },
+                EffectKind::Saturation { amount: 0.4 },
+                EffectKind::Sharpen { amount: 0.6 },
+            ]);
+            preset_button(ui, effects, "Faded", &[
+                EffectKind::Contrast { amount: -0.25 },
+                EffectKind::Saturation { amount: -0.25 },
+                EffectKind::Brightness { amount: 0.08 },
+            ]);
+            preset_button(ui, effects, "Vintage", &[
+                EffectKind::Sepia,
+                EffectKind::Vignette { strength: 0.5 },
+                EffectKind::Noise { amount: 0.18 },
+                EffectKind::Contrast { amount: -0.1 },
+            ]);
+            preset_button(ui, effects, "Dramatic", &[
+                EffectKind::Contrast { amount: 0.5 },
+                EffectKind::Saturation { amount: 0.2 },
+                EffectKind::Vignette { strength: 0.7 },
+            ]);
+            preset_button(ui, effects, "Dreamy", &[
+                EffectKind::Bloom { radius: 22.0 },
+                EffectKind::Brightness { amount: 0.12 },
+                EffectKind::Saturation { amount: 0.1 },
+            ]);
+            preset_button(ui, effects, "B&W high contrast", &[
+                EffectKind::Grayscale,
+                EffectKind::Contrast { amount: 0.5 },
+            ]);
+            preset_button(ui, effects, "Sketch", &[
+                EffectKind::Grayscale,
+                EffectKind::EdgeDetect { threshold: 0.3 },
+            ]);
+            preset_button(ui, effects, "Cyberpunk", &[
+                EffectKind::HueShift { degrees: -40.0 },
+                EffectKind::Saturation { amount: 0.5 },
+                EffectKind::ChromaticAberration { offset: 3.0 },
+                EffectKind::Bloom { radius: 14.0 },
+            ]);
+            preset_button(ui, effects, "Pastel", &[
+                EffectKind::Saturation { amount: -0.3 },
+                EffectKind::Brightness { amount: 0.15 },
+                EffectKind::Bloom { radius: 8.0 },
+            ]);
+        });
+    });
+}
+
+/// Apply a set of `EffectKind` entries to the stack, replacing any
+/// existing entry of the same discriminant in place (so re-clicking
+/// a preset converges on the preset's intended values without
+/// duplicating). When no entry of that kind exists yet, the new one
+/// is pushed onto the back of the stack.
+fn preset_button(
+    ui: &mut egui::Ui,
+    effects: &mut Vec<Effect>,
+    label: &'static str,
+    entries: &[EffectKind],
+) {
+    let btn = egui::Button::new(
+        RichText::new(crate::i18n::t(label))
+            .size(11.0)
+            .color(Color32::from_rgb(245, 230, 240)),
+    )
+    .fill(Color32::from_rgb(70, 50, 70))
+    .stroke(Stroke::new(1.0, Color32::from_rgb(150, 90, 130)))
+    .rounding(Rounding::same(4.0))
+    .min_size(Vec2::new(72.0, 22.0));
+    if ui
+        .add(btn)
+        .on_hover_text(crate::i18n::t(
+            "Apply this preset's effects (replaces matching entries; leaves other effects alone).",
+        ))
+        .clicked()
+    {
+        for kind in entries {
+            let disc = std::mem::discriminant(kind);
+            if let Some(idx) = effects
+                .iter()
+                .position(|e| std::mem::discriminant(&e.kind) == disc)
+            {
+                effects[idx].kind = kind.clone();
+                effects[idx].enabled = true;
+                effects[idx].intensity = 1.0;
+            } else {
+                effects.push(Effect::new(kind.clone()));
+            }
+        }
+    }
+}
+
+// ─── COLOUR-KEY SECTION ──────────────────────────────────────────────
+
+/// When the overlay's effect stack contains a `ColorKey` entry (i.e.
+/// the user has used the eyedropper or imported a scene with a
+/// pre-applied chroma key), expose a dedicated section with the
+/// colour swatch and the FFmpeg-chromakey-mirror sliders
+/// (similarity / blend / spill / invert) plus a "Re-pick" button
+/// that arms the eyedropper for a fresh sample.
+///
+/// The section auto-hides when no ColorKey entry exists. Returns
+/// `true` when the user clicked "Re-pick" — the caller then arms
+/// the Eyedropper tool (we can't do it here because we hold a
+/// mutable borrow of `effects` and arming the tool needs a
+/// mutable borrow of `state`).
+fn color_key_section(
+    ui: &mut egui::Ui,
+    effects: &mut Vec<Effect>,
+    salt: usize,
+) -> bool {
+    let has_color_key = effects
+        .iter()
+        .any(|e| matches!(e.kind, EffectKind::ColorKey { .. }));
+    if !has_color_key {
+        return false;
+    }
+    let mut activate_eyedropper = false;
+    egui::CollapsingHeader::new(
+        RichText::new(crate::i18n::t("Colour key (eyedropper)"))
+            .size(12.0)
+            .strong()
+            .color(Color32::from_rgb(255, 220, 140)),
+    )
+    .id_source(("image_editor_colorkey", salt))
+    .default_open(true)
+    .show(ui, |ui| {
+        let ck_idx = effects
+            .iter()
+            .position(|e| matches!(e.kind, EffectKind::ColorKey { .. }));
+        let mut to_remove: Option<usize> = None;
+        if let Some(idx) = ck_idx {
+            if let EffectKind::ColorKey {
+                color,
+                similarity,
+                blend,
+                spill,
+                invert,
+            } = &mut effects[idx].kind
+            {
+                ui.horizontal(|ui| {
+                    ui.label(crate::i18n::t("Key colour"));
+                    let mut rgb = [
+                        color[0] as f32 / 255.0,
+                        color[1] as f32 / 255.0,
+                        color[2] as f32 / 255.0,
+                    ];
+                    if ui.color_edit_button_rgb(&mut rgb).changed() {
+                        color[0] = (rgb[0] * 255.0).round().clamp(0.0, 255.0) as u8;
+                        color[1] = (rgb[1] * 255.0).round().clamp(0.0, 255.0) as u8;
+                        color[2] = (rgb[2] * 255.0).round().clamp(0.0, 255.0) as u8;
+                    }
+                    ui.label(format!(
+                        "#{:02X}{:02X}{:02X}",
+                        color[0], color[1], color[2]
+                    ));
+                    if ui
+                        .button(crate::i18n::t("\u{1F4A7} Re-pick"))
+                        .on_hover_text(crate::i18n::t(
+                            "Arms the eyedropper — next click on the preview resamples the colour.",
+                        ))
+                        .clicked()
+                    {
+                        activate_eyedropper = true;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label(crate::i18n::t("Similarity"));
+                    ui.add(egui::Slider::new(similarity, 0.0..=1.0))
+                        .on_hover_text(crate::i18n::t(
+                            "How wide a colour band around the key counts as a match.",
+                        ));
+                });
+                ui.horizontal(|ui| {
+                    ui.label(crate::i18n::t("Blend"));
+                    ui.add(egui::Slider::new(blend, 0.0..=1.0))
+                        .on_hover_text(crate::i18n::t(
+                            "Soften the edge of the keyed region.",
+                        ));
+                });
+                ui.horizontal(|ui| {
+                    ui.label(crate::i18n::t("Spill"));
+                    ui.add(egui::Slider::new(spill, 0.0..=1.0))
+                        .on_hover_text(crate::i18n::t(
+                            "De-spill: pulls the keyed colour out of remaining edges (export-only).",
+                        ));
+                });
+                ui.checkbox(invert, crate::i18n::t("Invert (keep matching)"))
+                    .on_hover_text(crate::i18n::t(
+                        "When checked, pixels that DO match the colour are kept and the rest is masked away.",
+                    ));
+            }
+            if ui
+                .button(
+                    RichText::new(crate::i18n::t("Remove colour key"))
+                        .color(Color32::from_rgb(255, 140, 140)),
+                )
+                .clicked()
+            {
+                to_remove = Some(idx);
+            }
+        }
+        if let Some(i) = to_remove {
+            effects.remove(i);
+        }
+    });
+    activate_eyedropper
 }

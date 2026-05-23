@@ -814,6 +814,20 @@ pub enum ImageBrushTool {
     /// Rectangle drag — the rectangle painted by the user is baked
     /// into the overlay's `EffectKind::Crop` entry.
     Crop,
+    /// Rectangle drag — the rectangle painted by the user is baked
+    /// into a fresh `EffectKind::Mask { Rect, ... }` entry. Honours
+    /// the editor's current `feather` / `invert` brush params so the
+    /// user can swap between "rectangle keep" and "rectangle cut"
+    /// without relabelling.
+    RectMask,
+    /// Ellipse drag — same as RectMask but with an elliptical mask
+    /// shape. The drag rectangle becomes the ellipse's bounding box.
+    EllipseMask,
+    /// Click-to-sample colour-key tool. A click on the preview
+    /// samples the underlying source pixel colour and pushes (or
+    /// updates) an `EffectKind::ColorKey` entry on the overlay's
+    /// effect stack so close-by colours become transparent.
+    Eyedropper,
 }
 
 /// Cached state for one image-overlay source. `Loading` is held only
