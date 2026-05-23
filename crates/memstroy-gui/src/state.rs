@@ -1313,6 +1313,66 @@ impl EditorState {
         pos
     }
 
+    /// Find an audio lane on which no existing audio clip's time range
+    /// overlaps `[t_in, t_out]`. Returns the first such lane (smallest
+    /// index) or `None` when every existing lane is currently busy or
+    /// when there are no audio lanes at all. Used by the canvas /
+    /// library / timeline drop handlers so a freshly added sound always
+    /// lands on its own row instead of stacking on top of whatever is
+    /// already there.
+    ///
+    /// Two ranges that merely touch at a single instant (e.g. one ends
+    /// at 5.0 and the next starts at 5.0) are intentionally treated as
+    /// non-overlapping so back-to-back placement on the same lane
+    /// stays legal.
+    pub fn find_empty_audio_lane_for_range(&self, t_in: f32, t_out: f32) -> Option<usize> {
+        let scene_dur = self.scene.output.duration.max(0.0);
+        let audio_lanes = self.audio_track_indices();
+        if audio_lanes.is_empty() {
+            return None;
+        }
+        for &lane in audio_lanes.iter() {
+            let mut busy = false;
+            for (aui, au) in self.scene.audio.iter().enumerate() {
+                let assigned = self
+                    .audio_track_assignments
+                    .get(&aui)
+                    .copied()
+                    .unwrap_or_else(|| audio_lanes[aui % audio_lanes.len()]);
+                if assigned != lane { continue; }
+                let other_in = au.t_in;
+                let other_out = au.t_out.unwrap_or(scene_dur);
+                // Half-open overlap test: ranges [a_in, a_out] and
+                // [b_in, b_out] overlap iff a_in < b_out AND b_in < a_out.
+                if t_in < other_out && other_in < t_out {
+                    busy = true;
+                    break;
+                }
+            }
+            if !busy {
+                return Some(lane);
+            }
+        }
+        None
+    }
+
+    /// Pick the lane a fresh audio clip with the given time range
+    /// should land on: the first empty audio lane that fits, falling
+    /// back to a freshly-inserted lane right after the video stack
+    /// when every existing lane is busy (or when no audio lanes exist
+    /// yet). Mirrors `pick_or_create_empty_video_lane_at` for sound.
+    pub fn pick_or_create_empty_audio_lane_for_range(
+        &mut self,
+        t_in: f32,
+        t_out: f32,
+    ) -> usize {
+        if let Some(lane) = self.find_empty_audio_lane_for_range(t_in, t_out) {
+            lane
+        } else {
+            self.insert_audio_track_at_top()
+        }
+    }
+
     // ─── Tab management ──────────────────────────────────────────────
 
     /// Create a new empty tab and switch to it.
