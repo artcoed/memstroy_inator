@@ -8,20 +8,17 @@ use memstroy_core::Scene;
 use tokio::runtime::Runtime;
 
 use crate::jobs::{spawn_refresh, spawn_render, JobEvent};
-use crate::node_editor::NodeEditor;
 use crate::panels;
 use crate::state::{EditorState, Selection};
-use crate::clip_editor;
+use crate::image_editor;
 use crate::curve_editor;
 use crate::audio_engine::AudioEngine;
-use memstroy_vision::PoseEstimator;
 
 pub struct App {
     rt: Runtime,
     state: EditorState,
     tx: Sender<JobEvent>,
     rx: Receiver<JobEvent>,
-    node_editor: NodeEditor,
     /// Per-actor extraction results. Key = actor index.
     frame_extract_results: Vec<Arc<Mutex<Option<(f32, usize, std::path::PathBuf)>>>>,
     /// Per-audio-track waveform extraction results.
@@ -104,7 +101,6 @@ impl App {
             state,
             tx,
             rx,
-            node_editor: NodeEditor::default(),
             frame_extract_results: Vec::new(),
             waveform_extract_results: Vec::new(),
             audio_engine,
@@ -626,38 +622,6 @@ impl App {
                 }
             });
 
-            // The Tools menu and the Skeleton Constructor item used the
-            // 🧠 (brain, U+1F9E0) and 🦴 (bone, U+1F9B4) emojis, but
-            // egui's bundled font set has no glyph for either. They
-            // rendered as the "□" missing-glyph mark, which the user
-            // reported as "null smiley". Substitute glyphs that are
-            // present in the default font (gear / spanner motif).
-            ui.menu_button(RichText::new(t("\u{2699} Tools")).strong(), |ui| {
-                if ui.button(t("\u{2692} Skeleton Constructor...")).clicked() {
-                    self.state.skeleton_editor.open = true;
-                    // Pre-select the source clip from the currently selected
-                    // actor (so the editor is ready to edit a familiar clip),
-                    // but the editor itself is now clip-centric — see
-                    // `skeleton_editor::on_clip_changed`.
-                    if let Selection::Actor(i) = self.state.selection {
-                        if i < self.state.scene.actors.len() {
-                            let path = self.state.scene.actors[i].source.clone();
-                            crate::skeleton_editor::select_clip(&mut self.state, &path);
-                        }
-                    }
-                    ui.close_menu();
-                }
-                ui.separator();
-                if ui.button(t("\u{1F310} Web Image Search...")).clicked() {
-                    // Sibling to Skeleton Constructor — opens the
-                    // floating browser-lite panel. Kept here as well
-                    // as in the View menu because users tend to look
-                    // for "find an image" under Tools first.
-                    self.state.web_image_search_open = true;
-                    ui.close_menu();
-                }
-            });
-
             // ── View menu ─────────────────────────────────────────
             // Single home for every floating-window toggle in the
             // editor. Adding new floating windows should only need a
@@ -668,16 +632,12 @@ impl App {
                     t("\u{1F310} Web Image Search"),
                 );
                 ui.checkbox(
-                    &mut self.state.node_editor_open,
-                    t("\u{1F517} Node Editor"),
-                );
-                ui.checkbox(
                     &mut self.state.curve_editor_open,
                     t("\u{1F4C8} Curve Editor"),
                 );
                 ui.checkbox(
-                    &mut self.state.clip_editor_open,
-                    t("\u{2702} Clip Editor"),
+                    &mut self.state.image_editor_open,
+                    t("\u{1F5BC} Image Editor"),
                 );
                 ui.checkbox(
                     &mut self.state.skeleton_editor.open,
@@ -1447,102 +1407,6 @@ impl App {
         );
     }
 
-    /// Run pose detection on the current frame of the selected actor.
-    /// Uses memstroy-vision's pose estimation. Falls back to dummy points
-    /// if ONNX runtime is not available.
-    fn run_pose_detection(&mut self) {
-        let actor_idx = match self.state.selection {
-            Selection::Actor(i) if i < self.state.scene.actors.len() => i,
-            _ => {
-                self.state.status = "Select an actor first for pose detection.".into();
-                return;
-            }
-        };
-
-        let actor = &self.state.scene.actors[actor_idx];
-        let source = actor.source.clone();
-
-        // Check if we can load anchor data from existing file
-        if let Some(anchors_path) = &actor.anchors {
-            if anchors_path.exists() {
-                if let Some(track) = memstroy_vision::load_anchor_track(&source) {
-                    // Extract points from the sample nearest to current time
-                    let t_in = actor.t_in.unwrap_or(0.0);
-                    let local_t = self.state.playhead - t_in + actor.source_start;
-                    let points: Vec<[f32; 2]> = track.samples.iter()
-                        .min_by(|a, b| (a.t - local_t).abs().partial_cmp(&(b.t - local_t).abs()).unwrap())
-                        .map(|sample| {
-                            sample.points.values()
-                                .map(|kp| [kp.x, kp.y])
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    self.state.detected_points = points;
-                    self.state.status = format!(
-                        "Loaded {} pose points from anchors file.",
-                        self.state.detected_points.len()
-                    );
-                    return;
-                }
-            }
-        }
-
-        // Try to run pose detection; gracefully degrade if ONNX isn't available
-        let model_path = self.state.assets_root.join("assets/models/yolov8n-pose.onnx");
-        if !model_path.exists() {
-            // Provide dummy detection points as a graceful degradation
-            self.state.detected_points = vec![
-                [0.50, 0.15], // head
-                [0.50, 0.35], // body center
-                [0.40, 0.30], // left shoulder
-                [0.60, 0.30], // right shoulder
-                [0.35, 0.50], // left elbow
-                [0.65, 0.50], // right elbow
-                [0.30, 0.65], // left wrist
-                [0.70, 0.65], // right wrist
-                [0.43, 0.55], // left hip
-                [0.57, 0.55], // right hip
-                [0.40, 0.75], // left knee
-                [0.60, 0.75], // right knee
-                [0.38, 0.90], // left ankle
-                [0.62, 0.90], // right ankle
-            ];
-            self.state.status =
-                "Pose detection requires ONNX runtime (model not found). Showing placeholder points."
-                    .into();
-            return;
-        }
-
-        // Attempt real detection via spawned task
-        let tx = self.tx.clone();
-        let source_clone = source.clone();
-        let model_clone = model_path.clone();
-
-        self.rt.spawn(async move {
-            let estimator = memstroy_vision::OnnxPoseEstimator::new(model_clone);
-            match estimator.estimate(&source_clone, 1.0).await {
-                Ok(track) => {
-                    if let Some(sample) = track.samples.first() {
-                        let points: Vec<[f32; 2]> = sample.points.values()
-                            .map(|kp| [kp.x, kp.y])
-                            .collect();
-                        let msg = format!("Detected {} pose points.", points.len());
-                        let _ = tx.send(JobEvent::Status(msg));
-                    } else {
-                        let _ = tx.send(JobEvent::Status("No pose detected in frame.".into()));
-                    }
-                }
-                Err(e) => {
-                    let msg = format!("Pose detection requires ONNX runtime: {}", e);
-                    let _ = tx.send(JobEvent::Status(msg));
-                }
-            }
-        });
-
-        // Show placeholder while waiting
-        self.state.status = "Running pose detection...".into();
-    }
-
     // ─── AUTO-SAVE / RECOVERY ────────────────────────────────────────
 
     /// Periodically saves the current scene to `~/.memstroy/autosave.scene.yaml`.
@@ -2197,11 +2061,10 @@ impl eframe::App for App {
             self.state.eyedropper_active = true;
         }
 
-        // Handle pose detection request
-        if self.state.status == "__DETECT_POSE__" {
-            self.state.status = String::new();
-            self.run_pose_detection();
-        }
+        // Pose detection used to be triggered from the (now-removed) clip
+        // editor's "Detect Pose" button. The status sentinel and runner
+        // are gone; if the feature returns it should land as a button on
+        // the actor inspector instead.
 
         // ── Audio engine synchronisation ──
         // Build the list of audio sources currently scheduled in the scene:
@@ -2353,8 +2216,7 @@ impl eframe::App for App {
                 crate::canvas_preview::canvas_preview(ui, &mut self.state);
             });
 
-        // Node editor floating window (scaffold)
-        self.node_editor.show(ctx, &mut self.state.node_editor_open);
+        // Node editor was removed.
 
         // Curve editor floating window
         if self.state.curve_editor_open {
@@ -2389,9 +2251,10 @@ impl eframe::App for App {
             self.state.curve_editor_open = curve_open;
         }
 
-        // Clip editor floating window
-        if self.state.clip_editor_open {
-            self.state.clip_editor_open = clip_editor::clip_editor_window(ctx, &mut self.state);
+        // Image editor floating window (replaces the old clip editor —
+        // image-only editing logic that doesn't apply to videos).
+        if self.state.image_editor_open {
+            self.state.image_editor_open = image_editor::image_editor_window(ctx, &mut self.state);
         }
 
         // Skeleton editor floating window

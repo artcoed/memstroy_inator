@@ -27,7 +27,6 @@ image = { workspace = true }
 chrono = { workspace = true }
 memstroy-core = { workspace = true }
 memstroy-render = { workspace = true }
-memstroy-vision = { workspace = true }
 memstroy-assets-server = { workspace = true }
 wgpu = { workspace = true }
 rodio = { workspace = true }

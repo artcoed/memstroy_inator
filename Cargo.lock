@@ -2740,7 +2740,6 @@ dependencies = [
  "memstroy-assets-server",
  "memstroy-core",
  "memstroy-render",
- "memstroy-vision",
  "reqwest",
  "rfd",
  "rodio",
