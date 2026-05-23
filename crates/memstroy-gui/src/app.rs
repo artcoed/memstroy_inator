@@ -756,22 +756,29 @@ impl App {
         //    when nothing wants keyboard input — typing into a text
         //    overlay or a search box should not play/pause, delete
         //    things, or close popups behind the user's back.
-        // 2. **Modifier-based shortcuts** (Ctrl+Z/Y/D/C/V) fire
-        //    UNCONDITIONALLY via `consume_key`. This is the "deep
-        //    fix" the user asked for: previously the whole handler
-        //    bailed on `wants_keyboard_input`, which meant Ctrl+C and
-        //    Ctrl+V silently no-op'd whenever any TextEdit retained
-        //    focus (e.g. after typing in the title overlay's caption,
-        //    even if focus subsequently moved to the canvas). The
-        //    `consume_key` API also stops the focused text widget
-        //    from running its own copy/paste logic for the same key,
-        //    so we don't get a double dispatch.
+        //
+        // 2. **Modifier-based shortcuts** (Ctrl+Z/Y/D/C/V) are routed
+        //    through `consume_key` for the chord. There is one
+        //    additional subtlety here: egui rewrites Ctrl+C, Ctrl+X
+        //    and Ctrl+V into `Event::Copy` / `Event::Cut` /
+        //    `Event::Paste(text)` *before* it dispatches to widgets,
+        //    and depending on the platform / IME stack the original
+        //    `Event::Key { key: C, modifiers: ctrl, … }` may or may
+        //    not also be present. That is why the previous
+        //    `consume_key`-only approach silently broke for some
+        //    users: on those platforms only `Event::Copy` was
+        //    delivered and `consume_key(.., Key::C)` never fired.
+        //    The deep fix is to drain BOTH the synthetic
+        //    Copy/Cut/Paste events *and* the raw Ctrl+C/Ctrl+V key
+        //    chords. Whichever shows up, our handler runs exactly
+        //    once and consumes the event so a focused TextEdit
+        //    can't process it again.
         let typing = ctx.wants_keyboard_input();
 
         let modifiers = ctx.input(|i| i.modifiers);
         let ctrl = modifiers.ctrl || modifiers.mac_cmd;
 
-        // Modifier-based shortcuts — always run.
+        // ── Modifier-based shortcuts — always run. ──
         if ctrl {
             // Ctrl+Z = Undo (NOT Shift+Z, which is redo).
             if !modifiers.shift && ctx.input_mut(|i| {
@@ -795,36 +802,75 @@ impl App {
             }) {
                 self.duplicate_selected();
             }
-            // Ctrl+C = copy current selection
-            if ctx.input_mut(|i| {
+        }
+
+        // ── Ctrl+C / Ctrl+X / Ctrl+V — handled via BOTH the synthetic
+        //    Copy/Cut/Paste events AND the raw Ctrl+C/Ctrl+V key
+        //    chords, then deduplicated for the frame so a single
+        //    physical keypress only invokes the handler once.
+        //
+        //    `swallow_clipboard_events` removes every Copy / Cut /
+        //    Paste(_) event from the input queue and tells us how
+        //    many we drained for each kind. If a TextEdit is also
+        //    visible on screen it will not see them, which kills the
+        //    "type into the title overlay's caption field, then
+        //    Ctrl+V on the canvas pastes raw text into the caption
+        //    instead of dropping the clipboard image as a layer"
+        //    confusion the user kept hitting.
+        //
+        //    The chord-based fallbacks via `consume_key` cover the
+        //    rare paths where the OS / IME delivered a plain
+        //    `Event::Key` without the matching synthetic event.
+        let drained = swallow_clipboard_events(ctx);
+        let chord_copy = ctrl
+            && !modifiers.shift
+            && ctx.input_mut(|i| {
                 i.consume_key(egui::Modifiers::COMMAND, egui::Key::C)
-            }) {
-                let n = self.state.copy_selection_to_clipboard();
-                if n > 0 {
-                    self.state.status = format!(
-                        "\u{1F4CB} Copied {} item{} to clipboard",
-                        n,
-                        if n == 1 { "" } else { "s" }
-                    );
+            });
+        let chord_cut = ctrl
+            && !modifiers.shift
+            && ctx.input_mut(|i| {
+                i.consume_key(egui::Modifiers::COMMAND, egui::Key::X)
+            });
+        let chord_paste = ctrl
+            && !modifiers.shift
+            && ctx.input_mut(|i| {
+                i.consume_key(egui::Modifiers::COMMAND, egui::Key::V)
+            });
+        // Suppress double-fire when both the synthetic Event::Copy
+        // and the raw Ctrl+C key arrived for the same physical press.
+        let do_copy = drained.copied || chord_copy;
+        let do_cut = drained.cut || chord_cut;
+        let do_paste = drained.pasted || chord_paste;
+
+        if do_copy || do_cut {
+            let n = self.state.copy_selection_to_clipboard();
+            if n > 0 {
+                self.state.status = format!(
+                    "\u{1F4CB} Copied {} item{} to clipboard",
+                    n,
+                    if n == 1 { "" } else { "s" }
+                );
+                if do_cut {
+                    // Ctrl+X = copy + delete primary / multi-selection.
+                    self.delete_selected();
                 }
             }
-            // Ctrl+V = paste
-            if ctx.input_mut(|i| {
-                i.consume_key(egui::Modifiers::COMMAND, egui::Key::V)
-            }) {
-                let pasted_image = self.try_paste_image_from_system_clipboard();
-                if !pasted_image {
-                    let n = self.state.paste_clipboard();
-                    if n > 0 {
-                        self.state.status = format!(
-                            "\u{1F4CB} Pasted {} item{} at the playhead",
-                            n,
-                            if n == 1 { "" } else { "s" },
-                        );
-                    } else {
-                        self.state.status =
-                            "\u{1F4CB} Clipboard is empty".into();
-                    }
+        }
+
+        if do_paste {
+            let pasted_image = self.try_paste_image_from_system_clipboard();
+            if !pasted_image {
+                let n = self.state.paste_clipboard();
+                if n > 0 {
+                    self.state.status = format!(
+                        "\u{1F4CB} Pasted {} item{} at the playhead",
+                        n,
+                        if n == 1 { "" } else { "s" },
+                    );
+                } else {
+                    self.state.status =
+                        "\u{1F4CB} Clipboard is empty".into();
                 }
             }
         }
@@ -2208,6 +2254,66 @@ fn format_elapsed(secs: f32) -> String {
     }
 }
 
+/// Counters returned by [`swallow_clipboard_events`] so the caller can
+/// tell which kinds of synthetic clipboard events showed up this frame.
+/// All three flags are set independently so e.g. Ctrl+X (which becomes
+/// `Event::Cut`) only fires the cut path, not the copy + paste paths.
+#[derive(Default, Clone, Copy)]
+struct ClipboardDrain {
+    /// At least one `egui::Event::Copy` was drained.
+    copied: bool,
+    /// At least one `egui::Event::Cut` was drained.
+    cut: bool,
+    /// At least one `egui::Event::Paste(_)` was drained. The paste
+    /// payload itself is discarded — our paste handler reads the OS
+    /// clipboard directly via `arboard` (so it can also recover image
+    /// bytes, which `Event::Paste` only carries as text), and falls
+    /// back to the in-process `EditorState::clipboard` when the OS
+    /// clipboard is empty.
+    pasted: bool,
+}
+
+/// Remove every `Event::Copy` / `Event::Cut` / `Event::Paste(_)`
+/// from egui's input queue for the current frame and report which
+/// kinds were present.
+///
+/// Why this exists: egui rewrites Ctrl+C / Ctrl+X / Ctrl+V into these
+/// synthetic events *before* dispatching them to focused widgets. On
+/// some platforms (notably Windows in a focused TextEdit) the raw
+/// `Event::Key { key: C, modifiers: ctrl, … }` is *not* delivered at
+/// all — only `Event::Copy` is. That is why a previous fix that
+/// relied solely on `consume_key(.., Key::C)` left some users with
+/// silent Ctrl+C/V on the canvas: their TextEdit had focus, egui
+/// converted the chord to `Event::Copy`, and our handler never saw
+/// the corresponding `Event::Key`.
+///
+/// Draining the events here both (a) drives our copy/paste handler
+/// from the synthetic path, and (b) prevents a focused TextEdit from
+/// running its own copy/paste logic on the same physical keypress.
+/// The combination means Ctrl+C/V always reaches the editor's clip
+/// clipboard regardless of whether a text input is focused.
+fn swallow_clipboard_events(ctx: &egui::Context) -> ClipboardDrain {
+    let mut out = ClipboardDrain::default();
+    ctx.input_mut(|input| {
+        input.events.retain(|ev| match ev {
+            egui::Event::Copy => {
+                out.copied = true;
+                false
+            }
+            egui::Event::Cut => {
+                out.cut = true;
+                false
+            }
+            egui::Event::Paste(_) => {
+                out.pasted = true;
+                false
+            }
+            _ => true,
+        });
+    });
+    out
+}
+
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.pump_events(ctx);
@@ -2246,6 +2352,18 @@ impl eframe::App for App {
 
         // Keyboard shortcuts
         self.handle_shortcuts(ctx);
+
+        // ── Auto-rescan local asset directories ──
+        // Cheap mtime-fingerprint poll (debounced to ~2 s) that picks
+        // up files dropped into `assets/{images,sounds,videos,
+        // particles}/` by an external tool (file manager, screenshot
+        // app, OneDrive sync, …). Without this poll the editor was
+        // frozen on whatever the library showed at startup and the
+        // user had to paste/drag a file inside the editor first to
+        // force a `reload_library` — which the user reported as
+        // "картинки подгружаются из локального кеша в проект только
+        // после добавления первой картинки".
+        self.state.auto_rescan_local_library_if_due();
 
         // ── Frame-level "auto undo snapshot on press" ──
         //

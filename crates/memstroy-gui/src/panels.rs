@@ -309,12 +309,15 @@ fn library_clips_tab(ui: &mut egui::Ui, state: &mut EditorState) {
     // Clips are server-managed by design — the Refresh action POSTs
     // to the in-process memstroy-assets-server which scrapes Telegram
     // on the GUI's behalf. Surface that explicitly so users know which
-    // controls drive this list.
+    // controls drive this list. Display the *connect-able* URL so the
+    // user never sees a confusing wildcard host like `0.0.0.0:8765`,
+    // which is a valid bind address but cannot be used as a request
+    // target on Windows / macOS.
     ui.label(
         RichText::new(format!(
             "\u{1F310} {}: {}",
             crate::i18n::t("server"),
-            state.server_url
+            crate::state::rewrite_server_url_for_client(&state.server_url)
         ))
         .size(9.0)
         .italics()
@@ -531,7 +534,7 @@ fn library_assets_tab(ui: &mut egui::Ui, state: &mut EditorState, kind: AssetDra
                 RichText::new(format!(
                     "{}: {}",
                     crate::i18n::t("source"),
-                    state.server_url
+                    crate::state::rewrite_server_url_for_client(&state.server_url)
                 ))
                 .size(9.0)
                 .italics()
@@ -7301,8 +7304,12 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     // sub-pixel rounding inside the scrollbar's pan-fraction round-trip
     // this caused the last layer to "пропадать" (disappear) at maximum
     // scroll. A full row-height of empty space keeps the last lane
-    // visible regardless of v_zoom rounding.
-    const BOTTOM_GUTTER: f32 = 80.0;
+    // visible regardless of v_zoom rounding. Sized to comfortably clear
+    // the tallest possible row at max v_zoom (audio is 48 px × 8 = 384
+    // px) so even on a short timeline panel the bottom-most audio lane
+    // is fully reachable instead of getting clipped by the scrollbar's
+    // last-pixel round-down.
+    const BOTTOM_GUTTER: f32 = 160.0;
     let total_tracks_h: f32 = rf_row_h
         + (0..num_tracks)
             .map(|i| {
@@ -9163,12 +9170,34 @@ fn stretchable_scrollbar(
 
     let track_len = if horizontal { rect.width() } else { rect.height() }.max(1.0);
     let cross = if horizontal { rect.height() } else { rect.width() };
-    // Bigger edge-grip zone — the user explicitly called out that
-    // grabbing the resize ends of the local-zoom thumb was difficult.
-    // 12 px of slack on each side comfortably catches imprecise
-    // targeting on standard 14-px scrollbars without overlapping into
-    // the thumb's body for short windows.
-    let edge_zone = (cross * 0.9).max(12.0);
+    // Edge-grip zone for "stretch the thumb" vs "pan the thumb".
+    //
+    // The user explicitly called out that grabbing the resize ends of
+    // the local-zoom thumb was difficult, so we want this generous
+    // (12 px on each side comfortably catches imprecise targeting on a
+    // standard 14-px scrollbar). BUT the zone must never grow so wide
+    // that it consumes the entire thumb — at maximum local zoom the
+    // thumb shrinks to ~1/V_ZOOM_MAX of the track length. A bare-minimum
+    // 12-px edge zone on a 14-px-wide vertical scrollbar with a short
+    // viewport (~150 px) produces an ~18 px thumb, where two 12-px
+    // edges overlap completely and **every** click hits Mode::ResizeStart.
+    // The user is then physically unable to drag the thumb down — every
+    // drag just shrinks the visible window. That's the
+    // "audio layer unreachable at max vertical zoom" report: the
+    // bottom audio rows existed in the layout, but the only thing the
+    // scrollbar would let the user do was *zoom out* instead of *pan
+    // down*.
+    //
+    // The remedy is to keep the edge zones from ever covering more
+    // than 1/3 of the thumb each, leaving at least 1/3 in the middle
+    // for Mode::Pan. We then enforce a tiny absolute floor (3 px) so
+    // the resize affordance still exists even on very short scrollbars.
+    let view_window_frac = (view_b_frac - view_a_frac).clamp(0.0, 1.0);
+    let thumb_pixels = (view_window_frac * track_len).max(1.0);
+    let preferred_edge_zone = (cross * 0.9).max(12.0);
+    let edge_zone = preferred_edge_zone
+        .min((thumb_pixels / 3.0).max(3.0))
+        .max(3.0);
     let min_window_frac = (10.0 / track_len).min(0.5);
 
     let a = view_a_frac.clamp(0.0, 1.0);
