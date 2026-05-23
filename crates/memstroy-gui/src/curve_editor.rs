@@ -1,19 +1,88 @@
-//! Curve editor panel — shows keyframe graphs for actor properties.
+//! Curve editor panel — shows keyframe graphs for actor / overlay /
+//! audio properties.
 //!
 //! Displays a time/value graph with draggable keyframe diamonds.
-//! Supports bezier easing curves with visual control handles.
+//! Supports bezier easing curves with visual control handles. Adding
+//! a keyframe (via the + Key button or by double-clicking the graph)
+//! also flags the underlying parameter as **animated** in the owning
+//! element's `animated_params` set so subsequent edits in the
+//! inspector consistently behave as keyframable.
+//!
+//! The panel is intentionally generic over the exact backing storage
+//! — see `CurveEditorTarget` for the supported flavours. The host
+//! window in `app.rs` decides which target to bind based on the
+//! current `Selection` (with a dropdown picker when the user has
+//! several elements multi-selected).
+
+use std::collections::BTreeSet;
 
 use egui::{Color32, Pos2, Rect, Rounding, Sense, Stroke, Vec2};
-use memstroy_core::{ActorState, Easing, Keyframe};
+use memstroy_core::{
+    param_ids, ActorState, Easing, Keyframe, OverlayState,
+};
 
-/// Property indices for the curve editor.
+/// Property indices for the curve editor (transform parameters).
 pub const PROP_SCALE: usize = 0;
 pub const PROP_POS_X: usize = 1;
 pub const PROP_POS_Y: usize = 2;
 pub const PROP_OPACITY: usize = 3;
 pub const PROP_ROTATION: usize = 4;
 
-const PROPERTY_NAMES: &[&str] = &["Scale", "Pos X", "Pos Y", "Opacity", "Rotation"];
+/// Total number of transform-parameter slots.
+const NUM_TRANSFORM_PROPS: usize = 5;
+
+/// What kind of element the curve editor is currently bound to. The
+/// caller hands one of these to [`curve_editor_panel`] together with
+/// the playhead and clip duration; the panel takes care of mapping
+/// `selected_property` to the right backing field.
+pub enum CurveEditorTarget<'a> {
+    /// Transform layout of an actor.
+    Actor {
+        layout: &'a mut Vec<Keyframe<ActorState>>,
+        animated_params: &'a mut BTreeSet<String>,
+    },
+    /// Transform layout of a text / image / video overlay. `t_in`
+    /// shifts the keyframe time-axis so the editor speaks scene-time
+    /// (matching the actor track's frame-of-reference).
+    Overlay {
+        layout: &'a mut Vec<Keyframe<OverlayState>>,
+        animated_params: &'a mut BTreeSet<String>,
+        t_in: f32,
+    },
+    /// Audio layer: per-parameter scalar tracks for Volume / Speed /
+    /// Pan. Only one parameter is shown at a time; the property
+    /// selector switches between them.
+    Audio {
+        kfs: &'a mut Vec<Keyframe<f32>>,
+        animated_params: &'a mut BTreeSet<String>,
+        param_id: &'static str,
+        param_label: &'static str,
+        param_color: Color32,
+        value_range: (f32, f32),
+        /// Static value to seed a freshly inserted keyframe with when
+        /// the track is empty.
+        static_value: f32,
+        /// Clip-local time of the playhead (audio kfs are stored in
+        /// clip-local seconds).
+        t_local: f32,
+    },
+}
+
+const PROPERTY_NAMES: &[&str] =
+    &["Scale", "Pos X", "Pos Y", "Opacity", "Rotation"];
+
+/// Map a transform-property slot to the param-id used in
+/// `animated_params`.
+fn prop_to_param_id(prop: usize) -> &'static str {
+    match prop {
+        PROP_SCALE => param_ids::SCALE,
+        PROP_POS_X => param_ids::POS_X,
+        PROP_POS_Y => param_ids::POS_Y,
+        PROP_OPACITY => param_ids::OPACITY,
+        PROP_ROTATION => param_ids::ROTATION,
+        _ => param_ids::SCALE,
+    }
+}
 
 /// Value range for each property (min, max).
 fn property_range(prop: usize) -> (f32, f32) {
@@ -27,8 +96,7 @@ fn property_range(prop: usize) -> (f32, f32) {
     }
 }
 
-/// Get the value of a property from an ActorState.
-fn get_property(state: &ActorState, prop: usize) -> f32 {
+fn get_actor_property(state: &ActorState, prop: usize) -> f32 {
     match prop {
         PROP_SCALE => state.scale,
         PROP_POS_X => state.pos[0],
@@ -39,8 +107,29 @@ fn get_property(state: &ActorState, prop: usize) -> f32 {
     }
 }
 
-/// Set the value of a property on an ActorState.
-fn set_property(state: &mut ActorState, prop: usize, value: f32) {
+fn set_actor_property(state: &mut ActorState, prop: usize, value: f32) {
+    match prop {
+        PROP_SCALE => state.scale = value,
+        PROP_POS_X => state.pos[0] = value,
+        PROP_POS_Y => state.pos[1] = value,
+        PROP_OPACITY => state.opacity = value,
+        PROP_ROTATION => state.rotation_deg = value,
+        _ => {}
+    }
+}
+
+fn get_overlay_property(state: &OverlayState, prop: usize) -> f32 {
+    match prop {
+        PROP_SCALE => state.scale,
+        PROP_POS_X => state.pos[0],
+        PROP_POS_Y => state.pos[1],
+        PROP_OPACITY => state.opacity,
+        PROP_ROTATION => state.rotation_deg,
+        _ => 0.0,
+    }
+}
+
+fn set_overlay_property(state: &mut OverlayState, prop: usize, value: f32) {
     match prop {
         PROP_SCALE => state.scale = value,
         PROP_POS_X => state.pos[0] = value,
@@ -63,37 +152,229 @@ fn property_color(prop: usize) -> Color32 {
     }
 }
 
-/// Get the control handle positions for a given easing type.
-/// Returns (handle_out_x, handle_out_y, handle_in_x, handle_in_y) as fractions [0,1].
-/// handle_out is the right handle of the left keyframe, handle_in is the left handle of the right keyframe.
-fn easing_to_bezier_handles(easing: Easing) -> ([f32; 2], [f32; 2]) {
-    match easing {
-        Easing::Step => ([0.5, 0.0], [0.5, 1.0]),
-        Easing::Linear => ([0.33, 0.33], [0.67, 0.67]),
-        Easing::EaseIn => ([0.42, 0.0], [1.0, 1.0]),
-        Easing::EaseOut => ([0.0, 0.0], [0.58, 1.0]),
-        Easing::EaseInOut => ([0.42, 0.0], [0.58, 1.0]),
-        Easing::Cubic => ([0.33, 0.0], [0.67, 1.0]),
+// ─── Common geometry helpers ─────────────────────────────────────────
+
+fn time_to_graph_x(t: f32, t_min: f32, t_max: f32, rect: Rect) -> f32 {
+    let frac = (t - t_min) / (t_max - t_min).max(1e-6);
+    rect.min.x + frac * rect.width()
+}
+
+fn value_to_graph_y(v: f32, v_min: f32, v_max: f32, rect: Rect) -> f32 {
+    let frac = (v - v_min) / (v_max - v_min).max(1e-6);
+    rect.max.y - frac * rect.height()
+}
+
+fn graph_x_to_time(x: f32, t_min: f32, t_max: f32, rect: Rect) -> f32 {
+    let frac = (x - rect.min.x) / rect.width().max(1.0);
+    t_min + frac * (t_max - t_min)
+}
+
+fn graph_y_to_value(y: f32, v_min: f32, v_max: f32, rect: Rect) -> f32 {
+    let frac = (rect.max.y - y) / rect.height().max(1.0);
+    v_min + frac * (v_max - v_min)
+}
+
+/// Cycle to the next easing in a fixed order. Used by the right-click
+/// menu *and* the "next easing" toolbar button so users can quickly
+/// preview every interpolation flavour without diving into the menu.
+#[allow(dead_code)]
+fn cycle_easing(e: Easing) -> Easing {
+    match e {
+        Easing::Linear => Easing::EaseIn,
+        Easing::EaseIn => Easing::EaseOut,
+        Easing::EaseOut => Easing::EaseInOut,
+        Easing::EaseInOut => Easing::Cubic,
+        Easing::Cubic => Easing::Step,
+        Easing::Step => Easing::Linear,
     }
 }
 
-/// Draw the curve editor panel.
+/// Render a small "Easing for selected kf" pair of menus that lets
+/// the user pick interpolation curves on the *currently focused*
+/// keyframe. Returns the new easing if the user picked one, or
+/// `None` if the menu was closed without changes.
+fn easing_picker(ui: &mut egui::Ui, current: Easing) -> Option<Easing> {
+    let mut picked = None;
+    egui::ComboBox::from_id_source("curve_editor_easing")
+        .selected_text(easing_label(current))
+        .show_ui(ui, |ui| {
+            for e in [
+                Easing::Linear,
+                Easing::EaseIn,
+                Easing::EaseOut,
+                Easing::EaseInOut,
+                Easing::Cubic,
+                Easing::Step,
+            ] {
+                if ui
+                    .selectable_label(current == e, easing_label(e))
+                    .clicked()
+                {
+                    picked = Some(e);
+                }
+            }
+        });
+    picked
+}
+
+fn easing_label(e: Easing) -> &'static str {
+    match e {
+        Easing::Linear => "Linear",
+        Easing::EaseIn => "Ease in",
+        Easing::EaseOut => "Ease out",
+        Easing::EaseInOut => "Ease in/out",
+        Easing::Cubic => "Cubic",
+        Easing::Step => "Step (hold)",
+    }
+}
+
+/// Draw the curve editor panel for the given target.
 ///
-/// `keyframes` is the actor's layout keyframe track.
-/// `duration` is the scene duration.
-/// `selected_property` is a mutable reference to which property is being edited.
-/// `playhead` is the current playhead time for the time indicator.
+/// `selected_property` is only meaningful for Actor / Overlay targets
+/// (transform property index). For Audio targets the property is fixed
+/// and the slot is ignored.
 pub fn curve_editor_panel(
     ui: &mut egui::Ui,
-    keyframes: &mut Vec<Keyframe<ActorState>>,
+    target: CurveEditorTarget<'_>,
     duration: f32,
     selected_property: &mut usize,
     playhead: f32,
 ) {
+    use crate::i18n::t;
+
+    match target {
+        CurveEditorTarget::Actor { layout, animated_params } => {
+            transform_curve_editor::<ActorState>(
+                ui,
+                layout,
+                animated_params,
+                duration,
+                selected_property,
+                playhead,
+                /* time_offset */ 0.0,
+                get_actor_property,
+                set_actor_property,
+                ActorState::default,
+            );
+        }
+        CurveEditorTarget::Overlay { layout, animated_params, t_in } => {
+            transform_curve_editor::<OverlayState>(
+                ui,
+                layout,
+                animated_params,
+                duration,
+                selected_property,
+                playhead,
+                /* time_offset */ t_in,
+                get_overlay_property,
+                set_overlay_property,
+                OverlayState::default,
+            );
+        }
+        CurveEditorTarget::Audio {
+            kfs,
+            animated_params,
+            param_id,
+            param_label,
+            param_color,
+            value_range,
+            static_value,
+            t_local,
+        } => {
+            // Header for audio param.
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(t("Curve Editor"))
+                        .size(13.0)
+                        .strong()
+                        .color(Color32::from_rgb(200, 180, 255)),
+                );
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(t(param_label))
+                        .size(11.0)
+                        .color(param_color),
+                );
+                let on = animated_params.contains(param_id);
+                let toggle_label = if on { t("Animated") } else { t("Static") };
+                if ui
+                    .selectable_label(on, toggle_label)
+                    .on_hover_text(t(
+                        "Toggle whether this parameter is animatable (changes will create keyframes)",
+                    ))
+                    .clicked()
+                {
+                    if on {
+                        animated_params.remove(param_id);
+                    } else {
+                        animated_params.insert(param_id.to_string());
+                    }
+                }
+                ui.with_layout(
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        if ui
+                            .small_button(t("+ Key"))
+                            .on_hover_text(t("Add keyframe at playhead"))
+                            .clicked()
+                        {
+                            let value = sample_f32_kfs(kfs, t_local, static_value);
+                            kfs.push(Keyframe::new(t_local.max(0.0), value));
+                            kfs.sort_by(|a, b| {
+                                a.t.partial_cmp(&b.t).unwrap()
+                            });
+                            animated_params.insert(param_id.to_string());
+                        }
+                    },
+                );
+            });
+
+            ui.add_space(4.0);
+            scalar_curve_editor(
+                ui,
+                kfs,
+                animated_params,
+                param_id,
+                param_color,
+                duration,
+                value_range,
+                static_value,
+                t_local,
+            );
+        }
+    }
+}
+
+/// Sample a `Vec<Keyframe<f32>>` track at time `t`, falling back to
+/// `default` for empty tracks. Used by the audio curve editor.
+fn sample_f32_kfs(kfs: &[Keyframe<f32>], t: f32, default: f32) -> f32 {
+    memstroy_core::keyframe::sample(kfs, t).unwrap_or(default)
+}
+
+/// Generic transform-curve editor used by both Actor and Overlay
+/// targets. Templated over the keyframe value type `T`. The caller
+/// supplies the property accessor / mutator and a default-state
+/// constructor used to seed the very first keyframe.
+#[allow(clippy::too_many_arguments)]
+fn transform_curve_editor<T>(
+    ui: &mut egui::Ui,
+    keyframes: &mut Vec<Keyframe<T>>,
+    animated_params: &mut BTreeSet<String>,
+    duration: f32,
+    selected_property: &mut usize,
+    playhead: f32,
+    time_offset: f32,
+    get_property: fn(&T, usize) -> f32,
+    set_property: fn(&mut T, usize, f32),
+    default_value: fn() -> T,
+) where
+    T: Clone,
+{
+    use crate::i18n::t;
     // ── Property selector toolbar ──
     ui.horizontal(|ui| {
         ui.label(
-            egui::RichText::new("Curve Editor")
+            egui::RichText::new(t("Curve Editor"))
                 .size(13.0)
                 .strong()
                 .color(Color32::from_rgb(200, 180, 255)),
@@ -102,8 +383,17 @@ pub fn curve_editor_panel(
         for (i, name) in PROPERTY_NAMES.iter().enumerate() {
             let color = property_color(i);
             let selected = *selected_property == i;
-            let text = egui::RichText::new(*name).size(11.0).color(if selected {
+            let param_id = prop_to_param_id(i);
+            let is_animated = animated_params.contains(param_id);
+            // Add a small diamond marker to the label when the
+            // parameter is currently flagged as animated so the user
+            // can tell at a glance which curve they're authoring.
+            let prefix = if is_animated { "\u{25C6} " } else { "" };
+            let display = format!("{}{}", prefix, t(*name));
+            let text = egui::RichText::new(display).size(11.0).color(if selected {
                 color
+            } else if is_animated {
+                Color32::from_rgb(200, 180, 120)
             } else {
                 Color32::from_rgb(140, 140, 160)
             });
@@ -112,21 +402,73 @@ pub fn curve_editor_panel(
             }
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.small_button("+ Key").on_hover_text("Add keyframe at playhead").clicked() {
-                // Add a keyframe at the current playhead position
-                let value = interpolate_at(keyframes, playhead, *selected_property);
+            if ui
+                .small_button(t("+ Key"))
+                .on_hover_text(t("Add keyframe at playhead"))
+                .clicked()
+            {
+                // The keyframe time stored on the layout is "scene
+                // time minus t_in" so it always matches the local
+                // frame the rest of the editor uses for that flavour
+                // of element.
+                let local_t = (playhead - time_offset).max(0.0);
+                let value = interpolate_at::<T>(
+                    keyframes,
+                    local_t,
+                    *selected_property,
+                    get_property,
+                );
                 let mut new_state = keyframes
                     .last()
-                    .map(|kf| kf.value)
-                    .unwrap_or_default();
+                    .map(|kf| kf.value.clone())
+                    .unwrap_or_else(default_value);
                 set_property(&mut new_state, *selected_property, value);
-                keyframes.push(Keyframe::new(playhead, new_state));
+                keyframes.push(Keyframe::new(local_t, new_state));
                 keyframes.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap());
+                // Mark the parameter as animated — adding a kf is a
+                // strong signal of intent.
+                animated_params.insert(prop_to_param_id(*selected_property).to_string());
             }
         });
     });
 
     ui.add_space(4.0);
+
+    // ── Easing picker for the selected kf at the playhead ──
+    if !keyframes.is_empty() {
+        let local_t = (playhead - time_offset).max(0.0);
+        let nearest_idx = keyframes
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                let da = (a.t - local_t).abs();
+                let db = (b.t - local_t).abs();
+                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(t("Transition into kf:"))
+                    .size(10.5)
+                    .color(Color32::from_rgb(160, 160, 180)),
+            );
+            let cur_easing = keyframes[nearest_idx].easing;
+            if let Some(next) = easing_picker(ui, cur_easing) {
+                keyframes[nearest_idx].easing = next;
+            }
+            ui.label(
+                egui::RichText::new(format!(
+                    "kf #{} @ {:.2}s",
+                    nearest_idx + 1,
+                    keyframes[nearest_idx].t,
+                ))
+                .size(10.0)
+                .color(Color32::from_rgb(120, 120, 140)),
+            );
+        });
+        ui.add_space(2.0);
+    }
 
     // ── Graph area ──
     let available = ui.available_size();
@@ -140,10 +482,7 @@ pub fn curve_editor_panel(
 
     let painter = ui.painter_at(graph_rect);
 
-    // Dark background
     painter.rect_filled(graph_rect, Rounding::same(4.0), Color32::from_rgb(12, 12, 20));
-
-    // Border
     painter.rect_stroke(
         graph_rect,
         Rounding::same(4.0),
@@ -158,11 +497,12 @@ pub fn curve_editor_panel(
     let margin = 4.0;
     let inner_rect = graph_rect.shrink(margin);
 
-    // ── Grid lines ──
     draw_grid(&painter, inner_rect, time_min, time_max, val_min, val_max);
 
-    // ── Playhead indicator ──
-    let ph_x = time_to_graph_x(playhead, time_min, time_max, inner_rect);
+    // Playhead indicator (rendered in local time so it lines up with
+    // the kf positions).
+    let local_playhead = (playhead - time_offset).max(0.0);
+    let ph_x = time_to_graph_x(local_playhead, time_min, time_max, inner_rect);
     if ph_x >= inner_rect.min.x && ph_x <= inner_rect.max.x {
         painter.line_segment(
             [
@@ -173,11 +513,9 @@ pub fn curve_editor_panel(
         );
     }
 
-    // ── Draw curve with bezier easing (sampled as multiple line segments) ──
     let curve_color = property_color(prop);
-    let handle_color = Color32::from_rgb(180, 180, 220);
-    let handle_line_color = Color32::from_rgb(100, 100, 140);
 
+    // Draw the curve segments.
     if keyframes.len() >= 2 {
         for pair in keyframes.windows(2) {
             let (kf_a, kf_b) = (&pair[0], &pair[1]);
@@ -188,29 +526,12 @@ pub fn curve_editor_panel(
             let xb = time_to_graph_x(kf_b.t, time_min, time_max, inner_rect);
             let yb = value_to_graph_y(vb, val_min, val_max, inner_rect);
 
-            // Get bezier handles based on the easing of kf_b (easing INTO kf_b)
-            let (handle_out, handle_in) = easing_to_bezier_handles(kf_b.easing);
-
-            // Convert handle fractions to pixel positions
-            let dx = xb - xa;
-            let dy = yb - ya;
-
-            // Handle out (from kf_a): offset in time/value space
-            let h_out_x = xa + handle_out[0] * dx;
-            let h_out_y = ya + (handle_out[1] - 0.0) * dy; // relative to start value
-
-            // Handle in (to kf_b): offset in time/value space
-            let h_in_x = xa + handle_in[0] * dx;
-            let h_in_y = ya + (handle_in[1] - 0.0) * dy; // relative to start value
-
-            // Draw the easing curve using 20 sampled points
-            let num_samples = 20;
+            let num_samples = 24;
             let mut prev_point = Pos2::new(xa, ya);
             for i in 1..=num_samples {
                 let frac = i as f32 / num_samples as f32;
-                // Apply the easing function to get the interpolated value
                 let eased = kf_b.easing.apply(frac);
-                let px = xa + frac * dx;
+                let px = xa + frac * (xb - xa);
                 let py = ya + eased * (yb - ya);
                 let cur_point = Pos2::new(px, py);
                 painter.line_segment(
@@ -219,27 +540,14 @@ pub fn curve_editor_panel(
                 );
                 prev_point = cur_point;
             }
-
-            // Draw bezier control handle lines and circles
-            // Handle out from kf_a (right handle)
-            painter.line_segment(
-                [Pos2::new(xa, ya), Pos2::new(h_out_x, h_out_y)],
-                Stroke::new(1.0, handle_line_color),
-            );
-            painter.circle_filled(Pos2::new(h_out_x, h_out_y), 3.0, handle_color);
-
-            // Handle in to kf_b (left handle)
-            painter.line_segment(
-                [Pos2::new(xb, yb), Pos2::new(h_in_x, h_in_y)],
-                Stroke::new(1.0, handle_line_color),
-            );
-            painter.circle_filled(Pos2::new(h_in_x, h_in_y), 3.0, handle_color);
         }
     }
 
-    // ── Draw keyframe diamonds (draggable) ──
+    // Draw keyframe diamonds (draggable).
     let diamond_size = 6.0;
     let mut drag_idx: Option<usize> = None;
+    let mut delete_idx: Option<usize> = None;
+    let mut easing_change: Option<(usize, Easing)> = None;
 
     for (ki, kf) in keyframes.iter().enumerate() {
         let v = get_property(&kf.value, prop);
@@ -247,7 +555,6 @@ pub fn curve_editor_panel(
         let cy = value_to_graph_y(v, val_min, val_max, inner_rect);
         let center = Pos2::new(cx, cy);
 
-        // Diamond shape (rotated square)
         let diamond_points = vec![
             Pos2::new(center.x, center.y - diamond_size),
             Pos2::new(center.x + diamond_size, center.y),
@@ -261,9 +568,8 @@ pub fn curve_editor_panel(
             Stroke::new(1.0, Color32::WHITE),
         ));
 
-        // Show easing type label near the diamond
         if keyframes.len() > 1 && ki > 0 {
-            let easing_label = match kf.easing {
+            let easing_l = match kf.easing {
                 Easing::Step => "Step",
                 Easing::Linear => "",
                 Easing::EaseIn => "In",
@@ -271,18 +577,17 @@ pub fn curve_editor_panel(
                 Easing::EaseInOut => "InOut",
                 Easing::Cubic => "Cubic",
             };
-            if !easing_label.is_empty() {
+            if !easing_l.is_empty() {
                 painter.text(
                     Pos2::new(center.x, center.y - diamond_size - 6.0),
                     egui::Align2::CENTER_BOTTOM,
-                    easing_label,
+                    easing_l,
                     egui::FontId::proportional(8.0),
                     Color32::from_rgb(160, 140, 200),
                 );
             }
         }
 
-        // Check if this diamond is being dragged
         let diamond_rect = Rect::from_center_size(center, Vec2::splat(diamond_size * 2.5));
         let id = ui.make_persistent_id(("curve_kf", ki));
         let kf_resp = ui.interact(diamond_rect, id, Sense::click_and_drag());
@@ -290,15 +595,42 @@ pub fn curve_editor_panel(
         if kf_resp.dragged() {
             drag_idx = Some(ki);
         }
+        kf_resp.context_menu(|ui| {
+            ui.label(egui::RichText::new(t("Interpolation")).size(10.0).strong());
+            ui.separator();
+            for (label, value) in [
+                ("Linear", Easing::Linear),
+                ("Ease in", Easing::EaseIn),
+                ("Ease out", Easing::EaseOut),
+                ("Ease in/out", Easing::EaseInOut),
+                ("Step (hold)", Easing::Step),
+                ("Cubic", Easing::Cubic),
+            ] {
+                let selected = kf.easing == value;
+                if ui.selectable_label(selected, t(label)).clicked() {
+                    easing_change = Some((ki, value));
+                    ui.close_menu();
+                }
+            }
+            ui.separator();
+            if ui.selectable_label(false, t("Delete keyframe")).clicked() {
+                delete_idx = Some(ki);
+                ui.close_menu();
+            }
+        });
+    }
 
-        // Right-click to cycle easing
-        if kf_resp.secondary_clicked() && ki > 0 {
-            // Cycle through easing types on right-click
-            // This will be handled below since we need mutable access
+    if let Some((ki, e)) = easing_change {
+        if let Some(kf) = keyframes.get_mut(ki) {
+            kf.easing = e;
+        }
+    }
+    if let Some(ki) = delete_idx {
+        if ki < keyframes.len() {
+            keyframes.remove(ki);
         }
     }
 
-    // Apply drag if any
     if let Some(ki) = drag_idx {
         if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
             let new_t = graph_x_to_time(pos.x, time_min, time_max, inner_rect)
@@ -310,53 +642,6 @@ pub fn curve_editor_panel(
         }
     }
 
-    // Handle control handle dragging
-    // For simplicity, control handles change the easing type when dragged
-    // (full bezier handle editing would require storing custom control points)
-    if keyframes.len() >= 2 {
-        for ki in 1..keyframes.len() {
-            let kf_b = &keyframes[ki];
-            let kf_a = &keyframes[ki - 1];
-            let va = get_property(&kf_a.value, prop);
-            let vb = get_property(&kf_b.value, prop);
-            let xa = time_to_graph_x(kf_a.t, time_min, time_max, inner_rect);
-            let ya = value_to_graph_y(va, val_min, val_max, inner_rect);
-            let xb = time_to_graph_x(kf_b.t, time_min, time_max, inner_rect);
-            let yb = value_to_graph_y(vb, val_min, val_max, inner_rect);
-
-            let (handle_out, handle_in) = easing_to_bezier_handles(kf_b.easing);
-            let dx = xb - xa;
-            let dy = yb - ya;
-
-            let h_out_pos = Pos2::new(xa + handle_out[0] * dx, ya + handle_out[1] * dy);
-            let h_in_pos = Pos2::new(xa + handle_in[0] * dx, ya + handle_in[1] * dy);
-
-            // Interact with handle_out
-            let h_out_rect = Rect::from_center_size(h_out_pos, Vec2::splat(10.0));
-            let h_out_id = ui.make_persistent_id(("curve_h_out", ki));
-            let h_out_resp = ui.interact(h_out_rect, h_out_id, Sense::click_and_drag());
-
-            // Interact with handle_in
-            let h_in_rect = Rect::from_center_size(h_in_pos, Vec2::splat(10.0));
-            let h_in_id = ui.make_persistent_id(("curve_h_in", ki));
-            let h_in_resp = ui.interact(h_in_rect, h_in_id, Sense::click_and_drag());
-
-            // On double-click of either handle, cycle through easing types
-            if h_out_resp.double_clicked() || h_in_resp.double_clicked() {
-                let next_easing = match keyframes[ki].easing {
-                    Easing::Linear => Easing::EaseIn,
-                    Easing::EaseIn => Easing::EaseOut,
-                    Easing::EaseOut => Easing::EaseInOut,
-                    Easing::EaseInOut => Easing::Cubic,
-                    Easing::Cubic => Easing::Step,
-                    Easing::Step => Easing::Linear,
-                };
-                keyframes[ki].easing = next_easing;
-            }
-        }
-    }
-
-    // Double-click to add a keyframe
     if response.double_clicked() {
         if let Some(pos) = response.interact_pointer_pos() {
             let new_t = graph_x_to_time(pos.x, time_min, time_max, inner_rect)
@@ -365,17 +650,193 @@ pub fn curve_editor_panel(
                 .clamp(val_min, val_max);
             let mut new_state = keyframes
                 .last()
-                .map(|kf| kf.value)
-                .unwrap_or_default();
+                .map(|kf| kf.value.clone())
+                .unwrap_or_else(default_value);
             set_property(&mut new_state, prop, new_v);
             keyframes.push(Keyframe::new(new_t, new_state));
             keyframes.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap());
+            animated_params.insert(prop_to_param_id(prop).to_string());
+        }
+    }
+
+    let _ = NUM_TRANSFORM_PROPS;
+}
+
+/// Audio scalar (Vec<Keyframe<f32>>) curve editor — single value over
+/// time, no property selector. Drag to move kfs; right-click for the
+/// easing menu; double-click empty to add. Adding marks the param as
+/// animated.
+#[allow(clippy::too_many_arguments)]
+fn scalar_curve_editor(
+    ui: &mut egui::Ui,
+    kfs: &mut Vec<Keyframe<f32>>,
+    animated_params: &mut BTreeSet<String>,
+    param_id: &str,
+    color: Color32,
+    duration: f32,
+    value_range: (f32, f32),
+    static_value: f32,
+    t_local: f32,
+) {
+    use crate::i18n::t;
+    let available = ui.available_size();
+    let graph_height = (available.y - 8.0).max(60.0);
+    let graph_width = available.x;
+
+    let (graph_rect, response) = ui.allocate_exact_size(
+        Vec2::new(graph_width, graph_height),
+        Sense::click_and_drag(),
+    );
+
+    let painter = ui.painter_at(graph_rect);
+    painter.rect_filled(graph_rect, Rounding::same(4.0), Color32::from_rgb(12, 12, 20));
+    painter.rect_stroke(
+        graph_rect,
+        Rounding::same(4.0),
+        Stroke::new(1.0, Color32::from_rgb(40, 40, 60)),
+    );
+
+    let (val_min, val_max) = value_range;
+    let time_min = 0.0_f32;
+    let time_max = duration.max(0.1);
+    let inner_rect = graph_rect.shrink(4.0);
+
+    draw_grid(&painter, inner_rect, time_min, time_max, val_min, val_max);
+
+    let ph_x = time_to_graph_x(t_local.max(0.0), time_min, time_max, inner_rect);
+    if ph_x >= inner_rect.min.x && ph_x <= inner_rect.max.x {
+        painter.line_segment(
+            [
+                Pos2::new(ph_x, inner_rect.min.y),
+                Pos2::new(ph_x, inner_rect.max.y),
+            ],
+            Stroke::new(1.0, Color32::from_rgb(255, 60, 60)),
+        );
+    }
+
+    if kfs.len() >= 2 {
+        for pair in kfs.windows(2) {
+            let (a, b) = (&pair[0], &pair[1]);
+            let xa = time_to_graph_x(a.t, time_min, time_max, inner_rect);
+            let ya = value_to_graph_y(a.value, val_min, val_max, inner_rect);
+            let xb = time_to_graph_x(b.t, time_min, time_max, inner_rect);
+            let yb = value_to_graph_y(b.value, val_min, val_max, inner_rect);
+
+            let num_samples = 24;
+            let mut prev_point = Pos2::new(xa, ya);
+            for i in 1..=num_samples {
+                let frac = i as f32 / num_samples as f32;
+                let eased = b.easing.apply(frac);
+                let px = xa + frac * (xb - xa);
+                let py = ya + eased * (yb - ya);
+                let cur_point = Pos2::new(px, py);
+                painter.line_segment(
+                    [prev_point, cur_point],
+                    Stroke::new(1.5, color),
+                );
+                prev_point = cur_point;
+            }
+        }
+    }
+
+    let diamond_size = 6.0;
+    let mut drag_idx: Option<usize> = None;
+    let mut delete_idx: Option<usize> = None;
+    let mut easing_change: Option<(usize, Easing)> = None;
+
+    for (ki, kf) in kfs.iter().enumerate() {
+        let cx = time_to_graph_x(kf.t, time_min, time_max, inner_rect);
+        let cy = value_to_graph_y(kf.value, val_min, val_max, inner_rect);
+        let center = Pos2::new(cx, cy);
+        let pts = vec![
+            Pos2::new(center.x, center.y - diamond_size),
+            Pos2::new(center.x + diamond_size, center.y),
+            Pos2::new(center.x, center.y + diamond_size),
+            Pos2::new(center.x - diamond_size, center.y),
+        ];
+        painter.add(egui::Shape::convex_polygon(
+            pts,
+            color,
+            Stroke::new(1.0, Color32::WHITE),
+        ));
+
+        let diamond_rect =
+            Rect::from_center_size(center, Vec2::splat(diamond_size * 2.5));
+        let id = ui.make_persistent_id(("audio_curve_kf", ki));
+        let kf_resp = ui.interact(diamond_rect, id, Sense::click_and_drag());
+        if kf_resp.dragged() {
+            drag_idx = Some(ki);
+        }
+        kf_resp.context_menu(|ui| {
+            ui.label(egui::RichText::new(t("Interpolation")).size(10.0).strong());
+            ui.separator();
+            for (label, value) in [
+                ("Linear", Easing::Linear),
+                ("Ease in", Easing::EaseIn),
+                ("Ease out", Easing::EaseOut),
+                ("Ease in/out", Easing::EaseInOut),
+                ("Step (hold)", Easing::Step),
+                ("Cubic", Easing::Cubic),
+            ] {
+                let selected = kf.easing == value;
+                if ui.selectable_label(selected, t(label)).clicked() {
+                    easing_change = Some((ki, value));
+                    ui.close_menu();
+                }
+            }
+            ui.separator();
+            if ui.selectable_label(false, t("Delete keyframe")).clicked() {
+                delete_idx = Some(ki);
+                ui.close_menu();
+            }
+        });
+    }
+
+    if let Some((ki, e)) = easing_change {
+        if let Some(kf) = kfs.get_mut(ki) {
+            kf.easing = e;
+        }
+    }
+    if let Some(ki) = delete_idx {
+        if ki < kfs.len() {
+            kfs.remove(ki);
+        }
+    }
+    if let Some(ki) = drag_idx {
+        if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
+            let new_t = graph_x_to_time(pos.x, time_min, time_max, inner_rect)
+                .clamp(0.0, time_max);
+            let new_v = graph_y_to_value(pos.y, val_min, val_max, inner_rect)
+                .clamp(val_min, val_max);
+            kfs[ki].t = new_t;
+            kfs[ki].value = new_v;
+        }
+    }
+    if response.double_clicked() {
+        if let Some(pos) = response.interact_pointer_pos() {
+            let new_t = graph_x_to_time(pos.x, time_min, time_max, inner_rect)
+                .clamp(0.0, time_max);
+            let new_v = graph_y_to_value(pos.y, val_min, val_max, inner_rect)
+                .clamp(val_min, val_max);
+            // Seed the very first kf with the static value at t=0 so
+            // the curve has a sensible starting point.
+            if kfs.is_empty() {
+                kfs.push(Keyframe::new(0.0, static_value));
+            }
+            kfs.push(Keyframe::new(new_t, new_v));
+            kfs.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap());
+            animated_params.insert(param_id.to_string());
         }
     }
 }
 
 /// Interpolate the current property value at a given time using easing.
-fn interpolate_at(keyframes: &[Keyframe<ActorState>], t: f32, prop: usize) -> f32 {
+fn interpolate_at<T>(
+    keyframes: &[Keyframe<T>],
+    t: f32,
+    prop: usize,
+    get_property: fn(&T, usize) -> f32,
+) -> f32 {
     if keyframes.is_empty() {
         return match prop {
             PROP_SCALE => 1.0,
@@ -395,7 +856,6 @@ fn interpolate_at(keyframes: &[Keyframe<ActorState>], t: f32, prop: usize) -> f3
         if t >= a.t && t <= b.t {
             let span = (b.t - a.t).max(1e-6);
             let raw_frac = (t - a.t) / span;
-            // Apply easing curve
             let eased_frac = b.easing.apply(raw_frac);
             let va = get_property(&a.value, prop);
             let vb = get_property(&b.value, prop);
@@ -410,7 +870,6 @@ fn draw_grid(painter: &egui::Painter, rect: Rect, t_min: f32, t_max: f32, v_min:
     let grid_color = Color32::from_rgb(30, 30, 45);
     let text_color = Color32::from_rgb(80, 80, 100);
 
-    // Horizontal lines (value axis)
     let num_h_lines = 5;
     for i in 0..=num_h_lines {
         let frac = i as f32 / num_h_lines as f32;
@@ -429,7 +888,6 @@ fn draw_grid(painter: &egui::Painter, rect: Rect, t_min: f32, t_max: f32, v_min:
         );
     }
 
-    // Vertical lines (time axis)
     let time_span = t_max - t_min;
     let step = if time_span > 20.0 {
         5.0
@@ -454,27 +912,4 @@ fn draw_grid(painter: &egui::Painter, rect: Rect, t_min: f32, t_max: f32, v_min:
         );
         t += step;
     }
-}
-
-// ─── Coordinate mapping helpers ──────────────────────────────────────
-
-fn time_to_graph_x(t: f32, t_min: f32, t_max: f32, rect: Rect) -> f32 {
-    let frac = (t - t_min) / (t_max - t_min).max(1e-6);
-    rect.min.x + frac * rect.width()
-}
-
-fn value_to_graph_y(v: f32, v_min: f32, v_max: f32, rect: Rect) -> f32 {
-    let frac = (v - v_min) / (v_max - v_min).max(1e-6);
-    // Y is inverted (higher values = higher on screen = lower Y)
-    rect.max.y - frac * rect.height()
-}
-
-fn graph_x_to_time(x: f32, t_min: f32, t_max: f32, rect: Rect) -> f32 {
-    let frac = (x - rect.min.x) / rect.width().max(1.0);
-    t_min + frac * (t_max - t_min)
-}
-
-fn graph_y_to_value(y: f32, v_min: f32, v_max: f32, rect: Rect) -> f32 {
-    let frac = (rect.max.y - y) / rect.height().max(1.0);
-    v_min + frac * (v_max - v_min)
 }

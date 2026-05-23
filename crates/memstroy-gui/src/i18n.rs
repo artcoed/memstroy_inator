@@ -129,6 +129,40 @@ fn ru_lookup(key: &str) -> Option<&'static str> {
         "\u{1F441} View" => "\u{1F441} Вид",
         "Web Image Search" => "Поиск картинок",
         "\u{1F310} Web Image Search" => "\u{1F310} Поиск картинок",
+        "Search images..." => "Поиск картинок…",
+        "Found" => "Найдено",
+        "Type a query and press Enter. Click a result to drop it on the canvas at the playhead, or drag it onto the canvas / timeline." =>
+            "Введите запрос и нажмите Enter. Кликните по результату, чтобы добавить картинку на холст в позиции плейхеда, или перетащите её на холст / таймлайн.",
+        "click an image to add it to the project, or drag it onto the canvas." =>
+            "кликните по картинке, чтобы добавить её в проект, или перетащите на холст.",
+        "No results yet." => "Пока ничего не найдено.",
+        // Curve editor strings
+        "+ Key" => "+ Кейфрейм",
+        "Add keyframe at playhead" => "Добавить кейфрейм в позиции плейхеда",
+        "Toggle whether this parameter is animatable (changes will create keyframes)" =>
+            "Переключить — параметр станет анимируемым (изменения создадут кейфреймы)",
+        "Animated" => "Анимирован",
+        "Static" => "Статичен",
+        "Element" => "Элемент",
+        "Select an actor, overlay or audio layer to edit its curves." =>
+            "Выберите актёра, оверлей или аудио-слой, чтобы редактировать его кривые.",
+        "Transition into kf:" => "Переход в кейфрейм:",
+        "Transition into kf" => "Переход в кейфрейм",
+        "Interpolation" => "Интерполяция",
+        "Linear" => "Линейный",
+        "Ease in" => "Замедление в начале",
+        "Ease out" => "Замедление в конце",
+        "Ease in/out" => "Замедление в начале и конце",
+        "Step (hold)" => "Скачок (удержание)",
+        "Step (instant)" => "Мгновенный",
+        "Cubic" => "Кубический",
+        "Delete keyframe" => "Удалить кейфрейм",
+        "Overlay" => "Слой",
+        "Pos X" => "Поз. X",
+        "Pos Y" => "Поз. Y",
+        // Mask add buttons
+        "\u{25AD} Rectangle / Crop" => "\u{25AD} Прямоугольник / Кроп",
+        // Per-param row context menu
         "Curve Editor" => "Редактор кривых",
         "\u{1F4C8} Curve Editor" => "\u{1F4C8} Редактор кривых",
         "Image Editor" => "Редактор изображений",
