@@ -2758,6 +2758,7 @@ name = "memstroy-render"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "image",
  "memstroy-core",
  "memstroy-vision",
  "serde",

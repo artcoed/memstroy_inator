@@ -73,12 +73,31 @@ pub async fn render_preview_frame(
     cleaned.push(output);
 
     let mut sink = |_: &str| {};
-    run_args(&cleaned, &mut sink).await
+    let result = run_args(&cleaned, &mut sink).await;
+    // Same cleanup story as `run_plan`: remove the mask alpha PNGs
+    // (and any other auxiliary assets the builder produced) so a
+    // long preview session doesn't leak temp files.
+    for p in &plan.cleanup_paths {
+        if let Err(e) = std::fs::remove_file(p) {
+            warn!(path = %p.display(), error = %e, "failed to remove mask asset");
+        }
+    }
+    result
 }
 
 async fn run_plan<F: FnMut(&str)>(plan: &FfmpegPlan, on_log: &mut F) -> Result<()> {
     let args = plan.to_args();
-    run_args(&args, on_log).await
+    let result = run_args(&args, on_log).await;
+    // Best-effort cleanup of auxiliary files (alpha PNGs for masks
+    // etc.) regardless of whether the run succeeded — leaking these
+    // under `std::env::temp_dir()` would slowly accrete on busy
+    // editors. We log a warning but don't propagate cleanup errors.
+    for p in &plan.cleanup_paths {
+        if let Err(e) = std::fs::remove_file(p) {
+            warn!(path = %p.display(), error = %e, "failed to remove mask asset");
+        }
+    }
+    result
 }
 
 async fn run_args<F: FnMut(&str)>(args: &[String], on_log: &mut F) -> Result<()> {

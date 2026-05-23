@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use memstroy_core::*;
 use memstroy_vision::pose::load_anchor_track;
 
@@ -37,6 +37,10 @@ pub struct FilterGraphBuilder<'a> {
     cursor: String,
     label_counter: u32,
     map_audio: Option<String>,
+    /// Side-output: temp PNG files this builder generated for
+    /// `EffectKind::Mask` exports. The render runner deletes these
+    /// after FFmpeg finishes so we don't leak under `std::env::temp_dir()`.
+    mask_assets: Vec<PathBuf>,
 }
 
 impl<'a> FilterGraphBuilder<'a> {
@@ -49,12 +53,13 @@ impl<'a> FilterGraphBuilder<'a> {
             cursor: "[base]".into(),
             label_counter: 0,
             map_audio: None,
+            mask_assets: Vec::new(),
         }
     }
 
-    pub fn finish(self) -> (String, Vec<FfmpegInput>, String, Option<String>) {
+    pub fn finish(self) -> (String, Vec<FfmpegInput>, String, Option<String>, Vec<PathBuf>) {
         let map_video = self.cursor.clone();
-        (self.chunks.join(";\n"), self.inputs, map_video, self.map_audio)
+        (self.chunks.join(";\n"), self.inputs, map_video, self.map_audio, self.mask_assets)
     }
 
     pub fn build(&mut self) -> Result<()> {
@@ -297,37 +302,71 @@ impl<'a> FilterGraphBuilder<'a> {
 
             let key = actor.chroma_key.key_color;
             let key_hex = format!("0x{:02X}{:02X}{:02X}", key[0], key[1], key[2]);
-            let mut chain = format!(
-                "[{idx}:v]chromakey={hex}:{sim}:{blend},format=yuva420p",
-                idx = idx,
-                hex = key_hex,
-                sim = actor.chroma_key.similarity,
-                blend = actor.chroma_key.blend,
-            );
-            if actor.flip_horizontal {
-                chain.push_str(",hflip");
-            }
-            // Append the user-defined effect stack BEFORE the layout
-            // scale so geometry-changing effects (mirror, etc.) operate
-            // in the actor's own pixel space.
-            for snippet in effect_stack_filters(&actor.effects) {
-                chain.push(',');
-                chain.push_str(&snippet);
-            }
-            // Speed multiplier: divide PTS by `speed` so the source
-            // plays back faster (`speed > 1`) or slower (`speed < 1`)
-            // while the visible window on the timeline is sized
-            // accordingly. Skip when neutral so the chain stays clean.
-            let speed = actor.speed.max(0.0001);
-            if (speed - 1.0).abs() > 1.0e-4 {
-                chain.push_str(&format!(",setpts=PTS/{:.6}", speed));
-            }
-
             let (pos_x, pos_y, scale_expr, scale_y_expr) = position_and_scale_expr(&actor.layout, w, h);
-            chain.push_str(&format!(",scale=w='iw*{sx}':h='ih*{sy}':eval=frame", sx = scale_expr, sy = scale_y_expr));
-
+            let speed = actor.speed.max(0.0001);
+            let speed_part = if (speed - 1.0).abs() > 1.0e-4 {
+                Some(format!("setpts=PTS/{:.6}", speed))
+            } else {
+                None
+            };
+            let scale_part = format!("scale=w='iw*{sx}':h='ih*{sy}':eval=frame", sx = scale_expr, sy = scale_y_expr);
             let actor_label = self.alloc_label("actor");
-            self.chunks.push(format!("{chain}{out}", chain = chain, out = actor_label));
+
+            if effects_have_mask(&actor.effects) {
+                // Mask effects need extra inputs and a multi-stream
+                // sub-graph (alphamerge), so we have to break the
+                // single-chunk chain. Lay it out in three pieces:
+                //   1) chromakey/format/hflip up to a labelled stage,
+                //   2) the user effect stack (handles mask boundaries),
+                //   3) speed + layout scale to the final actor label.
+                let mut prefix = format!(
+                    "[{idx}:v]chromakey={hex}:{sim}:{blend},format=yuva420p",
+                    idx = idx,
+                    hex = key_hex,
+                    sim = actor.chroma_key.similarity,
+                    blend = actor.chroma_key.blend,
+                );
+                if actor.flip_horizontal {
+                    prefix.push_str(",hflip");
+                }
+                let pre_label = self.alloc_label("actorPre");
+                self.chunks.push(format!("{prefix}{pre_label}", prefix = prefix, pre_label = pre_label));
+                let after_fx = self.apply_effect_stack(pre_label, &actor.effects)?;
+                let mut tail_filters: Vec<String> = Vec::new();
+                if let Some(s) = speed_part { tail_filters.push(s); }
+                tail_filters.push(scale_part);
+                self.chunks.push(format!(
+                    "{src}{filters}{out}",
+                    src = after_fx,
+                    filters = tail_filters.join(","),
+                    out = actor_label,
+                ));
+            } else {
+                // Fast path — keep the historical single-chunk shape so
+                // the export trace stays compact for scenes without
+                // any masks.
+                let mut chain = format!(
+                    "[{idx}:v]chromakey={hex}:{sim}:{blend},format=yuva420p",
+                    idx = idx,
+                    hex = key_hex,
+                    sim = actor.chroma_key.similarity,
+                    blend = actor.chroma_key.blend,
+                );
+                if actor.flip_horizontal {
+                    chain.push_str(",hflip");
+                }
+                for snippet in effect_stack_filters(&actor.effects) {
+                    chain.push(',');
+                    chain.push_str(&snippet);
+                }
+                if let Some(s) = &speed_part {
+                    chain.push(',');
+                    chain.push_str(s);
+                }
+                chain.push(',');
+                chain.push_str(&scale_part);
+                self.chunks.push(format!("{chain}{out}", chain = chain, out = actor_label));
+            }
 
             let composed = self.alloc_label("stack");
             let enable = match (actor.t_in, actor.t_out) {
@@ -579,21 +618,38 @@ impl<'a> FilterGraphBuilder<'a> {
             t: None,
         });
         let (x, y, scale_expr, scale_y_expr) = position_and_scale_expr(&ov.layout, w, h);
-        let mut chain = format!("[{idx}:v]format=yuva420p", idx = idx);
-        // Apply the user-defined effect stack before the layout scale,
-        // matching the actor pipeline so e.g. blur / hue shift work in
-        // the image's native pixel space (before the on-canvas resize).
-        for snippet in effect_stack_filters(&ov.effects) {
-            chain.push(',');
-            chain.push_str(&snippet);
-        }
-        chain.push_str(&format!(
-            ",scale=w='iw*{sx}':h='ih*{sy}':eval=frame",
+        let scale_part = format!(
+            "scale=w='iw*{sx}':h='ih*{sy}':eval=frame",
             sx = scale_expr,
             sy = scale_y_expr,
-        ));
+        );
         let img_label = self.alloc_label("img");
-        self.chunks.push(format!("{chain}{out}", chain = chain, out = img_label));
+
+        if effects_have_mask(&ov.effects) {
+            // See `emit_actors` — masks force a multi-stream layout
+            // because they need a second input plus alphamerge.
+            let pre_label = self.alloc_label("imgPre");
+            self.chunks.push(format!("[{idx}:v]format=yuva420p{pre_label}", idx = idx, pre_label = pre_label));
+            let after_fx = self.apply_effect_stack(pre_label, &ov.effects)?;
+            self.chunks.push(format!(
+                "{src}{scale}{out}",
+                src = after_fx,
+                scale = scale_part,
+                out = img_label,
+            ));
+        } else {
+            let mut chain = format!("[{idx}:v]format=yuva420p", idx = idx);
+            // Apply the user-defined effect stack before the layout scale,
+            // matching the actor pipeline so e.g. blur / hue shift work in
+            // the image's native pixel space (before the on-canvas resize).
+            for snippet in effect_stack_filters(&ov.effects) {
+                chain.push(',');
+                chain.push_str(&snippet);
+            }
+            chain.push(',');
+            chain.push_str(&scale_part);
+            self.chunks.push(format!("{chain}{out}", chain = chain, out = img_label));
+        }
         let next = self.alloc_label("imgstack");
         self.chunks.push(format!(
             "{cur}{img}overlay=x='{x}':y='{y}':enable='between(t,{a},{b})':eof_action=pass{out}",
@@ -619,28 +675,56 @@ impl<'a> FilterGraphBuilder<'a> {
             t: None,
         });
         let (x, y, scale_expr, scale_y_expr) = position_and_scale_expr(&ov.layout, w, h);
-        let mut chain = format!("[{idx}:v]format=yuva420p", idx = idx);
-        if let Some(ck) = &ov.chroma_key {
+        let chroma_part = ov.chroma_key.as_ref().map(|ck| {
             let key_hex = format!(
                 "0x{:02X}{:02X}{:02X}",
                 ck.key_color[0], ck.key_color[1], ck.key_color[2]
             );
-            chain.push_str(&format!(",chromakey={}:{}:{}", key_hex, ck.similarity, ck.blend));
-        }
-        // Apply the user-defined effect stack — same convention as
-        // images / actors so the export matches what the canvas previews.
-        for snippet in effect_stack_filters(&ov.effects) {
-            chain.push(',');
-            chain.push_str(&snippet);
-        }
-        // Speed multiplier — see `emit_actors` for the math.
+            format!("chromakey={}:{}:{}", key_hex, ck.similarity, ck.blend)
+        });
         let speed = ov.speed.max(0.0001);
-        if (speed - 1.0).abs() > 1.0e-4 {
-            chain.push_str(&format!(",setpts=PTS/{:.6}", speed));
-        }
-        chain.push_str(&format!(",scale=w='iw*{sx}':h='ih*{sy}':eval=frame", sx = scale_expr, sy = scale_y_expr));
+        let speed_part = if (speed - 1.0).abs() > 1.0e-4 {
+            Some(format!("setpts=PTS/{:.6}", speed))
+        } else {
+            None
+        };
+        let scale_part = format!("scale=w='iw*{sx}':h='ih*{sy}':eval=frame", sx = scale_expr, sy = scale_y_expr);
         let v_label = self.alloc_label("vid");
-        self.chunks.push(format!("{chain}{out}", chain = chain, out = v_label));
+
+        if effects_have_mask(&ov.effects) {
+            // Multi-stream layout for masks — see `emit_actors`.
+            let mut prefix = format!("[{idx}:v]format=yuva420p", idx = idx);
+            if let Some(c) = &chroma_part { prefix.push(','); prefix.push_str(c); }
+            let pre_label = self.alloc_label("vidPre");
+            self.chunks.push(format!("{prefix}{pre_label}", prefix = prefix, pre_label = pre_label));
+            let after_fx = self.apply_effect_stack(pre_label, &ov.effects)?;
+            let mut tail_filters: Vec<String> = Vec::new();
+            if let Some(s) = speed_part { tail_filters.push(s); }
+            tail_filters.push(scale_part);
+            self.chunks.push(format!(
+                "{src}{filters}{out}",
+                src = after_fx,
+                filters = tail_filters.join(","),
+                out = v_label,
+            ));
+        } else {
+            let mut chain = format!("[{idx}:v]format=yuva420p", idx = idx);
+            if let Some(c) = &chroma_part { chain.push(','); chain.push_str(c); }
+            // Apply the user-defined effect stack — same convention as
+            // images / actors so the export matches what the canvas previews.
+            for snippet in effect_stack_filters(&ov.effects) {
+                chain.push(',');
+                chain.push_str(&snippet);
+            }
+            // Speed multiplier — see `emit_actors` for the math.
+            if let Some(s) = &speed_part {
+                chain.push(',');
+                chain.push_str(s);
+            }
+            chain.push(',');
+            chain.push_str(&scale_part);
+            self.chunks.push(format!("{chain}{out}", chain = chain, out = v_label));
+        }
         let next = self.alloc_label("vidstack");
         self.chunks.push(format!(
             "{cur}{v}overlay=x='{x}':y='{y}':enable='between(t,{a},{b})':eof_action=pass{out}",
@@ -867,6 +951,187 @@ impl<'a> FilterGraphBuilder<'a> {
         ));
         self.map_audio = Some(mix);
         Ok(())
+    }
+
+    // ─── EFFECT STACK + MASKS ──────────────────────────────────────
+    //
+    // The bulk of the per-element effect pipeline is single-pass: each
+    // entry compiles to one or more comma-joined filters appended to
+    // the element's chain. `EffectKind::Mask` is the exception — its
+    // alpha shape is in element-local UV space, which FFmpeg can't
+    // express in a single-pass filter. So we render a grayscale alpha
+    // PNG once per Mask instance, add it as a synthetic image input,
+    // and stitch it into the chain with `alphamerge`. The mask is
+    // multiplied with the element's existing alpha (rather than
+    // replacing it) so chromakey results survive the masking step,
+    // matching the live-preview semantics in `image_effects.rs`.
+
+    /// Walk `effects` and apply them on top of `current` (a labelled
+    /// stream). Non-mask effects are buffered into a single comma
+    /// chunk for compactness; each `Mask` flushes the buffer to its
+    /// own labelled stage, then emits an alphamerge sub-graph and
+    /// returns the new label so subsequent effects continue from
+    /// there. Returns the label of the final stream.
+    fn apply_effect_stack(&mut self, mut current: String, effects: &[Effect]) -> Result<String> {
+        let mut buffer: Vec<String> = Vec::new();
+        for eff in effects {
+            if !eff.enabled { continue; }
+            let i = eff.intensity.clamp(0.0, 1.0);
+            if i <= 0.001 { continue; }
+            if let EffectKind::Mask { shape, feather, invert } = &eff.kind {
+                current = self.flush_effect_buffer(current, &mut buffer);
+                current = self.emit_mask_alphamerge(current, shape, *feather, *invert, i)?;
+            } else if let Some(snippet) = effect_to_filter(&eff.kind, i) {
+                buffer.push(snippet);
+            }
+        }
+        current = self.flush_effect_buffer(current, &mut buffer);
+        Ok(current)
+    }
+
+    /// Drain `buffer` into a single comma-joined filter chunk attached
+    /// to `current`. Returns either the unchanged `current` (when the
+    /// buffer is empty) or the label of the new output stream.
+    fn flush_effect_buffer(&mut self, current: String, buffer: &mut Vec<String>) -> String {
+        if buffer.is_empty() { return current; }
+        let next = self.alloc_label("fxchain");
+        self.chunks.push(format!(
+            "{cur}{joined}{out}",
+            cur = current,
+            joined = buffer.join(","),
+            out = next,
+        ));
+        buffer.clear();
+        next
+    }
+
+    /// Emit an alphamerge sub-graph that masks the existing alpha of
+    /// `current` against a generated grayscale PNG. The returned label
+    /// is the new output stream (with composite alpha already
+    /// applied). The PNG is registered for cleanup so it's removed
+    /// after FFmpeg finishes regardless of success / failure.
+    fn emit_mask_alphamerge(
+        &mut self,
+        current: String,
+        shape: &MaskShape,
+        feather: f32,
+        invert: bool,
+        intensity: f32,
+    ) -> Result<String> {
+        let png_path = self.generate_mask_png(shape, feather, invert, intensity)?;
+        let mask_idx = self.add_input(FfmpegInput {
+            path: png_path,
+            kind: InputKind::Image,
+            r#loop: false,
+            seek: None,
+            t: None,
+        });
+
+        // Sub-graph layout (labels are fresh per call):
+        //
+        //   [current]format=yuva420p,split=2[mainA][mainB];
+        //   [mainA]alphaextract[mainAlpha];
+        //   [mask_idx:v]format=gray[maskRaw];
+        //   [maskRaw][mainB]scale2ref=w=main_w:h=main_h[maskScaled][mainBp];
+        //   [mainAlpha][maskScaled]blend=all_mode=multiply:all_opacity=1[combined];
+        //   [mainBp][combined]alphamerge[masked]
+        //
+        // - `split` duplicates the main stream so we can both extract
+        //   its alpha (for the multiply) and use the colour data on
+        //   the alphamerge side.
+        // - `scale2ref` resizes the mask PNG to the source's pixel
+        //   dimensions; the mask is authored in UV space so any
+        //   reference resolution works, and stretching gives a soft
+        //   anti-aliased edge that matches the GPU preview.
+        // - `blend=multiply` combines the two alpha planes so the
+        //   element's existing alpha (chromakey, prior masks) is
+        //   preserved instead of being overwritten.
+        let main_a = self.alloc_label("maskMainA");
+        let main_b = self.alloc_label("maskMainB");
+        self.chunks.push(format!(
+            "{cur}format=yuva420p,split=2{a}{b}",
+            cur = current, a = main_a, b = main_b,
+        ));
+        let main_alpha = self.alloc_label("maskMainAlpha");
+        self.chunks.push(format!("{a}alphaextract{aout}", a = main_a, aout = main_alpha));
+        let mask_raw = self.alloc_label("maskRaw");
+        self.chunks.push(format!("[{idx}:v]format=gray{m}", idx = mask_idx, m = mask_raw));
+        let mask_scaled = self.alloc_label("maskScaled");
+        let main_bp = self.alloc_label("maskMainBp");
+        self.chunks.push(format!(
+            "{m}{b}scale2ref=w=main_w:h=main_h{ms}{bp}",
+            m = mask_raw, b = main_b, ms = mask_scaled, bp = main_bp,
+        ));
+        let combined = self.alloc_label("maskCombined");
+        self.chunks.push(format!(
+            "{ma}{ms}blend=all_mode=multiply:all_opacity=1{c}",
+            ma = main_alpha, ms = mask_scaled, c = combined,
+        ));
+        let masked = self.alloc_label("masked");
+        self.chunks.push(format!(
+            "{bp}{c}alphamerge{out}",
+            bp = main_bp, c = combined, out = masked,
+        ));
+        Ok(masked)
+    }
+
+    /// Generate a grayscale PNG for the given mask parameters and
+    /// return its path. The image is 2048×2048 (UV-space; the
+    /// filtergraph stretches it to source resolution at render time
+    /// via `scale2ref`). Each pixel encodes the per-pixel alpha keep
+    /// factor blended with `intensity` exactly like
+    /// `image_effects::sample_mask_alpha`, so the FFmpeg result lines
+    /// up with the live preview pixel-for-pixel.
+    fn generate_mask_png(
+        &mut self,
+        shape: &MaskShape,
+        feather: f32,
+        invert: bool,
+        intensity: f32,
+    ) -> Result<PathBuf> {
+        const SIZE: u32 = 2048;
+        let mut buf = vec![0u8; (SIZE * SIZE) as usize];
+        let inv_dim = 1.0 / SIZE as f32;
+        let f = feather.clamp(0.0, 0.5).max(1e-6);
+        let hard_edge = feather <= 1e-6;
+        let i = intensity.clamp(0.0, 1.0);
+        for y in 0..SIZE {
+            let v = (y as f32 + 0.5) * inv_dim;
+            let row = (y as usize) * SIZE as usize;
+            for x in 0..SIZE {
+                let u = (x as f32 + 0.5) * inv_dim;
+                let margin = shape.signed_margin_uv(u, v);
+                let mut keep = if hard_edge {
+                    if margin >= 0.0 { 1.0 } else { 0.0 }
+                } else {
+                    (margin / f + 0.5).clamp(0.0, 1.0)
+                };
+                if invert { keep = 1.0 - keep; }
+                // Same intensity blend as `apply_mask_alpha`:
+                // i = 0  → keep_eff = 1.0 (mask is a no-op),
+                // i = 1  → keep_eff = keep.
+                let keep_eff = 1.0 - i * (1.0 - keep);
+                buf[row + x as usize] = (keep_eff * 255.0).clamp(0.0, 255.0) as u8;
+            }
+        }
+
+        // Filename includes pid + time + counter so concurrent renders
+        // (e.g. GUI scrubber + CLI export) don't collide.
+        let counter = self.mask_assets.len() as u32 + self.label_counter;
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let filename = format!("memstroy-mask-{}-{}-{}.png", pid, nanos, counter);
+        let path = std::env::temp_dir().join(filename);
+
+        let img: image::GrayImage = image::ImageBuffer::from_raw(SIZE, SIZE, buf)
+            .ok_or_else(|| anyhow::anyhow!("failed to wrap mask buffer as GrayImage"))?;
+        img.save_with_format(&path, image::ImageFormat::Png)
+            .with_context(|| format!("write mask PNG to {}", path.display()))?;
+        self.mask_assets.push(path.clone());
+        Ok(path)
     }
 }
 
@@ -1103,6 +1368,20 @@ fn effect_stack_filters(effects: &[Effect]) -> Vec<String> {
     out
 }
 
+/// Quick predicate used by emitters to decide whether the element's
+/// effect stack contains any [`EffectKind::Mask`] entries that are
+/// actually live (enabled and with non-zero intensity). When the
+/// answer is `false` we keep the historical single-chunk emission
+/// path; when it's `true` we switch to the multi-chunk layout that
+/// can host the alphamerge sub-graph for each mask.
+fn effects_have_mask(effects: &[Effect]) -> bool {
+    effects.iter().any(|e| {
+        e.enabled
+            && e.intensity.clamp(0.0, 1.0) > 0.001
+            && matches!(e.kind, EffectKind::Mask { .. })
+    })
+}
+
 fn effect_to_filter(kind: &EffectKind, i: f32) -> Option<String> {
     use EffectKind as K;
     Some(match kind {
@@ -1191,13 +1470,13 @@ fn effect_to_filter(kind: &EffectKind, i: f32) -> Option<String> {
         }
         K::Bloom { radius } => format!("gblur=sigma={}", (radius * i).max(1.0)),
         K::Mask { shape: _, feather: _, invert: _ } => {
-            // The mask shape geometry (rect / ellipse / polygon in UV
-            // space) is not currently expressible in a single-pass
-            // ffmpeg filter chain — proper export needs a generated
-            // alpha PNG plus an `alphamerge` step which the filtergraph
-            // builder doesn't yet emit. Skip the entry for now so the
-            // export pipeline doesn't break; the live preview still
-            // shows the masked result via the CPU image-effects path.
+            // Mask is handled by the multi-stream alphamerge sub-graph
+            // emitted from `FilterGraphBuilder::emit_mask_alphamerge`,
+            // not via the single-pass comma chain. Returning `None`
+            // here lets the legacy `effect_stack_filters` path skip
+            // the entry safely; the new `apply_effect_stack` method
+            // never calls this arm because it special-cases `Mask`
+            // before reaching `effect_to_filter`.
             return None;
         }
         K::Crop { left, top, right, bottom } => {
