@@ -1403,8 +1403,9 @@ fn extract_frames_blocking(
         return;
     }
 
-    let duration = match std::process::Command::new(&ffprobe)
-        .args([
+    let duration = {
+        let mut cmd = std::process::Command::new(&ffprobe);
+        cmd.args([
             "-v",
             "error",
             "-show_entries",
@@ -1412,26 +1413,28 @@ fn extract_frames_blocking(
             "-of",
             "default=noprint_wrappers=1:nokey=1",
         ])
-        .arg(&source)
-        .output()
-    {
-        Ok(out) => {
-            let s = String::from_utf8_lossy(&out.stdout);
-            s.trim().parse::<f32>().unwrap_or(10.0)
-        }
-        Err(e) => {
-            tracing::error!("ffprobe failed: {e}");
-            10.0
+        .arg(&source);
+        match memstroy_render::hide_console_std(&mut cmd).output() {
+            Ok(out) => {
+                let s = String::from_utf8_lossy(&out.stdout);
+                s.trim().parse::<f32>().unwrap_or(10.0)
+            }
+            Err(e) => {
+                tracing::error!("ffprobe failed: {e}");
+                10.0
+            }
         }
     };
 
     let output_pattern = cache_dir.join("%06d.jpg");
-    let status = std::process::Command::new(&ffmpeg)
-        .args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
-        .arg(&source)
-        .args(["-vf", "fps=30,scale=480:-1", "-q:v", "8"])
-        .arg(&output_pattern)
-        .status();
+    let status = {
+        let mut cmd = std::process::Command::new(&ffmpeg);
+        cmd.args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
+            .arg(&source)
+            .args(["-vf", "fps=30,scale=480:-1", "-q:v", "8"])
+            .arg(&output_pattern);
+        memstroy_render::hide_console_std(&mut cmd).status()
+    };
 
     match status {
         Ok(s) if s.success() => {

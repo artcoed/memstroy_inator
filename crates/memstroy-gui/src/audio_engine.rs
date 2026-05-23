@@ -560,14 +560,16 @@ fn resolve_audio_source(src: &Path) -> Option<PathBuf> {
     }
 
     let ffmpeg = memstroy_render::ffmpeg_binary();
-    let status = std::process::Command::new(&ffmpeg)
-        .args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
-        .arg(src)
-        .args(["-vn", "-ac", "2", "-ar", "44100", "-sn", "-dn", "-f", "wav"])
-        .arg(&cache_path)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+    let status = {
+        let mut cmd = std::process::Command::new(&ffmpeg);
+        cmd.args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
+            .arg(src)
+            .args(["-vn", "-ac", "2", "-ar", "44100", "-sn", "-dn", "-f", "wav"])
+            .arg(&cache_path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        memstroy_render::hide_console_std(&mut cmd).status()
+    };
 
     match status {
         Ok(s) if s.success() => {

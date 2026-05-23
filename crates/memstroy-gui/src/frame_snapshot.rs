@@ -1158,15 +1158,16 @@ fn probe_video_duration_sync(path: &Path) -> Option<f32> {
     if !ffprobe.exists() {
         ffprobe = std::path::PathBuf::from("ffprobe");
     }
-    let out = std::process::Command::new(&ffprobe)
-        .args([
+    let out = {
+        let mut cmd = std::process::Command::new(&ffprobe);
+        cmd.args([
             "-v", "error",
             "-show_entries", "format=duration",
             "-of", "default=noprint_wrappers=1:nokey=1",
         ])
-        .arg(path)
-        .output()
-        .ok()?;
+        .arg(path);
+        memstroy_render::hide_console_std(&mut cmd).output().ok()?
+    };
     let s = String::from_utf8_lossy(&out.stdout);
     s.trim().parse::<f32>().ok()
 }
@@ -1191,13 +1192,15 @@ fn extract_video_frame_sync(path: &Path, time_secs: f32) -> Option<(Vec<u8>, u32
     // `-ss` AFTER `-i` performs an accurate decode-up-to seek instead
     // of the demuxer's keyframe-based fast seek — we want the exact
     // frame the user is parked on, not the closest preceding keyframe.
-    let status = std::process::Command::new(&ffmpeg)
-        .args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
-        .arg(path)
-        .args(["-ss", &format!("{:.3}", time_secs.max(0.0))])
-        .args(["-frames:v", "1", "-vcodec", "png"])
-        .arg(&out_path)
-        .status();
+    let status = {
+        let mut cmd = std::process::Command::new(&ffmpeg);
+        cmd.args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
+            .arg(path)
+            .args(["-ss", &format!("{:.3}", time_secs.max(0.0))])
+            .args(["-frames:v", "1", "-vcodec", "png"])
+            .arg(&out_path);
+        memstroy_render::hide_console_std(&mut cmd).status()
+    };
 
     let ok = matches!(status, Ok(s) if s.success());
     let result = if ok {
