@@ -1,0 +1,524 @@
+//! In-app **Web Image Search** panel.
+//!
+//! Shipped as a small self-contained "browser-lite" so the user can
+//! find an image on the open web without leaving the editor and drop
+//! it straight onto the canvas. The interaction model intentionally
+//! mirrors the existing **Library → Images** tab so muscle memory
+//! carries over:
+//!
+//! * type a query, press Enter — `spawn_web_image_search` runs in the
+//!   tokio runtime and posts results back over the App's `JobEvent`
+//!   channel;
+//! * click a result thumbnail → `spawn_web_image_download` saves the
+//!   full-resolution file into the project's `assets/images/` and the
+//!   pump-events handler in [`crate::app`] both refreshes the Images
+//!   tab and adds an `Overlay::Image` at the playhead;
+//! * drag a result thumbnail onto the canvas / timeline — once the
+//!   file has landed locally, the row populates [`crate::state::AssetDrag`]
+//!   exactly the way a normal library card does, so the existing
+//!   `canvas_preview::handle_canvas_asset_drag` and timeline drop
+//!   handlers pick it up unchanged.
+//!
+//! No new HTTP / GUI / parsing crates are added — the module reuses
+//! `reqwest`, `serde_json`, `image` and `egui_extras` that the GUI
+//! crate already depends on. The search backend is **DuckDuckGo's
+//! image endpoint** (`/i.js?o=json`), which doesn't require an API
+//! key. The HTML scrape that extracts the `vqd` token is intentionally
+//! tolerant of multiple known shapes; if DuckDuckGo changes its
+//! markup the module surfaces a clear error string in `status` rather
+//! than crashing.
+
+use std::path::PathBuf;
+use std::sync::mpsc::Sender;
+
+use egui::{Color32, RichText, Rounding, Sense, Stroke, Vec2};
+use serde::{Deserialize, Serialize};
+
+use crate::jobs::{spawn_web_image_download, spawn_web_image_search, JobEvent};
+use crate::state::{AssetDragKind, EditorState, LibraryTab};
+
+/// Cap on how many search results we render and address by index.
+/// DuckDuckGo's first page tends to return up to ~100 hits; rendering
+/// more than ~120 thumbnails simultaneously is mostly counter-productive
+/// (network + paint cost) so we hard-cap before storing.
+pub const MAX_RESULTS: usize = 120;
+
+/// One image hit returned by the search backend.
+///
+/// `Serialize`/`Deserialize` are derived so future "save the last
+/// query with the project" features get them for free; today the
+/// struct is purely in-memory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebImageHit {
+    /// Direct URL of the full-resolution image (PNG / JPEG / WebP).
+    /// This is what we download when the user clicks "Add" / drops
+    /// the row on the canvas.
+    pub image_url: String,
+    /// URL of a small thumbnail used in the panel grid. DuckDuckGo
+    /// proxies these via its own CDN so they always return CORS-free
+    /// and resolve quickly even when the source page is slow.
+    pub thumbnail_url: String,
+    /// Free-form alt-text / page title the search engine returned.
+    pub title: String,
+    /// Page the image originally came from. Surfaced as a small grey
+    /// hint under the title so the user can sanity-check attribution.
+    pub source_page: String,
+    pub width: u32,
+    pub height: u32,
+    /// Local path on disk once the image has been downloaded. Until
+    /// then drag-to-canvas is disabled for the row (we'd have nothing
+    /// to put in `state.asset_drag.dragging`). `Some` after a
+    /// successful download — set by the pump-events handler.
+    #[serde(default)]
+    pub local_path: Option<PathBuf>,
+    /// True while a download for this row is in flight. Cleared by
+    /// the pump-events handler regardless of success / failure so the
+    /// UI doesn't get stuck with a permanent spinner.
+    #[serde(default, skip)]
+    pub downloading: bool,
+    /// Error string from the most recent download attempt, if any.
+    /// Rendered as a tooltip on the row so failures don't disappear
+    /// silently.
+    #[serde(default, skip)]
+    pub last_error: Option<String>,
+}
+
+impl WebImageHit {
+    pub fn new(
+        image_url: String,
+        thumbnail_url: String,
+        title: String,
+        source_page: String,
+        width: u32,
+        height: u32,
+    ) -> Self {
+        Self {
+            image_url,
+            thumbnail_url,
+            title,
+            source_page,
+            width,
+            height,
+            local_path: None,
+            downloading: false,
+            last_error: None,
+        }
+    }
+}
+
+/// Panel-local state. Lives inside `EditorState` (see `state.rs`) so
+/// it's kept across show/hide cycles of the floating window.
+#[derive(Default)]
+pub struct WebImageSearchState {
+    /// Current text in the search box (live-edited).
+    pub query: String,
+    /// Last query that was actually sent to the backend, so retyping
+    /// the same string + Enter doesn't refire the search uselessly.
+    pub last_sent_query: String,
+    /// Results from the latest successful search.
+    pub results: Vec<WebImageHit>,
+    /// Free-form status string shown above the grid (errors, "no
+    /// results", "downloading 'foo.jpg'…", …).
+    pub status: String,
+    /// True while a search request is in flight. Drives a spinner
+    /// next to the search box.
+    pub searching: bool,
+    /// Monotonic id used to associate a download response with the
+    /// hit that triggered it. We pass this in to `spawn_web_image_download`
+    /// and the matching `JobEvent::WebImageDownloaded` carries it back.
+    pub next_request_id: u64,
+}
+
+/// Mark the matching hit as "no longer downloading" and update its
+/// local_path / last_error fields based on the download outcome.
+/// Returns `Some(asset.path)` and the "place on canvas?" flag the
+/// caller asked for so the App-side handler can do the canvas
+/// insertion outside the borrow of `state.web_image_search`.
+pub fn ingest_download_result(
+    state: &mut WebImageSearchState,
+    image_url: &str,
+    result: &Result<crate::state::LibraryAsset, String>,
+) {
+    for hit in state.results.iter_mut() {
+        if hit.image_url == image_url {
+            hit.downloading = false;
+            match result {
+                Ok(asset) => {
+                    hit.local_path = Some(asset.path.clone());
+                    hit.last_error = None;
+                }
+                Err(e) => {
+                    hit.last_error = Some(e.clone());
+                }
+            }
+            return;
+        }
+    }
+}
+
+/// Render the floating "Web Image Search" window. Called every frame
+/// from `App::update` while `state.web_image_search_open` is true; the
+/// `&mut bool` lets egui's window close button toggle the field on
+/// the editor state.
+pub fn show_window(
+    ctx: &egui::Context,
+    state: &mut EditorState,
+    tx: &Sender<JobEvent>,
+) {
+    let mut open = state.web_image_search_open;
+    egui::Window::new(format!("\u{1F310} {}", crate::i18n::t("Web Image Search")))
+        .open(&mut open)
+        .default_size([520.0, 620.0])
+        .min_width(360.0)
+        .min_height(280.0)
+        .resizable(true)
+        .collapsible(true)
+        .show(ctx, |ui| {
+            window_body(ui, state, tx);
+        });
+    state.web_image_search_open = open;
+}
+
+fn window_body(ui: &mut egui::Ui, state: &mut EditorState, tx: &Sender<JobEvent>) {
+    use crate::i18n::t;
+
+    // ── Search bar ─────────────────────────────────────────────────
+    ui.horizontal(|ui| {
+        let resp = ui.add(
+            egui::TextEdit::singleline(&mut state.web_image_search.query)
+                .hint_text(t("Search Google / DuckDuckGo for images..."))
+                .desired_width(ui.available_width() - 110.0),
+        );
+        let enter = resp.lost_focus()
+            && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let go = ui.button(format!("\u{1F50D} {}", t("Search"))).clicked() || enter;
+        if go {
+            kick_search(state, tx);
+            // Refocus the box so the user can immediately edit the
+            // query without clicking back into it.
+            resp.request_focus();
+        }
+        if state.web_image_search.searching {
+            ui.spinner();
+        }
+    });
+
+    // ── Status / hint line ─────────────────────────────────────────
+    let hint = if !state.web_image_search.status.is_empty() {
+        state.web_image_search.status.clone()
+    } else if state.web_image_search.results.is_empty() {
+        t("Type a query and press Enter. Click a result to drop it on the canvas at the playhead, or drag it onto the canvas / timeline.").to_string()
+    } else {
+        format!(
+            "{} {} \u{2014} {}",
+            t("Found"),
+            state.web_image_search.results.len(),
+            t("click an image to add it to the project, or drag it onto the canvas."),
+        )
+    };
+    ui.label(
+        RichText::new(hint)
+            .size(10.5)
+            .italics()
+            .color(Color32::from_rgb(160, 160, 180)),
+    );
+    ui.add_space(4.0);
+
+    ui.separator();
+    ui.add_space(2.0);
+
+    // ── Results grid ───────────────────────────────────────────────
+    egui::ScrollArea::vertical()
+        .auto_shrink([false; 2])
+        .show(ui, |ui| {
+            results_grid(ui, state, tx);
+        });
+}
+
+fn results_grid(ui: &mut egui::Ui, state: &mut EditorState, tx: &Sender<JobEvent>) {
+    let avail_w = ui.available_width();
+    let card_w = 150.0_f32;
+    let card_h = 180.0_f32;
+    let gap = 6.0_f32;
+    // Floor of how many cards fit; never less than 1 so a narrow
+    // panel still renders one column.
+    let cols = ((avail_w + gap) / (card_w + gap)).floor().max(1.0) as usize;
+
+    if state.web_image_search.results.is_empty() {
+        ui.add_space(12.0);
+        ui.vertical_centered(|ui| {
+            ui.label(
+                RichText::new("\u{1F50D}")
+                    .size(40.0)
+                    .color(Color32::from_rgb(60, 60, 80)),
+            );
+            ui.label(
+                RichText::new(crate::i18n::t("No results yet."))
+                    .size(11.0)
+                    .color(Color32::from_rgb(140, 140, 160)),
+            );
+        });
+        return;
+    }
+
+    // We mutate state.web_image_search.results inside the loop (to
+    // flip `downloading`), and we kick downloads through a borrow of
+    // `state` as a whole. Rather than fight the borrow checker, we
+    // drive the loop by index and look up the hit fresh on each pass.
+    let n = state.web_image_search.results.len();
+    let mut i = 0;
+    while i < n {
+        ui.horizontal(|ui| {
+            for col in 0..cols {
+                let idx = i + col;
+                if idx >= n { break; }
+                draw_card(ui, state, tx, idx, card_w, card_h);
+                if col + 1 < cols { ui.add_space(gap); }
+            }
+        });
+        ui.add_space(gap);
+        i += cols;
+    }
+}
+
+/// Draw one result card and wire its click / drag interactions.
+fn draw_card(
+    ui: &mut egui::Ui,
+    state: &mut EditorState,
+    tx: &Sender<JobEvent>,
+    idx: usize,
+    card_w: f32,
+    card_h: f32,
+) {
+    // Read-only snapshot of the row so the rest of the function can
+    // mutate state freely. The row is small (~12 fields) so the clone
+    // is essentially free.
+    let hit = state.web_image_search.results[idx].clone();
+
+    let frame = egui::Frame::none()
+        .fill(Color32::from_rgb(28, 28, 42))
+        .rounding(Rounding::same(5.0))
+        .inner_margin(egui::Margin::same(4.0))
+        .stroke(Stroke::new(
+            1.0,
+            if hit.local_path.is_some() {
+                // Subtly highlight rows we've already cached locally
+                // — they're the ones that support drag.
+                Color32::from_rgb(70, 110, 70)
+            } else {
+                Color32::from_rgb(50, 50, 70)
+            },
+        ));
+
+    let resp = frame.show(ui, |ui| {
+        ui.set_width(card_w);
+        ui.set_height(card_h);
+        ui.vertical(|ui| {
+            // Thumbnail box ─── fixed height, image stretched to fit.
+            let thumb_size = Vec2::new(card_w - 8.0, card_h - 60.0);
+            let (rect, _) = ui.allocate_exact_size(thumb_size, Sense::hover());
+            ui.painter().rect_filled(
+                rect,
+                Rounding::same(3.0),
+                Color32::from_rgb(18, 18, 28),
+            );
+            // Use the thumbnail URL as-is — egui_extras' image
+            // loaders fetch HTTPS resources transparently because
+            // `install_image_loaders` is called in `main.rs`.
+            let img = egui::Image::from_uri(hit.thumbnail_url.clone())
+                .fit_to_exact_size(thumb_size)
+                .maintain_aspect_ratio(true)
+                .rounding(Rounding::same(3.0));
+            img.paint_at(ui, rect);
+
+            if hit.downloading {
+                // Draw a translucent overlay + spinner-ish dot pattern
+                // so the user knows that row is busy.
+                ui.painter().rect_filled(
+                    rect,
+                    Rounding::same(3.0),
+                    Color32::from_rgba_premultiplied(0, 0, 0, 140),
+                );
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "\u{2B6F}",
+                    egui::FontId::proportional(22.0),
+                    Color32::from_rgb(255, 220, 80),
+                );
+            } else if hit.local_path.is_some() {
+                // Tiny green dot in the corner to confirm the file
+                // is locally cached and drag-ready.
+                let dot = rect.right_top() + egui::vec2(-6.0, 6.0);
+                ui.painter().circle_filled(
+                    dot,
+                    3.0,
+                    Color32::from_rgb(120, 220, 120),
+                );
+            }
+
+            // Title (one line, ellipsised by egui automatically)
+            ui.label(
+                RichText::new(if hit.title.is_empty() { "(untitled)" } else { hit.title.as_str() })
+                    .size(10.5)
+                    .color(Color32::from_rgb(220, 220, 240))
+                    .strong(),
+            );
+            // Source / dimensions
+            let dim = format!("{}\u{00D7}{}", hit.width, hit.height);
+            let host = host_of(&hit.source_page);
+            ui.label(
+                RichText::new(format!("{}  \u{00B7}  {}", dim, host))
+                    .size(9.0)
+                    .color(Color32::from_rgb(140, 140, 160)),
+            );
+        });
+    }).response;
+
+    let resp = resp.interact(Sense::click_and_drag());
+
+    // Tooltips: errors live here so they stay out of the grid.
+    if let Some(err) = &hit.last_error {
+        resp.clone().on_hover_text(format!("\u{26A0} {}", err));
+    } else {
+        resp.clone().on_hover_text(format!(
+            "{}\n{}",
+            hit.title,
+            hit.source_page,
+        ));
+    }
+
+    // ── Click ⇒ download + place on canvas ──
+    if resp.clicked() && !hit.downloading {
+        kick_download(state, tx, idx, /*place_on_canvas=*/ true);
+    }
+
+    // ── Drag ⇒ if locally cached, populate asset_drag like any
+    //          library row; otherwise kick a background download
+    //          so the file is ready by the time the next gesture
+    //          lands. ──
+    if resp.dragged() {
+        if let Some(local) = hit.local_path.clone() {
+            state.asset_drag.dragging = Some(local.clone());
+            state.asset_drag.kind = AssetDragKind::Image;
+            state.asset_drag.label = if hit.title.is_empty() {
+                "web image".to_string()
+            } else {
+                hit.title.clone()
+            };
+            state.asset_drag.thumbnail = Some(local);
+            if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
+                state.asset_drag.pos = [pos.x, pos.y];
+            }
+        } else if !hit.downloading {
+            // Pre-fetch on drag-start so a re-attempt picks up the
+            // local file. We DON'T flip place_on_canvas here, because
+            // the canvas drop handler will commit the placement once
+            // the file lands.
+            kick_download(state, tx, idx, /*place_on_canvas=*/ false);
+            state.web_image_search.status = format!(
+                "\u{2B6F} {} \u{2014} {}",
+                crate::i18n::t("Downloading"),
+                short_url(&hit.image_url),
+            );
+        }
+    }
+}
+
+// ── Action helpers ────────────────────────────────────────────────────
+
+fn kick_search(state: &mut EditorState, tx: &Sender<JobEvent>) {
+    let q = state.web_image_search.query.trim().to_string();
+    if q.is_empty() {
+        state.web_image_search.status = crate::i18n::t("Type a search query first.").to_string();
+        return;
+    }
+    if state.web_image_search.searching && q == state.web_image_search.last_sent_query {
+        // Already running this exact search; let it finish.
+        return;
+    }
+    let Some(handle) = state.tokio_handle.clone() else {
+        state.web_image_search.status =
+            "Tokio runtime missing — search disabled.".to_string();
+        return;
+    };
+    state.web_image_search.last_sent_query = q.clone();
+    state.web_image_search.searching = true;
+    state.web_image_search.status = format!("\u{1F50D} Searching for \"{}\"...", q);
+    state.web_image_search.results.clear();
+    spawn_web_image_search(&handle, tx.clone(), q);
+}
+
+fn kick_download(
+    state: &mut EditorState,
+    tx: &Sender<JobEvent>,
+    hit_idx: usize,
+    place_on_canvas: bool,
+) {
+    if hit_idx >= state.web_image_search.results.len() {
+        return;
+    }
+    // Mark the row as in-flight so the UI shows the spinner overlay
+    // and we don't kick duplicate fetches if the user spams clicks.
+    if state.web_image_search.results[hit_idx].downloading {
+        return;
+    }
+    state.web_image_search.results[hit_idx].downloading = true;
+    state.web_image_search.results[hit_idx].last_error = None;
+
+    let hit = state.web_image_search.results[hit_idx].clone();
+    let dest = state.images_dir();
+
+    // Switch the library tab to Images so the downloaded file is
+    // visible the moment it lands — matches the Ctrl+V paste flow.
+    state.library_tab = LibraryTab::Images;
+
+    let Some(handle) = state.tokio_handle.clone() else {
+        state.web_image_search.results[hit_idx].downloading = false;
+        state.web_image_search.results[hit_idx].last_error =
+            Some("Tokio runtime missing".to_string());
+        return;
+    };
+
+    let request_id = state.web_image_search.next_request_id;
+    state.web_image_search.next_request_id =
+        state.web_image_search.next_request_id.wrapping_add(1);
+
+    state.web_image_search.status = format!(
+        "\u{2B6F} {} \u{2192} {}",
+        crate::i18n::t("Downloading"),
+        short_url(&hit.image_url),
+    );
+
+    spawn_web_image_download(
+        &handle,
+        tx.clone(),
+        hit.image_url.clone(),
+        hit.title.clone(),
+        dest,
+        request_id,
+        place_on_canvas,
+    );
+}
+
+// ── tiny formatting helpers ───────────────────────────────────────────
+
+/// `https://example.com/foo/bar.jpg?baz=1` → `example.com`.
+fn host_of(url: &str) -> &str {
+    let s = url.trim_start_matches("http://").trim_start_matches("https://");
+    let end = s.find('/').unwrap_or(s.len());
+    &s[..end]
+}
+
+/// Very short URL summary for the status line ("filename.jpg").
+fn short_url(url: &str) -> String {
+    let trimmed = url.split('?').next().unwrap_or(url);
+    let last = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    if last.is_empty() {
+        trimmed.to_string()
+    } else if last.len() > 60 {
+        format!("{}\u{2026}", &last[..60])
+    } else {
+        last.to_string()
+    }
+}
