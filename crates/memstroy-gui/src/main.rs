@@ -90,6 +90,18 @@ fn main() -> Result<()> {
             // cost is otherwise paid for every cold start even when
             // the user never opens a text overlay.
             system_fonts::install_default_definitions(&cc.egui_ctx);
+            // Kick off the system-font discovery scan in a background
+            // thread RIGHT NOW so the picker is populated by the time
+            // the user clicks "+T" and opens the font dropdown. The
+            // scan walks every TTF/OTF in the OS font directories
+            // and parses each one for its display name — on a typical
+            // Windows machine that's 600+ files, several seconds of
+            // work that absolutely must not block the UI thread.
+            // Without this prefetch the very first text overlay had
+            // a multi-second hang ("при создании текста пролаг
+            // долгий") while the inspector waited for the scan to
+            // finish synchronously.
+            system_fonts::kick_background_scan();
             Ok(Box::new(app::App::new(runtime)))
         }),
     )

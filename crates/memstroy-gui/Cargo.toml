@@ -87,6 +87,15 @@ obfstr = { version = "0.4", optional = true }
 # present in the egui graph, so the binary cost is essentially zero.
 ttf-parser = "0.25"
 
+# Font byte-stream validator. Used by `system_fonts::ensure_font_loaded`
+# to reject malformed TTFs *before* they reach `ctx.set_fonts(...)`.
+# egui's text layout uses ab_glyph internally; pre-flighting with the
+# same parser avoids the panic-on-bad-font crash users were hitting
+# when the picker accepted a system font that ttf-parser tolerated but
+# ab_glyph did not. Already present transitively via memstroy-render
+# / egui, so this is just an explicit re-export with no extra cost.
+ab_glyph = "0.2"
+
 # ── Windows-only build dependency: PE VersionInfo resource ──────────
 # `winresource` programmatically generates and links a Win32
 # VS_VERSIONINFO resource into the produced `.exe`, populating the
