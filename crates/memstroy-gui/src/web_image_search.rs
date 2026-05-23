@@ -37,11 +37,17 @@ use serde::{Deserialize, Serialize};
 use crate::jobs::{spawn_web_image_download, spawn_web_image_search, JobEvent};
 use crate::state::{AssetDragKind, EditorState, LibraryTab};
 
-/// Cap on how many search results we render and address by index.
-/// DuckDuckGo's first page tends to return up to ~100 hits; rendering
-/// more than ~120 thumbnails simultaneously is mostly counter-productive
-/// (network + paint cost) so we hard-cap before storing.
-pub const MAX_RESULTS: usize = 120;
+/// Cap on how many results we ingest from a single DDG page response.
+/// DuckDuckGo's first page tends to return up to ~100 hits; this cap
+/// guards against unbounded growth while leaving headroom for the
+/// occasional response with more entries.
+pub const MAX_RESULTS_PER_PAGE: usize = 200;
+
+/// Hard cap on the total number of cached results across all loaded
+/// pages. Past this we stop accepting "Load more" clicks. ~1000 cards
+/// is already past the point where the panel becomes scroll-bound;
+/// going higher mostly hurts paint cost.
+pub const MAX_TOTAL_RESULTS: usize = 1_000;
 
 /// One image hit returned by the search backend.
 ///
@@ -115,7 +121,8 @@ pub struct WebImageSearchState {
     /// Last query that was actually sent to the backend, so retyping
     /// the same string + Enter doesn't refire the search uselessly.
     pub last_sent_query: String,
-    /// Results from the latest successful search.
+    /// Results from the latest successful search, accumulated across
+    /// paginated page fetches.
     pub results: Vec<WebImageHit>,
     /// Free-form status string shown above the grid (errors, "no
     /// results", "downloading 'foo.jpg'…", …).
@@ -127,6 +134,14 @@ pub struct WebImageSearchState {
     /// hit that triggered it. We pass this in to `spawn_web_image_download`
     /// and the matching `JobEvent::WebImageDownloaded` carries it back.
     pub next_request_id: u64,
+    /// DuckDuckGo `s=` start-offset for the next page; `None` means
+    /// "no more pages" (initial state, end-of-results, or after an
+    /// error). The "Load more" button is only shown when this is
+    /// `Some(_)`.
+    pub next_offset: Option<u32>,
+    /// 1-indexed page counter for status display only ("Page 2: 100
+    /// more results"). Resets to 0 on a fresh search.
+    pub page_count: u32,
 }
 
 /// Mark the matching hit as "no longer downloading" and update its
@@ -168,12 +183,29 @@ pub fn show_window(
     let mut open = state.web_image_search_open;
     egui::Window::new(format!("\u{1F310} {}", crate::i18n::t("Web Image Search")))
         .open(&mut open)
-        .default_size([520.0, 620.0])
+        // ── Size constraints (fix for "window grows wider on every search") ──
+        // The window auto-resized to fit the inner grid. As soon as
+        // results landed, the inner grid measured wider than the
+        // initial 520 px and the window pumped wider on every frame.
+        // We pin the default + max widths so the window never grows
+        // sideways during a search; the user can still drag-resize
+        // within the [min..max] range, and `auto_shrink([true, false])`
+        // on the inner ScrollArea (see `window_body`) lets the panel
+        // shrink horizontally when the user makes it narrower.
+        .default_size([560.0, 640.0])
         .min_width(360.0)
+        .max_width(720.0)
         .min_height(280.0)
-        .resizable(true)
+        .max_height(1200.0)
+        .resizable([true, true])
         .collapsible(true)
         .show(ctx, |ui| {
+            // Hard-cap the inner UI's max width so child widgets
+            // (search bar, grid rows) cannot push past the window's
+            // own max_width. Without this `ui.set_max_width(...)` the
+            // grid's `ui.horizontal(...)` would still measure wider
+            // than the panel and the next-frame layout would jitter.
+            ui.set_max_width(700.0);
             window_body(ui, state, tx);
         });
     state.web_image_search_open = open;
@@ -193,7 +225,7 @@ fn window_body(ui: &mut egui::Ui, state: &mut EditorState, tx: &Sender<JobEvent>
             && ui.input(|i| i.key_pressed(egui::Key::Enter));
         let go = ui.button(format!("\u{1F50D} {}", t("Search"))).clicked() || enter;
         if go {
-            kick_search(state, tx);
+            kick_search(state, tx, /*append=*/ false);
             // Refocus the box so the user can immediately edit the
             // query without clicking back into it.
             resp.request_focus();
@@ -229,9 +261,73 @@ fn window_body(ui: &mut egui::Ui, state: &mut EditorState, tx: &Sender<JobEvent>
 
     // ── Results grid ───────────────────────────────────────────────
     egui::ScrollArea::vertical()
-        .auto_shrink([false; 2])
+        // Allow the panel to shrink HORIZONTALLY when the user resizes
+        // the window narrower (`true` for the X axis), but keep it
+        // pinned vertically so the grid doesn't collapse against its
+        // content height (`false` for the Y axis). This stops the
+        // "грид сам растягивается" feedback loop reported by the
+        // user — the inner ScrollArea no longer dictates the window's
+        // width.
+        .auto_shrink([true, false])
         .show(ui, |ui| {
             results_grid(ui, state, tx);
+
+            // ── Pagination control ──────────────────────────────
+            // When the backend reported a `next_offset` we expose a
+            // single "Load more" button at the bottom of the grid.
+            // Clicking it appends the next batch onto `results`
+            // instead of replacing them, so the user can keep
+            // scrolling past the first ~100 hits without losing
+            // their place.
+            let has_more = state.web_image_search.next_offset.is_some()
+                && !state.web_image_search.searching
+                && state.web_image_search.results.len() < MAX_TOTAL_RESULTS;
+            if has_more {
+                ui.add_space(8.0);
+                ui.vertical_centered(|ui| {
+                    let next_pg = state.web_image_search.page_count + 1;
+                    let label = format!(
+                        "\u{2B07} {} (page {})",
+                        t("Load more"),
+                        next_pg + 1,
+                    );
+                    if ui
+                        .button(RichText::new(label).size(12.0))
+                        .on_hover_text(t(
+                            "Fetch the next page of results from the search engine and append it below.",
+                        ))
+                        .clicked()
+                    {
+                        kick_search(state, tx, /*append=*/ true);
+                    }
+                });
+                ui.add_space(8.0);
+            } else if state.web_image_search.searching
+                && !state.web_image_search.results.is_empty()
+            {
+                // While a "Load more" fetch is in flight, surface a
+                // spinner where the button used to be so the user
+                // sees the request is being processed.
+                ui.add_space(8.0);
+                ui.vertical_centered(|ui| {
+                    ui.spinner();
+                });
+                ui.add_space(8.0);
+            } else if state.web_image_search.next_offset.is_none()
+                && state.web_image_search.results.len() >= MAX_RESULTS_PER_PAGE
+            {
+                // Reached either the per-engine end or our own cap.
+                ui.add_space(6.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        RichText::new(t("(end of results)"))
+                            .size(10.0)
+                            .italics()
+                            .color(Color32::from_rgb(120, 120, 140)),
+                    );
+                });
+                ui.add_space(6.0);
+            }
         });
 }
 
@@ -275,14 +371,28 @@ fn results_grid(ui: &mut egui::Ui, state: &mut EditorState, tx: &Sender<JobEvent
     let n = state.web_image_search.results.len();
     let mut i = 0;
     while i < n {
-        ui.horizontal(|ui| {
-            for col in 0..cols {
-                let idx = i + col;
-                if idx >= n { break; }
-                draw_card(ui, state, tx, idx, card_w, card_h);
-                if col + 1 < cols { ui.add_space(gap); }
-            }
-        });
+        // Allocate the row with an explicit max width so a stale
+        // `cols` value (e.g. one frame after the scrollbar appears)
+        // can't cause `ui.horizontal` to measure wider than the
+        // panel and pump the parent window wider on the next frame.
+        let row_max_w = avail_w;
+        ui.allocate_ui_with_layout(
+            egui::vec2(row_max_w, card_h),
+            egui::Layout::left_to_right(egui::Align::TOP),
+            |ui| {
+                ui.set_max_width(row_max_w);
+                for col in 0..cols {
+                    let idx = i + col;
+                    if idx >= n {
+                        break;
+                    }
+                    draw_card(ui, state, tx, idx, card_w, card_h);
+                    if col + 1 < cols {
+                        ui.add_space(gap);
+                    }
+                }
+            },
+        );
         ui.add_space(gap);
         i += cols;
     }
@@ -434,14 +544,19 @@ fn draw_card(
 
 // ── Action helpers ────────────────────────────────────────────────────
 
-fn kick_search(state: &mut EditorState, tx: &Sender<JobEvent>) {
+/// Kick a fresh search (when `append == false`) or fetch the next page
+/// (when `append == true`). The append path keeps the existing
+/// `results` and the cached `next_offset` is consumed as the
+/// search engine `s=` start offset.
+fn kick_search(state: &mut EditorState, tx: &Sender<JobEvent>, append: bool) {
     let q = state.web_image_search.query.trim().to_string();
     if q.is_empty() {
         state.web_image_search.status = crate::i18n::t("Type a search query first.").to_string();
         return;
     }
-    if state.web_image_search.searching && q == state.web_image_search.last_sent_query {
-        // Already running this exact search; let it finish.
+    if state.web_image_search.searching {
+        // Already running a search/page fetch; ignore the click so we
+        // don't spawn a second background request.
         return;
     }
     let Some(handle) = state.tokio_handle.clone() else {
@@ -449,11 +564,34 @@ fn kick_search(state: &mut EditorState, tx: &Sender<JobEvent>) {
             "Tokio runtime missing — search disabled.".to_string();
         return;
     };
-    state.web_image_search.last_sent_query = q.clone();
+
+    // For the "append" path, only proceed when we actually have a
+    // saved offset from the previous response. Otherwise treat the
+    // call as a fresh search to avoid an HTTP request that would
+    // immediately return zero hits.
+    let offset = if append {
+        match state.web_image_search.next_offset {
+            Some(o) => o,
+            None => return,
+        }
+    } else {
+        0
+    };
+
+    if !append {
+        state.web_image_search.last_sent_query = q.clone();
+        state.web_image_search.results.clear();
+        state.web_image_search.next_offset = None;
+        state.web_image_search.page_count = 0;
+        state.web_image_search.status = format!("\u{1F50D} Searching for \"{}\"...", q);
+    } else {
+        state.web_image_search.status = format!(
+            "\u{2B07} Loading page {}...",
+            state.web_image_search.page_count + 1,
+        );
+    }
     state.web_image_search.searching = true;
-    state.web_image_search.status = format!("\u{1F50D} Searching for \"{}\"...", q);
-    state.web_image_search.results.clear();
-    spawn_web_image_search(&handle, tx.clone(), q);
+    spawn_web_image_search(&handle, tx.clone(), q, offset);
 }
 
 fn kick_download(
