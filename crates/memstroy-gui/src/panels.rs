@@ -267,12 +267,45 @@ fn library_split_panel<L, G>(
 fn library_clips_tab(ui: &mut egui::Ui, state: &mut EditorState) {
     let search_lower = state.library_search.to_lowercase();
     let clip_count = state.library.mellstroy_clips.len();
-    ui.label(
-        RichText::new(format!("{} ({})", t("Clips"), clip_count))
-            .size(12.0)
-            .strong()
-            .color(Color32::from_rgb(220, 130, 50)),
-    );
+
+    // ── Header row: clip count + channel badge + manual Refresh ──
+    // The library was historically refresh-on-search-only, but that
+    // left users with an empty cache (first launch / fresh install)
+    // with no obvious affordance: scrolling did nothing because the
+    // list was empty, and the search box still had to be tabbed into
+    // to fire a request. Surface the channel and an explicit
+    // Refresh button so the flow is discoverable.
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(format!("{} ({})", t("Clips"), clip_count))
+                .size(12.0)
+                .strong()
+                .color(Color32::from_rgb(220, 130, 50)),
+        );
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new(format!("@{}", state.tg_channel))
+                .size(10.0)
+                .color(COL_TEXT_DIM)
+                .italics(),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // Disable the button while a refresh is already running
+            // so we don't fire concurrent ingest requests.
+            let label = if state.refreshing {
+                format!("\u{1F504} {}", t("refreshing..."))
+            } else {
+                format!("\u{1F504} {}", t("Refresh from Telegram"))
+            };
+            let resp = ui.add_enabled(
+                !state.refreshing,
+                egui::Button::new(RichText::new(label).size(11.0)),
+            );
+            if resp.clicked() {
+                maybe_auto_refresh(state, /*force=*/ true);
+            }
+        });
+    });
     // Clips are server-managed by design — the Refresh action POSTs
     // to the in-process memstroy-assets-server which scrapes Telegram
     // on the GUI's behalf. Surface that explicitly so users know which
@@ -297,13 +330,33 @@ fn library_clips_tab(ui: &mut egui::Ui, state: &mut EditorState) {
     }
     ui.add_space(2.0);
 
+    // ── First-show auto-fetch ──
+    // When the panel opens with an empty local cache and we haven't
+    // tried yet, kick a refresh automatically. This is what users
+    // expect from "open the editor and see Mellstroy clips" without
+    // having to discover the search-box trick. Guarded by
+    // `last_auto_refresh.is_none()` so we only do it once per session
+    // — subsequent empty states (e.g. user wipes the cache mid-session)
+    // can still trigger via the Refresh button above.
+    if state.library.mellstroy_clips.is_empty()
+        && state.last_auto_refresh.is_none()
+        && !state.refreshing
+    {
+        maybe_auto_refresh(state, /*force=*/ true);
+    }
+
     let scroll_out = egui::ScrollArea::vertical()
         .id_source("library_clips_scroll")
         .auto_shrink([false; 2])
         .show(ui, |ui| {
             if state.library.mellstroy_clips.is_empty() {
+                let hint = if state.refreshing {
+                    t("Fetching clips from the server...")
+                } else {
+                    t("No clips yet — click Refresh from Telegram above to fetch the latest ones.")
+                };
                 ui.label(
-                    RichText::new(t("No clips yet — start typing in the search box or scroll to fetch from the server."))
+                    RichText::new(hint)
                         .italics()
                         .color(COL_TEXT_DIM)
                         .size(11.0),
