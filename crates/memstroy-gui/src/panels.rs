@@ -5565,14 +5565,17 @@ fn timeline_marquee_update(
         || state.asset_drag.dragging.is_some();
 
     let id = egui::Id::new(("timeline_marquee_interact",));
-    // Use `Sense::click_and_drag()` so a click on empty timeline space
-    // can clear the selection (per user request: "если кликаем по
-    // свободному пространству то отменить все выделения элементов"),
-    // while a drag from empty space starts the multi-select lasso.
-    // Single clicks on clips still propagate to the per-clip
-    // interactors registered earlier in the frame, because we
-    // explicitly bail out below when the press point lands on top of
-    // any existing clip rectangle.
+    // Calling `ui.interact()` with the same id as the early-registration
+    // call at the top of `timeline()` updates the widget's WidgetRect
+    // in place — egui's `WidgetRects::insert` REPLACES at the existing
+    // position, preserving registration order so clips registered
+    // between the two calls stay topmost in the hit-test. Without the
+    // early registration this widget would be the topmost interactive
+    // rectangle at every clip position, and egui would give every
+    // clip click to the marquee instead of the per-clip handler —
+    // exactly the "single click does not select" bug the user
+    // reported. The lasso-on-drag and clear-on-empty-click branches
+    // below still see this response normally.
     let resp = ui.interact(tracks_rect, id, egui::Sense::click_and_drag());
 
     // ── Marquee start guard ──
@@ -5586,11 +5589,22 @@ fn timeline_marquee_update(
     // on release with the standard 2-px corner test.
     const MARQUEE_MIN_TRAVEL_PX: f32 = 5.0;
 
+    // Detect the first frame of a press that lands inside the tracks
+    // viewport. We use the raw input layer (not `resp.drag_started()`)
+    // because we want to react on the very first frame of the press,
+    // BEFORE the user has moved past the drag threshold — that way a
+    // pure click on empty space (no movement at all) still ends up
+    // setting `timeline_marquee_pending` and the release branch can
+    // treat it as "click on empty area → clear selection".
+    let primary_pressed = ui.input(|i| i.pointer.primary_pressed());
+    let press_origin = ui.input(|i| i.pointer.press_origin());
+
     if state.timeline_marquee.is_none()
-        && resp.drag_started()
+        && state.timeline_marquee_pending.is_none()
+        && primary_pressed
         && !drag_in_flight
     {
-        if let Some(p) = resp.interact_pointer_pos() {
+        if let Some(p) = press_origin {
             // Reject presses on the header column / scrollbars by
             // checking that the press point lies inside the tracks
             // rectangle proper.
@@ -5598,7 +5612,10 @@ fn timeline_marquee_update(
                 // Walk the on-screen clip rects and bail out if the
                 // press lands on top of any of them. The press will
                 // then propagate to the per-clip drag handler instead
-                // of being captured here.
+                // of being captured here. Use the PRESS ORIGIN
+                // (not the live interact pos) so a small mouse
+                // wobble during the press doesn't reclassify a
+                // clip-click as a marquee start.
                 let mut on_clip = false;
                 for_each_clip_screen_rect(
                     state,
@@ -5619,23 +5636,23 @@ fn timeline_marquee_update(
                 // strip — that gesture owns the press already.
                 let on_playhead = state.timeline_scrubbing_playhead;
                 if !on_clip && !on_playhead {
-                    // Defer the actual marquee start until the user
-                    // has moved more than MARQUEE_MIN_TRAVEL_PX away
-                    // from the press origin. Until then we just
-                    // remember the press point in
-                    // `timeline_marquee_pending` so a quick click
-                    // gets handled by the click branch below without
-                    // ever materialising a lasso. The selection is
-                    // NOT cleared here — the click branch below
-                    // handles "clear on empty click", and the commit
-                    // branch handles "replace on lasso end" — so a
-                    // micro-drag-then-release leaves the existing
-                    // selection intact.
+                    // Remember the press point. Until the pointer
+                    // moves more than `MARQUEE_MIN_TRAVEL_PX` we
+                    // keep it pending — a release without movement
+                    // is treated as "click on empty area" and clears
+                    // the selection; movement past the threshold
+                    // promotes it into a real lasso.
                     state.timeline_marquee_pending = Some(p);
                 }
             }
         }
     }
+    // Suppress the unused warning for `resp.drag_started()`: it's now
+    // entirely subsumed by the `primary_pressed` path above. The
+    // response itself is still useful as a side-effect (it forces
+    // the widget to be registered for hit-tests), so we keep the
+    // call.
+    let _ = resp;
 
     // Promote a pending press into a real marquee once the pointer has
     // travelled past the threshold.
@@ -7018,30 +7035,38 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     // BEFORE the per-clip / marquee interactors run so the press is
     // captured by the scrub before any other widget claims it.
     //
-    // The strip is ~7 px wide on either side of the playhead screen-X
+    // The strip is ~10 px wide on either side of the playhead screen-X
     // (covering one full pixel-width of slop on both sides of the
     // 1.5 px line, plus an extra few for fingers and trackpads). Its
     // hit-test is registered persistently across frames so a drag
     // continues to scrub even after the playhead has moved away from
     // the original press position.
+    //
+    // Activation is FROZEN to the press frame: we only check the
+    // strip on the very first frame of the press (`primary_pressed`).
+    // Without this freeze, auto-playback could drift the playhead
+    // toward an unrelated press position on a later frame and
+    // erroneously trigger scrubbing for a click that landed on a
+    // clip — exactly the "click on a clip is interpreted as scrub"
+    // / "single click does not select" symptom the user reported.
     {
         let pps_now = state.timeline_zoom;
         let any_pointer_down = ui.input(|i| i.pointer.any_down());
+        let primary_pressed = ui.input(|i| i.pointer.primary_pressed());
         let press_origin = ui.input(|i| i.pointer.press_origin());
 
-        // Latch the scrub mode on the first frame of a press where the
-        // press point sits inside the strip and on the tracks viewport.
-        // We use the playhead's screen-X AT PRESS TIME (not the moving
-        // playhead) so the strip is the same logical handle the user
-        // visually grabbed.
-        if !state.timeline_scrubbing_playhead {
-            if let (Some(ph_x_initial), Some(p)) = (
+        if primary_pressed && !state.timeline_scrubbing_playhead {
+            if let (Some(ph_x_at_press), Some(p)) = (
                 time_to_x(state.playhead, state.timeline_scroll, pps_now, track_left, track_right),
                 press_origin,
             ) {
-                let strip_half = 7.0_f32;
-                if any_pointer_down
-                    && (p.x - ph_x_initial).abs() <= strip_half
+                // Slightly wider hit zone than the visual line so users
+                // can grab it without surgical precision — addresses
+                // the user feedback that clicks on the timeline scale
+                // (the playhead line, "шкала таймлайна") were being
+                // absorbed by the clip behind it.
+                let strip_half = 10.0_f32;
+                if (p.x - ph_x_at_press).abs() <= strip_half
                     && p.y >= tracks_rect.min.y
                     && p.y <= tracks_rect.max.y
                     // Skip when an asset / clip drag is already in
@@ -7088,6 +7113,32 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             d.insert_temp::<bool>(egui::Id::new("timeline_input_lock"), false);
         });
     }
+
+    // ── Early marquee widget registration ──
+    //
+    // Register the marquee's hit-test rectangle BEFORE any clip
+    // interact() calls so egui's hit-test treats clips as the topmost
+    // (later-registered) widgets. Without this the marquee — which
+    // covers the entire tracks viewport with `Sense::click_and_drag()`
+    // — would be the topmost interactive widget at every clip
+    // position, and egui's hit-test (see `hit_test_on_close` in
+    // egui::hit_test) gives clicks/drags to the LAST registered
+    // widget at the pointer position. The user's report
+    // "single click on a layer panel element doesn't select it,
+    // probably because of false multi-select triggering" is exactly
+    // this: every clip click was being intercepted by the marquee
+    // interactor, the clip's `clicked()` returned false, and the
+    // selection never updated.
+    //
+    // We don't process the marquee logic here — the response is
+    // re-fetched at the end of the function via `read_response` so
+    // the rest of the marquee state machine still runs after the
+    // clip loop has had a chance to set `state.timeline_drag` /
+    // `state.canvas_selection`. This matches egui's documented
+    // pattern for "register early, react late" interactions.
+    let marquee_id = egui::Id::new(("timeline_marquee_interact",));
+    let _early_marquee_resp =
+        ui.interact(tracks_rect, marquee_id, egui::Sense::click_and_drag());
 
 
     // ── Track rows ──
@@ -8821,29 +8872,32 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     // Vertical scrollbar drives both pan (timeline_v_scroll in pixels) and
     // local zoom (timeline_v_zoom multiplier on track heights).
     //
-    // Two invariants the previous implementation got wrong:
+    // The thumb represents the visible window in CONTENT space, so its
+    // size MUST be `viewport_h / total_tracks_h` (clamped). Previously
+    // we used `1 / v_zoom`, which assumed the natural content height at
+    // v_zoom=1 always equalled the viewport. With many tracks (or a
+    // short panel) the content overflows even at v_zoom=1, but the
+    // synthetic `1/v_zoom` formula reported a full-bar thumb — so
+    // dragging the bar did nothing AND the post-frame map of `pan_frac`
+    // back onto `view_a_v` rounded to 0, snapping `timeline_v_scroll`
+    // to the top every frame. Net effect: the bottom-most audio row
+    // was unreachable no matter how the user tried to scroll
+    // (wheel, drag, stretch).
     //
-    //   (a) The thumb size must reflect the LOCAL ZOOM only, not the
-    //       ratio of the panel's height to the content's height. So
-    //       resizing the layers panel does NOT shrink/grow the thumb
-    //       (bug 2). The thumb size is `1 / v_zoom` clamped to a sane
-    //       range.
-    //
-    //   (b) The thumb's max travel must be the FULL scrollable range —
-    //       which includes the Render Frame row and any per-param
-    //       expansion of the selected layer, not just the bare track
-    //       sum. Previously `total_v` ignored those, so when the user
-    //       scrolled to the bottom the thumb's `view_b_v` clamped to
-    //       1.0 while `view_a_v` kept growing → thumb shrank (bug 1)
-    //       and audio rows past the synthetic limit were unreachable
-    //       (bug 4).
-    //
-    // We therefore drive the scrollbar with two fully decoupled signals:
-    // pan progress through `max_v_scroll`, and zoom-derived thumb size.
-    let max_v_scroll = (total_tracks_h - viewport_h).max(0.0);
+    // The new contract: the thumb size is the real visibility ratio.
+    // Stretching the thumb (resize via the edges) is reinterpreted as
+    // a zoom change such that the new size matches the new content /
+    // viewport ratio. Dragging the thumb middle pans as before.
     const V_ZOOM_MIN: f32 = 1.0;
     const V_ZOOM_MAX: f32 = 8.0;
-    let thumb_size_frac = (1.0_f32 / v_zoom).clamp(1.0 / V_ZOOM_MAX, 1.0);
+    let max_v_scroll = (total_tracks_h - viewport_h).max(0.0);
+    // Smallest thumb the widget will let the user produce when dragging
+    // the resize grips — kept consistent with the v_zoom upper bound
+    // (1 / V_ZOOM_MAX) so users can still stretch the thumb shorter to
+    // zoom in even when the content is just barely overflowing.
+    let min_thumb_frac = (1.0_f32 / V_ZOOM_MAX).min(1.0);
+    let thumb_size_frac = (viewport_h / total_tracks_h.max(1.0))
+        .clamp(min_thumb_frac, 1.0);
     let pan_frac = if max_v_scroll > 0.0 {
         (state.timeline_v_scroll / max_v_scroll).clamp(0.0, 1.0)
     } else {
@@ -8859,15 +8913,31 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
         view_b_v,
     );
     {
-        let new_thumb_size = (new_b_v - new_a_v).clamp(1.0 / V_ZOOM_MAX, 1.0);
-        let new_v_zoom = (1.0 / new_thumb_size).clamp(V_ZOOM_MIN, V_ZOOM_MAX);
+        let new_thumb_size = (new_b_v - new_a_v).clamp(min_thumb_frac, 1.0);
+        // The user resized the thumb if its size changed. Translate the
+        // new thumb size into a v_zoom by inverting the visibility
+        // ratio: smaller thumb ↔ more total content ↔ larger v_zoom.
+        // We solve `viewport_h / new_total = new_thumb_size` for
+        // `new_v_zoom`, treating total_tracks_h as roughly linear in
+        // v_zoom (the constant `BOTTOM_GUTTER` and small per-row
+        // padding terms are absorbed into the residual — close enough
+        // for a UI control where one pixel of slop is invisible).
+        let zoom_changed = (new_thumb_size - thumb_size_frac).abs() > 1.0e-4;
+        let new_v_zoom = if zoom_changed {
+            let zoom_ratio = thumb_size_frac / new_thumb_size.max(1.0e-4);
+            (v_zoom * zoom_ratio).clamp(V_ZOOM_MIN, V_ZOOM_MAX)
+        } else {
+            v_zoom
+        };
         state.timeline_v_zoom = new_v_zoom;
 
-        // Recompute total content height with the NEW v_zoom, then map
-        // the (possibly updated) pan fraction back onto the new
+        // Recompute total content height with the (possibly updated)
+        // v_zoom, then map the new pan fraction back onto the new
         // scrollable range. This keeps the visible top-of-viewport
-        // anchored to the same content fraction across zoom changes,
-        // and makes "drag thumb to bottom" reliably hit the last row.
+        // anchored to the same content fraction across zoom changes
+        // and makes "drag thumb to bottom" reliably hit the last row
+        // (including the bottom-most audio lane, which is the bug
+        // this whole rewrite addresses).
         let new_total_tracks_h: f32 = RF_ROW_BASE_H * new_v_zoom
             + render_frame_expansion(state, new_v_zoom)
             + (0..num_tracks)
