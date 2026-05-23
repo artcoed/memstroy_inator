@@ -8,6 +8,7 @@ mod curve_editor;
 
 mod gpu_preview;
 mod i18n;
+mod image_effects;
 mod jobs;
 mod kf_anim;
 mod node_editor;
