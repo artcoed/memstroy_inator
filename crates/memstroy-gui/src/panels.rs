@@ -1787,6 +1787,25 @@ fn param_label(highlighted: bool, text: &'static str) -> RichText {
     }
 }
 
+/// Same visual treatment as [`param_label`] but takes a runtime `&str`
+/// the caller has already translated. Used by the audio inspector
+/// helpers, where labels like `"Pitch (semitones)"` are composed via
+/// `i18n::t(...)` at the call site (returning a `&'static str` that
+/// shouldn't be translated again, or a `String` for keys with runtime
+/// formatting). Mirrors the gold-highlight when a timeline kf was just
+/// clicked so the user can trace which audio param a kf belongs to —
+/// the same affordance the actor / overlay / render-frame inspectors
+/// already give for video params.
+fn param_label_str(highlighted: bool, text: &str) -> RichText {
+    if highlighted {
+        RichText::new(text).size(11.0).strong()
+            .color(Color32::from_rgb(255, 220, 80))
+            .background_color(Color32::from_rgba_premultiplied(80, 60, 0, 80))
+    } else {
+        RichText::new(text).size(11.0)
+    }
+}
+
 /// Compact circular rotation dial. The pointer angle relative to the
 /// dial centre is mapped directly to `*deg` so the user always lands on
 /// the exact value they aim at — no slider scrubbing needed. Double-
@@ -4792,6 +4811,13 @@ fn inspector_audio(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
     use crate::i18n::t;
     let _ = state.scene.output.duration;
 
+    // Snapshot the kf-highlight up front so the per-param rows can
+    // gold-flash their labels when the user just clicked a kf in the
+    // timeline — mirrors what `inspector_actor_transform` does. We
+    // clone instead of borrowing because the body re-borrows
+    // `state.scene.audio[i]` mutably below.
+    let kf_highlight = state.kf_highlight.clone();
+
     // Snapshot fields needed for the post-edit cascade so the borrow on
     // `audio` can end before we touch the actor / frame-cache vecs.
     let parent_actor_id: Option<String>;
@@ -4816,6 +4842,7 @@ fn inspector_audio(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
         // a slider, it should be a value like Speed" complaint.
         inspector_audio_param_ex(
             ui,
+            i,
             t("Volume"),
             "volume",
             0.0..=4.0,
@@ -4825,6 +4852,7 @@ fn inspector_audio(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
             &mut audio.volume,
             &mut audio.volume_kfs,
             &mut audio.animated_params,
+            &kf_highlight,
         );
 
         // ── Speed (DragValue — no slider so the user can dial in
@@ -4833,6 +4861,15 @@ fn inspector_audio(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
         // reflect the new playback length, mirroring the new video
         // behaviour. Bound layers (an actor that owns this audio's
         // `parent_actor` link) are updated by the cascade below.
+        //
+        // Speed cannot delegate to `inspector_audio_param_ex` because it
+        // has unique side effects: editing the value resizes the visible
+        // window via `t_out` (using the cached "1× length") and
+        // cascades onto the linked actor below. The widget therefore
+        // stays inline but uses the SAME shared primitives every other
+        // inspector relies on — `kf_anim::animated_toggle` for the
+        // painted diamond and `param_label_str` for the gold-highlight
+        // label.
         let old_speed = audio.speed.max(0.0001);
         let cur_dur = match audio.t_out {
             Some(o) => (o - audio.t_in).max(0.05),
@@ -4841,33 +4878,27 @@ fn inspector_audio(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
         let one_x_dur = cur_dur * old_speed;
         let mut new_speed = audio.speed;
         let mut speed_dirty = false;
-        let speed_animated = audio.animated_params.contains("speed");
         ui.horizontal(|ui| {
-            // Diamond toggle for keyframing speed. When ON the cascade
-            // below still operates on the STATIC `audio.speed`, but
-            // edits while animated upsert a kf at the playhead like
-            // every other animatable param.
-            let marker = if speed_animated { "\u{25C6}" } else { "\u{25C7}" };
-            let col = if speed_animated { Color32::from_rgb(255, 180, 80) } else { COL_TEXT_DIM };
-            let toggle = ui
-                .add(
-                    egui::Button::new(RichText::new(marker).size(11.0).color(col))
-                        .frame(false)
-                        .min_size(Vec2::new(14.0, 14.0)),
-                )
-                .on_hover_text(crate::i18n::t("Toggle animation for this parameter"));
-            if toggle.clicked() {
-                if speed_animated {
-                    audio.animated_params.remove("speed");
-                } else {
-                    audio.animated_params.insert("speed".to_string());
-                    if audio.speed_kfs.is_empty() {
-                        audio.speed_kfs.push(memstroy_core::Keyframe::new(0.0, audio.speed));
-                    }
-                }
+            // Shared painted-diamond toggle. Seeds a kf at t=0 the
+            // moment animation is turned on so the per-param strip
+            // below has something to drag, mirroring what the volume
+            // / pitch / pan rows do via `inspector_audio_param_ex`.
+            let was_on = audio.animated_params.contains("speed");
+            let _toggled = crate::kf_anim::animated_toggle(
+                ui,
+                &mut audio.animated_params,
+                "speed",
+                ("audio_param", i, "speed"),
+            );
+            if !was_on
+                && audio.animated_params.contains("speed")
+                && audio.speed_kfs.is_empty()
+            {
+                audio.speed_kfs.push(memstroy_core::Keyframe::new(0.0, audio.speed));
             }
 
-            ui.label(t("Speed"));
+            let speed_animated = audio.animated_params.contains("speed");
+            ui.label(param_label_str(kf_highlight.is_active("speed"), t("Speed")));
             // When animated, sample the kf track at the playhead so the
             // displayed value tracks the animation curve like the other
             // audio params do; otherwise show the static value.
@@ -4912,7 +4943,9 @@ fn inspector_audio(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
                 speed_dirty = true;
             }
         });
-        // Per-param strip for speed kfs.
+        // Per-param strip for speed kfs — same widget the actor /
+        // overlay / render-frame inspectors use.
+        let speed_animated = audio.animated_params.contains("speed");
         if speed_animated && !audio.speed_kfs.is_empty() {
             let max_kf_t = audio.speed_kfs.iter().map(|k| k.t).fold(0.0_f32, f32::max);
             let dur = max_kf_t.max(t_local).max(1.0);
@@ -4925,7 +4958,7 @@ fn inspector_audio(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
                 &easings,
                 dur,
                 Some(t_local.max(0.0)),
-                ("audio_kf_strip", "speed"),
+                ("audio_kf_strip", i, "speed"),
             );
             crate::kf_anim::apply_strip_to_f32_kfs(&mut audio.speed_kfs, &interaction);
         }
@@ -4982,6 +5015,7 @@ fn inspector_audio(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
     ui.add_space(6.0);
     inspector_audio_param(
         ui,
+        i,
         &crate::i18n::t("Pitch (semitones)"),
         "pitch",
         -24.0..=24.0,
@@ -4990,9 +5024,11 @@ fn inspector_audio(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
         &mut audio.pitch_semitones,
         &mut audio.pitch_kfs,
         &mut audio.animated_params,
+        &kf_highlight,
     );
     inspector_audio_param(
         ui,
+        i,
         &crate::i18n::t("Pan"),
         "pan",
         -1.0..=1.0,
@@ -5001,6 +5037,7 @@ fn inspector_audio(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
         &mut audio.pan,
         &mut audio.pan_kfs,
         &mut audio.animated_params,
+        &kf_highlight,
     );
     ui.horizontal(|ui| {
         ui.checkbox(&mut audio.mute, crate::i18n::t("Mute"));
@@ -5011,6 +5048,7 @@ fn inspector_audio(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
     ui.label(RichText::new(crate::i18n::t("Audio effects")).strong().size(12.0).color(COL_TEXT_DIM));
     inspector_audio_param(
         ui,
+        i,
         &crate::i18n::t("Reverb"),
         "reverb",
         0.0..=1.0,
@@ -5019,6 +5057,7 @@ fn inspector_audio(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
         &mut audio.reverb,
         &mut audio.reverb_kfs,
         &mut audio.animated_params,
+        &kf_highlight,
     );
 
     // ── Filters (animatable cutoffs) ─────────────────────────────────
@@ -5044,6 +5083,7 @@ fn inspector_audio(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
         let mut lp_static_f32 = audio.low_pass_hz.map(|v| v as f32).unwrap_or(8000.0);
         inspector_audio_param(
             ui,
+            i,
             &crate::i18n::t("Low-pass cutoff (Hz)"),
             "low_pass",
             100.0..=20000.0,
@@ -5052,6 +5092,7 @@ fn inspector_audio(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
             &mut lp_static_f32,
             &mut audio.low_pass_kfs,
             &mut audio.animated_params,
+            &kf_highlight,
         );
         // Persist the (possibly edited) static value back as u32.
         audio.low_pass_hz = Some(lp_static_f32.clamp(20.0, 22000.0) as u32);
@@ -5067,6 +5108,7 @@ fn inspector_audio(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
         let mut hp_static_f32 = audio.high_pass_hz.map(|v| v as f32).unwrap_or(120.0);
         inspector_audio_param(
             ui,
+            i,
             &crate::i18n::t("High-pass cutoff (Hz)"),
             "high_pass",
             20.0..=8000.0,
@@ -5075,6 +5117,7 @@ fn inspector_audio(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
             &mut hp_static_f32,
             &mut audio.high_pass_kfs,
             &mut audio.animated_params,
+            &kf_highlight,
         );
         audio.high_pass_hz = Some(hp_static_f32.clamp(20.0, 22000.0) as u32);
     }
@@ -5200,6 +5243,7 @@ fn inspector_audio(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
 #[allow(clippy::too_many_arguments)]
 fn inspector_audio_param(
     ui: &mut egui::Ui,
+    audio_idx: usize,
     label: &str,
     param_id: &str,
     range: std::ops::RangeInclusive<f32>,
@@ -5208,10 +5252,11 @@ fn inspector_audio_param(
     static_value: &mut f32,
     kfs: &mut Vec<memstroy_core::Keyframe<f32>>,
     animated: &mut std::collections::BTreeSet<String>,
+    kf_highlight: &crate::kf_anim::KfHighlight,
 ) {
     inspector_audio_param_ex(
-        ui, label, param_id, range, logarithmic, false, t_local,
-        static_value, kfs, animated,
+        ui, audio_idx, label, param_id, range, logarithmic, false, t_local,
+        static_value, kfs, animated, kf_highlight,
     );
 }
 
@@ -5220,9 +5265,23 @@ fn inspector_audio_param(
 /// volume to behave the same way as Speed — a precise typed/dragged
 /// value rather than a constrained slider — so we keep a thin
 /// dispatch on top of the legacy 9-arg helper for backward compat.
+///
+/// Visually this row is built out of the SAME primitives as the actor /
+/// overlay / render-frame inspectors:
+///
+///   - [`kf_anim::animated_toggle`] for the per-param "is animated"
+///     diamond (painted directly because egui's default font doesn't
+///     render the Unicode diamond glyphs — the previous Unicode-glyph
+///     toggle showed up as an empty square on most installs).
+///   - [`param_label_str`] for the label so it gets the gold highlight
+///     flash when the user clicks the matching kf in the timeline.
+///   - [`kf_anim::keyframe_strip`] + [`kf_anim::apply_strip_to_f32_kfs`]
+///     for the time-graph under each animated param so the user can
+///     drag kf times and right-click for interpolation flavour.
 #[allow(clippy::too_many_arguments)]
 fn inspector_audio_param_ex(
     ui: &mut egui::Ui,
+    audio_idx: usize,
     label: &str,
     param_id: &str,
     range: std::ops::RangeInclusive<f32>,
@@ -5232,55 +5291,51 @@ fn inspector_audio_param_ex(
     static_value: &mut f32,
     kfs: &mut Vec<memstroy_core::Keyframe<f32>>,
     animated: &mut std::collections::BTreeSet<String>,
+    kf_highlight: &crate::kf_anim::KfHighlight,
 ) {
-    let is_animated = animated.contains(param_id);
+    use crate::kf_anim;
+
+    let is_animated_pre = animated.contains(param_id);
 
     // Display value: when animated, sample the kf track at the playhead
     // so the slider reflects the current animated value; otherwise the
     // static field.
-    let mut display = if is_animated && !kfs.is_empty() {
+    let mut display = if is_animated_pre && !kfs.is_empty() {
         memstroy_core::keyframe::sample(kfs, t_local).unwrap_or(*static_value)
     } else {
         *static_value
     };
 
     ui.horizontal(|ui| {
-        // Compact left-aligned animation marker: filled diamond when ON,
-        // outline diamond when OFF — same affordance as the video
-        // inspector's per-param `kf_anim::animated_toggle`. Clicking
-        // toggles whether the param is keyframed; the row otherwise
-        // looks like a regular labelled slider.
-        let marker = if is_animated { "\u{25C6}" } else { "\u{25C7}" }; // ◆ / ◇
-        let col = if is_animated { Color32::from_rgb(255, 180, 80) } else { COL_TEXT_DIM };
-        let toggle = ui
-            .add(egui::Button::new(RichText::new(marker).size(11.0).color(col))
-                .frame(false)
-                .min_size(Vec2::new(14.0, 14.0)))
-            .on_hover_text(crate::i18n::t("Toggle animation for this parameter"));
-        if toggle.clicked() {
-            if is_animated {
-                animated.remove(param_id);
-            } else {
-                animated.insert(param_id.to_string());
-                if kfs.is_empty() {
-                    kfs.push(memstroy_core::Keyframe::new(0.0, *static_value));
-                }
-            }
+        // Shared painted-diamond toggle — same widget used by every
+        // other inspector. Replaces the hand-rolled Unicode-glyph
+        // toggle that rendered as an empty square on default fonts.
+        let was_on = animated.contains(param_id);
+        let _toggled = kf_anim::animated_toggle(
+            ui,
+            animated,
+            param_id,
+            ("audio_param", audio_idx, param_id),
+        );
+        // Seed a kf at clip-local t=0 the moment the user turns
+        // animation ON so the per-param strip below has at least one
+        // diamond to drag, mirroring the previous behaviour.
+        if !was_on && animated.contains(param_id) && kfs.is_empty() {
+            kfs.push(memstroy_core::Keyframe::new(0.0, *static_value));
         }
 
-        ui.label(label);
+        ui.label(param_label_str(kf_highlight.is_active(param_id), label));
 
         let resp = if numeric {
             // Numeric mode (e.g. Volume): expose the value via DragValue
             // so the user can type or drag without being constrained to
             // the slider's visual gradient. Mirrors the Speed widget.
-            let r = ui.add(
+            ui.add(
                 egui::DragValue::new(&mut display)
                     .range(range.clone())
                     .speed(0.01)
                     .fixed_decimals(3),
-            );
-            r
+            )
         } else {
             let mut slider = egui::Slider::new(&mut display, range.clone());
             if logarithmic {
@@ -5292,6 +5347,7 @@ fn inspector_audio_param_ex(
             ui.add(slider)
         };
 
+        let is_animated = animated.contains(param_id);
         if resp.changed() {
             if is_animated {
                 if kfs.is_empty() {
@@ -5308,6 +5364,7 @@ fn inspector_audio_param_ex(
     // animated. When the user toggles animation on without entering any
     // edits yet, the strip will show a single seed kf at t=0 (placed
     // by the toggle handler above) so they have something to drag.
+    let is_animated = animated.contains(param_id);
     if is_animated && !kfs.is_empty() {
         // Use the larger of the clip's local playhead and the largest
         // kf time as the strip's right edge so the user can always see
@@ -5317,15 +5374,15 @@ fn inspector_audio_param_ex(
         let times: Vec<f32> = kfs.iter().map(|k| k.t).collect();
         let easings: Vec<memstroy_core::Easing> =
             kfs.iter().map(|k| k.easing).collect();
-        let interaction = crate::kf_anim::keyframe_strip(
+        let interaction = kf_anim::keyframe_strip(
             ui,
             &times,
             &easings,
             dur,
             Some(t_local.max(0.0)),
-            ("audio_kf_strip", param_id),
+            ("audio_kf_strip", audio_idx, param_id),
         );
-        crate::kf_anim::apply_strip_to_f32_kfs(kfs, &interaction);
+        kf_anim::apply_strip_to_f32_kfs(kfs, &interaction);
     }
 }
 
