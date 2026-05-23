@@ -1302,6 +1302,35 @@ impl App {
                 self.state.status = "\u{1F5D1} Background deleted.".into();
             }
             Selection::Audio(i) if i < self.state.scene.audio.len() => {
+                // Cascade audio → parent actor: deleting a sound that
+                // is bound to a video clip via `parent_actor` removes
+                // the parent clip too, which then removes every
+                // SIBLING audio bound to the same parent through the
+                // existing `remove_audio_bound_to_actor` path. This
+                // closes the "delete attached layers together" loop
+                // in the audio→video direction (the actor branch
+                // above already handles the video→audio direction).
+                let parent_actor_id = self.state.scene.audio[i].parent_actor.clone();
+                if let Some(parent_id) = parent_actor_id {
+                    if let Some(actor_idx) =
+                        self.state.scene.actors.iter().position(|a| a.id == parent_id)
+                    {
+                        // Re-target the selection at the parent and
+                        // recurse — the existing actor branch already
+                        // wipes every bound audio (including this
+                        // one), the matching frame_caches /
+                        // frame_extract_results entries, and the
+                        // actor_track_assignments map. We then drop
+                        // back through the recursion with a clean
+                        // selection.
+                        self.state.selection = Selection::Actor(actor_idx);
+                        self.delete_selected();
+                        return;
+                    }
+                    // Orphaned binding (parent already gone) — fall
+                    // through to a plain audio remove so the user can
+                    // still get rid of the row.
+                }
                 self.state.mutate(|s| { s.audio.remove(i); });
                 if i < self.state.audio_waveforms.len() {
                     self.state.audio_waveforms.remove(i);
@@ -1360,176 +1389,424 @@ impl App {
         let t = self.state.playhead;
         match self.state.selection {
             Selection::Background(i) if i < self.state.scene.backgrounds.len() => {
-                let bg = &self.state.scene.backgrounds[i];
-                let start = bg.start;
-                let end = bg.start + bg.duration;
-                if t <= start || t >= end {
-                    self.state.status = "\u{26A0} Playhead is outside this background's range.".into();
-                    return;
-                }
-                let mut right = bg.clone();
-                right.id = format!("{}_R", right.id);
-                right.start = t;
-                right.duration = end - t;
-                let left_dur = t - start;
-                self.state.mutate(move |s| {
-                    s.backgrounds[i].duration = left_dur;
-                    s.backgrounds.insert(i + 1, right);
-                });
-                self.state.status = "\u{2702} Background split at playhead.".into();
+                self.split_background_at(i, t);
             }
             Selection::Actor(i) if i < self.state.scene.actors.len() => {
-                let a = &self.state.scene.actors[i];
-                let start = a.t_in.unwrap_or(0.0);
-                let end = a.t_out.unwrap_or(self.state.scene.output.duration);
-                if t <= start || t >= end {
-                    self.state.status = "\u{26A0} Playhead is outside this actor's range.".into();
-                    return;
-                }
-                let mut right = a.clone();
-                right.id = format!("{}_R", right.id);
-                right.t_in = Some(t);
-                right.t_out = Some(end);
-                // Correct source_start for the right half
-                right.source_start = a.source_start + (t - start);
-                // Keep only keyframes in each half (by LOCAL time relative to actor start).
-                let local_split = t - start;
-                // Right half: keep keyframes at or after the split point, shift them to start from 0
-                right.layout.retain(|kf| kf.t >= local_split);
-                for kf in right.layout.iter_mut() {
-                    kf.t -= local_split;
-                }
-                // If right half has no keyframes, add one at t=0 with the last known state
-                if right.layout.is_empty() {
-                    let last_state = a.layout.last().map(|k| k.value).unwrap_or_default();
-                    right.layout.push(memstroy_core::Keyframe::new(0.0, last_state));
-                }
-                let local_split_for_left = local_split;
-                // Capture the original lane so the right half stays on the
-                // same track (otherwise the new index falls back to "first
-                // video lane" and the user perceives it as a layer jump).
-                let original_lane = self.state.actor_track_assignments.get(&i).copied();
-                self.state.mutate(move |s| {
-                    s.actors[i].t_out = Some(t);
-                    // Left half: keep keyframes at or before the split point
-                    s.actors[i].layout.retain(|kf| kf.t <= local_split_for_left);
-                    // If left half has no keyframes, add one at t=0 with default state
-                    if s.actors[i].layout.is_empty() {
-                        s.actors[i].layout.push(memstroy_core::Keyframe::new(0.0, memstroy_core::ActorState::default()));
-                    }
-                    s.actors.insert(i + 1, right);
-                });
-                // Shift every actor_track_assignments entry >= i+1 by +1 to
-                // account for the insertion, then bind the new right half
-                // to the original lane.
-                let pivot = i + 1;
-                let mut shifted: std::collections::HashMap<usize, usize> =
-                    std::collections::HashMap::with_capacity(
-                        self.state.actor_track_assignments.len() + 1,
-                    );
-                for (k, v) in self.state.actor_track_assignments.iter() {
-                    let new_k = if *k >= pivot { *k + 1 } else { *k };
-                    shifted.insert(new_k, *v);
-                }
-                if let Some(lane) = original_lane {
-                    shifted.insert(pivot, lane);
-                }
-                self.state.actor_track_assignments = shifted;
-                self.state.status = "\u{2702} Actor split at playhead.".into();
+                // Splitting a video clip cascades to every audio that
+                // declared this actor as its `parent_actor`. Without
+                // this the user would have to manually re-cut each
+                // bound audio track at the same playhead — and the
+                // sync_audio_to_actor pass would silently snap the
+                // audio back to the LEFT half's window the next
+                // frame, so the right half's audio would simply
+                // vanish. This is the user-facing "разрезанные слои
+                // с прикреплёнными аудио тоже должны разрезаться"
+                // requirement.
+                self.split_actor_with_cascade(i, t);
             }
             Selection::Overlay(i) if i < self.state.scene.overlays.len() => {
-                let ov = &self.state.scene.overlays[i];
-                let (start, end) = match ov {
-                    memstroy_core::Overlay::Text(txt) => (txt.t_in, txt.t_out),
-                    memstroy_core::Overlay::Image(im) => (im.t_in, im.t_out),
-                    memstroy_core::Overlay::Video(v) => (v.t_in, v.t_out),
-                };
-                if t <= start || t >= end {
-                    self.state.status = "\u{26A0} Playhead is outside this overlay's range.".into();
-                    return;
-                }
-                let mut right = ov.clone();
-                let local_split = t - start;
-                match &mut right {
-                    memstroy_core::Overlay::Text(txt) => {
-                        txt.id = format!("{}_R", txt.id);
-                        txt.t_in = t;
-                        txt.layout.retain(|kf| kf.t >= local_split);
-                        for kf in txt.layout.iter_mut() { kf.t -= local_split; }
-                        if txt.layout.is_empty() {
-                            txt.layout.push(memstroy_core::Keyframe::new(0.0, memstroy_core::OverlayState::default()));
-                        }
-                    }
-                    memstroy_core::Overlay::Image(im) => {
-                        im.id = format!("{}_R", im.id);
-                        im.t_in = t;
-                        im.layout.retain(|kf| kf.t >= local_split);
-                        for kf in im.layout.iter_mut() { kf.t -= local_split; }
-                        if im.layout.is_empty() {
-                            im.layout.push(memstroy_core::Keyframe::new(0.0, memstroy_core::OverlayState::default()));
-                        }
-                    }
-                    memstroy_core::Overlay::Video(v) => {
-                        v.id = format!("{}_R", v.id);
-                        v.t_in = t;
-                        v.layout.retain(|kf| kf.t >= local_split);
-                        for kf in v.layout.iter_mut() { kf.t -= local_split; }
-                        if v.layout.is_empty() {
-                            v.layout.push(memstroy_core::Keyframe::new(0.0, memstroy_core::OverlayState::default()));
-                        }
-                    }
-                }
-                let local_split_left = local_split;
-                // Preserve the overlay's lane assignment for the right half.
-                let original_overlay_lane =
-                    self.state.overlay_track_assignments.get(&i).copied();
-                self.state.mutate(move |s| {
-                    match &mut s.overlays[i] {
-                        memstroy_core::Overlay::Text(txt) => {
-                            txt.t_out = t;
-                            txt.layout.retain(|kf| kf.t <= local_split_left);
-                            if txt.layout.is_empty() {
-                                txt.layout.push(memstroy_core::Keyframe::new(0.0, memstroy_core::OverlayState::default()));
-                            }
-                        }
-                        memstroy_core::Overlay::Image(im) => {
-                            im.t_out = t;
-                            im.layout.retain(|kf| kf.t <= local_split_left);
-                            if im.layout.is_empty() {
-                                im.layout.push(memstroy_core::Keyframe::new(0.0, memstroy_core::OverlayState::default()));
-                            }
-                        }
-                        memstroy_core::Overlay::Video(v) => {
-                            v.t_out = t;
-                            v.layout.retain(|kf| kf.t <= local_split_left);
-                            if v.layout.is_empty() {
-                                v.layout.push(memstroy_core::Keyframe::new(0.0, memstroy_core::OverlayState::default()));
-                            }
-                        }
-                    }
-                    s.overlays.insert(i + 1, right);
-                });
-                // Shift overlay_track_assignments to account for the insert
-                // and bind the right half to the original lane.
-                let pivot = i + 1;
-                let mut shifted: std::collections::HashMap<usize, usize> =
-                    std::collections::HashMap::with_capacity(
-                        self.state.overlay_track_assignments.len() + 1,
-                    );
-                for (k, v) in self.state.overlay_track_assignments.iter() {
-                    let new_k = if *k >= pivot { *k + 1 } else { *k };
-                    shifted.insert(new_k, *v);
-                }
-                if let Some(lane) = original_overlay_lane {
-                    shifted.insert(pivot, lane);
-                }
-                self.state.overlay_track_assignments = shifted;
-                self.state.status = "\u{2702} Overlay split at playhead.".into();
+                self.split_overlay_at(i, t);
+            }
+            Selection::Audio(i) if i < self.state.scene.audio.len() => {
+                // Splitting an audio with `parent_actor` cascades the
+                // other direction: the parent video clip and every
+                // sibling audio bound to the same parent are split at
+                // the same playhead so the bound pair (and any
+                // additional bindings) stay in lock-step.
+                self.split_audio_with_cascade(i, t);
             }
             _ => {
                 self.state.status = "\u{26A0} Select an element to split.".into();
             }
         }
+    }
+
+    /// Split the background segment at index `i` at scene-time `t`.
+    /// Returns `true` when the split happened (`t` is strictly inside
+    /// the segment); otherwise leaves the scene untouched and posts a
+    /// status message.
+    fn split_background_at(&mut self, i: usize, t: f32) -> bool {
+        if i >= self.state.scene.backgrounds.len() {
+            return false;
+        }
+        let bg = &self.state.scene.backgrounds[i];
+        let start = bg.start;
+        let end = bg.start + bg.duration;
+        if t <= start || t >= end {
+            self.state.status =
+                "\u{26A0} Playhead is outside this background's range.".into();
+            return false;
+        }
+        let mut right = bg.clone();
+        right.id = format!("{}_R", right.id);
+        right.start = t;
+        right.duration = end - t;
+        let left_dur = t - start;
+        self.state.mutate(move |s| {
+            s.backgrounds[i].duration = left_dur;
+            s.backgrounds.insert(i + 1, right);
+        });
+        self.state.status = "\u{2702} Background split at playhead.".into();
+        true
+    }
+
+    /// Split the actor at index `i` at scene-time `t`. Returns
+    /// `Some((right_idx, right_id))` so the caller can re-parent any
+    /// audio that was bound to this actor over to the right half.
+    /// Returns `None` when `t` lies outside the actor's window.
+    ///
+    /// This intentionally preserves the (pre-existing) "actor layout
+    /// kfs treated as clip-local time inside split" behaviour — even
+    /// though the timeline's MOVE handler treats them as scene-time.
+    /// Fixing that inconsistency is a separate task; this rewrite
+    /// only adds the cascade logic on top of the existing split.
+    fn split_actor_at(&mut self, i: usize, t: f32) -> Option<(usize, String)> {
+        if i >= self.state.scene.actors.len() {
+            return None;
+        }
+        let a = &self.state.scene.actors[i];
+        let start = a.t_in.unwrap_or(0.0);
+        let end = a.t_out.unwrap_or(self.state.scene.output.duration);
+        if t <= start || t >= end {
+            self.state.status =
+                "\u{26A0} Playhead is outside this actor's range.".into();
+            return None;
+        }
+        let mut right = a.clone();
+        right.id = format!("{}_R", right.id);
+        let right_id = right.id.clone();
+        right.t_in = Some(t);
+        right.t_out = Some(end);
+        right.source_start = a.source_start + (t - start);
+        let local_split = t - start;
+        right.layout.retain(|kf| kf.t >= local_split);
+        for kf in right.layout.iter_mut() {
+            kf.t -= local_split;
+        }
+        if right.layout.is_empty() {
+            let last_state = a.layout.last().map(|k| k.value).unwrap_or_default();
+            right.layout.push(memstroy_core::Keyframe::new(0.0, last_state));
+        }
+        let local_split_for_left = local_split;
+        let original_lane = self.state.actor_track_assignments.get(&i).copied();
+        self.state.mutate(move |s| {
+            s.actors[i].t_out = Some(t);
+            s.actors[i].layout.retain(|kf| kf.t <= local_split_for_left);
+            if s.actors[i].layout.is_empty() {
+                s.actors[i].layout.push(memstroy_core::Keyframe::new(
+                    0.0,
+                    memstroy_core::ActorState::default(),
+                ));
+            }
+            s.actors.insert(i + 1, right);
+        });
+        let pivot = i + 1;
+        let mut shifted: std::collections::HashMap<usize, usize> =
+            std::collections::HashMap::with_capacity(
+                self.state.actor_track_assignments.len() + 1,
+            );
+        for (k, v) in self.state.actor_track_assignments.iter() {
+            let new_k = if *k >= pivot { *k + 1 } else { *k };
+            shifted.insert(new_k, *v);
+        }
+        if let Some(lane) = original_lane {
+            shifted.insert(pivot, lane);
+        }
+        self.state.actor_track_assignments = shifted;
+        // Frame caches mirror the actors Vec by index — slot a
+        // placeholder in for the right half so the rest of the
+        // cache table stays index-aligned with the scene.
+        if pivot <= self.state.frame_caches.len() {
+            self.state.frame_caches.insert(
+                pivot,
+                crate::video_cache::FrameCache::new(
+                    std::path::PathBuf::new(),
+                    pivot,
+                ),
+            );
+        }
+        if pivot <= self.frame_extract_results.len() {
+            self.frame_extract_results.insert(pivot, std::sync::Arc::new(std::sync::Mutex::new(None)));
+        }
+        Some((pivot, right_id))
+    }
+
+    /// Split actor `i` at `t`, then split every audio with
+    /// `parent_actor == actor.id` at the same scene-time and re-parent
+    /// the right-half audio rows over to the freshly inserted
+    /// right-half actor's id.
+    fn split_actor_with_cascade(&mut self, i: usize, t: f32) {
+        if i >= self.state.scene.actors.len() {
+            return;
+        }
+        let actor_id = self.state.scene.actors[i].id.clone();
+
+        // Capture bound-audio indices BEFORE we mutate the audio Vec.
+        // Sorted descending so consecutive splits don't shift earlier
+        // entries (each split inserts at au_idx+1, only affecting
+        // strictly higher indices).
+        let mut bound_audio: Vec<usize> = self
+            .state
+            .scene
+            .audio
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.parent_actor.as_deref() == Some(actor_id.as_str()))
+            .map(|(idx, _)| idx)
+            .collect();
+        bound_audio.sort_unstable_by(|a, b| b.cmp(a));
+
+        let Some((_right_idx, right_actor_id)) = self.split_actor_at(i, t) else {
+            return;
+        };
+
+        for au_idx in bound_audio {
+            if au_idx >= self.state.scene.audio.len() {
+                continue;
+            }
+            // Tolerate the case where the bound audio's window doesn't
+            // contain the playhead (clip was previously trimmed past
+            // `t`). We just skip those rows instead of erroring out;
+            // the actor split already happened so partial cascade is
+            // strictly better than aborting.
+            let au = &self.state.scene.audio[au_idx];
+            let au_start = au.t_in;
+            let au_end = au.t_out.unwrap_or(self.state.scene.output.duration);
+            if t <= au_start || t >= au_end {
+                continue;
+            }
+            let _ = self.split_audio_at(au_idx, t, Some(right_actor_id.clone()));
+        }
+
+        self.state.status = "\u{2702} Actor split at playhead.".into();
+    }
+
+    /// Split the overlay at index `i` at scene-time `t`. Overlays have
+    /// no parent / child relationships so this never cascades.
+    fn split_overlay_at(&mut self, i: usize, t: f32) -> bool {
+        if i >= self.state.scene.overlays.len() {
+            return false;
+        }
+        let ov = &self.state.scene.overlays[i];
+        let (start, end) = match ov {
+            memstroy_core::Overlay::Text(txt) => (txt.t_in, txt.t_out),
+            memstroy_core::Overlay::Image(im) => (im.t_in, im.t_out),
+            memstroy_core::Overlay::Video(v) => (v.t_in, v.t_out),
+        };
+        if t <= start || t >= end {
+            self.state.status =
+                "\u{26A0} Playhead is outside this overlay's range.".into();
+            return false;
+        }
+        let mut right = ov.clone();
+        let local_split = t - start;
+        match &mut right {
+            memstroy_core::Overlay::Text(txt) => {
+                txt.id = format!("{}_R", txt.id);
+                txt.t_in = t;
+                txt.layout.retain(|kf| kf.t >= local_split);
+                for kf in txt.layout.iter_mut() { kf.t -= local_split; }
+                if txt.layout.is_empty() {
+                    txt.layout.push(memstroy_core::Keyframe::new(0.0, memstroy_core::OverlayState::default()));
+                }
+            }
+            memstroy_core::Overlay::Image(im) => {
+                im.id = format!("{}_R", im.id);
+                im.t_in = t;
+                im.layout.retain(|kf| kf.t >= local_split);
+                for kf in im.layout.iter_mut() { kf.t -= local_split; }
+                if im.layout.is_empty() {
+                    im.layout.push(memstroy_core::Keyframe::new(0.0, memstroy_core::OverlayState::default()));
+                }
+            }
+            memstroy_core::Overlay::Video(v) => {
+                v.id = format!("{}_R", v.id);
+                v.t_in = t;
+                v.layout.retain(|kf| kf.t >= local_split);
+                for kf in v.layout.iter_mut() { kf.t -= local_split; }
+                if v.layout.is_empty() {
+                    v.layout.push(memstroy_core::Keyframe::new(0.0, memstroy_core::OverlayState::default()));
+                }
+            }
+        }
+        let local_split_left = local_split;
+        let original_overlay_lane =
+            self.state.overlay_track_assignments.get(&i).copied();
+        self.state.mutate(move |s| {
+            match &mut s.overlays[i] {
+                memstroy_core::Overlay::Text(txt) => {
+                    txt.t_out = t;
+                    txt.layout.retain(|kf| kf.t <= local_split_left);
+                    if txt.layout.is_empty() {
+                        txt.layout.push(memstroy_core::Keyframe::new(0.0, memstroy_core::OverlayState::default()));
+                    }
+                }
+                memstroy_core::Overlay::Image(im) => {
+                    im.t_out = t;
+                    im.layout.retain(|kf| kf.t <= local_split_left);
+                    if im.layout.is_empty() {
+                        im.layout.push(memstroy_core::Keyframe::new(0.0, memstroy_core::OverlayState::default()));
+                    }
+                }
+                memstroy_core::Overlay::Video(v) => {
+                    v.t_out = t;
+                    v.layout.retain(|kf| kf.t <= local_split_left);
+                    if v.layout.is_empty() {
+                        v.layout.push(memstroy_core::Keyframe::new(0.0, memstroy_core::OverlayState::default()));
+                    }
+                }
+            }
+            s.overlays.insert(i + 1, right);
+        });
+        let pivot = i + 1;
+        let mut shifted: std::collections::HashMap<usize, usize> =
+            std::collections::HashMap::with_capacity(
+                self.state.overlay_track_assignments.len() + 1,
+            );
+        for (k, v) in self.state.overlay_track_assignments.iter() {
+            let new_k = if *k >= pivot { *k + 1 } else { *k };
+            shifted.insert(new_k, *v);
+        }
+        if let Some(lane) = original_overlay_lane {
+            shifted.insert(pivot, lane);
+        }
+        self.state.overlay_track_assignments = shifted;
+        self.state.status = "\u{2702} Overlay split at playhead.".into();
+        true
+    }
+
+    /// Split the audio track at index `i` at scene-time `t`. When
+    /// `right_parent` is `Some`, that string overrides the right
+    /// half's `parent_actor`; otherwise the right half inherits the
+    /// original's `parent_actor` value. Returns the right-half
+    /// audio's index, or `None` when `t` lies outside the audio's
+    /// playable window.
+    fn split_audio_at(
+        &mut self,
+        i: usize,
+        t: f32,
+        right_parent: Option<String>,
+    ) -> Option<usize> {
+        if i >= self.state.scene.audio.len() {
+            return None;
+        }
+        let au = &self.state.scene.audio[i];
+        let start = au.t_in;
+        let end = au.t_out.unwrap_or(self.state.scene.output.duration);
+        if t <= start || t >= end {
+            self.state.status =
+                "\u{26A0} Playhead is outside this audio's range.".into();
+            return None;
+        }
+        let mut right = au.clone();
+        right.id = format!("{}_R", right.id);
+        right.t_in = t;
+        right.t_out = Some(end);
+        right.source_start = au.source_start + (t - start).max(0.0);
+        if let Some(rp) = right_parent {
+            right.parent_actor = Some(rp);
+        }
+        let original_lane = self.state.audio_track_assignments.get(&i).copied();
+        self.state.mutate(move |s| {
+            s.audio[i].t_out = Some(t);
+            s.audio.insert(i + 1, right);
+        });
+        let pivot = i + 1;
+        crate::panels::shift_assignments_for_insert(
+            &mut self.state.audio_track_assignments,
+            pivot,
+        );
+        if let Some(lane) = original_lane {
+            self.state.audio_track_assignments.insert(pivot, lane);
+        }
+        if pivot <= self.state.audio_waveforms.len() {
+            self.state.audio_waveforms.insert(pivot, crate::state::AudioWaveform::default());
+        }
+        if pivot <= self.waveform_extract_results.len() {
+            self.waveform_extract_results.insert(
+                pivot,
+                std::sync::Arc::new(std::sync::Mutex::new(None)),
+            );
+        }
+        Some(pivot)
+    }
+
+    /// Split the audio at index `i` at `t`. When the audio has a
+    /// `parent_actor`, also split that actor and every sibling audio
+    /// bound to the same parent — same cascade as
+    /// `split_actor_with_cascade`, just initiated from the audio
+    /// side. The originating audio is split inline (with the right
+    /// half re-parented to the new right-half actor) so the
+    /// cascade pass never tries to double-cut it.
+    fn split_audio_with_cascade(&mut self, i: usize, t: f32) {
+        if i >= self.state.scene.audio.len() {
+            return;
+        }
+        let parent_actor_id = self.state.scene.audio[i].parent_actor.clone();
+
+        let Some(parent_id) = parent_actor_id else {
+            // Standalone audio — just split the one row.
+            if self.split_audio_at(i, t, None).is_some() {
+                self.state.status = "\u{2702} Audio split at playhead.".into();
+            }
+            return;
+        };
+
+        // Locate the parent actor by id. If it's gone (orphaned
+        // binding), fall back to a standalone audio split so the
+        // user still gets the cut they asked for.
+        let parent_idx = match self
+            .state
+            .scene
+            .actors
+            .iter()
+            .position(|a| a.id == parent_id)
+        {
+            Some(p) => p,
+            None => {
+                if self.split_audio_at(i, t, None).is_some() {
+                    self.state.status = "\u{2702} Audio split at playhead.".into();
+                }
+                return;
+            }
+        };
+
+        // Capture every sibling audio bound to the same parent
+        // BEFORE any split (they all need the same right-actor id
+        // for re-parenting). Sorted descending so insertions don't
+        // invalidate later entries.
+        let mut sibling_audio: Vec<usize> = self
+            .state
+            .scene
+            .audio
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.parent_actor.as_deref() == Some(parent_id.as_str()))
+            .map(|(idx, _)| idx)
+            .collect();
+        sibling_audio.sort_unstable_by(|a, b| b.cmp(a));
+
+        let Some((_right_actor_idx, right_actor_id)) = self.split_actor_at(parent_idx, t) else {
+            return;
+        };
+
+        // Split every captured audio row. The originating audio is
+        // included in this list because it has the same parent_actor.
+        // All right halves get re-parented to right_actor_id.
+        for au_idx in sibling_audio {
+            if au_idx >= self.state.scene.audio.len() {
+                continue;
+            }
+            let au = &self.state.scene.audio[au_idx];
+            let au_start = au.t_in;
+            let au_end = au.t_out.unwrap_or(self.state.scene.output.duration);
+            if t <= au_start || t >= au_end {
+                continue;
+            }
+            let _ = self.split_audio_at(au_idx, t, Some(right_actor_id.clone()));
+        }
+
+        self.state.status = "\u{2702} Audio split at playhead.".into();
     }
 
     /// Merge the selected element with its next sibling of the same kind.
