@@ -42,10 +42,23 @@ pub enum JobEvent {
     RenderFinished(Result<PathBuf, String>),
     RefreshProgress(String),
     RefreshFinished(Result<RefreshSummary, String>),
-    /// Web image search returned a (possibly empty) list of hits.
-    /// The error variant carries a human-readable string suitable for
+    /// Web image search returned a (possibly empty) list of hits, plus
+    /// an optional cursor (`next_offset`) for the next page. The
+    /// `page_offset` echoes the request's start offset so the UI can
+    /// distinguish "fresh search → replace results" (offset == 0) from
+    /// "append page → push onto existing results" (offset > 0). The
+    /// error variant carries a human-readable string suitable for
     /// surfacing on the panel's status line.
-    WebSearchFinished(Result<Vec<crate::web_image_search::WebImageHit>, String>),
+    WebSearchFinished {
+        page_offset: u32,
+        result: Result<
+            (
+                Vec<crate::web_image_search::WebImageHit>,
+                Option<u32>,
+            ),
+            String,
+        >,
+    },
     /// A web image download for the row identified by `request_id` has
     /// completed. `image_url` is repeated so the panel can match the
     /// response back to its row even after the user has scrolled or
@@ -405,7 +418,7 @@ async fn generate_thumbnails(clips_dir: &std::path::Path, thumbs_dir: &std::path
 // and the panel surfaces a clear error string.
 
 use crate::state::LibraryAsset;
-use crate::web_image_search::{WebImageHit, MAX_RESULTS};
+use crate::web_image_search::WebImageHit;
 
 /// Default user-agent string sent with every DuckDuckGo request.
 /// DDG sometimes serves a different / shorter HTML to clients without
@@ -415,17 +428,31 @@ const UA: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firef
 
 /// Fire a web image search and post the result back via `tx`.
 ///
-/// The whole flow runs on the runtime's worker pool — no await on the
-/// caller's side. The function never panics; every failure is mapped
-/// to a `JobEvent::WebSearchFinished(Err(_))`.
-pub fn spawn_web_image_search(rt: &Handle, tx: Sender<JobEvent>, query: String) {
+/// `page_offset` is forwarded as DuckDuckGo's `s=` parameter — pass
+/// `0` for the first page; subsequent pages reuse the offset returned
+/// in the previous response. The whole flow runs on the runtime's
+/// worker pool — no await on the caller's side. The function never
+/// panics; every failure is mapped to a
+/// `JobEvent::WebSearchFinished { result: Err(_), .. }`.
+pub fn spawn_web_image_search(
+    rt: &Handle,
+    tx: Sender<JobEvent>,
+    query: String,
+    page_offset: u32,
+) {
     rt.spawn(async move {
-        let result = run_web_image_search(&query).await;
-        let _ = tx.send(JobEvent::WebSearchFinished(result));
+        let result = run_web_image_search(&query, page_offset).await;
+        let _ = tx.send(JobEvent::WebSearchFinished {
+            page_offset,
+            result,
+        });
     });
 }
 
-async fn run_web_image_search(query: &str) -> Result<Vec<WebImageHit>, String> {
+async fn run_web_image_search(
+    query: &str,
+    page_offset: u32,
+) -> Result<(Vec<WebImageHit>, Option<u32>), String> {
     let client = reqwest::Client::builder()
         .user_agent(UA)
         .timeout(Duration::from_secs(20))
@@ -461,7 +488,11 @@ async fn run_web_image_search(query: &str) -> Result<Vec<WebImageHit>, String> {
         "DuckDuckGo refused the search (no vqd token in response). Try again later or tweak the query.".to_string()
     })?;
 
-    // 2. Hit the JSON endpoint with the scraped token.
+    // 2. Hit the JSON endpoint with the scraped token. `s=N` is the
+    //    DDG start offset. First page uses 0; subsequent pages reuse
+    //    the offset extracted from the previous response's `next`
+    //    field.
+    let s_str = page_offset.to_string();
     let json_resp = client
         .get("https://duckduckgo.com/i.js")
         .query(&[
@@ -471,6 +502,7 @@ async fn run_web_image_search(query: &str) -> Result<Vec<WebImageHit>, String> {
             ("vqd", vqd.as_str()),
             ("f", ",,,,,,"),
             ("p", "1"),
+            ("s", s_str.as_str()),
             ("v7exp", "a"),
         ])
         .header("Accept", "application/json")
@@ -488,13 +520,14 @@ async fn run_web_image_search(query: &str) -> Result<Vec<WebImageHit>, String> {
         .map_err(|e| format!("Couldn't parse image-search JSON: {e}"))?;
 
     let hits = parse_ddg_results(&json);
-    if hits.is_empty() {
+    let next_offset = parse_ddg_next_offset(&json);
+    if hits.is_empty() && page_offset == 0 {
         return Err(format!(
             "No image results for \"{}\" (DuckDuckGo returned an empty list).",
             query
         ));
     }
-    Ok(hits)
+    Ok((hits, next_offset))
 }
 
 /// Pull the `vqd` token out of DuckDuckGo's landing HTML.
@@ -560,8 +593,8 @@ fn parse_ddg_results(v: &serde_json::Value) -> Vec<WebImageHit> {
         Some(a) => a,
         None => return Vec::new(),
     };
-    let mut hits = Vec::with_capacity(arr.len().min(MAX_RESULTS));
-    for entry in arr.iter().take(MAX_RESULTS) {
+    let mut hits = Vec::with_capacity(arr.len().min(crate::web_image_search::MAX_RESULTS_PER_PAGE));
+    for entry in arr.iter().take(crate::web_image_search::MAX_RESULTS_PER_PAGE) {
         let image = entry
             .get("image")
             .and_then(|s| s.as_str())
@@ -596,6 +629,33 @@ fn parse_ddg_results(v: &serde_json::Value) -> Vec<WebImageHit> {
         hits.push(WebImageHit::new(image, thumb, title, url, width, height));
     }
     hits
+}
+
+/// Pull the next-page start offset out of a DDG `i.js` response.
+///
+/// DuckDuckGo embeds a `next` field that looks like
+/// `i.js?q=foo&s=100&dl=…&l=us-en&...`. We only care about the `s=`
+/// parameter — that's the offset to feed back as `s` on the next
+/// request. Returns `None` when the response has no `next` field
+/// (end of results), when the field can't be parsed, or when the
+/// extracted offset is identical to the current page (would loop
+/// forever).
+fn parse_ddg_next_offset(v: &serde_json::Value) -> Option<u32> {
+    let next_raw = v.get("next").and_then(|n| n.as_str())?;
+    // `s=` is at most one occurrence in the path/query string. Find
+    // it tolerantly without spinning up the `url` crate just for
+    // this single parse.
+    let s_pos = next_raw.find("s=")?;
+    let after = &next_raw[s_pos + 2..];
+    let end = after
+        .as_bytes()
+        .iter()
+        .position(|c| !c.is_ascii_digit())
+        .unwrap_or(after.len());
+    if end == 0 {
+        return None;
+    }
+    after[..end].parse::<u32>().ok()
 }
 
 /// Download one image to `dest_dir` and report the result back via `tx`.

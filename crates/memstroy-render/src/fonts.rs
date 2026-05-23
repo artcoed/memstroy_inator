@@ -41,6 +41,16 @@ pub fn find_font(family: &str, bold: bool) -> Option<PathBuf> {
         .cloned()
 }
 
+/// Public access to the discovered TTF/OTF file list.
+///
+/// Used by the GUI's `system_fonts` module to enumerate every font on
+/// disk and surface them in the font picker — without re-walking the
+/// filesystem (the cache is populated once on first call and shared
+/// across the workspace).
+pub fn discovered_font_paths() -> &'static [PathBuf] {
+    font_cache()
+}
+
 fn font_cache() -> &'static [PathBuf] {
     static CACHE: OnceLock<Vec<PathBuf>> = OnceLock::new();
     CACHE.get_or_init(scan_font_dirs)
@@ -63,6 +73,17 @@ fn scan_font_dirs() -> Vec<PathBuf> {
     if let Some(home) = dirs_home() {
         roots.push(home.join(".fonts"));
         roots.push(home.join(".local/share/fonts"));
+        roots.push(home.join("Library/Fonts"));
+    }
+    // Windows 11 stores per-user fonts under
+    // `%LOCALAPPDATA%\Microsoft\Windows\Fonts` — that's where the
+    // "Install for me only" path of the Settings → Personalization
+    // → Fonts page drops a TTF, and is exactly the directory the
+    // user complains about ("шрифты не подгружаются системные, на
+    // Win 11 отображается только 2"). The legacy `C:/Windows/Fonts`
+    // root above only catches the `installforAllUsers` path.
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        roots.push(PathBuf::from(local).join("Microsoft").join("Windows").join("Fonts"));
     }
 
     let mut out = Vec::new();
