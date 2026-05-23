@@ -1,16 +1,12 @@
-# Particle library
+# Particle library (legacy)
 
-Particles are sprites with a "bouncy / alive" preset baked in.
-Dropping one onto the canvas spawns an `ImageOverlay` that already
-has these animation modifiers wired up:
+This directory used to back a dedicated **Particles** tab in the
+editor's library panel — sprites dropped here spawned
+`ImageOverlay`s with a "bouncy / alive" preset (Spin / Pulse /
+Wobble) already wired up. The dedicated tab has been retired in
+favour of authoring particles through the regular **Images** tab and
+adding the modifiers manually from the inspector.
 
-- **Spin** at 90°/sec — continuous rotation.
-- **Pulse** at 1.5 Hz, ±0.15 scale — gentle breathing.
-- **Wobble** at 1.0 Hz, ±12 px in X & Y — slight drift.
-
-Edit / mute / remove modifiers from the inspector after dropping
-to taste.
-
-Same drop-in workflow as the **Images** tab: PNG / JPG / WebP /
-GIF files in this directory are picked up by the **Particles** tab
-on the next library refresh.
+The folder is still scanned on launch so existing scene files that
+reference assets from here continue to load. New particle assets
+should be dropped into `assets/images/` instead.

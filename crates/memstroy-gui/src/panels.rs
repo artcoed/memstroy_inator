@@ -176,108 +176,6 @@ fn maybe_auto_refresh(state: &mut EditorState, force: bool) {
     state.status = "__REFRESH_REQUESTED__".into();
 }
 
-/// Render a "Local | Global" split inside the library panel — kept
-/// here as dead code in case future iterations want to bring back a
-/// per-tab user/global division. The current UI flattens the list
-/// because the "Local" half had been an empty placeholder anyway.
-#[allow(dead_code)]
-fn library_split_panel<L, G>(
-    ui: &mut egui::Ui,
-    state: &mut EditorState,
-    id_salt: &str,
-    local_section: L,
-    global_section: G,
-) where
-    L: FnOnce(&mut egui::Ui, &mut EditorState),
-    G: FnOnce(&mut egui::Ui, &mut EditorState),
-{
-    let total_rect = ui.available_rect_before_wrap();
-    let total_h = total_rect.height().max(80.0);
-    // Reserve room for two headers + the drag handle.
-    let header_h = 18.0_f32;
-    let handle_h = 6.0_f32;
-    let inner_h = (total_h - 2.0 * header_h - handle_h).max(40.0);
-    let split = state.library_split.clamp(0.05, 0.95);
-    let local_h = (split * inner_h).max(20.0);
-    let global_h = (inner_h - local_h).max(20.0);
-
-    // ─── Local section header + body ─────────────────────────────────
-    ui.label(
-        RichText::new(t("Local (your imports)"))
-            .size(10.0)
-            .strong()
-            .color(Color32::from_rgb(180, 220, 180)),
-    );
-    ui.allocate_ui_with_layout(
-        Vec2::new(ui.available_width(), local_h),
-        egui::Layout::top_down(egui::Align::LEFT),
-        |ui| {
-            ui.set_min_size(Vec2::new(ui.available_width(), local_h));
-            local_section(ui, state);
-        },
-    );
-
-    // ─── Draggable splitter ──────────────────────────────────────────
-    let handle_id = ui.make_persistent_id(id_salt);
-    let (handle_rect, handle_resp) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), handle_h), Sense::click_and_drag());
-    let hovered = handle_resp.hovered();
-    let dragging = handle_resp.dragged();
-    let _ = handle_id;
-
-    // Render the handle as a thin gradient bar with a centered grip,
-    // brighter when hovered/dragged so the affordance is obvious.
-    let bar_col = if dragging {
-        Color32::from_rgb(180, 140, 255)
-    } else if hovered {
-        Color32::from_rgb(120, 100, 200)
-    } else {
-        Color32::from_rgb(60, 60, 80)
-    };
-    ui.painter().rect_filled(handle_rect, Rounding::same(2.0), bar_col);
-    // Draw a small "≡" grip to make the affordance obvious without
-    // depending on font glyph coverage. Three short horizontal lines.
-    let grip_col = Color32::from_rgba_premultiplied(255, 255, 255, 180);
-    let cx = handle_rect.center().x;
-    let cy = handle_rect.center().y;
-    for dx in [-9.0_f32, 0.0, 9.0] {
-        ui.painter().line_segment(
-            [egui::pos2(cx + dx - 3.0, cy), egui::pos2(cx + dx + 3.0, cy)],
-            Stroke::new(1.0, grip_col),
-        );
-    }
-    if hovered || dragging {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
-    }
-    if dragging {
-        let dy = handle_resp.drag_delta().y;
-        if inner_h > 0.0 {
-            let new_split = split + dy / inner_h;
-            state.library_split = new_split.clamp(0.05, 0.95);
-        }
-    }
-    // Double-click resets to 50/50.
-    if handle_resp.double_clicked() {
-        state.library_split = 0.5;
-    }
-
-    // ─── Global section header + body ────────────────────────────────
-    ui.label(
-        RichText::new(t("Global (built-in / browser)"))
-            .size(10.0)
-            .strong()
-            .color(Color32::from_rgb(180, 200, 255)),
-    );
-    ui.allocate_ui_with_layout(
-        Vec2::new(ui.available_width(), global_h),
-        egui::Layout::top_down(egui::Align::LEFT),
-        |ui| {
-            ui.set_min_size(Vec2::new(ui.available_width(), global_h));
-            global_section(ui, state);
-        },
-    );
-}
-
 /// Render the Mellstroy clip browser content. Refresh is now implicit:
 /// scrolling near the bottom of the list asks the assets-server for
 /// more, and editing the search field re-fires the request. Server URL
@@ -3922,38 +3820,6 @@ fn overlay_id(ov: &Overlay) -> String {
     }
 }
 
-/// Visual chip + drag source for the skeleton attach panel.
-/// Currently unused (the inspector uses a compact ComboBox + Attach
-/// buttons instead of a chip row), kept for the future cross-panel
-/// drag-from-layers implementation.
-#[allow(dead_code)]
-fn element_drag_chip(
-    ui: &mut egui::Ui,
-    salt: impl std::hash::Hash + Copy,
-    label: &str,
-    accent: Color32,
-) -> egui::Response {
-    let id = ui.id().with(salt);
-    let pad = Vec2::new(6.0, 4.0);
-    let text_size = ui.fonts(|f| {
-        f.layout_no_wrap(label.into(), egui::FontId::proportional(10.0), Color32::WHITE)
-    });
-    let chip_size = Vec2::new(text_size.size().x + pad.x * 2.0, 20.0);
-    let (rect, resp) = ui.allocate_exact_size(chip_size, Sense::click_and_drag());
-    let painter = ui.painter_at(rect);
-    let bg = if resp.dragged() {
-        Color32::from_rgb(80, 100, 80)
-    } else {
-        Color32::from_rgb(40, 40, 55)
-    };
-    painter.rect_filled(rect, Rounding::same(3.0), bg);
-    painter.rect_stroke(rect, Rounding::same(3.0), Stroke::new(1.0, accent));
-    painter.text(rect.center(), egui::Align2::CENTER_CENTER, label,
-        egui::FontId::proportional(10.0), COL_TEXT);
-    let _ = id;
-    resp
-}
-
 /// Commit a drag-and-drop / picker-driven attach: write the binding
 /// into the source element's `skeleton_attachment` field (overlays) or
 /// push into the source actor's `skeleton_attachments` list. Only ONE
@@ -5609,45 +5475,6 @@ fn apply_snap_to_window(
         }
     }
 }
-
-/// Collect all clip edges (start/end times) from the scene, excluding a specific actor index.
-///
-/// **Deprecated**: superseded by `collect_snap_targets` (above), which
-/// supports excluding any kind of clip (not just actors) and adds the
-/// playhead and scene boundaries to the snap-target set. Kept around as
-/// a no-op stub so external integrations that still call it (out-of-tree
-/// tools, tests) don't break — but every in-tree caller now goes through
-/// `collect_snap_targets` instead.
-#[allow(dead_code)]
-fn collect_clip_edges(state: &EditorState, exclude_actor: Option<usize>) -> Vec<f32> {
-    let mut edges = Vec::new();
-    let duration = state.scene.output.duration;
-
-    for (i, a) in state.scene.actors.iter().enumerate() {
-        if exclude_actor == Some(i) { continue; }
-        edges.push(a.t_in.unwrap_or(0.0));
-        edges.push(a.t_out.unwrap_or(duration));
-    }
-    for bg in &state.scene.backgrounds {
-        edges.push(bg.start);
-        edges.push(bg.start + bg.duration);
-    }
-    for ov in &state.scene.overlays {
-        let (s, e) = match ov {
-            Overlay::Text(t) => (t.t_in, t.t_out),
-            Overlay::Image(im) => (im.t_in, im.t_out),
-            Overlay::Video(v) => (v.t_in, v.t_out),
-        };
-        edges.push(s);
-        edges.push(e);
-    }
-    for au in &state.scene.audio {
-        edges.push(au.t_in);
-        edges.push(au.t_out.unwrap_or(duration));
-    }
-    edges
-}
-
 
 // ─── OVERLAP TRIMMING ON LAYER ───────────────────────────────────────
 //
@@ -10890,40 +10717,6 @@ fn selected_layer_mask_above_height(
 /// every param of the layer, so the times are shared — the per-param
 /// row only differs in label / colour.
 ///
-/// Currently unused: the inline kf strips inside the inspector took
-/// over this responsibility. Kept around so the timeline-track-row
-/// keyframe markers can be re-introduced without rediscovering the
-/// per-layer time list math.
-#[allow(dead_code)]
-fn keyframe_times_for_layer(state: &EditorState, sel: Selection) -> Vec<f32> {
-    match sel {
-        Selection::Actor(ai) => state
-            .scene
-            .actors
-            .get(ai)
-            .map(|a| a.layout.iter().map(|kf| kf.t).collect())
-            .unwrap_or_default(),
-        Selection::Overlay(oi) => state
-            .scene
-            .overlays
-            .get(oi)
-            .map(|ov| match ov {
-                Overlay::Text(t) => t.layout.iter().map(|kf| kf.t).collect(),
-                Overlay::Image(im) => im.layout.iter().map(|kf| kf.t).collect(),
-                Overlay::Video(v) => v.layout.iter().map(|kf| kf.t).collect(),
-            })
-            .unwrap_or_default(),
-        Selection::RenderFrame => state
-            .scene
-            .render_frame
-            .layout
-            .iter()
-            .map(|kf| kf.t)
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
 /// For each animatable transform parameter on the selected layer,
 /// return the list of `(local_t, scene_t)` keyframe pairs at which
 /// **that specific parameter actually changes value** relative to the

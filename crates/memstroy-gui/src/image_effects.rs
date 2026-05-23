@@ -330,20 +330,22 @@ pub(crate) fn sample_mask_alpha(
 
 // ─── COLOUR-KEY MASK (eyedropper) ─────────────────────────────────────
 //
-// Mirrors `memstroy_vision::HsvChromaKey` in pure CPU code so the live
-// preview matches what the export pipeline produces. We keep the same
-// HSV similarity / blend semantics so a single picked colour produces
-// the same alpha map regardless of which renderer the user is looking
-// at. Spill suppression is NOT applied here — the preview's purpose
-// is to show the user where the key cuts; the export-side
-// `chromakey` filter already handles spill suppression downstream.
+// Pure-CPU implementation of HSV-based chroma keying for the live
+// preview. Keeps the same similarity / blend semantics as the
+// FFmpeg `chromakey` filter the export side uses, so a single picked
+// colour produces visually consistent alpha cuts in both the editor
+// preview and the rendered MP4. Spill suppression is NOT applied
+// here — the preview's job is to show the user where the key
+// cuts; the export-side `chromakey` filter handles spill suppression
+// downstream.
 
 /// Apply a colour-key mask to an RGBA8 image in place. Pixels close
 /// to `key_color` (in HSV space) get their alpha multiplied by 0;
 /// pixels far from it keep their alpha. `similarity` and `blend`
-/// follow the same semantics as `HsvChromaKey`. `invert` flips the
-/// keep / remove polarity. `intensity` blends between "no keying"
-/// and "full keying" so the master envelope can fade the effect in.
+/// follow the same semantics as the FFmpeg `chromakey` filter.
+/// `invert` flips the keep / remove polarity. `intensity` blends
+/// between "no keying" and "full keying" so the master envelope can
+/// fade the effect in.
 pub(crate) fn apply_color_key_alpha(
     rgba: &mut Vec<u8>,
     w: u32,
@@ -371,7 +373,7 @@ pub(crate) fn apply_color_key_alpha(
         let dh = hue_distance_deg_local(hsv.0, key_hsv.0);
         let ds = (hsv.1 - key_hsv.1).abs();
         let dv = (hsv.2 - key_hsv.2).abs();
-        // Match HsvChromaKey alpha: 0 inside core, 1 outside,
+        // Match FFmpeg `chromakey` alpha: 0 inside core, 1 outside,
         // soft edge between core and core+blend.
         let mut alpha_keep = 1.0_f32;
         if dh < hue_tol_deg && ds < sv_tol && dv < sv_tol {

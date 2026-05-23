@@ -194,11 +194,6 @@ impl SkeletonTemplate {
         crate::keyframe::sample(&point.track, t)
     }
 
-    /// Get all point names.
-    pub fn point_names(&self) -> Vec<&str> {
-        self.points.keys().map(|s| s.as_str()).collect()
-    }
-
     /// Set a keyframe for a point at time `t`. Inserts or updates.
     pub fn set_point_keyframe(&mut self, point_name: &str, t: f32, state: PointState, easing: Easing) {
         let point = self.points.get_mut(point_name);
@@ -214,85 +209,4 @@ impl SkeletonTemplate {
             point.track.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap());
         }
     }
-
-    /// Remove the keyframe nearest to time `t` for a point.
-    pub fn remove_point_keyframe(&mut self, point_name: &str, t: f32) -> bool {
-        let point = self.points.get_mut(point_name);
-        let Some(point) = point else { return false; };
-
-        let threshold = 0.05;
-        if let Some(idx) = point.track.iter().position(|kf| (kf.t - t).abs() < threshold) {
-            point.track.remove(idx);
-            true
-        } else {
-            false
-        }
-    }
-}
-
-
-
-// ─── ATTACHMENT RESOLVER ─────────────────────────────────────────────
-
-/// Result of resolving a skeleton attachment at a specific time.
-#[derive(Debug, Clone, Copy)]
-pub struct ResolvedAttachment {
-    /// Position in normalised clip coordinates [0,1] (with offset applied).
-    pub x: f32,
-    pub y: f32,
-    /// Combined scale (point scale * attachment scale).
-    pub scale: f32,
-    /// Rotation in degrees (if follow_rotation is true).
-    pub rotation_deg: f32,
-}
-
-/// Resolve a `SkeletonAttachment` against available templates at time `t`.
-///
-/// Searches `templates` for one matching `attachment.skeleton_id` (by name
-/// or source_clip filename), then samples the named point at time `t` and
-/// applies the attachment's offset and scale.
-///
-/// Returns `None` if the skeleton or point is not found.
-pub fn resolve_skeleton_attachment(
-    attachment: &SkeletonAttachment,
-    templates: &[SkeletonTemplate],
-    t: f32,
-) -> Option<ResolvedAttachment> {
-    // Find the matching template
-    let template = templates.iter().find(|tmpl| {
-        tmpl.name == attachment.skeleton_id
-            || tmpl.source_clip.file_stem()
-                .and_then(|s| s.to_str())
-                .map(|s| s == attachment.skeleton_id)
-                .unwrap_or(false)
-    })?;
-
-    // Sample the point
-    let point_state = template.sample_point(&attachment.point_name, t)?;
-
-    // Apply offset and scale
-    let x = point_state.x + attachment.offset[0];
-    let y = point_state.y + attachment.offset[1];
-    let scale = point_state.scale * attachment.scale;
-    let rotation_deg = if attachment.follow_rotation {
-        point_state.rotation_deg
-    } else {
-        0.0
-    };
-
-    Some(ResolvedAttachment { x, y, scale, rotation_deg })
-}
-
-/// Convenience: resolve all skeleton attachments for an actor at time `t`.
-/// Returns a vec of (attachment_index, resolved_position) pairs.
-pub fn resolve_actor_skeleton_attachments(
-    actor_skeleton_attachments: &[SkeletonAttachment],
-    templates: &[SkeletonTemplate],
-    t: f32,
-) -> Vec<(usize, ResolvedAttachment)> {
-    actor_skeleton_attachments.iter().enumerate()
-        .filter_map(|(i, att)| {
-            resolve_skeleton_attachment(att, templates, t).map(|r| (i, r))
-        })
-        .collect()
 }

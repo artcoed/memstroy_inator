@@ -573,8 +573,11 @@ pub fn downscale_for_preview(img: &ColorImage, max_dim: usize) -> ColorImage {
 }
 
 /// CPU implementation of the chroma-key + colour-correction pipeline.
-/// Mirrors what the live `apply_preview_effects` did but lives on the cache so
-/// the result can be reused across repaints.
+/// The cache layer keeps the baked result around across repaints so
+/// the per-pixel loop is not re-run for every frame the playhead
+/// lingers on. Output matches FFmpeg's `chromakey` + colour-correction
+/// chain to within preview-resolution tolerance, so the live preview
+/// stays faithful to the export.
 ///
 /// Pipeline order (per pixel):
 ///   1. chromakey + spill suppression

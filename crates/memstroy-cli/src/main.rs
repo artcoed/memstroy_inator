@@ -1,4 +1,4 @@
-//! CLI entry point for memstroy_generator.
+//! CLI entry point for memstroy-inator.
 //!
 //! All operations the GUI does are also exposed here for headless and
 //! scripted use:
@@ -267,7 +267,7 @@ fn starter_scene() -> Scene {
         animated_params: Default::default(),
     });
     Scene {
-        format_version: 1,
+        format_version: 2,
         output: OutputSpec::default(),
         backgrounds: vec![bg],
         camera: Vec::new(),

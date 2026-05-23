@@ -1,4 +1,4 @@
-//! Domain model for memstroy_generator scenes.
+//! Domain model for memstroy-inator scenes.
 //!
 //! A `Scene` describes a meme video: output size, duration, layered
 //! background tracks, mellstroy "actors" (chroma-keyed clips) with
@@ -7,26 +7,24 @@
 //! All animatable values are expressed via `Keyframe<T>` lists with an
 //! easing curve between consecutive keyframes.
 //!
-//! The format is round-trippable as YAML (preferred) or JSON.
+//! The format is round-trippable as YAML (preferred), JSON, or as the
+//! editor-native `.memstroy` bundle (a JSON document that wraps the
+//! scene under a `"scene"` key alongside per-tab editor metadata).
 
 pub mod scene;
 pub mod easing;
 pub mod keyframe;
 pub mod anchor;
-pub mod ai_pipeline;
 pub mod canvas;
 pub mod skeleton;
-pub mod scripting;
 pub mod effects;
 
 pub use scene::*;
 pub use easing::*;
 pub use keyframe::*;
 pub use anchor::*;
-pub use ai_pipeline::*;
 pub use canvas::*;
 pub use skeleton::*;
-pub use scripting::*;
 pub use effects::*;
 
 use std::path::Path;

@@ -216,14 +216,6 @@ impl EditorViewport {
         }
     }
 
-    /// Size of the visible world area in world pixels.
-    pub fn visible_world_size(&self, viewport_size: [f32; 2]) -> [f32; 2] {
-        [
-            viewport_size[0] / self.zoom,
-            viewport_size[1] / self.zoom,
-        ]
-    }
-
     /// Pan the viewport by a screen-pixel delta.
     pub fn pan(&mut self, screen_delta: [f32; 2]) {
         self.center.x -= screen_delta[0] / self.zoom;
@@ -248,23 +240,4 @@ impl EditorViewport {
         // Use the smaller factor so the whole frame fits, with 10% padding
         self.zoom = aspect_x.min(aspect_y) * 0.85;
     }
-}
-
-// ─── COORDINATE CONVERSION HELPERS ───────────────────────────────────
-
-/// Convert legacy normalised coordinates [0,1] to world pixels given
-/// a reference rect (position + size). Useful for migration.
-pub fn normalized_to_world(norm: [f32; 2], rect_center: WorldPos, rect_size: [f32; 2]) -> WorldPos {
-    WorldPos {
-        x: rect_center.x + (norm[0] - 0.5) * rect_size[0],
-        y: rect_center.y + (norm[1] - 0.5) * rect_size[1],
-    }
-}
-
-/// Convert world pixels back to normalised coordinates relative to a rect.
-pub fn world_to_normalized(world: WorldPos, rect_center: WorldPos, rect_size: [f32; 2]) -> [f32; 2] {
-    [
-        0.5 + (world.x - rect_center.x) / rect_size[0],
-        0.5 + (world.y - rect_center.y) / rect_size[1],
-    ]
 }

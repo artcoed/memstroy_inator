@@ -2426,15 +2426,6 @@ fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
     ((a as f32) * (1.0 - t) + (b as f32) * t).clamp(0.0, 255.0) as u8
 }
 
-/// Helper: truncate a string to max_chars.
-#[allow(dead_code)]
-fn truncate_str(s: &str, max_chars: usize) -> &str {
-    if s.len() <= max_chars { return s; }
-    let mut end = max_chars;
-    while end > 0 && !s.is_char_boundary(end) { end -= 1; }
-    &s[..end]
-}
-
 #[derive(Clone, Copy, PartialEq)]
 enum DisplayMode {
     Active,
@@ -3929,54 +3920,6 @@ fn write_selection_rotation(
     }
 }
 
-/// Insert a keyframe within ε of `t` on an actor track, seeding it with
-/// the eased current value so animation continues smoothly from the
-/// visual state.
-#[allow(dead_code)]
-fn ensure_actor_kf_at_playhead(layout: &mut Vec<Keyframe<ActorState>>, t: f32) {
-    if layout.is_empty() {
-        layout.push(Keyframe::new(t, ActorState::default()));
-        return;
-    }
-    let eps = 1.0e-3;
-    if layout.iter().any(|kf| (kf.t - t).abs() < eps) {
-        return;
-    }
-    let sampled = keyframe::sample(layout, t).unwrap_or_default();
-    layout.push(Keyframe::new(t, sampled));
-    layout.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
-}
-
-#[allow(dead_code)]
-fn ensure_overlay_kf_at_playhead(layout: &mut Vec<Keyframe<OverlayState>>, t: f32) {
-    if layout.is_empty() {
-        layout.push(Keyframe::new(t, OverlayState::default()));
-        return;
-    }
-    let eps = 1.0e-3;
-    if layout.iter().any(|kf| (kf.t - t).abs() < eps) {
-        return;
-    }
-    let sampled = keyframe::sample(layout, t).unwrap_or_default();
-    layout.push(Keyframe::new(t, sampled));
-    layout.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
-}
-
-#[allow(dead_code)]
-fn ensure_canvas_kf_at_playhead(layout: &mut Vec<Keyframe<CanvasTransform>>, t: f32) {
-    if layout.is_empty() {
-        layout.push(Keyframe::new(t, CanvasTransform::default()));
-        return;
-    }
-    let eps = 1.0e-3;
-    if layout.iter().any(|kf| (kf.t - t).abs() < eps) {
-        return;
-    }
-    let sampled = keyframe::sample(layout, t).unwrap_or_default();
-    layout.push(Keyframe::new(t, sampled));
-    layout.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
-}
-
 /// Insert a keyframe at `t` on the render-frame layout, seeded with the
 /// eased current value. Used so that moving / resizing / rotating the
 /// render frame on the canvas at any playhead authors animation
@@ -3995,41 +3938,8 @@ fn ensure_render_frame_kf_at_playhead(layout: &mut Vec<Keyframe<RenderFrameState
     layout.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
 }
 
-#[allow(dead_code)]
-fn apply_to_anim_kf<F: FnOnce(&mut ActorState)>(
-    layout: &mut Vec<Keyframe<ActorState>>,
-    t: f32,
-    f: F,
-) {
-    let eps = 1.0e-3;
-    if let Some(kf) = layout.iter_mut().find(|kf| (kf.t - t).abs() < eps) {
-        f(&mut kf.value);
-        return;
-    }
-    if let Some(kf) = layout.first_mut() {
-        f(&mut kf.value);
-    }
-}
-
-#[allow(dead_code)]
-fn apply_to_overlay_kf<F: FnOnce(&mut OverlayState)>(
-    layout: &mut Vec<Keyframe<OverlayState>>,
-    t: f32,
-    f: F,
-) {
-    let eps = 1.0e-3;
-    if let Some(kf) = layout.iter_mut().find(|kf| (kf.t - t).abs() < eps) {
-        f(&mut kf.value);
-        return;
-    }
-    if let Some(kf) = layout.first_mut() {
-        f(&mut kf.value);
-    }
-}
-
 /// Apply a closure to the render-frame keyframe at `t`. Falls back to the
-/// first keyframe when no exact match exists (mirrors the behaviour of
-/// `apply_to_anim_kf`).
+/// first keyframe when no exact match exists.
 fn apply_to_render_frame_kf<F: FnOnce(&mut RenderFrameState)>(
     layout: &mut Vec<Keyframe<RenderFrameState>>,
     t: f32,
@@ -5199,79 +5109,6 @@ fn is_point_on_selection(state: &EditorState, pos: WorldPos) -> bool {
         }
         _ => false,
     }
-}
-
-
-// ─── PREVIEW EFFECTS (CHROMAKEY + COLOR CORRECTION) ──────────────────
-
-/// Apply chromakey and color correction to a raw frame for preview display.
-/// This is a simplified CPU-based version for real-time preview.
-#[allow(dead_code)]
-fn apply_preview_effects(
-    img: &egui::ColorImage,
-    ck: &memstroy_core::ChromaKeyParams,
-    cc: &memstroy_core::ColorCorrection,
-) -> egui::ColorImage {
-    let mut out = egui::ColorImage::new(img.size, Color32::TRANSPARENT);
-    let key_r = ck.key_color[0] as f32;
-    let key_g = ck.key_color[1] as f32;
-    let key_b = ck.key_color[2] as f32;
-    let similarity = ck.similarity.clamp(0.0, 1.0);
-    let blend = ck.blend.clamp(0.0, 1.0);
-    let spill = ck.spill.clamp(0.0, 1.0);
-    // Color distance threshold
-    let threshold = similarity * 441.0; // max RGB distance = sqrt(3*255^2) ≈ 441
-    let blend_range = blend * 200.0;
-
-    for (i, pixel) in img.pixels.iter().enumerate() {
-        let r = pixel.r() as f32;
-        let g = pixel.g() as f32;
-        let b = pixel.b() as f32;
-
-        // Chromakey: compute color distance to key
-        let dist = ((r - key_r).powi(2) + (g - key_g).powi(2) + (b - key_b).powi(2)).sqrt();
-        let alpha = if dist < threshold {
-            0.0
-        } else if dist < threshold + blend_range {
-            (dist - threshold) / blend_range.max(0.01)
-        } else {
-            1.0
-        };
-
-        // Spill suppression
-        let (mut out_r, mut out_g, mut out_b) = (r, g, b);
-        if alpha > 0.0 && spill > 0.0 && g > ((r + b) * 0.5) as f32 {
-            let avg_rb = (r + b) * 0.5;
-            out_g = g - (g - avg_rb) * spill;
-        }
-
-        // Color correction
-        // Brightness
-        out_r = (out_r + cc.brightness * 255.0).clamp(0.0, 255.0);
-        out_g = (out_g + cc.brightness * 255.0).clamp(0.0, 255.0);
-        out_b = (out_b + cc.brightness * 255.0).clamp(0.0, 255.0);
-        // Contrast
-        out_r = ((out_r - 128.0) * cc.contrast + 128.0).clamp(0.0, 255.0);
-        out_g = ((out_g - 128.0) * cc.contrast + 128.0).clamp(0.0, 255.0);
-        out_b = ((out_b - 128.0) * cc.contrast + 128.0).clamp(0.0, 255.0);
-        // Saturation
-        let gray = 0.299 * out_r + 0.587 * out_g + 0.114 * out_b;
-        out_r = (gray + (out_r - gray) * cc.saturation).clamp(0.0, 255.0);
-        out_g = (gray + (out_g - gray) * cc.saturation).clamp(0.0, 255.0);
-        out_b = (gray + (out_b - gray) * cc.saturation).clamp(0.0, 255.0);
-        // Temperature (warm/cool shift)
-        if cc.temperature > 0.0 {
-            out_r = (out_r + cc.temperature * 30.0).clamp(0.0, 255.0);
-            out_b = (out_b - cc.temperature * 30.0).clamp(0.0, 255.0);
-        } else if cc.temperature < 0.0 {
-            out_r = (out_r + cc.temperature * 30.0).clamp(0.0, 255.0);
-            out_b = (out_b - cc.temperature * 30.0).clamp(0.0, 255.0);
-        }
-
-        let a = (alpha * 255.0) as u8;
-        out.pixels[i] = Color32::from_rgba_unmultiplied(out_r as u8, out_g as u8, out_b as u8, a);
-    }
-    out
 }
 
 

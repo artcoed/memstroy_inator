@@ -5,16 +5,20 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "Chroma-keying and pose estimation primitives"
+description = "Background-removal (U²-Netp) and pose-anchor I/O for memstroy-inator"
 
 [dependencies]
+# Background removal pipeline (`bgremove.rs`) plus pose-anchor sidecar
+# loading (`pose.rs`). The crate no longer ships an in-process pose
+# estimator or a CPU chroma-keyer, so the dependency surface is the
+# minimum required to decode an image, run a U²-Netp ONNX session
+# in a `spawn_blocking` thread, and parse the anchor JSON the
+# renderer reads.
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 image = { workspace = true }
 memstroy-core = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
-tokio = { workspace = true, features = ["io-util"] }
-ndarray = { workspace = true }
+tokio = { workspace = true }
 ort = { workspace = true }

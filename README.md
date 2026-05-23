@@ -255,10 +255,10 @@ cargo run -p memstroy-gui --release
 The editor opens with five regions:
 
 - **Top menu** — File / Render / View.
-- **Library (left)** — `Clips`, `Videos`, `Sounds`, `Images`,
-  `Particles`. The Clips tab is server-driven; the others scan the
-  matching `assets/<kind>/` directory directly. Drag a row onto the
-  canvas or the timeline to add it to the scene.
+- **Library (left)** — `Clips`, `Videos`, `Sounds`, `Images`. The
+  Clips tab is server-driven; the others scan the matching
+  `assets/<kind>/` directory directly. Drag a row onto the canvas
+  or the timeline to add it to the scene.
 - **Preview (centre)** — a 9:16 canvas at the output ratio with
   live transform handles, chroma-key picker and effect stack.
 - **Inspector (right)** — properties for the selected actor, overlay,
@@ -274,9 +274,10 @@ Use `Settings → Language` to switch between English and Русский.
 
 ## Scene format (excerpt)
 
-A scene is a YAML or JSON file with `format_version: 1`. See
-`examples/scene.yaml` for a full sample. All animatable values follow
-the same shape:
+A scene is a YAML / JSON / `.memstroy` file with
+`format_version: 2` (newly created scenes; v1 files are upgraded in
+place on load via `Scene::upgrade_legacy`). See `examples/scene.yaml`
+for a full sample. All animatable values follow the same shape:
 
 ```yaml
 layout:

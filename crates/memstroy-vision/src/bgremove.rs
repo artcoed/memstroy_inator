@@ -51,8 +51,8 @@ const STD: [f32; 3] = [0.229, 0.224, 0.225];
 // ─── TRAIT ───────────────────────────────────────────────────────────
 
 /// Async-friendly background-removal abstraction. Lets callers swap a
-/// no-op stub during tests for a real ONNX implementation in
-/// production, paralleling [`crate::pose::PoseEstimator`].
+/// no-op stub during tests for the real ONNX implementation in
+/// production.
 #[async_trait]
 pub trait BackgroundRemover: Send + Sync {
     /// Decode `input`, predict the foreground mask, and return an RGBA
@@ -178,7 +178,7 @@ fn run_u2netp(
 ) -> Result<RgbaImage> {
     use ort::session::builder::GraphOptimizationLevel;
 
-    // Same session-builder dance as `pose.rs` — `with_optimization_level`
+    // Build a fresh ORT session for this image. `with_optimization_level`
     // returns a `Result` whose error type carries the partially-built
     // builder via `.recover()` so we can never lose it.
     let builder = ort::session::Session::builder()
@@ -278,10 +278,10 @@ fn run_u2netp(
 
 // ─── RESIZE HELPERS ─────────────────────────────────────────────────
 
-/// Bilinear RGB resize. Avoids pulling a heavier dep just for one call
-/// and matches the style of `resize_rgb` in `pose.rs` (but with proper
-/// bilinear instead of nearest-neighbour, since matting quality
-/// suffers a lot from blocky upscales).
+/// Bilinear RGB resize. Inlined here to keep the dependency surface
+/// small (no need to drag in `image::imageops::resize`) and to keep
+/// matting quality high — nearest-neighbour upscales of saliency maps
+/// produce visibly blocky cutouts.
 fn resize_rgb_bilinear(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<u8> {
     let mut dst = vec![0u8; dw * dh * 3];
     if sw == 0 || sh == 0 || dw == 0 || dh == 0 {

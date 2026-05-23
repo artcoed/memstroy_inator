@@ -562,10 +562,10 @@ pub(crate) fn color_correction_filters(
     }
     if cc.temperature.abs() > 1e-4 {
         // Temperature warm = +red / −blue, magnitude scaled to keep
-        // the slider's [-1, 1] feel consistent with the preview's
-        // 30-pixel R/B shift (see `apply_preview_effects` in
-        // `canvas_preview.rs`). 0.5× felt right in side-by-side
-        // matching against the preview thumbnail.
+        // the slider's [-1, 1] feel consistent with the live preview's
+        // R/B shift (the equivalent CPU pipeline now lives on
+        // `video_cache::apply_effects_cached`). 0.5× felt right in
+        // side-by-side matching against the preview thumbnail.
         let t = cc.temperature.clamp(-1.0, 1.0) * 0.5;
         out.push(format!(
             "colorbalance=rs={:.4}:bs={:.4}",

@@ -10,7 +10,9 @@ description = "Compose memstroy scenes into MP4s via FFmpeg"
 [dependencies]
 anyhow = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
+# `io-util` (`AsyncReadExt`) is needed by `runner.rs` to stream
+# ffmpeg's stderr line-by-line for the GUI's progress callback.
+tokio = { workspace = true, features = ["io-util"] }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
