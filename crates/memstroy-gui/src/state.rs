@@ -45,6 +45,22 @@ impl Track {
     }
 }
 
+/// Active rectangle (rubber-band) selection on the timeline. Both
+/// corners live in screen-pixel coordinates because the timeline
+/// already operates in screen space (the world-pixel anchor used by
+/// the canvas marquee doesn't apply here).
+#[derive(Clone, Copy, Debug)]
+pub struct TimelineMarquee {
+    pub start: egui::Pos2,
+    pub end: egui::Pos2,
+}
+
+impl TimelineMarquee {
+    pub fn rect(&self) -> egui::Rect {
+        egui::Rect::from_two_pos(self.start, self.end)
+    }
+}
+
 /// Drag state for clips already on the timeline. Tracks only whether a
 /// timeline clip is currently being dragged, so we can take a single undo
 /// snapshot at the start of the gesture.
@@ -64,6 +80,24 @@ pub struct TimelineDrag {
     /// where a horizontal drag accidentally pops the clip onto another
     /// lane mid-motion.
     pub start_pointer_y: Option<f32>,
+    /// Movers that need an overlap-trim pass when the drag ends. We
+    /// queue them up during the gesture instead of trimming on every
+    /// frame (which made neighbouring clips disappear the instant the
+    /// dragged clip even momentarily overlapped them). On pointer-up
+    /// the queue is drained and `enforce_no_overlap_on_layer` runs
+    /// once per unique mover.
+    pub pending_overlap: Vec<PendingOverlapMover>,
+}
+
+/// Lightweight mirror of `panels::MovedClipKind` used to persist
+/// "deferred overlap-trim" requests on the EditorState across frames
+/// without exposing that internal type from the panels module.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PendingOverlapMover {
+    Actor(usize),
+    Overlay(usize),
+    Audio(usize),
+    Background(usize),
 }
 
 /// What the layer panel wants to do when the current drag finally ends.
@@ -398,6 +432,13 @@ pub struct EditorState {
     /// once. World-pixel coords for both corners.
     pub canvas_marquee: Option<CanvasMarquee>,
 
+    /// Active marquee on the timeline panel. `Some` while the user is
+    /// dragging an empty area between clips to lasso a group of clips.
+    /// Coordinates are in screen pixels — the timeline panel handler
+    /// commits the selection on drag-end against every clip whose
+    /// screen-rect intersects the marquee.
+    pub timeline_marquee: Option<TimelineMarquee>,
+
     /// State for the "Shared" library tab — talks to a separate
     /// `memstroy-assets-server` instance over HTTP and lazily streams
     /// previews / files into the editor.
@@ -453,6 +494,14 @@ pub struct EditorState {
     pub image_textures: std::sync::Mutex<
         std::collections::HashMap<PathBuf, ImageTextureSlot>,
     >,
+    /// Cache of effects-baked image textures keyed by
+    /// `(source_path, effects_signature)`. Refreshed when the user
+    /// edits the effect stack and reused frame-to-frame for stable
+    /// playback. Effects are baked on the CPU via
+    /// `crate::image_effects::apply_effect_stack`.
+    pub image_fx_textures: std::sync::Mutex<
+        std::collections::HashMap<(PathBuf, u64), ImageFxSlot>,
+    >,
 }
 
 /// Cached state for one image-overlay source. `Loading` is held only
@@ -468,6 +517,17 @@ pub enum ImageTextureSlot {
     /// Decode failed (missing file, unsupported format, etc.). Cached
     /// so we don't keep retrying on every frame.
     Failed,
+}
+
+/// Cached effects-processed texture for an image overlay. Stored
+/// alongside the Crop UV inset so the renderer can shrink the picture's
+/// visible rectangle to match a Crop entry on the effect stack.
+#[derive(Clone)]
+pub struct ImageFxSlot {
+    pub texture: egui::TextureHandle,
+    pub size: [u32; 2],
+    /// (left, top, right, bottom) crop inset in normalised 0..1.
+    pub crop: [f32; 4],
 }
 
 /// A single scene tab with its own file path and name.
@@ -832,6 +892,78 @@ impl EditorState {
         bump(&mut self.audio_track_assignments);
         bump(&mut self.overlay_track_assignments);
         0
+    }
+
+    /// Find a video lane that has no actor / overlay clip currently
+    /// occupying time `t`. Returns the first such lane (smallest index)
+    /// or `None` when every lane is currently busy. Used by canvas-drop
+    /// handlers so a freshly dropped clip lands on its own row instead
+    /// of stacking on top of whatever is already on V1.
+    pub fn find_empty_video_lane_at(&self, t: f32) -> Option<usize> {
+        let scene_dur = self.scene.output.duration.max(0.0);
+        for &lane in self.video_track_indices().iter() {
+            let mut busy = false;
+            // Actors assigned to this lane.
+            for (ai, _) in self.scene.actors.iter().enumerate() {
+                let assigned = self
+                    .actor_track_assignments
+                    .get(&ai)
+                    .copied()
+                    .unwrap_or_else(|| {
+                        self.video_track_indices()
+                            .first()
+                            .copied()
+                            .unwrap_or(0)
+                    });
+                if assigned != lane { continue; }
+                let a = &self.scene.actors[ai];
+                let t_in = a.t_in.unwrap_or(0.0);
+                let t_out = a.t_out.unwrap_or(scene_dur);
+                if t >= t_in && t <= t_out {
+                    busy = true;
+                    break;
+                }
+            }
+            if busy { continue; }
+            // Overlays assigned to this lane.
+            let default_overlay_lane = {
+                let v = self.video_track_indices();
+                if v.len() >= 2 { v[1] } else { v.first().copied().unwrap_or(0) }
+            };
+            for (oi, ov) in self.scene.overlays.iter().enumerate() {
+                let assigned = self
+                    .overlay_track_assignments
+                    .get(&oi)
+                    .copied()
+                    .unwrap_or(default_overlay_lane);
+                if assigned != lane { continue; }
+                let (t_in, t_out) = match ov {
+                    memstroy_core::Overlay::Text(o) => (o.t_in, o.t_out),
+                    memstroy_core::Overlay::Image(o) => (o.t_in, o.t_out),
+                    memstroy_core::Overlay::Video(o) => (o.t_in, o.t_out),
+                };
+                if t >= t_in && t <= t_out {
+                    busy = true;
+                    break;
+                }
+            }
+            if !busy {
+                return Some(lane);
+            }
+        }
+        None
+    }
+
+    /// Pick the lane a fresh canvas-dropped clip should land on:
+    /// the first empty video lane at time `t`, falling back to a
+    /// freshly-inserted lane at the top of the video stack when every
+    /// existing lane is busy.
+    pub fn pick_or_create_empty_video_lane_at(&mut self, t: f32) -> usize {
+        if let Some(lane) = self.find_empty_video_lane_at(t) {
+            lane
+        } else {
+            self.insert_video_track_at_top()
+        }
     }
 
     /// Insert a new audio track immediately after the last video track
