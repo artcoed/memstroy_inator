@@ -5097,6 +5097,14 @@ fn ensure_image_fx_loaded(
 }
 
 /// Try to select an element at the given world position.
+///
+/// Hit-test priority follows the **timeline / layer panel order**: the
+/// row that sits highest on the panel (smallest track index = drawn
+/// on top) is checked first, so the layer the user visually sees on
+/// top is the one a click selects. Actors and overlays are merged
+/// into a single ordering so a click on an actor that visually covers
+/// an overlay no longer "falls through" to the hidden overlay
+/// underneath.
 fn try_select_at(state: &mut EditorState, pos: WorldPos) {
     let t = state.playhead;
 
@@ -5109,65 +5117,97 @@ fn try_select_at(state: &mut EditorState, pos: WorldPos) {
     let frame_tl_x = rf_state.pos.x - world_w * 0.5;
     let frame_tl_y = rf_state.pos.y - world_h * 0.5;
 
-    // Build hit-test order from track positions: topmost row first. Any
-    // overlay on a row below the actor rows is biased down so a stacked
-    // click first lands on the on-top element.
-    let mut order: Vec<(usize, i32)> = state.scene.overlays.iter().enumerate()
-        .map(|(i, _)| {
-            let bias = if overlay_is_behind_actors(state, i) {
-                1_000_000
-            } else {
-                0
-            };
-            (i, overlay_track_index(state, i) as i32 + bias)
-        })
-        .collect();
-    order.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
-
-    for (idx, _) in order {
-        let overlay = &state.scene.overlays[idx];
-        let (t_in, t_out, layout) = match overlay {
-            Overlay::Text(txt) => (txt.t_in, txt.t_out, &txt.layout),
-            Overlay::Image(img) => (img.t_in, img.t_out, &img.layout),
-            Overlay::Video(vid) => (vid.t_in, vid.t_out, &vid.layout),
-        };
-        let sample_t = if t >= t_in && t <= t_out { t - t_in }
-            else if t < t_in { 0.0 } else { t_out - t_in };
-        let ov_state = keyframe::sample(layout, sample_t).unwrap_or_default();
-
-        let ov_world = WorldPos {
-            x: frame_tl_x + ov_state.pos[0] * world_w,
-            y: frame_tl_y + ov_state.pos[1] * world_h,
-        };
-        let (ew, eh) = overlay_bbox_with_state(overlay, &ov_state, state);
-        if pos.x >= ov_world.x - ew * 0.5 && pos.x <= ov_world.x + ew * 0.5
-            && pos.y >= ov_world.y - eh * 0.5 && pos.y <= ov_world.y + eh * 0.5
-        {
-            state.selection = Selection::Overlay(idx);
-            return;
-        }
+    // ── Build a unified hit-test order across actors + overlays ──
+    //
+    // Z-rank mirrors the canvas render z-order so that whatever the
+    // user sees on top is what gets selected first:
+    //
+    //   pass 1: overlays classified as "behind actors"
+    //           (any actor sits on a higher row than the overlay)
+    //   pass 2: actors
+    //   pass 3: overlays "on top" of actors
+    //
+    // Within each pass the layer-panel order wins: the row that sits
+    // higher on the panel (smaller `track_index`) gets a higher z and
+    // therefore a higher selection priority. Within the same track,
+    // the later-added element (larger scene index) wins, matching the
+    // draw-in-scene-order tie-breaker used by `draw_canvas_overlays`
+    // and `draw_canvas_elements`.
+    enum HitCand {
+        Actor(usize),
+        Overlay(usize),
     }
-
-    // Check actors (reverse order = top layer first)
-    for (idx, actor) in state.scene.actors.iter().enumerate().rev() {
+    // Multiplier large enough to dominate any plausible track / scene
+    // index combination so passes never bleed into each other.
+    const PASS_STRIDE: i64 = 10_000_000_000;
+    const TRACK_STRIDE: i64 = 100_000;
+    let mut cands: Vec<(i64, HitCand)> = Vec::new();
+    for (idx, _) in state.scene.overlays.iter().enumerate() {
+        let track = overlay_track_index(state, idx) as i64;
+        let pass: i64 = if overlay_is_behind_actors(state, idx) { 1 } else { 3 };
+        // Smaller track => higher panel row => higher z (on top).
+        // Larger scene idx => drawn later within track => higher z.
+        let within = -track * TRACK_STRIDE + idx as i64;
+        cands.push((pass * PASS_STRIDE + within, HitCand::Overlay(idx)));
+    }
+    for (idx, actor) in state.scene.actors.iter().enumerate() {
         if !actor.visible { continue; }
-        let world_pos = get_element_world_pos(state, &actor.id, &actor.layout, t);
-        let actor_scale = keyframe::sample(&actor.layout, t)
-            .map(|s| s.scale).unwrap_or(1.0);
-        let (base_w, base_h) = if let Some(fc) = state.frame_caches.get(idx) {
-            if fc.is_ready() && fc.frame_count > 0 {
-                (fc.source_width as f32, fc.source_height as f32)
-            } else { (1080.0, 1920.0) }
-        } else { (1080.0, 1920.0) };
-        let elem_width = base_w * actor_scale;
-        let elem_height = base_h * actor_scale;
-        let half_w = elem_width * 0.5;
-        let half_h = elem_height * 0.5;
-        if pos.x >= world_pos.x - half_w && pos.x <= world_pos.x + half_w
-            && pos.y >= world_pos.y - half_h && pos.y <= world_pos.y + half_h
-        {
-            state.selection = Selection::Actor(idx);
-            return;
+        let track = actor_track_index(state, idx) as i64;
+        // Same within-pass tie-breaker as overlays so two actors that
+        // overlap on the canvas are picked by panel row first, then by
+        // scene order.
+        let within = -track * TRACK_STRIDE + idx as i64;
+        cands.push((2 * PASS_STRIDE + within, HitCand::Actor(idx)));
+    }
+    // Highest z (drawn last / on top) checked first.
+    cands.sort_by(|a, b| b.0.cmp(&a.0));
+
+    for (_, cand) in cands {
+        match cand {
+            HitCand::Overlay(idx) => {
+                let overlay = &state.scene.overlays[idx];
+                let (t_in, t_out, layout) = match overlay {
+                    Overlay::Text(txt) => (txt.t_in, txt.t_out, &txt.layout),
+                    Overlay::Image(img) => (img.t_in, img.t_out, &img.layout),
+                    Overlay::Video(vid) => (vid.t_in, vid.t_out, &vid.layout),
+                };
+                let sample_t = if t >= t_in && t <= t_out { t - t_in }
+                    else if t < t_in { 0.0 } else { t_out - t_in };
+                let ov_state = keyframe::sample(layout, sample_t).unwrap_or_default();
+
+                let ov_world = WorldPos {
+                    x: frame_tl_x + ov_state.pos[0] * world_w,
+                    y: frame_tl_y + ov_state.pos[1] * world_h,
+                };
+                let (ew, eh) = overlay_bbox_with_state(overlay, &ov_state, state);
+                if pos.x >= ov_world.x - ew * 0.5 && pos.x <= ov_world.x + ew * 0.5
+                    && pos.y >= ov_world.y - eh * 0.5 && pos.y <= ov_world.y + eh * 0.5
+                {
+                    state.selection = Selection::Overlay(idx);
+                    return;
+                }
+            }
+            HitCand::Actor(idx) => {
+                let actor = &state.scene.actors[idx];
+                let world_pos = get_element_world_pos(state, &actor.id, &actor.layout, t);
+                let actor_scale = keyframe::sample(&actor.layout, t)
+                    .map(|s| s.scale).unwrap_or(1.0);
+                let (base_w, base_h) = if let Some(fc) = state.frame_caches.get(idx) {
+                    if fc.is_ready() && fc.frame_count > 0 {
+                        (fc.source_width as f32, fc.source_height as f32)
+                    } else { (1080.0, 1920.0) }
+                } else { (1080.0, 1920.0) };
+                let elem_width = base_w * actor_scale;
+                let elem_height = base_h * actor_scale;
+                let half_w = elem_width * 0.5;
+                let half_h = elem_height * 0.5;
+                if pos.x >= world_pos.x - half_w && pos.x <= world_pos.x + half_w
+                    && pos.y >= world_pos.y - half_h && pos.y <= world_pos.y + half_h
+                {
+                    state.selection = Selection::Actor(idx);
+                    return;
+                }
+            }
         }
     }
 
