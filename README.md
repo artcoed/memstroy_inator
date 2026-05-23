@@ -178,7 +178,7 @@ cargo run -p memstroy-gui --release
 
 The editor opens with five regions:
 
-- **Top menu** — File / Render / Tools / View.
+- **Top menu** — File / Render / View.
 - **Library (left)** — `Clips`, `Videos`, `Sounds`, `Images`,
   `Particles`. The Clips tab is server-driven; the others scan the
   matching `assets/<kind>/` directory directly. Drag a row onto the
