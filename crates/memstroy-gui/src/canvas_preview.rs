@@ -4527,13 +4527,27 @@ fn ensure_image_loaded(
     ctx: &egui::Context,
 ) -> Option<(u32, u32)> {
     use crate::state::ImageTextureSlot;
+    // Cool-down between repeat decode attempts on a previously-failed
+    // path. 500 ms is short enough that the user perceives the file
+    // appearing "as soon as it's written", but long enough that we
+    // don't burn CPU when the file genuinely won't decode.
+    const FAILED_RETRY_COOLDOWN: std::time::Duration =
+        std::time::Duration::from_millis(500);
+
     // Fast path: already in the map.
+    let mut should_retry = false;
     if let Ok(map) = state.image_textures.lock() {
         if let Some(slot) = map.get(path) {
-            return match slot {
-                ImageTextureSlot::Loaded { size, .. } => Some((size[0], size[1])),
-                ImageTextureSlot::Failed => None,
-            };
+            match slot {
+                ImageTextureSlot::Loaded { size, .. } => return Some((size[0], size[1])),
+                ImageTextureSlot::Failed { last_attempt } => {
+                    if last_attempt.elapsed() < FAILED_RETRY_COOLDOWN {
+                        return None;
+                    }
+                    should_retry = true;
+                    // Fall through to decode again below.
+                }
+            }
         }
     }
 
@@ -4570,10 +4584,27 @@ fn ensure_image_loaded(
                     path.to_path_buf(),
                     ImageTextureSlot::Loaded { texture, size: sz },
                 );
+                if should_retry {
+                    // Nudge the next paint so the freshly-decoded image
+                    // shows up without waiting for an unrelated input
+                    // event.
+                    ctx.request_repaint();
+                }
                 return Some((sz[0], sz[1]));
             }
             _ => {
-                map.insert(path.to_path_buf(), ImageTextureSlot::Failed);
+                map.insert(
+                    path.to_path_buf(),
+                    ImageTextureSlot::Failed {
+                        last_attempt: std::time::Instant::now(),
+                    },
+                );
+                // Schedule a repaint after the cool-down so the canvas
+                // re-checks the file (e.g. once an in-flight download
+                // finishes writing it). Without this, a failed-then-
+                // succeeded sequence only retries when the user moves
+                // the mouse over the canvas.
+                ctx.request_repaint_after(FAILED_RETRY_COOLDOWN);
             }
         }
     }

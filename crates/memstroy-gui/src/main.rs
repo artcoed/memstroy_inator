@@ -3,17 +3,16 @@
 mod app;
 mod audio_engine;
 mod canvas_preview;
-mod clip_editor;
 mod curve_editor;
 
 mod gpu_preview;
 mod i18n;
+mod image_editor;
 mod image_effects;
 mod image_fx_cache;
 mod image_fx_worker;
 mod jobs;
 mod kf_anim;
-mod node_editor;
 mod panels;
 mod settings;
 mod skeleton_editor;

@@ -607,7 +607,13 @@ pub(crate) fn add_library_asset_at_playhead(
                 animated_params: Default::default(),
             });
             state.scene.overlays.push(overlay);
-            state.selection = Selection::Overlay(state.scene.overlays.len() - 1);
+            let new_idx = state.scene.overlays.len() - 1;
+            // Always land the new image overlay on its own lane so a
+            // drop never silently replaces an image already on the
+            // default overlay row.
+            let lane = state.pick_or_create_empty_video_lane_at(t);
+            state.overlay_track_assignments.insert(new_idx, lane);
+            state.selection = Selection::Overlay(new_idx);
             state.status = format!("Added image: {}", asset.id);
         }
         AssetDragKind::Particle => {
@@ -647,7 +653,12 @@ pub(crate) fn add_library_asset_at_playhead(
                 animated_params: Default::default(),
             });
             state.scene.overlays.push(overlay);
-            state.selection = Selection::Overlay(state.scene.overlays.len() - 1);
+            let new_idx = state.scene.overlays.len() - 1;
+            // Same rule as plain images — a particle drop must never
+            // clobber an existing layer.
+            let lane = state.pick_or_create_empty_video_lane_at(t);
+            state.overlay_track_assignments.insert(new_idx, lane);
+            state.selection = Selection::Overlay(new_idx);
             state.status = format!("Added particle: {}", asset.id);
         }
         AssetDragKind::Video => {
@@ -665,6 +676,27 @@ fn clip_card(ui: &mut egui::Ui, state: &mut EditorState, clip: &crate::state::Li
     // Stretch to the full available width of the library column rather than
     // sizing to the inner row's content.
     let avail_w = ui.available_width().max(80.0);
+
+    // Resolve a human-readable title once so the card and the placeholder
+    // thumbnail share the same source of truth. The Telegram caption,
+    // when present, is the canonical name; we fall back to a generic
+    // "Untitled clip" string only when the sidecar truly has nothing —
+    // numeric ids are deliberately NOT surfaced as the row title because
+    // users complained about clips appearing as "цифры в названиях".
+    let desc = clean_clip_text(&clip.description);
+    let title: String = if desc.is_empty() {
+        crate::i18n::t("Untitled clip").to_string()
+    } else {
+        desc
+    };
+    // First grapheme-ish letter of the title for the placeholder
+    // thumbnail. Falls back to the channel-style hash when even that
+    // is unavailable so the row is still distinguishable.
+    let initial: String = title
+        .chars()
+        .find(|c| !c.is_whitespace())
+        .map(|c| c.to_uppercase().to_string())
+        .unwrap_or_else(|| "?".to_string());
 
     let frame = egui::Frame::none()
         .fill(Color32::from_rgb(32, 32, 48))
@@ -686,10 +718,19 @@ fn clip_card(ui: &mut egui::Ui, state: &mut EditorState, clip: &crate::state::Li
                         .rounding(Rounding::same(3.0)),
                 );
             } else {
+                // No thumbnail yet — paint a tinted placeholder with the
+                // first letter of the caption so the card remains
+                // recognisable at a glance instead of just being a grey
+                // square with a numeric id.
                 let (rect, _) = ui.allocate_exact_size(thumb_size, Sense::hover());
                 ui.painter().rect_filled(rect, Rounding::same(3.0), Color32::from_rgb(40, 40, 55));
-                ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER,
-                    format!("{}", clip.id), egui::FontId::proportional(11.0), COL_TEXT_DIM);
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    &initial,
+                    egui::FontId::proportional(20.0),
+                    Color32::from_rgb(190, 160, 220),
+                );
             }
 
             // Vertical text column claims the rest of the available width
@@ -699,14 +740,17 @@ fn clip_card(ui: &mut egui::Ui, state: &mut EditorState, clip: &crate::state::Li
                 egui::Layout::top_down(egui::Align::LEFT),
                 |ui| {
                     ui.set_min_width(ui.available_width());
-                    let desc = clean_clip_text(&clip.description);
-                    let display = if desc.is_empty() { format!("Clip #{}", clip.id) } else { desc };
-                    ui.label(RichText::new(format!("#{}", clip.id)).size(9.0)
-                        .color(Color32::from_rgb(120, 100, 200)));
-                    ui.add(
-                        egui::Label::new(RichText::new(display).size(11.0).color(COL_TEXT))
-                            .truncate(),
+                    // The Telegram caption gets the prominent slot. The
+                    // numeric id used to live above it but cluttered the
+                    // row — moved into a hover tooltip so power users can
+                    // still see it without it dominating the panel.
+                    let label_resp = ui.add(
+                        egui::Label::new(
+                            RichText::new(&title).size(11.5).color(COL_TEXT),
+                        )
+                        .truncate(),
                     );
+                    label_resp.on_hover_text(format!("#{}", clip.id));
                 },
             );
         });
@@ -735,11 +779,11 @@ fn clip_card(ui: &mut egui::Ui, state: &mut EditorState, clip: &crate::state::Li
 fn clip_drag_label(clip: &crate::state::LibraryClip) -> String {
     let desc = clean_clip_text(&clip.description);
     if desc.is_empty() {
-        format!("Clip #{}", clip.id)
+        crate::i18n::t("Untitled clip").to_string()
     } else if desc.chars().count() > 28 {
-        format!("#{}  {}\u{2026}", clip.id, desc.chars().take(26).collect::<String>())
+        format!("{}\u{2026}", desc.chars().take(26).collect::<String>())
     } else {
-        format!("#{}  {}", clip.id, desc)
+        desc
     }
 }
 
@@ -768,6 +812,16 @@ pub fn inspector(ui: &mut egui::Ui, state: &mut EditorState) {
         .auto_shrink([false; 2])
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
+            // Reserve ample horizontal real estate for sliders so the
+            // per-row Scale / Rotation / Opacity sliders are wide enough
+            // to drag comfortably even when the inspector panel is narrow
+            // and a few extra widgets (animatable diamond, link button,
+            // numeric DragValue) live on the same horizontal row.
+            // Without this override the default `slider_width` is ~100
+            // px which made the local scale sliders extremely fiddly to
+            // hit precisely.
+            let avail = ui.available_width();
+            ui.spacing_mut().slider_width = (avail - 88.0).max(140.0);
             inspector_body(ui, state);
         });
 }
@@ -1211,9 +1265,10 @@ fn inspector_actor(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
     ).size(10.0).color(COL_TEXT_DIM));
     ui.add_space(6.0);
 
-    // Tab bar: Transform | Effects
+    // Tab bar: Transform | Masks | Effects
     ui.horizontal(|ui| {
         if ui.selectable_label(state.inspector_tab == 0, t("Transform")).clicked() { state.inspector_tab = 0; }
+        if ui.selectable_label(state.inspector_tab == 1, t("Masks")).clicked() { state.inspector_tab = 1; }
         if ui.selectable_label(state.inspector_tab == 2, t("Effects")).clicked() { state.inspector_tab = 2; }
     });
     ui.separator();
@@ -1224,6 +1279,7 @@ fn inspector_actor(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
             inspector_actor_transform(ui, state, i);
             inspector_actor_speed(ui, state, i);
         }
+        1 => inspector_actor_masks(ui, state, i),
         2 => inspector_actor_effects(ui, state, i, actor_count, cache_count),
         _ => {
             inspector_actor_transform(ui, state, i);
@@ -1999,7 +2055,17 @@ fn inspector_effect_stack(
             ui.horizontal(|ui| {
                 ui.label(RichText::new("+ Add effect:").size(11.0).strong());
                 let mut to_add: Option<usize> = None;
-                let presets = memstroy_core::all_effect_presets();
+                // Hide masks from the generic effect picker — they live
+                // in the dedicated "Masks" inspector tool now and the
+                // bare "Mask" / "Mask (ellipse)" labels in the picker
+                // were confusing because users couldn't tell how to
+                // apply them. Cropping is also a mask-style operation
+                // but is kept here because it's commonly used as a
+                // straight effect (no canvas tool to arm).
+                let presets: Vec<memstroy_core::Effect> = memstroy_core::all_effect_presets()
+                    .into_iter()
+                    .filter(|e| !matches!(e.kind, memstroy_core::EffectKind::Mask { .. }))
+                    .collect();
                 egui::ComboBox::from_id_source(("effect_add", salt))
                     .selected_text("choose…")
                     .width(160.0)
@@ -2429,6 +2495,210 @@ fn inspector_actor_speed(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
         }
     }
     sync_audio_to_actor(state, i);
+}
+
+/// "Masks" inspector tab body for actors. Lists every mask-style
+/// effect (`EffectKind::Mask` and `EffectKind::Crop`) that already
+/// lives on the actor and exposes a clear set of "+ Add mask"
+/// shortcuts. Each shortcut also arms the matching canvas tool
+/// (`state.mask_tool`) so the user can immediately paint the shape
+/// without diving back into the toolbar.
+fn inspector_actor_masks(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
+    let effects: &mut Vec<memstroy_core::Effect> = &mut state.scene.actors[i].effects;
+    let mask_tool = &mut state.mask_tool;
+    inspector_masks_section(ui, effects, mask_tool, ("actor_masks", i));
+}
+
+/// Shared masks UI used by the actor inspector tab and the per-overlay
+/// inspector column. Mutates the effects list in place: removes the
+/// trailing mask entry on "Reset", commits a "+ Add" preset and arms
+/// the matching canvas tool, edits feather / invert on existing
+/// entries.
+fn inspector_masks_section(
+    ui: &mut egui::Ui,
+    effects: &mut Vec<memstroy_core::Effect>,
+    mask_tool: &mut crate::state::MaskTool,
+    salt: impl std::hash::Hash + Copy,
+) {
+    use memstroy_core::{Effect, EffectKind, MaskShape};
+    use crate::state::MaskTool;
+
+    ui.label(
+        RichText::new(crate::i18n::t("Masks"))
+            .size(13.0)
+            .strong()
+            .color(Color32::from_rgb(255, 200, 120)),
+    );
+    ui.add_space(2.0);
+    ui.label(
+        RichText::new(crate::i18n::t(
+            "Masks hide / reveal parts of the layer. Pick a shape, then drag on the canvas to paint it.",
+        ))
+        .size(10.0)
+        .italics()
+        .color(COL_TEXT_DIM),
+    );
+    ui.add_space(6.0);
+
+    // ── Existing masks ──
+    let mut to_remove: Option<usize> = None;
+    for (ei, eff) in effects.iter_mut().enumerate() {
+        let label = match &eff.kind {
+            EffectKind::Mask { shape, .. } => match shape {
+                MaskShape::Rect { .. } => crate::i18n::t("Rectangle mask"),
+                MaskShape::Ellipse { .. } => crate::i18n::t("Ellipse mask"),
+                MaskShape::Polygon { .. } => crate::i18n::t("Freehand mask"),
+            },
+            EffectKind::Crop { .. } => crate::i18n::t("Crop"),
+            _ => continue,
+        };
+        egui::Frame::none()
+            .fill(Color32::from_rgb(34, 28, 38))
+            .rounding(Rounding::same(4.0))
+            .stroke(Stroke::new(1.0, Color32::from_rgb(70, 60, 100)))
+            .inner_margin(egui::Margin::same(6.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut eff.enabled, "");
+                    ui.label(
+                        RichText::new(label)
+                            .strong()
+                            .size(11.5)
+                            .color(Color32::from_rgb(255, 220, 180)),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("x").on_hover_text("Remove mask").clicked() {
+                            to_remove = Some(ei);
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+                match &mut eff.kind {
+                    EffectKind::Mask { feather, invert, shape } => {
+                        ui.horizontal(|ui| {
+                            ui.label(crate::i18n::t("Feather"));
+                            ui.add(egui::Slider::new(feather, 0.0..=0.5));
+                        });
+                        ui.checkbox(invert, crate::i18n::t("Invert (hide inside)"));
+                        // "Repaint" arms the canvas tool that matches
+                        // this mask's shape so the user can overwrite
+                        // its geometry with a fresh drag.
+                        let tool = match shape {
+                            MaskShape::Rect { .. } => MaskTool::RectMask,
+                            MaskShape::Ellipse { .. } => MaskTool::EllipseMask,
+                            MaskShape::Polygon { .. } => MaskTool::FreehandMask,
+                        };
+                        let label = format!(
+                            "\u{270E} {} {}",
+                            crate::i18n::t("Repaint"),
+                            shape_kind_name(shape),
+                        );
+                        if ui.button(label).clicked() {
+                            *mask_tool = tool;
+                        }
+                    }
+                    EffectKind::Crop { left, top, right, bottom } => {
+                        ui.horizontal(|ui| {
+                            ui.label(crate::i18n::t("Left"));
+                            ui.add(egui::Slider::new(left, 0.0..=0.49));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label(crate::i18n::t("Top"));
+                            ui.add(egui::Slider::new(top, 0.0..=0.49));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label(crate::i18n::t("Right"));
+                            ui.add(egui::Slider::new(right, 0.0..=0.49));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label(crate::i18n::t("Bottom"));
+                            ui.add(egui::Slider::new(bottom, 0.0..=0.49));
+                        });
+                        if ui.button(format!(
+                            "\u{270E} {} {}",
+                            crate::i18n::t("Repaint"),
+                            crate::i18n::t("Crop"),
+                        )).clicked() {
+                            *mask_tool = MaskTool::Crop;
+                        }
+                    }
+                    _ => {}
+                }
+            });
+        ui.add_space(3.0);
+    }
+    if let Some(idx) = to_remove {
+        effects.remove(idx);
+    }
+
+    if effects.iter().all(|e| !matches!(e.kind, EffectKind::Mask { .. } | EffectKind::Crop { .. })) {
+        ui.label(
+            RichText::new(crate::i18n::t("No masks yet."))
+                .size(10.5)
+                .italics()
+                .color(COL_TEXT_DIM),
+        );
+        ui.add_space(4.0);
+    }
+
+    // ── Add-mask shortcuts ──
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new(format!("+ {}", crate::i18n::t("Add mask")))
+            .size(11.0)
+            .strong(),
+    );
+    egui::Grid::new(("masks_add_grid", salt))
+        .num_columns(2)
+        .spacing([6.0, 6.0])
+        .show(ui, |ui| {
+            if ui.button(crate::i18n::t("\u{25AD} Rectangle")).clicked() {
+                effects.push(Effect::mask_rect());
+                *mask_tool = MaskTool::RectMask;
+            }
+            if ui.button(crate::i18n::t("\u{2B2D} Ellipse")).clicked() {
+                effects.push(Effect::mask_ellipse());
+                *mask_tool = MaskTool::EllipseMask;
+            }
+            ui.end_row();
+            if ui.button(crate::i18n::t("\u{270D} Freehand")).clicked() {
+                effects.push(memstroy_core::Effect::mask_freehand());
+                *mask_tool = MaskTool::FreehandMask;
+            }
+            if ui.button(crate::i18n::t("\u{2702} Crop")).clicked() {
+                effects.push(Effect::crop());
+                *mask_tool = MaskTool::Crop;
+            }
+            ui.end_row();
+        });
+
+    // Active tool indicator + "Stop drawing" affordance.
+    if mask_tool.is_active() {
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!(
+                    "\u{1F58C} {}: {}",
+                    crate::i18n::t("Drawing"),
+                    mask_tool.label(),
+                ))
+                .color(Color32::from_rgb(255, 200, 80))
+                .size(11.0),
+            );
+            if ui.button(crate::i18n::t("Stop")).clicked() {
+                *mask_tool = MaskTool::None;
+            }
+        });
+    }
+}
+
+fn shape_kind_name(shape: &memstroy_core::MaskShape) -> &'static str {
+    use memstroy_core::MaskShape;
+    match shape {
+        MaskShape::Rect { .. } => "rectangle",
+        MaskShape::Ellipse { .. } => "ellipse",
+        MaskShape::Polygon { .. } => "polygon",
+    }
 }
 
 fn inspector_actor_effects(ui: &mut egui::Ui, state: &mut EditorState, i: usize, _actor_count: usize, _cache_count: usize) {
@@ -2996,7 +3266,7 @@ fn inspector_actor_skeleton_attachments(ui: &mut egui::Ui, state: &mut EditorSta
         if templates.is_empty() {
             ui.label(RichText::new(
                 "No skeleton bound to this clip yet.\n\
-                 Open Tools \u{2192} Skeleton Constructor and save a \
+                 Open View \u{2192} Skeleton Editor and save a \
                  sidecar next to the source file."
             ).size(10.0).italics().color(COL_TEXT_DIM));
             return;
@@ -3420,6 +3690,8 @@ fn inspector_overlay(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
             ui.add_space(8.0);
             inspector_modifiers(ui, &mut im.modifiers, ("img_mods", i));
             ui.add_space(8.0);
+            inspector_masks_section(ui, &mut im.effects, &mut state.mask_tool, ("img_masks", i));
+            ui.add_space(8.0);
             let fx_t_local = (playhead - im.t_in).max(0.0);
             inspector_effect_stack(ui, &mut im.effects, ("img_fx", i), fx_t_local);
         }
@@ -3491,6 +3763,8 @@ fn inspector_overlay(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
                 state.kf_highlight.clone());
             ui.add_space(8.0);
             inspector_modifiers(ui, &mut v.modifiers, ("vid_mods", i));
+            ui.add_space(8.0);
+            inspector_masks_section(ui, &mut v.effects, &mut state.mask_tool, ("vid_masks", i));
             ui.add_space(8.0);
             let fx_t_local = (playhead - v.t_in).max(0.0);
             inspector_effect_stack(ui, &mut v.effects, ("vid_fx", i), fx_t_local);
@@ -5003,7 +5277,11 @@ fn timeline_marquee_update(
     let resp = ui.interact(tracks_rect, id, egui::Sense::drag());
 
     // Start a marquee gesture only if no other timeline drag picked up
-    // the press first this frame.
+    // the press first this frame, AND the press point lies on empty
+    // space — i.e. NOT inside any existing clip's screen rect.
+    // Marquee-on-clip used to make it impossible to drag a clip to a
+    // different lane / re-trim it because the press was always
+    // swallowed by the marquee interactor.
     if state.timeline_marquee.is_none()
         && resp.drag_started()
         && !drag_in_flight
@@ -5013,20 +5291,42 @@ fn timeline_marquee_update(
             // checking that the press point lies inside the tracks
             // rectangle proper.
             if tracks_rect.contains(p) {
-                let extend = ui.input(|i| {
-                    i.modifiers.ctrl || i.modifiers.shift || i.modifiers.command
-                });
-                state.timeline_marquee = Some(crate::state::TimelineMarquee {
-                    start: p,
-                    end: p,
-                });
-                if !extend {
-                    // Replace gesture: clear any old multi-selection
-                    // when the marquee begins; the commit pass below
-                    // will re-populate it. We do NOT touch the primary
-                    // `selection` until commit so a tiny accidental
-                    // drag (smaller than 2 px) leaves it intact.
-                    state.canvas_selection.clear();
+                // Walk the on-screen clip rects and bail out if the
+                // press lands on top of any of them. The press will
+                // then propagate to the per-clip drag handler instead
+                // of being captured here.
+                let mut on_clip = false;
+                for_each_clip_screen_rect(
+                    state,
+                    track_rows,
+                    tracks_rect,
+                    rf_row_h,
+                    v_scroll,
+                    pps,
+                    track_left,
+                    track_right,
+                    |_sel, clip_rect| {
+                        if clip_rect.contains(p) {
+                            on_clip = true;
+                        }
+                    },
+                );
+                if !on_clip {
+                    let extend = ui.input(|i| {
+                        i.modifiers.ctrl || i.modifiers.shift || i.modifiers.command
+                    });
+                    state.timeline_marquee = Some(crate::state::TimelineMarquee {
+                        start: p,
+                        end: p,
+                    });
+                    if !extend {
+                        // Replace gesture: clear any old multi-selection
+                        // when the marquee begins; the commit pass below
+                        // will re-populate it. We do NOT touch the primary
+                        // `selection` until commit so a tiny accidental
+                        // drag (smaller than 2 px) leaves it intact.
+                        state.canvas_selection.clear();
+                    }
                 }
             }
         }
@@ -6467,10 +6767,19 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     // Total scaled height needed to fit all tracks at the current v_zoom,
     // including any per-param keyframe-row expansion on the selected layer.
     // The dedicated Render Frame row is added once at the top.
+    //
+    // We pad the total with `BOTTOM_GUTTER` so the user can ALWAYS scroll
+    // the bottom-most lane fully into the visible area, with a small
+    // empty band beneath it. Without this gutter, expanding a track via
+    // per-param keyframe rows could push the last row's bottom edge
+    // exactly to the viewport bottom — sometimes unreachable depending
+    // on the v_zoom rounding — and the user couldn't scroll any further.
+    const BOTTOM_GUTTER: f32 = 16.0;
     let total_tracks_h: f32 = rf_row_h
         + (0..num_tracks)
             .map(|i| state.tracks[i].height * v_zoom + selected_layer_expansion(state, i, v_zoom))
-            .sum::<f32>();
+            .sum::<f32>()
+        + BOTTOM_GUTTER;
     let max_v_scroll = (total_tracks_h - viewport_h).max(0.0);
     state.timeline_v_scroll = state.timeline_v_scroll.max(0.0).min(max_v_scroll);
     let v_scroll = state.timeline_v_scroll;
@@ -7839,7 +8148,8 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                     state.tracks[i].height * new_v_zoom
                         + selected_layer_expansion(state, i, new_v_zoom)
                 })
-                .sum::<f32>();
+                .sum::<f32>()
+            + BOTTOM_GUTTER;
         let new_max_v_scroll = (new_total_tracks_h - viewport_h).max(0.0);
         let denom = (1.0 - new_thumb_size).max(1.0e-4);
         let new_pan_frac = (new_a_v / denom).clamp(0.0, 1.0);
@@ -7888,38 +8198,84 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
 
             if matches!(kind, AssetDragKind::Clip | AssetDragKind::Video) {
                 // Pick the destination video lane:
-                //   1. The lane under the cursor when it's an unlocked video lane.
-                //   2. Otherwise, create a new video lane just above the
-                //      audio block so the dropped clip gets its own layer.
-                let target = drop_track
+                //   1. The lane under the cursor when it is an unlocked
+                //      video lane AND has nothing currently occupying
+                //      `drop_time`. Reusing a non-empty lane would
+                //      overwrite the existing layer, which the user
+                //      explicitly does not want.
+                //   2. Otherwise, the first empty video lane at
+                //      `drop_time`, falling back to a freshly-inserted
+                //      lane at the top of the video stack so the new
+                //      clip always lands on its own row.
+                let cursor_lane_empty = drop_track
                     .filter(|i| state.tracks[*i].kind == TrackKind::Video
-                        && !state.tracks[*i].locked);
-                let assigned = match target {
+                        && !state.tracks[*i].locked)
+                    .filter(|i| {
+                        // Walk the actors+overlays already pinned to
+                        // this lane and check that none of them spans
+                        // `drop_time`.
+                        let mut occupied = false;
+                        for (ai, a) in state.scene.actors.iter().enumerate() {
+                            let assigned = state
+                                .actor_track_assignments
+                                .get(&ai)
+                                .copied()
+                                .unwrap_or_else(|| {
+                                    state.video_track_indices()
+                                        .first().copied().unwrap_or(0)
+                                });
+                            if assigned != *i { continue; }
+                            let t_in = a.t_in.unwrap_or(0.0);
+                            let t_out = a.t_out.unwrap_or(duration);
+                            if drop_time >= t_in && drop_time <= t_out {
+                                occupied = true;
+                                break;
+                            }
+                        }
+                        if occupied { return false; }
+                        let default_overlay_lane = {
+                            let v = state.video_track_indices();
+                            if v.len() >= 2 { v[1] } else { v.first().copied().unwrap_or(0) }
+                        };
+                        for (oi, ov) in state.scene.overlays.iter().enumerate() {
+                            let assigned = state
+                                .overlay_track_assignments
+                                .get(&oi)
+                                .copied()
+                                .unwrap_or(default_overlay_lane);
+                            if assigned != *i { continue; }
+                            let (t_in, t_out) = match ov {
+                                memstroy_core::Overlay::Text(o) => (o.t_in, o.t_out),
+                                memstroy_core::Overlay::Image(o) => (o.t_in, o.t_out),
+                                memstroy_core::Overlay::Video(o) => (o.t_in, o.t_out),
+                            };
+                            if drop_time >= t_in && drop_time <= t_out {
+                                occupied = true;
+                                break;
+                            }
+                        }
+                        !occupied
+                    });
+                let assigned = match cursor_lane_empty {
                     Some(t) => t,
-                    None => state.insert_video_track_at_bottom(),
+                    None => state.pick_or_create_empty_video_lane_at(drop_time),
                 };
                 add_actor_from_clip_at_time(state, &asset_path, drop_time);
                 if let Some(new_idx) = state.scene.actors.len().checked_sub(1) {
                     state.actor_track_assignments.insert(new_idx, assigned);
                     // The bound audio (added by add_actor_from_clip_at_time)
                     // mirrors the actor's lane via sync_bound_audio_lanes()
-                    // at the end of the frame.
-                    // Same-lane overlap rule: trim/split/remove anything
-                    // we just dropped on top of.
-                    let drop_token =
-                        EditorState::drag_token("library_drop", new_idx);
-                    state.mutate_drag(drop_token, |_| {});
-                    let _ = enforce_no_overlap_on_layer(
-                        state,
-                        MovedClipKind::Actor(new_idx),
-                        drop_token,
-                    );
-                    state.end_drag_group();
+                    // at the end of the frame. The destination lane is
+                    // guaranteed empty at `drop_time`, so we deliberately
+                    // skip the same-lane overlap pass that used to delete
+                    // neighbours here.
                 }
             } else if matches!(kind, AssetDragKind::Sound | AssetDragKind::Image | AssetDragKind::Particle) {
                 // Build a LibraryAsset proxy from the drag payload and
                 // delegate to the per-kind spawner. The element lands
-                // at the drop time on the playhead-default lane.
+                // at the drop time; the spawner pins it onto the first
+                // empty lane (or a freshly-inserted one) so a drop
+                // never silently replaces an existing layer.
                 let id = asset_path.file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("asset")
@@ -7935,36 +8291,6 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                 state.playhead = drop_time;
                 add_library_asset_at_playhead(state, &asset, kind);
                 state.playhead = saved_t;
-                // Trim/split/remove neighbours on the freshly-dropped
-                // asset's lane. We dispatch by kind because the
-                // last-pushed element index varies per spawner above.
-                let drop_token = EditorState::drag_token("library_drop_asset", 0);
-                state.mutate_drag(drop_token, |_| {});
-                let mover = match kind {
-                    AssetDragKind::Sound => state
-                        .scene
-                        .audio
-                        .len()
-                        .checked_sub(1)
-                        .map(MovedClipKind::Audio),
-                    AssetDragKind::Image | AssetDragKind::Particle => state
-                        .scene
-                        .overlays
-                        .len()
-                        .checked_sub(1)
-                        .map(MovedClipKind::Overlay),
-                    AssetDragKind::Video => state
-                        .scene
-                        .actors
-                        .len()
-                        .checked_sub(1)
-                        .map(MovedClipKind::Actor),
-                    _ => None,
-                };
-                if let Some(m) = mover {
-                    let _ = enforce_no_overlap_on_layer(state, m, drop_token);
-                }
-                state.end_drag_group();
             }
 
             // Clear the drag state.
