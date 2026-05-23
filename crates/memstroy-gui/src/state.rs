@@ -743,7 +743,7 @@ pub struct EditorState {
 /// On commit they are baked into the selected overlay's effect stack
 /// as either an `EffectKind::Mask { Polygon, .. }` or an
 /// `EffectKind::Crop { .. }` entry depending on the active tool.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ImageEditorBrush {
     pub tool: ImageBrushTool,
     /// Soft edge applied to a freshly committed polygon mask
@@ -759,6 +759,39 @@ pub struct ImageEditorBrush {
     /// Anchor point for rectangle-style drags (Crop). Stored in
     /// source-image UV. `None` outside an active drag.
     pub crop_drag_start: Option<[f32; 2]>,
+
+    // ─── Preview viewport state ───────────────────────────────────
+    /// Height (in pixels) of the preview pane inside the editor
+    /// window. The user can drag the splitter handle below the
+    /// preview to give the picture more (or less) vertical room
+    /// without resizing the whole window.
+    pub preview_height: f32,
+    /// Multiplicative zoom applied to the rendered preview. `1.0`
+    /// is "fit to pane" — the value is multiplied on top of the
+    /// aspect-fit scale so the picture grows / shrinks around the
+    /// pane centre. Range is clamped to `0.1..=8.0` at the call
+    /// site so the preview never disappears or explodes.
+    pub preview_zoom: f32,
+    /// Pan offset (screen pixels) applied to the zoomed preview so
+    /// the user can scroll the picture around inside the pane when
+    /// zoomed past `1.0`. Reset to `[0.0, 0.0]` whenever the zoom
+    /// returns to a fit-or-smaller value.
+    pub preview_pan: [f32; 2],
+}
+
+impl Default for ImageEditorBrush {
+    fn default() -> Self {
+        Self {
+            tool: ImageBrushTool::default(),
+            feather: 0.0,
+            invert: false,
+            draft: Vec::new(),
+            crop_drag_start: None,
+            preview_height: 260.0,
+            preview_zoom: 1.0,
+            preview_pan: [0.0, 0.0],
+        }
+    }
 }
 
 /// Image-editor brush mode. Mirrors the tool buttons in the
@@ -2111,9 +2144,93 @@ impl EditorState {
         Ok(asset)
     }
 
-    /// Spawn an `Overlay::Image` for the supplied library asset at the
-    /// current playhead, anchored to the first empty video lane (or a
-    /// freshly-spawned one). Returns the overlay index of the new
+    /// Save an edited variant of an image overlay (with the full
+    /// effect stack baked in) to the project's local image library
+    /// and return the resulting [`LibraryAsset`].
+    ///
+    /// `source_stem` is used to derive the on-disk filename (e.g.
+    /// `cat` → `edited_cat_<unix-millis>.png`) so the file manager
+    /// listing groups variants of the same source together; if the
+    /// stem is empty `edited` is used as the prefix. Library-tab
+    /// scan rules accept the produced PNG, so the saved file appears
+    /// in the Images tab on the very next frame and can be dragged
+    /// onto the canvas like any other sticker.
+    pub fn save_edited_image_to_library(
+        &mut self,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+        source_stem: &str,
+    ) -> Result<LibraryAsset, String> {
+        if width == 0 || height == 0 {
+            return Err("edited image is empty".into());
+        }
+        let expected = (width as usize) * (height as usize) * 4;
+        if rgba.len() < expected {
+            return Err(format!(
+                "edited image buffer too small: {} < {}",
+                rgba.len(),
+                expected
+            ));
+        }
+        let dir = self.images_dir();
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            return Err(format!("create {}: {}", dir.display(), e));
+        }
+        // Sanitise the stem so we don't accidentally write the
+        // overlay's full path (slashes, dots, …) into a filename. We
+        // keep ASCII alphanumerics, dashes and underscores; anything
+        // else collapses to `_` so the result is filesystem-safe on
+        // Windows / macOS / Linux.
+        let safe_stem: String = source_stem
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let prefix = if safe_stem.is_empty() {
+            "edited".to_string()
+        } else {
+            format!("edited_{}", safe_stem)
+        };
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let mut filename = format!("{}_{}.png", prefix, stamp);
+        let mut path = dir.join(&filename);
+        let mut suffix = 1u32;
+        while path.exists() {
+            filename = format!("{}_{}_{}.png", prefix, stamp, suffix);
+            path = dir.join(&filename);
+            suffix += 1;
+            if suffix > 1000 {
+                break;
+            }
+        }
+        let buf = image::RgbaImage::from_raw(width, height, rgba.to_vec())
+            .ok_or_else(|| "failed to wrap edited image".to_string())?;
+        buf.save(&path)
+            .map_err(|e| format!("save {}: {}", path.display(), e))?;
+        let id = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("edited")
+            .to_string();
+        let asset = LibraryAsset {
+            id: id.clone(),
+            path: path.clone(),
+            label: id,
+            thumbnail: Some(path),
+        };
+        self.reload_library();
+        Ok(asset)
+    }
+
     /// element so the caller can push it into the selection. Used by
     /// the Ctrl+V system-clipboard handler — pasting an image from the
     /// OS turns into "image now lives in the library AND on the canvas
