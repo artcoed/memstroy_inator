@@ -19,6 +19,7 @@ mod state;
 mod title_templates;
 mod undo;
 mod video_cache;
+mod web_image_search;
 
 use anyhow::Result;
 use tracing_subscriber::EnvFilter;
