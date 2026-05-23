@@ -89,32 +89,49 @@ below) and point the GUI at the network address through
 
 ## Packaging the client (release build)
 
-The `scripts/` directory ships a self-contained packager that
-produces a release-stripped, asset-bundled folder ready to be
-zipped and shipped:
+Client bundles are built for distribution and run against the
+operator's remote `memstroy-assets-server`. They:
+
+- Are compiled with the workspace's hardened `[profile.release]`
+  (symbol-stripped, panic-abort, no debug-info, no incremental).
+- Bake the assets-server URL into the binary at compile time, wrapped
+  through `obfstr` so it does not appear verbatim in `strings(1)`.
+- **Do not include any `assets/`** directory — every clip / image /
+  sound is fetched from the remote server on demand and cached under
+  `~/.memstroy/cache/` (or `%USERPROFILE%\.memstroy\cache\`).
+- **Do not include `memstroy-assets-server`** itself — the server is
+  expected to run on the operator's backend, separate from the
+  shipped client.
 
 ```bash
 # Linux / macOS
-scripts/package-client.sh                        # → dist/memstroy-inator-<os>-<ver>/
+scripts/package-client.sh --server-url https://assets.your-domain.example
+# → dist/memstroy-inator-<os>-<arch>-<ver>/
 
 # Windows PowerShell
-pwsh scripts/package-client.ps1                  # → dist\memstroy-inator-windows-<ver>\
+pwsh scripts/package-client.ps1 -ServerUrl https://assets.your-domain.example
+# → dist\memstroy-inator-windows-<arch>-<ver>\
 ```
 
-What the script does:
+The packagers refuse a loopback `--server-url` (`127.0.0.1`,
+`localhost`, `::1`) by default — pass `--allow-loopback` /
+`-AllowLoopback` for staging bundles that intentionally hit a local
+box.
 
-1. `cargo build --release -p memstroy-gui -p memstroy-assets-server -p memstroy-cli`.
-2. Copies the three release binaries into `dist/<bundle-name>/bin/`.
-3. Mirrors the runtime asset skeleton (`assets/images`,
-   `assets/sounds`, `assets/particles`, `assets/clips`,
-   `assets/videos`, `assets/text`) so the GUI has somewhere to put
-   downloaded clips on first launch.
-4. Drops an `examples/` copy, the README and a top-level
-   launcher script (`memstroy-inator.sh` / `memstroy-inator.bat`).
+Other useful flags:
 
-Override the output directory with `--out <path>` and the bundle
-name with `--name <name>` if you want to ship a specific build to a
-specific environment.
+- `--out <path>` / `-Out <path>` — override output directory.
+- `--name <name>` / `-Name <name>` — override the bundle directory
+  name.
+- `--zip` / `-Zip` — also produce `<bundle-name>.zip` next to the
+  staged directory.
+
+What ends up in the bundle:
+
+1. `bin/memstroy-gui` (+ `bin/memstroy` CLI on supported platforms).
+2. `examples/*.yaml` and `README.md`.
+3. A top-level launcher (`memstroy-inator.sh` / `memstroy-inator.bat`)
+   that simply execs the GUI binary.
 
 ## Running the backend (assets-server)
 
