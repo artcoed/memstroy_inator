@@ -482,7 +482,11 @@ impl AudioEngine {
     }
 
     /// Stop all playback and release every sink, including any background
-    /// load that hasn't yet attached.
+    /// load that hasn't yet attached. Currently unused: the editor pauses
+    /// rather than stops on every transport interaction; kept in the
+    /// public API in case a future "rewind to t=0 and reset state"
+    /// shortcut wants it.
+    #[allow(dead_code)]
     pub fn stop(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         self.pending = None;
