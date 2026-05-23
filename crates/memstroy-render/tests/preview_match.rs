@@ -316,3 +316,276 @@ fn image_overlay_inherits_full_pipeline() {
         "image overlay rotation animation didn't emit rotate filter:\n{graph}",
     );
 }
+
+
+// ─── PR #62 follow-up: effect animation / LGG curves / skeleton ───
+//
+// PR #62 wired in the keyframe / modifier / world-pixel pipeline but
+// left three further preview-vs-render parity gaps open: per-frame
+// effect parameter animation, tone curves + per-channel LGG, and
+// skeleton-attachment-driven world position. The tests below pin the
+// contract for each of those gaps so a future regression flips a
+// red CI light.
+
+#[test]
+fn animated_effect_param_emits_per_segment_chain() {
+    // An `Effect::Blur` whose `radius` is keyframed must lower into
+    // a chain of `boxblur=…:enable='between(t,…)'` clauses, one per
+    // keyframe-bounded segment, so the export blurs in lock-step
+    // with the canvas preview's `effect.sampled_at(t_local)` path.
+    use memstroy_core::{Effect, EffectKind, Keyframe};
+
+    let mut scene = baseline_scene();
+    let mut actor = baseline_actor("a1");
+    let mut blur = Effect::new(EffectKind::Blur { radius: 4.0 });
+    blur.animated_params.insert("p0".into());
+    blur.param_kfs.insert(
+        "p0".into(),
+        vec![
+            Keyframe::new(0.0, 2.0_f32),
+            Keyframe::new(1.0, 24.0_f32),
+        ],
+    );
+    actor.effects.push(blur);
+    scene.actors.push(actor);
+
+    let graph = build_filter_graph(&scene);
+    // The chain must contain at least two `boxblur` invocations
+    // gated by `between(t,…)` — proves the per-segment animation
+    // expansion fired instead of the static fast path.
+    let blur_count = graph.matches("boxblur=").count();
+    assert!(
+        blur_count >= 2,
+        "expected multi-segment boxblur chain, got {blur_count}: {graph}",
+    );
+    assert!(
+        graph.contains("boxblur=") && graph.contains(":enable='between(t,"),
+        "missing per-segment enable on boxblur:\n{graph}",
+    );
+}
+
+#[test]
+fn animated_intensity_alone_drives_segmentation() {
+    // The master `intensity` envelope is itself one of the keyable
+    // parameters (`Effect.animated_params` includes `"intensity"`).
+    // Animating only intensity — even on a parameterless effect like
+    // Grayscale — should still fan out into a per-segment chain so
+    // the export fades in/out the same way the preview does.
+    use memstroy_core::{Effect, Keyframe};
+
+    let mut scene = baseline_scene();
+    let mut actor = baseline_actor("a1");
+    let mut gray = Effect::grayscale();
+    gray.animated_params.insert("intensity".into());
+    gray.param_kfs.insert(
+        "intensity".into(),
+        vec![
+            Keyframe::new(0.0, 0.0_f32),
+            Keyframe::new(1.0, 1.0_f32),
+            Keyframe::new(2.0, 0.0_f32),
+        ],
+    );
+    actor.effects.push(gray);
+    scene.actors.push(actor);
+
+    let graph = build_filter_graph(&scene);
+    let mixer_count = graph.matches("colorchannelmixer=rr=").count();
+    assert!(
+        mixer_count >= 3,
+        "expected ≥3 grayscale segments for kf-animated intensity, got {mixer_count}:\n{graph}",
+    );
+}
+
+#[test]
+fn cc_lift_gain_gamma_lowers_to_lutrgb() {
+    // Per-channel Lift / Gain / Gamma must show up in the graph
+    // as a `lutrgb=` filter using the DaVinci formula
+    // `pow(max(0,(val/255 + L*(1-val/255))*G), 1/Gma)`. The test
+    // injects a non-trivial lift on the red channel and checks
+    // both the filter name and the formula's signature.
+    let mut scene = baseline_scene();
+    let mut actor = baseline_actor("a1");
+    actor.color_correction = ColorCorrection {
+        lift: [0.2, 0.0, 0.0],
+        gain: [1.0, 1.2, 1.0],
+        gamma: [1.0, 1.0, 0.8],
+        ..ColorCorrection::default()
+    };
+    scene.actors.push(actor);
+
+    let graph = build_filter_graph(&scene);
+    assert!(
+        graph.contains("lutrgb=r='clip(255*pow(max(0,(val/255+(0.2000)"),
+        "lift on R channel didn't materialise in lutrgb expression:\n{graph}",
+    );
+    assert!(
+        graph.contains("g='clip(255*pow(max(0,(val/255+(0.0000)*(1-val/255))*(1.2000))"),
+        "gain on G channel didn't materialise in lutrgb expression:\n{graph}",
+    );
+    // 1/0.8 = 1.25 — the inverse-gamma factor on B should appear.
+    assert!(
+        graph.contains("1.2500"),
+        "inverse gamma 1/0.8 = 1.25 not present:\n{graph}",
+    );
+}
+
+#[test]
+fn cc_tone_curves_lower_to_curves_filter() {
+    // Master + per-channel tone curves must each emit a separate
+    // `curves=preset=none:…='…/…'` filter so the export honours
+    // the editor's curve points.
+    use memstroy_core::ToneCurves;
+
+    let mut scene = baseline_scene();
+    let mut actor = baseline_actor("a1");
+    actor.color_correction = ColorCorrection {
+        curves: ToneCurves {
+            master: vec![[0.0, 0.0], [0.5, 0.6], [1.0, 1.0]],
+            red: vec![[0.0, 0.1], [1.0, 0.9]],
+            green: vec![[0.0, 0.0], [1.0, 1.0]], // identity → not emitted
+            blue: vec![[0.0, 0.0], [1.0, 1.0]],
+        },
+        ..ColorCorrection::default()
+    };
+    scene.actors.push(actor);
+
+    let graph = build_filter_graph(&scene);
+    assert!(
+        graph.contains("curves=preset=none:m='0.0000/0.0000 0.5000/0.6000 1.0000/1.0000'"),
+        "master tone curve didn't emit `curves=…:m=`:\n{graph}",
+    );
+    assert!(
+        graph.contains("curves=preset=none:r='0.0000/0.1000 1.0000/0.9000'"),
+        "red tone curve didn't emit `curves=…:r=`:\n{graph}",
+    );
+    // Identity green/blue must be skipped — only one occurrence of
+    // `:g='` or `:b='` would mean we leaked an identity filter.
+    assert!(
+        !graph.contains("curves=preset=none:g='"),
+        "identity green curve was emitted (should be skipped):\n{graph}",
+    );
+}
+
+#[test]
+fn skeleton_attachment_overrides_overlay_world_pos() {
+    // An overlay bound to a host actor's skeleton point must take
+    // its world position from the skeleton track — NOT the legacy
+    // normalised layout. We assert the host's source-pixel scale
+    // (`1080.0000` for the default 1080×1920 fallback used when no
+    // ffprobe data is available) appears in the overlay's X
+    // expression, which is the unique fingerprint of the skeleton
+    // projection branch.
+    use memstroy_core::skeleton::{
+        PointState, SkeletonAttachment, SkeletonPoint, SkeletonTemplate,
+    };
+    use std::collections::BTreeMap;
+
+    let mut scene = baseline_scene();
+    let host = baseline_actor("hero");
+    let host_clip = host.source.clone();
+    scene.actors.push(host);
+
+    let mut points = BTreeMap::new();
+    let mut hat = SkeletonPoint {
+        name: "hat".into(),
+        ..Default::default()
+    };
+    hat.track = vec![
+        Keyframe::new(0.0, PointState { x: 0.4, y: 0.2, scale: 1.0, rotation_deg: 0.0 }),
+        Keyframe::new(1.0, PointState { x: 0.6, y: 0.3, scale: 1.0, rotation_deg: 0.0 }),
+    ];
+    points.insert("hat".into(), hat);
+    scene.skeleton_templates.push(SkeletonTemplate {
+        name: "hero_skel".into(),
+        source_clip: host_clip,
+        fps: 30.0,
+        clip_duration: 2.0,
+        points,
+    });
+
+    scene.overlays.push(Overlay::Image(ImageOverlay {
+        id: "cap".into(),
+        source: PathBuf::from("cap.png"),
+        t_in: 0.0,
+        t_out: 2.0,
+        layout: vec![Keyframe::new(0.0, OverlayState::default())],
+        modifiers: Vec::new(),
+        skeleton_attachment: Some(SkeletonAttachment {
+            skeleton_id: "hero_skel".into(),
+            point_name: "hat".into(),
+            offset: [0.0, 0.0],
+            scale: 1.0,
+            follow_rotation: false,
+        }),
+        effects: Vec::new(),
+        animated_params: Default::default(),
+        chroma_key: None,
+    }));
+
+    let graph = build_filter_graph(&scene);
+    assert!(
+        graph.contains("1080.0000"),
+        "skeleton-attached overlay didn't use host source width fallback:\n{graph}",
+    );
+    // The point's normalised X coords (0.4, 0.6) must appear in the
+    // piecewise expression — proves the skeleton track is being
+    // sampled rather than the legacy layout (which would emit 0.5).
+    assert!(
+        graph.contains("0.400000") && graph.contains("0.600000"),
+        "skeleton point keyframes (0.4, 0.6) not threaded into expression:\n{graph}",
+    );
+}
+
+#[test]
+fn actor_skeleton_attachment_overrides_own_world_pos() {
+    // When an actor itself binds to a skeleton point (the
+    // `Actor.skeleton_attachments[0]` override path), its world
+    // position must come from that skeleton, not from the legacy
+    // layout's `pos = [0.5, 0.7]`. We use a point whose Y differs
+    // from the legacy default so the override is detectable.
+    use memstroy_core::skeleton::{
+        PointState, SkeletonAttachment, SkeletonPoint, SkeletonTemplate,
+    };
+    use std::collections::BTreeMap;
+
+    let mut scene = baseline_scene();
+    // Host clip provides the skeleton; a separate "follower" actor
+    // is the one that binds to the host's hat point.
+    let host = baseline_actor("hero");
+    let host_clip = host.source.clone();
+    scene.actors.push(host);
+
+    let mut follower = baseline_actor("a2");
+    follower.skeleton_attachments.push(SkeletonAttachment {
+        skeleton_id: "hero_skel".into(),
+        point_name: "hat".into(),
+        offset: [0.0, 0.0],
+        scale: 1.0,
+        follow_rotation: false,
+    });
+    scene.actors.push(follower);
+
+    let mut points = BTreeMap::new();
+    let mut hat = SkeletonPoint {
+        name: "hat".into(),
+        ..Default::default()
+    };
+    hat.track = vec![Keyframe::new(
+        0.0,
+        PointState { x: 0.25, y: 0.15, scale: 1.0, rotation_deg: 0.0 },
+    )];
+    points.insert("hat".into(), hat);
+    scene.skeleton_templates.push(SkeletonTemplate {
+        name: "hero_skel".into(),
+        source_clip: host_clip,
+        fps: 30.0,
+        clip_duration: 2.0,
+        points,
+    });
+
+    let graph = build_filter_graph(&scene);
+    assert!(
+        graph.contains("0.250000"),
+        "actor-skeleton-attached follower didn't take its X from the skeleton point (0.25):\n{graph}",
+    );
+}
