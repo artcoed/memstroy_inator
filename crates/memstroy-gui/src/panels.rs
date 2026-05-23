@@ -2743,19 +2743,63 @@ fn inspector_masks_section(
                         ui.checkbox(invert, crate::i18n::t("Invert (hide inside)"));
                         // "Repaint" arms the canvas tool that matches
                         // this mask's shape so the user can overwrite
-                        // its geometry with a fresh drag.
-                        let tool = match shape {
-                            MaskShape::Rect { .. } => MaskTool::RectMask,
-                            MaskShape::Ellipse { .. } => MaskTool::EllipseMask,
-                            MaskShape::Polygon { .. } => MaskTool::FreehandMask,
-                        };
-                        let label = format!(
-                            "\u{270E} {} {}",
-                            crate::i18n::t("Repaint"),
-                            shape_kind_name(shape),
-                        );
-                        if ui.button(label).clicked() {
-                            *mask_tool = tool;
+                        // its geometry with a fresh drag. Polygon
+                        // masks expose two repaint modes side-by-side
+                        // (freehand drag-trail and segment click-by-
+                        // click) because both author the same
+                        // `MaskShape::Polygon` data — the user picks
+                        // whichever input style suits their gesture.
+                        match shape {
+                            MaskShape::Rect { .. } => {
+                                let label = format!(
+                                    "\u{270E} {} {}",
+                                    crate::i18n::t("Repaint"),
+                                    shape_kind_name(shape),
+                                );
+                                if ui.button(label).clicked() {
+                                    *mask_tool = MaskTool::RectMask;
+                                }
+                            }
+                            MaskShape::Ellipse { .. } => {
+                                let label = format!(
+                                    "\u{270E} {} {}",
+                                    crate::i18n::t("Repaint"),
+                                    shape_kind_name(shape),
+                                );
+                                if ui.button(label).clicked() {
+                                    *mask_tool = MaskTool::EllipseMask;
+                                }
+                            }
+                            MaskShape::Polygon { .. } => {
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .button(format!(
+                                            "\u{270D} {} {}",
+                                            crate::i18n::t("Repaint"),
+                                            crate::i18n::t("freehand"),
+                                        ))
+                                        .on_hover_text(crate::i18n::t(
+                                            "Drag a continuous trail across the canvas to redraw this polygon.",
+                                        ))
+                                        .clicked()
+                                    {
+                                        *mask_tool = MaskTool::FreehandMask;
+                                    }
+                                    if ui
+                                        .button(format!(
+                                            "\u{2B20} {} {}",
+                                            crate::i18n::t("Repaint"),
+                                            crate::i18n::t("segments"),
+                                        ))
+                                        .on_hover_text(crate::i18n::t(
+                                            "Click on the canvas to plant new polygon vertices; click near the first or double-click to close.",
+                                        ))
+                                        .clicked()
+                                    {
+                                        *mask_tool = MaskTool::SegmentMask;
+                                    }
+                                });
+                            }
                         }
                     }
                     EffectKind::Crop { left, top, right, bottom } => {
@@ -2878,6 +2922,25 @@ fn inspector_masks_section(
                 effects.push(memstroy_core::Effect::mask_freehand());
                 *mask_tool = MaskTool::FreehandMask;
             }
+            // Segment selection mask. The bilingual sister tool to
+            // Freehand: the user lays down polygon vertices click-by-
+            // click instead of dragging a continuous trail. Useful
+            // for hard-edged outlines (sticker borders, geometric
+            // logos) where freehand drag is too noisy. Same shape
+            // type (`MaskShape::Polygon`) so the renderer / FFmpeg
+            // export pipeline doesn't need a new branch — only the
+            // editor input handler differs.
+            if ui
+                .button(crate::i18n::t("\u{2B20} Segment selection"))
+                .on_hover_text(crate::i18n::t(
+                    "Click on the canvas to plant polygon vertices; click near the first point or double-click to close. Right-click pops the last vertex.",
+                ))
+                .clicked()
+            {
+                effects.push(memstroy_core::Effect::mask_freehand());
+                *mask_tool = MaskTool::SegmentMask;
+            }
+            ui.end_row();
             // Eyedropper colour-key mask. Clicking arms the canvas
             // tool AND pushes a placeholder ColorKey effect so the
             // user can already tweak similarity / blend without

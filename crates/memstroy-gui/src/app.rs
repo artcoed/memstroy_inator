@@ -910,6 +910,23 @@ impl App {
                 if self.state.mask_tool != crate::state::MaskTool::None {
                     self.state.mask_tool = crate::state::MaskTool::None;
                     self.state.mask_draft_points.clear();
+                    self.state.mask_segment_cursor_uv = None;
+                    // Also drop any in-flight mask-draw carrier so a
+                    // segment-mask polygon under construction doesn't
+                    // leak into the regular transform pipeline. The
+                    // other mask tools commit on pointer-release so
+                    // their carrier is short-lived, but the segment
+                    // tool keeps its `DrawMask` mode alive across
+                    // clicks until the polygon is closed — Esc is
+                    // the only place that gesture can be aborted
+                    // mid-flight.
+                    if matches!(
+                        self.state.canvas_drag.mode,
+                        crate::state::CanvasDragMode::DrawMask { .. }
+                    ) {
+                        self.state.canvas_drag.mode =
+                            crate::state::CanvasDragMode::None;
+                    }
                     self.state.status = "Mask tool cancelled".into();
                 }
             }

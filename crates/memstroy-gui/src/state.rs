@@ -607,6 +607,16 @@ pub struct EditorState {
     /// `CanvasDragMode` derives `Copy` and can't store a Vec.
     pub mask_draft_points: Vec<[f32; 2]>,
 
+    /// Live cursor UV (in element-local coords, 0..1) updated every
+    /// frame while `MaskTool::SegmentMask` is armed and the user is
+    /// hovering over the selected element. The mask-draft renderer
+    /// reads this to draw a "rubber-band" line from the last
+    /// committed vertex to the live cursor — and a dashed
+    /// closure-preview from the cursor back to the first vertex.
+    /// `None` when the cursor is off-element or the tool is idle.
+    /// Reset alongside `mask_draft_points` on commit / cancel.
+    pub mask_segment_cursor_uv: Option<[f32; 2]>,
+
     /// State for the "Shared" library tab — talks to a separate
     /// `memstroy-assets-server` instance over HTTP and lazily streams
     /// previews / files into the editor.
@@ -2388,7 +2398,32 @@ pub enum MaskTool {
     /// `EffectKind::ColorKey` entry onto the layer's effect stack.
     /// Works on actors (sampled from the decoded frame cache) and
     /// image overlays (sampled from the source PNG) alike.
+    ///
+    /// **Activation lives in the inspector "Masks" panel** — the
+    /// floating canvas toolbar no longer exposes a button for this
+    /// tool because the per-effect controls (similarity / blend /
+    /// spill / invert) need to be visible while the user is picking,
+    /// and the inspector is the only place those sliders live. The
+    /// canvas-side click handler is unchanged: once the inspector
+    /// arms the tool, the next click on the picture samples the
+    /// pixel and writes it to the colour-key entry.
     Eyedropper,
+    /// **Segment selection mask** — click-by-click polygon
+    /// construction with an eyedropper-style crosshair cursor. Each
+    /// click plants a vertex; segments are drawn between consecutive
+    /// vertices. Closure happens in three equivalent ways so the
+    /// user can pick whichever feels most natural for the current
+    /// gesture:
+    ///   * click near the first vertex (with ≥ 3 vertices placed),
+    ///   * double-click anywhere,
+    ///   * press Enter / Return.
+    /// Right-click pops the last vertex (handy for backing out of a
+    /// misplaced corner without restarting the polygon). Esc cancels
+    /// the entire draft. The committed shape is identical to a
+    /// freehand polygon (`MaskShape::Polygon`) so downstream sampling
+    /// (`apply_mask_alpha`, FFmpeg export) works unchanged — what
+    /// differs is *how* the user lays the points down.
+    SegmentMask,
 }
 
 impl MaskTool {
@@ -2401,6 +2436,7 @@ impl MaskTool {
             MaskTool::EllipseMask => "Ellipse mask",
             MaskTool::FreehandMask => "Freehand mask",
             MaskTool::Eyedropper => "Eyedropper mask",
+            MaskTool::SegmentMask => "Segment mask",
         }
     }
 }
