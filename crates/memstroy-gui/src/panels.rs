@@ -2130,6 +2130,32 @@ fn inspector_effect_kind_params(
             inspector_effect_anim_slider(
                 ui, eff, "p3", "Crop bottom", 0.0..=0.49, false, t_local, ("eff_crop_b", ei));
         }
+        K::Mask { .. } => {
+            // Mask: feather slider + invert toggle + a "Repaint" button
+            // that arms the matching canvas tool so the user can
+            // overwrite the shape geometry without leaving the
+            // inspector. The shape itself is drawn directly on the
+            // canvas while painting, not through this widget.
+            inspector_effect_anim_slider(
+                ui, eff, "p0", "Feather", 0.0..=0.5, false, t_local, ("eff_mask_f", ei));
+            if let memstroy_core::EffectKind::Mask { invert, shape, .. } = &mut eff.kind {
+                ui.horizontal(|ui| {
+                    ui.checkbox(invert, "Invert");
+                    let kind_label = match shape {
+                        memstroy_core::MaskShape::Rect { .. } => "Rectangle".to_string(),
+                        memstroy_core::MaskShape::Ellipse { .. } => "Ellipse".to_string(),
+                        memstroy_core::MaskShape::Polygon { points } => {
+                            format!("Polygon ({} points)", points.len())
+                        }
+                    };
+                    ui.label(
+                        RichText::new(format!("Shape: {}", kind_label))
+                            .size(10.0)
+                            .color(COL_TEXT_DIM),
+                    );
+                });
+            }
+        }
         K::Grayscale | K::Sepia | K::Invert | K::MirrorH | K::MirrorV
             | K::OldFilm | K::Vhs => unreachable!(),
     }
@@ -2166,6 +2192,7 @@ fn effect_kind_param_get(
         K::Crop { top, .. } if key == "p1" => Some(*top),
         K::Crop { right, .. } if key == "p2" => Some(*right),
         K::Crop { bottom, .. } if key == "p3" => Some(*bottom),
+        K::Mask { feather, .. } if key == "p0" => Some(*feather),
         _ => None,
     }
 }
@@ -2203,6 +2230,7 @@ fn effect_kind_param_set(
         K::Crop { top, .. } if key == "p1" => *top = new_val.clamp(0.0, 0.49),
         K::Crop { right, .. } if key == "p2" => *right = new_val.clamp(0.0, 0.49),
         K::Crop { bottom, .. } if key == "p3" => *bottom = new_val.clamp(0.0, 0.49),
+        K::Mask { feather, .. } if key == "p0" => *feather = new_val.clamp(0.0, 0.5),
         _ => {}
     }
 }

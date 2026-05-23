@@ -3,7 +3,7 @@
 //! Renders an infinite 2D canvas with pan/zoom, the render frame
 //! rectangle, and all scene elements positioned in world pixels.
 
-use egui::{Color32, Pos2, Rect, Rounding, Sense, Stroke, Vec2};
+use egui::{Color32, Pos2, Rect, RichText, Rounding, Sense, Stroke, Vec2};
 use memstroy_core::*;
 use std::collections::HashSet;
 
@@ -137,6 +137,14 @@ pub fn canvas_preview(ui: &mut egui::Ui, state: &mut EditorState) {
     // ── Handle pan/zoom input ──
     handle_canvas_input(ui, &response, state, viewport_size, full_rect);
 
+    // ── Mask / crop drawing tools — when one of the tools is armed
+    //    we hand the pointer gesture off to the mask painter BEFORE
+    //    the regular transform pipeline so a click+drag never
+    //    accidentally moves the element underneath the brush.
+    if mask_tool_active(state) {
+        handle_mask_draw_input(ui, &response, state, full_rect, viewport_size);
+    }
+
     // ── Draw grid ──
     draw_canvas_grid(&painter, full_rect, &state.canvas_viewport, viewport_size);
 
@@ -164,6 +172,12 @@ pub fn canvas_preview(ui: &mut egui::Ui, state: &mut EditorState) {
     // ── Marquee (rubber-band) selection rectangle, drawn above
     //    everything else so the user can see what they're lassoing.
     draw_canvas_marquee(&painter, full_rect, state, viewport_size);
+
+    // ── Mask / crop drawing preview overlay (drawn last so the
+    //    in-progress shape sits on top of every gizmo). Visual only;
+    //    the actual masking is applied through the image-effects
+    //    pipeline once the gesture is committed.
+    draw_mask_draft(&painter, full_rect, state, viewport_size);
 
     // ── Library drag-to-canvas: visual ghost + drop accept ──
     handle_canvas_asset_drag(ui, state, full_rect, viewport_size);
@@ -2213,6 +2227,14 @@ fn draw_selection_gizmo(
         draw_selection_handles(painter, full_rect, state, viewport_size);
         return;
     }
+    // Mask / crop drawing tools own the pointer for the duration of
+    // their gesture — render the gizmo handles for visual context but
+    // skip the drag-state machine so the regular Move/Resize handlers
+    // don't fight the mask painter.
+    if mask_tool_active(state) {
+        draw_selection_handles(painter, full_rect, state, viewport_size);
+        return;
+    }
 
     // Drag state machine
     if response.drag_started() {
@@ -2802,6 +2824,11 @@ fn apply_drag(
             let total_delta = new_rot - initial_rot_deg;
             broadcast_multi_rotation(state, total_delta);
         }
+
+        // Mask drawing modes are handled in `handle_mask_draw_input` —
+        // they don't go through the same world-pixel transform pipeline
+        // as the move / resize / rotate modes above.
+        CanvasDragMode::DrawMask { .. } => {}
     }
 }
 
@@ -4853,6 +4880,9 @@ fn draw_viewport_controls(
     state: &mut EditorState,
     viewport_size: [f32; 2],
 ) {
+    // ── Mask / crop tool palette (top-left) ──
+    draw_mask_toolbar(ui, full_rect, state);
+
     // Floating controls in the bottom-right corner
     let btn_size = Vec2::new(24.0, 24.0);
     let margin = 8.0;
@@ -4906,9 +4936,433 @@ fn draw_viewport_controls(
 
 
 
-// ─── SNAP HELPERS ────────────────────────────────────────────────────
+// ─── MASK / CROP TOOLBAR ─────────────────────────────────────────────
+//
+// A small floating palette anchored to the top-left of the canvas.
+// Toggling a tool sets `EditorState::mask_tool`; subsequent drag input
+// is dispatched to `handle_mask_draw_input` instead of the regular
+// transform pipeline. Pressing the same button again or pressing
+// Escape disarms the tool.
 
-/// Identifies which element to exclude from the snap-target search so that an
+/// Draw the mask / crop tool palette and forward clicks back to
+/// `EditorState::mask_tool`. The buttons sit on top of every other
+/// canvas element so they remain accessible even while a marquee /
+/// drag is in flight. A short status badge in the top-centre tells
+/// the user which tool is armed and how to commit / cancel.
+fn draw_mask_toolbar(
+    ui: &mut egui::Ui,
+    full_rect: Rect,
+    state: &mut EditorState,
+) {
+    use crate::state::MaskTool;
+    let margin = 8.0;
+    let btn_w = 28.0;
+    let btn_h = 24.0;
+    let gap = 4.0;
+    let tools: [(MaskTool, &str, &str); 5] = [
+        (MaskTool::None, "\u{2196}", "Select / transform (Esc)"),
+        (MaskTool::Crop, "\u{2702}", "Crop tool — drag a rectangle to crop"),
+        (MaskTool::RectMask, "\u{25A1}", "Rectangle mask — drag to mask outside the rect"),
+        (MaskTool::EllipseMask, "\u{25CB}", "Ellipse mask — drag to mask outside the ellipse"),
+        (MaskTool::FreehandMask, "\u{270F}", "Freehand mask — paint a closed polygon"),
+    ];
+    for (i, (tool, glyph, hint)) in tools.iter().enumerate() {
+        let rect = Rect::from_min_size(
+            Pos2::new(full_rect.min.x + margin + (btn_w + gap) * i as f32,
+                     full_rect.min.y + margin),
+            Vec2::new(btn_w, btn_h),
+        );
+        let active = state.mask_tool == *tool;
+        let mut btn = egui::Button::new(
+            RichText::new(*glyph)
+                .size(14.0)
+                .color(if active { Color32::BLACK } else { Color32::from_rgb(220, 220, 230) }),
+        );
+        if active {
+            btn = btn.fill(Color32::from_rgb(255, 200, 50));
+        } else {
+            btn = btn.fill(Color32::from_rgba_premultiplied(30, 30, 40, 220));
+        }
+        let resp = ui.put(rect, btn).on_hover_text(*hint);
+        if resp.clicked() {
+            state.mask_tool = if active { MaskTool::None } else { *tool };
+            state.mask_draft_points.clear();
+        }
+    }
+
+    // ── Status badge ──
+    if state.mask_tool != MaskTool::None {
+        let label = format!(
+            "{} active — drag inside the selected element. Esc to cancel.",
+            state.mask_tool.label()
+        );
+        let pos = Pos2::new(
+            full_rect.center().x,
+            full_rect.min.y + margin + btn_h * 0.5,
+        );
+        let painter = ui.painter_at(full_rect);
+        let galley = painter.layout_no_wrap(
+            label,
+            egui::FontId::proportional(11.0),
+            Color32::from_rgb(20, 20, 30),
+        );
+        let pad = Vec2::new(8.0, 3.0);
+        let bg_rect = Rect::from_center_size(
+            pos,
+            galley.size() + pad * 2.0,
+        );
+        painter.rect_filled(
+            bg_rect,
+            Rounding::same(4.0),
+            Color32::from_rgb(255, 200, 50),
+        );
+        painter.galley(
+            bg_rect.min + pad,
+            galley,
+            Color32::from_rgb(20, 20, 30),
+        );
+    }
+}
+
+// ─── MASK / CROP DRAWING INPUT ───────────────────────────────────────
+//
+// Uses the same world-pixel coordinate system as the rest of the
+// canvas. The drag origin is captured when the pointer first goes
+// down inside the selected element's bounding box, then on every
+// frame while the button is held the cursor's UV position relative
+// to that bounding box is stored / appended. On release the resulting
+// shape is committed to the element's `effects` stack as the right
+// `EffectKind` variant for the active tool.
+
+use crate::state::MaskTool;
+
+/// True when the mask drawing pipeline should consume this pointer
+/// gesture instead of the default transform handler. Always returns
+/// `false` when no tool is armed.
+pub(crate) fn mask_tool_active(state: &EditorState) -> bool {
+    state.mask_tool != MaskTool::None
+}
+
+/// Convert a screen-space pointer to UV (0..1) inside the selected
+/// element's screen rect. Returns `None` when no element is selected
+/// or the rect has zero size.
+fn screen_to_element_uv(
+    state: &EditorState,
+    full_rect: Rect,
+    viewport_size: [f32; 2],
+    pointer: Pos2,
+) -> Option<([f32; 2], Selection, Rect)> {
+    let elem_rect = selected_element_screen_rect(state, full_rect, viewport_size)?;
+    if elem_rect.width() <= 0.5 || elem_rect.height() <= 0.5 {
+        return None;
+    }
+    let u = (pointer.x - elem_rect.min.x) / elem_rect.width();
+    let v = (pointer.y - elem_rect.min.y) / elem_rect.height();
+    Some(([u.clamp(-0.5, 1.5), v.clamp(-0.5, 1.5)], state.selection, elem_rect))
+}
+
+/// Run the mask drawing input handler. Must be called from
+/// `canvas_preview` BEFORE the regular transform pipeline so the mask
+/// gesture has priority. Returns `true` when the gesture has been
+/// consumed (caller should skip the default handlers).
+pub(crate) fn handle_mask_draw_input(
+    ui: &egui::Ui,
+    response: &egui::Response,
+    state: &mut EditorState,
+    full_rect: Rect,
+    viewport_size: [f32; 2],
+) -> bool {
+    if !mask_tool_active(state) {
+        return false;
+    }
+    // The crop / rect / ellipse / freehand tools all dispatch through
+    // the same code path; a single `CanvasDragMode::DrawMask` carries
+    // the active tool tag.
+    let pointer_pos = ui.input(|i| i.pointer.hover_pos());
+
+    // Pointer-down inside the selected element starts the drag.
+    if response.drag_started() || (response.clicked() && pointer_pos.is_some()) {
+        if let Some(p) = pointer_pos {
+            if let Some((uv, target, _rect)) =
+                screen_to_element_uv(state, full_rect, viewport_size, p)
+            {
+                state.canvas_drag.mode = crate::state::CanvasDragMode::DrawMask {
+                    tool: state.mask_tool,
+                    start_uv: uv,
+                    target,
+                };
+                state.mask_draft_points.clear();
+                state.mask_draft_points.push(uv);
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+            }
+        }
+    }
+
+    // While the drag is in flight, accumulate freehand vertices and
+    // request a per-frame repaint so the preview line follows the
+    // cursor smoothly.
+    if let crate::state::CanvasDragMode::DrawMask { tool, .. } = state.canvas_drag.mode {
+        ui.ctx().request_repaint();
+        if let Some(p) = pointer_pos {
+            if let Some((uv, _, _)) =
+                screen_to_element_uv(state, full_rect, viewport_size, p)
+            {
+                if matches!(tool, MaskTool::FreehandMask) {
+                    // Decimate so the path doesn't accumulate thousands
+                    // of duplicate points when the cursor barely moves.
+                    let push = match state.mask_draft_points.last() {
+                        Some(prev) => {
+                            let dx = uv[0] - prev[0];
+                            let dy = uv[1] - prev[1];
+                            (dx * dx + dy * dy).sqrt() > 0.005
+                        }
+                        None => true,
+                    };
+                    if push {
+                        state.mask_draft_points.push(uv);
+                    }
+                } else if state.mask_draft_points.len() >= 2 {
+                    state.mask_draft_points[1] = uv;
+                } else {
+                    state.mask_draft_points.push(uv);
+                }
+            }
+        }
+    }
+
+    // Pointer-release commits the shape.
+    let released = ui.input(|i| i.pointer.any_released());
+    if released {
+        if let crate::state::CanvasDragMode::DrawMask { tool, start_uv, target } =
+            state.canvas_drag.mode
+        {
+            commit_mask_draft(state, tool, start_uv, target);
+            state.canvas_drag.mode = crate::state::CanvasDragMode::None;
+            state.mask_draft_points.clear();
+        }
+    }
+    true
+}
+
+/// Push the painted shape onto the target element's `effects` stack.
+/// Crop becomes `EffectKind::Crop`; the other tools build an
+/// `EffectKind::Mask` carrying the matching shape.
+fn commit_mask_draft(
+    state: &mut EditorState,
+    tool: MaskTool,
+    start_uv: [f32; 2],
+    target: Selection,
+) {
+    let pts = state.mask_draft_points.clone();
+    if pts.is_empty() { return; }
+    // Bound the rect / ellipse to the smallest enclosing axis-aligned
+    // box of the drag (start, current).
+    let last_uv = *pts.last().unwrap_or(&start_uv);
+    let lx = start_uv[0].min(last_uv[0]).clamp(0.0, 1.0);
+    let rx = start_uv[0].max(last_uv[0]).clamp(0.0, 1.0);
+    let ty = start_uv[1].min(last_uv[1]).clamp(0.0, 1.0);
+    let by = start_uv[1].max(last_uv[1]).clamp(0.0, 1.0);
+    if (rx - lx).abs() < 0.005 && (by - ty).abs() < 0.005 && tool != MaskTool::FreehandMask {
+        // Treat tiny gestures as a misclick — don't commit anything.
+        return;
+    }
+
+    let new_effect = match tool {
+        MaskTool::Crop => {
+            // Crop insets are measured FROM each edge in 0..0.49.
+            let l = lx.clamp(0.0, 0.49);
+            let t = ty.clamp(0.0, 0.49);
+            let r = (1.0 - rx).clamp(0.0, 0.49);
+            let b = (1.0 - by).clamp(0.0, 0.49);
+            Some(memstroy_core::Effect::new(
+                memstroy_core::EffectKind::Crop {
+                    left: l,
+                    top: t,
+                    right: r,
+                    bottom: b,
+                },
+            ))
+        }
+        MaskTool::RectMask => Some(memstroy_core::Effect::new(
+            memstroy_core::EffectKind::Mask {
+                shape: memstroy_core::MaskShape::Rect {
+                    left: lx,
+                    top: ty,
+                    right: rx,
+                    bottom: by,
+                },
+                feather: 0.0,
+                invert: false,
+            },
+        )),
+        MaskTool::EllipseMask => {
+            let cx = (lx + rx) * 0.5;
+            let cy = (ty + by) * 0.5;
+            let rxx = ((rx - lx) * 0.5).max(0.005);
+            let ryy = ((by - ty) * 0.5).max(0.005);
+            Some(memstroy_core::Effect::new(
+                memstroy_core::EffectKind::Mask {
+                    shape: memstroy_core::MaskShape::Ellipse {
+                        cx,
+                        cy,
+                        rx: rxx,
+                        ry: ryy,
+                    },
+                    feather: 0.0,
+                    invert: false,
+                },
+            ))
+        }
+        MaskTool::FreehandMask => {
+            if pts.len() < 3 { None } else {
+                let clamped: Vec<[f32; 2]> = pts
+                    .into_iter()
+                    .map(|p| [p[0].clamp(0.0, 1.0), p[1].clamp(0.0, 1.0)])
+                    .collect();
+                Some(memstroy_core::Effect::new(
+                    memstroy_core::EffectKind::Mask {
+                        shape: memstroy_core::MaskShape::Polygon { points: clamped },
+                        feather: 0.0,
+                        invert: false,
+                    },
+                ))
+            }
+        }
+        MaskTool::None => None,
+    };
+
+    let Some(effect) = new_effect else { return; };
+
+    // Fold the new effect into the target element's stack inside a
+    // single `mutate` call so it lands as one undo step.
+    state.mutate(|scene| {
+        match target {
+            Selection::Actor(i) if i < scene.actors.len() => {
+                scene.actors[i].effects.push(effect);
+            }
+            Selection::Overlay(i) if i < scene.overlays.len() => {
+                let effects = match &mut scene.overlays[i] {
+                    memstroy_core::Overlay::Text(t) => &mut t.effects,
+                    memstroy_core::Overlay::Image(im) => &mut im.effects,
+                    memstroy_core::Overlay::Video(v) => &mut v.effects,
+                };
+                effects.push(effect);
+            }
+            _ => {}
+        }
+    });
+    state.status = format!("\u{2702} {} applied", tool.label());
+}
+
+/// Draw the in-progress mask shape on top of the canvas while the
+/// user is dragging. Visual only — committed shapes render through
+/// the live image-effects pipeline.
+fn draw_mask_draft(
+    painter: &egui::Painter,
+    full_rect: Rect,
+    state: &EditorState,
+    viewport_size: [f32; 2],
+) {
+    let crate::state::CanvasDragMode::DrawMask { tool, start_uv, .. } =
+        state.canvas_drag.mode
+    else {
+        return;
+    };
+    let Some(elem_rect) =
+        selected_element_screen_rect(state, full_rect, viewport_size)
+    else {
+        return;
+    };
+    let to_screen = |uv: [f32; 2]| {
+        Pos2::new(
+            elem_rect.min.x + uv[0] * elem_rect.width(),
+            elem_rect.min.y + uv[1] * elem_rect.height(),
+        )
+    };
+    let stroke_main = Stroke::new(1.5, Color32::from_rgb(255, 200, 50));
+    let stroke_dash = Stroke::new(1.0, Color32::from_rgba_premultiplied(255, 200, 50, 160));
+    let last_uv = *state
+        .mask_draft_points
+        .last()
+        .unwrap_or(&start_uv);
+    match tool {
+        MaskTool::Crop | MaskTool::RectMask => {
+            let a = to_screen(start_uv);
+            let b = to_screen(last_uv);
+            let r = Rect::from_two_pos(a, b);
+            painter.rect_stroke(r, Rounding::ZERO, stroke_main);
+            // Dim the area being trimmed away so the user can preview
+            // the cropped result without committing.
+            if matches!(tool, MaskTool::Crop) {
+                let dim = Color32::from_rgba_premultiplied(0, 0, 0, 110);
+                let er = elem_rect;
+                if r.min.y > er.min.y {
+                    painter.rect_filled(
+                        Rect::from_min_max(er.min, Pos2::new(er.max.x, r.min.y)),
+                        Rounding::ZERO, dim);
+                }
+                if r.max.y < er.max.y {
+                    painter.rect_filled(
+                        Rect::from_min_max(Pos2::new(er.min.x, r.max.y), er.max),
+                        Rounding::ZERO, dim);
+                }
+                if r.min.x > er.min.x {
+                    painter.rect_filled(
+                        Rect::from_min_max(
+                            Pos2::new(er.min.x, r.min.y),
+                            Pos2::new(r.min.x, r.max.y),
+                        ),
+                        Rounding::ZERO, dim);
+                }
+                if r.max.x < er.max.x {
+                    painter.rect_filled(
+                        Rect::from_min_max(
+                            Pos2::new(r.max.x, r.min.y),
+                            Pos2::new(er.max.x, r.max.y),
+                        ),
+                        Rounding::ZERO, dim);
+                }
+            }
+        }
+        MaskTool::EllipseMask => {
+            let a = to_screen(start_uv);
+            let b = to_screen(last_uv);
+            let r = Rect::from_two_pos(a, b);
+            // Approximate an ellipse with a dense polyline.
+            let cx = r.center().x;
+            let cy = r.center().y;
+            let rx = r.width() * 0.5;
+            let ry = r.height() * 0.5;
+            let segments = 64;
+            let mut prev = Pos2::new(cx + rx, cy);
+            for s in 1..=segments {
+                let theta = (s as f32 / segments as f32) * std::f32::consts::TAU;
+                let p = Pos2::new(cx + rx * theta.cos(), cy + ry * theta.sin());
+                painter.line_segment([prev, p], stroke_main);
+                prev = p;
+            }
+        }
+        MaskTool::FreehandMask => {
+            if state.mask_draft_points.len() >= 2 {
+                let mut prev = to_screen(state.mask_draft_points[0]);
+                for &uv in state.mask_draft_points.iter().skip(1) {
+                    let cur = to_screen(uv);
+                    painter.line_segment([prev, cur], stroke_main);
+                    prev = cur;
+                }
+                // Ghost line back to the start so the user knows the
+                // path will be closed on release.
+                if let Some(&first) = state.mask_draft_points.first() {
+                    painter.line_segment([prev, to_screen(first)], stroke_dash);
+                }
+            }
+        }
+        MaskTool::None => {}
+    }
+}
+
+
+// ─── SNAP HELPERS ────────────────────────────────────────────────────
 /// element doesn't snap to itself.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SnapExclude {
