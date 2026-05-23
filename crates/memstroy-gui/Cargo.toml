@@ -36,3 +36,11 @@ rodio = { workspace = true }
 # `json` is enabled here (only in the GUI crate) for the shared library
 # panel — the rest of the workspace doesn't pay for serde_json wiring.
 reqwest = { workspace = true, features = ["json"] }
+# System clipboard access. Used to honour Ctrl+V on the canvas: when
+# the OS clipboard contains an image (e.g. a screenshot or a
+# "copy image" from the browser), we save it into the project's image
+# library, add an Overlay::Image at the playhead, and route to the
+# first empty video lane (or a freshly-spawned one). The `image-data`
+# feature pulls in the `get_image` API; the rest of the default
+# features (notification icon helpers etc.) are not needed.
+arboard = { version = "3", default-features = false, features = ["image-data"] }
