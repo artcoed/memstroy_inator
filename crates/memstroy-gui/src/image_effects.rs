@@ -31,7 +31,7 @@
 //! images get a single decode pass, so the cost is paid once and the
 //! result is cached until the effect parameters change.
 
-use memstroy_core::effects::{Effect, EffectKind};
+use memstroy_core::effects::{Effect, EffectKind, MaskShape};
 
 /// Apply the effect stack in `effects` to an RGBA8 buffer in place.
 /// `(w, h)` are the image dimensions in pixels.
@@ -176,6 +176,9 @@ pub fn apply_effect_stack(
                 crop.2 = (crop.2 + r).min(0.49);
                 crop.3 = (crop.3 + b).min(0.49);
             }
+            EffectKind::Mask { shape, feather, invert } => {
+                apply_mask_alpha(rgba, w, h, shape, *feather, *invert, i);
+            }
         }
     }
     crop
@@ -222,9 +225,96 @@ pub fn signature(effects: &[Effect]) -> u64 {
                 ((right * 1000.0) as i32).hash(&mut h);
                 ((bottom * 1000.0) as i32).hash(&mut h);
             }
+            EffectKind::Mask { shape, feather, invert } => {
+                25u8.hash(&mut h);
+                ((feather * 1000.0) as i32).hash(&mut h);
+                invert.hash(&mut h);
+                hash_mask_shape(shape, &mut h);
+            }
         }
     }
     h.finish()
+}
+
+#[inline]
+fn hash_mask_shape<H: std::hash::Hasher>(shape: &MaskShape, h: &mut H) {
+    use std::hash::Hash;
+    std::mem::discriminant(shape).hash(h);
+    match shape {
+        MaskShape::Rect { left, top, right, bottom } => {
+            ((left * 1000.0) as i32).hash(h);
+            ((top * 1000.0) as i32).hash(h);
+            ((right * 1000.0) as i32).hash(h);
+            ((bottom * 1000.0) as i32).hash(h);
+        }
+        MaskShape::Ellipse { cx, cy, rx, ry } => {
+            ((cx * 1000.0) as i32).hash(h);
+            ((cy * 1000.0) as i32).hash(h);
+            ((rx * 1000.0) as i32).hash(h);
+            ((ry * 1000.0) as i32).hash(h);
+        }
+        MaskShape::Polygon { points } => {
+            (points.len() as u32).hash(h);
+            for p in points {
+                ((p[0] * 1000.0) as i32).hash(h);
+                ((p[1] * 1000.0) as i32).hash(h);
+            }
+        }
+    }
+}
+
+/// Apply a mask shape to the image's alpha channel. Pixels INSIDE the
+/// mask keep their original alpha; pixels OUTSIDE get their alpha
+/// multiplied by `(1 - intensity)` (so `intensity == 1` = fully cut
+/// away). `feather` softens the edge in UV space.
+fn apply_mask_alpha(
+    rgba: &mut Vec<u8>,
+    w: u32,
+    h: u32,
+    shape: &MaskShape,
+    feather: f32,
+    invert: bool,
+    intensity: f32,
+) {
+    if rgba.len() < (w as usize) * (h as usize) * 4 { return; }
+    let i = intensity.clamp(0.0, 1.0);
+    let feather = feather.clamp(0.0, 0.5);
+    let inv_w = 1.0 / (w as f32).max(1.0);
+    let inv_h = 1.0 / (h as f32).max(1.0);
+    for y in 0..h {
+        let v = (y as f32 + 0.5) * inv_h;
+        let row = (y as usize) * (w as usize) * 4;
+        for x in 0..w {
+            let u = (x as f32 + 0.5) * inv_w;
+            let alpha_keep = sample_mask_alpha(shape, u, v, feather, invert);
+            // Blend `alpha_keep` against the original alpha by `intensity`:
+            // intensity = 0 → original alpha unchanged; intensity = 1 →
+            // alpha replaced by `original * alpha_keep`.
+            let idx = row + (x as usize) * 4 + 3;
+            let orig = rgba[idx] as f32;
+            let target = orig * alpha_keep;
+            let out = orig + (target - orig) * i;
+            rgba[idx] = out.clamp(0.0, 255.0) as u8;
+        }
+    }
+}
+
+/// Returns the per-pixel alpha keep factor (0..1) for `(u, v)` in UV
+/// coords. Honours `feather` (UV-space soft edge) and `invert`.
+pub(crate) fn sample_mask_alpha(
+    shape: &MaskShape,
+    u: f32,
+    v: f32,
+    feather: f32,
+    invert: bool,
+) -> f32 {
+    let f = feather.max(1e-6);
+    let margin = shape.signed_margin_uv(u, v);
+    let mut keep = (margin / f + 0.5).clamp(0.0, 1.0);
+    if feather <= 1e-6 {
+        keep = if margin >= 0.0 { 1.0 } else { 0.0 };
+    }
+    if invert { 1.0 - keep } else { keep }
 }
 
 // ─── PIXEL OPS ──────────────────────────────────────────────────────

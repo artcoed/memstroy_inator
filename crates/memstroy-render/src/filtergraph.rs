@@ -1190,6 +1190,16 @@ fn effect_to_filter(kind: &EffectKind, i: f32) -> Option<String> {
             format!("rgbashift=rh=-{o}:bh={o}", o = (i * 6.0).round() as i32)
         }
         K::Bloom { radius } => format!("gblur=sigma={}", (radius * i).max(1.0)),
+        K::Mask { shape: _, feather: _, invert: _ } => {
+            // The mask shape geometry (rect / ellipse / polygon in UV
+            // space) is not currently expressible in a single-pass
+            // ffmpeg filter chain — proper export needs a generated
+            // alpha PNG plus an `alphamerge` step which the filtergraph
+            // builder doesn't yet emit. Skip the entry for now so the
+            // export pipeline doesn't break; the live preview still
+            // shows the masked result via the CPU image-effects path.
+            return None;
+        }
         K::Crop { left, top, right, bottom } => {
             // Express the visible window as a `crop=w:h:x:y` filter using
             // ffmpeg's `iw` / `ih` source dimensions. The sub-image is then
