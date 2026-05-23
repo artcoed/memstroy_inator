@@ -750,45 +750,55 @@ impl App {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        // Skip global shortcuts when any widget wants keyboard input —
-        // typing into a text overlay or a search box should not
-        // play/pause, undo, or delete things behind the user's back.
-        if ctx.wants_keyboard_input() {
-            return;
-        }
+        // Two-tier gating:
+        //
+        // 1. **Plain-key shortcuts** (Space, Delete, Esc) only fire
+        //    when nothing wants keyboard input — typing into a text
+        //    overlay or a search box should not play/pause, delete
+        //    things, or close popups behind the user's back.
+        // 2. **Modifier-based shortcuts** (Ctrl+Z/Y/D/C/V) fire
+        //    UNCONDITIONALLY via `consume_key`. This is the "deep
+        //    fix" the user asked for: previously the whole handler
+        //    bailed on `wants_keyboard_input`, which meant Ctrl+C and
+        //    Ctrl+V silently no-op'd whenever any TextEdit retained
+        //    focus (e.g. after typing in the title overlay's caption,
+        //    even if focus subsequently moved to the canvas). The
+        //    `consume_key` API also stops the focused text widget
+        //    from running its own copy/paste logic for the same key,
+        //    so we don't get a double dispatch.
+        let typing = ctx.wants_keyboard_input();
 
         let modifiers = ctx.input(|i| i.modifiers);
         let ctrl = modifiers.ctrl || modifiers.mac_cmd;
 
-        ctx.input(|i| {
-            // Space = Play/Pause
-            if i.key_pressed(egui::Key::Space) {
-                self.state.playing = !self.state.playing;
-                if self.state.playing {
-                    self.state.status = "\u{25B6} Playing".into();
-                } else {
-                    self.state.status = "\u{23F8} Paused".into();
-                }
-            }
+        // Modifier-based shortcuts — always run.
+        if ctrl {
             // Ctrl+Z = Undo (NOT Shift+Z, which is redo).
-            if ctrl && !modifiers.shift && i.key_pressed(egui::Key::Z) {
+            if !modifiers.shift && ctx.input_mut(|i| {
+                i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z)
+            }) {
                 self.state.undo();
             }
             // Ctrl+Shift+Z or Ctrl+Y = Redo
-            if ctrl && ((i.key_pressed(egui::Key::Z) && modifiers.shift) || i.key_pressed(egui::Key::Y)) {
+            let redo_z = ctx.input_mut(|i| {
+                i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::Z)
+            });
+            let redo_y = ctx.input_mut(|i| {
+                i.consume_key(egui::Modifiers::COMMAND, egui::Key::Y)
+            });
+            if redo_z || redo_y {
                 self.state.redo();
             }
-            // Delete key = remove selected element
-            if i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace) {
-                self.delete_selected();
-            }
-            // Ctrl+D = duplicate selected
-            if ctrl && i.key_pressed(egui::Key::D) {
+            // Ctrl+D = duplicate
+            if ctx.input_mut(|i| {
+                i.consume_key(egui::Modifiers::COMMAND, egui::Key::D)
+            }) {
                 self.duplicate_selected();
             }
-            // Ctrl+C = copy current selection (single or multi-select)
-            // into the in-memory clipboard.
-            if ctrl && i.key_pressed(egui::Key::C) {
+            // Ctrl+C = copy current selection
+            if ctx.input_mut(|i| {
+                i.consume_key(egui::Modifiers::COMMAND, egui::Key::C)
+            }) {
                 let n = self.state.copy_selection_to_clipboard();
                 if n > 0 {
                     self.state.status = format!(
@@ -798,13 +808,10 @@ impl App {
                     );
                 }
             }
-            // Ctrl+V = paste. First try the SYSTEM clipboard so a
-            // screenshot or "copy image" from the browser lands on the
-            // canvas / library directly. When no image is available we
-            // fall through to the in-process clipboard so duplicates
-            // of canvas / layer-panel selections still work via the
-            // same shortcut.
-            if ctrl && i.key_pressed(egui::Key::V) {
+            // Ctrl+V = paste
+            if ctx.input_mut(|i| {
+                i.consume_key(egui::Modifiers::COMMAND, egui::Key::V)
+            }) {
                 let pasted_image = self.try_paste_image_from_system_clipboard();
                 if !pasted_image {
                     let n = self.state.paste_clipboard();
@@ -819,6 +826,31 @@ impl App {
                             "\u{1F4CB} Clipboard is empty".into();
                     }
                 }
+            }
+        }
+
+        // Plain-key shortcuts — gated by typing focus.
+        if typing {
+            return;
+        }
+
+        ctx.input(|i| {
+            // Space = Play/Pause
+            if i.key_pressed(egui::Key::Space) {
+                self.state.playing = !self.state.playing;
+                if self.state.playing {
+                    self.state.status = "\u{25B6} Playing".into();
+                } else {
+                    self.state.status = "\u{23F8} Paused".into();
+                }
+            }
+            // Delete key = remove selected element (only when no
+            // modifier — Ctrl+Delete is reserved for future use).
+            if !ctrl
+                && (i.key_pressed(egui::Key::Delete)
+                    || i.key_pressed(egui::Key::Backspace))
+            {
+                self.delete_selected();
             }
             // Escape clears the canvas multi-selection so the user can
             // exit a marquee paint without affecting other shortcuts.
@@ -1156,28 +1188,54 @@ impl App {
                 // Bound audio (the AudioTrack created when the clip was
                 // dropped) follows the actor on delete so we never leak
                 // orphaned audio rows.
-                let _removed = crate::panels::remove_audio_bound_to_actor(
+                let removed_audio = crate::panels::remove_audio_bound_to_actor(
                     &mut self.state, &actor_id);
+                // App-side `waveform_extract_results` mirrors the
+                // audio Vec by index. `remove_audio_bound_to_actor`
+                // gives us the indices in scene-Vec order so removing
+                // back-to-front keeps every later index valid as we
+                // splice. (Front-to-back would tear the table.)
+                let mut sorted = removed_audio.clone();
+                sorted.sort_unstable();
+                for ai in sorted.into_iter().rev() {
+                    if ai < self.waveform_extract_results.len() {
+                        self.waveform_extract_results.remove(ai);
+                    }
+                }
                 self.state.mutate(|s| { s.actors.remove(i); });
-                // Keep frame_caches and frame_extract_results in lock-step with actors
-                // so subsequent actors don't display the wrong cached frames.
+                // Keep every side-table that mirrors the actors Vec in
+                // lock-step with the new index space. Without the
+                // assignments shift, the actor that used to sit at
+                // `i+1` keeps its old assignments[i+1] entry which now
+                // belongs to a different actor — that's the "layers
+                // jump" the user reported when deleting.
                 if i < self.state.frame_caches.len() {
                     self.state.frame_caches.remove(i);
                 }
                 if i < self.frame_extract_results.len() {
                     self.frame_extract_results.remove(i);
                 }
+                crate::panels::shift_assignments_after_remove(
+                    &mut self.state.actor_track_assignments, i);
                 self.state.selection = Selection::None;
+                self.state.canvas_selection.clear();
+                self.state.multi_select.clear();
                 self.state.status = "\u{1F5D1} Actor deleted.".into();
             }
             Selection::Overlay(i) if i < self.state.scene.overlays.len() => {
                 self.state.mutate(|s| { s.overlays.remove(i); });
+                crate::panels::shift_assignments_after_remove(
+                    &mut self.state.overlay_track_assignments, i);
                 self.state.selection = Selection::None;
+                self.state.canvas_selection.clear();
+                self.state.multi_select.clear();
                 self.state.status = "\u{1F5D1} Overlay deleted.".into();
             }
             Selection::Background(i) if i < self.state.scene.backgrounds.len() => {
                 self.state.mutate(|s| { s.backgrounds.remove(i); });
                 self.state.selection = Selection::None;
+                self.state.canvas_selection.clear();
+                self.state.multi_select.clear();
                 self.state.status = "\u{1F5D1} Background deleted.".into();
             }
             Selection::Audio(i) if i < self.state.scene.audio.len() => {
@@ -1188,7 +1246,11 @@ impl App {
                 if i < self.waveform_extract_results.len() {
                     self.waveform_extract_results.remove(i);
                 }
+                crate::panels::shift_assignments_after_remove(
+                    &mut self.state.audio_track_assignments, i);
                 self.state.selection = Selection::None;
+                self.state.canvas_selection.clear();
+                self.state.multi_select.clear();
                 self.state.status = "\u{1F5D1} Audio deleted.".into();
             }
             _ => {}

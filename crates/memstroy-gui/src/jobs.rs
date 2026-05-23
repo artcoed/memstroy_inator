@@ -433,12 +433,13 @@ fn sanitise_id(id: &str) -> String {
 /// `thumbs/<stem>.jpg`, run a quick ffmpeg pass to extract a frame.
 async fn generate_thumbnails(clips_dir: &std::path::Path, thumbs_dir: &std::path::Path) {
     let bin = ffmpeg_binary();
-    let ffmpeg_ok = std::process::Command::new(&bin)
-        .arg("-version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok();
+    let ffmpeg_ok = {
+        let mut cmd = std::process::Command::new(&bin);
+        cmd.arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        memstroy_render::hide_console_std(&mut cmd).status().is_ok()
+    };
     if !ffmpeg_ok {
         warn!("ffmpeg not found — skipping thumbnail generation");
         return;
@@ -464,8 +465,9 @@ async fn generate_thumbnails(clips_dir: &std::path::Path, thumbs_dir: &std::path
         let thumb = thumbs_dir.join(format!("{}.jpg", stem));
         if thumb.exists() { continue; }
 
-        let result = tokio::process::Command::new(&bin)
-            .args([
+        let result = {
+            let mut cmd = tokio::process::Command::new(&bin);
+            cmd.args([
                 "-y", "-hide_banner", "-loglevel", "error",
                 "-ss", "0.5",
                 "-i", &p.to_string_lossy(),
@@ -475,28 +477,27 @@ async fn generate_thumbnails(clips_dir: &std::path::Path, thumbs_dir: &std::path
             ])
             .arg(&thumb)
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .await;
+            .stderr(std::process::Stdio::null());
+            memstroy_render::hide_console_tokio(&mut cmd).status().await
+        };
         match result {
             Ok(status) if status.success() => {
                 info!(id = %stem, "generated thumbnail");
             }
             Ok(_) => {
                 // Some clips fail at ss=0.5 (very short). Retry from 0.
-                let _ = tokio::process::Command::new(&bin)
-                    .args([
-                        "-y", "-hide_banner", "-loglevel", "error",
-                        "-i", &p.to_string_lossy(),
-                        "-frames:v", "1",
-                        "-vf", "scale=120:-1",
-                        "-q:v", "6",
-                    ])
-                    .arg(&thumb)
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status()
-                    .await;
+                let mut cmd = tokio::process::Command::new(&bin);
+                cmd.args([
+                    "-y", "-hide_banner", "-loglevel", "error",
+                    "-i", &p.to_string_lossy(),
+                    "-frames:v", "1",
+                    "-vf", "scale=120:-1",
+                    "-q:v", "6",
+                ])
+                .arg(&thumb)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+                let _ = memstroy_render::hide_console_tokio(&mut cmd).status().await;
             }
             Err(e) => warn!(id = %stem, error = %e, "ffmpeg thumbnail failed"),
         }
