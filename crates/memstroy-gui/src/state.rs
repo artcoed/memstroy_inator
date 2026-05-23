@@ -219,6 +219,14 @@ pub struct TimelineDrag {
     /// the queue is drained and `enforce_no_overlap_on_layer` runs
     /// once per unique mover.
     pub pending_overlap: Vec<PendingOverlapMover>,
+    /// Scene-time of the active snap target this frame. `Some` when
+    /// the dragged clip's edge is currently glued to a neighbour
+    /// edge / playhead / scene boundary; the timeline draws a thin
+    /// vertical guide at this time so the user gets visual confirm
+    /// of which target the edge attached to. Cleared at the start of
+    /// every timeline() pass and at drag-end so a stale guide can't
+    /// linger after the snap goes away.
+    pub snap_indicator: Option<f32>,
 }
 
 /// Lightweight mirror of `panels::MovedClipKind` used to persist
