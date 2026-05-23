@@ -1,0 +1,338 @@
+#!/usr/bin/env bash
+# scripts/make-installer.sh
+#
+# Build a self-extracting Linux installer (.run) for the
+# memstroy-inator client bundle produced by `scripts/package-client.sh`.
+#
+# Layout the produced installer ends up creating on the target machine:
+#
+#   ~/.local/share/memstroy-inator/        (per-user, default)
+#       bin/memstroy-gui                   the editor
+#       bin/memstroy                       the CLI
+#       examples/, README.md
+#       memstroy-inator.sh                 launcher copied from the bundle
+#       uninstall.sh                       uninstaller (removes everything)
+#
+#   ~/.local/bin/memstroy-gui              symlink → bin/memstroy-gui
+#   ~/.local/share/applications/
+#       memstroy-inator.desktop            menu entry
+#   ~/Desktop/memstroy-inator.desktop      desktop shortcut (chmod +x)
+#
+# If the user runs the installer with `sudo`, it switches to a
+# system-wide install at `/opt/memstroy-inator/` with menu entries in
+# `/usr/share/applications/` and the binary symlinked to
+# `/usr/local/bin/memstroy-gui`. The desktop shortcut is skipped in
+# that mode (no single "Desktop" to drop it on).
+#
+# Usage:
+#   # build a fresh bundle first, then wrap it in an installer
+#   scripts/make-installer.sh --server-url https://assets.example.com
+#
+#   # reuse an already-staged bundle directory (skips cargo build)
+#   scripts/make-installer.sh \
+#       --bundle-dir dist/memstroy-inator-linux-x86_64-0.1.0
+#
+#   # custom output dir / installer name
+#   scripts/make-installer.sh --server-url https://assets.example.com \
+#       --out ./build --name memstroy-inator-1.2.3
+#
+# Required (one of):
+#   --server-url <URL>     Forwarded to package-client.sh to build a
+#                          fresh bundle. Either this or --bundle-dir
+#                          must be supplied.
+#   --bundle-dir <path>    Reuse a bundle directory that was already
+#                          produced by package-client.sh.
+#
+# Optional:
+#   --out <path>           Output directory for the installer
+#                          (default: ./dist).
+#   --name <name>          Installer base name (without .run suffix);
+#                          defaults to the bundle directory's name.
+#   --allow-loopback       Forwarded to package-client.sh.
+#
+# The script writes ONE artefact: <out>/<name>.run. That file is the
+# whole installer — distribute it as-is.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "${ROOT_DIR}"
+
+# ─── CLI ─────────────────────────────────────────────────────────────
+OUT_DIR=""
+INSTALLER_NAME=""
+BUNDLE_DIR=""
+SERVER_URL=""
+ALLOW_LOOPBACK=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --out)            OUT_DIR="$2"; shift 2 ;;
+        --name)           INSTALLER_NAME="$2"; shift 2 ;;
+        --bundle-dir)     BUNDLE_DIR="$2"; shift 2 ;;
+        --server-url)     SERVER_URL="$2"; shift 2 ;;
+        --allow-loopback) ALLOW_LOOPBACK=1; shift ;;
+        -h|--help)
+            sed -n '2,55p' "$0"
+            exit 0
+            ;;
+        *)
+            echo "unknown option: $1" >&2
+            exit 1
+            ;;
+    esac
+done
+
+if [[ -z "${BUNDLE_DIR}" && -z "${SERVER_URL}" ]]; then
+    echo "error: pass either --bundle-dir <path> or --server-url <URL>" >&2
+    exit 2
+fi
+
+# ─── Build the bundle if not pre-supplied ────────────────────────────
+if [[ -z "${BUNDLE_DIR}" ]]; then
+    pkg_args=(--server-url "${SERVER_URL}")
+    if [[ "${ALLOW_LOOPBACK}" -eq 1 ]]; then
+        pkg_args+=(--allow-loopback)
+    fi
+    echo "==> building client bundle via scripts/package-client.sh"
+    "${SCRIPT_DIR}/package-client.sh" "${pkg_args[@]}"
+
+    # Recover the bundle path the packager just produced. We mirror
+    # the naming convention from package-client.sh exactly so the
+    # two scripts stay in sync without an explicit handshake file.
+    OS_NAME="$(uname -s | tr '[:upper:]' '[:lower:]')"
+    ARCH_NAME="$(uname -m)"
+    VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/' || echo "dev")"
+    BUNDLE_DIR="${ROOT_DIR}/dist/memstroy-inator-${OS_NAME}-${ARCH_NAME}-${VERSION}"
+fi
+
+if [[ ! -d "${BUNDLE_DIR}" ]]; then
+    echo "error: bundle directory does not exist: ${BUNDLE_DIR}" >&2
+    exit 3
+fi
+if [[ ! -x "${BUNDLE_DIR}/bin/memstroy-gui" ]]; then
+    echo "error: ${BUNDLE_DIR}/bin/memstroy-gui not found or not executable" >&2
+    exit 3
+fi
+
+BUNDLE_DIR_ABS="$(cd "${BUNDLE_DIR}" && pwd)"
+BUNDLE_BASENAME="$(basename "${BUNDLE_DIR_ABS}")"
+
+if [[ -z "${OUT_DIR}" ]]; then
+    OUT_DIR="$(cd "$(dirname "${BUNDLE_DIR_ABS}")" && pwd)"
+fi
+mkdir -p "${OUT_DIR}"
+OUT_DIR="$(cd "${OUT_DIR}" && pwd)"
+
+if [[ -z "${INSTALLER_NAME}" ]]; then
+    INSTALLER_NAME="${BUNDLE_BASENAME}"
+fi
+INSTALLER_PATH="${OUT_DIR}/${INSTALLER_NAME}.run"
+
+echo "==> wrapping bundle into self-extracting installer"
+echo "    bundle    : ${BUNDLE_DIR_ABS}"
+echo "    installer : ${INSTALLER_PATH}"
+
+# ─── Build a tar.gz payload of the bundle ────────────────────────────
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "${TMP_DIR}"' EXIT
+
+PAYLOAD="${TMP_DIR}/payload.tar.gz"
+tar -C "$(dirname "${BUNDLE_DIR_ABS}")" \
+    -czf "${PAYLOAD}" \
+    "${BUNDLE_BASENAME}"
+
+# ─── Header script ───────────────────────────────────────────────────
+# The header runs first when the user executes the .run file, then
+# `tail -n +<N>` slices the appended tar.gz off the end of the same
+# file and pipes it through `tar xz`. The marker line is a sentinel
+# we look up at runtime, so it doesn't matter how long the header
+# becomes — there's no fragile precomputed line number.
+HEADER="${TMP_DIR}/header.sh"
+cat > "${HEADER}" <<HEADER_EOF
+#!/usr/bin/env bash
+# memstroy-inator installer (self-extracting).
+#
+# Run me directly:
+#     chmod +x ${INSTALLER_NAME}.run
+#     ./${INSTALLER_NAME}.run
+#
+# Or system-wide:
+#     sudo ./${INSTALLER_NAME}.run
+set -euo pipefail
+
+APP_NAME="memstroy-inator"
+APP_TITLE="memstroy-inator"
+APP_VERSION="${BUNDLE_BASENAME}"
+PAYLOAD_BASENAME="${BUNDLE_BASENAME}"
+HEADER_EOF
+
+cat >> "${HEADER}" <<'HEADER_EOF'
+
+# Allow non-interactive runs (CI / scripted deployments) to skip the
+# "press enter to continue" prompts.
+NONINTERACTIVE="${MEMSTROY_NONINTERACTIVE:-0}"
+
+# ─── Resolve install location ────────────────────────────────────────
+if [[ "$(id -u)" -eq 0 ]]; then
+    INSTALL_DIR="/opt/${APP_NAME}"
+    BIN_LINK_DIR="/usr/local/bin"
+    DESKTOP_DIR="/usr/share/applications"
+    USER_DESKTOP=""
+    SCOPE="system"
+else
+    INSTALL_DIR="${HOME}/.local/share/${APP_NAME}"
+    BIN_LINK_DIR="${HOME}/.local/bin"
+    DESKTOP_DIR="${HOME}/.local/share/applications"
+    USER_DESKTOP="${HOME}/Desktop"
+    SCOPE="user"
+fi
+
+echo "==> ${APP_TITLE} installer (${APP_VERSION})"
+echo "    scope         : ${SCOPE}"
+echo "    install dir   : ${INSTALL_DIR}"
+echo "    binary symlink: ${BIN_LINK_DIR}/memstroy-gui"
+echo "    menu entry    : ${DESKTOP_DIR}/${APP_NAME}.desktop"
+if [[ -n "${USER_DESKTOP}" ]]; then
+    echo "    desktop short.: ${USER_DESKTOP}/${APP_NAME}.desktop"
+fi
+
+if [[ "${NONINTERACTIVE}" != "1" ]]; then
+    printf 'Continue? [Y/n] '
+    read -r answer || answer=""
+    case "${answer}" in
+        n|N|no|NO) echo "aborted."; exit 0 ;;
+    esac
+fi
+
+# ─── Extract payload ─────────────────────────────────────────────────
+# Find the first line of the appended tar.gz by looking for our
+# sentinel; the archive starts on the line *after* it.
+ARCHIVE_LINE=$(awk '/^__MEMSTROY_PAYLOAD_BELOW__$/ { print NR + 1; exit 0 }' "$0")
+if [[ -z "${ARCHIVE_LINE}" ]]; then
+    echo "error: corrupt installer (payload sentinel not found)" >&2
+    exit 1
+fi
+
+mkdir -p "${INSTALL_DIR}"
+EXTRACT_TMP="$(mktemp -d)"
+trap 'rm -rf "${EXTRACT_TMP}"' EXIT
+
+echo "==> extracting payload"
+tail -n +"${ARCHIVE_LINE}" "$0" | tar -xz -C "${EXTRACT_TMP}"
+
+# The tarball was built with the bundle's own directory at the top,
+# e.g. memstroy-inator-linux-x86_64-0.1.0/. Move its contents into
+# INSTALL_DIR so the layout becomes flat: INSTALL_DIR/bin/, etc.
+PAYLOAD_ROOT="${EXTRACT_TMP}/${PAYLOAD_BASENAME}"
+if [[ ! -d "${PAYLOAD_ROOT}" ]]; then
+    echo "error: extracted payload missing expected directory ${PAYLOAD_BASENAME}" >&2
+    exit 1
+fi
+
+# Wipe the previous install (idempotent), but keep INSTALL_DIR itself
+# in case it is a mount point or has odd parent permissions.
+find "${INSTALL_DIR}" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+cp -a "${PAYLOAD_ROOT}/." "${INSTALL_DIR}/"
+
+chmod +x "${INSTALL_DIR}/bin/memstroy-gui" 2>/dev/null || true
+chmod +x "${INSTALL_DIR}/bin/memstroy"     2>/dev/null || true
+chmod +x "${INSTALL_DIR}/memstroy-inator.sh" 2>/dev/null || true
+
+# ─── PATH symlink ────────────────────────────────────────────────────
+mkdir -p "${BIN_LINK_DIR}"
+ln -sf "${INSTALL_DIR}/bin/memstroy-gui" "${BIN_LINK_DIR}/memstroy-gui"
+if [[ -x "${INSTALL_DIR}/bin/memstroy" ]]; then
+    ln -sf "${INSTALL_DIR}/bin/memstroy" "${BIN_LINK_DIR}/memstroy"
+fi
+
+# ─── Menu / desktop entries ──────────────────────────────────────────
+mkdir -p "${DESKTOP_DIR}"
+DESKTOP_FILE="${DESKTOP_DIR}/${APP_NAME}.desktop"
+cat > "${DESKTOP_FILE}" <<DESKTOP
+[Desktop Entry]
+Type=Application
+Name=memstroy-inator
+GenericName=Meme Video Editor
+Comment=Assemble Mellstroy-style memes for vertical short videos
+Exec=${INSTALL_DIR}/bin/memstroy-gui %F
+Terminal=false
+Categories=AudioVideo;Video;AudioVideoEditing;
+StartupNotify=true
+DESKTOP
+chmod 644 "${DESKTOP_FILE}"
+
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database "${DESKTOP_DIR}" >/dev/null 2>&1 || true
+fi
+
+if [[ -n "${USER_DESKTOP}" ]] && [[ -d "${USER_DESKTOP}" ]]; then
+    cp -f "${DESKTOP_FILE}" "${USER_DESKTOP}/${APP_NAME}.desktop"
+    chmod +x "${USER_DESKTOP}/${APP_NAME}.desktop"
+    # GNOME ≥ 42 requires the file to be marked trusted via gio.
+    if command -v gio >/dev/null 2>&1; then
+        gio set "${USER_DESKTOP}/${APP_NAME}.desktop" \
+            metadata::trusted true >/dev/null 2>&1 || true
+    fi
+fi
+
+# ─── Uninstaller ─────────────────────────────────────────────────────
+UNINSTALL_SCRIPT="${INSTALL_DIR}/uninstall.sh"
+cat > "${UNINSTALL_SCRIPT}" <<UNINSTALL
+#!/usr/bin/env bash
+# memstroy-inator uninstaller.
+set -e
+
+INSTALL_DIR="${INSTALL_DIR}"
+BIN_LINK_DIR="${BIN_LINK_DIR}"
+DESKTOP_DIR="${DESKTOP_DIR}"
+USER_DESKTOP="${USER_DESKTOP}"
+APP_NAME="${APP_NAME}"
+
+echo "==> Removing menu entry"
+rm -f "\${DESKTOP_DIR}/\${APP_NAME}.desktop"
+if [[ -n "\${USER_DESKTOP}" ]]; then
+    rm -f "\${USER_DESKTOP}/\${APP_NAME}.desktop"
+fi
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database "\${DESKTOP_DIR}" >/dev/null 2>&1 || true
+fi
+
+echo "==> Removing PATH symlinks"
+for n in memstroy-gui memstroy; do
+    if [[ -L "\${BIN_LINK_DIR}/\${n}" ]]; then
+        rm -f "\${BIN_LINK_DIR}/\${n}"
+    fi
+done
+
+echo "==> Removing install dir: \${INSTALL_DIR}"
+rm -rf "\${INSTALL_DIR}"
+
+echo "==> done"
+UNINSTALL
+chmod +x "${UNINSTALL_SCRIPT}"
+
+echo
+echo "==> installation complete"
+echo "    launch with: memstroy-gui   (or pick it from the menu)"
+echo "    uninstall  : ${UNINSTALL_SCRIPT}"
+exit 0
+
+__MEMSTROY_PAYLOAD_BELOW__
+HEADER_EOF
+
+# ─── Concatenate header + payload into the final .run file ───────────
+mkdir -p "${OUT_DIR}"
+cat "${HEADER}" "${PAYLOAD}" > "${INSTALLER_PATH}"
+chmod +x "${INSTALLER_PATH}"
+
+SIZE_BYTES="$(stat -c %s "${INSTALLER_PATH}" 2>/dev/null || stat -f %z "${INSTALLER_PATH}")"
+SIZE_MB="$(awk -v b="${SIZE_BYTES}" 'BEGIN { printf "%.1f", b / (1024*1024) }')"
+
+echo "==> done"
+echo "    installer : ${INSTALLER_PATH}"
+echo "    size      : ${SIZE_MB} MiB (${SIZE_BYTES} bytes)"
+echo
+echo "Distribute the file above; users run it with:"
+echo "    chmod +x $(basename "${INSTALLER_PATH}") && ./$(basename "${INSTALLER_PATH}")"
