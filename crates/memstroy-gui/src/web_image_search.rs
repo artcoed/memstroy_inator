@@ -186,7 +186,7 @@ fn window_body(ui: &mut egui::Ui, state: &mut EditorState, tx: &Sender<JobEvent>
     ui.horizontal(|ui| {
         let resp = ui.add(
             egui::TextEdit::singleline(&mut state.web_image_search.query)
-                .hint_text(t("Search Google / DuckDuckGo for images..."))
+                .hint_text(t("Search images..."))
                 .desired_width(ui.available_width() - 110.0),
         );
         let enter = resp.lost_focus()

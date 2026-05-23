@@ -91,7 +91,16 @@ impl<'a> FilterGraphBuilder<'a> {
 
     fn emit_base_canvas(&mut self) {
         let [w, h] = self.scene.output.resolution;
-        let [r, g, b] = self.scene.output.background_color;
+        // When the scene has no backgrounds the user gets a full-frame
+        // chromakey green base layer (so the export can be keyed in
+        // post). When at least one background is present we honour
+        // the configured `output.background_color` because a partial
+        // background still needs a fallback colour for the gaps.
+        let [r, g, b] = if self.scene.backgrounds.is_empty() {
+            [0u8, 255u8, 0u8]
+        } else {
+            self.scene.output.background_color
+        };
         let bg_hex = format!("0x{:02X}{:02X}{:02X}", r, g, b);
         // The base canvas is generated entirely from a filter source so
         // no `-i` slot is consumed.
@@ -623,13 +632,34 @@ impl<'a> FilterGraphBuilder<'a> {
             sx = scale_expr,
             sy = scale_y_expr,
         );
+        // Optional chromakey filter — added when the user picked a
+        // colour with the eyedropper. Mirrors the `VideoOverlay` /
+        // `Actor` pipelines so the same ChromaKeyParams produces the
+        // same visual result regardless of which overlay flavour the
+        // user picked.
+        let chroma_part = ov.chroma_key.as_ref().map(|ck| {
+            let key_hex = format!(
+                "0x{:02X}{:02X}{:02X}",
+                ck.key_color[0], ck.key_color[1], ck.key_color[2]
+            );
+            format!("chromakey={}:{}:{}", key_hex, ck.similarity, ck.blend)
+        });
         let img_label = self.alloc_label("img");
 
         if effects_have_mask(&ov.effects) {
             // See `emit_actors` — masks force a multi-stream layout
             // because they need a second input plus alphamerge.
             let pre_label = self.alloc_label("imgPre");
-            self.chunks.push(format!("[{idx}:v]format=yuva420p{pre_label}", idx = idx, pre_label = pre_label));
+            let chroma_clause = chroma_part
+                .as_ref()
+                .map(|c| format!(",{}", c))
+                .unwrap_or_default();
+            self.chunks.push(format!(
+                "[{idx}:v]format=yuva420p{ck}{pre_label}",
+                idx = idx,
+                ck = chroma_clause,
+                pre_label = pre_label,
+            ));
             let after_fx = self.apply_effect_stack(pre_label, &ov.effects)?;
             self.chunks.push(format!(
                 "{src}{scale}{out}",
@@ -639,6 +669,10 @@ impl<'a> FilterGraphBuilder<'a> {
             ));
         } else {
             let mut chain = format!("[{idx}:v]format=yuva420p", idx = idx);
+            if let Some(ref c) = chroma_part {
+                chain.push(',');
+                chain.push_str(c);
+            }
             // Apply the user-defined effect stack before the layout scale,
             // matching the actor pipeline so e.g. blur / hue shift work in
             // the image's native pixel space (before the on-canvas resize).
