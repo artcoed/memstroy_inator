@@ -49,6 +49,11 @@ impl App {
         let (tx, rx) = channel();
         let mut state = EditorState::new();
         state.tokio_handle = Some(rt.handle().clone());
+        // Hand the JobEvent sender to the editor state so the canvas
+        // paint loop can dispatch background image-effects bake jobs
+        // (see `image_fx_worker::submit_image_fx_job`). Cloned so the
+        // App keeps its own Sender for the existing job spawners.
+        state.image_fx_tx = Some(tx.clone());
         state.reload_library();
 
         // ── Auto-bootstrap the local memstroy-assets-server ──
@@ -179,7 +184,7 @@ impl App {
         );
     }
 
-    fn pump_events(&mut self, _ctx: &egui::Context) {
+    fn pump_events(&mut self, ctx: &egui::Context) {
         while let Ok(ev) = self.rx.try_recv() {
             match ev {
                 JobEvent::Status(s) => self.state.status = s,
@@ -296,6 +301,53 @@ impl App {
                         }
                     }
                 }
+                JobEvent::ImageFxReady(result) => {
+                    self.handle_image_fx_ready(ctx, result);
+                }
+            }
+        }
+    }
+
+    /// Finalise an image-effects bake by uploading the RGBA buffer as
+    /// an `egui::TextureHandle` (which has to happen on the UI thread)
+    /// and stashing the result in `state.image_fx_cache` keyed by
+    /// `(path, sig)`. Failures are stored too so the canvas knows not
+    /// to keep retrying the same broken bake every frame.
+    fn handle_image_fx_ready(
+        &mut self,
+        ctx: &egui::Context,
+        result: crate::image_fx_worker::ImageFxResult,
+    ) {
+        match result.outcome {
+            Ok(baked) => {
+                let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                    [baked.width as usize, baked.height as usize],
+                    &baked.rgba,
+                );
+                let name = format!(
+                    "img_overlay_fx_{}_{:x}",
+                    result
+                        .path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("anon"),
+                    result.sig,
+                );
+                let texture =
+                    ctx.load_texture(name, color_image, egui::TextureOptions::LINEAR);
+                let slot = crate::image_fx_cache::ImageFxSlot {
+                    texture,
+                    size: [baked.width, baked.height],
+                    crop: baked.crop,
+                };
+                self.state
+                    .image_fx_cache
+                    .put_ready(result.path, result.sig, slot);
+            }
+            Err(reason) => {
+                self.state
+                    .image_fx_cache
+                    .put_failed(result.path, result.sig, reason);
             }
         }
     }

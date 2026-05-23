@@ -4581,61 +4581,77 @@ fn ensure_image_loaded(
     None
 }
 
-/// Build (or fetch from cache) an image texture with the supplied
-/// effect stack baked in. Returns the `TextureHandle` plus the
-/// (left, top, right, bottom) Crop UV inset accumulated by the stack
-/// — the renderer uses the inset to shrink the picture's screen
-/// rectangle so previews match the FFmpeg export.
+/// Look up the effect-baked image texture for `(path, effects)` from
+/// the L2 cache. Non-blocking: when the entry is missing or stale,
+/// dispatches a background bake job and returns `None` so the caller
+/// falls back to drawing the unprocessed image until the worker
+/// finishes. The previous synchronous decode + effect pipeline ran on
+/// the UI thread and stalled paint for tens to hundreds of ms on a
+/// typical 4K overlay; the worker (`crate::image_fx_worker`) now
+/// handles the heavy lifting and posts the result back via
+/// `JobEvent::ImageFxReady`.
+///
+/// Returns `(TextureHandle, crop_inset)` only when the cache holds a
+/// `Ready` slot. `Pending` and `Failed` both return `None` — the draw
+/// path then uses the unprocessed `image_textures` slot, so the
+/// picture stays visible while the bake is in flight (or after a
+/// failed bake).
 fn ensure_image_fx_loaded(
     state: &EditorState,
     path: &std::path::Path,
     effects: &[memstroy_core::effects::Effect],
     ctx: &egui::Context,
 ) -> Option<(egui::TextureHandle, [f32; 4])> {
-    let sig = crate::image_effects::signature(effects);
-    let key = (path.to_path_buf(), sig);
+    use crate::image_fx_cache::LookupOutcome;
 
-    // Fast path: cached texture from a previous frame.
-    if let Ok(map) = state.image_fx_textures.lock() {
-        if let Some(slot) = map.get(&key) {
-            return Some((slot.texture.clone(), slot.crop));
+    let sig = crate::image_effects::signature(effects);
+
+    match state.image_fx_cache.lookup(path, sig) {
+        LookupOutcome::Ready(slot) => {
+            // While any bake is still pending, keep the egui frame
+            // loop alive so the eventual upload paints without a
+            // user-input nudge. (Once everything is Ready / Failed
+            // we go reactive again.)
+            return Some((slot.texture, slot.crop));
+        }
+        LookupOutcome::Pending => {
+            // A worker is already baking this exact (path, sig).
+            // Caller will fall back to the unprocessed image.
+            ctx.request_repaint_after(std::time::Duration::from_millis(33));
+            return None;
+        }
+        LookupOutcome::Failed => {
+            // Bake previously failed; don't keep retrying every frame.
+            // The unprocessed image is shown as a fallback.
+            return None;
+        }
+        LookupOutcome::Miss => {
+            // Fall through and dispatch a fresh bake.
         }
     }
 
-    // Slow path: decode the source PNG, run the CPU effect pipeline,
-    // upload the result as a fresh texture, and cache it.
-    let decoded = image::open(path).ok()?.to_rgba8();
-    let w = decoded.width();
-    let h = decoded.height();
-    let mut buf = decoded.into_raw();
-    let crop = crate::image_effects::apply_effect_stack(&mut buf, w, h, effects, 0.0);
-    let color_image = egui::ColorImage::from_rgba_unmultiplied(
-        [w as usize, h as usize],
-        &buf,
-    );
-    let name = format!(
-        "img_overlay_fx_{}_{:x}",
-        path.file_name().and_then(|s| s.to_str()).unwrap_or("anon"),
-        sig,
-    );
-    let texture = ctx.load_texture(name, color_image, egui::TextureOptions::LINEAR);
-    let crop_arr = [crop.0, crop.1, crop.2, crop.3];
-
-    if let Ok(mut map) = state.image_fx_textures.lock() {
-        // Evict every cached entry for the same source path that has a
-        // different signature — keeps the cache from growing unbounded
-        // as the user tweaks effect parameters frame-by-frame.
-        map.retain(|(p, s), _| !(p == path && *s != sig));
-        map.insert(
-            key,
-            crate::state::ImageFxSlot {
-                texture: texture.clone(),
-                size: [w, h],
-                crop: crop_arr,
-            },
+    // Cache miss. Dispatch a background bake — the worker will dedup
+    // concurrent submissions for the same (path, sig) so it's safe to
+    // call this every frame while the entry stays in `Pending`.
+    if let (Some(handle), Some(tx)) =
+        (state.tokio_handle.as_ref(), state.image_fx_tx.as_ref())
+    {
+        crate::image_fx_worker::submit_image_fx_job(
+            handle,
+            tx,
+            &state.image_fx_cache,
+            ctx,
+            path.to_path_buf(),
+            effects.to_vec(),
+            sig,
         );
+        ctx.request_repaint_after(std::time::Duration::from_millis(33));
+    } else {
+        // Tokio handle / channel not wired up — only happens in
+        // tests that construct an EditorState without an App.
+        // Treat as "no fx available" so draws fall back cleanly.
     }
-    Some((texture, crop_arr))
+    None
 }
 
 /// Try to select an element at the given world position.
