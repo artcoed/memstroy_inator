@@ -211,8 +211,80 @@ fn ru_lookup(key: &str) -> Option<&'static str> {
         "Select an image overlay to edit it." => "Выберите слой-картинку, чтобы редактировать.",
         "This panel exposes image-only editing tools (crop, quick colour, filters)." =>
             "Эта панель содержит инструменты только для изображений (кадр, цвет, фильтры).",
+        "This panel exposes image-only editing tools (brush mask, crop, stylize)." =>
+            "Эта панель содержит инструменты только для изображений (маска-кисть, обрезка, стилизация).",
         "Preview will appear after canvas renders the image once." =>
             "Превью появится, как только холст хоть раз отрисует это изображение.",
+        // ── Image-editor tool toolbar ────────────────────────────
+        "Tool:" => "Инструмент:",
+        // Note: "View" already translates to "Вид" higher up (menu
+        // bar). Reusing that mapping for the no-tool button keeps
+        // the Russian UI consistent without a duplicate match arm
+        // (which the compiler flags as an unreachable pattern).
+        "Brush" => "Кисть",
+        "Cutout" => "Вырезание",
+        "View only — no interactive painting" => "Только просмотр — без рисования",
+        "Brush — paint a freehand mask: pixels INSIDE the painted shape are kept, the rest is masked away" =>
+            "Кисть — рисуйте произвольную маску: пиксели ВНУТРИ контура сохраняются, остальное скрывается",
+        "Cutout — paint a freehand mask: pixels INSIDE the painted shape are masked away (erase a region)" =>
+            "Вырезание — рисуйте произвольную маску: пиксели ВНУТРИ контура скрываются (стереть область)",
+        "Crop — drag a rectangle to set the crop bounds" =>
+            "Обрезка — протяните прямоугольник, чтобы задать границы обрезки",
+        "Pick a tool to draw on the preview." => "Выберите инструмент, чтобы рисовать на превью.",
+        "Drag on the preview to paint a mask polygon." =>
+            "Протяните по превью, чтобы нарисовать маску-полигон.",
+        "Drag on the preview to paint an erase region." =>
+            "Протяните по превью, чтобы стереть область.",
+        "Drag on the preview to define the crop rectangle." =>
+            "Протяните по превью, чтобы задать прямоугольник обрезки.",
+        "Clear stroke" => "Очистить штрих",
+        "Invert" => "Инвертировать",
+        "When checked, the painted polygon is the masked-OUT region (instead of the kept region)." =>
+            "Если включено — нарисованный контур задаёт СКРЫВАЕМУЮ область (а не сохраняемую).",
+        // ── Save edited image / status messages ─────────────────
+        "Save edited image" => "Сохранить изображение",
+        "Bake the current effect stack into a fresh PNG and add it to the project's local image library." =>
+            "Применить текущие эффекты и сохранить как PNG в локальную библиотеку картинок проекта.",
+        "\u{2705} Edited image saved to library:" =>
+            "\u{2705} Изображение сохранено в библиотеку:",
+        "\u{274C} Save edited image failed:" =>
+            "\u{274C} Не удалось сохранить изображение:",
+        // ── Preview zoom / pan toolbar ──────────────────────────
+        "Zoom:" => "Масштаб:",
+        "Zoom in" => "Увеличить",
+        "Zoom out" => "Уменьшить",
+        "Fit" => "Вписать",
+        "Fit the picture into the preview pane" => "Вписать картинку в окно превью",
+        "1:1" => "1:1",
+        "Show preview at native pixel scale" => "Показать в исходном масштабе",
+        // ── Image-editor section headers / sliders ──────────────
+        "Geometry" => "Геометрия",
+        "Stylize" => "Стилизация",
+        "Distortion" => "Искажение",
+        "Retro" => "Ретро",
+        "Top" => "Сверху",
+        "Pixelate" => "Пикселизация",
+        "Posterize" => "Постеризация",
+        "Edge detect" => "Контуры",
+        "Bloom" => "Свечение (bloom)",
+        "Glitch" => "Глитч",
+        "Chromatic aberration" => "Хроматическая аберрация",
+        "Wave amp" => "Амплитуда волны",
+        "Wave \u{03BB}" => "Длина волны \u{03BB}",
+        "Old film" => "Старая плёнка",
+        "VHS" => "VHS",
+        "Grayscale" => "Чёрно-белое",
+        "Sepia" => "Сепия",
+        // ── Geometry rotate / mirror buttons ────────────────────
+        "\u{21BA} -90\u{00B0}" => "\u{21BA} -90\u{00B0}",
+        "\u{21BB} +90\u{00B0}" => "\u{21BB} +90\u{00B0}",
+        "180\u{00B0}" => "180\u{00B0}",
+        "Rotate 90° counter-clockwise" => "Повернуть на 90° против часовой стрелки",
+        "Rotate 90° clockwise" => "Повернуть на 90° по часовой стрелке",
+        "Flip 180°" => "Перевернуть на 180°",
+        "Reset rotation to 0°" => "Сбросить поворот в 0°",
+        "\u{2194} Mirror H" => "\u{2194} Отразить по горизонтали",
+        "\u{2195} Mirror V" => "\u{2195} Отразить по вертикали",
         "Skeleton Editor" => "Редактор скелета",
         "\u{2692} Skeleton Editor" => "\u{2692} Редактор скелета",
 
