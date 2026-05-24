@@ -95,6 +95,13 @@ pub struct RefreshSummary {
     pub failed: usize,
 }
 
+/// Legacy filter-complex-based render path. Kept compiled (and behind
+/// the same export entry-point shape) so any downstream caller that
+/// still points at `spawn_render` keeps working — the GUI's render
+/// button now uses [`spawn_render_via_snapshot`] for canvas-perfect
+/// parity, and only this function name is preserved for backwards
+/// compatibility with branches / forks that haven't migrated yet.
+#[allow(dead_code)]
 pub fn spawn_render(
     rt: &Handle,
     tx: Sender<JobEvent>,
@@ -112,6 +119,229 @@ pub fn spawn_render(
             result.map(|_| out_path).map_err(|e| e.to_string()),
         ));
     });
+}
+
+/// Render the scene by composing every output frame through the
+/// snapshot painter pipeline, then encoding the resulting PNG sequence
+/// alongside the scene's audio tracks via ffmpeg.
+///
+/// ## Why this path exists
+///
+/// The original `spawn_render` route translates the entire scene into
+/// a single ffmpeg `filter_complex` graph. That works for trivial
+/// scenes but accumulates an open-ended list of "the export looks
+/// nothing like the canvas" bugs whenever a feature can be expressed
+/// in the live preview (CPU image effects, custom blends,
+/// pixel-perfect text rasterisation, frame-cache-driven actor frames)
+/// but lacks an exact ffmpeg counterpart. The user-visible failure
+/// mode is the export looking like a coarse approximation of the
+/// canvas (or, for hard cases, completely different content).
+///
+/// The snapshot painter — `frame_snapshot::render_full_frame_at` — is
+/// the same code path that powers the "Extract frame" button the user
+/// has already validated as pixel-perfect. Running it for every output
+/// frame and stitching the resulting PNGs into an MP4 gives absolute
+/// canvas-preview parity by construction.
+///
+/// ## Inputs (all owned + Send)
+///
+/// `scene` is the canonicalised scene (resolution forced to the
+/// project-native 1080×1920, z-order populated). `frame_caches` is the
+/// thread-safe projection of the live editor's actor frame caches
+/// produced by `frame_snapshot::snapshot_frame_caches`. The track
+/// assignment maps drive the same z-bucketing the canvas uses. None of
+/// these inputs hold non-`Send` data, so the spawned future is
+/// well-formed for tokio's multi-threaded scheduler.
+///
+/// ## Output
+///
+/// On success the rendered MP4 lands at `out_path`. Progress is
+/// streamed back through `tx` as a mix of `RenderLog` events
+/// (per-frame compose status + ffmpeg encode log lines) and a final
+/// `RenderFinished` event once the encode completes.
+pub fn spawn_render_via_snapshot(
+    rt: &Handle,
+    tx: Sender<JobEvent>,
+    scene: Scene,
+    frame_caches: Vec<crate::video_cache::FrameCacheLite>,
+    actor_track_assignments: std::collections::HashMap<usize, usize>,
+    overlay_track_assignments: std::collections::HashMap<usize, usize>,
+    assets: PathBuf,
+    out_path: PathBuf,
+) {
+    rt.spawn(async move {
+        let log_tx = tx.clone();
+        let result = render_via_snapshot_impl(
+            scene,
+            frame_caches,
+            actor_track_assignments,
+            overlay_track_assignments,
+            assets,
+            out_path.clone(),
+            log_tx,
+        )
+        .await;
+        let _ = tx.send(JobEvent::RenderFinished(
+            result.map(|_| out_path).map_err(|e| e.to_string()),
+        ));
+    });
+}
+
+/// Async body of the snapshot render path. Split out from
+/// `spawn_render_via_snapshot` so the orchestration stays readable
+/// and so the runner doesn't accidentally hold the channel sender
+/// across the long blocking sections (frame compose + ffmpeg).
+async fn render_via_snapshot_impl(
+    scene: Scene,
+    frame_caches: Vec<crate::video_cache::FrameCacheLite>,
+    actor_track_assignments: std::collections::HashMap<usize, usize>,
+    overlay_track_assignments: std::collections::HashMap<usize, usize>,
+    assets: PathBuf,
+    out_path: PathBuf,
+    log_tx: Sender<JobEvent>,
+) -> Result<(), String> {
+    use std::time::Instant;
+
+    let fps = scene.output.fps.max(1);
+    let duration = scene.output.duration.max(1.0 / 60.0);
+    let total_frames = ((duration * fps as f32).ceil() as usize).max(1);
+
+    // Per-render scratch directory under the system temp root. We tag
+    // it with the process id + a high-resolution timestamp so two
+    // concurrent renders (e.g. CLI + GUI exporting at once) never
+    // collide. The directory tree is removed unconditionally at the
+    // end — both on success and on failure — to keep tmp clean even
+    // after a crash mid-render.
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let frames_dir = std::env::temp_dir().join(format!("memstroy-render-{pid}-{nanos}"));
+    std::fs::create_dir_all(&frames_dir)
+        .map_err(|e| format!("create temp dir {}: {e}", frames_dir.display()))?;
+
+    let _ = log_tx.send(JobEvent::RenderLog(format!(
+        "Rendering {total_frames} frames at {fps} fps -> {}",
+        frames_dir.display()
+    )));
+
+    // ── Compose every frame ─────────────────────────────────────
+    //
+    // The painter loop is CPU-heavy (load JPGs, run CPU effects,
+    // blend, save PNG) and runs on `tokio::task::spawn_blocking` so
+    // it doesn't tie up the tokio worker that's also driving
+    // ffmpeg's stderr reader during the encode phase.
+    //
+    // Progress is streamed live through `log_tx` so the GUI bar
+    // animates continuously. We mirror ffmpeg's `frame=N
+    // time=HH:MM:SS.mmm` format so the existing log parser in
+    // `app.rs::handle_render_log` updates the bar as-is — no GUI
+    // changes required for the new path. Cadence is roughly once
+    // per second of scene-time, matching ffmpeg's own progress
+    // emission rate so the bar moves at the same speed during
+    // compose AND encode.
+    let progress_stride = (fps as usize).max(1);
+    let frames_dir_for_compose = frames_dir.clone();
+    let scene_for_compose = scene.clone();
+    let frame_caches_for_compose = frame_caches.clone();
+    let actor_tracks_for_compose = actor_track_assignments.clone();
+    let overlay_tracks_for_compose = overlay_track_assignments.clone();
+    let log_tx_for_compose = log_tx.clone();
+
+    let compose_start = Instant::now();
+    let compose_result: Result<(), String> = tokio::task::spawn_blocking(move || {
+        let scene = scene_for_compose;
+        let frame_caches = frame_caches_for_compose;
+        let actor_tracks = actor_tracks_for_compose;
+        let overlay_tracks = overlay_tracks_for_compose;
+        for i in 0..total_frames {
+            let t = i as f32 / fps as f32;
+            let img = crate::frame_snapshot::render_full_frame_at(
+                &scene,
+                &frame_caches,
+                &actor_tracks,
+                &overlay_tracks,
+                t,
+            );
+            let path = frames_dir_for_compose.join(format!("{:06}.png", i + 1));
+            img.save(&path)
+                .map_err(|e| format!("save {} failed: {e}", path.display()))?;
+            if i % progress_stride == 0 || i + 1 == total_frames {
+                let secs = t;
+                let line = format!(
+                    "frame={frame} time={hh:02}:{mm:02}:{ss:06.3} compose",
+                    frame = i + 1,
+                    hh = (secs as u32) / 3600,
+                    mm = ((secs as u32) / 60) % 60,
+                    ss = secs - ((secs as u32) / 60 * 60) as f32,
+                );
+                let _ = log_tx_for_compose.send(JobEvent::RenderLog(line));
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("compose task panicked: {e}"))?;
+
+    if let Err(e) = compose_result {
+        // Best-effort cleanup before bubbling the error.
+        let _ = std::fs::remove_dir_all(&frames_dir);
+        return Err(e);
+    }
+
+    let compose_secs = compose_start.elapsed().as_secs_f32();
+    let _ = log_tx.send(JobEvent::RenderLog(format!(
+        "Composed {total_frames} frames in {:.1}s — encoding...",
+        compose_secs
+    )));
+
+    // ── Encode the PNG sequence + audio into MP4 ────────────────
+    //
+    // `build_image_sequence_plan` produces an FfmpegPlan whose
+    // first input is the PNG sequence (consumed at the output
+    // fps via image2 demuxer) and whose remaining inputs are the
+    // scene's audio tracks. The plan's filter_complex contains
+    // ONLY the audio mixing chain, so video is mapped straight
+    // from `[0:v]` with no per-frame compositing — the snapshot
+    // painter already did all the work.
+    let plan = match memstroy_render::build_image_sequence_plan(
+        &scene,
+        &frames_dir,
+        &out_path,
+        &assets,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&frames_dir);
+            return Err(format!("build image-sequence plan: {e}"));
+        }
+    };
+
+    let encode_start = Instant::now();
+    let log_tx_for_encode = log_tx.clone();
+    let encode_result =
+        memstroy_render::run_ffmpeg_plan(&plan, |line| {
+            let _ = log_tx_for_encode.send(JobEvent::RenderLog(line.to_string()));
+        })
+        .await;
+
+    // Cleanup happens unconditionally so a half-finished render
+    // doesn't leak hundreds of PNGs under /tmp.
+    let _ = std::fs::remove_dir_all(&frames_dir);
+
+    match encode_result {
+        Ok(()) => {
+            let encode_secs = encode_start.elapsed().as_secs_f32();
+            tracing::info!(
+                compose_secs,
+                encode_secs,
+                "render via snapshot finished"
+            );
+            Ok(())
+        }
+        Err(e) => Err(format!("ffmpeg encode failed: {e}")),
+    }
 }
 
 /// Stamp every actor / overlay's `z_order` field on the supplied

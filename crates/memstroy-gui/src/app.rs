@@ -7,7 +7,7 @@ use egui::{Color32, RichText, ViewportCommand, Rounding, Stroke, Vec2};
 use memstroy_core::Scene;
 use tokio::runtime::Runtime;
 
-use crate::jobs::{spawn_refresh, spawn_render, JobEvent};
+use crate::jobs::{spawn_refresh, JobEvent};
 use crate::panels;
 use crate::state::{EditorState, Selection};
 use crate::image_editor;
@@ -2357,10 +2357,35 @@ impl App {
         // track even though the preview correctly draws the clip on
         // top. See `populate_render_z_order` for the full mapping.
         crate::jobs::populate_render_z_order(&self.state, &mut scene_for_render);
-        spawn_render(
+
+        // ── Snapshot-based render path ──────────────────────────
+        //
+        // Render every output frame through `frame_snapshot` (the
+        // same painter pipeline the canvas preview and the
+        // "Extract frame" button use), then encode the resulting
+        // PNG sequence + audio via ffmpeg. This guarantees the
+        // exported MP4 is pixel-for-pixel identical to what the
+        // user sees on the canvas — no more bug-class of "ffmpeg
+        // filter graph approximates the preview but doesn't quite
+        // match it" that the previous filter_complex-only render
+        // path produced.
+        //
+        // We snapshot the bits the painters need (lite frame caches,
+        // track assignments) here on the UI thread so the spawned
+        // render task can own them outright. Frame caches that
+        // aren't ready yet still produce a valid render — the
+        // painter falls back to skipping the actor for that frame,
+        // exactly as the canvas preview does.
+        let frame_caches = crate::frame_snapshot::snapshot_frame_caches(&self.state);
+        let actor_tracks = self.state.actor_track_assignments.clone();
+        let overlay_tracks = self.state.overlay_track_assignments.clone();
+        crate::jobs::spawn_render_via_snapshot(
             self.rt.handle(),
             self.tx.clone(),
             scene_for_render,
+            frame_caches,
+            actor_tracks,
+            overlay_tracks,
             self.state.assets_root.clone(),
             path,
         );

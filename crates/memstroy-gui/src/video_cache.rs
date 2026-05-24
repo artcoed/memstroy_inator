@@ -68,6 +68,49 @@ struct PreloadResult {
     frames: Vec<Option<ColorImage>>,
 }
 
+/// Thread-safe snapshot of the disk-resident half of a [`FrameCache`].
+///
+/// `FrameCache` itself isn't `Send` because it owns `egui::TextureHandle`s
+/// and an `Arc<Mutex<…>>` for the pre-load worker. The full-render
+/// pipeline (`render_via_snapshot`) needs to be able to look up an
+/// actor's extracted JPGs from a background thread, so we mirror the
+/// purely-data fields here. The actual frame pixels are still loaded
+/// from disk on demand via `image::open(cache_dir/NNNNNN.jpg)`, so the
+/// snapshot carries no pixel buffers — it's a few bytes per actor and
+/// safe to clone, send across threads, and live for the duration of an
+/// async render task.
+///
+/// `ready=false` means the source clip's `ffmpeg -vf fps=…` extraction
+/// pass either hasn't finished or never started; callers should skip
+/// the actor (the snapshot painters fall back to a no-op the same way
+/// they do during a live preview when the cache hasn't warmed up).
+#[derive(Clone, Debug)]
+pub struct FrameCacheLite {
+    pub cache_dir: PathBuf,
+    pub fps: f32,
+    pub frame_count: usize,
+    #[allow(dead_code)] // reserved for callers that need to know the source's intrinsic dimensions
+    pub source_width: u32,
+    #[allow(dead_code)]
+    pub source_height: u32,
+    pub ready: bool,
+}
+
+impl FrameCacheLite {
+    /// Project the disk-resident fields out of a live [`FrameCache`].
+    /// Cheap; everything we copy is `Copy` or already a `PathBuf`.
+    pub fn from_cache(fc: &FrameCache) -> Self {
+        Self {
+            cache_dir: fc.cache_dir.clone(),
+            fps: fc.fps,
+            frame_count: fc.frame_count,
+            source_width: fc.source_width,
+            source_height: fc.source_height,
+            ready: fc.ready,
+        }
+    }
+}
+
 impl FrameCache {
     /// Create a new empty frame cache (not yet ready).
     pub fn new(source: PathBuf, actor_index: usize) -> Self {

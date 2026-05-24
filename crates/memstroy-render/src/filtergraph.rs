@@ -133,6 +133,24 @@ impl<'a> FilterGraphBuilder<'a> {
         Ok(())
     }
 
+    /// Audio-only build entry point used by the snapshot-based render
+    /// path. Skips every video filter (composite, overlays, camera,
+    /// finalise) so the resulting filter_complex string contains only
+    /// the per-track normalisation chain + amix, and `inputs` carries
+    /// only audio-source `-i` slots. The caller is expected to prepend
+    /// an `InputKind::ImageSequence` input as slot 0 and map the video
+    /// output from `[0:v]` directly.
+    ///
+    /// This is what makes the snapshot render's output file actually
+    /// playable: the per-frame PNGs handle the picture exactly the way
+    /// the canvas preview does, while the well-tested
+    /// `aresample → aformat → atrim → adelay → apad → amix` chain
+    /// handles audio mixing without touching the video at all.
+    pub fn build_audio_only(&mut self) -> Result<()> {
+        self.emit_audio()?;
+        Ok(())
+    }
+
     /// Emit every actor and overlay in a single pass, sorted by
     /// `z_order`. Lower z = drawn first (visually behind), higher z
     /// = drawn later (visually on top). Within ties, the previous

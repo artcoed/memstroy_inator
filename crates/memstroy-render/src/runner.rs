@@ -33,6 +33,18 @@ where
     run_plan(&plan, &mut on_log).await
 }
 
+/// Run a pre-built [`FfmpegPlan`] against ffmpeg, streaming its
+/// stderr into `on_log`. Public so the GUI's snapshot-based render
+/// path can construct its own plan via `build_image_sequence_plan`
+/// (or any future variant) and run it without going back through the
+/// `Scene → filter_complex` builder.
+pub async fn run_ffmpeg_plan<F>(plan: &FfmpegPlan, mut on_log: F) -> Result<()>
+where
+    F: FnMut(&str),
+{
+    run_plan(plan, &mut on_log).await
+}
+
 /// Render a single still frame at time `t` to `out_png`. Useful for
 /// the GUI scrubber. Implementation: render the full scene to a
 /// pipe-friendly intermediate is overkill for a preview; we instead

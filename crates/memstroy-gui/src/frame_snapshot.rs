@@ -70,6 +70,7 @@ use memstroy_core::{
 use crate::image_effects;
 use crate::state::{EditorState, Selection};
 use crate::video_cache;
+use crate::video_cache::FrameCacheLite;
 
 /// Public entry point — composes the canvas at the playhead, saves
 /// the result into the project's image library, and adds a new
@@ -140,6 +141,54 @@ pub fn extract_frame_to_image_layer(state: &mut EditorState) -> Result<usize, St
     Ok(idx)
 }
 
+// ─── PUBLIC FULL-FRAME RENDER ENTRY POINT ──────────────────────────
+//
+// `render_full_frame_at` is the back-end the new MP4 export path uses:
+// for each output frame at scene-time `t` it composes the same picture
+// `extract_frame_to_image_layer` would (full canvas, no subset), then
+// returns the RGBA buffer for the caller to encode. Decoupled from
+// `EditorState` on purpose — the render loop runs on a background
+// thread and mustn't take a `&mut` borrow of the live editor state.
+//
+// `frame_caches` is the cheap-to-clone projection of the live actors'
+// frame caches (see `FrameCacheLite::from_cache`); the painters look
+// up extracted JPGs from disk via the snapshot fields and never touch
+// the egui texture handles. `actor_track_assignments` /
+// `overlay_track_assignments` are simple `HashMap<usize, usize>` clones
+// used to drive the timeline-track-derived z-order. None of these
+// dependencies hold any non-`Send` data, so the entire call is safe to
+// run from a `tokio::spawn` task or a `std::thread`.
+pub fn render_full_frame_at(
+    scene: &Scene,
+    frame_caches: &[FrameCacheLite],
+    actor_track_assignments: &std::collections::HashMap<usize, usize>,
+    overlay_track_assignments: &std::collections::HashMap<usize, usize>,
+    t: f32,
+) -> RgbaImage {
+    let summary = compose_frame_owned(
+        scene,
+        frame_caches,
+        actor_track_assignments,
+        overlay_track_assignments,
+        &[],
+        true,
+        t,
+    );
+    summary.image
+}
+
+/// Snapshot every cache slot in the live editor state into the
+/// thread-safe `FrameCacheLite` form. Index alignment is preserved so
+/// `frame_caches[actor_idx]` continues to work the way `paint_actor`
+/// expects.
+pub fn snapshot_frame_caches(state: &EditorState) -> Vec<FrameCacheLite> {
+    state
+        .frame_caches
+        .iter()
+        .map(FrameCacheLite::from_cache)
+        .collect()
+}
+
 // ─── COMPOSITOR ────────────────────────────────────────────────────
 
 #[derive(Default)]
@@ -150,13 +199,44 @@ struct CompositeSummary {
     skipped_image_bg: u32,
 }
 
+/// Thin shim that snapshots `state.frame_caches` and routes through
+/// the owned-data compositor. Keeps `extract_frame_to_image_layer`'s
+/// existing `&mut EditorState` API intact while letting the render
+/// loop call the same compositor with thread-safe inputs.
 fn compose_frame(
     state: &mut EditorState,
     subset: &[Selection],
     full_frame: bool,
     t: f32,
 ) -> CompositeSummary {
-    let scene_clone = state.scene.clone();
+    let frame_caches = snapshot_frame_caches(state);
+    let actor_tracks = state.actor_track_assignments.clone();
+    let overlay_tracks = state.overlay_track_assignments.clone();
+    let scene = state.scene.clone();
+    compose_frame_owned(
+        &scene,
+        &frame_caches,
+        &actor_tracks,
+        &overlay_tracks,
+        subset,
+        full_frame,
+        t,
+    )
+}
+
+/// Background-thread-friendly compositor. Identical semantics to the
+/// `compose_frame` shim above but with explicit, owned inputs so the
+/// caller can be a `tokio::spawn` task that doesn't have access to the
+/// live editor state.
+fn compose_frame_owned(
+    scene_clone: &Scene,
+    frame_caches: &[FrameCacheLite],
+    actor_track_assignments: &std::collections::HashMap<usize, usize>,
+    overlay_track_assignments: &std::collections::HashMap<usize, usize>,
+    subset: &[Selection],
+    full_frame: bool,
+    t: f32,
+) -> CompositeSummary {
     let rf = &scene_clone.render_frame;
     let [rw, rh] = rf.resolution;
     let rw = rw.max(1);
@@ -262,8 +342,7 @@ fn compose_frame(
         if !actor.visible {
             continue;
         }
-        let track = state
-            .actor_track_assignments
+        let track = actor_track_assignments
             .get(&ai)
             .copied()
             .unwrap_or(0);
@@ -289,8 +368,7 @@ fn compose_frame(
             Some(o) => o,
             None => continue,
         };
-        let track = state
-            .overlay_track_assignments
+        let track = overlay_track_assignments
             .get(&oi)
             .copied()
             .unwrap_or(0);
@@ -337,7 +415,16 @@ fn compose_frame(
                 }
             }
             PaintOp::Actor(ai) => {
-                paint_actor(state, &scene_clone, ai, &rf_state, rw, rh, t, &mut canvas);
+                paint_actor(
+                    frame_caches,
+                    scene_clone,
+                    ai,
+                    &rf_state,
+                    rw,
+                    rh,
+                    t,
+                    &mut canvas,
+                );
             }
         }
     }
@@ -513,7 +600,7 @@ fn paint_image_overlay(
 // ─── ACTOR ─────────────────────────────────────────────────────────
 
 fn paint_actor(
-    state: &mut EditorState,
+    frame_caches: &[FrameCacheLite],
     scene: &Scene,
     actor_idx: usize,
     rf_state: &RenderFrameState,
@@ -550,14 +637,19 @@ fn paint_actor(
     let speed = actor.speed.max(1.0e-4);
     let local_t = (t - t_in) * speed + actor.source_start;
     let (mut frame_buf, src_w, src_h) =
-        match load_actor_frame_rgba(state, actor_idx, local_t) {
+        match load_actor_frame_rgba(frame_caches, actor_idx, local_t) {
             Some(t) => t,
             None => return,
         };
 
     // Apply chroma key + colour correction + effect stack at the
-    // actor's local-for-anim time (same time canvas_preview uses).
-    let local_for_anim = (state.playhead - t_in).max(0.0);
+    // actor's local clip-time. We use `t` (the rendering / playhead
+    // time) here — NOT a snapshot of any global playhead — so the
+    // animation curves on CC / effects sample at the same instant the
+    // layout sample comes from. The previous `state.playhead` lookup
+    // was correct only when the snapshot was taken AT the playhead;
+    // the full-render path needs animation to advance per frame.
+    let local_for_anim = (t - t_in).max(0.0);
     let cc = actor.color_correction.sampled_at(local_for_anim);
     let baked_effects: Vec<Effect> = actor
         .effects
@@ -652,12 +744,12 @@ fn element_world_pos(scene: &Scene, element_id: &str, t: f32) -> Option<WorldPos
 /// `local_t`. Returns `(rgba, w, h)` or `None` when the cache isn't
 /// ready (frames haven't finished extracting yet).
 fn load_actor_frame_rgba(
-    state: &EditorState,
+    frame_caches: &[FrameCacheLite],
     actor_idx: usize,
     local_t: f32,
 ) -> Option<(Vec<u8>, u32, u32)> {
-    let fc = state.frame_caches.get(actor_idx)?;
-    if !fc.is_ready() || fc.frame_count == 0 {
+    let fc = frame_caches.get(actor_idx)?;
+    if !fc.ready || fc.frame_count == 0 {
         return None;
     }
     let frame_index = ((local_t * fc.fps).floor() as usize)
