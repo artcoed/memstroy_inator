@@ -27,7 +27,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::time::Duration;
 
-use memstroy_core::Scene;
+use memstroy_core::{Overlay, Scene};
 use memstroy_render::{ffmpeg_binary, render_scene};
 use serde::Deserialize;
 use tokio::runtime::Handle;
@@ -112,6 +112,74 @@ pub fn spawn_render(
             result.map(|_| out_path).map_err(|e| e.to_string()),
         ));
     });
+}
+
+/// Stamp every actor / overlay's `z_order` field on the supplied
+/// scene from the editor's timeline-track assignments. Must be called
+/// on the cloned scene right before `spawn_render` so the renderer's
+/// `emit_z_ordered_elements` pass reproduces the preview canvas's
+/// layer stacking exactly.
+///
+/// Stacking rule (mirrors `canvas_preview::draw_canvas_overlays` and
+/// `frame_snapshot::paint_frame`):
+///   * Lower track index = higher up the timeline panel = drawn LAST
+///     (visually on top)  → HIGHER `z_order` value.
+///   * Higher track index = lower on the panel = drawn FIRST (behind)
+///     → LOWER `z_order` value.
+///
+/// We map `z_order = -(track as i32) - 1`. The `- 1` offset makes
+/// even track 0 produce `z_order = -1` (nonzero), which is what the
+/// renderer keys on to enable explicit z-ordering — without it, a
+/// scene with all elements on track 0 would still trip the all-zero
+/// legacy fallback and the user-visible bug ("clips above an image
+/// in preview disappear behind the image after render") would
+/// resurrect itself.
+///
+/// Defaults for un-assigned elements mirror the canvas helpers:
+///   * Actors  → first video track (`actor_track_index`),
+///   * Overlays → second video track if present, else first
+///     (`default_overlay_track`).
+pub fn populate_render_z_order(state: &crate::state::EditorState, scene: &mut Scene) {
+    use crate::state::TrackKind;
+
+    let z_for_track = |track: usize| -> i32 { -(track as i32) - 1 };
+
+    let default_actor_track = (0..state.tracks.len())
+        .find(|i| state.tracks[*i].kind == TrackKind::Video)
+        .unwrap_or(0);
+
+    let video_track_indices: Vec<usize> = (0..state.tracks.len())
+        .filter(|i| state.tracks[*i].kind == TrackKind::Video)
+        .collect();
+    let default_overlay_track = if video_track_indices.len() >= 2 {
+        video_track_indices[1]
+    } else if !video_track_indices.is_empty() {
+        video_track_indices[0]
+    } else {
+        0
+    };
+
+    for (idx, actor) in scene.actors.iter_mut().enumerate() {
+        let track = state
+            .actor_track_assignments
+            .get(&idx)
+            .copied()
+            .unwrap_or(default_actor_track);
+        actor.z_order = z_for_track(track);
+    }
+    for (idx, ov) in scene.overlays.iter_mut().enumerate() {
+        let track = state
+            .overlay_track_assignments
+            .get(&idx)
+            .copied()
+            .unwrap_or(default_overlay_track);
+        let z = z_for_track(track);
+        match ov {
+            Overlay::Text(t) => t.z_order = z,
+            Overlay::Image(i) => i.z_order = z,
+            Overlay::Video(v) => v.z_order = z,
+        }
+    }
 }
 
 /// Trigger a server-driven Telegram refresh and pull any new clips

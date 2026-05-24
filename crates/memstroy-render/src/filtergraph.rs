@@ -73,11 +73,15 @@ impl<'a> FilterGraphBuilder<'a> {
     pub fn build(&mut self) -> Result<()> {
         self.emit_base_canvas();
         self.emit_backgrounds()?;
-        // Text overlays explicitly placed UNDER the actors render first.
-        self.emit_overlays_filtered(true)?;
-        self.emit_actors()?;
-        // Everything else (image/video overlays + text on top) renders after.
-        self.emit_overlays_filtered(false)?;
+        // Single z-ordered pass — actors and overlays are interleaved
+        // by their per-element `z_order` so the export matches the
+        // preview canvas's timeline-track stacking. The GUI populates
+        // `z_order` on each actor / overlay right before invoking the
+        // renderer (see `populate_render_z_order` in
+        // `memstroy-gui/src/jobs.rs`); legacy scenes / scripts that
+        // never set it fall back to the historical
+        // text-behind-actors → actors → everything-else-on-top order.
+        self.emit_z_ordered_elements()?;
         self.emit_camera()?;
         self.emit_audio()?;
         // Output normalisation pass — must be the LAST video filter so
@@ -85,6 +89,89 @@ impl<'a> FilterGraphBuilder<'a> {
         // known-good shape (yuv420p, square pixels, even dims, CFR at
         // the requested fps). See `finalize_video` for the rationale.
         self.finalize_video();
+        Ok(())
+    }
+
+    /// Emit every actor and overlay in a single pass, sorted by
+    /// `z_order`. Lower z = drawn first (visually behind), higher z
+    /// = drawn later (visually on top). Within ties, the previous
+    /// emit ordering is preserved (text overlays sorted by `z_index`,
+    /// scene index for tiebreak).
+    ///
+    /// Falls back to the legacy 3-phase ordering (text-behind-actors
+    /// → actors → image/video/text-on-top) when ALL elements have
+    /// `z_order == 0`, which is the case for scenes saved before the
+    /// `z_order` field was introduced or scripts that don't populate
+    /// it.
+    fn emit_z_ordered_elements(&mut self) -> Result<()> {
+        let [w, h] = self.scene.output.resolution;
+
+        // Detect whether anything overrides the legacy ordering.
+        let any_explicit = self.scene.actors.iter().any(|a| a.z_order != 0)
+            || self.scene.overlays.iter().any(|ov| match ov {
+                Overlay::Text(t) => t.z_order != 0,
+                Overlay::Image(i) => i.z_order != 0,
+                Overlay::Video(v) => v.z_order != 0,
+            });
+
+        // (sort_key_primary, secondary, tertiary, kind)
+        // - kind 0 = actor, 1 = overlay
+        let mut items: Vec<(i32, i32, usize, u8, usize)> = Vec::new();
+
+        for (idx, actor) in self.scene.actors.iter().enumerate() {
+            let primary = if any_explicit { actor.z_order } else { 100 };
+            // Actors don't have a per-element z_index secondary, so
+            // use 0; index acts as the stable tiebreak.
+            items.push((primary, 0, idx, 0, idx));
+        }
+        for (idx, ov) in self.scene.overlays.iter().enumerate() {
+            let (primary, secondary) = if any_explicit {
+                let z = match ov {
+                    Overlay::Text(t) => t.z_order,
+                    Overlay::Image(i) => i.z_order,
+                    Overlay::Video(v) => v.z_order,
+                };
+                let z2 = match ov {
+                    Overlay::Text(t) => t.z_index,
+                    _ => 100,
+                };
+                (z, z2)
+            } else {
+                // Legacy fallback: text with `behind_actors=true` goes
+                // BELOW actors; everything else (image / video / text
+                // with `behind_actors=false`) goes ABOVE actors. Within
+                // each band, sort by `z_index` (text only) ascending.
+                match ov {
+                    Overlay::Text(t) if t.behind_actors => (0, t.z_index),
+                    Overlay::Text(t) => (200, t.z_index),
+                    _ => (200, 100),
+                }
+            };
+            items.push((primary, secondary, idx, 1, idx));
+        }
+
+        // Sort: primary asc (lower drawn first → behind), then secondary
+        // (text z_index), then stable scene-order tiebreak. Ties between
+        // actors and overlays at the same z_order resolve by scene index
+        // — same shape the preview's `frame_snapshot` uses.
+        items.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then(a.1.cmp(&b.1))
+                .then(a.4.cmp(&b.4))
+        });
+
+        for (_p, _s, _i, kind, idx) in items {
+            if kind == 0 {
+                self.emit_actor_at(idx)?;
+            } else {
+                match &self.scene.overlays[idx] {
+                    Overlay::Text(t) => self.emit_text(t, w, h)?,
+                    Overlay::Image(im) => self.emit_image_overlay(im, w, h)?,
+                    Overlay::Video(v) => self.emit_video_overlay(v, w, h)?,
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -349,9 +436,24 @@ impl<'a> FilterGraphBuilder<'a> {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn emit_actors(&mut self) -> Result<()> {
+        for idx in 0..self.scene.actors.len() {
+            self.emit_actor_at(idx)?;
+        }
+        Ok(())
+    }
+
+    /// Emit a single actor's filter chunks (chromakey → effect stack →
+    /// scale/rotate/opacity → overlay onto cursor → attachments).
+    /// Lifted out of the original `emit_actors` loop so the new
+    /// `emit_z_ordered_elements` pass can interleave actors with
+    /// overlays based on the GUI-supplied per-element `z_order` —
+    /// matching the preview's timeline-track stacking.
+    fn emit_actor_at(&mut self, actor_idx: usize) -> Result<()> {
         let [w, h] = self.scene.output.resolution;
-        for actor in &self.scene.actors {
+        let actor = &self.scene.actors[actor_idx];
+        {
             let path = self.resolve(&actor.source);
             let idx = self.add_input(FfmpegInput {
                 path: path.clone(),
@@ -633,6 +735,7 @@ impl<'a> FilterGraphBuilder<'a> {
 
     /// Emit overlays in z-order. `under_actors=true` selects only text overlays
     /// flagged with `behind_actors`; otherwise emits everything else.
+    #[allow(dead_code)]
     fn emit_overlays_filtered(&mut self, under_actors: bool) -> Result<()> {
         let [w, h] = self.scene.output.resolution;
         // Collect indices with their effective z and a stable scene-order tie.
