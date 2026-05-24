@@ -1,16 +1,16 @@
-# Particle library
+# Библиотека частиц
 
-Particles are sprites with a "bouncy / alive" preset baked in.
-Dropping one onto the canvas spawns an `ImageOverlay` that already
-has these animation modifiers wired up:
+Частицы — это спрайты с заранее зашитым «живым» пресетом. При броске
+такого спрайта на холст создаётся `ImageOverlay`, к которому уже
+подключены модификаторы анимации:
 
-- **Spin** at 90°/sec — continuous rotation.
-- **Pulse** at 1.5 Hz, ±0.15 scale — gentle breathing.
-- **Wobble** at 1.0 Hz, ±12 px in X & Y — slight drift.
+- **Spin** — постоянное вращение, 90°/с.
+- **Pulse** — лёгкое «дыхание», 1.5 Гц, амплитуда ±0.15 по масштабу.
+- **Wobble** — небольшой дрейф, 1.0 Гц, ±12 px по X и Y.
 
-Edit / mute / remove modifiers from the inspector after dropping
-to taste.
+После броска модификаторы можно править, отключать или удалять в
+инспекторе.
 
-Same drop-in workflow as the **Images** tab: PNG / JPG / WebP /
-GIF files in this directory are picked up by the **Particles** tab
-on the next library refresh.
+Логика та же, что у вкладки **Images**: PNG / JPG / WebP / GIF из
+этого каталога подхватываются вкладкой **Particles** при следующем
+обновлении библиотеки.

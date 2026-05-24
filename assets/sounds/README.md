@@ -1,14 +1,15 @@
-# Sound library
+# Библиотека звуков
 
-Drop your sound effects (`.mp3`, `.wav`, `.ogg`, `.flac`, `.aac`,
-`.m4a`, `.opus`) into this directory and click **Refresh** in the
-library panel. Each file becomes a draggable row in the **Sounds**
-tab — drop one onto the timeline to insert it as an `AudioTrack`,
-or onto the canvas to add it at the playhead.
+Складывайте звуковые эффекты (`.mp3`, `.wav`, `.ogg`, `.flac`,
+`.aac`, `.m4a`, `.opus`) в этот каталог и нажимайте **Refresh** в
+панели библиотеки. Каждый файл становится строкой во вкладке
+**Sounds**: бросьте его на таймлайн — добавится `AudioTrack`, или
+на холст — будет добавлен в позиции плейхеда.
 
-The file stem (`my_drum_hit` from `my_drum_hit.wav`) becomes the
-asset id and the row label, so name files for findability.
+Имя файла без расширения (например, `my_drum_hit` из
+`my_drum_hit.wav`) используется как идентификатор ассета и подпись
+строки — давайте файлам осмысленные имена для удобства поиска.
 
-Optional thumbnail: place a sibling `<stem>.thumb.png` (or `.jpg`)
-next to the audio file and the library row picks it up
-automatically.
+Опциональное превью: положите рядом с аудио-файлом
+`<имя>.thumb.png` (или `.jpg`) — библиотека подхватит его
+автоматически.
