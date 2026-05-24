@@ -135,7 +135,41 @@ impl FfmpegPlan {
 /// Build (but do not run) an FFmpeg plan for the given scene + output
 /// path. Resolves all relative asset paths against `assets_root`.
 pub fn build_plan(scene: &Scene, output: &Path, assets_root: &Path) -> Result<FfmpegPlan> {
-    let mut builder = FilterGraphBuilder::new(scene, assets_root);
+    // ── Render-frame ⇄ output canonicalisation ────────────────────
+    //
+    // The canvas preview converts an element's legacy `[0..1]`
+    // normalised position to world pixels via
+    // `pos * render_frame.resolution`. The renderer's
+    // `expr::build_element_transform` does the same conversion via
+    // `pos * output.resolution`. As long as the two resolution
+    // fields agree, preview and render see every overlay at the
+    // same world position; when they diverge — e.g. because a
+    // scene was loaded from disk with one value and the inspector
+    // panel (which used to be the only place that re-synced them)
+    // never opened — every overlay's world position drifts in the
+    // export, the rf-camera's centre crop chops them off-canvas
+    // and the user sees only the actor (or the actor at the wrong
+    // size) instead of the composed scene. We canonicalise the two
+    // fields here so EVERY render path — full export, single-frame
+    // preview, CLI, GUI — is immune to that class of bug regardless
+    // of what set the scene up.
+    //
+    // Policy: `render_frame.resolution` IS the output resolution
+    // (per its own doc-comment in `core::canvas::RenderFrame`).
+    // We point both at the same value so the preview's
+    // `world_w = rf.resolution[0]` formula and the renderer's
+    // `world_w = output.resolution[0]` formula agree by
+    // construction.
+    let mut canonical: Scene;
+    let scene_ref: &Scene = if scene.render_frame.resolution != scene.output.resolution {
+        canonical = scene.clone();
+        canonical.render_frame.resolution = canonical.output.resolution;
+        &canonical
+    } else {
+        scene
+    };
+
+    let mut builder = FilterGraphBuilder::new(scene_ref, assets_root);
     builder.build()?;
     let (filter, inputs, map_video, map_audio, cleanup_paths) = builder.finish();
     Ok(FfmpegPlan {
@@ -144,9 +178,9 @@ pub fn build_plan(scene: &Scene, output: &Path, assets_root: &Path) -> Result<Ff
         map_video,
         map_audio,
         output: output.to_path_buf(),
-        fps: scene.output.fps,
-        resolution: scene.output.resolution,
-        duration: scene.output.duration,
+        fps: scene_ref.output.fps,
+        resolution: scene_ref.output.resolution,
+        duration: scene_ref.output.duration,
         cleanup_paths,
     })
 }
