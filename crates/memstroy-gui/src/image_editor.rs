@@ -218,7 +218,7 @@ fn image_editor_content(ui: &mut egui::Ui, state: &mut EditorState) {
         let label = source
             .file_name()
             .and_then(|s| s.to_str())
-            .unwrap_or("(unknown)");
+            .unwrap_or(crate::i18n::t("(unknown)"));
         ui.label(RichText::new(label).size(10.5));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let fmt = source
@@ -2004,7 +2004,7 @@ fn effects_overview_section(ui: &mut egui::Ui, effects: &mut Vec<Effect>, salt: 
                         "Mute / un-mute this effect without removing it.",
                     ));
                 ui.label(
-                    RichText::new(eff.kind.label())
+                    RichText::new(crate::i18n::t(eff.kind.label()))
                         .size(11.0)
                         .color(if eff.enabled {
                             Color32::from_rgb(220, 220, 240)
