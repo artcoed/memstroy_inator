@@ -266,6 +266,130 @@ fn static_opacity_emits_alpha_multiplier() {
 }
 
 #[test]
+fn animated_opacity_emits_geq_alpha_filter() {
+    // Regression for "У клипов прозрачность неверная после рендера в
+    // отличие от предпросмотра": the renderer used to flatten any
+    // animated opacity to a single midpoint sample (by index, not by
+    // time), so a fade-in keyframed `0.0 → 1.0` rendered as a flat
+    // `1.0` (the second keyframe) and didn't match the canvas
+    // preview's per-frame `keyframe::sample(&layout, t)`. The fix
+    // routes animated opacity through `geq` with a piecewise
+    // expression in `T` (geq's only time variable) so each output
+    // frame gets the right alpha.
+    let mut scene = baseline_scene();
+    let mut actor = baseline_actor("a1");
+    actor.layout = vec![
+        Keyframe::new(0.0, ActorState { opacity: 0.0, ..ActorState::default() }),
+        Keyframe::new(1.0, ActorState { opacity: 1.0, ..ActorState::default() }),
+    ];
+    scene.actors.push(actor);
+
+    let graph = build_filter_graph(&scene);
+    assert!(
+        graph.contains("geq=a='clip(alpha(X,Y)*("),
+        "animated opacity didn't emit per-frame geq alpha multiplier:\n{graph}",
+    );
+    // The piecewise expression must use uppercase `T` (geq's
+    // vocabulary) and reference the keyframe boundary at t=1.
+    assert!(
+        graph.contains("if(lt(T,1.000000)"),
+        "geq expression doesn't switch on `T` at the keyframe boundary:\n{graph}",
+    );
+    // And it must NOT fall back to the static fast path on the same
+    // actor — that would mean opacity got applied twice.
+    assert!(
+        !graph.contains("colorchannelmixer=aa=1.0000"),
+        "animated path leaked an extra static alpha multiplier:\n{graph}",
+    );
+}
+
+#[test]
+fn clip_with_t_in_emits_tpad_to_align_source_timeline() {
+    // Regression for "два клипа разместил последовательно на одном
+    // слое и после рендера только первый отрисовался": when an actor
+    // has `t_in > 0` the renderer used to feed its source straight
+    // through, expecting `enable=between(t,t_in,t_out)` to gate
+    // visibility. But the source decoder runs from scene-time 0 in
+    // step with the shared timeline — by the time the enable window
+    // opens at t_in the source is already at PTS=t_in (or worse,
+    // past EOF for short clips). The fix is `time_align_filters`:
+    // trim → setpts=PTS-STARTPTS → tpad transparent pad before the
+    // content, so the source's first frame lands at scene-time
+    // t_in. We assert the new chain shows up in the filter graph
+    // for an actor whose t_in is non-zero.
+    let mut scene = baseline_scene();
+    scene.output.duration = 10.0;
+    let mut actor = baseline_actor("late");
+    actor.t_in = Some(4.0);
+    actor.t_out = Some(8.0);
+    scene.actors.push(actor);
+
+    let graph = build_filter_graph(&scene);
+
+    assert!(
+        graph.contains("trim=duration=4.000000"),
+        "expected `trim=duration=4` to cap the post-speed source at clip_dur:\n{graph}",
+    );
+    assert!(
+        graph.contains("tpad=start_duration=4.000000:color=black@0.0"),
+        "expected `tpad=start_duration=4:color=black@0.0` to delay the source to t_in=4:\n{graph}",
+    );
+    // tail = scene_dur - t_out = 10 - 8 = 2
+    assert!(
+        graph.contains("tpad=stop_duration=2.000000:color=black@0.0"),
+        "expected trailing tpad to extend the stream to scene end:\n{graph}",
+    );
+}
+
+#[test]
+fn sequential_clips_each_get_their_own_alignment() {
+    // The exact bug the user reported: two clips on the same lane
+    // back-to-back. Both must emit independent time-align chains so
+    // their sources don't race each other against the shared scene
+    // timeline. We also confirm the SECOND clip's tpad shifts it to
+    // scene-time 4 — without this it would render its source's
+    // 4-second mark at scene-time 4 (or EOF, depending on source
+    // length), exactly the "second clip never appears" symptom.
+    let mut scene = baseline_scene();
+    scene.output.duration = 8.0;
+    let mut a = baseline_actor("clipA");
+    a.t_in = Some(0.0);
+    a.t_out = Some(4.0);
+    scene.actors.push(a);
+    let mut b = baseline_actor("clipB");
+    b.t_in = Some(4.0);
+    b.t_out = Some(8.0);
+    scene.actors.push(b);
+
+    let graph = build_filter_graph(&scene);
+
+    // Each actor gets its own trim + setpts=PTS-STARTPTS.
+    assert!(
+        graph.matches("trim=duration=4.000000").count() >= 2,
+        "expected two independent `trim=duration=4` filters, one per clip:\n{graph}",
+    );
+    let setpts_count = graph.matches("setpts=PTS-STARTPTS").count();
+    assert!(
+        setpts_count >= 2,
+        "expected at least two PTS resets (one per clip), got {setpts_count}:\n{graph}",
+    );
+    // Clip A is at t_in=0 so no start tpad; clip B at t_in=4 must
+    // pick up a `tpad=start_duration=4`.
+    assert!(
+        graph.contains("tpad=start_duration=4.000000:color=black@0.0"),
+        "second clip didn't shift its source to start at scene-time 4:\n{graph}",
+    );
+    // And clip A must NOT have a start_duration tpad (t_in=0).
+    // To verify, the only start_duration occurrence should be the
+    // one for clip B.
+    assert_eq!(
+        graph.matches("tpad=start_duration=").count(),
+        1,
+        "exactly one start_duration tpad expected (only clip B has t_in>0):\n{graph}",
+    );
+}
+
+#[test]
 fn color_correction_emits_eq_and_colorbalance() {
     // Brightness / contrast / saturation roll into a single `eq=`
     // filter; temperature spawns a `colorbalance=`. Both must be in
