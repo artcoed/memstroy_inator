@@ -1,9 +1,9 @@
-# Image / sticker library
+# Библиотека картинок и стикеров
 
-Drop PNG / JPG / WebP / GIF stickers in here, then **Refresh** in
-the library panel. Each entry shows up in the **Images** tab; drag
-a row onto the canvas (or timeline) to insert an `ImageOverlay` at
-the drop position.
+Складывайте сюда PNG / JPG / WebP / GIF и нажимайте **Refresh** в
+панели библиотеки. Каждый файл появится во вкладке **Images**;
+перетащите строку на холст или таймлайн — в сцену будет добавлен
+`ImageOverlay` в точке броска.
 
-The sticker file is its own thumbnail — small images render in the
-list as-is, larger ones are downscaled by egui's image loader.
+Сам файл стикера и есть его превью: маленькие картинки рисуются в
+списке как есть, крупные — даунскейлятся загрузчиком egui.
