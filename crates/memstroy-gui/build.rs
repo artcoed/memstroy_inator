@@ -170,6 +170,38 @@ fn embed_windows_version_info() {
     res.set_version_info(winresource::VersionInfo::FILEVERSION, packed);
     res.set_version_info(winresource::VersionInfo::PRODUCTVERSION, packed);
 
+    // ── App icon ────────────────────────────────────────────────────
+    // Embed the multi-resolution catost.ico into the PE so Explorer,
+    // the taskbar, Alt-Tab, Start Menu shortcuts and Inno Setup's
+    // generated shortcuts all show the branded logo without each
+    // surface needing its own out-of-band reference. The file is
+    // checked in next to its PNG source under
+    // `assets/internal_images/`. Path is resolved relative to
+    // CARGO_MANIFEST_DIR (which is `crates/memstroy-gui/`), so we
+    // climb two directories to reach the workspace root.
+    //
+    // If the .ico ever goes missing we surface a `cargo:warning=`
+    // and continue — same best-effort policy as the VS_VERSIONINFO
+    // block above.
+    let manifest_dir = env::var("CARGO_MANIFEST_DIR")
+        .expect("CARGO_MANIFEST_DIR is set by cargo");
+    let icon_path = Path::new(&manifest_dir)
+        .join("..")
+        .join("..")
+        .join("assets")
+        .join("internal_images")
+        .join("catost.ico");
+    if icon_path.is_file() {
+        res.set_icon(icon_path.to_string_lossy().as_ref());
+        println!("cargo:rerun-if-changed={}", icon_path.display());
+    } else {
+        println!(
+            "cargo:warning=app icon not found at {}; \
+             memstroy-gui.exe will use the default Windows icon",
+            icon_path.display()
+        );
+    }
+
     if let Err(err) = res.compile() {
         // A missing resource compiler is not fatal — the binary
         // builds, it just won't have the version block. Surface

@@ -103,6 +103,16 @@ if (-not (Test-Path $GuiExe)) {
     exit 3
 }
 
+# ── Locate branded app icon inside the bundle ───────────────────────
+# package-client.ps1 stages catost.ico at the bundle root. We use it
+# for Setup.exe's own Explorer icon (SetupIconFile), the Add/Remove
+# Programs entry (UninstallDisplayIcon) and the Start Menu / Desktop
+# shortcuts (IconFilename). When the file is missing we fall back to
+# Inno Setup's default and the .exe's embedded icon, so an older
+# bundle without the .ico still installs cleanly.
+$BundleIconIco = Join-Path $BundleDirAbs "catost.ico"
+$HasBundleIcon = Test-Path $BundleIconIco
+
 if ([string]::IsNullOrWhiteSpace($Out)) {
     $Out = Split-Path $BundleDirAbs -Parent
 }
@@ -213,7 +223,28 @@ $IssLines = @(
     'PrivilegesRequiredOverridesAllowed=dialog commandline'
     'ArchitecturesInstallIn64BitMode=x64'
     'UninstallDisplayName=memstroy-inator'
-    "UninstallDisplayIcon={app}\bin\$AppExeName"
+    $(if ($HasBundleIcon) {
+        # Branded icon shipped in the bundle: point both the Setup.exe
+        # itself (icon shown for the .exe in Explorer) and the
+        # uninstaller entry in Settings -> Apps at the catost logo.
+        # `SetupIconFile` is a path to a .ico relative to the
+        # OutputDir / SourceDir Inno Setup uses; we already pass an
+        # absolute path so resolution is unambiguous.
+        "SetupIconFile=$BundleIconIco"
+    } else {
+        '; SetupIconFile= (no bundled icon found, using Inno default)'
+    })
+    $(if ($HasBundleIcon) {
+        # Once installed, point the Add/Remove Programs entry at the
+        # copy of the .ico the installer drops next to the binary.
+        # Falling back to the .exe is fine because build.rs now
+        # embeds the same icon as a PE resource, but referencing the
+        # .ico explicitly is one less surface that depends on the
+        # resource compiler having run on the build host.
+        'UninstallDisplayIcon={app}\catost.ico'
+    } else {
+        "UninstallDisplayIcon={app}\bin\$AppExeName"
+    })
     # ── PE VersionInfo block ─────────────────────────────────────────
     # Populates the Properties → Details tab of the generated
     # Setup.exe. A blank VersionInfo block is itself a heuristic
@@ -239,9 +270,20 @@ $IssLines = @(
     "Source: `"$BundleDirAbs\*`"; DestDir: `"{app}`"; Flags: ignoreversion recursesubdirs createallsubdirs"
     ''
     '[Icons]'
-    "Name: `"{group}\memstroy-inator`"; Filename: `"{app}\bin\$AppExeName`""
+    $(if ($HasBundleIcon) {
+        # Anchor every shortcut to {app}\catost.ico so the Start Menu
+        # entry and Desktop shortcut survive a future change in how
+        # the .exe carries (or doesn't carry) its embedded icon.
+        "Name: `"{group}\memstroy-inator`"; Filename: `"{app}\bin\$AppExeName`"; IconFilename: `"{app}\catost.ico`""
+    } else {
+        "Name: `"{group}\memstroy-inator`"; Filename: `"{app}\bin\$AppExeName`""
+    })
     "Name: `"{group}\{cm:UninstallProgram,memstroy-inator}`"; Filename: `"{uninstallexe}`""
-    "Name: `"{autodesktop}\memstroy-inator`"; Filename: `"{app}\bin\$AppExeName`"; Tasks: desktopicon"
+    $(if ($HasBundleIcon) {
+        "Name: `"{autodesktop}\memstroy-inator`"; Filename: `"{app}\bin\$AppExeName`"; IconFilename: `"{app}\catost.ico`"; Tasks: desktopicon"
+    } else {
+        "Name: `"{autodesktop}\memstroy-inator`"; Filename: `"{app}\bin\$AppExeName`"; Tasks: desktopicon"
+    })
     ''
     '[Run]'
     "Filename: `"{app}\bin\$AppExeName`"; Description: `"{cm:LaunchProgram,memstroy-inator}`"; Flags: nowait postinstall skipifsilent"
@@ -251,6 +293,11 @@ $IssLines = @(
 Write-Host "==> compiling installer with ISCC"
 Write-Host "    bundle    : $BundleDirAbs"
 Write-Host "    output    : $InstallerPath"
+if ($HasBundleIcon) {
+    Write-Host "    app icon  : $BundleIconIco"
+} else {
+    Write-Host "    app icon  : (none — install will use Inno default)"
+}
 
 & $IsccExe "/Q" $IssPath
 if ($LASTEXITCODE -ne 0) { throw "ISCC.exe failed (exit $LASTEXITCODE)" }

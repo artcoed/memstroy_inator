@@ -120,6 +120,23 @@ Get-ChildItem -Path (Join-Path $RootDir "examples") -Filter "*.yaml" -ErrorActio
 $ReadmeSrc = Join-Path $RootDir "README.md"
 if (Test-Path $ReadmeSrc) { Copy-Item -Path $ReadmeSrc -Destination $BundleDir -Force }
 
+# ── App icon ────────────────────────────────────────────────────────
+# The Windows installer (scripts/make-installer.ps1) uses this .ico
+# for `SetupIconFile=` (icon shown for Setup.exe in Explorer) and for
+# `UninstallDisplayIcon=` (icon shown in Settings -> Apps). We also
+# carry the source PNG alongside the .ico so any future cross-platform
+# tooling can find the same logo without reaching back into the repo.
+$IconIcoSrc = Join-Path $RootDir "assets\internal_images\catost.ico"
+$IconPngSrc = Join-Path $RootDir "assets\internal_images\catost.png"
+if (Test-Path $IconIcoSrc) {
+    Copy-Item -Path $IconIcoSrc -Destination (Join-Path $BundleDir "catost.ico") -Force
+} else {
+    Write-Warning "app icon not found at $IconIcoSrc; the installer will fall back to the default Inno Setup icon"
+}
+if (Test-Path $IconPngSrc) {
+    Copy-Item -Path $IconPngSrc -Destination (Join-Path $BundleDir "catost.png") -Force
+}
+
 # ── Top-level launcher .bat ─────────────────────────────────────────
 # The launcher no longer cd's into the bundle to find a local assets\
 # directory — there isn't one in client mode. The editor reads its

@@ -69,11 +69,39 @@ fn main() -> Result<()> {
         .thread_name("memstroy-bg")
         .build()?;
 
+    // ── Window / taskbar icon ───────────────────────────────────────
+    // Branding logo: assets/internal_images/catost.png. We bake the
+    // PNG bytes into the binary via include_bytes! so a deployed
+    // bundle never depends on the source-tree path at runtime —
+    // important because client builds ship without an `assets/`
+    // directory next to the executable.
+    //
+    // Decoding is best-effort: if the PNG ever becomes malformed we
+    // emit a tracing warning and fall back to the OS default icon
+    // rather than crashing the whole editor on startup.
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1480.0, 900.0])
+        .with_min_inner_size([1100.0, 700.0])
+        .with_title("memstroy-inator");
+    const APP_ICON_PNG: &[u8] =
+        include_bytes!("../../../assets/internal_images/catost.png");
+    match image::load_from_memory(APP_ICON_PNG) {
+        Ok(img) => {
+            let rgba = img.to_rgba8();
+            let (w, h) = rgba.dimensions();
+            viewport = viewport.with_icon(egui::IconData {
+                rgba: rgba.into_raw(),
+                width: w,
+                height: h,
+            });
+        }
+        Err(err) => {
+            tracing::warn!("failed to decode embedded app icon (catost.png): {err}");
+        }
+    }
+
     let opts = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1480.0, 900.0])
-            .with_min_inner_size([1100.0, 700.0])
-            .with_title("memstroy-inator"),
+        viewport,
         ..Default::default()
     };
 
