@@ -193,7 +193,7 @@ pub fn skeleton_editor_window(ctx: &egui::Context, state: &mut EditorState) -> b
     let max_w = (screen_rect.width() - 40.0).max(500.0);
     let max_h = (screen_rect.height() - 60.0).max(420.0);
 
-    egui::Window::new("Skeleton Constructor")
+    egui::Window::new(crate::i18n::t("Skeleton Constructor"))
         .open(&mut open)
         .default_size([920.0, 660.0])
         .min_width(560.0)
@@ -402,10 +402,10 @@ fn skeleton_editor_content(ui: &mut egui::Ui, state: &mut EditorState) {
     if state.skeleton_editor.template_idx.is_none() {
         ui.add_space(20.0);
         ui.label(
-            RichText::new(
+            RichText::new(crate::i18n::t(
                 "Pick a clip from the library above and create a skeleton template.\n\
                 The skeleton is saved alongside the source clip as <name>.skeleton.json so it follows the asset across projects.",
-            )
+            ))
             .italics()
             .color(COL_TEXT_DIM),
         );
@@ -542,14 +542,14 @@ fn fit_timeline_to_clip_if_needed(state: &mut EditorState, rendered_w: f32) {
 
 fn skeleton_toolbar(ui: &mut egui::Ui, state: &mut EditorState) {
     ui.horizontal(|ui| {
-        ui.label(RichText::new("Clip:").size(12.0).strong());
+        ui.label(RichText::new(crate::i18n::t("Clip:")).size(12.0).strong());
 
         let current_label = state
             .skeleton_editor
             .clip_path
             .as_ref()
             .and_then(|p| p.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string()))
-            .unwrap_or_else(|| "(none)".into());
+            .unwrap_or_else(|| crate::i18n::t("(none)").into());
 
         let lib_paths: Vec<std::path::PathBuf> = state
             .library
@@ -577,7 +577,7 @@ fn skeleton_toolbar(ui: &mut egui::Ui, state: &mut EditorState) {
                 let resp = ui.add(
                     egui::TextEdit::singleline(&mut search_buf)
                         .desired_width(200.0)
-                        .hint_text("\u{1F50D} search clip..."),
+                        .hint_text(crate::i18n::t("\u{1F50D} search clip...")),
                 );
                 resp.request_focus();
 
@@ -591,7 +591,7 @@ fn skeleton_toolbar(ui: &mut egui::Ui, state: &mut EditorState) {
                             let name = path
                                 .file_stem()
                                 .and_then(|s| s.to_str())
-                                .unwrap_or("(?)")
+                                .unwrap_or(crate::i18n::t("(?)"))
                                 .to_string();
                             if !needle.is_empty()
                                 && !name.to_lowercase().contains(&needle)
@@ -607,7 +607,7 @@ fn skeleton_toolbar(ui: &mut egui::Ui, state: &mut EditorState) {
                         }
                         if shown == 0 {
                             ui.label(
-                                RichText::new("(no matches)")
+                                RichText::new(crate::i18n::t("(no matches)"))
                                     .size(10.0)
                                     .italics()
                                     .color(COL_TEXT_DIM),
@@ -628,7 +628,7 @@ fn skeleton_toolbar(ui: &mut egui::Ui, state: &mut EditorState) {
             if state.skeleton_editor.template_idx.is_none() {
                 if ui
                     .button(
-                        RichText::new("+ Create Skeleton")
+                        RichText::new(crate::i18n::t("+ Create Skeleton"))
                             .color(Color32::from_rgb(80, 200, 120)),
                     )
                     .clicked()
@@ -636,8 +636,8 @@ fn skeleton_toolbar(ui: &mut egui::Ui, state: &mut EditorState) {
                     create_template_for_current_clip(state);
                 }
             } else if ui
-                .button("Save")
-                .on_hover_text("Save skeleton to <clip>.skeleton.json")
+                .button(crate::i18n::t("Save"))
+                .on_hover_text(crate::i18n::t("Save skeleton to <clip>.skeleton.json"))
                 .clicked()
             {
                 save_current_template(state);
@@ -650,18 +650,18 @@ fn skeleton_toolbar(ui: &mut egui::Ui, state: &mut EditorState) {
                 let pc = state.skeleton_editor.preview_cache.as_ref().unwrap();
                 if pc.is_ready() {
                     (
-                        format!("preview {}f", pc.frame_count),
+                        format!("{} {}f", crate::i18n::t("preview"), pc.frame_count),
                         Color32::from_rgb(120, 180, 120),
                     )
                 } else if pc.extracting {
-                    ("extracting...".to_string(), Color32::from_rgb(255, 200, 80))
+                    (crate::i18n::t("extracting...").to_string(), Color32::from_rgb(255, 200, 80))
                 } else {
-                    ("preview pending".to_string(), COL_TEXT_DIM)
+                    (crate::i18n::t("preview pending").to_string(), COL_TEXT_DIM)
                 }
             } else if state.skeleton_editor.actor_idx.is_some() {
-                ("actor cache".to_string(), COL_TEXT_DIM)
+                (crate::i18n::t("actor cache").to_string(), COL_TEXT_DIM)
             } else {
-                ("no preview".to_string(), COL_TEXT_DIM)
+                (crate::i18n::t("no preview").to_string(), COL_TEXT_DIM)
             };
             ui.label(RichText::new(msg).size(10.0).color(col));
         });
@@ -850,7 +850,7 @@ fn create_template_for_current_clip(state: &mut EditorState) {
     state.skeleton_editor.template_idx = Some(state.scene.skeleton_templates.len() - 1);
     state.skeleton_editor.total_frames = (clip_duration * 30.0).ceil() as u32;
     save_current_template(state);
-    state.status = "Skeleton template created.".into();
+    state.status = crate::i18n::t("Skeleton template created.").into();
 }
 
 fn save_current_template(state: &mut EditorState) {
@@ -859,8 +859,8 @@ fn save_current_template(state: &mut EditorState) {
     };
     let template = &state.scene.skeleton_templates[idx];
     match template.save_alongside_clip() {
-        Ok(path) => state.status = format!("Skeleton saved: {}", path.display()),
-        Err(e) => state.status = format!("Save failed: {}", e),
+        Ok(path) => state.status = format!("{} {}", crate::i18n::t("Skeleton saved:"), path.display()),
+        Err(e) => state.status = format!("{} {}", crate::i18n::t("Save failed:"), e),
     }
 }
 
@@ -911,9 +911,9 @@ fn frame_preview(ui: &mut egui::Ui, state: &mut EditorState, width: f32, height:
             .map(|fc| fc.extracting)
             .unwrap_or(false);
         let msg = if extracting {
-            "Extracting preview frames...".to_string()
+            crate::i18n::t("Extracting preview frames...").to_string()
         } else {
-            format!("Frame {}", state.skeleton_editor.current_frame)
+            format!("{} {}", crate::i18n::t("Frame"), state.skeleton_editor.current_frame)
         };
         painter.text(
             rect.center(),
@@ -1125,11 +1125,11 @@ fn transport_bar(ui: &mut egui::Ui, state: &mut EditorState) {
     }
 
     ui.horizontal(|ui| {
-        if ui.button("\u{23EE}").on_hover_text("First frame").clicked() {
+        if ui.button("\u{23EE}").on_hover_text(crate::i18n::t("First frame")).clicked() {
             state.skeleton_editor.current_frame = 0;
             sync_play_time(state, fps);
         }
-        if ui.button("\u{25C0}").on_hover_text("Previous frame").clicked()
+        if ui.button("\u{25C0}").on_hover_text(crate::i18n::t("Previous frame")).clicked()
             && state.skeleton_editor.current_frame > 0
         {
             state.skeleton_editor.current_frame -= 1;
@@ -1143,7 +1143,7 @@ fn transport_bar(ui: &mut egui::Ui, state: &mut EditorState) {
         };
         if ui
             .button(play_label)
-            .on_hover_text("Play / Pause (drag a point during playback to record keyframes)")
+            .on_hover_text(crate::i18n::t("Play / Pause (drag a point during playback to record keyframes)"))
             .clicked()
         {
             state.skeleton_editor.playing = !state.skeleton_editor.playing;
@@ -1153,13 +1153,13 @@ fn transport_bar(ui: &mut egui::Ui, state: &mut EditorState) {
             }
         }
 
-        if ui.button("\u{23E9}").on_hover_text("Next frame").clicked()
+        if ui.button("\u{23E9}").on_hover_text(crate::i18n::t("Next frame")).clicked()
             && state.skeleton_editor.current_frame + 1 < total
         {
             state.skeleton_editor.current_frame += 1;
             sync_play_time(state, fps);
         }
-        if ui.button("\u{23ED}").on_hover_text("Last frame").clicked() {
+        if ui.button("\u{23ED}").on_hover_text(crate::i18n::t("Last frame")).clicked() {
             state.skeleton_editor.current_frame = total - 1;
             sync_play_time(state, fps);
         }
@@ -1179,12 +1179,12 @@ fn transport_bar(ui: &mut egui::Ui, state: &mut EditorState) {
 
         if let Some(name) = state.skeleton_editor.track_loop_point.clone() {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let resp = ui.button(RichText::new("\u{25CB} stop tracking").size(10.0).color(Color32::from_rgb(255, 160, 80)));
+                let resp = ui.button(RichText::new(crate::i18n::t("\u{25CB} stop tracking")).size(10.0).color(Color32::from_rgb(255, 160, 80)));
                 if resp.clicked() {
                     state.skeleton_editor.track_loop_point = None;
                     state.skeleton_editor.playing = false;
                 }
-                resp.on_hover_text(format!("Looping over '{}'", name));
+                resp.on_hover_text(format!("{} '{}'", crate::i18n::t("Looping over"), name));
             });
         }
     });
@@ -1201,9 +1201,9 @@ fn timeline_loop_toggle(ui: &mut egui::Ui, state: &mut EditorState) {
     } else {
         COL_TEXT_DIM
     };
-    let btn = egui::Button::new(RichText::new("\u{1F501} Loop").size(11.0).color(col));
+    let btn = egui::Button::new(RichText::new(crate::i18n::t("\u{1F501} Loop")).size(11.0).color(col));
     if ui.add(btn)
-        .on_hover_text("Loop playback (wrap to start at end of clip)")
+        .on_hover_text(crate::i18n::t("Loop playback (wrap to start at end of clip)"))
         .clicked()
     {
         state.skeleton_editor.loop_playback = !state.skeleton_editor.loop_playback;
@@ -1587,19 +1587,19 @@ fn keyframe_easing_panel(ui: &mut egui::Ui, state: &mut EditorState) {
 
     ui.horizontal(|ui| {
         ui.label(
-            RichText::new(format!("KF '{}' #{}", name, idx + 1))
+            RichText::new(format!("{} '{}' #{}", crate::i18n::t("KF"), name, idx + 1))
                 .size(11.0)
                 .color(COL_TEXT_DIM),
         );
-        ui.label(RichText::new("transition:").size(10.0).color(COL_TEXT_DIM));
+        ui.label(RichText::new(crate::i18n::t("transition:")).size(10.0).color(COL_TEXT_DIM));
 
         for (label, value) in &[
-            ("Step", Easing::Step),
-            ("Linear", Easing::Linear),
-            ("EaseIn", Easing::EaseIn),
-            ("EaseOut", Easing::EaseOut),
-            ("EaseInOut", Easing::EaseInOut),
-            ("Bezier", Easing::Cubic),
+            (crate::i18n::t("Step"), Easing::Step),
+            (crate::i18n::t("Linear"), Easing::Linear),
+            (crate::i18n::t("EaseIn"), Easing::EaseIn),
+            (crate::i18n::t("EaseOut"), Easing::EaseOut),
+            (crate::i18n::t("EaseInOut"), Easing::EaseInOut),
+            (crate::i18n::t("Bezier"), Easing::Cubic),
         ] {
             let is_sel = current_easing == *value;
             if ui
@@ -1612,7 +1612,7 @@ fn keyframe_easing_panel(ui: &mut egui::Ui, state: &mut EditorState) {
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui
-                .small_button(RichText::new("delete kf").color(Color32::from_rgb(255, 120, 120)))
+                .small_button(RichText::new(crate::i18n::t("delete kf")).color(Color32::from_rgb(255, 120, 120)))
                 .clicked()
             {
                 delete_kf = true;
@@ -1647,13 +1647,13 @@ fn keyframe_easing_panel(ui: &mut egui::Ui, state: &mut EditorState) {
 /// keyframe range), delete. The "+" button auto-generates names like
 /// `p1`, `p2`, ... so the user can immediately start placing.
 fn point_list_panel(ui: &mut egui::Ui, state: &mut EditorState) {
-    ui.label(RichText::new("Points").size(14.0).strong());
+    ui.label(RichText::new(crate::i18n::t("Points")).size(14.0).strong());
     ui.add_space(4.0);
 
     ui.horizontal(|ui| {
         if ui
-            .button(RichText::new("+ Add point").color(Color32::from_rgb(120, 220, 140)))
-            .on_hover_text("Add a new point with an auto-generated name and start placing it")
+            .button(RichText::new(crate::i18n::t("+ Add point")).color(Color32::from_rgb(120, 220, 140)))
+            .on_hover_text(crate::i18n::t("Add a new point with an auto-generated name and start placing it"))
             .clicked()
         {
             add_auto_point(state);
@@ -1674,7 +1674,7 @@ fn point_list_panel(ui: &mut egui::Ui, state: &mut EditorState) {
 
     if point_names.is_empty() {
         ui.label(
-            RichText::new("No points yet — press \"+ Add point\".")
+            RichText::new(crate::i18n::t("No points yet — press \"+ Add point\"."))
                 .size(11.0)
                 .color(COL_TEXT_DIM)
                 .italics(),
@@ -1750,7 +1750,7 @@ fn point_list_panel(ui: &mut egui::Ui, state: &mut EditorState) {
                         |ui| {
                             if ui
                                 .small_button("\u{1F5D1}")
-                                .on_hover_text("Remove point")
+                                .on_hover_text(crate::i18n::t("Remove point"))
                                 .clicked()
                             {
                                 to_remove = Some(name.clone());
@@ -1765,9 +1765,9 @@ fn point_list_panel(ui: &mut egui::Ui, state: &mut EditorState) {
                             if ui
                                 .small_button(RichText::new(track_label).color(track_color))
                                 .on_hover_text(if is_tracking {
-                                    "Stop tracking"
+                                    crate::i18n::t("Stop tracking")
                                 } else {
-                                    "Track: loop playback over this point's keyframe range"
+                                    crate::i18n::t("Track: loop playback over this point's keyframe range")
                                 })
                                 .clicked()
                             {
@@ -1782,14 +1782,14 @@ fn point_list_panel(ui: &mut egui::Ui, state: &mut EditorState) {
                                         .size(10.0)
                                         .color(Color32::from_rgb(180, 220, 180)),
                                 )
-                                .on_hover_text(
+                                .on_hover_text(crate::i18n::t(
                                     "Guide image is set — drag a different\n\
                                     image from the Images library to replace it.",
-                                );
+                                ));
                             }
 
                             ui.label(
-                                RichText::new(format!("{} kf", num_kf))
+                                RichText::new(format!("{} {}", num_kf, crate::i18n::t("kf")))
                                     .size(9.0)
                                     .color(COL_TEXT_DIM),
                             );
@@ -1820,12 +1820,14 @@ fn point_list_panel(ui: &mut egui::Ui, state: &mut EditorState) {
                 // look identical to non-droppable rows and the user
                 // wonders why the dragged image isn't sticking.
                 let caption = format!(
-                    "\u{2935} drop \"{}\" as guide for {}",
+                    "\u{2935} {} \"{}\" {} {}",
+                    crate::i18n::t("drop"),
                     if dragged_image_label.is_empty() {
-                        "image"
+                        crate::i18n::t("image")
                     } else {
                         dragged_image_label.as_str()
                     },
+                    crate::i18n::t("as guide for"),
                     name,
                 );
                 painter.text(
@@ -1890,7 +1892,7 @@ fn point_list_panel(ui: &mut egui::Ui, state: &mut EditorState) {
         }
         state.skeleton_editor.point_guide_images.remove(&name);
         let _ = state.scene.skeleton_templates[tmpl_idx].save_alongside_clip();
-        state.status = format!("Removed point: {}", name);
+        state.status = format!("{} {}", crate::i18n::t("Removed point:"), name);
     }
 
     // Apply the per-row image drop AFTER the row loop so the borrow
@@ -1909,12 +1911,13 @@ fn point_list_panel(ui: &mut egui::Ui, state: &mut EditorState) {
         state.asset_drag.label.clear();
         state.asset_drag.thumbnail = None;
         state.status = format!(
-            "Guide image set for '{}': {}",
+            "{} '{}': {}",
+            crate::i18n::t("Guide image set for"),
             point_name,
             image_path
                 .file_name()
                 .and_then(|s| s.to_str())
-                .unwrap_or("(image)"),
+                .unwrap_or(crate::i18n::t("(image)")),
         );
     }
 
@@ -1938,16 +1941,16 @@ fn point_guide_image_panel(ui: &mut egui::Ui, state: &mut EditorState) {
     ui.separator();
     ui.add_space(4.0);
     ui.label(
-        RichText::new("Guide image")
+        RichText::new(crate::i18n::t("Guide image"))
             .size(12.0)
             .strong()
             .color(Color32::from_rgb(180, 180, 230)),
     );
     ui.label(
-        RichText::new(
+        RichText::new(crate::i18n::t(
             "Drag an image from the Images library onto a point row above \
              or into the box below. Visual aid only — not saved to the template.",
-        )
+        ))
         .size(9.0)
         .color(COL_TEXT_DIM)
         .italics(),
@@ -1956,7 +1959,7 @@ fn point_guide_image_panel(ui: &mut egui::Ui, state: &mut EditorState) {
 
     let Some(point_name) = state.skeleton_editor.selected_point.clone() else {
         ui.label(
-            RichText::new("Select a point first.")
+            RichText::new(crate::i18n::t("Select a point first."))
                 .size(10.0)
                 .italics()
                 .color(COL_TEXT_DIM),
@@ -1976,14 +1979,14 @@ fn point_guide_image_panel(ui: &mut egui::Ui, state: &mut EditorState) {
                     "\u{1F5BC} {}",
                     p.file_name()
                         .and_then(|s| s.to_str())
-                        .unwrap_or("image"),
+                        .unwrap_or(crate::i18n::t("image")),
                 ))
                 .size(10.0)
                 .color(COL_TEXT),
             );
             if ui
-                .small_button("clear")
-                .on_hover_text("Remove the guide image")
+                .small_button(crate::i18n::t("clear"))
+                .on_hover_text(crate::i18n::t("Remove the guide image"))
                 .clicked()
             {
                 state
@@ -2037,18 +2040,19 @@ fn point_guide_image_panel(ui: &mut egui::Ui, state: &mut EditorState) {
 
     let caption = if hovered {
         format!(
-            "\u{2935} drop \"{}\" \u{2192} {}",
+            "\u{2935} {} \"{}\" \u{2192} {}",
+            crate::i18n::t("drop"),
             if dragged_label.is_empty() {
-                "image"
+                crate::i18n::t("image")
             } else {
                 dragged_label.as_str()
             },
             point_name,
         )
     } else if current.is_some() {
-        "Drop another image to replace.".to_string()
+        crate::i18n::t("Drop another image to replace.").to_string()
     } else {
-        format!("Drag an image here for '{}'.", point_name)
+        format!("{} '{}'.", crate::i18n::t("Drag an image here for"), point_name)
     };
     painter.text(
         zone_rect.center(),
@@ -2073,11 +2077,12 @@ fn point_guide_image_panel(ui: &mut egui::Ui, state: &mut EditorState) {
             state.asset_drag.label.clear();
             state.asset_drag.thumbnail = None;
             state.status = format!(
-                "Guide image set for '{}': {}",
+                "{} '{}': {}",
+                crate::i18n::t("Guide image set for"),
                 point_name,
                 p.file_name()
                     .and_then(|s| s.to_str())
-                    .unwrap_or("(image)"),
+                    .unwrap_or(crate::i18n::t("(image)")),
             );
         }
     }
@@ -2103,7 +2108,7 @@ fn add_auto_point(state: &mut EditorState) {
     state.skeleton_editor.selected_point = Some(name.clone());
     state.skeleton_editor.selected_keyframe = None;
     state.skeleton_editor.name_counter = n;
-    state.status = format!("Added point: {}. Click on the frame to place it.", name);
+    state.status = format!("{} {}. {}", crate::i18n::t("Added point:"), name, crate::i18n::t("Click on the frame to place it."));
 }
 
 // Suppress dead-code warning for COL_POINT_DEFAULT (kept for future use /

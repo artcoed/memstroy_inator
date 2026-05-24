@@ -283,9 +283,9 @@ pub fn animated_toggle(
     ));
 
     let resp = resp.on_hover_text(if on {
-        "Animated — click to lock to a single static value"
+        crate::i18n::t("Animated — click to lock to a single static value")
     } else {
-        "Static — click to make this parameter animatable (changes will create keyframes)"
+        crate::i18n::t("Static — click to make this parameter animatable (changes will create keyframes)")
     });
     if resp.clicked() {
         if on {
@@ -346,14 +346,14 @@ pub mod audio_param_ids {
     /// as a fallback for unknown / future ids.
     pub fn label(id: &str) -> &'static str {
         match id {
-            VOLUME    => "Volume",
-            SPEED     => "Speed",
-            PITCH     => "Pitch",
-            PAN       => "Pan",
-            LOW_PASS  => "Low-pass",
-            HIGH_PASS => "High-pass",
-            REVERB    => "Reverb",
-            _         => "param",
+            VOLUME    => crate::i18n::t("Volume"),
+            SPEED     => crate::i18n::t("Speed"),
+            PITCH     => crate::i18n::t("Pitch"),
+            PAN       => crate::i18n::t("Pan"),
+            LOW_PASS  => crate::i18n::t("Low-pass"),
+            HIGH_PASS => crate::i18n::t("High-pass"),
+            REVERB    => crate::i18n::t("Reverb"),
+            _         => crate::i18n::t("param"),
         }
     }
 }

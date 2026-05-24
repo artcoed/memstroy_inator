@@ -476,7 +476,7 @@ fn draw_card(
 
             // Title (one line, ellipsised by egui automatically)
             ui.label(
-                RichText::new(if hit.title.is_empty() { "(untitled)" } else { hit.title.as_str() })
+                RichText::new(if hit.title.is_empty() { crate::i18n::t("(untitled)") } else { hit.title.as_str() })
                     .size(10.5)
                     .color(Color32::from_rgb(220, 220, 240))
                     .strong(),
@@ -519,7 +519,7 @@ fn draw_card(
             state.asset_drag.dragging = Some(local.clone());
             state.asset_drag.kind = AssetDragKind::Image;
             state.asset_drag.label = if hit.title.is_empty() {
-                "web image".to_string()
+                crate::i18n::t("web image").to_string()
             } else {
                 hit.title.clone()
             };
@@ -561,7 +561,7 @@ fn kick_search(state: &mut EditorState, tx: &Sender<JobEvent>, append: bool) {
     }
     let Some(handle) = state.tokio_handle.clone() else {
         state.web_image_search.status =
-            "Tokio runtime missing — search disabled.".to_string();
+            crate::i18n::t("Tokio runtime missing — search disabled.").to_string();
         return;
     };
 
@@ -583,10 +583,11 @@ fn kick_search(state: &mut EditorState, tx: &Sender<JobEvent>, append: bool) {
         state.web_image_search.results.clear();
         state.web_image_search.next_offset = None;
         state.web_image_search.page_count = 0;
-        state.web_image_search.status = format!("\u{1F50D} Searching for \"{}\"...", q);
+        state.web_image_search.status = format!("{} \"{}\"...", crate::i18n::t("\u{1F50D} Searching for"), q);
     } else {
         state.web_image_search.status = format!(
-            "\u{2B07} Loading page {}...",
+            "{} {}...",
+            crate::i18n::t("\u{2B07} Loading page"),
             state.web_image_search.page_count + 1,
         );
     }
@@ -621,7 +622,7 @@ fn kick_download(
     let Some(handle) = state.tokio_handle.clone() else {
         state.web_image_search.results[hit_idx].downloading = false;
         state.web_image_search.results[hit_idx].last_error =
-            Some("Tokio runtime missing".to_string());
+            Some(crate::i18n::t("Tokio runtime missing").to_string());
         return;
     };
 

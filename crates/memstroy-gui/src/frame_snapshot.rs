@@ -101,7 +101,7 @@ pub fn extract_frame_to_image_layer(state: &mut EditorState) -> Result<usize, St
     let w = img.width();
     let h = img.height();
     if w == 0 || h == 0 {
-        return Err("render frame has zero resolution".into());
+        return Err(crate::i18n::t("render frame has zero resolution").into());
     }
 
     // ── Save into project library + spawn the new overlay ────────
@@ -112,25 +112,27 @@ pub fn extract_frame_to_image_layer(state: &mut EditorState) -> Result<usize, St
     // isn't surprised when they look at the resulting picture.
     let mut status = if full_frame {
         format!(
-            "\u{1F4F8} Frame extracted as image layer '{}' ({}\u{00D7}{}).",
+            "{} '{}' ({}\u{00D7}{}).",
+            crate::i18n::t("\u{1F4F8} Frame extracted as image layer"),
             asset.id, w, h
         )
     } else {
         format!(
-            "\u{1F4F8} Selected layers extracted as image layer '{}' ({}\u{00D7}{}).",
+            "{} '{}' ({}\u{00D7}{}).",
+            crate::i18n::t("\u{1F4F8} Selected layers extracted as image layer"),
             asset.id, w, h
         )
     };
     if summary.skipped_text > 0 || summary.skipped_video > 0 || summary.skipped_image_bg > 0 {
-        status.push_str(" Skipped:");
+        status.push_str(crate::i18n::t(" Skipped:"));
         if summary.skipped_text > 0 {
-            status.push_str(&format!(" {} text", summary.skipped_text));
+            status.push_str(&format!(" {}{}", summary.skipped_text, crate::i18n::t(" text")));
         }
         if summary.skipped_video > 0 {
-            status.push_str(&format!(" {} video overlay", summary.skipped_video));
+            status.push_str(&format!(" {}{}", summary.skipped_video, crate::i18n::t(" video overlay")));
         }
         if summary.skipped_image_bg > 0 {
-            status.push_str(&format!(" {} image background", summary.skipped_image_bg));
+            status.push_str(&format!(" {}{}", summary.skipped_image_bg, crate::i18n::t(" image background")));
         }
         status.push('.');
     }
