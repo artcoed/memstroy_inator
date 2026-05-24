@@ -124,6 +124,16 @@ impl<'a> FilterGraphBuilder<'a> {
         // text-behind-actors → actors → everything-else-on-top order.
         self.emit_z_ordered_elements()?;
         self.emit_camera()?;
+        // Apply render-frame-level effects (blur, vignette, colour
+        // grading, etc.) to the FULL composite — after all elements
+        // have been overlaid and the camera pass has run but BEFORE
+        // the final yuv420p normalisation. This matches the preview's
+        // semantics where render-frame effects are a global post-
+        // process applied uniformly to the captured output. Skipped
+        // when the effects list is empty or all entries are disabled
+        // (the common case), so no extra filter complexity is added
+        // for typical scenes.
+        self.emit_render_frame_effects()?;
         self.emit_audio()?;
         // Output normalisation pass — must be the LAST video filter so
         // every code path above feeds the encoder a stream with a
@@ -213,6 +223,64 @@ impl<'a> FilterGraphBuilder<'a> {
             }
         }
 
+        Ok(())
+    }
+
+    /// Apply the render frame's effects stack to the post-composite
+    /// stream. These are global post-process effects (vignette, blur,
+    /// colour grading, etc.) that affect the entire output uniformly,
+    /// applied after all elements have been overlaid and the camera
+    /// pass has run.
+    ///
+    /// The render frame's effects list is usually empty (the field
+    /// defaults to `Vec::new()`) so this method is a no-op for most
+    /// scenes. When effects ARE present, they are applied in order
+    /// just like per-element effect stacks — using the same
+    /// `effect_to_filter` translation and supporting animated
+    /// parameters via the `effect_animated_filter_chain` path.
+    ///
+    /// Masks on the render frame are currently not supported (they
+    /// require a multi-stream alphamerge sub-graph that doesn't make
+    /// semantic sense at the composite level — what would "alpha" mean
+    /// for the final output?). They are silently skipped with a
+    /// warning.
+    fn emit_render_frame_effects(&mut self) -> Result<()> {
+        let effects = &self.scene.render_frame.effects;
+        if effects.is_empty() || effects.iter().all(|e| !e.enabled) {
+            return Ok(());
+        }
+        let scene_dur = self.scene.output.duration;
+        let mut snippets: Vec<String> = Vec::new();
+        for eff in effects {
+            if !eff.enabled {
+                continue;
+            }
+            if matches!(eff.kind, EffectKind::Mask { .. }) {
+                tracing::warn!(
+                    "Mask effects on the render frame are not supported; skipping",
+                );
+                continue;
+            }
+            if let Some(snippet) = crate::expr::effect_animated_filter_chain(
+                eff,
+                0.0,
+                scene_dur,
+                |kind, intensity| effect_to_filter(kind, intensity),
+            ) {
+                snippets.push(snippet);
+            }
+        }
+        if snippets.is_empty() {
+            return Ok(());
+        }
+        let next = self.alloc_label("rfx");
+        self.chunks.push(format!(
+            "{cur}{filters}{out}",
+            cur = self.cursor,
+            filters = snippets.join(","),
+            out = next,
+        ));
+        self.cursor = next;
         Ok(())
     }
 
@@ -505,6 +573,13 @@ impl<'a> FilterGraphBuilder<'a> {
     fn emit_actor_at(&mut self, actor_idx: usize) -> Result<()> {
         let [w, h] = self.scene.output.resolution;
         let actor = &self.scene.actors[actor_idx];
+        // Skip hidden actors — mirrors `canvas_preview` and
+        // `frame_snapshot` which both check `!actor.visible` before
+        // drawing. Without this, elements the user hid in the editor
+        // still appear in the exported MP4.
+        if !actor.visible {
+            return Ok(());
+        }
         {
             let path = self.resolve(&actor.source);
             let idx = self.add_input(FfmpegInput {

@@ -137,39 +137,23 @@ impl FfmpegPlan {
 pub fn build_plan(scene: &Scene, output: &Path, assets_root: &Path) -> Result<FfmpegPlan> {
     // ── Render-frame ⇄ output canonicalisation ────────────────────
     //
-    // The canvas preview converts an element's legacy `[0..1]`
-    // normalised position to world pixels via
-    // `pos * render_frame.resolution`. The renderer's
-    // `expr::build_element_transform` does the same conversion via
-    // `pos * output.resolution`. As long as the two resolution
-    // fields agree, preview and render see every overlay at the
-    // same world position; when they diverge — e.g. because a
-    // scene was loaded from disk with one value and the inspector
-    // panel (which used to be the only place that re-synced them)
-    // never opened — every overlay's world position drifts in the
-    // export, the rf-camera's centre crop chops them off-canvas
-    // and the user sees only the actor (or the actor at the wrong
-    // size) instead of the composed scene. We canonicalise the two
-    // fields here so EVERY render path — full export, single-frame
-    // preview, CLI, GUI — is immune to that class of bug regardless
-    // of what set the scene up.
+    // The render frame's `resolution` field is the single source of
+    // truth for the output file's pixel dimensions. It defines the
+    // rectangle on the canvas that gets captured. To keep the legacy
+    // `[0..1]` normalised position formula `pos * resolution`
+    // consistent between the canvas preview (which uses
+    // `rf.resolution`) and the renderer (which uses
+    // `output.resolution`), we always sync `output.resolution` to
+    // match `render_frame.resolution`.
     //
-    // Policy: `render_frame.resolution` IS the output resolution
-    // (per its own doc-comment in `core::canvas::RenderFrame`).
-    // We point both at the same value so the preview's
-    // `world_w = rf.resolution[0]` formula and the renderer's
-    // `world_w = output.resolution[0]` formula agree by
-    // construction.
-    let mut canonical: Scene;
-    let scene_ref: &Scene = if scene.render_frame.resolution != scene.output.resolution {
-        canonical = scene.clone();
-        canonical.render_frame.resolution = canonical.output.resolution;
-        &canonical
-    } else {
-        scene
-    };
+    // This also ensures that when a scene is loaded from disk with
+    // stale `output.resolution` (e.g. saved before the user changed
+    // the render frame size), every overlay's world position in the
+    // export still matches what the canvas preview shows.
+    let mut canonical: Scene = scene.clone();
+    canonical.output.resolution = canonical.render_frame.resolution;
 
-    let mut builder = FilterGraphBuilder::new(scene_ref, assets_root);
+    let mut builder = FilterGraphBuilder::new(&canonical, assets_root);
     builder.build()?;
     let (filter, inputs, map_video, map_audio, cleanup_paths) = builder.finish();
     Ok(FfmpegPlan {
@@ -178,9 +162,9 @@ pub fn build_plan(scene: &Scene, output: &Path, assets_root: &Path) -> Result<Ff
         map_video,
         map_audio,
         output: output.to_path_buf(),
-        fps: scene_ref.output.fps,
-        resolution: scene_ref.output.resolution,
-        duration: scene_ref.output.duration,
+        fps: canonical.output.fps,
+        resolution: canonical.output.resolution,
+        duration: canonical.output.duration,
         cleanup_paths,
     })
 }
