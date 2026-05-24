@@ -484,7 +484,7 @@ impl<'a> FilterGraphBuilder<'a> {
             if xform.opacity_animated {
                 tracing::debug!(
                     actor_id = %actor.id,
-                    "actor opacity is keyframed; export uses static midpoint sample",
+                    "actor opacity is keyframed; export uses per-frame `geq` alpha to mirror the preview's per-frame keyframe sample",
                 );
             }
             let speed = actor.speed.max(0.0001);
@@ -493,6 +493,29 @@ impl<'a> FilterGraphBuilder<'a> {
             } else {
                 None
             };
+            // ── Time alignment chain ────────────────────────────
+            //
+            // Trims the post-speed source to the visible window,
+            // resets PTS, and pads with transparent frames so the
+            // foreground stream covers every scene-time and the
+            // source's first content frame lands at scene-time
+            // `t_in`. Without this, two clips placed back-to-back
+            // on the same lane race their decoder against the
+            // single shared timeline — the second clip's source
+            // hits EOF before its `enable=` window opens.
+            //
+            // Audio handles the same problem with the analogous
+            // `atrim → asetpts → adelay → apad → atrim` chain in
+            // `emit_audio`, which is why the user's bug report said
+            // "звук был" while the picture froze on the first clip.
+            let scene_dur = self.scene.output.duration;
+            let align_filters = time_align_filters(
+                t_in_clip,
+                t_out_clip,
+                scene_dur,
+                actor.loop_source,
+            );
+            let alpha_part = alpha_filter_for(&xform);
             let scale_part = format!(
                 "scale=w='max(2,iw*({sx}))':h='max(2,ih*({sy}))':eval=frame",
                 sx = xform.sx_expr,
@@ -539,6 +562,13 @@ impl<'a> FilterGraphBuilder<'a> {
                 let after_fx = self.apply_effect_stack(pre_label, &actor.effects, t_in_clip, t_out_clip)?;
                 let mut tail_filters: Vec<String> = Vec::new();
                 if let Some(s) = speed_part { tail_filters.push(s); }
+                // Speed is in source-time, so we apply it BEFORE the
+                // align chain. Once `align_filters` runs, the
+                // stream's PTS axis is scene-time and the geq alpha
+                // expression (which uses `T`) lines up with the
+                // canvas preview's `keyframe::sample(&layout, t)`
+                // call, where `t` is the scene playhead.
+                tail_filters.extend(align_filters.iter().cloned());
                 tail_filters.push(scale_part);
                 if let Some(rot) = &xform.rot_expr {
                     // `c=none` keeps the corners transparent so the
@@ -548,11 +578,8 @@ impl<'a> FilterGraphBuilder<'a> {
                         r = rot,
                     ));
                 }
-                if xform.opacity_static < 0.999 {
-                    tail_filters.push(format!(
-                        "colorchannelmixer=aa={:.4}",
-                        xform.opacity_static.clamp(0.0, 1.0),
-                    ));
+                if let Some(a) = &alpha_part {
+                    tail_filters.push(a.clone());
                 }
                 self.chunks.push(format!(
                     "{src}{filters}{out}",
@@ -589,6 +616,16 @@ impl<'a> FilterGraphBuilder<'a> {
                     chain.push(',');
                     chain.push_str(s);
                 }
+                // Time-align the source with the scene-time window
+                // before any output-space filter (scale / rotate /
+                // alpha) runs. After this, the stream's PTS axis is
+                // scene-time so the geq `T` evaluates on the same
+                // axis as the layout keyframes — see
+                // `time_align_filters` for the why.
+                for f in &align_filters {
+                    chain.push(',');
+                    chain.push_str(f);
+                }
                 chain.push(',');
                 chain.push_str(&scale_part);
                 if let Some(rot) = &xform.rot_expr {
@@ -598,12 +635,9 @@ impl<'a> FilterGraphBuilder<'a> {
                         r = rot,
                     ));
                 }
-                if xform.opacity_static < 0.999 {
+                if let Some(a) = &alpha_part {
                     chain.push(',');
-                    chain.push_str(&format!(
-                        "colorchannelmixer=aa={:.4}",
-                        xform.opacity_static.clamp(0.0, 1.0),
-                    ));
+                    chain.push_str(a);
                 }
                 self.chunks.push(format!("{chain}{out}", chain = chain, out = actor_label));
             }
@@ -873,12 +907,17 @@ impl<'a> FilterGraphBuilder<'a> {
             chain.push(',');
             chain.push_str(&r);
         }
-        if xform.opacity_static < 0.999 {
+        // Text overlays don't have an actor-style "source clip" that
+        // needs time-aligning (the rasterised PNG is static — its
+        // overlay `enable=` window is enough to gate visibility).
+        // But the opacity bug still applies: the layout's `opacity`
+        // is sampled per-frame in the canvas preview, so when the
+        // user keyframes a fade we route through the same animated
+        // alpha helper the actor / image / video paths use. Static
+        // opacity keeps the cheap `colorchannelmixer=aa=`.
+        if let Some(a) = alpha_filter_for(&xform) {
             chain.push(',');
-            chain.push_str(&format!(
-                "colorchannelmixer=aa={:.4}",
-                xform.opacity_static.clamp(0.0, 1.0),
-            ));
+            chain.push_str(&a);
         }
         self.chunks
             .push(format!("{chain}{out}", chain = chain, out = txt_label));
@@ -975,9 +1014,21 @@ impl<'a> FilterGraphBuilder<'a> {
         if xform.opacity_animated {
             tracing::debug!(
                 overlay_id = %ov.id,
-                "image overlay opacity is keyframed; export uses static midpoint sample",
+                "image overlay opacity is keyframed; export uses per-frame `geq` alpha to mirror the preview",
             );
         }
+        // ── Time-align chain & alpha filter ────────────────────────
+        // Same alignment the actor pipeline uses — without it two
+        // image overlays placed sequentially on the same lane would
+        // race the `-loop 1` source's natural framerate against the
+        // shared scene timeline. Image inputs loop indefinitely so
+        // trim is harmless: the loop fills `clip_dur`, then the
+        // start/stop tpads pad the rest of the scene with
+        // transparent frames so the overlay's `enable=` window is
+        // the only thing toggling visibility.
+        let scene_dur = self.scene.output.duration;
+        let align_filters = time_align_filters(ov.t_in, ov.t_out, scene_dur, false);
+        let alpha_part = alpha_filter_for(&xform);
         let scale_part = format!(
             "scale=w='max(2,iw*({sx}))':h='max(2,ih*({sy}))':eval=frame",
             sx = xform.sx_expr,
@@ -1014,18 +1065,20 @@ impl<'a> FilterGraphBuilder<'a> {
                 pre_label = pre_label,
             ));
             let after_fx = self.apply_effect_stack(pre_label, &ov.effects, ov.t_in, ov.t_out)?;
-            let mut tail: Vec<String> = vec![scale_part];
+            let mut tail: Vec<String> = Vec::new();
+            // Time-align comes BEFORE scale: scale operates on the
+            // (already aligned) scene-time stream, and the geq
+            // alpha that follows reads `T` as scene-time.
+            tail.extend(align_filters.iter().cloned());
+            tail.push(scale_part);
             if let Some(rot) = &xform.rot_expr {
                 tail.push(format!(
                     "rotate={r}:c=none:ow=hypot(iw\\,ih):oh=hypot(iw\\,ih)",
                     r = rot,
                 ));
             }
-            if xform.opacity_static < 0.999 {
-                tail.push(format!(
-                    "colorchannelmixer=aa={:.4}",
-                    xform.opacity_static.clamp(0.0, 1.0),
-                ));
+            if let Some(a) = &alpha_part {
+                tail.push(a.clone());
             }
             self.chunks.push(format!(
                 "{src}{filters}{out}",
@@ -1048,6 +1101,13 @@ impl<'a> FilterGraphBuilder<'a> {
                 chain.push(',');
                 chain.push_str(&snippet);
             }
+            // Time-align AFTER the source-time effect stack, BEFORE
+            // any output-space transform, so geq's `T` evaluates as
+            // scene-time when the alpha filter fires below.
+            for f in &align_filters {
+                chain.push(',');
+                chain.push_str(f);
+            }
             chain.push(',');
             chain.push_str(&scale_part);
             if let Some(rot) = &xform.rot_expr {
@@ -1057,12 +1117,9 @@ impl<'a> FilterGraphBuilder<'a> {
                     r = rot,
                 ));
             }
-            if xform.opacity_static < 0.999 {
+            if let Some(a) = &alpha_part {
                 chain.push(',');
-                chain.push_str(&format!(
-                    "colorchannelmixer=aa={:.4}",
-                    xform.opacity_static.clamp(0.0, 1.0),
-                ));
+                chain.push_str(a);
             }
             self.chunks.push(format!("{chain}{out}", chain = chain, out = img_label));
         }
@@ -1101,7 +1158,7 @@ impl<'a> FilterGraphBuilder<'a> {
         if xform.opacity_animated {
             tracing::debug!(
                 overlay_id = %ov.id,
-                "video overlay opacity is keyframed; export uses static midpoint sample",
+                "video overlay opacity is keyframed; export uses per-frame `geq` alpha to mirror the preview",
             );
         }
         let chroma_part = ov.chroma_key.as_ref().map(|ck| {
@@ -1117,6 +1174,17 @@ impl<'a> FilterGraphBuilder<'a> {
         } else {
             None
         };
+        // ── Time alignment chain & alpha filter ────────────────────
+        // Without time-align, two video overlays placed sequentially
+        // on the same lane race their decoders against the shared
+        // scene timeline — the second one's source hits EOF before
+        // its `enable=` window opens (this is the user-visible
+        // "только первый клип отрисовался" bug). The audio path
+        // already shifts each track with `adelay`, which is why audio
+        // played correctly while the picture froze.
+        let scene_dur = self.scene.output.duration;
+        let align_filters = time_align_filters(ov.t_in, ov.t_out, scene_dur, ov.loop_source);
+        let alpha_part = alpha_filter_for(&xform);
         let scale_part = format!(
             "scale=w='max(2,iw*({sx}))':h='max(2,ih*({sy}))':eval=frame",
             sx = xform.sx_expr,
@@ -1135,6 +1203,11 @@ impl<'a> FilterGraphBuilder<'a> {
             let after_fx = self.apply_effect_stack(pre_label, &ov.effects, ov.t_in, ov.t_out)?;
             let mut tail: Vec<String> = Vec::new();
             if let Some(s) = speed_part { tail.push(s); }
+            // Speed is in source-time, so it must run BEFORE the
+            // align chain. Once aligned the stream's PTS axis is
+            // scene-time and the geq below evaluates `T` on the
+            // same axis as the layout keyframes.
+            tail.extend(align_filters.iter().cloned());
             tail.push(scale_part);
             if let Some(rot) = &xform.rot_expr {
                 tail.push(format!(
@@ -1142,11 +1215,8 @@ impl<'a> FilterGraphBuilder<'a> {
                     r = rot,
                 ));
             }
-            if xform.opacity_static < 0.999 {
-                tail.push(format!(
-                    "colorchannelmixer=aa={:.4}",
-                    xform.opacity_static.clamp(0.0, 1.0),
-                ));
+            if let Some(a) = &alpha_part {
+                tail.push(a.clone());
             }
             self.chunks.push(format!(
                 "{src}{filters}{out}",
@@ -1170,6 +1240,12 @@ impl<'a> FilterGraphBuilder<'a> {
                 chain.push(',');
                 chain.push_str(s);
             }
+            // Time-align AFTER speed (source-time) so what comes next
+            // works in scene-time.
+            for f in &align_filters {
+                chain.push(',');
+                chain.push_str(f);
+            }
             chain.push(',');
             chain.push_str(&scale_part);
             if let Some(rot) = &xform.rot_expr {
@@ -1179,12 +1255,9 @@ impl<'a> FilterGraphBuilder<'a> {
                     r = rot,
                 ));
             }
-            if xform.opacity_static < 0.999 {
+            if let Some(a) = &alpha_part {
                 chain.push(',');
-                chain.push_str(&format!(
-                    "colorchannelmixer=aa={:.4}",
-                    xform.opacity_static.clamp(0.0, 1.0),
-                ));
+                chain.push_str(a);
             }
             self.chunks.push(format!("{chain}{out}", chain = chain, out = v_label));
         }
@@ -1927,6 +2000,169 @@ impl<'a> FilterGraphBuilder<'a> {
             .with_context(|| format!("write mask PNG to {}", path.display()))?;
         self.mask_assets.push(path.clone());
         Ok(path)
+    }
+}
+
+/// Build the trim/setpts/tpad filter chain that aligns a clip's
+/// post-processing source stream with its scene-time window
+/// `[t_in, t_out]`.
+///
+/// ## Why
+///
+/// Without this alignment the source's natural decoder timeline
+/// (PTS = `0..source_duration`) sits at scene-time 0 and only the
+/// `enable=between(t,t_in,t_out)` clause on the overlay site gates
+/// visibility. Two clips placed sequentially on the same lane
+/// therefore behave like this:
+///
+/// * Clip A (`t_in=0..t_out=4`, source 4 s) — source plays in step
+///   with the enable window, looks correct.
+/// * Clip B (`t_in=4..t_out=8`, source 4 s) — source has been
+///   streaming since scene-time 0; by the time the enable window
+///   opens at `t=4` the decoder is at EOF and the overlay activates
+///   with nothing left to draw. Audio looked fine because
+///   `emit_audio` already wraps each track in
+///   `atrim+asetpts+adelay+apad+atrim`, but the video stream had no
+///   counterpart.
+///
+/// This is the user-visible bug "two clips on the same layer — only
+/// the first draws, the second never appears even though its audio
+/// plays" and is the bug we fix here.
+///
+/// ## Pipeline (in order)
+///
+///   1. `trim=duration={clip_dur}` — cap the source at its visible
+///      window so a long source doesn't bleed past `t_out`.
+///   2. `setpts=PTS-STARTPTS` — reset the clip-local PTS to 0 so the
+///      subsequent `tpad` starts from a known origin regardless of
+///      `-ss` seek or speed-change baseline.
+///   3. `tpad=start_duration={t_in}:color=black@0.0` — prepend
+///      transparent frames so the foreground stream has a frame at
+///      every scene-time from 0 onwards, and the *content* frames
+///      start at PTS=`t_in`. This is what makes the source's first
+///      frame line up with scene-time `t_in`, instead of scene-time
+///      0 (the bug). Skipped when `t_in <= 0` (no shift needed).
+///   4. `tpad=stop_duration={tail}:color=black@0.0` — extend the
+///      stream to scene end with transparent frames so the overlay
+///      filter never sees foreground EOF before the scene actually
+///      ends. Skipped when `tail <= 0`.
+///
+/// ## Inputs
+///
+/// * `t_in` / `t_out` — the clip's visible window in scene-time.
+/// * `scene_dur` — total scene duration; bounds the trailing pad.
+/// * `loop_source` — when true the source already loops (we still
+///   trim because the source could otherwise overflow `clip_dur` at
+///   playback speed). Reserved for future tuning; today the trim
+///   semantics are uniform.
+///
+/// `clip_dur` is computed from `t_out - t_in` and is therefore in
+/// **scene-time units**. Callers must place the speed `setpts` filter
+/// (`setpts=PTS/{speed}`) *before* this chain, so the post-speed
+/// stream's PTS rate already matches scene-time and `trim` consumes
+/// exactly the right amount of post-processed source.
+fn time_align_filters(
+    t_in: f32,
+    t_out: f32,
+    scene_dur: f32,
+    _loop_source: bool,
+) -> Vec<String> {
+    let clip_dur = (t_out - t_in).max(1.0 / 60.0);
+    let mut out = Vec::with_capacity(4);
+    // Cap the post-speed stream at the clip's visible duration. For
+    // looping sources this also stops the loop from spilling past
+    // `t_out` on the timeline (the loop is meant to fill the visible
+    // window, not the whole scene).
+    out.push(format!("trim=duration={:.6}", clip_dur));
+    // After trim, the stream PTS still carries any non-zero baseline
+    // from upstream (chromakey/format/cc passthrough preserves PTS).
+    // Resetting here means the next `tpad=start_duration` measures
+    // its pad from a clean zero, regardless of source seek / speed.
+    out.push("setpts=PTS-STARTPTS".to_string());
+    if t_in > 1.0e-3 {
+        // Transparent black pad. yuva420p preserves alpha so the
+        // pre-content frames composite as a no-op over the canvas.
+        // The rendered MP4 therefore shows nothing for this clip
+        // until scene-time `t_in`, exactly like the canvas preview
+        // (which never paints elements outside their `[t_in, t_out]`
+        // window).
+        out.push(format!(
+            "tpad=start_duration={:.6}:color=black@0.0",
+            t_in,
+        ));
+    }
+    let tail = (scene_dur - t_out).max(0.0);
+    if tail > 1.0e-3 {
+        out.push(format!(
+            "tpad=stop_duration={:.6}:color=black@0.0",
+            tail,
+        ));
+    }
+    out
+}
+
+/// Build the per-frame alpha-multiplier filter for an animated
+/// opacity track.
+///
+/// ## Why
+///
+/// `colorchannelmixer=aa=` only accepts a numeric constant — it has
+/// no `eval=frame` mode. The renderer used to flatten any opacity
+/// animation to a single midpoint sample (`opacity_static`), so a
+/// fade-in keyframed `0.0 → 1.0` became a flat `1.0` (the midpoint
+/// keyframe by *index*, not by time) and the rendered MP4 didn't
+/// match the canvas preview's per-frame alpha. That's the
+/// "прозрачность неверная после рендера" symptom the user reported.
+///
+/// `geq` does support per-frame expressions of `T` (the frame time
+/// in seconds; geq's expression vocabulary doesn't include
+/// lowercase `t`). We use it on the alpha plane only — the YUV
+/// channels default to a passthrough, so the fast-path RGBA
+/// content stays bit-exact and only the alpha picks up the
+/// animated multiplier.
+///
+/// `opacity_expr_t` MUST already use `T` as its time variable
+/// (which is what `expr::piecewise_in_var(.., "T")` produces and
+/// what `ElementTransform::opacity_expr_t` carries). Because the
+/// caller has already passed the stream through `time_align_filters`,
+/// `T` evaluates to *scene-time* — the same axis the layout
+/// keyframes were authored on, so the geq sample matches the
+/// preview's `keyframe::sample(&layout, scene_t)` result.
+fn animated_alpha_filter(opacity_expr_t: &str) -> String {
+    // Single-quote the value so the commas inside `alpha(X,Y)` don't
+    // get interpreted as filter separators by the filter_complex
+    // parser. The inner expression has no quotes so the surrounding
+    // single-quote pair is unambiguous.
+    format!(
+        "geq=a='clip(alpha(X,Y)*({expr}),0,255)'",
+        expr = opacity_expr_t,
+    )
+}
+
+/// Pick the right alpha-multiplier filter for an element transform.
+///
+/// Returns `Some(filter)` only when an alpha multiplication is
+/// actually needed:
+///
+/// * Animated opacity → per-frame `geq` (see `animated_alpha_filter`).
+/// * Static opacity < ~1.0 → cheap `colorchannelmixer=aa=`.
+/// * Otherwise → `None`, no filter emitted.
+///
+/// Centralising this pick means the fast-path scenes (most clips
+/// have a single opacity=1.0 keyframe) pay nothing extra, while
+/// animated scenes always go through `geq` regardless of which
+/// element type (actor, image overlay, video overlay, text)
+/// produced the transform.
+fn alpha_filter_for(xform: &crate::expr::ElementTransform) -> Option<String> {
+    if xform.opacity_animated {
+        Some(animated_alpha_filter(&xform.opacity_expr_t))
+    } else if xform.opacity_static < 0.999 {
+        Some(format!(
+            "colorchannelmixer=aa={:.4}",
+            xform.opacity_static.clamp(0.0, 1.0),
+        ))
+    } else {
+        None
     }
 }
 
