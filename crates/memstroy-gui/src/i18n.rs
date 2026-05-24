@@ -973,6 +973,7 @@ fn ru_lookup(key: &str) -> Option<&'static str> {
         "polygon" => "полигон",
         "Mask" => "Маска",
         "Color key" => "Цветовой ключ",
+        "Color key mask" => "Хромакей",
         "Effect" => "Эффект",
         "Key colour" => "Цвет ключа",
         "Remove mask" => "Удалить маску",
