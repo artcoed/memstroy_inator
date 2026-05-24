@@ -607,13 +607,36 @@ use memstroy_core::AudioTrack;
 /// Materialise a placeholder audio file at `path` so the renderer's
 /// existence check (added defensively to skip stale references after
 /// asset rename/move) doesn't drop the track on the floor in the
-/// test. Content is irrelevant — the test only inspects the graph
-/// string, never invokes ffmpeg.
+/// test. The bytes form a valid 44-byte PCM WAV header (mono, 16-bit,
+/// 44.1 kHz, zero-length data chunk), so when the test environment
+/// has `ffprobe` on PATH the renderer's audio-stream probe correctly
+/// classifies the file as having an audio stream — without this the
+/// new "skip silent sources" guard would drop every test track and
+/// every assertion in the audio block would fail.
 fn touch_audio_file(path: &std::path::Path) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::write(path, b"");
+    // RIFF / WAVE / fmt  / 16-byte PCM descriptor / data / 0-byte body.
+    // RIFF chunk size is 36 bytes (8+16+8+4) — i.e. total file - 8.
+    // PCM=1, channels=1, sample_rate=44100, byte_rate=88200,
+    // block_align=2, bits_per_sample=16.
+    const WAV_HEADER: &[u8] = &[
+        0x52, 0x49, 0x46, 0x46, // "RIFF"
+        0x24, 0x00, 0x00, 0x00, // RIFF size = 36
+        0x57, 0x41, 0x56, 0x45, // "WAVE"
+        0x66, 0x6D, 0x74, 0x20, // "fmt "
+        0x10, 0x00, 0x00, 0x00, // fmt chunk size = 16
+        0x01, 0x00, // audio format = PCM
+        0x01, 0x00, // num channels = 1
+        0x44, 0xAC, 0x00, 0x00, // sample rate = 44100
+        0x88, 0x58, 0x01, 0x00, // byte rate = 88200
+        0x02, 0x00, // block align = 2
+        0x10, 0x00, // bits per sample = 16
+        0x64, 0x61, 0x74, 0x61, // "data"
+        0x00, 0x00, 0x00, 0x00, // data size = 0
+    ];
+    let _ = std::fs::write(path, WAV_HEADER);
 }
 
 fn audio_track(id: &str, t_in: f32) -> AudioTrack {
@@ -735,5 +758,133 @@ fn audio_fade_in_out_emit_afade_filters() {
     assert!(
         graph.contains("afade=t=out:"),
         "fade_out didn't surface as an afade-out filter:\n{graph}",
+    );
+}
+
+
+
+#[test]
+fn audio_track_with_no_audio_stream_is_skipped() {
+    // Regression for the "Ошибка рендера / exit code -22 (Invalid
+    // argument) | aac Could not open encoder before EOF" double-
+    // failure: when the user drops a silent video clip on the canvas
+    // the GUI auto-pushes an `AudioTrack` referencing that source
+    // file. With no audio stream in the source, the renderer's
+    // `[idx:a]aresample=…` reference resolved to nothing and ffmpeg
+    // aborted filter-graph configuration with "Stream specifier ':a'
+    // matches no streams" — taking BOTH encoder threads down with it
+    // (libx264 -22, AAC EOF) and writing a 0-byte mp4. The fix
+    // ffprobes each audio source up front and silently drops tracks
+    // whose source has no audio.
+    //
+    // We can't run ffprobe in tests reliably (CI sandboxes don't
+    // ship it), so we exercise the contract a different way: a
+    // silent ".mp4" file (just the existence-check trips and ffprobe
+    // either confirms-no-audio or fails-open) must not cause a
+    // panic, and when a SECOND track with valid WAV data is also
+    // present, that one still gets emitted. This pins the "skip ONE
+    // bad track without breaking the rest" invariant of the fix.
+    let mut scene = baseline_scene();
+    // Track #1: source is a mostly-empty file (no proper audio
+    // stream). With ffprobe present this gets skipped; without
+    // ffprobe it falls through to ffmpeg. Either way the graph
+    // builder must complete without panicking.
+    let bad_path = std::env::temp_dir().join("memstroy_render_test_silent_src.bin");
+    let _ = std::fs::write(&bad_path, b"\0\0\0\0not a media file");
+    scene.audio.push(memstroy_core::AudioTrack {
+        id: "silent".into(),
+        source: bad_path.clone(),
+        t_in: 0.0,
+        ..memstroy_core::AudioTrack::default()
+    });
+    // Track #2: a real valid-header WAV — must always make it into
+    // the graph regardless of how track #1 was handled.
+    scene.audio.push(audio_track("good", 0.5));
+
+    let graph = build_filter_graph(&scene);
+
+    // The well-formed track must still appear (fade/aresample
+    // chain is the unique fingerprint of its inclusion).
+    assert!(
+        graph.contains("aresample=44100"),
+        "well-formed audio track was unexpectedly dropped:\n{graph}",
+    );
+
+    // Cleanup: don't leak the test artifact into /tmp.
+    let _ = std::fs::remove_file(&bad_path);
+}
+
+#[test]
+fn output_stream_is_normalised_to_yuv420p_cfr() {
+    // Pin the contract of `FilterGraphBuilder::finalize_video`: every
+    // graph — empty, busy, with or without audio — must end with a
+    // single normalisation chunk that locks the encoder input to
+    // `format=yuv420p`, square pixels, even dimensions and the
+    // requested constant frame rate. Without this lock the encoder
+    // sees yuva420p frames + ffmpeg's auto-conversion, which is the
+    // tipping point for the libx264 "Task finished with error code:
+    // -22" failure on more elaborate filter-graph topologies (rotate
+    // + per-frame scale + alphamerge masks). Asserting the literal
+    // tokens here means a future refactor that drops the finalise
+    // step trips CI before it reaches the user.
+    let scene = baseline_scene();
+    let graph = build_filter_graph(&scene);
+
+    assert!(
+        graph.contains("format=yuv420p"),
+        "missing final yuv420p lock — encoder may receive yuva frames:\n{graph}",
+    );
+    assert!(
+        graph.contains("setsar=1"),
+        "missing setsar=1 — non-square pixel ratio may leak through:\n{graph}",
+    );
+    assert!(
+        graph.contains("trunc(iw/2)*2"),
+        "missing even-dimension clamp — odd output resolution would crash libx264:\n{graph}",
+    );
+    // fps={fps} pins the constant frame rate; baseline scene runs at
+    // 30 fps so the literal `fps=30` should appear.
+    assert!(
+        graph.contains("fps=30"),
+        "missing CFR lock at output fps — non-monotonic timestamps may reach the encoder:\n{graph}",
+    );
+}
+
+#[test]
+fn scale_expression_is_clamped_against_zero_dimensions() {
+    // libx264 rejects frames whose dimensions are zero or negative
+    // with the same `-22` (EINVAL) error code. When a layout keyframe
+    // animates `scale = 0.0` (e.g. a "punch out" effect) the
+    // unprotected `iw*{sx}` expression evaluated to 0 → scale filter
+    // produced a 0×0 frame → encoder died. The fix wraps every
+    // scale-driven expression in `max(2, …)`.
+    let mut scene = baseline_scene();
+    let mut actor = baseline_actor("vanish");
+    actor.layout = vec![
+        memstroy_core::Keyframe::new(
+            0.0,
+            memstroy_core::ActorState {
+                scale: 0.0,
+                ..memstroy_core::ActorState::default()
+            },
+        ),
+        memstroy_core::Keyframe::new(
+            1.0,
+            memstroy_core::ActorState {
+                scale: 1.0,
+                ..memstroy_core::ActorState::default()
+            },
+        ),
+    ];
+    scene.actors.push(actor);
+
+    let graph = build_filter_graph(&scene);
+    assert!(
+        graph.contains("max(2,iw*("),
+        "actor scale wasn't clamped against zero dimensions:\n{graph}",
+    );
+    assert!(
+        graph.contains("max(2,ih*("),
+        "actor scale_y wasn't clamped against zero dimensions:\n{graph}",
     );
 }
