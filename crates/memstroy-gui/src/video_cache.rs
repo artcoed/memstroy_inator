@@ -590,14 +590,29 @@ pub fn apply_effects_cpu(
     cc: &memstroy_core::ColorCorrection,
 ) -> ColorImage {
     let mut out = ColorImage::new(img.size, egui::Color32::TRANSPARENT);
-    let key_r = ck.key_color[0] as f32;
-    let key_g = ck.key_color[1] as f32;
-    let key_b = ck.key_color[2] as f32;
-    let similarity = ck.similarity.clamp(0.0, 1.0);
-    let blend = ck.blend.clamp(0.0, 1.0);
-    let spill = ck.spill.clamp(0.0, 1.0);
-    let threshold = similarity * 441.0;
-    let blend_range = (blend * 200.0).max(0.01);
+    // ── Chromakey: FFmpeg-faithful YCbCr (BT.601) distance ──
+    //
+    // The export pipeline (memstroy-render/filtergraph.rs) emits
+    // FFmpeg's `chromakey` filter, which keys on the Cb/Cr distance
+    // between each pixel and the chosen key colour, normalised to
+    // `[0, 1]` by `255*sqrt(2)`. Mirroring that maths here keeps the
+    // canvas preview pixel-aligned with the rendered video — the
+    // legacy RGB-Euclidean approximation (`*441 / *200`) drifted
+    // visibly from the export, especially at the soft edges, which
+    // is the "preview shows one thing, render shows another" bug
+    // the user reported.
+    //
+    // `similarity < 1e-5` (or non-finite) is treated as "chromakey
+    // disabled" — the same threshold the export-side `chromakey_filter`
+    // helper uses, so dialing the slider all the way down disables the
+    // key on both surfaces consistently instead of crashing the
+    // export with `Result too large`.
+    let similarity = if ck.similarity.is_finite() { ck.similarity.clamp(0.0, 1.0) } else { 0.0 };
+    let blend = if ck.blend.is_finite() { ck.blend.clamp(0.0, 1.0) } else { 0.0 };
+    let spill = if ck.spill.is_finite() { ck.spill.clamp(0.0, 1.0) } else { 0.0 };
+    let chroma_active = similarity >= 1.0e-5;
+    let (key_cb, key_cr) = rgb_to_cbcr_bt601(ck.key_color);
+    let dist_norm = 255.0 * std::f32::consts::SQRT_2;
 
     // Pre-bake tone curves into LUTs for cache-friendly per-pixel lookup.
     let lut_master = build_curve_lut(&cc.curves.master);
@@ -628,13 +643,27 @@ pub fn apply_effects_cpu(
         let g = pixel.g() as f32;
         let b = pixel.b() as f32;
 
-        let dist = ((r - key_r).powi(2) + (g - key_g).powi(2) + (b - key_b).powi(2)).sqrt();
-        let alpha = if dist < threshold {
-            0.0
-        } else if dist < threshold + blend_range {
-            (dist - threshold) / blend_range
-        } else {
+        // FFmpeg-equivalent YCbCr keying: identical formula to the
+        // chromakey filter the export pipeline uses, so the alpha
+        // map the user sees in the canvas matches the rendered MP4.
+        // When `similarity < 1e-5` the chromakey is disabled (the
+        // export skips the filter entirely on the same threshold),
+        // keeping the source pixel fully opaque.
+        let alpha = if !chroma_active {
             1.0
+        } else {
+            let cb = -0.169 * r - 0.331 * g + 0.500 * b + 128.0;
+            let cr =  0.500 * r - 0.419 * g - 0.081 * b + 128.0;
+            let du = cb - key_cb;
+            let dv = cr - key_cr;
+            let diff = (du * du + dv * dv).sqrt() / dist_norm;
+            if diff < similarity {
+                0.0
+            } else if blend > 0.0 && diff < similarity + blend {
+                ((diff - similarity) / blend).clamp(0.0, 1.0)
+            } else {
+                1.0
+            }
         };
 
         let (mut or_, mut og, mut ob) = (r, g, b);
@@ -696,6 +725,21 @@ pub fn apply_effects_cpu(
         out.pixels[i] = egui::Color32::from_rgba_unmultiplied(or_ as u8, og as u8, ob as u8, a);
     }
     out
+}
+
+/// Convert an RGB triple (0..=255) to BT.601 chroma components
+/// `(Cb, Cr)` in the same 0..255 axis used by FFmpeg's `chromakey`
+/// filter. Shared between `apply_effects_cpu` and the colour-key
+/// effect-stack preview so both paths produce the alpha map FFmpeg
+/// would emit on export.
+#[inline]
+pub(crate) fn rgb_to_cbcr_bt601(rgb: [u8; 3]) -> (f32, f32) {
+    let r = rgb[0] as f32;
+    let g = rgb[1] as f32;
+    let b = rgb[2] as f32;
+    let cb = -0.169 * r - 0.331 * g + 0.500 * b + 128.0;
+    let cr =  0.500 * r - 0.419 * g - 0.081 * b + 128.0;
+    (cb, cr)
 }
 
 /// Build a 256-entry LUT from a piecewise-linear tone curve. Each LUT entry
@@ -833,11 +877,12 @@ fn apply_mask_color_image(
 }
 
 /// Apply a colour-key mask by attenuating alpha for pixels close to
-/// `key_color` in HSV space. Mirrors `image_effects::apply_color_key_alpha`
-/// but works on the `ColorImage` buffer used by the video preview
-/// pipeline. The kernel is intentionally identical to the keyframe
-/// preview so the user sees the same alpha map regardless of which
-/// path produced the frame.
+/// `key_color` in YUV (Cb/Cr) space — the same maths FFmpeg's
+/// `chromakey` filter uses. Mirrors `image_effects::apply_color_key_alpha`
+/// so the canvas preview's alpha map is pixel-aligned with the
+/// rendered video. The legacy HSV-distance approximation visibly
+/// drifted from the export — the user's "what I see in the preview is
+/// not what gets rendered" complaint — and is replaced here.
 fn apply_color_key_color_image(
     img: &ColorImage,
     key_color: [u8; 3],
@@ -852,29 +897,37 @@ fn apply_color_key_color_image(
     let h = img.size[1];
     if w == 0 || h == 0 { return out; }
     let i = intensity.clamp(0.0, 1.0);
-    let key_hsv = rgb_to_hsv_local_vc(key_color);
-    let hue_tol_deg = 60.0 * similarity.clamp(0.0, 1.0);
-    let sv_tol = 0.5 * similarity.clamp(0.0, 1.0);
-    let blend = blend.clamp(0.0, 1.0);
+    // Mirror `chromakey_filter`'s "disabled below 1e-5" rule so a
+    // dialed-down ColorKey effect renders identically on both
+    // surfaces — the export pipeline emits a no-op `null` filter on
+    // that threshold, so the preview must do nothing too.
+    let similarity = if similarity.is_finite() { similarity.clamp(0.0, 1.0) } else { 0.0 };
+    let blend = if blend.is_finite() { blend.clamp(0.0, 1.0) } else { 0.0 };
+    if similarity < 1.0e-5 && !invert {
+        // Disabled key — nothing to attenuate. Returning early keeps
+        // the per-pixel loop's no-op path obvious.
+        return out;
+    }
+    let (key_cb, key_cr) = rgb_to_cbcr_bt601(key_color);
+    let dist_norm = 255.0 * std::f32::consts::SQRT_2;
     for px in 0..(w * h) {
         if px >= out.pixels.len() { break; }
         let p = out.pixels[px];
-        let hsv = rgb_to_hsv_local_vc([p.r(), p.g(), p.b()]);
-        let dh = hue_distance_deg_vc(hsv.0, key_hsv.0);
-        let ds = (hsv.1 - key_hsv.1).abs();
-        let dv = (hsv.2 - key_hsv.2).abs();
-        let mut alpha_keep = 1.0_f32;
-        if dh < hue_tol_deg && ds < sv_tol && dv < sv_tol {
-            alpha_keep = 0.0;
-        } else if dh < hue_tol_deg + 360.0 * blend
-            && ds < sv_tol + blend
-            && dv < sv_tol + blend
-        {
-            let edge = ((dh - hue_tol_deg) / (360.0 * blend + f32::EPSILON))
-                .max((ds - sv_tol) / (blend + f32::EPSILON))
-                .max((dv - sv_tol) / (blend + f32::EPSILON));
-            alpha_keep = edge.clamp(0.0, 1.0);
-        }
+        let r = p.r() as f32;
+        let g = p.g() as f32;
+        let b = p.b() as f32;
+        let cb = -0.169 * r - 0.331 * g + 0.500 * b + 128.0;
+        let cr =  0.500 * r - 0.419 * g - 0.081 * b + 128.0;
+        let du = cb - key_cb;
+        let dv = cr - key_cr;
+        let diff = (du * du + dv * dv).sqrt() / dist_norm;
+        let mut alpha_keep = if diff < similarity {
+            0.0
+        } else if blend > 0.0 && diff < similarity + blend {
+            ((diff - similarity) / blend).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
         if invert { alpha_keep = 1.0 - alpha_keep; }
         let orig = p.a() as f32;
         let target = orig * alpha_keep;
@@ -882,35 +935,6 @@ fn apply_color_key_color_image(
         out.pixels[px] = egui::Color32::from_rgba_unmultiplied(p.r(), p.g(), p.b(), new_a);
     }
     out
-}
-
-#[inline]
-fn rgb_to_hsv_local_vc(rgb: [u8; 3]) -> (f32, f32, f32) {
-    let r = rgb[0] as f32 / 255.0;
-    let g = rgb[1] as f32 / 255.0;
-    let b = rgb[2] as f32 / 255.0;
-    let max = r.max(g).max(b);
-    let min = r.min(g).min(b);
-    let delta = max - min;
-    let h = if delta == 0.0 {
-        0.0
-    } else if max == r {
-        60.0 * (((g - b) / delta) % 6.0)
-    } else if max == g {
-        60.0 * ((b - r) / delta + 2.0)
-    } else {
-        60.0 * ((r - g) / delta + 4.0)
-    };
-    let h = if h < 0.0 { h + 360.0 } else { h };
-    let s = if max == 0.0 { 0.0 } else { delta / max };
-    let v = max;
-    (h, s, v)
-}
-
-#[inline]
-fn hue_distance_deg_vc(a: f32, b: f32) -> f32 {
-    let d = (a - b).abs() % 360.0;
-    d.min(360.0 - d)
 }
 
 /// Apply a Crop effect by zeroing the alpha channel outside the visible
