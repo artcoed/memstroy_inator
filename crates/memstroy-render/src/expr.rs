@@ -40,6 +40,20 @@ pub(crate) fn piecewise<T, F>(kfs: &[Keyframe<T>], getter: F) -> String
 where
     F: Fn(&T) -> f32,
 {
+    piecewise_in_var(kfs, getter, "t")
+}
+
+/// Variant of [`piecewise`] that lets the caller pick the time
+/// variable name embedded in the expression. The default `t` is what
+/// `overlay=`, `rotate=`, `scale=eval=frame` and friends understand;
+/// `T` is required when the expression will be evaluated inside the
+/// `geq=` filter (geq's expression vocabulary only exposes the
+/// uppercase `T` for "frame time in seconds"). All other behaviour —
+/// easing, segment ordering, last-value clamp — is identical.
+pub(crate) fn piecewise_in_var<T, F>(kfs: &[Keyframe<T>], getter: F, var: &str) -> String
+where
+    F: Fn(&T) -> f32,
+{
     if kfs.is_empty() {
         return "0".to_string();
     }
@@ -52,9 +66,9 @@ where
         let v0 = getter(&a.value);
         let v1 = getter(&b.value);
         let span = (b.t - a.t).max(1e-6);
-        // u = clip((t - a.t)/span, 0, 1) — guards numerical drift at
-        // the upper edge so the last segment doesn't overshoot.
-        let u = format!("((t-{:.6})/{:.6})", a.t, span);
+        // u = clip((var - a.t)/span, 0, 1) — guards numerical drift
+        // at the upper edge so the last segment doesn't overshoot.
+        let u = format!("(({var}-{:.6})/{:.6})", a.t, span, var = var);
         let segment = match b.easing {
             // Step holds the previous value until the next keyframe,
             // matching `Easing::Step::apply(t) → 0.0` in `easing.rs`.
@@ -93,7 +107,13 @@ where
                 )
             }
         };
-        expr = format!("if(lt(t,{:.6}),{},{})", b.t, segment, expr);
+        expr = format!(
+            "if(lt({var},{:.6}),{},{})",
+            b.t,
+            segment,
+            expr,
+            var = var,
+        );
     }
     expr
 }
@@ -301,13 +321,22 @@ pub(crate) struct ElementTransform {
     /// fast path stays free of the costly `rotate` filter).
     pub rot_expr: Option<String>,
     /// Static opacity sample at the layout midpoint. `1.0` means the
-    /// alpha multiplication can be skipped.
+    /// alpha multiplication can be skipped. Always usable as a
+    /// constant for the fast `colorchannelmixer=aa=` path.
     pub opacity_static: f32,
-    /// Whether the layout's opacity actually moves between keyframes
-    /// (the export is still applied as static; this flag lets the
-    /// caller log a one-line warning when an animation is silently
-    /// flattened).
+    /// Whether the layout's opacity actually moves between keyframes.
+    /// When `true` the renderer must use `opacity_expr_t` (per-frame
+    /// alpha via `geq`) instead of the static fast path so the
+    /// rendered MP4 matches the canvas preview's per-frame alpha
+    /// sample at every scene-time, not just the midpoint.
     pub opacity_animated: bool,
+    /// Piecewise opacity expression in the **uppercase `T`** time
+    /// variable (frame time in seconds). `T` is the only time
+    /// variable exposed by the `geq=` filter, which is the path the
+    /// renderer takes when `opacity_animated` is `true`. Always
+    /// available — for a single-keyframe layout this is just the
+    /// constant value, identical to `opacity_static`.
+    pub opacity_expr_t: String,
     /// Static flips sampled at the midpoint keyframe — the predominant
     /// flip state shown in the preview.
     pub hflip: bool,
@@ -480,9 +509,34 @@ where
         None
     };
 
-    // ── Opacity (static — sampled at midpoint to match the dominant
-    //    on-canvas alpha; per-frame opacity needs `geq` and is left as
-    //    a follow-up because the cost dwarfs the visual benefit). ───
+    // ── Opacity ─────────────────────────────────────────────────────
+    //
+    // The canvas preview (`canvas_preview::draw_canvas_elements`,
+    // `frame_snapshot::paint_*`) samples the layout's `opacity` field
+    // **per frame** at the playhead, then bakes it into the egui mesh
+    // tint / `paint_layer_rgba` alpha. To make the rendered MP4
+    // match, we mirror that exactly:
+    //
+    //   * `opacity_expr_t` — full piecewise expression in `T` (frame
+    //     time, scene-absolute) ready to drop into the `geq=` filter
+    //     so each output frame gets its own alpha multiplier.
+    //   * `opacity_static` — midpoint sample, kept as a fast-path
+    //     constant for clips whose opacity is genuinely static
+    //     (single-keyframe layouts and any other layout where every
+    //     keyframe carries the same value). This avoids the per-pixel
+    //     `geq` for the overwhelmingly common static-opacity case.
+    //   * `opacity_animated` — true when the keyframes actually
+    //     differ, telling the caller to take the geq path.
+    //
+    // Note: the expression is sampled at *scene* time `T`, not
+    // clip-local time. This matches the preview, where
+    // `keyframe::sample(&layout, t)` is called with the scene
+    // playhead — the layout keyframes were authored in scene-time
+    // when the user dropped them. The renderer's clip-stream
+    // alignment (`time_align_filters` in filtergraph.rs) shifts
+    // each clip's PTS so `T` inside its filter chain equals scene
+    // time, keeping the geq evaluation on the same axis the
+    // preview uses.
     let opacity_static = legacy_layout
         .get(legacy_layout.len() / 2)
         .map(|kf| kf.value.opacity().clamp(0.0, 1.0))
@@ -490,6 +544,8 @@ where
     let opacity_animated = legacy_layout
         .windows(2)
         .any(|w| (w[0].value.opacity() - w[1].value.opacity()).abs() > 1e-3);
+    let opacity_expr_t =
+        piecewise_in_var(legacy_layout, |s: &S| s.opacity().clamp(0.0, 1.0), "T");
 
     // ── Flip — static midpoint sample, same fallback the preview's
     //    canvas mesh path uses for the dominant side of an animation.
@@ -507,6 +563,7 @@ where
         rot_expr,
         opacity_static,
         opacity_animated,
+        opacity_expr_t,
         hflip,
         vflip,
     }
