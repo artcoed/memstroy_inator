@@ -1296,31 +1296,35 @@ fn build_plan_canonicalises_render_frame_resolution_to_output_resolution() {
     // that pushed every overlay to the wrong world position in the
     // export — the bg/text plates ended up off-canvas while the
     // actor (centred at 0.5, 0.5) survived. `build_plan` now
-    // canonicalises the two fields at the renderer boundary.
+    // canonicalises by syncing `output.resolution = rf.resolution`
+    // because the render frame IS the on-canvas selection area and
+    // its resolution is the single source of truth for the output
+    // file's pixel dimensions.
     let mut scene = baseline_scene();
     scene.output.resolution = [1080, 1920];
     scene.render_frame.resolution = [3840, 3840]; // intentionally divergent
     scene.actors.push(baseline_actor("hero"));
 
     // Build the graph; the canonicalisation step inside `build_plan`
-    // should clone the scene and align rf.resolution → output.resolution
+    // should clone the scene and align output.resolution → rf.resolution
     // BEFORE the filtergraph builder reads anything. The user-visible
-    // proof is that the legacy `pos * out_w` substring uses the OUTPUT
-    // width (1080), which now matches what the canvas preview's
-    // `world_w = rf.resolution[0]` formula produces.
+    // proof is that the legacy `pos * out_w` substring uses the
+    // RENDER FRAME width (3840), which is what the canvas preview's
+    // `world_w = rf.resolution[0]` formula always used.
     let graph = build_filter_graph(&scene);
 
-    // Find the legacy normalised pos lowering: `(({pos_x})*1080.0000)`.
+    // Find the legacy normalised pos lowering: `(({pos_x})*3840.0000)`.
     // The exact substring depends on how the piecewise expression is
     // formatted, so we assert on the W constant the formula multiplies
-    // by — that's `out_w` (1080) per `expr.rs::build_element_transform`.
+    // by — that's `rf.resolution[0]` (3840) which is now the
+    // authoritative output width after canonicalisation.
     assert!(
-        graph.contains("*1080.0000)"),
-        "world_x lowering should use out_w=1080 (matching the canvas preview's rf.resolution after canonicalisation):\n{graph}",
+        graph.contains("*3840.0000)"),
+        "world_x lowering should use rf.resolution width (3840) as the authoritative output size:\n{graph}",
     );
     assert!(
-        !graph.contains("*3840.0000)"),
-        "the divergent rf.resolution (3840) must NOT leak into the renderer's world-pos formulae after canonicalisation:\n{graph}",
+        !graph.contains("*1080.0000)"),
+        "the stale output.resolution (1080) must NOT leak into the renderer's world-pos formulae — rf.resolution is the source of truth:\n{graph}",
     );
 }
 
