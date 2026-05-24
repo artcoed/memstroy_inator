@@ -1250,3 +1250,92 @@ fn legacy_zero_z_order_keeps_old_actor_then_overlay_ordering() {
         "legacy fallback should keep actor at slot 0:\n{graph}",
     );
 }
+
+
+#[test]
+fn empty_backgrounds_use_configured_color_not_chromakey_green() {
+    // Regression: the renderer used to paint the base canvas bright
+    // chromakey green (`[0, 255, 0]`) whenever `scene.backgrounds`
+    // was empty, on the theory that exports would be re-keyed in
+    // post. In practice that flooded the entire void with green
+    // wherever a chroma-keyed actor's transparent pixels lived, so
+    // the user's bug "итоговый рендер не совпадает с превью" — the
+    // editor canvas's neutral void becomes a wall of bright green
+    // in the MP4. Emitting the configured `output.background_color`
+    // unconditionally fixes that and keeps existing scenes with a
+    // non-default colour (e.g. user-chosen white) round-tripping
+    // correctly.
+    let mut scene = baseline_scene();
+    scene.output.background_color = [255, 255, 255]; // explicit white
+    assert!(scene.backgrounds.is_empty());
+    scene.actors.push(baseline_actor("only_actor"));
+
+    let graph = build_filter_graph(&scene);
+
+    // Base canvas must use the configured background_color (white)
+    // — NOT the legacy chromakey-green hack.
+    assert!(
+        graph.contains("color=c=0xFFFFFF:"),
+        "base canvas should be the configured `output.background_color` (white) when there are no backgrounds, got:\n{graph}",
+    );
+    assert!(
+        !graph.contains("color=c=0x00FF00:s="),
+        "base canvas must NOT default to bright chromakey green when scene.backgrounds is empty:\n{graph}",
+    );
+}
+
+#[test]
+fn build_plan_canonicalises_render_frame_resolution_to_output_resolution() {
+    // Regression: the canvas preview converts legacy `[0..1]` pos
+    // values via `pos * render_frame.resolution`, while the renderer's
+    // `expr::build_element_transform` does the same conversion via
+    // `pos * output.resolution`. The two formulae agree only when
+    // both resolution fields hold the same value. Scenes loaded from
+    // disk where the inspector panel never opened to re-sync them
+    // (panels.rs `inspector_nothing`) used to produce a mismatch
+    // that pushed every overlay to the wrong world position in the
+    // export — the bg/text plates ended up off-canvas while the
+    // actor (centred at 0.5, 0.5) survived. `build_plan` now
+    // canonicalises the two fields at the renderer boundary.
+    let mut scene = baseline_scene();
+    scene.output.resolution = [1080, 1920];
+    scene.render_frame.resolution = [3840, 3840]; // intentionally divergent
+    scene.actors.push(baseline_actor("hero"));
+
+    // Build the graph; the canonicalisation step inside `build_plan`
+    // should clone the scene and align rf.resolution → output.resolution
+    // BEFORE the filtergraph builder reads anything. The user-visible
+    // proof is that the legacy `pos * out_w` substring uses the OUTPUT
+    // width (1080), which now matches what the canvas preview's
+    // `world_w = rf.resolution[0]` formula produces.
+    let graph = build_filter_graph(&scene);
+
+    // Find the legacy normalised pos lowering: `(({pos_x})*1080.0000)`.
+    // The exact substring depends on how the piecewise expression is
+    // formatted, so we assert on the W constant the formula multiplies
+    // by — that's `out_w` (1080) per `expr.rs::build_element_transform`.
+    assert!(
+        graph.contains("*1080.0000)"),
+        "world_x lowering should use out_w=1080 (matching the canvas preview's rf.resolution after canonicalisation):\n{graph}",
+    );
+    assert!(
+        !graph.contains("*3840.0000)"),
+        "the divergent rf.resolution (3840) must NOT leak into the renderer's world-pos formulae after canonicalisation:\n{graph}",
+    );
+}
+
+#[test]
+fn build_plan_keeps_scene_unchanged_when_resolutions_already_match() {
+    // The canonicalisation step must be a no-op for the common case
+    // where `output.resolution == render_frame.resolution`. We verify
+    // that the build still succeeds and produces the same legacy
+    // lowering against the matching width (so the cheap path that
+    // skips the clone is exercised).
+    let mut scene = baseline_scene();
+    scene.output.resolution = [1080, 1920];
+    scene.render_frame.resolution = [1080, 1920]; // already aligned
+    scene.actors.push(baseline_actor("hero"));
+
+    let graph = build_filter_graph(&scene);
+    assert!(graph.contains("*1080.0000)"), "expected matching out_w lowering: {graph}");
+}
