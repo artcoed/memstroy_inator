@@ -284,6 +284,7 @@ impl MontageOutput {
                 effects: Vec::new(),
                 speed: 1.0,
                 animated_params: Default::default(),
+                z_order: 0,
             };
             scene.actors.push(actor);
         }
@@ -334,6 +335,7 @@ impl MontageOutput {
                 behind_actors: false,
                 effects: Vec::new(),
                 animated_params: Default::default(),
+                z_order: 0,
             });
             scene.overlays.push(overlay);
         }

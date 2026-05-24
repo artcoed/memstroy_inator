@@ -158,6 +158,7 @@ pub fn add_template_to_scene(
         behind_actors: false,
         effects: Vec::new(),
         animated_params: Default::default(),
+        z_order: 0,
     });
     scene.overlays.push(overlay);
     scene.overlays.len() - 1
