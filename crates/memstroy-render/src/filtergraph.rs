@@ -1332,23 +1332,44 @@ impl<'a> FilterGraphBuilder<'a> {
     }
 
     /// Apply camera moves (zoom/pan/rotate) to the final composite.
-    /// Uses FFmpeg's `crop` + `scale` filters with piecewise expressions
-    /// driven by `CameraState` keyframes OR the new `RenderFrame` layout.
+    ///
+    /// As of the render-frame parity rewrite, the *render-frame
+    /// camera* (rf.pos / rf.zoom / rf.rotation_deg + modifiers) is
+    /// baked into every element's per-overlay X/Y/scale/rotate
+    /// expressions inside `expr::build_element_transform`, mirroring
+    /// `frame_snapshot::world_to_output` exactly. That is the only
+    /// path that produces an output pixel-equivalent to what the
+    /// canvas preview shows when the rf is rotated or zoomed (the
+    /// previous post-composite `pad → rotate → crop → scale` pipeline
+    /// operated on a fixed `W×H` buffer that simply doesn't contain
+    /// world content for `rf.zoom < 1` or `rf.rotation_deg != 0`,
+    /// producing transparent corners and silently-clamped centre
+    /// crops — the user-visible "rendered video doesn't look like
+    /// the canvas selection area at all" bug).
+    ///
+    /// This method therefore only handles the *legacy* `Scene.camera`
+    /// array (the v1 `CameraState` keyframes). Modern scenes use the
+    /// render frame and short-circuit here. Empty legacy + rf both
+    /// no-ops.
     fn emit_camera(&mut self) -> Result<()> {
-        // Prefer new render_frame if it has non-trivial keyframes
-        let use_render_frame = self.scene.render_frame.layout.len() > 1
-            || self.scene.render_frame.layout.first()
-                .map(|kf| kf.value.zoom != 1.0 || kf.value.rotation_deg != 0.0)
-                .unwrap_or(false);
-
-        if use_render_frame {
-            return self.emit_render_frame_camera();
-        }
-
         if self.scene.camera.is_empty() {
+            // Modern path: render-frame camera is already applied
+            // per-element by `expr::build_element_transform`. Nothing
+            // to do at the composite level.
             return Ok(());
         }
 
+        // ── Legacy v1 camera (`Scene.camera`) ──
+        //
+        // Older scenes used a camera array of `CameraState` keyframes
+        // expressed in normalised coords. Those scenes don't carry an
+        // animated render-frame, so we honour the legacy camera with
+        // the same pad → rotate → crop → scale pipeline as before.
+        // Any scene using both `camera` and an animated render-frame
+        // is a misconfiguration; the render-frame's per-element
+        // transform takes precedence and the legacy camera is
+        // applied on top, which is the same behaviour the previous
+        // build had.
         let [w, h] = self.scene.output.resolution;
         let camera = &self.scene.camera;
 
@@ -1445,8 +1466,22 @@ impl<'a> FilterGraphBuilder<'a> {
     }
 
     /// Emit camera based on the new RenderFrame layout (world-pixel coords).
-    /// The render frame defines a region on the canvas; we crop that region
-    /// from the composite and scale it to the output resolution.
+    ///
+    /// **No longer used.** The render-frame camera transform is now
+    /// baked into every element's per-overlay X/Y/scale/rotate
+    /// expression by `expr::build_element_transform`, mirroring
+    /// `frame_snapshot::world_to_output` exactly. The post-composite
+    /// `pad → rotate → crop → scale` pipeline this method implemented
+    /// operated on a fixed `W × H` buffer that didn't contain world
+    /// content for `rf.zoom < 1` or `rf.rotation_deg != 0`, producing
+    /// transparent corners and silently-clamped centre crops — i.e.
+    /// the user-visible "rendered video doesn't look like the canvas
+    /// selection area at all" bug.
+    ///
+    /// Kept compiled for now so the comment + history stays
+    /// inspectable next to the new pipeline; the dead-code attribute
+    /// silences the warning. Safe to delete in a follow-up.
+    #[allow(dead_code)]
     fn emit_render_frame_camera(&mut self) -> Result<()> {
         let [w, h] = self.scene.output.resolution;
         let rf = &self.scene.render_frame;
