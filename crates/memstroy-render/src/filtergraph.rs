@@ -80,7 +80,51 @@ impl<'a> FilterGraphBuilder<'a> {
         self.emit_overlays_filtered(false)?;
         self.emit_camera()?;
         self.emit_audio()?;
+        // Output normalisation pass — must be the LAST video filter so
+        // every code path above feeds the encoder a stream with a
+        // known-good shape (yuv420p, square pixels, even dims, CFR at
+        // the requested fps). See `finalize_video` for the rationale.
+        self.finalize_video();
         Ok(())
+    }
+
+    /// Append a single normalisation chunk to the cursor that locks
+    /// the output stream shape to libx264's happy path:
+    ///
+    /// * `format=yuv420p` — drop the alpha channel BEFORE the encoder
+    ///   sees the stream, instead of relying on ffmpeg's auto-inserted
+    ///   yuva→yuv converter which historically tripped on the more
+    ///   elaborate filter-graph topologies (rotate + per-frame scale +
+    ///   alphamerge masks) and surfaced as
+    ///   `vost#0:0/libx264 Task finished with error code: -22`.
+    /// * `scale=trunc(iw/2)*2:trunc(ih/2)*2` — defence in depth: when
+    ///   `output.resolution` comes from a script (`scripting.rs::set
+    ///   _output_resolution`) the user can pick odd dimensions, which
+    ///   yuv420p's 4:2:0 chroma subsampling rejects with the same
+    ///   `-22` error from inside libx264's `x264_picture_alloc`.
+    /// * `setsar=1` — force square pixels, matching what every player
+    ///   assumes for vertical 1080×1920 output and avoiding a stretch
+    ///   mismatch between input clips with non-1 SAR and the canvas.
+    /// * `fps={out_fps}` — re-time the composite to a strict CFR with
+    ///   the requested frame rate. The command-level `-r` and
+    ///   `-fps_mode cfr` flags tell the encoder what to expect, but
+    ///   the filter graph can still emit frames with non-monotonic
+    ///   timestamps when overlay chains drop / repeat depending on
+    ///   `enable=` clauses; resampling here gives the encoder a clean
+    ///   monotonic stream regardless of upstream noise.
+    /// * `setpts=PTS-STARTPTS` — start at PTS=0 even when the input
+    ///   sources had non-zero baseline timestamps (background videos
+    ///   with `-ss` seek, etc.).
+    fn finalize_video(&mut self) {
+        let final_label = self.alloc_label("vout");
+        let fps = self.scene.output.fps;
+        self.chunks.push(format!(
+            "{cur}format=yuv420p,scale=trunc(iw/2)*2:trunc(ih/2)*2:flags=lanczos,setsar=1,fps={fps},setpts=PTS-STARTPTS{out}",
+            cur = self.cursor,
+            fps = fps,
+            out = final_label,
+        ));
+        self.cursor = final_label;
     }
 
     fn alloc_label(&mut self, hint: &str) -> String {
@@ -348,7 +392,7 @@ impl<'a> FilterGraphBuilder<'a> {
                 None
             };
             let scale_part = format!(
-                "scale=w='iw*{sx}':h='ih*{sy}':eval=frame",
+                "scale=w='max(2,iw*({sx}))':h='max(2,ih*({sy}))':eval=frame",
                 sx = xform.sx_expr,
                 sy = xform.sy_expr,
             );
@@ -543,7 +587,7 @@ impl<'a> FilterGraphBuilder<'a> {
 
             // Build filter chain for the prop
             let chain = format!(
-                "[{idx}:v]format=yuva420p,scale=w='iw*{s}':h='ih*{s}':eval=frame",
+                "[{idx}:v]format=yuva420p,scale=w='max(2,iw*({s}))':h='max(2,ih*({s}))':eval=frame",
                 idx = idx,
                 s = prop_scale,
             );
@@ -685,7 +729,7 @@ impl<'a> FilterGraphBuilder<'a> {
             t.skeleton_attachment.as_ref(),
         );
         let scale_part = format!(
-            "scale=w='iw*{sx}':h='ih*{sy}':eval=frame",
+            "scale=w='max(2,iw*({sx}))':h='max(2,ih*({sy}))':eval=frame",
             sx = xform.sx_expr,
             sy = xform.sy_expr,
         );
@@ -832,7 +876,7 @@ impl<'a> FilterGraphBuilder<'a> {
             );
         }
         let scale_part = format!(
-            "scale=w='iw*{sx}':h='ih*{sy}':eval=frame",
+            "scale=w='max(2,iw*({sx}))':h='max(2,ih*({sy}))':eval=frame",
             sx = xform.sx_expr,
             sy = xform.sy_expr,
         );
@@ -971,7 +1015,7 @@ impl<'a> FilterGraphBuilder<'a> {
             None
         };
         let scale_part = format!(
-            "scale=w='iw*{sx}':h='ih*{sy}':eval=frame",
+            "scale=w='max(2,iw*({sx}))':h='max(2,ih*({sy}))':eval=frame",
             sx = xform.sx_expr,
             sy = xform.sy_expr,
         );
@@ -1368,6 +1412,32 @@ impl<'a> FilterGraphBuilder<'a> {
                     track_id = %tr.id,
                     path = %path.display(),
                     "audio track source not found on disk; skipping",
+                );
+                continue;
+            }
+            // Defence in depth #2 — by far the most common cause of
+            // the "Could not open encoder before EOF" / "libx264 Task
+            // finished with error code: -22" double-failure the user
+            // hit on render: `add_actor_from_clip_at_time` in the GUI
+            // auto-pushes an `AudioTrack` referencing the same source
+            // file as the dropped actor so the embedded soundtrack
+            // gets its own row on the audio lanes. When the source
+            // clip happens to be silent (gif-to-mp4 conversions,
+            // screen captures without a mic, the editor's own muted
+            // exports), the auto-track still gets created and the
+            // renderer's `[idx:a]aresample=…` reference resolves to
+            // nothing. ffmpeg then aborts filter-graph configuration
+            // with "Stream specifier ':a' matches no streams" — and
+            // because that abort kills the *whole* graph BOTH encoder
+            // threads die together, with the symptom pair the user
+            // reported. ffprobing the source up front lets us drop
+            // the track gracefully instead of taking down the whole
+            // export.
+            if !crate::proc::probe_has_audio_stream(&path) {
+                tracing::warn!(
+                    track_id = %tr.id,
+                    path = %path.display(),
+                    "audio track source has no audio stream; skipping (silent source clip?)",
                 );
                 continue;
             }
