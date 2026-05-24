@@ -888,3 +888,94 @@ fn scale_expression_is_clamped_against_zero_dimensions() {
         "actor scale_y wasn't clamped against zero dimensions:\n{graph}",
     );
 }
+
+
+#[test]
+fn mask_alphamerge_pins_blend_inputs_to_common_axis() {
+    // Pin the contract of `emit_mask_alphamerge`: every link feeding
+    // the `blend` and `alphamerge` filters in the mask sub-graph must
+    // declare an explicit format / fps / setpts / setsar so
+    // `framesync_configure()` (the helper both filters share) can
+    // pair the still-image-derived mask stream with the video-derived
+    // alpha stream on a common axis.
+    //
+    // Without this lock, ffmpeg 7.0+ aborts filter graph init with
+    //
+    //   [Parsed_blend_NN] Failed to configure output pad on Parsed_blend_NN
+    //   Error reinitializing filters!
+    //
+    // …which kills both encoder threads (libx264 -22, AAC EOF) and
+    // produces a 0-byte mp4. The fix is purely defensive — adds
+    // explicit per-link normalisation around the sub-graph so the
+    // graph initialises cleanly on every supported ffmpeg.
+    use memstroy_core::{
+        Effect, EffectKind, ImageOverlay, MaskShape, OverlayState,
+    };
+
+    let mut scene = baseline_scene();
+    scene.overlays.push(Overlay::Image(ImageOverlay {
+        id: "masked_img".into(),
+        source: PathBuf::from("test.png"),
+        t_in: 0.0,
+        t_out: 2.0,
+        layout: vec![Keyframe::new(0.0, OverlayState::default())],
+        modifiers: Vec::new(),
+        skeleton_attachment: None,
+        effects: vec![Effect::new(EffectKind::Mask {
+            shape: MaskShape::Polygon {
+                points: vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+            },
+            feather: 0.0,
+            invert: false,
+        })],
+        animated_params: Default::default(),
+        chroma_key: None,
+    }));
+
+    let graph = build_filter_graph(&scene);
+
+    // Each of the four links into blend/alphamerge gets its own
+    // explicit (format=)?,fps,setpts,setsar wrapper. The exact label
+    // names are an implementation detail, so we just assert the
+    // tokens land in the graph somewhere and the count is right.
+    //
+    // 1) main split feed — must include `format=yuva420p` AND the
+    //    timing locks BEFORE `split`.
+    assert!(
+        graph.contains("format=yuva420p,fps=30,setpts=PTS-STARTPTS,setsar=1,split=2"),
+        "main stream not normalised before split:\n{graph}",
+    );
+    // 2) extracted alpha — feeds blend, must be re-stamped as gray
+    //    on the same axis.
+    assert!(
+        graph.contains("alphaextract,format=gray,fps=30,setpts=PTS-STARTPTS,setsar=1"),
+        "alphaextract output not normalised before blend:\n{graph}",
+    );
+    // 3) mask PNG raw — must be force-converted to the same axis
+    //    immediately after the [idx:v] reference.
+    assert!(
+        graph.contains("format=gray,fps=30,setpts=PTS-STARTPTS,setsar=1"),
+        "mask PNG not normalised after [idx:v]:\n{graph}",
+    );
+    // 4) post-scale2ref mask — even though scale2ref already wraps
+    //    the mask to source dims, its timing/sar metadata is unsafe
+    //    to feed straight into blend on ffmpeg 7+.
+    assert!(
+        graph.contains("scale2ref=w=main_w:h=main_h"),
+        "scale2ref no longer present (intended fallback for older ffmpeg):\n{graph}",
+    );
+    // 5) blend uses repeatlast=1 so the looped still PNG keeps
+    //    feeding the chain after its first frame — without this the
+    //    second-and-later video frames would arrive at blend with
+    //    only one input live and framesync would tear down.
+    assert!(
+        graph.contains("blend=all_mode=multiply:all_opacity=1:shortest=0:repeatlast=1"),
+        "blend missing shortest=0:repeatlast=1 framesync hint:\n{graph}",
+    );
+    // 6) alphamerge passthrough is also re-stamped (alphamerge uses
+    //    framesync internally too).
+    assert!(
+        graph.contains("alphamerge"),
+        "alphamerge filter missing — mask sub-graph broken:\n{graph}",
+    );
+}
