@@ -589,3 +589,151 @@ fn actor_skeleton_attachment_overrides_own_world_pos() {
         "actor-skeleton-attached follower didn't take its X from the skeleton point (0.25):\n{graph}",
     );
 }
+
+
+// ─── Audio pipeline regression tests ─────────────────────────────────
+//
+// The render used to fail with `Could not open encoder before EOF`
+// (AAC) and `-22 Invalid argument` (libx264) whenever the user
+// dropped two audio tracks coming from sources with different sample
+// rates / channel layouts — `amix` requires uniform inputs and aborts
+// the entire filter graph on mismatch. The fix in
+// `filtergraph.rs::emit_audio` normalises every track BEFORE amix and
+// pins the post-mix bus once more so the AAC encoder always sees a
+// stable PCM stream. These tests pin the contract.
+
+use memstroy_core::AudioTrack;
+
+/// Materialise a placeholder audio file at `path` so the renderer's
+/// existence check (added defensively to skip stale references after
+/// asset rename/move) doesn't drop the track on the floor in the
+/// test. Content is irrelevant — the test only inspects the graph
+/// string, never invokes ffmpeg.
+fn touch_audio_file(path: &std::path::Path) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, b"");
+}
+
+fn audio_track(id: &str, t_in: f32) -> AudioTrack {
+    let path = std::env::temp_dir().join(format!("memstroy_render_test_{id}.wav"));
+    touch_audio_file(&path);
+    AudioTrack {
+        id: id.into(),
+        source: path,
+        t_in,
+        ..AudioTrack::default()
+    }
+}
+
+#[test]
+fn audio_chain_normalises_each_track_before_amix() {
+    // Two tracks, mismatched rates in real life (48k + 44.1k) — the
+    // graph must aresample + aformat each one to the bus rate so
+    // amix's uniform-format requirement is satisfied.
+    let mut scene = baseline_scene();
+    scene.audio.push(audio_track("a1", 0.0));
+    scene.audio.push(audio_track("a2", 1.5));
+
+    let graph = build_filter_graph(&scene);
+
+    // Per-track normalisation — both aresample and aformat must be
+    // present (count >= 2 for two tracks).
+    let resample_count = graph.matches("aresample=44100").count();
+    assert!(
+        resample_count >= 2,
+        "expected aresample=44100 on every audio track, got {resample_count}:\n{graph}",
+    );
+    let aformat_count = graph.matches("channel_layouts=stereo").count();
+    assert!(
+        aformat_count >= 3,
+        "expected aformat with channel_layouts=stereo per track + post-mix \
+         (>=3), got {aformat_count}:\n{graph}",
+    );
+
+    // amix uses the safe variant: longest duration, no early
+    // dropouts (we apad the per-track chains anyway).
+    assert!(
+        graph.contains("amix=inputs=2:duration=longest:dropout_transition=0:normalize=0"),
+        "amix not configured with the post-fix robust parameters:\n{graph}",
+    );
+
+    // The per-track apad is what saves the AAC encoder from EOF
+    // before init when one source ends early.
+    assert!(
+        graph.contains("apad=whole_dur="),
+        "per-track apad missing — AAC encoder may EOF before init:\n{graph}",
+    );
+
+    // adelay positions the second track at 1.5 s on the timeline.
+    assert!(
+        graph.contains("adelay=1500:all=1"),
+        "adelay for t_in=1.5 not present (or wrong syntax):\n{graph}",
+    );
+}
+
+#[test]
+fn audio_single_track_skips_amix_but_pins_format() {
+    // Single-track scenes don't need a mixer node — but they still
+    // need the final aformat lock so the AAC encoder knows what to
+    // expect. (Without it the `-c:a aac -ar 44100 -ac 2` flags rely
+    // on auto-conversion that historically broke the pipeline.)
+    let mut scene = baseline_scene();
+    scene.audio.push(audio_track("only", 0.0));
+    let graph = build_filter_graph(&scene);
+
+    assert!(
+        !graph.contains("amix="),
+        "single-track scene should not allocate an amix node:\n{graph}",
+    );
+    assert!(
+        graph.contains("aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo"),
+        "single-track scene missing the format-pin filter:\n{graph}",
+    );
+}
+
+#[test]
+fn audio_mute_forces_volume_to_zero() {
+    // The previous code wrote `volume={tr.volume}` regardless of the
+    // `mute` flag — the user's mute click was a no-op in the export.
+    // The fix must collapse `mute=true` to `volume=0`.
+    let mut scene = baseline_scene();
+    let mut tr = audio_track("muted", 0.0);
+    tr.volume = 0.8;
+    tr.mute = true;
+    scene.audio.push(tr);
+    let graph = build_filter_graph(&scene);
+
+    assert!(
+        graph.contains("volume=0.000000"),
+        "mute flag did not collapse volume to zero:\n{graph}",
+    );
+    assert!(
+        !graph.contains("volume=0.800000"),
+        "mute should override the static volume value, but the original leaked through:\n{graph}",
+    );
+}
+
+#[test]
+fn audio_fade_in_out_emit_afade_filters() {
+    // fade_in / fade_out used to be silently dropped (rendered audio
+    // started/ended at full volume regardless of the GUI's fade
+    // ramps). The fix wires them through `afade`.
+    let mut scene = baseline_scene();
+    let mut tr = audio_track("fade", 0.0);
+    tr.t_out = Some(2.0);
+    tr.fade_in = 0.25;
+    tr.fade_out = 0.5;
+    scene.audio.push(tr);
+    let graph = build_filter_graph(&scene);
+
+    assert!(
+        graph.contains("afade=t=in:st=0:d=0.250000"),
+        "fade_in didn't surface as an afade-in filter:\n{graph}",
+    );
+    assert!(
+        graph.contains("afade=t=out:"),
+        "fade_out didn't surface as an afade-out filter:\n{graph}",
+    );
+}

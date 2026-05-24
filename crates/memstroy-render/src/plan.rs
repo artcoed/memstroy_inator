@@ -76,13 +76,40 @@ impl FfmpegPlan {
         if let Some(a) = &self.map_audio {
             args.push("-map".into());
             args.push(a.clone());
+            // ── AAC encoder hardening ──
+            // Pinning sample rate (`-ar`) and channel count (`-ac`)
+            // alongside the codec belt-and-braces forces the encoder
+            // to negotiate one specific format with the filter
+            // graph. Without these the encoder used to defer init
+            // until the first frame arrived from `amix`, and when
+            // the filter graph collapsed (mismatched sample rates
+            // across sources, see `emit_audio`) the encoder
+            // surfaced as "Could not open encoder before EOF" with
+            // no diagnostic lead-in. Aligning these values with the
+            // post-mix `aformat` filter means the encoder opens at
+            // graph-init time and any failure is now the actual
+            // filter error.
             args.push("-c:a".into());
             args.push("aac".into());
             args.push("-b:a".into());
             args.push("192k".into());
+            args.push("-ar".into());
+            args.push("44100".into());
+            args.push("-ac".into());
+            args.push("2".into());
         }
         args.push("-r".into());
         args.push(self.fps.to_string());
+        // `-fps_mode cfr` (the modern replacement for `-vsync cfr`)
+        // tells ffmpeg to emit a constant-frame-rate stream by
+        // duplicating / dropping frames as needed. Without it the
+        // x264 encoder occasionally received frames with non-
+        // monotonic timestamps from the more elaborate overlay
+        // chains (rotate + per-frame scale), which surfaced as the
+        // "-22 Invalid argument" libx264 task failure even when the
+        // filter graph itself was fine.
+        args.push("-fps_mode".into());
+        args.push("cfr".into());
         args.push("-t".into());
         args.push(format!("{:.3}", self.duration));
         args.push("-pix_fmt".into());
@@ -93,6 +120,13 @@ impl FfmpegPlan {
         args.push("medium".into());
         args.push("-crf".into());
         args.push("19".into());
+        // `+faststart` relocates the moov atom to the front of the
+        // file after encoding finishes, so players (and the editor
+        // itself when re-importing the result) can start playback
+        // without seeking to the end first. Cheap to add and a
+        // strict win for the user.
+        args.push("-movflags".into());
+        args.push("+faststart".into());
         args.push(self.output.to_string_lossy().to_string());
         args
     }
