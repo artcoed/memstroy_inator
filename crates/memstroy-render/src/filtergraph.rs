@@ -271,16 +271,27 @@ impl<'a> FilterGraphBuilder<'a> {
 
     fn emit_base_canvas(&mut self) {
         let [w, h] = self.scene.output.resolution;
-        // When the scene has no backgrounds the user gets a full-frame
-        // chromakey green base layer (so the export can be keyed in
-        // post). When at least one background is present we honour
-        // the configured `output.background_color` because a partial
-        // background still needs a fallback colour for the gaps.
-        let [r, g, b] = if self.scene.backgrounds.is_empty() {
-            [0u8, 255u8, 0u8]
-        } else {
-            self.scene.output.background_color
-        };
+        // The base canvas is the FALLBACK colour shown wherever no
+        // background, no overlay and no actor pixel covers the
+        // output frame. It is also what the canvas-preview's
+        // dark-grey editor void becomes once exported, so the user
+        // expects it to match `output.background_color` —
+        // **including** when there are no `Scene.backgrounds`.
+        //
+        // Earlier builds painted the base bright green
+        // (`[0, 255, 0]`) whenever `scene.backgrounds.is_empty()`
+        // under the theory that the export would be re-keyed in
+        // post. In practice that is never what the GUI workflow
+        // wants: image overlays, text plates and chroma-keyed
+        // actors all rely on the base being a neutral background,
+        // and a chroma-keyed actor on top of that hack made the
+        // entire video look like a wall of green wherever the
+        // actor's transparent pixels lived (the user's bug report
+        // "итоговый рендер должен быть таким же, как видео внутри
+        // области рендера в проекте"). Routing both cases through
+        // the same `output.background_color` field keeps the export
+        // aligned with what the editor canvas actually shows.
+        let [r, g, b] = self.scene.output.background_color;
         let bg_hex = format!("0x{:02X}{:02X}{:02X}", r, g, b);
         // The base canvas is generated entirely from a filter source so
         // no `-i` slot is consumed.
