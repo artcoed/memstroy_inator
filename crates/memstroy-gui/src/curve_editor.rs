@@ -219,12 +219,12 @@ fn easing_picker(ui: &mut egui::Ui, current: Easing) -> Option<Easing> {
 
 fn easing_label(e: Easing) -> &'static str {
     match e {
-        Easing::Linear => "Linear",
-        Easing::EaseIn => "Ease in",
-        Easing::EaseOut => "Ease out",
-        Easing::EaseInOut => "Ease in/out",
-        Easing::Cubic => "Cubic",
-        Easing::Step => "Step (hold)",
+        Easing::Linear => crate::i18n::t("Linear"),
+        Easing::EaseIn => crate::i18n::t("Ease in"),
+        Easing::EaseOut => crate::i18n::t("Ease out"),
+        Easing::EaseInOut => crate::i18n::t("Ease in/out"),
+        Easing::Cubic => crate::i18n::t("Cubic"),
+        Easing::Step => crate::i18n::t("Step (hold)"),
     }
 }
 

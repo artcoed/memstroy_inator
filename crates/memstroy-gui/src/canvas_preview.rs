@@ -203,7 +203,7 @@ fn handle_eyedropper_click(
             handle_eyedropper_click_overlay(ui, state, full_rect, viewport_size, click_pos, idx);
         }
         _ => {
-            state.status = "Eyedropper: select an actor or image overlay first.".into();
+            state.status = crate::i18n::t("Eyedropper: select an actor or image overlay first.").into();
         }
     }
 }
@@ -227,14 +227,14 @@ fn handle_eyedropper_click_actor(
     let elem_rect = match actor_screen_rect(state, full_rect, viewport_size, idx) {
         Some(r) => r,
         None => {
-            state.status = "Eyedropper: cannot resolve actor rect.".into();
+            state.status = crate::i18n::t("Eyedropper: cannot resolve actor rect.").into();
             return;
         }
     };
 
     // Click must be inside the actor's rect — otherwise we have no UV.
     if !elem_rect.contains(click_pos) {
-        state.status = "Eyedropper: click on the actor's image.".into();
+        state.status = crate::i18n::t("Eyedropper: click on the actor's image.").into();
         return;
     }
 
@@ -269,12 +269,12 @@ fn handle_eyedropper_click_actor(
             let src = state.scene.actors[idx].source.clone();
             let chroma = state.scene.actors[idx].chroma_key.clone();
             let _ = chroma.save_alongside_clip(&src);
-            state.status = format!("Picked chroma key #{:02X}{:02X}{:02X}", key[0], key[1], key[2]);
+            state.status = format!("{} #{:02X}{:02X}{:02X}", crate::i18n::t("Picked chroma key"), key[0], key[1], key[2]);
             ui.ctx().request_repaint();
             return;
         }
     }
-    state.status = "Eyedropper: frame not yet decoded — try again in a moment.".into();
+    state.status = crate::i18n::t("Eyedropper: frame not yet decoded — try again in a moment.").into();
 }
 
 /// Eyedropper handler for image overlays. Loads the source image
@@ -300,18 +300,18 @@ fn handle_eyedropper_click_overlay(
         Overlay::Image(im) => im.source.clone(),
         _ => {
             state.status =
-                "Eyedropper: overlay must be an image (text / video not supported here)."
+                crate::i18n::t("Eyedropper: overlay must be an image (text / video not supported here).")
                     .into();
             return;
         }
     };
     let elem_rect = selected_element_screen_rect(state, full_rect, viewport_size);
     let Some(elem_rect) = elem_rect else {
-        state.status = "Eyedropper: cannot resolve overlay rect.".into();
+        state.status = crate::i18n::t("Eyedropper: cannot resolve overlay rect.").into();
         return;
     };
     if !elem_rect.contains(click_pos) {
-        state.status = "Eyedropper: click on the overlay's image.".into();
+        state.status = crate::i18n::t("Eyedropper: click on the overlay's image.").into();
         return;
     }
     // Account for rotation just like the mask painter does — without
@@ -346,7 +346,7 @@ fn handle_eyedropper_click_overlay(
             let w = rgba.width() as usize;
             let h = rgba.height() as usize;
             if w == 0 || h == 0 {
-                state.status = "Eyedropper: overlay image has zero size.".into();
+                state.status = crate::i18n::t("Eyedropper: overlay image has zero size.").into();
                 return;
             }
             let px = ((u * w as f32) as usize).min(w - 1);
@@ -370,13 +370,14 @@ fn handle_eyedropper_click_overlay(
                 im.chroma_key = Some(ck);
             }
             state.status = format!(
-                "Picked overlay key #{:02X}{:02X}{:02X}",
+                "{} #{:02X}{:02X}{:02X}",
+                crate::i18n::t("Picked overlay key"),
                 key[0], key[1], key[2]
             );
             ui.ctx().request_repaint();
         }
         Err(e) => {
-            state.status = format!("Eyedropper: failed to read overlay image — {}", e);
+            state.status = format!("{} {}", crate::i18n::t("Eyedropper: failed to read overlay image —"), e);
         }
     }
 }
@@ -1316,8 +1317,8 @@ fn draw_canvas_elements(
         // Display mode indicator
         if display_mode != DisplayMode::Active {
             let badge = match display_mode {
-                DisplayMode::BeforeStart => "FIRST",
-                DisplayMode::AfterEnd => "LAST",
+                DisplayMode::BeforeStart => crate::i18n::t("FIRST"),
+                DisplayMode::AfterEnd => crate::i18n::t("LAST"),
                 _ => "",
             };
             painter.text(
@@ -1387,15 +1388,15 @@ fn draw_canvas_backgrounds(
         let (fill_color, label) = match &bg.source {
             MediaSource::SolidColor { color } => {
                 let c = Color32::from_rgb(color[0], color[1], color[2]);
-                (c, format!("Solid #{}", bg.id))
+                (c, format!("{} #{}", crate::i18n::t("Solid"), bg.id))
             }
             MediaSource::Image { path } => {
                 let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("img");
-                (Color32::from_rgb(30, 50, 70), format!("BG: {}", name))
+                (Color32::from_rgb(30, 50, 70), format!("{} {}", crate::i18n::t("BG:"), name))
             }
             MediaSource::Video { path, .. } => {
                 let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("vid");
-                (Color32::from_rgb(25, 40, 60), format!("BG: {}", name))
+                (Color32::from_rgb(25, 40, 60), format!("{} {}", crate::i18n::t("BG:"), name))
             }
         };
 
@@ -1430,8 +1431,8 @@ fn draw_canvas_backgrounds(
         // Display mode badge
         if display_mode != DisplayMode::Active {
             let badge = match display_mode {
-                DisplayMode::BeforeStart => "FIRST",
-                DisplayMode::AfterEnd => "LAST",
+                DisplayMode::BeforeStart => crate::i18n::t("FIRST"),
+                DisplayMode::AfterEnd => crate::i18n::t("LAST"),
                 _ => "",
             };
             painter.text(
@@ -1718,8 +1719,8 @@ fn draw_canvas_overlays(
                     }
                     if display_mode != DisplayMode::Active {
                         let badge = match display_mode {
-                            DisplayMode::BeforeStart => "FIRST",
-                            DisplayMode::AfterEnd => "LAST",
+                            DisplayMode::BeforeStart => crate::i18n::t("FIRST"),
+                            DisplayMode::AfterEnd => crate::i18n::t("LAST"),
                             _ => "",
                         };
                         painter.text(
@@ -1737,7 +1738,8 @@ fn draw_canvas_overlays(
                     draw_overlay_placeholder(
                         painter, elem_rect, COL_OVERLAY_IMAGE, idx, state,
                         &format!(
-                            "IMG (missing): {}",
+                            "{} {}",
+                            crate::i18n::t("IMG (missing):"),
                             img.source.file_name().and_then(|s| s.to_str()).unwrap_or("?")
                         ),
                         display_mode,
@@ -1752,7 +1754,7 @@ fn draw_canvas_overlays(
                 let elem_rect = Rect::from_center_size(center_pos, Vec2::new(half_w * 2.0, half_h * 2.0));
                 if !full_rect.intersects(elem_rect) { continue; }
                 draw_overlay_placeholder(painter, elem_rect, COL_OVERLAY_VIDEO, idx, state,
-                    &format!("VID: {}", vid.source.file_name().and_then(|s| s.to_str()).unwrap_or("?")),
+                    &format!("{} {}", crate::i18n::t("VID:"), vid.source.file_name().and_then(|s| s.to_str()).unwrap_or("?")),
                     display_mode);
             }
         }
@@ -1788,8 +1790,8 @@ fn draw_overlay_placeholder(
     painter.rect_stroke(elem_rect, Rounding::same(4.0), Stroke::new(border_width, border_col));
     if display_mode != DisplayMode::Active {
         let badge = match display_mode {
-            DisplayMode::BeforeStart => "FIRST",
-            DisplayMode::AfterEnd => "LAST",
+            DisplayMode::BeforeStart => crate::i18n::t("FIRST"),
+            DisplayMode::AfterEnd => crate::i18n::t("LAST"),
             _ => "",
         };
         painter.text(
@@ -2254,8 +2256,8 @@ fn draw_text_overlay(
     // Display mode badge (kept axis-aligned for legibility)
     if display_mode != DisplayMode::Active {
         let badge = match display_mode {
-            DisplayMode::BeforeStart => "FIRST",
-            DisplayMode::AfterEnd => "LAST",
+            DisplayMode::BeforeStart => crate::i18n::t("FIRST"),
+            DisplayMode::AfterEnd => crate::i18n::t("LAST"),
             _ => "",
         };
         painter.text(
@@ -5353,7 +5355,7 @@ fn draw_viewport_controls(
         btn_size,
     );
     let fit_resp = ui.put(fit_rect, egui::Button::new("F").small());
-    if fit_resp.on_hover_text("Fit render frame in view").clicked() {
+    if fit_resp.on_hover_text(crate::i18n::t("Fit render frame in view")).clicked() {
         let rf = &state.scene.render_frame;
         let rf_state = sample_render_frame(rf, state.playhead);
         state.canvas_viewport.fit_render_frame(
@@ -5369,7 +5371,7 @@ fn draw_viewport_controls(
         btn_size,
     );
     let zin_resp = ui.put(zin_rect, egui::Button::new("+").small());
-    if zin_resp.on_hover_text("Zoom in").clicked() {
+    if zin_resp.on_hover_text(crate::i18n::t("Zoom in")).clicked() {
         state.canvas_viewport.zoom = (state.canvas_viewport.zoom * 1.3).min(50.0);
     }
 
@@ -5379,7 +5381,7 @@ fn draw_viewport_controls(
         btn_size,
     );
     let zout_resp = ui.put(zout_rect, egui::Button::new("-").small());
-    if zout_resp.on_hover_text("Zoom out").clicked() {
+    if zout_resp.on_hover_text(crate::i18n::t("Zoom out")).clicked() {
         state.canvas_viewport.zoom = (state.canvas_viewport.zoom / 1.3).max(0.01);
     }
 
@@ -5420,10 +5422,10 @@ fn draw_mask_toolbar(
     let btn_h = 24.0;
     let gap = 4.0;
     let tools: [(MaskTool, &str, &str); 5] = [
-        (MaskTool::None, "\u{2196}", "Select / transform (Esc)"),
-        (MaskTool::RectMask, "\u{25A1}", "Rectangle mask / crop — drag to define a rectangular region. Combines the legacy Rectangle and Crop tools."),
-        (MaskTool::EllipseMask, "\u{25CB}", "Ellipse mask — drag to mask outside the ellipse"),
-        (MaskTool::FreehandMask, "\u{270F}", "Freehand mask — paint a closed polygon"),
+        (MaskTool::None, "\u{2196}", crate::i18n::t("Select / transform (Esc)")),
+        (MaskTool::RectMask, "\u{25A1}", crate::i18n::t("Rectangle mask / crop — drag to define a rectangular region. Combines the legacy Rectangle and Crop tools.")),
+        (MaskTool::EllipseMask, "\u{25CB}", crate::i18n::t("Ellipse mask — drag to mask outside the ellipse")),
+        (MaskTool::FreehandMask, "\u{270F}", crate::i18n::t("Freehand mask — paint a closed polygon")),
         // Segment selection mask. Click-by-click polygon construction
         // with an eyedropper-style crosshair: each click plants a
         // vertex, click near the first vertex (≥ 3 placed) or
@@ -5432,7 +5434,7 @@ fn draw_mask_toolbar(
         // lives only in the inspector "Masks" panel where the
         // similarity / blend / spill sliders sit alongside it, so
         // colour picking and tuning happen in one place.
-        (MaskTool::SegmentMask, "\u{2B20}", "Segment selection mask — click on the canvas to plant polygon vertices, click near the first point or double-click to close. Right-click pops the last vertex; Esc cancels."),
+        (MaskTool::SegmentMask, "\u{2B20}", crate::i18n::t("Segment selection mask — click on the canvas to plant polygon vertices, click near the first point or double-click to close. Right-click pops the last vertex; Esc cancels.")),
     ];
     for (i, (tool, glyph, hint)) in tools.iter().enumerate() {
         let rect = Rect::from_min_size(
@@ -5461,8 +5463,9 @@ fn draw_mask_toolbar(
     // ── Status badge ──
     if state.mask_tool != MaskTool::None {
         let label = format!(
-            "{} active — drag inside the selected element. Esc to cancel.",
-            state.mask_tool.label()
+            "{} {}",
+            state.mask_tool.label(),
+            crate::i18n::t("active — drag inside the selected element. Esc to cancel."),
         );
         let pos = Pos2::new(
             full_rect.center().x,
@@ -5773,7 +5776,7 @@ fn handle_segment_mask_input(
     // primary click starts a brand-new polygon.
     if response.secondary_clicked() {
         if state.mask_draft_points.pop().is_some() {
-            state.status = "Segment mask: removed last vertex".into();
+            state.status = crate::i18n::t("Segment mask: removed last vertex").into();
         }
         if state.mask_draft_points.is_empty() {
             state.canvas_drag.mode = CanvasDragMode::None;
@@ -5824,7 +5827,7 @@ fn handle_segment_mask_input(
             // click — the user otherwise gets no feedback for why
             // their vertex didn't appear.
             state.status =
-                "Segment mask: select an actor or image overlay first, then click on it.".into();
+                crate::i18n::t("Segment mask: select an actor or image overlay first, then click on it.").into();
             return;
         };
 
@@ -5836,7 +5839,7 @@ fn handle_segment_mask_input(
                 target,
             };
             state.mask_draft_points.push(uv);
-            state.status = "Segment mask: vertex 1 placed — keep clicking, double-click or click the first point to close.".into();
+            state.status = crate::i18n::t("Segment mask: vertex 1 placed — keep clicking, double-click or click the first point to close.").into();
             return;
         }
 
@@ -5867,8 +5870,10 @@ fn handle_segment_mask_input(
 
         state.mask_draft_points.push(uv);
         state.status = format!(
-            "Segment mask: vertex {} placed — click first point or double-click to close.",
+            "{} {}{}",
+            crate::i18n::t("Segment mask: vertex"),
             state.mask_draft_points.len(),
+            crate::i18n::t(" placed — click first point or double-click to close."),
         );
     }
 }
@@ -6008,7 +6013,7 @@ fn commit_mask_draft(
             _ => {}
         }
     });
-    state.status = format!("\u{2702} {} applied", tool.label());
+    state.status = format!("\u{2702} {} {}", tool.label(), crate::i18n::t("applied"));
 }
 
 /// Eyedropper colour-key mask — the click handler for
@@ -6039,14 +6044,14 @@ fn handle_eyedropper_mask_click(
     let Some((uv, target, _rect)) =
         screen_to_element_uv(state, full_rect, viewport_size, pointer)
     else {
-        state.status = "Eyedropper mask: select an element first.".into();
+        state.status = crate::i18n::t("Eyedropper mask: select an element first.").into();
         return;
     };
     // The UV math returns a clamped value in [-0.5, 1.5] so the user
     // can paint near the edges; for sampling we need a real pixel
     // inside the source so a click outside the picture is rejected.
     if uv[0] < 0.0 || uv[0] > 1.0 || uv[1] < 0.0 || uv[1] > 1.0 {
-        state.status = "Eyedropper mask: click on the picture itself.".into();
+        state.status = crate::i18n::t("Eyedropper mask: click on the picture itself.").into();
         return;
     }
 
@@ -6061,14 +6066,15 @@ fn handle_eyedropper_mask_click(
     };
     let Some(rgb) = picked else {
         state.status =
-            "Eyedropper mask: source frame not yet decoded — try again in a moment.".into();
+            crate::i18n::t("Eyedropper mask: source frame not yet decoded — try again in a moment.").into();
         return;
     };
 
     // Apply the picked colour: overwrite the latest ColorKey entry on
     // the layer if there is one, otherwise push a fresh one.
     let label = format!(
-        "\u{1F4A7} Color key: #{:02X}{:02X}{:02X}",
+        "\u{1F4A7} {} #{:02X}{:02X}{:02X}",
+        crate::i18n::t("Color key:"),
         rgb[0], rgb[1], rgb[2],
     );
     state.mutate(|scene| {
@@ -6736,7 +6742,7 @@ pub fn handle_canvas_asset_drag(
         );
     }
     let label = if state.asset_drag.label.is_empty() {
-        "Drop on canvas".to_string()
+        crate::i18n::t("Drop on canvas").to_string()
     } else {
         state.asset_drag.label.clone()
     };
@@ -6751,7 +6757,7 @@ pub fn handle_canvas_asset_drag(
     painter.text(
         text_anchor + egui::vec2(0.0, 18.0),
         egui::Align2::LEFT_TOP,
-        "drop here to place at cursor",
+        crate::i18n::t("drop here to place at cursor"),
         egui::FontId::proportional(9.0),
         Color32::from_rgb(160, 160, 180),
     );

@@ -253,13 +253,13 @@ impl App {
                     }
                 }
                 JobEvent::RenderFinished(Ok(p)) => {
-                    self.state.status = format!("\u{2705} Rendered: {}", p.display());
+                    self.state.status = format!("{} {}", crate::i18n::t("\u{2705} Rendered:"), p.display());
                     if let Some(rp) = self.state.render_progress.as_mut() {
                         rp.done = true;
                     }
                 }
                 JobEvent::RenderFinished(Err(e)) => {
-                    self.state.status = format!("\u{274C} Render failed: {}", e);
+                    self.state.status = format!("{} {}", crate::i18n::t("\u{274C} Render failed:"), e);
                     if let Some(rp) = self.state.render_progress.as_mut() {
                         rp.done = true;
                         rp.error = Some(e);
@@ -284,19 +284,22 @@ impl App {
                     self.state.refreshing = false;
                     self.state.reload_library();
                     self.state.status = format!(
-                        "\u{1F389} Refresh done! {} new clips, {} total in library",
-                        summary.new_clips, summary.total_clips
+                        "{} {} {}, {} {}",
+                        crate::i18n::t("\u{1F389} Refresh done!"),
+                        summary.new_clips, crate::i18n::t("new clips,"),
+                        summary.total_clips, crate::i18n::t("total in library"),
                     );
                     if summary.failed > 0 {
                         self.state.status.push_str(&format!(
-                            " ({} failed)",
-                            summary.failed
+                            " ({} {})",
+                            summary.failed,
+                            crate::i18n::t("failed"),
                         ));
                     }
                 }
                 JobEvent::RefreshFinished(Err(e)) => {
                     self.state.refreshing = false;
-                    self.state.status = format!("\u{274C} Refresh failed: {}", e);
+                    self.state.status = format!("{} {}", crate::i18n::t("\u{274C} Refresh failed:"), e);
                 }
                 JobEvent::WebSearchFinished {
                     page_offset,
@@ -339,16 +342,18 @@ impl App {
                             }
                             self.state.web_image_search.status = if n == 0 {
                                 if is_first_page {
-                                    "\u{1F50D} No results.".to_string()
+                                    crate::i18n::t("\u{1F50D} No results.").to_string()
                                 } else {
-                                    "(no more results)".to_string()
+                                    crate::i18n::t("(no more results)").to_string()
                                 }
                             } else if is_first_page {
-                                format!("\u{2705} Got {} result(s).", n)
+                                format!("{} {} {}.", crate::i18n::t("\u{2705} Got"), n, crate::i18n::t("result(s)"))
                             } else {
                                 format!(
-                                    "\u{2795} +{} (total {})",
+                                    "{} +{} ({} {})",
+                                    crate::i18n::t("\u{2795}"),
                                     n,
+                                    crate::i18n::t("total"),
                                     self.state.web_image_search.results.len()
                                 )
                             };
@@ -387,7 +392,8 @@ impl App {
                             // the Images tab (matches Ctrl+V flow).
                             self.state.reload_library();
                             self.state.web_image_search.status = format!(
-                                "\u{2705} Saved \u{2192} {}",
+                                "{} \u{2192} {}",
+                                crate::i18n::t("\u{2705} Saved"),
                                 asset.label,
                             );
                             if place_on_canvas {
@@ -396,14 +402,15 @@ impl App {
                                 self.state.library_tab =
                                     crate::state::LibraryTab::Images;
                                 self.state.status = format!(
-                                    "\u{1F310} Web image \u{2192} {}",
+                                    "{} \u{2192} {}",
+                                    crate::i18n::t("\u{1F310} Web image"),
                                     asset.label,
                                 );
                             }
                         }
                         Err(e) => {
                             self.state.web_image_search.status =
-                                format!("\u{274C} Download failed: {}", e);
+                                format!("{} {}", crate::i18n::t("\u{274C} Download failed:"), e);
                         }
                     }
                 }
@@ -668,8 +675,8 @@ impl App {
                 }
                 if ui.button(t("\u{1F4C2} Open scene...")).clicked() {
                     if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("Memstroy Project", &["memstroy"])
-                        .add_filter("Scene", &["yaml", "yml", "json"])
+                        .add_filter(t("Memstroy Project"), &["memstroy"])
+                        .add_filter(t("Scene"), &["yaml", "yml", "json"])
                         .pick_file()
                     {
                         let is_memstroy = path
@@ -694,14 +701,14 @@ impl App {
                                 }
                                 // Update tab name
                                 let name = path.file_stem().and_then(|s| s.to_str())
-                                    .unwrap_or("Scene").to_string();
+                                    .unwrap_or(t("Scene")).to_string();
                                 if self.state.active_tab < self.state.scene_tabs.len() {
                                     self.state.scene_tabs[self.state.active_tab].name = name;
                                     self.state.scene_tabs[self.state.active_tab].path = Some(path.clone());
                                     self.state.scene_tabs[self.state.active_tab].scene = self.state.scene.clone();
                                 }
                             }
-                            Err(e) => self.state.status = format!("\u{274C} Open failed: {e}"),
+                            Err(e) => self.state.status = format!("{} {e}", t("\u{274C} Open failed:")),
                         }
                     }
                     ui.close_menu();
@@ -977,9 +984,10 @@ impl App {
             let n = self.state.copy_selection_to_clipboard();
             if n > 0 {
                 self.state.status = format!(
-                    "\u{1F4CB} Copied {} item{} to clipboard",
+                    "{} {} {}",
+                    crate::i18n::t("\u{1F4CB} Copied"),
                     n,
-                    if n == 1 { "" } else { "s" }
+                    if n == 1 { crate::i18n::t("item to clipboard") } else { crate::i18n::t("items to clipboard") }
                 );
                 // Remember when this copy happened so the next Ctrl+V
                 // knows to prefer our in-app clipboard over an OS
@@ -1023,9 +1031,10 @@ impl App {
                 let n = self.state.paste_clipboard();
                 if n > 0 {
                     self.state.status = format!(
-                        "\u{1F4CB} Pasted {} item{} at the playhead",
+                        "{} {} {}",
+                        crate::i18n::t("\u{1F4CB} Pasted"),
                         n,
-                        if n == 1 { "" } else { "s" },
+                        if n == 1 { crate::i18n::t("item at the playhead") } else { crate::i18n::t("items at the playhead") },
                     );
                     handled = true;
                 }
@@ -1045,16 +1054,17 @@ impl App {
                 let n = self.state.paste_clipboard();
                 if n > 0 {
                     self.state.status = format!(
-                        "\u{1F4CB} Pasted {} item{} at the playhead",
+                        "{} {} {}",
+                        crate::i18n::t("\u{1F4CB} Pasted"),
                         n,
-                        if n == 1 { "" } else { "s" },
+                        if n == 1 { crate::i18n::t("item at the playhead") } else { crate::i18n::t("items at the playhead") },
                     );
                     handled = true;
                 }
             }
             if !handled {
                 self.state.status =
-                    "\u{1F4CB} Clipboard is empty".into();
+                    crate::i18n::t("\u{1F4CB} Clipboard is empty").into();
             }
         }
 
@@ -1079,9 +1089,9 @@ impl App {
             if i.key_pressed(egui::Key::Space) {
                 self.state.playing = !self.state.playing;
                 if self.state.playing {
-                    self.state.status = "\u{25B6} Playing".into();
+                    self.state.status = crate::i18n::t("\u{25B6} Playing").into();
                 } else {
-                    self.state.status = "\u{23F8} Paused".into();
+                    self.state.status = crate::i18n::t("\u{23F8} Paused").into();
                 }
             }
             // Delete key = remove selected element (only when no
@@ -1128,7 +1138,7 @@ impl App {
                         self.state.canvas_drag.mode =
                             crate::state::CanvasDragMode::None;
                     }
-                    self.state.status = "Mask tool cancelled".into();
+                    self.state.status = crate::i18n::t("Mask tool cancelled").into();
                 }
             }
         });
@@ -1176,14 +1186,15 @@ impl App {
         {
             Ok(a) => a,
             Err(err) => {
-                self.state.status = format!("Clipboard image save failed: {}", err);
+                self.state.status = format!("{} {}", crate::i18n::t("Clipboard image save failed:"), err);
                 return true; // we tried; don't fall through to internal paste
             }
         };
         let _idx = self.state.add_image_overlay_at_playhead(&asset);
         self.state.library_tab = crate::state::LibraryTab::Images;
         self.state.status = format!(
-            "\u{1F4CB} Pasted clipboard image \u{2192} {} ({}\u{00D7}{})",
+            "{} \u{2192} {} ({}\u{00D7}{})",
+            crate::i18n::t("\u{1F4CB} Pasted clipboard image"),
             asset.label, width, height
         );
         true
@@ -1399,7 +1410,7 @@ impl App {
                             match audio_prop {
                                 AUDIO_SPEED => (
                                     &mut audio.speed_kfs,
-                                    "Speed",
+                                    crate::i18n::t("Speed"),
                                     Color32::from_rgb(255, 180, 80),
                                     (0.05_f32, 16.0_f32),
                                     audio.speed,
@@ -1407,7 +1418,7 @@ impl App {
                                 ),
                                 AUDIO_PAN => (
                                     &mut audio.pan_kfs,
-                                    "Pan",
+                                    crate::i18n::t("Pan"),
                                     Color32::from_rgb(180, 220, 255),
                                     (-1.0_f32, 1.0_f32),
                                     audio.pan,
@@ -1415,7 +1426,7 @@ impl App {
                                 ),
                                 _ => (
                                     &mut audio.volume_kfs,
-                                    "Volume",
+                                    crate::i18n::t("Volume"),
                                     Color32::from_rgb(120, 220, 160),
                                     (0.0_f32, 4.0_f32),
                                     audio.volume,
@@ -1484,7 +1495,7 @@ impl App {
                 self.state.selection = Selection::None;
                 self.state.canvas_selection.clear();
                 self.state.multi_select.clear();
-                self.state.status = "\u{1F5D1} Actor deleted.".into();
+                self.state.status = crate::i18n::t("\u{1F5D1} Actor deleted.").into();
             }
             Selection::Overlay(i) if i < self.state.scene.overlays.len() => {
                 self.state.mutate(|s| { s.overlays.remove(i); });
@@ -1493,14 +1504,14 @@ impl App {
                 self.state.selection = Selection::None;
                 self.state.canvas_selection.clear();
                 self.state.multi_select.clear();
-                self.state.status = "\u{1F5D1} Overlay deleted.".into();
+                self.state.status = crate::i18n::t("\u{1F5D1} Overlay deleted.").into();
             }
             Selection::Background(i) if i < self.state.scene.backgrounds.len() => {
                 self.state.mutate(|s| { s.backgrounds.remove(i); });
                 self.state.selection = Selection::None;
                 self.state.canvas_selection.clear();
                 self.state.multi_select.clear();
-                self.state.status = "\u{1F5D1} Background deleted.".into();
+                self.state.status = crate::i18n::t("\u{1F5D1} Background deleted.").into();
             }
             Selection::Audio(i) if i < self.state.scene.audio.len() => {
                 // Cascade audio → parent actor: deleting a sound that
@@ -1544,7 +1555,7 @@ impl App {
                 self.state.selection = Selection::None;
                 self.state.canvas_selection.clear();
                 self.state.multi_select.clear();
-                self.state.status = "\u{1F5D1} Audio deleted.".into();
+                self.state.status = crate::i18n::t("\u{1F5D1} Audio deleted.").into();
             }
             _ => {}
         }
@@ -1558,7 +1569,7 @@ impl App {
                 let new_idx = self.state.scene.actors.len();
                 self.state.mutate(move |s| { s.actors.push(dup); });
                 self.state.selection = Selection::Actor(new_idx);
-                self.state.status = "\u{1F4CB} Actor duplicated.".into();
+                self.state.status = crate::i18n::t("\u{1F4CB} Actor duplicated.").into();
             }
             Selection::Overlay(i) if i < self.state.scene.overlays.len() => {
                 let mut dup = self.state.scene.overlays[i].clone();
@@ -1570,7 +1581,7 @@ impl App {
                 let new_idx = self.state.scene.overlays.len();
                 self.state.mutate(move |s| { s.overlays.push(dup); });
                 self.state.selection = Selection::Overlay(new_idx);
-                self.state.status = "\u{1F4CB} Overlay duplicated.".into();
+                self.state.status = crate::i18n::t("\u{1F4CB} Overlay duplicated.").into();
             }
             Selection::Background(i) if i < self.state.scene.backgrounds.len() => {
                 let mut dup = self.state.scene.backgrounds[i].clone();
@@ -1578,7 +1589,7 @@ impl App {
                 let new_idx = self.state.scene.backgrounds.len();
                 self.state.mutate(move |s| { s.backgrounds.push(dup); });
                 self.state.selection = Selection::Background(new_idx);
-                self.state.status = "\u{1F4CB} Background duplicated.".into();
+                self.state.status = crate::i18n::t("\u{1F4CB} Background duplicated.").into();
             }
             _ => {}
         }
@@ -1617,7 +1628,7 @@ impl App {
                 self.split_audio_with_cascade(i, t);
             }
             _ => {
-                self.state.status = "\u{26A0} Select an element to split.".into();
+                self.state.status = crate::i18n::t("\u{26A0} Select an element to split.").into();
             }
         }
     }
@@ -1635,7 +1646,7 @@ impl App {
         let end = bg.start + bg.duration;
         if t <= start || t >= end {
             self.state.status =
-                "\u{26A0} Playhead is outside this background's range.".into();
+                crate::i18n::t("\u{26A0} Playhead is outside this background's range.").into();
             return false;
         }
         let mut right = bg.clone();
@@ -1647,7 +1658,7 @@ impl App {
             s.backgrounds[i].duration = left_dur;
             s.backgrounds.insert(i + 1, right);
         });
-        self.state.status = "\u{2702} Background split at playhead.".into();
+        self.state.status = crate::i18n::t("\u{2702} Background split at playhead.").into();
         true
     }
 
@@ -1670,7 +1681,7 @@ impl App {
         let end = a.t_out.unwrap_or(self.state.scene.output.duration);
         if t <= start || t >= end {
             self.state.status =
-                "\u{26A0} Playhead is outside this actor's range.".into();
+                crate::i18n::t("\u{26A0} Playhead is outside this actor's range.").into();
             return None;
         }
         let mut right = a.clone();
@@ -1779,7 +1790,7 @@ impl App {
             let _ = self.split_audio_at(au_idx, t, Some(right_actor_id.clone()));
         }
 
-        self.state.status = "\u{2702} Actor split at playhead.".into();
+        self.state.status = crate::i18n::t("\u{2702} Actor split at playhead.").into();
     }
 
     /// Split the overlay at index `i` at scene-time `t`. Overlays have
@@ -1796,7 +1807,7 @@ impl App {
         };
         if t <= start || t >= end {
             self.state.status =
-                "\u{26A0} Playhead is outside this overlay's range.".into();
+                crate::i18n::t("\u{26A0} Playhead is outside this overlay's range.").into();
             return false;
         }
         let mut right = ov.clone();
@@ -1872,7 +1883,7 @@ impl App {
             shifted.insert(pivot, lane);
         }
         self.state.overlay_track_assignments = shifted;
-        self.state.status = "\u{2702} Overlay split at playhead.".into();
+        self.state.status = crate::i18n::t("\u{2702} Overlay split at playhead.").into();
         true
     }
 
@@ -1896,7 +1907,7 @@ impl App {
         let end = au.t_out.unwrap_or(self.state.scene.output.duration);
         if t <= start || t >= end {
             self.state.status =
-                "\u{26A0} Playhead is outside this audio's range.".into();
+                crate::i18n::t("\u{26A0} Playhead is outside this audio's range.").into();
             return None;
         }
         let mut right = au.clone();
@@ -1948,7 +1959,7 @@ impl App {
         let Some(parent_id) = parent_actor_id else {
             // Standalone audio — just split the one row.
             if self.split_audio_at(i, t, None).is_some() {
-                self.state.status = "\u{2702} Audio split at playhead.".into();
+                self.state.status = crate::i18n::t("\u{2702} Audio split at playhead.").into();
             }
             return;
         };
@@ -1966,7 +1977,7 @@ impl App {
             Some(p) => p,
             None => {
                 if self.split_audio_at(i, t, None).is_some() {
-                    self.state.status = "\u{2702} Audio split at playhead.".into();
+                    self.state.status = crate::i18n::t("\u{2702} Audio split at playhead.").into();
                 }
                 return;
             }
@@ -2007,7 +2018,7 @@ impl App {
             let _ = self.split_audio_at(au_idx, t, Some(right_actor_id.clone()));
         }
 
-        self.state.status = "\u{2702} Audio split at playhead.".into();
+        self.state.status = crate::i18n::t("\u{2702} Audio split at playhead.").into();
     }
 
     /// Merge the selected element with its next sibling of the same kind.
@@ -2022,7 +2033,7 @@ impl App {
                     s.backgrounds[i].duration = next_end - start;
                     s.backgrounds.remove(i + 1);
                 });
-                self.state.status = "\u{1F517} Backgrounds merged.".into();
+                self.state.status = crate::i18n::t("\u{1F517} Backgrounds merged.").into();
             }
             Selection::Actor(i) if i + 1 < self.state.scene.actors.len() => {
                 let next = self.state.scene.actors[i + 1].clone();
@@ -2038,7 +2049,7 @@ impl App {
                     s.actors[i].layout.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap());
                     s.actors.remove(i + 1);
                 });
-                self.state.status = "\u{1F517} Actors merged.".into();
+                self.state.status = crate::i18n::t("\u{1F517} Actors merged.").into();
             }
             Selection::Overlay(i) if i + 1 < self.state.scene.overlays.len() => {
                 let next_end = match &self.state.scene.overlays[i + 1] {
@@ -2054,10 +2065,10 @@ impl App {
                     }
                     s.overlays.remove(i + 1);
                 });
-                self.state.status = "\u{1F517} Overlays merged.".into();
+                self.state.status = crate::i18n::t("\u{1F517} Overlays merged.").into();
             }
             _ => {
-                self.state.status = "\u{26A0} Select an element with a next sibling to merge.".into();
+                self.state.status = crate::i18n::t("\u{26A0} Select an element with a next sibling to merge.").into();
             }
         }
     }
@@ -2116,7 +2127,7 @@ impl App {
             self.waveform_extract_results[audio_idx] = result_slot;
         }
 
-        self.state.status = "\u{1F3B5} Extracting audio waveforms...".into();
+        self.state.status = crate::i18n::t("\u{1F3B5} Extracting audio waveforms...").into();
     }
 
     /// Poll for waveform extraction completion across all audio tracks.
@@ -2132,7 +2143,9 @@ impl App {
                     self.state.audio_waveforms[audio_idx].ready = true;
                     self.state.audio_waveforms[audio_idx].extracting = false;
                     self.state.status = format!(
-                        "\u{2705} Waveform ready (audio {}): {:.1}s",
+                        "{} ({} {}): {:.1}s",
+                        crate::i18n::t("\u{2705} Waveform ready"),
+                        crate::i18n::t("audio"),
                         audio_idx, duration
                     );
                 }
@@ -2193,7 +2206,7 @@ impl App {
             );
         }
 
-        self.state.status = "\u{1F3AC} Extracting preview frames...".into();
+        self.state.status = crate::i18n::t("\u{1F3AC} Extracting preview frames...").into();
     }
 
     /// Poll for frame extraction completion across all actors.
@@ -2204,8 +2217,10 @@ impl App {
                     if let Some(fc) = self.state.frame_caches.get_mut(actor_idx) {
                         fc.set_ready(duration, frame_count, cache_dir);
                         self.state.status = format!(
-                            "\u{2705} Preview ready (actor {}): {} frames ({:.1}s)",
-                            actor_idx, frame_count, duration
+                            "{} ({} {}): {} {} ({:.1}s)",
+                            crate::i18n::t("\u{2705} Preview ready"),
+                            crate::i18n::t("actor"),
+                            actor_idx, frame_count, crate::i18n::t("frames"), duration
                         );
                     }
                 }
@@ -2223,19 +2238,19 @@ impl App {
             if is_memstroy {
                 match self.state.save_memstroy(&path) {
                     Ok(()) => {
-                        self.state.status = "\u{2705} Saved (.memstroy).".into();
+                        self.state.status = crate::i18n::t("\u{2705} Saved (.memstroy).").into();
                     }
-                    Err(e) => self.state.status = format!("\u{274C} Save failed: {e}"),
+                    Err(e) => self.state.status = format!("{} {e}", crate::i18n::t("\u{274C} Save failed:")),
                 }
             } else {
                 match self.state.scene.save(&path) {
                     Ok(()) => {
-                        self.state.status = "\u{2705} Saved.".into();
+                        self.state.status = crate::i18n::t("\u{2705} Saved.").into();
                         // Save layout alongside scene
                         let layout_path = path.with_extension("layout.json");
                         self.state.save_layout(&layout_path);
                     }
-                    Err(e) => self.state.status = format!("\u{274C} Save failed: {e}"),
+                    Err(e) => self.state.status = format!("{} {e}", crate::i18n::t("\u{274C} Save failed:")),
                 }
             }
         } else {
@@ -2248,9 +2263,9 @@ impl App {
             // .memstroy is the project-native bundle (scene + layout in
             // a single JSON file). YAML / JSON remain available for
             // CLI / version-control friendliness.
-            .add_filter("Memstroy Project", &["memstroy"])
-            .add_filter("Scene YAML", &["yaml", "yml"])
-            .add_filter("Scene JSON", &["json"])
+            .add_filter(crate::i18n::t("Memstroy Project"), &["memstroy"])
+            .add_filter(crate::i18n::t("Scene YAML"), &["yaml", "yml"])
+            .add_filter(crate::i18n::t("Scene JSON"), &["json"])
             .set_file_name("project.memstroy")
             .save_file()
         {
@@ -2276,19 +2291,19 @@ impl App {
             match result {
                 Ok(()) => {
                     self.state.scene_path = Some(path.clone());
-                    self.state.status = "\u{2705} Saved.".into();
+                    self.state.status = crate::i18n::t("\u{2705} Saved.").into();
                     if self.state.active_tab < self.state.scene_tabs.len() {
                         let name = path
                             .file_stem()
                             .and_then(|s| s.to_str())
-                            .unwrap_or("Scene")
+                            .unwrap_or(crate::i18n::t("Scene"))
                             .to_string();
                         self.state.scene_tabs[self.state.active_tab].name = name;
                         self.state.scene_tabs[self.state.active_tab].path =
                             Some(path.clone());
                     }
                 }
-                Err(e) => self.state.status = format!("\u{274C} Save failed: {e}"),
+                Err(e) => self.state.status = format!("{} {e}", crate::i18n::t("\u{274C} Save failed:")),
             }
         }
     }
@@ -2322,7 +2337,7 @@ impl App {
             self.state.assets_root.clone(),
             path,
         );
-        self.state.status = "\u{1F3A5} Rendering at 1080x1920...".into();
+        self.state.status = crate::i18n::t("\u{1F3A5} Rendering at 1080x1920...").into();
     }
 
     fn run_refresh(&mut self) {
@@ -2330,7 +2345,7 @@ impl App {
             return;
         }
         self.state.refreshing = true;
-        self.state.status = "\u{1F504} Refreshing clips via assets-server...".into();
+        self.state.status = crate::i18n::t("\u{1F504} Refreshing clips via assets-server...").into();
         spawn_refresh(
             self.rt.handle(),
             self.tx.clone(),
@@ -2412,7 +2427,7 @@ impl App {
                 } else if progress >= 0.05 && progress < 0.999 {
                     let total = elapsed_secs / progress.max(0.001);
                     let remaining = (total - elapsed_secs).max(0.0);
-                    format!(" \u{2014} ETA {}", format_elapsed(remaining))
+                    format!(" \u{2014} {} {}", crate::i18n::t("ETA"), format_elapsed(remaining))
                 } else {
                     String::new()
                 };
@@ -2513,10 +2528,10 @@ impl App {
                 self.state.last_autosave = Some(std::time::Instant::now());
                 self.state.autosave_toast_until =
                     Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
-                self.state.status = "\u{1F4BE} Auto-saved".into();
+                self.state.status = crate::i18n::t("\u{1F4BE} Auto-saved").into();
             }
             Err(e) => {
-                self.state.status = format!("\u{26A0} Autosave failed: {e}");
+                self.state.status = format!("{} {e}", crate::i18n::t("\u{26A0} Autosave failed:"));
             }
         }
     }
@@ -2584,18 +2599,18 @@ impl App {
                 Ok(scene) => {
                     self.state.scene = scene;
                     self.state.scene_path = None;
-                    self.state.status = "\u{2705} Recovered scene loaded.".into();
+                    self.state.status = crate::i18n::t("\u{2705} Recovered scene loaded.").into();
                 }
                 Err(e) => {
-                    self.state.status = format!("\u{274C} Recovery failed: {e}");
+                    self.state.status = format!("{} {e}", crate::i18n::t("\u{274C} Recovery failed:"));
                 }
             },
             Some("no") => {
                 let _ = std::fs::remove_file(&autosave_path);
-                self.state.status = "\u{1F5D1} Recovery discarded.".into();
+                self.state.status = crate::i18n::t("\u{1F5D1} Recovery discarded.").into();
             }
             Some("later") => {
-                self.state.status = "Recovery postponed.".into();
+                self.state.status = crate::i18n::t("Recovery postponed.").into();
             }
             _ => {}
         }
@@ -2700,7 +2715,7 @@ impl App {
                     );
                 });
                 self.state.selection = Selection::Overlay(new_idx_out);
-                self.state.status = format!("\u{2728} Added title: {}", tpl.name);
+                self.state.status = format!("{} {}", crate::i18n::t("\u{2728} Added title:"), tpl.name);
                 self.state.title_picker_open = false;
             }
         }
@@ -3096,7 +3111,7 @@ impl eframe::App for App {
                 };
                 if let Err(err) = std::fs::create_dir_all(&dest_dir) {
                     self.state.status =
-                        format!("Couldn't create {}: {}", dest_dir.display(), err);
+                        format!("{} {}: {}", crate::i18n::t("Couldn't create"), dest_dir.display(), err);
                     continue;
                 }
                 let file_name = path
@@ -3138,7 +3153,8 @@ impl eframe::App for App {
                         Ok(_) => true,
                         Err(err) => {
                             self.state.status = format!(
-                                "Couldn't import {}: {}",
+                                "{} {}: {}",
+                                crate::i18n::t("Couldn't import"),
                                 path.display(),
                                 err
                             );
@@ -3167,7 +3183,8 @@ impl eframe::App for App {
                         self.state.library_tab
                     };
                     self.state.status = format!(
-                        "Imported into library: {}",
+                        "{} {}",
+                        crate::i18n::t("Imported into library:"),
                         dest.display()
                     );
                     // Drop landed inside the library panel — no scene
@@ -3215,7 +3232,7 @@ impl eframe::App for App {
                     let lane = self.state.pick_or_create_empty_video_lane_at(t);
                     self.state.overlay_track_assignments.insert(new_idx, lane);
                     self.state.selection = Selection::Overlay(new_idx);
-                    self.state.status = format!("Dropped image: {} (saved to library)", id);
+                    self.state.status = format!("{} {} ({})", crate::i18n::t("Dropped image:"), id, crate::i18n::t("saved to library"));
                 } else if is_audio {
                     let id = dest.file_stem().and_then(|s| s.to_str())
                         .map(|s| s.to_string())
@@ -3227,7 +3244,7 @@ impl eframe::App for App {
                         ..Default::default()
                     });
                     self.state.selection = Selection::Audio(self.state.scene.audio.len() - 1);
-                    self.state.status = format!("Dropped audio: {} (saved to library)", id);
+                    self.state.status = format!("{} {} ({})", crate::i18n::t("Dropped audio:"), id, crate::i18n::t("saved to library"));
                 }
             }
         }
@@ -3398,7 +3415,7 @@ impl eframe::App for App {
         // Curve editor floating window
         if self.state.curve_editor_open {
             let mut curve_open = self.state.curve_editor_open;
-            egui::Window::new("Curve Editor")
+            egui::Window::new(crate::i18n::t("Curve Editor"))
                 .open(&mut curve_open)
                 .default_size([600.0, 240.0])
                 .resizable(true)
