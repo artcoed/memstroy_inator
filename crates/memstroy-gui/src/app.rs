@@ -2330,6 +2330,25 @@ impl App {
         // (see `inspector_nothing` in panels.rs).
         let mut scene_for_render = self.state.scene.clone();
         scene_for_render.output.resolution = [1080, 1920];
+        // Sync `render_frame.resolution` alongside `output.resolution`.
+        // The canvas preview converts legacy `[0..1]` pos values via
+        // `pos * render_frame.resolution`; the renderer's
+        // `expr::build_element_transform` does the same conversion via
+        // `pos * output.resolution`. The inspector panel resets
+        // `rf.resolution = [1080, 1920]` on every draw (panels.rs
+        // `inspector_nothing`), but the render button doesn't pass
+        // through the inspector — so a scene loaded from disk (or built
+        // by a script) with `render_frame.resolution != [1080, 1920]`
+        // makes the two formulae compute DIFFERENT world coordinates
+        // for every overlay/actor, the export drifts off-frame, and
+        // the user sees the bug "итоговый рендер не совпадает с
+        // превью": the bg image and text disappear because their
+        // world position in the export is offset, while the actor
+        // (centred at `(0.5, 0.5)`) survives. `plan::build_plan` does
+        // the same canonicalisation defensively, but doing it here
+        // keeps the intent visible at the call site and protects any
+        // alternative codepath that doesn't go through `build_plan`.
+        scene_for_render.render_frame.resolution = [1080, 1920];
         // Stamp `z_order` on every actor and overlay from the editor's
         // timeline-track assignments. Without this the renderer falls
         // back to its legacy ordering (text-behind-actors → actors →
