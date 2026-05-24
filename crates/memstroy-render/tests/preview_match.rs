@@ -1339,3 +1339,212 @@ fn build_plan_keeps_scene_unchanged_when_resolutions_already_match() {
     let graph = build_filter_graph(&scene);
     assert!(graph.contains("*1080.0000)"), "expected matching out_w lowering: {graph}");
 }
+
+
+
+// ─── Render-frame camera parity (rewrite) ──────────────────────────
+//
+// The render-frame camera (rf.pos / rf.zoom / rf.rotation_deg + its
+// modifiers) is now baked into every element's per-overlay
+// X / Y / scale / rotate expressions, mirroring the snapshot
+// rasterizer's `world_to_output`. The previous build applied the
+// camera as a post-composite `pad → rotate → crop → scale` over a
+// fixed `W × H` buffer that didn't contain world content for
+// `rf.zoom < 1` or `rf.rotation_deg != 0` — producing transparent
+// corners and silently-clamped centre crops. The tests below pin
+// the new contract so any regression that re-introduces the
+// post-composite camera (or drops the per-element zoom / rotation)
+// flips a CI light immediately.
+
+#[test]
+fn render_frame_zoom_multiplies_per_element_scale() {
+    // When rf.zoom = 2.0 the rf rectangle covers half the world
+    // area, so every element should appear TWICE as big in the
+    // output (their scale is multiplied by rf.zoom). We assert the
+    // zoom value `2.000000` shows up in the actor's `scale=` filter
+    // — fingerprint of the per-element rf-zoom multiplication.
+    let mut scene = baseline_scene();
+    scene.render_frame.layout = vec![Keyframe::new(
+        0.0,
+        RenderFrameState {
+            pos: WorldPos { x: 540.0, y: 960.0 },
+            zoom: 2.0,
+            rotation_deg: 0.0,
+        },
+    )];
+    scene.actors.push(baseline_actor("a1"));
+
+    let graph = build_filter_graph(&scene);
+    // The scale filter must reference `2.000000` from the rf-zoom
+    // multiplier on the actor's scale_y / scale_x expression.
+    assert!(
+        graph.contains("scale=w='max(2,iw*") && graph.contains("2.000000"),
+        "rf.zoom=2 not folded into per-element scale filter:\n{graph}",
+    );
+}
+
+#[test]
+fn render_frame_zoom_below_one_widens_visible_world() {
+    // rf.zoom = 0.5 means the rf rectangle covers TWICE the world
+    // area, so elements should appear at HALF their authored size
+    // in the output. The post-composite camera's `min(iw, …)` clamp
+    // used to silently disable this case (the W×H composite buffer
+    // didn't extend past the rf rectangle), producing a cropped
+    // 1× output instead of the wider 0.5× crop the canvas shows.
+    // The new pipeline applies the zoom factor per-element so the
+    // export produces the wider view correctly.
+    let mut scene = baseline_scene();
+    scene.render_frame.layout = vec![Keyframe::new(
+        0.0,
+        RenderFrameState {
+            pos: WorldPos { x: 540.0, y: 960.0 },
+            zoom: 0.5,
+            rotation_deg: 0.0,
+        },
+    )];
+    scene.actors.push(baseline_actor("a1"));
+
+    let graph = build_filter_graph(&scene);
+    // The factor 0.5 must appear in the scale filter for the
+    // actor — fingerprint of the per-element rf-zoom path.
+    assert!(
+        graph.contains("0.500000"),
+        "rf.zoom=0.5 not folded into per-element scale:\n{graph}",
+    );
+    // The previous post-composite camera filter signature must NOT
+    // appear — the new pipeline doesn't crop the composite at all
+    // for the rf path (camera transform is per-element).
+    assert!(
+        !graph.contains("[rfcam"),
+        "post-composite rf-camera leaked back in:\n{graph}",
+    );
+    assert!(
+        !graph.contains("[rfpad"),
+        "post-composite rf-camera pad leaked back in:\n{graph}",
+    );
+}
+
+#[test]
+fn render_frame_rotation_emits_rotate_on_every_element() {
+    // When rf.rotation_deg != 0, the un-rotation `-rf.rotation_deg`
+    // must be folded into every element's rotation, which means a
+    // per-frame `rotate=` filter has to fire even on actors that
+    // have no per-frame rotation of their own. This is the
+    // counter-rotation that lands the rf-aligned content axis-
+    // aligned in the output.
+    let mut scene = baseline_scene();
+    scene.render_frame.layout = vec![Keyframe::new(
+        0.0,
+        RenderFrameState {
+            pos: WorldPos { x: 540.0, y: 960.0 },
+            zoom: 1.0,
+            rotation_deg: 30.0,
+        },
+    )];
+    scene.actors.push(baseline_actor("a1"));
+
+    let graph = build_filter_graph(&scene);
+    assert!(
+        graph.contains("rotate="),
+        "rf rotation didn't propagate to per-element rotate filter:\n{graph}",
+    );
+    // The hypot bbox must be present so the rotated frame doesn't
+    // get its corners clipped at the overlay boundary (this is
+    // already the convention the per-frame rotation path uses for
+    // animated layout rotations; we want the same shape here).
+    assert!(
+        graph.contains("hypot(iw"),
+        "rotate filter doesn't pad to hypot — corners will clip:\n{graph}",
+    );
+    // The rf rotation value (30.000000) must show up in the rotate
+    // expression, fingerprinting the per-element fold.
+    assert!(
+        graph.contains("30.000000"),
+        "rf.rotation_deg=30 not folded into per-element rotation:\n{graph}",
+    );
+}
+
+#[test]
+fn render_frame_camera_no_longer_runs_post_composite() {
+    // Regression: the new pipeline applies the rf camera per-element,
+    // so the post-composite `pad → rotate → crop → scale` pass that
+    // used to run over the `W × H` buffer must NOT fire any more.
+    // We assert the legacy labels never appear for an animated rf.
+    let mut scene = baseline_scene();
+    scene.render_frame.layout = vec![
+        Keyframe::new(0.0, RenderFrameState::default()),
+        Keyframe::new(
+            2.0,
+            RenderFrameState {
+                pos: WorldPos { x: 540.0, y: 960.0 },
+                zoom: 1.5,
+                rotation_deg: 20.0,
+            },
+        ),
+    ];
+    scene.actors.push(baseline_actor("a1"));
+
+    let graph = build_filter_graph(&scene);
+    assert!(
+        !graph.contains("[rfcam"),
+        "post-composite rf-camera filter leaked back in:\n{graph}",
+    );
+    assert!(
+        !graph.contains("[rfpad"),
+        "post-composite rf-camera pad leaked back in:\n{graph}",
+    );
+    assert!(
+        !graph.contains("[rfrot"),
+        "post-composite rf-camera rotate leaked back in:\n{graph}",
+    );
+}
+
+#[test]
+fn render_frame_modifier_pulse_animates_per_element_scale() {
+    // A Pulse modifier on the render-frame should animate the rf zoom
+    // and therefore animate every element's scale. The sine term must
+    // appear in the scale filter — fingerprint of rf-modifier
+    // propagation. Without this, rf modifiers visibly shake the
+    // outline in preview but the export stays static.
+    let mut scene = baseline_scene();
+    scene.render_frame.modifiers.push(TrackModifier {
+        enabled: true,
+        kind: ModifierKind::Pulse {
+            freq_hz: 3.0,
+            amp_scale: 0.2,
+        },
+        ..Default::default()
+    });
+    scene.actors.push(baseline_actor("a1"));
+
+    let graph = build_filter_graph(&scene);
+    // The amp_scale (0.2) and the sin() time term must appear inside
+    // a scale=… expression for the actor — proves the rf Pulse
+    // modifier has been folded into per-element scale.
+    assert!(
+        graph.contains("scale=w='max(2,iw*"),
+        "scale filter not present on actor:\n{graph}",
+    );
+    assert!(
+        graph.contains("sin(") && graph.contains("0.200000"),
+        "rf Pulse modifier (amp_scale=0.2 sin term) not threaded into per-element scale:\n{graph}",
+    );
+}
+
+#[test]
+fn default_render_frame_skips_zoom_rotate_fast_path() {
+    // The default render frame (single keyframe at default state, no
+    // modifiers) must NOT emit rf-camera arithmetic into the scale /
+    // rotate expressions — that's the fast path so the typical
+    // scene's filter-graph stays compact. The actor has no
+    // per-frame rotation either, so `rotate=` should not appear at
+    // all.
+    let mut scene = baseline_scene();
+    scene.actors.push(baseline_actor("a1"));
+
+    let graph = build_filter_graph(&scene);
+    assert!(
+        !graph.contains("rotate="),
+        "default rf shouldn't emit a rotate filter on a non-rotated actor:\n{graph}",
+    );
+}
