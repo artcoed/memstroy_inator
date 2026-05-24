@@ -716,6 +716,7 @@ pub(crate) fn add_library_asset_at_playhead(
                 effects: Vec::new(),
                 animated_params: Default::default(),
                 chroma_key: None,
+                z_order: 0,
             });
             state.scene.overlays.push(overlay);
             let new_idx = state.scene.overlays.len() - 1;
@@ -763,6 +764,7 @@ pub(crate) fn add_library_asset_at_playhead(
                 effects: Vec::new(),
                 animated_params: Default::default(),
                 chroma_key: None,
+                z_order: 0,
             });
             state.scene.overlays.push(overlay);
             let new_idx = state.scene.overlays.len() - 1;
@@ -12195,6 +12197,7 @@ pub fn add_text_overlay(state: &mut EditorState) -> usize {
         behind_actors: false,
         effects: Vec::new(),
         animated_params: Default::default(),
+        z_order: 0,
     });
 
     state.scene.overlays.push(overlay);
@@ -12254,6 +12257,7 @@ pub(crate) fn add_actor_from_clip_at_time(state: &mut EditorState, path: &PathBu
         effects: Vec::new(),
         speed: 1.0,
         animated_params: Default::default(),
+        z_order: 0,
     };
     state.scene.actors.push(actor);
     let new_actor_idx = state.scene.actors.len() - 1;
