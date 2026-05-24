@@ -1662,11 +1662,12 @@ impl<'a> FilterGraphBuilder<'a> {
 
         // Sub-graph layout (labels are fresh per call):
         //
-        //   [current]format=yuva420p,split=2[mainA][mainB];
-        //   [mainA]alphaextract[mainAlpha];
-        //   [mask_idx:v]format=gray[maskRaw];
-        //   [maskRaw][mainB]scale2ref=w=main_w:h=main_h[maskScaled][mainBp];
-        //   [mainAlpha][maskScaled]blend=all_mode=multiply:all_opacity=1[combined];
+        //   [current]format=yuva420p,fps={fps},setpts=PTS-STARTPTS,setsar=1,split=2[mainA][mainB];
+        //   [mainA]alphaextract,format=gray,fps={fps},setpts=PTS-STARTPTS,setsar=1[mainAlpha];
+        //   [mask_idx:v]format=gray,fps={fps},setpts=PTS-STARTPTS,setsar=1[maskRaw];
+        //   [maskRaw][mainB]scale2ref=w=main_w:h=main_h[maskScaledRaw][mainBp];
+        //   [maskScaledRaw]format=gray,fps={fps},setpts=PTS-STARTPTS,setsar=1[maskScaled];
+        //   [mainAlpha][maskScaled]blend=all_mode=multiply:all_opacity=1:shortest=0:repeatlast=1[combined];
         //   [mainBp][combined]alphamerge[masked]
         //
         // - `split` duplicates the main stream so we can both extract
@@ -1675,29 +1676,87 @@ impl<'a> FilterGraphBuilder<'a> {
         // - `scale2ref` resizes the mask PNG to the source's pixel
         //   dimensions; the mask is authored in UV space so any
         //   reference resolution works, and stretching gives a soft
-        //   anti-aliased edge that matches the GPU preview.
+        //   anti-aliased edge that matches the GPU preview. The
+        //   filter is deprecated in ffmpeg 7.0+ ("use scale=rw:rh
+        //   instead") but the replacement isn't available in older
+        //   builds we still support, so we keep it AND patch around
+        //   the framesync-init regression that came with the same
+        //   release. See below.
         // - `blend=multiply` combines the two alpha planes so the
         //   element's existing alpha (chromakey, prior masks) is
         //   preserved instead of being overwritten.
+        //
+        // Why the explicit `format/fps/setpts/setsar` belt around
+        // every link going into `blend` and `alphamerge`:
+        //
+        //   ffmpeg 7.0 tightened `framesync_configure()` (the helper
+        //   `blend` uses to pair its two inputs frame-by-frame). It
+        //   now refuses to initialise when the two inputs disagree on
+        //   timebase, sample-aspect-ratio, or frame-rate metadata —
+        //   conditions that fall out trivially when one input is a
+        //   looped still PNG (`-loop 1 -framerate fps -i mask.png`)
+        //   and the other is video-derived through `split` +
+        //   `alphaextract`. The user-facing symptom is a four-line
+        //   tombstone in stderr:
+        //
+        //       [Parsed_scale2ref_33] scale2ref is deprecated, use scale=rw:rh instead
+        //       [Parsed_blend_34] Failed to configure output pad on Parsed_blend_34
+        //       Error reinitializing filters!
+        //       Failed to inject frame into filter network: Invalid argument
+        //
+        //   …followed by the usual chain reaction (libx264 task -22,
+        //   AAC "Could not open encoder before EOF", `Lsize=0KiB`,
+        //   "Conversion failed!"). Pinning every blend/alphamerge
+        //   input to `gray @ {fps} fps, sar 1:1, PTS-STARTPTS` makes
+        //   `framesync_configure()` agree on a common axis again and
+        //   the graph initialises cleanly on every ffmpeg ≥ 4.x.
+        let fps = self.scene.output.fps;
         let main_a = self.alloc_label("maskMainA");
         let main_b = self.alloc_label("maskMainB");
         self.chunks.push(format!(
-            "{cur}format=yuva420p,split=2{a}{b}",
-            cur = current, a = main_a, b = main_b,
+            "{cur}format=yuva420p,fps={fps},setpts=PTS-STARTPTS,setsar=1,split=2{a}{b}",
+            cur = current, fps = fps, a = main_a, b = main_b,
         ));
         let main_alpha = self.alloc_label("maskMainAlpha");
-        self.chunks.push(format!("{a}alphaextract{aout}", a = main_a, aout = main_alpha));
+        self.chunks.push(format!(
+            "{a}alphaextract,format=gray,fps={fps},setpts=PTS-STARTPTS,setsar=1{aout}",
+            a = main_a, fps = fps, aout = main_alpha,
+        ));
         let mask_raw = self.alloc_label("maskRaw");
-        self.chunks.push(format!("[{idx}:v]format=gray{m}", idx = mask_idx, m = mask_raw));
+        self.chunks.push(format!(
+            "[{idx}:v]format=gray,fps={fps},setpts=PTS-STARTPTS,setsar=1{m}",
+            idx = mask_idx, fps = fps, m = mask_raw,
+        ));
+        // scale2ref pre-stage: produces a resized (but timing-naive)
+        // mask plus a passthrough of the reference. We immediately
+        // wrap the resized output in a fresh format/fps/setpts/setsar
+        // chain so it carries the same axis as `mainAlpha` going into
+        // `blend`. The passthrough mainBp is also re-stamped before
+        // it reaches alphamerge — alphamerge uses framesync too.
+        let mask_scaled_pre = self.alloc_label("maskScaledRaw");
+        let main_bp_pre = self.alloc_label("maskMainBpRaw");
+        self.chunks.push(format!(
+            "{m}{b}scale2ref=w=main_w:h=main_h{ms_pre}{bp_pre}",
+            m = mask_raw, b = main_b, ms_pre = mask_scaled_pre, bp_pre = main_bp_pre,
+        ));
         let mask_scaled = self.alloc_label("maskScaled");
+        self.chunks.push(format!(
+            "{ms_pre}format=gray,fps={fps},setpts=PTS-STARTPTS,setsar=1{ms}",
+            ms_pre = mask_scaled_pre, fps = fps, ms = mask_scaled,
+        ));
         let main_bp = self.alloc_label("maskMainBp");
         self.chunks.push(format!(
-            "{m}{b}scale2ref=w=main_w:h=main_h{ms}{bp}",
-            m = mask_raw, b = main_b, ms = mask_scaled, bp = main_bp,
+            "{bp_pre}fps={fps},setpts=PTS-STARTPTS,setsar=1{bp}",
+            bp_pre = main_bp_pre, fps = fps, bp = main_bp,
         ));
         let combined = self.alloc_label("maskCombined");
+        // `shortest=0:repeatlast=1` tells framesync to keep the still
+        // mask alive for the full duration of the video stream
+        // instead of bailing at the first "EOF" from the looped PNG
+        // input. Without this, on some ffmpeg builds the blend would
+        // emit a single frame and then silently shut down the chain.
         self.chunks.push(format!(
-            "{ma}{ms}blend=all_mode=multiply:all_opacity=1{c}",
+            "{ma}{ms}blend=all_mode=multiply:all_opacity=1:shortest=0:repeatlast=1{c}",
             ma = main_alpha, ms = mask_scaled, c = combined,
         ));
         let masked = self.alloc_label("masked");
