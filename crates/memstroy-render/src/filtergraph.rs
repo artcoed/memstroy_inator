@@ -59,7 +59,15 @@ impl<'a> FilterGraphBuilder<'a> {
 
     pub fn finish(self) -> (String, Vec<FfmpegInput>, String, Option<String>, Vec<PathBuf>) {
         let map_video = self.cursor.clone();
-        (self.chunks.join(";\n"), self.inputs, map_video, self.map_audio, self.mask_assets)
+        // Join with a bare `;` (no trailing `\n`) so the
+        // filter_complex string we hand to `Command::args` is a
+        // single physical line. Newlines inside the argument are
+        // legal but they confuse some Windows console tooling and
+        // make the diagnostic log less greppable; the renderer's
+        // tail-line buffer in `runner.rs` only keeps the last few
+        // lines of stderr, so a graph that spans 200 newlines used
+        // to push the actual error message off the visible window.
+        (self.chunks.join(";"), self.inputs, map_video, self.map_audio, self.mask_assets)
     }
 
     pub fn build(&mut self) -> Result<()> {
@@ -1290,10 +1298,80 @@ impl<'a> FilterGraphBuilder<'a> {
         if self.scene.audio.is_empty() {
             return Ok(());
         }
-        // For the first iteration we mix all audio inputs with amix.
+        // ── Audio pipeline ─────────────────────────────────────────
+        //
+        // The previous implementation wired every track straight into
+        // `amix=inputs=N:normalize=0` with nothing but a `volume` +
+        // `adelay`. ffmpeg's `amix` filter REQUIRES uniform sample
+        // rate, channel layout and sample format across all inputs —
+        // anything else aborts the *entire* filter graph at init time
+        // with "Invalid argument" (-22). When that happens both
+        // streams fail in lockstep:
+        //
+        //   * libx264 can't accept frames because its filtergraph
+        //     dependency died → `vost#0/libx264 Task finished with
+        //     error code: -22`,
+        //   * AAC never sees a sample → `aost#0/aac Could not open
+        //     encoder before EOF`,
+        //
+        // and ffmpeg writes the file with `Lsize=0KiB` and
+        // `frame=0` — the exact failure mode the user hit when
+        // mixing `416_2_audio_R` (extracted at 48 kHz) with
+        // `453_3_audio_R` (44.1 kHz). The fix is to normalise every
+        // track BEFORE amix and pin the post-mix bus once more so
+        // the AAC encoder sees a stable PCM stream regardless of how
+        // each source happens to have been encoded.
+        //
+        // The chain per track (in order) is:
+        //   1. `aresample` to a fixed sample rate so amix's mixers
+        //      align channel for channel.
+        //   2. `aformat` to lock sample format + layout (stereo).
+        //   3. `atrim=duration={clip_dur}` to cap the source at its
+        //      intended on-timeline length BEFORE we shift it into
+        //      place — otherwise a long source bleeds past `t_out`
+        //      and we lose control of the mix.
+        //   4. `asetpts=PTS-STARTPTS` to reset timestamps so adelay
+        //      treats clip-local time as zero.
+        //   5. `volume` (forced to 0 when `mute` is set).
+        //   6. `afade` for fade_in / fade_out (curves match the GUI
+        //      preview).
+        //   7. `adelay={t_in_ms}|...` to position on the scene
+        //      timeline.
+        //   8. `apad=whole_dur={scene_dur}` so the per-track chain
+        //      always reaches the end of the scene with silence;
+        //      this guarantees the AAC encoder receives at least one
+        //      frame to flush even when all sources end early.
+        //   9. `atrim=duration={scene_dur}` + `asetpts=PTS-STARTPTS`
+        //      caps the chain at the scene length so no track over-
+        //      shoots `-t` and trips the muxer.
+        //
+        // After the mix we apply one more `aformat` to nail the bus
+        // to the AAC encoder's expected layout (the `-ac 2 -ar 44100`
+        // output flags are belt-and-braces but only work if the
+        // filter actually delivers that format).
+        const SR: u32 = 44_100;
+        const FMT: &str = "fltp";
+        const LAYOUT: &str = "stereo";
+
+        let scene_dur = self.scene.output.duration.max(1.0 / 60.0);
+
         let mut audio_labels = Vec::new();
         for tr in &self.scene.audio {
             let path = self.resolve(&tr.source);
+            // Defence in depth: if the audio file went missing (user
+            // moved/deleted it after dropping it on the timeline) the
+            // filter `[idx:a]` reference would fail at graph init.
+            // Skip with a warning so the rest of the export still
+            // runs.
+            if !path.exists() {
+                tracing::warn!(
+                    track_id = %tr.id,
+                    path = %path.display(),
+                    "audio track source not found on disk; skipping",
+                );
+                continue;
+            }
+
             let idx = self.add_input(FfmpegInput {
                 path,
                 kind: InputKind::Audio,
@@ -1301,27 +1379,118 @@ impl<'a> FilterGraphBuilder<'a> {
                 seek: if tr.source_start > 0.0 { Some(tr.source_start) } else { None },
                 t: None,
             });
+
+            let t_in = tr.t_in.max(0.0).min(scene_dur);
+            let t_out = tr
+                .t_out
+                .unwrap_or(scene_dur)
+                .clamp(t_in, scene_dur);
+            let clip_dur = (t_out - t_in).max(1.0 / 60.0);
+
+            // Mute overrides the static volume completely — the GUI's
+            // M button is a hard mute, not a "remember the volume"
+            // switch.
+            let volume = if tr.mute { 0.0 } else { tr.volume.max(0.0) };
+
+            let mut filters: Vec<String> = Vec::with_capacity(10);
+            filters.push(format!("aresample={sr}", sr = SR));
+            filters.push(format!(
+                "aformat=sample_fmts={fmt}:sample_rates={sr}:channel_layouts={ch}",
+                fmt = FMT,
+                sr = SR,
+                ch = LAYOUT,
+            ));
+            filters.push(format!("atrim=duration={:.6}", clip_dur));
+            filters.push("asetpts=PTS-STARTPTS".into());
+            if tr.fade_in > 0.0 {
+                let fi = tr.fade_in.min(clip_dur);
+                if fi > 0.0 {
+                    filters.push(format!(
+                        "afade=t=in:st=0:d={:.6}:curve=tri",
+                        fi
+                    ));
+                }
+            }
+            if tr.fade_out > 0.0 {
+                let fo = tr.fade_out.min(clip_dur);
+                if fo > 0.0 {
+                    let st = (clip_dur - fo).max(0.0);
+                    filters.push(format!(
+                        "afade=t=out:st={:.6}:d={:.6}:curve=tri",
+                        st, fo
+                    ));
+                }
+            }
+            // `volume=1` is a no-op — skip emitting it to keep the
+            // graph string short for the common unmuted-default case.
+            if (volume - 1.0).abs() > 1e-4 {
+                filters.push(format!("volume={:.6}", volume));
+            }
+            let delay_ms = (t_in * 1000.0).round().max(0.0) as u64;
+            if delay_ms > 0 {
+                // `all=1` propagates the same delay to every channel
+                // even when the input layout disagrees with the per-
+                // channel list — robust against odd source layouts.
+                filters.push(format!("adelay={d}:all=1", d = delay_ms));
+            }
+            filters.push(format!("apad=whole_dur={:.6}", scene_dur));
+            filters.push(format!("atrim=duration={:.6}", scene_dur));
+            filters.push("asetpts=PTS-STARTPTS".into());
+
             let lbl = self.alloc_label("a");
             self.chunks.push(format!(
-                "[{idx}:a]volume={v},adelay={d}|{d}{out}",
+                "[{idx}:a]{filters}{out}",
                 idx = idx,
-                v = tr.volume,
-                d = (tr.t_in * 1000.0) as u64,
+                filters = filters.join(","),
                 out = lbl,
             ));
             audio_labels.push(lbl);
         }
+
         if audio_labels.is_empty() {
+            // All tracks were skipped (sources missing). Render
+            // proceeds without an audio stream — better than failing
+            // the whole encode for a single bad reference.
             return Ok(());
         }
-        let inputs = audio_labels.join("");
+
         let mix = self.alloc_label("amix");
-        self.chunks.push(format!(
-            "{inputs}amix=inputs={n}:normalize=0{out}",
-            inputs = inputs,
-            n = audio_labels.len(),
-            out = mix
-        ));
+        if audio_labels.len() == 1 {
+            // Single-track fast path: skip amix entirely and just
+            // re-pin the format. amix=inputs=1 also works but adds a
+            // pointless mix node and a normalize coefficient.
+            self.chunks.push(format!(
+                "{src}aformat=sample_fmts={fmt}:sample_rates={sr}:channel_layouts={ch}{out}",
+                src = audio_labels[0],
+                fmt = FMT,
+                sr = SR,
+                ch = LAYOUT,
+                out = mix,
+            ));
+        } else {
+            let inputs = audio_labels.join("");
+            let mixed = self.alloc_label("amixraw");
+            // `dropout_transition=0` keeps each input at full gain
+            // even after another input EOFs (with our apad above no
+            // input EOFs early anyway, but this stays safe in case a
+            // future change removes the pad). `normalize=0` matches
+            // the GUI preview's mixer where each track's static
+            // volume is preserved verbatim.
+            self.chunks.push(format!(
+                "{inputs}amix=inputs={n}:duration=longest:dropout_transition=0:normalize=0{out}",
+                inputs = inputs,
+                n = audio_labels.len(),
+                out = mixed,
+            ));
+            self.chunks.push(format!(
+                "{src}aformat=sample_fmts={fmt}:sample_rates={sr}:channel_layouts={ch}{out}",
+                src = mixed,
+                fmt = FMT,
+                sr = SR,
+                ch = LAYOUT,
+                out = mix,
+            ));
+        }
         self.map_audio = Some(mix);
         Ok(())
     }
