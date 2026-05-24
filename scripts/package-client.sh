@@ -173,6 +173,24 @@ mkdir -p "${BUNDLE_DIR}/examples"
 cp -p examples/*.yaml "${BUNDLE_DIR}/examples/" 2>/dev/null || true
 cp -p README.md "${BUNDLE_DIR}/" 2>/dev/null || true
 
+# ─── App icon ────────────────────────────────────────────────────────
+# The Linux installer (scripts/make-installer.sh) installs this PNG
+# under ${INSTALL_DIR}/share/icons/ and references it from the
+# generated .desktop file's `Icon=` line so the menu entry / desktop
+# shortcut display the branded logo. We also carry the .ico in case
+# the same bundle ever needs to be repackaged for Windows on a
+# non-Windows host.
+ICON_PNG_SRC="${ROOT_DIR}/assets/internal_images/catost.png"
+ICON_ICO_SRC="${ROOT_DIR}/assets/internal_images/catost.ico"
+if [[ -f "${ICON_PNG_SRC}" ]]; then
+    cp -p "${ICON_PNG_SRC}" "${BUNDLE_DIR}/catost.png"
+else
+    echo "warning: app icon not found at ${ICON_PNG_SRC}; menu entry will use the generic icon" >&2
+fi
+if [[ -f "${ICON_ICO_SRC}" ]]; then
+    cp -p "${ICON_ICO_SRC}" "${BUNDLE_DIR}/catost.ico"
+fi
+
 # ─── Top-level launcher ──────────────────────────────────────────────
 # The launcher no longer cd's into the bundle to find a local `assets/`
 # directory — there isn't one in client mode. The editor reads its
