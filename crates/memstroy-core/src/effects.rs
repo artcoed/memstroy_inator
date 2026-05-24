@@ -350,7 +350,7 @@ impl EffectKind {
             EffectKind::Bloom { .. } => "Bloom",
             EffectKind::Crop { .. } => "Crop",
             EffectKind::Mask { .. } => "Mask",
-            EffectKind::ColorKey { .. } => "Color key",
+            EffectKind::ColorKey { .. } => "Chroma Key",
         }
     }
 }

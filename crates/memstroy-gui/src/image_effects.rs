@@ -330,18 +330,19 @@ pub(crate) fn sample_mask_alpha(
 
 // ─── COLOUR-KEY MASK (eyedropper) ─────────────────────────────────────
 //
-// Mirrors `memstroy_vision::HsvChromaKey` in pure CPU code so the live
-// preview matches what the export pipeline produces. We keep the same
-// HSV similarity / blend semantics so a single picked colour produces
-// the same alpha map regardless of which renderer the user is looking
-// at. Spill suppression is NOT applied here — the preview's purpose
-// is to show the user where the key cuts; the export-side
-// `chromakey` filter already handles spill suppression downstream.
+// Mirrors FFmpeg's `chromakey` filter (BT.601 YCbCr distance) so the
+// canvas preview produces the alpha map the export pipeline will emit
+// pixel-for-pixel. The legacy HSV approximation drifted visibly from
+// the export — same root cause as the chroma-key preview/render
+// mismatch on Actor.chroma_key. Spill suppression is NOT applied here
+// — the preview's purpose is to show where the key cuts; the export-
+// side `chromakey` filter already handles spill suppression downstream.
 
 /// Apply a colour-key mask to an RGBA8 image in place. Pixels close
-/// to `key_color` (in HSV space) get their alpha multiplied by 0;
+/// to `key_color` (in YCbCr space) get their alpha multiplied by 0;
 /// pixels far from it keep their alpha. `similarity` and `blend`
-/// follow the same semantics as `HsvChromaKey`. `invert` flips the
+/// follow FFmpeg's `chromakey` semantics so the canvas preview
+/// matches the rendered output exactly. `invert` flips the
 /// keep / remove polarity. `intensity` blends between "no keying"
 /// and "full keying" so the master envelope can fade the effect in.
 pub(crate) fn apply_color_key_alpha(
@@ -357,69 +358,45 @@ pub(crate) fn apply_color_key_alpha(
 ) {
     if rgba.len() < (w as usize) * (h as usize) * 4 { return; }
     let i = intensity.clamp(0.0, 1.0);
-    let key_hsv = rgb_to_hsv_local(key_color);
-    let hue_tol_deg = 60.0 * similarity.clamp(0.0, 1.0);
-    let sv_tol = 0.5 * similarity.clamp(0.0, 1.0);
-    let blend = blend.clamp(0.0, 1.0);
+    // Mirror `chromakey_filter`'s "disabled below 1e-5" rule so a
+    // dialed-down ColorKey effect renders identically on both the
+    // preview and the export — the export emits a no-op `null`
+    // filter on that threshold, so the preview must do nothing too.
+    let similarity = if similarity.is_finite() { similarity.clamp(0.0, 1.0) } else { 0.0 };
+    let blend = if blend.is_finite() { blend.clamp(0.0, 1.0) } else { 0.0 };
+    if similarity < 1.0e-5 && !invert {
+        return;
+    }
+    let kr = key_color[0] as f32;
+    let kg = key_color[1] as f32;
+    let kb = key_color[2] as f32;
+    let key_cb = -0.169 * kr - 0.331 * kg + 0.500 * kb + 128.0;
+    let key_cr =  0.500 * kr - 0.419 * kg - 0.081 * kb + 128.0;
+    let dist_norm = 255.0 * std::f32::consts::SQRT_2;
     let total = (w as usize) * (h as usize);
     for px in 0..total {
         let idx = px * 4;
-        let r = rgba[idx];
-        let g = rgba[idx + 1];
-        let b = rgba[idx + 2];
-        let hsv = rgb_to_hsv_local([r, g, b]);
-        let dh = hue_distance_deg_local(hsv.0, key_hsv.0);
-        let ds = (hsv.1 - key_hsv.1).abs();
-        let dv = (hsv.2 - key_hsv.2).abs();
-        // Match HsvChromaKey alpha: 0 inside core, 1 outside,
-        // soft edge between core and core+blend.
-        let mut alpha_keep = 1.0_f32;
-        if dh < hue_tol_deg && ds < sv_tol && dv < sv_tol {
-            alpha_keep = 0.0;
-        } else if dh < hue_tol_deg + 360.0 * blend
-            && ds < sv_tol + blend
-            && dv < sv_tol + blend
-        {
-            let edge = ((dh - hue_tol_deg) / (360.0 * blend + f32::EPSILON))
-                .max((ds - sv_tol) / (blend + f32::EPSILON))
-                .max((dv - sv_tol) / (blend + f32::EPSILON));
-            alpha_keep = edge.clamp(0.0, 1.0);
-        }
+        let r = rgba[idx] as f32;
+        let g = rgba[idx + 1] as f32;
+        let b = rgba[idx + 2] as f32;
+        let cb = -0.169 * r - 0.331 * g + 0.500 * b + 128.0;
+        let cr =  0.500 * r - 0.419 * g - 0.081 * b + 128.0;
+        let du = cb - key_cb;
+        let dv = cr - key_cr;
+        let diff = (du * du + dv * dv).sqrt() / dist_norm;
+        let mut alpha_keep = if diff < similarity {
+            0.0
+        } else if blend > 0.0 && diff < similarity + blend {
+            ((diff - similarity) / blend).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
         if invert { alpha_keep = 1.0 - alpha_keep; }
         let orig = rgba[idx + 3] as f32;
         let target = orig * alpha_keep;
         let out = orig + (target - orig) * i;
         rgba[idx + 3] = out.clamp(0.0, 255.0) as u8;
     }
-}
-
-#[inline]
-fn rgb_to_hsv_local(rgb: [u8; 3]) -> (f32, f32, f32) {
-    let r = rgb[0] as f32 / 255.0;
-    let g = rgb[1] as f32 / 255.0;
-    let b = rgb[2] as f32 / 255.0;
-    let max = r.max(g).max(b);
-    let min = r.min(g).min(b);
-    let delta = max - min;
-    let h = if delta == 0.0 {
-        0.0
-    } else if max == r {
-        60.0 * (((g - b) / delta) % 6.0)
-    } else if max == g {
-        60.0 * ((b - r) / delta + 2.0)
-    } else {
-        60.0 * ((r - g) / delta + 4.0)
-    };
-    let h = if h < 0.0 { h + 360.0 } else { h };
-    let s = if max == 0.0 { 0.0 } else { delta / max };
-    let v = max;
-    (h, s, v)
-}
-
-#[inline]
-fn hue_distance_deg_local(a: f32, b: f32) -> f32 {
-    let d = (a - b).abs() % 360.0;
-    d.min(360.0 - d)
 }
 
 // ─── PIXEL OPS ──────────────────────────────────────────────────────
