@@ -68,6 +68,7 @@ fn baseline_actor(id: &str) -> Actor {
         effects: Vec::new(),
         speed: 1.0,
         animated_params: Default::default(),
+        z_order: 0,
     }
 }
 
@@ -308,6 +309,7 @@ fn image_overlay_inherits_full_pipeline() {
         effects: Vec::new(),
         animated_params: Default::default(),
         chroma_key: None,
+        z_order: 0,
     }));
 
     let graph = build_filter_graph(&scene);
@@ -520,6 +522,7 @@ fn skeleton_attachment_overrides_overlay_world_pos() {
         effects: Vec::new(),
         animated_params: Default::default(),
         chroma_key: None,
+        z_order: 0,
     }));
 
     let graph = build_filter_graph(&scene);
@@ -930,6 +933,7 @@ fn mask_alphamerge_pins_blend_inputs_to_common_axis() {
         })],
         animated_params: Default::default(),
         chroma_key: None,
+        z_order: 0,
     }));
 
     let graph = build_filter_graph(&scene);
@@ -977,5 +981,148 @@ fn mask_alphamerge_pins_blend_inputs_to_common_axis() {
     assert!(
         graph.contains("alphamerge"),
         "alphamerge filter missing — mask sub-graph broken:\n{graph}",
+    );
+}
+
+
+
+// ─── PR #71: per-element z_order parity with preview canvas ────────
+//
+// User report (verbatim, translated): "In the preview the Mellstroy
+// clips sit on top of the image, but after rendering only the image
+// is visible." Root cause: the renderer was emitting actors first and
+// image / video overlays unconditionally AFTER actors, regardless of
+// the timeline-track-derived z-order the preview canvas honours.
+// `Scene::*::z_order` (populated by `populate_render_z_order` in the
+// GUI from `*_track_assignments`) plus
+// `FilterGraphBuilder::emit_z_ordered_elements` interleaves them
+// correctly. The tests below pin both the new behaviour and the
+// legacy fallback so old saved scenes don't drift.
+
+#[test]
+fn image_overlay_with_lower_z_order_renders_below_actor() {
+    // Stacking the user expects:
+    //   * top track    → actor   → drawn LAST  (visible on top)
+    //   * bottom track → image   → drawn FIRST (background)
+    //
+    // GUI maps lower track index to higher z_order:
+    //   `populate_render_z_order` produces `z_order = -(track + 1)`,
+    //   so an actor on track 0 gets `-1` and an image on track 1
+    //   gets `-2`.
+    //
+    // The renderer's new single-pass `emit_z_ordered_elements`
+    // sorts ascending: image (`-2`) is emitted before actor (`-1`),
+    // which means ffmpeg sees the image's `-i` first (input slot 0)
+    // and the actor's `-i` second (slot 1). The actor's chain is
+    // the only one that uses `chromakey=`, so checking which input
+    // index that filter binds to is enough to lock the order.
+    let mut scene = baseline_scene();
+    let mut actor = baseline_actor("hero");
+    actor.z_order = -1; // top track
+    scene.actors.push(actor);
+
+    scene.overlays.push(Overlay::Image(ImageOverlay {
+        id: "bg_img".into(),
+        source: PathBuf::from("img.png"),
+        t_in: 0.0,
+        t_out: 2.0,
+        layout: vec![Keyframe::new(0.0, OverlayState::default())],
+        modifiers: Vec::new(),
+        skeleton_attachment: None,
+        effects: Vec::new(),
+        animated_params: Default::default(),
+        chroma_key: None,
+        z_order: -2, // bottom track
+    }));
+
+    let graph = build_filter_graph(&scene);
+
+    // The actor (chromakey'd input) must be slot 1, NOT slot 0 — slot
+    // 0 belongs to the lower-z_order image overlay that gets emitted
+    // first now.
+    assert!(
+        graph.contains("[1:v]chromakey="),
+        "actor's chromakey filter is not bound to ffmpeg input slot 1 — \
+         lower-z_order image should have claimed slot 0 first:\n{graph}",
+    );
+    assert!(
+        !graph.contains("[0:v]chromakey="),
+        "actor was emitted FIRST (slot 0); the image with z_order=-2 \
+         should have been emitted before it:\n{graph}",
+    );
+}
+
+#[test]
+fn image_overlay_with_higher_z_order_renders_above_actor() {
+    // Inverse case: image authored on a track ABOVE the actor (lower
+    // track index) must end up drawn LAST (visually on top of the
+    // actor) — exactly what the preview shows when the user puts an
+    // overlay sticker on V0 with a Mellstroy clip on V1.
+    //
+    //   actor on track 1 → z_order = -2 (drawn first, behind)
+    //   image on track 0 → z_order = -1 (drawn last, on top)
+    let mut scene = baseline_scene();
+    let mut actor = baseline_actor("hero");
+    actor.z_order = -2; // bottom track
+    scene.actors.push(actor);
+
+    scene.overlays.push(Overlay::Image(ImageOverlay {
+        id: "sticker".into(),
+        source: PathBuf::from("sticker.png"),
+        t_in: 0.0,
+        t_out: 2.0,
+        layout: vec![Keyframe::new(0.0, OverlayState::default())],
+        modifiers: Vec::new(),
+        skeleton_attachment: None,
+        effects: Vec::new(),
+        animated_params: Default::default(),
+        chroma_key: None,
+        z_order: -1, // top track
+    }));
+
+    let graph = build_filter_graph(&scene);
+
+    // Actor emitted first → slot 0; image emitted second → slot 1.
+    assert!(
+        graph.contains("[0:v]chromakey="),
+        "actor with z_order=-2 should be emitted FIRST (slot 0):\n{graph}",
+    );
+    assert!(
+        !graph.contains("[1:v]chromakey="),
+        "actor input must NOT be at slot 1; that slot belongs to the \
+         higher-z_order image:\n{graph}",
+    );
+}
+
+#[test]
+fn legacy_zero_z_order_keeps_old_actor_then_overlay_ordering() {
+    // Backward-compat lock: when no element has a non-zero z_order
+    // (the case for any project saved before the field existed, and
+    // for every scripting.rs-built scene), the renderer must NOT
+    // start interleaving — it has to keep the historical
+    // "actors first, image/video overlays second" order so old
+    // exports look identical.
+    let mut scene = baseline_scene();
+    scene.actors.push(baseline_actor("hero"));
+    scene.overlays.push(Overlay::Image(ImageOverlay {
+        id: "img".into(),
+        source: PathBuf::from("legacy.png"),
+        t_in: 0.0,
+        t_out: 2.0,
+        layout: vec![Keyframe::new(0.0, OverlayState::default())],
+        modifiers: Vec::new(),
+        skeleton_attachment: None,
+        effects: Vec::new(),
+        animated_params: Default::default(),
+        chroma_key: None,
+        z_order: 0,
+    }));
+
+    let graph = build_filter_graph(&scene);
+
+    // Actor first → slot 0, image second → slot 1.
+    assert!(
+        graph.contains("[0:v]chromakey="),
+        "legacy fallback should keep actor at slot 0:\n{graph}",
     );
 }

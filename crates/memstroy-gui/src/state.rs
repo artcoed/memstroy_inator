@@ -2268,6 +2268,7 @@ impl EditorState {
             effects: Vec::new(),
             animated_params: Default::default(),
             chroma_key: None,
+            z_order: 0,
         });
         self.last_drag_group = None;
         self.undo.push(&self.scene);

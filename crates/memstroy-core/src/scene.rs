@@ -544,6 +544,17 @@ pub struct Actor {
     /// `layout` (single static value). Empty for fresh actors.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub animated_params: BTreeSet<String>,
+    /// **Stacking order at render time.** Lower value = drawn earlier =
+    /// visually behind; higher value = drawn later = visually on top.
+    /// Populated by the GUI from the element's video-track row position
+    /// (lower track index = on top → higher `z_order`) right before the
+    /// scene is handed to the renderer, so the exported MP4 layers
+    /// actors and overlays in the same order the preview canvas shows.
+    /// Defaults to `0` for legacy scenes / scripts; the renderer falls
+    /// back to its old "actors between behind-actors-text and
+    /// everything-else-on-top" rule when ALL elements have z_order == 0.
+    #[serde(default)]
+    pub z_order: i32,
 }
 
 fn default_true() -> bool { true }
@@ -899,6 +910,12 @@ pub struct TextOverlay {
     /// **Animated parameter set** — see Actor::animated_params.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub animated_params: BTreeSet<String>,
+    /// **Stacking order at render time.** See `Actor::z_order` — same
+    /// semantics. The legacy `behind_actors` flag and `z_index` value
+    /// are kept for backward compatibility with old saved scenes; when
+    /// the GUI populates `z_order` on a fresh render it takes precedence.
+    #[serde(default)]
+    pub z_order: i32,
 }
 
 fn default_text_z() -> i32 { 100 }
@@ -1054,6 +1071,9 @@ pub struct ImageOverlay {
     /// means no keying (default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chroma_key: Option<ChromaKeyParams>,
+    /// **Stacking order at render time.** See `Actor::z_order`.
+    #[serde(default)]
+    pub z_order: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1087,6 +1107,9 @@ pub struct VideoOverlay {
     /// **Animated parameter set** — see Actor::animated_params.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub animated_params: BTreeSet<String>,
+    /// **Stacking order at render time.** See `Actor::z_order`.
+    #[serde(default)]
+    pub z_order: i32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]

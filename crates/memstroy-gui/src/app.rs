@@ -2330,6 +2330,14 @@ impl App {
         // (see `inspector_nothing` in panels.rs).
         let mut scene_for_render = self.state.scene.clone();
         scene_for_render.output.resolution = [1080, 1920];
+        // Stamp `z_order` on every actor and overlay from the editor's
+        // timeline-track assignments. Without this the renderer falls
+        // back to its legacy ordering (text-behind-actors → actors →
+        // image/video on top), which silently drops Mellstroy clips
+        // BEHIND any image overlay that happens to live on a lower
+        // track even though the preview correctly draws the clip on
+        // top. See `populate_render_z_order` for the full mapping.
+        crate::jobs::populate_render_z_order(&self.state, &mut scene_for_render);
         spawn_render(
             self.rt.handle(),
             self.tx.clone(),
@@ -3225,6 +3233,7 @@ impl eframe::App for App {
                         effects: Vec::new(),
                         animated_params: Default::default(),
                         chroma_key: None,
+                        z_order: 0,
                     });
                     self.state.scene.overlays.push(overlay);
                     let new_idx = self.state.scene.overlays.len() - 1;

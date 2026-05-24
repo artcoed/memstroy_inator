@@ -265,6 +265,7 @@ fn starter_scene() -> Scene {
         behind_actors: false,
         effects: Vec::new(),
         animated_params: Default::default(),
+        z_order: 0,
     });
     Scene {
         format_version: 1,
