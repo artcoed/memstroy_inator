@@ -378,15 +378,40 @@ where
 
     // ── Render-frame expressions ─────────────────────────────────────
     //
-    // Only `rf.pos` (with its modifier offsets) feeds the camera-
-    // centring step below. `rf.zoom` and `rf.rotation_deg` are now
-    // applied EXCLUSIVELY by the `emit_render_frame_camera` pass on
-    // the composite — they no longer leak into element world
-    // positions because every overlay / actor uses the v2 decoupled
-    // formula (see `Scene::migrate_decouple_render_frame`).
+    // The render frame is a moveable / scalable / rotatable rectangle
+    // on the world canvas; its contents become the rendered output.
+    // To match the canvas preview and the `frame_snapshot` rasterizer
+    // (the gold reference: see `frame_snapshot::world_to_output`) we
+    // bake the FULL render-frame camera transform into every
+    // element's overlay placement here:
+    //
+    //   1. translate the element by `-rf.pos` so the rf centre lands
+    //      at world origin,
+    //   2. rotate the result by `-rf.rotation_deg` so the rf becomes
+    //      axis-aligned with the output,
+    //   3. multiply by `rf.zoom` so the rf rectangle covers the
+    //      output's `W × H`,
+    //   4. translate by `(W/2, H/2)` so the rf centre is the output
+    //      centre.
+    //
+    // The same `rf.zoom` factor is applied to every element's scale
+    // (so the elements shrink/grow when the user zooms the rf), and
+    // `-rf.rotation_deg` is added to every element's rotation (so the
+    // elements counter-rotate to land axis-aligned in the output).
+    //
+    // Doing this per-element makes the post-composite camera pass
+    // (the old `emit_render_frame_camera`) redundant — and that's
+    // important because the post-composite pass operated on a fixed
+    // `W × H` buffer that simply doesn't contain world content for
+    // `rf.zoom < 1` or `rf.rotation_deg != 0`. The previous behaviour
+    // produced transparent corners on rotated rfs and clamped zoomed-
+    // out rfs to the centre crop — i.e. the user-visible bug "render
+    // doesn't match the canvas selection area at all".
     let rf = &scene.render_frame;
     let rf_pos_x_kf = piecewise(&rf.layout, |s: &RenderFrameState| s.pos.x);
     let rf_pos_y_kf = piecewise(&rf.layout, |s: &RenderFrameState| s.pos.y);
+    let rf_zoom_kf = piecewise(&rf.layout, |s: &RenderFrameState| s.zoom);
+    let rf_rot_deg_kf = piecewise(&rf.layout, |s: &RenderFrameState| s.rotation_deg);
     let rf_mods = build_modifier_expr(&rf.modifiers, 0.0);
     let rf_pos_x = if rf_mods.dx_is_zero() {
         rf_pos_x_kf.clone()
@@ -398,6 +423,41 @@ where
     } else {
         format!("(({})+({}))", rf_pos_y_kf, rf_mods.dy)
     };
+    // RF rotation modifier (Spin / Wobble / Walk drot) layered on top
+    // of the eased keyframe sample, in degrees — same convention as
+    // `frame_snapshot::sample_render_frame_eased`.
+    let rf_rot_deg_eased = if rf_mods.drot_is_zero() {
+        rf_rot_deg_kf.clone()
+    } else {
+        format!("(({})+({}))", rf_rot_deg_kf, rf_mods.drot_deg)
+    };
+    // RF zoom modifier (Pulse): the snapshot computes
+    //     zoom_eased = zoom / max(1e-3, 1 + d_scale)
+    // so a positive `d_scale` zooms OUT (covers more world area). We
+    // mirror that exactly.
+    let rf_zoom_eased = if rf_mods.dscale_is_zero() {
+        rf_zoom_kf.clone()
+    } else {
+        format!(
+            "(({})/(max(0.001,1+({}))))",
+            rf_zoom_kf, rf_mods.dscale,
+        )
+    };
+
+    // Detect whether the rf camera is the static identity transform
+    // (default RenderFrame, no animation, no modifiers). The fast
+    // path skips the cos/sin terms and the zoom multiplier so the
+    // typical scene's filter-graph stays compact.
+    let rf_zoom_is_one = rf
+        .layout
+        .iter()
+        .all(|kf| (kf.value.zoom - 1.0).abs() < 1.0e-4)
+        && rf_mods.dscale_is_zero();
+    let rf_rot_is_zero = rf
+        .layout
+        .iter()
+        .all(|kf| kf.value.rotation_deg.abs() < 1.0e-3)
+        && rf_mods.drot_is_zero();
 
     // ── World position priority: skeleton → canvas_layouts → legacy ─
     let canvas_layout = scene
@@ -457,54 +517,122 @@ where
         format!("(({})+({}))", world_y, mods.dy)
     };
 
-    // ── World → output canvas: composite is centred at render_frame.pos ─
-    // The existing `emit_render_frame_camera` does a centre crop +
-    // scale based on `rf.zoom` / `rf.rotation_deg`, which matches a
-    // composite whose centre IS render_frame.pos. So we bake the
-    // translation into overlay X/Y here and leave zoom/rotation to
-    // the camera pass — exactly how the preview decomposes the
-    // problem.
-    let centre_x_expr = format!(
-        "(({wx})-({rfx})+{half_w:.4})",
-        wx = world_x,
-        rfx = rf_pos_x,
-        half_w = half_w,
-    );
-    let centre_y_expr = format!(
-        "(({wy})-({rfy})+{half_h:.4})",
-        wy = world_y,
-        rfy = rf_pos_y,
-        half_h = half_h,
-    );
+    // ── World → output canvas: full render-frame camera transform ───
+    //
+    // Mirrors `frame_snapshot::world_to_output` exactly so the export
+    // composes elements at the same output coordinates the snapshot
+    // (and the canvas preview) puts them at.
+    //
+    //     dx = world_x - rf.pos.x
+    //     dy = world_y - rf.pos.y
+    //     theta = -rf.rotation_deg                  (we un-rotate world)
+    //     rx = dx * cos(theta) - dy * sin(theta)
+    //     ry = dx * sin(theta) + dy * cos(theta)
+    //     centre_x = W/2 + rx * rf.zoom
+    //     centre_y = H/2 + ry * rf.zoom
+    //
+    // Plus per-element scale `*= rf.zoom` and per-element rotation
+    // `-= rf.rotation_deg` further down, so each element renders into
+    // the output as if photographed by the rf camera.
+    let dx_expr = format!("(({wx})-({rfx}))", wx = world_x, rfx = rf_pos_x);
+    let dy_expr = format!("(({wy})-({rfy}))", wy = world_y, rfy = rf_pos_y);
+
+    // Apply the inverse rotation of the rf so its rectangle becomes
+    // axis-aligned with the output. The fast path skips cos/sin when
+    // the rf is never rotated.
+    let (rx_expr, ry_expr) = if rf_rot_is_zero {
+        (dx_expr.clone(), dy_expr.clone())
+    } else {
+        // theta = -rf_rotation_deg in radians; we expand this once
+        // here so the resulting expression's cos/sin appear with
+        // their natural ffmpeg-readable form (`cos(-X)` parses fine).
+        let theta_rad = format!("((-({}))*PI/180)", rf_rot_deg_eased);
+        let cos_t = format!("cos({})", theta_rad);
+        let sin_t = format!("sin({})", theta_rad);
+        let rx = format!(
+            "(({dx})*({cs})-({dy})*({sn}))",
+            dx = dx_expr,
+            dy = dy_expr,
+            cs = cos_t,
+            sn = sin_t,
+        );
+        let ry = format!(
+            "(({dx})*({sn})+({dy})*({cs}))",
+            dx = dx_expr,
+            dy = dy_expr,
+            cs = cos_t,
+            sn = sin_t,
+        );
+        (rx, ry)
+    };
+
+    // Scale the offset by the rf zoom (so a zoom-out rf shows a
+    // larger area of the world inside the same output rectangle, and
+    // a zoom-in rf shows a smaller area).
+    let (zx_expr, zy_expr) = if rf_zoom_is_one {
+        (rx_expr, ry_expr)
+    } else {
+        (
+            format!("(({})*({}))", rx_expr, rf_zoom_eased),
+            format!("(({})*({}))", ry_expr, rf_zoom_eased),
+        )
+    };
+
+    let centre_x_expr = format!("(({rx})+{half_w:.4})", rx = zx_expr, half_w = half_w);
+    let centre_y_expr = format!("(({ry})+{half_h:.4})", ry = zy_expr, half_h = half_h);
     let x_expr = format!("({})-w/2", centre_x_expr);
     let y_expr = format!("({})-h/2", centre_y_expr);
 
     // ── Scale (with Pulse modifier added, scale_y multiplied) ────────
+    //
+    // The rf camera's zoom factor multiplies every element's scale
+    // so the element shrinks/grows in lock-step with the rf
+    // (matches `frame_snapshot::paint_actor`'s
+    // `out_w = src_w * scale * zoom`).
     let scale_base = piecewise(legacy_layout, |s: &S| s.scale());
     let scale_y_factor = piecewise(legacy_layout, |s: &S| s.scale_y());
-    let sx_expr = if mods.dscale_is_zero() {
+    let sx_base = if mods.dscale_is_zero() {
         scale_base.clone()
     } else {
         format!("(({})+({}))", scale_base, mods.dscale)
     };
-    let sy_expr = if mods.dscale_is_zero() {
+    let sy_base = if mods.dscale_is_zero() {
         format!("({})*({})", scale_base, scale_y_factor)
     } else {
         format!("(({})+({}))*({})", scale_base, mods.dscale, scale_y_factor)
     };
+    let sx_expr = if rf_zoom_is_one {
+        sx_base
+    } else {
+        format!("(({})*({}))", sx_base, rf_zoom_eased)
+    };
+    let sy_expr = if rf_zoom_is_one {
+        sy_base
+    } else {
+        format!("(({})*({}))", sy_base, rf_zoom_eased)
+    };
 
     // ── Rotation — combine layout + Spin / Wobble / Walk drot ────────
+    //
+    // Plus `-rf.rotation_deg` so the element counter-rotates with the
+    // un-rotated rf, mirroring `frame_snapshot`'s
+    // `rotation_rad = (layout.rotation_deg - rf_state.rotation_deg).to_radians()`.
     let rot_deg_layout = piecewise(legacy_layout, |s: &S| s.rotation_deg());
     let layout_has_rot = legacy_layout
         .iter()
         .any(|kf| kf.value.rotation_deg().abs() > 0.05);
-    let rot_expr = if layout_has_rot || !mods.drot_is_zero() {
-        let rot_deg_total = if mods.drot_is_zero() {
+    let rot_expr = if layout_has_rot || !mods.drot_is_zero() || !rf_rot_is_zero {
+        let elem_rot_deg = if mods.drot_is_zero() {
             rot_deg_layout
         } else {
             format!("(({})+({}))", rot_deg_layout, mods.drot_deg)
         };
-        Some(format!("(({})*PI/180)", rot_deg_total))
+        let total_deg = if rf_rot_is_zero {
+            elem_rot_deg
+        } else {
+            format!("(({})-({}))", elem_rot_deg, rf_rot_deg_eased)
+        };
+        Some(format!("(({})*PI/180)", total_deg))
     } else {
         None
     };
