@@ -6,6 +6,47 @@ use memstroy_vision::pose::load_anchor_track;
 
 use crate::plan::{FfmpegInput, InputKind};
 
+/// Format a `chromakey=...` filter snippet from a [`ChromaKeyParams`].
+///
+/// FFmpeg's `chromakey` filter requires `similarity ∈ [1e-5, 1]` —
+/// passing zero or anything finer crashes the filter with
+/// `Error applying option 'similarity' to filter 'chromakey':
+/// Result too large | Value 0.000000 for parameter 'similarity'
+/// out of range [1e-05 - 1]`, which is exactly the export error
+/// the user hit when zeroing the chromakey sliders. We mirror
+/// FFmpeg's contract here:
+///
+/// * `similarity < 1e-5` (or non-finite) → return `None` so the
+///   caller skips the filter entirely (chromakey disabled).
+/// * Otherwise both `similarity` and `blend` are clamped to FFmpeg's
+///   accepted ranges before we format them.
+///
+/// Named-argument form (`color=`/`similarity=`/`blend=`) keeps the
+/// per-segment animation path's `:enable=...` suffix unambiguous,
+/// matching the form already used by the `EffectKind::ColorKey`
+/// emission below.
+fn chromakey_filter(ck: &ChromaKeyParams) -> Option<String> {
+    if !ck.similarity.is_finite() || ck.similarity < 1.0e-5 {
+        return None;
+    }
+    let sim = ck.similarity.clamp(1.0e-5, 1.0);
+    let blend = if ck.blend.is_finite() {
+        ck.blend.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let key_hex = format!(
+        "0x{:02X}{:02X}{:02X}",
+        ck.key_color[0], ck.key_color[1], ck.key_color[2],
+    );
+    Some(format!(
+        "chromakey=color={hex}:similarity={sim:.6}:blend={blend:.6}",
+        hex = key_hex,
+        sim = sim,
+        blend = blend,
+    ))
+}
+
 /// Translates a [`Scene`] into an FFmpeg `filter_complex` graph.
 ///
 /// Strategy:
@@ -463,8 +504,6 @@ impl<'a> FilterGraphBuilder<'a> {
                 t: None,
             });
 
-            let key = actor.chroma_key.key_color;
-            let key_hex = format!("0x{:02X}{:02X}{:02X}", key[0], key[1], key[2]);
             // Build the full preview-faithful transform: skeleton
             // attachments (when bound) override world position; then
             // canvas_layouts, then legacy normalised; render_frame
@@ -540,13 +579,22 @@ impl<'a> FilterGraphBuilder<'a> {
                 //   1) chromakey/format/hflip + CC up to a labelled stage,
                 //   2) the user effect stack (handles mask boundaries),
                 //   3) speed + layout scale + per-frame rotate/alpha.
-                let mut prefix = format!(
-                    "[{idx}:v]chromakey={hex}:{sim}:{blend},format=yuva420p",
-                    idx = idx,
-                    hex = key_hex,
-                    sim = actor.chroma_key.similarity,
-                    blend = actor.chroma_key.blend,
-                );
+                //
+                // `chromakey_filter` returns `None` when `similarity`
+                // is effectively zero — that's the user's "disable
+                // keying" signal and also FFmpeg's hard limit (the
+                // filter rejects values < 1e-5). When it's `None` we
+                // simply omit the `chromakey=` segment and feed the
+                // raw input straight into `format=yuva420p`.
+                let ck_part = chromakey_filter(&actor.chroma_key);
+                let mut prefix = match &ck_part {
+                    Some(ck) => format!(
+                        "[{idx}:v]{ck},format=yuva420p",
+                        idx = idx,
+                        ck = ck,
+                    ),
+                    None => format!("[{idx}:v]format=yuva420p", idx = idx),
+                };
                 if want_hflip {
                     prefix.push_str(",hflip");
                 }
@@ -590,14 +638,19 @@ impl<'a> FilterGraphBuilder<'a> {
             } else {
                 // Fast path — keep the historical single-chunk shape so
                 // the export trace stays compact for scenes without
-                // any masks.
-                let mut chain = format!(
-                    "[{idx}:v]chromakey={hex}:{sim}:{blend},format=yuva420p",
-                    idx = idx,
-                    hex = key_hex,
-                    sim = actor.chroma_key.similarity,
-                    blend = actor.chroma_key.blend,
-                );
+                // any masks. Same `chromakey_filter` contract: when
+                // similarity is effectively zero, the filter is
+                // omitted entirely instead of crashing FFmpeg with
+                // "Result too large".
+                let ck_part = chromakey_filter(&actor.chroma_key);
+                let mut chain = match &ck_part {
+                    Some(ck) => format!(
+                        "[{idx}:v]{ck},format=yuva420p",
+                        idx = idx,
+                        ck = ck,
+                    ),
+                    None => format!("[{idx}:v]format=yuva420p", idx = idx),
+                };
                 if want_hflip {
                     chain.push_str(",hflip");
                 }
@@ -1038,14 +1091,11 @@ impl<'a> FilterGraphBuilder<'a> {
         // colour with the eyedropper. Mirrors the `VideoOverlay` /
         // `Actor` pipelines so the same ChromaKeyParams produces the
         // same visual result regardless of which overlay flavour the
-        // user picked.
-        let chroma_part = ov.chroma_key.as_ref().map(|ck| {
-            let key_hex = format!(
-                "0x{:02X}{:02X}{:02X}",
-                ck.key_color[0], ck.key_color[1], ck.key_color[2]
-            );
-            format!("chromakey={}:{}:{}", key_hex, ck.similarity, ck.blend)
-        });
+        // user picked. Routes through the shared `chromakey_filter`
+        // helper so a zero-similarity entry skips the filter
+        // (instead of crashing FFmpeg) and the parameters are
+        // clamped to the filter's accepted range.
+        let chroma_part = ov.chroma_key.as_ref().and_then(chromakey_filter);
         let img_label = self.alloc_label("img");
 
         if effects_have_mask(&ov.effects) {
@@ -1161,13 +1211,7 @@ impl<'a> FilterGraphBuilder<'a> {
                 "video overlay opacity is keyframed; export uses per-frame `geq` alpha to mirror the preview",
             );
         }
-        let chroma_part = ov.chroma_key.as_ref().map(|ck| {
-            let key_hex = format!(
-                "0x{:02X}{:02X}{:02X}",
-                ck.key_color[0], ck.key_color[1], ck.key_color[2]
-            );
-            format!("chromakey={}:{}:{}", key_hex, ck.similarity, ck.blend)
-        });
+        let chroma_part = ov.chroma_key.as_ref().and_then(chromakey_filter);
         let speed = ov.speed.max(0.0001);
         let speed_part = if (speed - 1.0).abs() > 1.0e-4 {
             Some(format!("setpts=PTS/{:.6}", speed))
@@ -2543,7 +2587,7 @@ fn effect_to_filter(kind: &EffectKind, i: f32) -> Option<String> {
             )
         }
         K::ColorKey { color, similarity, blend, spill: _, invert } => {
-            // FFmpeg's `chromakey` filter does the same HSV-distance
+            // FFmpeg's `chromakey` filter does the same YUV-distance
             // alpha keying we run on the CPU preview side, so the
             // exported video matches the live editor frame exactly.
             // `intensity` (the master envelope) scales the similarity
@@ -2560,22 +2604,38 @@ fn effect_to_filter(kind: &EffectKind, i: f32) -> Option<String> {
             // is required so the per-segment animation path can append
             // `:enable='between(t,a,b)'` without the parser
             // mis-reading it as a fourth positional arg.
+            //
+            // Similarity is clamped to FFmpeg's accepted range
+            // [1e-5, 1] before formatting — values below that crash
+            // the filter with `Result too large`. When the user dials
+            // the slider all the way down (or `intensity` fades the
+            // distance to zero) we treat it as "effect disabled" and
+            // emit a no-op `null` filter instead so the effect
+            // chain stays valid.
+            let raw_sim = (similarity * i).clamp(0.0, 1.0);
+            if !raw_sim.is_finite() || raw_sim < 1.0e-5 {
+                return Some("null".to_string());
+            }
+            let sim = raw_sim.clamp(1.0e-5, 1.0);
+            let blend = if blend.is_finite() {
+                blend.clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
             let key_hex = format!(
                 "0x{:02X}{:02X}{:02X}",
                 color[0], color[1], color[2],
             );
-            let sim = (similarity * i).clamp(0.0, 1.0);
-            let blend = blend.clamp(0.0, 1.0);
             if *invert {
                 format!(
-                    "chromahold=color={hex}:similarity={sim:.4}:blend={blend:.4}",
+                    "chromahold=color={hex}:similarity={sim:.6}:blend={blend:.6}",
                     hex = key_hex,
                     sim = sim,
                     blend = blend,
                 )
             } else {
                 format!(
-                    "chromakey=color={hex}:similarity={sim:.4}:blend={blend:.4}",
+                    "chromakey=color={hex}:similarity={sim:.6}:blend={blend:.6}",
                     hex = key_hex,
                     sim = sim,
                     blend = blend,
