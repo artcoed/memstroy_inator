@@ -50,6 +50,13 @@ where
 /// `geq=` filter (geq's expression vocabulary only exposes the
 /// uppercase `T` for "frame time in seconds"). All other behaviour —
 /// easing, segment ordering, last-value clamp — is identical.
+///
+/// `var` may be any ffmpeg-side expression that evaluates to seconds,
+/// not just a single identifier — e.g. `(t-2.5)` to sample a
+/// clip-local layout against the scene-time `t`. The wrapper
+/// substitutes `var` literally everywhere the time variable appears,
+/// so the caller can mix scene-time and clip-local samples in the
+/// same filter graph by passing different `var` strings.
 pub(crate) fn piecewise_in_var<T, F>(kfs: &[Keyframe<T>], getter: F, var: &str) -> String
 where
     F: Fn(&T) -> f32,
@@ -116,6 +123,60 @@ where
         );
     }
     expr
+}
+
+/// Time base for the keyframe layout passed to
+/// [`build_element_transform`].
+///
+/// This drives the time variable used inside `piecewise()` expressions
+/// for the legacy layout — it does NOT affect modifiers (which always
+/// use clip-local time) or the render-frame layout (always scene-time).
+///
+/// * [`LayoutTimeBase::Scene`] — keyframe `t` values are absolute
+///   scene-time. Used for `Actor.layout`, where the canvas preview
+///   calls `keyframe::sample(&actor.layout, t)` with the scene
+///   playhead `t` directly.
+/// * [`LayoutTimeBase::ClipLocal { t_in }`] — keyframe `t` values are
+///   clip-local seconds (`t - t_in`). Used for every `Overlay::*`
+///   layout, where the canvas preview computes `sample_t = t - t_in`
+///   before calling `keyframe::sample`. The renderer substitutes the
+///   ffmpeg time variable `t` with `(t - t_in)` so the resulting
+///   expression evaluates the layout at the right offset.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum LayoutTimeBase {
+    Scene,
+    ClipLocal { t_in: f32 },
+}
+
+impl LayoutTimeBase {
+    /// Build the ffmpeg time-variable expression callers feed into
+    /// `piecewise_in_var`. Returns a bare `t` for scene-time and
+    /// `(t-{t_in})` for clip-local layouts.
+    fn xy_var(&self) -> String {
+        match self {
+            LayoutTimeBase::Scene => "t".to_string(),
+            LayoutTimeBase::ClipLocal { t_in } => format!("(t-{:.6})", t_in),
+        }
+    }
+
+    /// Same as [`Self::xy_var`] but for the `geq=` filter, which only
+    /// understands uppercase `T` as the frame-time variable.
+    fn geq_var(&self) -> String {
+        match self {
+            LayoutTimeBase::Scene => "T".to_string(),
+            LayoutTimeBase::ClipLocal { t_in } => format!("(T-{:.6})", t_in),
+        }
+    }
+}
+
+/// Build a piecewise expression for a legacy-layout scalar against a
+/// configurable [`LayoutTimeBase`]. Convenience wrapper around
+/// [`piecewise_in_var`] that picks the right `var` string.
+fn piecewise_layout<T, F>(kfs: &[Keyframe<T>], getter: F, base: LayoutTimeBase) -> String
+where
+    F: Fn(&T) -> f32,
+{
+    piecewise_in_var(kfs, getter, &base.xy_var())
 }
 
 // ─── MODIFIER (Wobble / Shake / Pulse / Spin / Walk) ────────────────
@@ -361,6 +422,14 @@ pub(crate) struct ElementTransform {
 /// Scale / rotation / opacity / flips always come from `legacy_layout`
 /// (the canvas_layouts override only carries position, mirroring the
 /// preview where `get_element_world_pos` returns *only* `WorldPos`).
+///
+/// `layout_time_base` controls how the layout's keyframe times are
+/// interpreted. Actors store keyframes in scene-time and use
+/// [`LayoutTimeBase::Scene`]; overlays store keyframes in clip-local
+/// time and use [`LayoutTimeBase::ClipLocal { t_in }`]. Without this
+/// distinction every overlay animation in a clip whose `t_in > 0`
+/// rendered out-of-sync with the canvas preview (the preview samples
+/// at `t - t_in`, the renderer at `t`).
 pub(crate) fn build_element_transform<S>(
     scene: &Scene,
     element_id: &str,
@@ -368,6 +437,7 @@ pub(crate) fn build_element_transform<S>(
     modifiers: &[TrackModifier],
     t_in: f32,
     skeleton_attachment: Option<&SkeletonAttachment>,
+    layout_time_base: LayoutTimeBase,
 ) -> ElementTransform
 where
     S: PositionedState + Clone,
@@ -497,8 +567,8 @@ where
         //
         //     world_x(t) = pos_x(t) * out_w
         //     world_y(t) = pos_y(t) * out_h
-        let pos_x = piecewise(legacy_layout, |s: &S| s.pos()[0]);
-        let pos_y = piecewise(legacy_layout, |s: &S| s.pos()[1]);
+        let pos_x = piecewise_layout(legacy_layout, |s: &S| s.pos()[0], layout_time_base);
+        let pos_y = piecewise_layout(legacy_layout, |s: &S| s.pos()[1], layout_time_base);
         let wx = format!("(({px})*{W:.4})", px = pos_x, W = out_w as f32);
         let wy = format!("(({py})*{H:.4})", py = pos_y, H = out_h as f32);
         (wx, wy)
@@ -589,8 +659,8 @@ where
     // so the element shrinks/grows in lock-step with the rf
     // (matches `frame_snapshot::paint_actor`'s
     // `out_w = src_w * scale * zoom`).
-    let scale_base = piecewise(legacy_layout, |s: &S| s.scale());
-    let scale_y_factor = piecewise(legacy_layout, |s: &S| s.scale_y());
+    let scale_base = piecewise_layout(legacy_layout, |s: &S| s.scale(), layout_time_base);
+    let scale_y_factor = piecewise_layout(legacy_layout, |s: &S| s.scale_y(), layout_time_base);
     let sx_base = if mods.dscale_is_zero() {
         scale_base.clone()
     } else {
@@ -617,7 +687,7 @@ where
     // Plus `-rf.rotation_deg` so the element counter-rotates with the
     // un-rotated rf, mirroring `frame_snapshot`'s
     // `rotation_rad = (layout.rotation_deg - rf_state.rotation_deg).to_radians()`.
-    let rot_deg_layout = piecewise(legacy_layout, |s: &S| s.rotation_deg());
+    let rot_deg_layout = piecewise_layout(legacy_layout, |s: &S| s.rotation_deg(), layout_time_base);
     let layout_has_rot = legacy_layout
         .iter()
         .any(|kf| kf.value.rotation_deg().abs() > 0.05);
@@ -673,7 +743,7 @@ where
         .windows(2)
         .any(|w| (w[0].value.opacity() - w[1].value.opacity()).abs() > 1e-3);
     let opacity_expr_t =
-        piecewise_in_var(legacy_layout, |s: &S| s.opacity().clamp(0.0, 1.0), "T");
+        piecewise_in_var(legacy_layout, |s: &S| s.opacity().clamp(0.0, 1.0), &layout_time_base.geq_var());
 
     // ── Flip — static midpoint sample, same fallback the preview's
     //    canvas mesh path uses for the dominant side of an animation.

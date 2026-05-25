@@ -1,6 +1,6 @@
 # scripts/make-installer.ps1
 #
-# Build a Windows installer (.exe) for the memstroy-inator client
+# Build a Windows installer (.exe) for the Memstroy-inator client
 # bundle produced by `scripts/package-client.ps1`.
 #
 # Backend: Inno Setup. We generate an .iss script on the fly and feed
@@ -11,9 +11,9 @@
 # bundle changes; we just wrap it.
 #
 # What the produced installer does on the target machine (defaults):
-#   * Installs into "%ProgramFiles%\memstroy-inator" (admin) or
-#     "%LocalAppData%\Programs\memstroy-inator" (per-user).
-#   * Creates a Start Menu group "memstroy-inator" with the editor
+#   * Installs into "%ProgramFiles%\Memstroy-inator" (admin) or
+#     "%LocalAppData%\Programs\Memstroy-inator" (per-user).
+#   * Creates a Start Menu group "Memstroy-inator" with the editor
 #     and the uninstaller.
 #   * Creates a Desktop shortcut to the editor.
 #   * Registers an entry in Settings → Apps → Installed apps so it
@@ -23,11 +23,11 @@
 #   pwsh scripts/make-installer.ps1 -ServerUrl https://assets.example.com
 #
 #   # reuse an already-staged bundle (skips cargo build)
-#   pwsh scripts/make-installer.ps1 -BundleDir .\dist\memstroy-inator-windows-amd64-0.1.0
+#   pwsh scripts/make-installer.ps1 -BundleDir .\dist\Memstroy-inator-windows-amd64-0.1.0
 #
 #   # custom output dir / installer name / Inno Setup compiler path
 #   pwsh scripts/make-installer.ps1 -ServerUrl https://assets.example.com `
-#       -Out .\build -Name memstroy-inator-1.2.3 `
+#       -Out .\build -Name Memstroy-inator-1.2.3 `
 #       -IsccPath "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
 #
 # Required (one of):
@@ -87,7 +87,7 @@ if ([string]::IsNullOrWhiteSpace($BundleDir)) {
         | Select-Object -First 1).Matches[0].Groups[1].Value
     if ([string]::IsNullOrWhiteSpace($Version)) { $Version = "dev" }
     $Arch       = $env:PROCESSOR_ARCHITECTURE.ToLower()
-    $BundleName = "memstroy-inator-windows-$Arch-$Version"
+    $BundleName = "Memstroy-inator-windows-$Arch-$Version"
     $BundleDir  = Join-Path $RootDir "dist\$BundleName"
 }
 
@@ -176,8 +176,8 @@ $VersionInfoVersion = ($VersionParts[0..3]) -join '.'
 
 $Year            = (Get-Date).Year
 $AppId           = "{{B5A4F3A2-9A01-4E69-9E2E-MEMSTROYINATOR}}"  # stable GUID for upgrades
-$AppName         = "memstroy-inator"
-$AppPublisher    = "memstroy-inator contributors"
+$AppName         = "Memstroy-inator"
+$AppPublisher    = "Memstroy-inator contributors"
 $AppExeName      = "memstroy-gui.exe"
 $InstallerStem   = "$Name-Setup"
 $InstallerPath   = Join-Path $Out "$InstallerStem.exe"
@@ -193,7 +193,7 @@ $InstallerPath   = Join-Path $Out "$InstallerStem.exe"
 #     Inno Setup's stock `[Icons]` block; the uninstaller registration
 #     in Settings → Apps is automatic.
 $IssTemp = New-Item -ItemType Directory -Force `
-    -Path (Join-Path $env:TEMP "memstroy-inator-iss-$([System.Guid]::NewGuid().ToString('N'))")
+    -Path (Join-Path $env:TEMP "Memstroy-inator-iss-$([System.Guid]::NewGuid().ToString('N'))")
 $IssPath = Join-Path $IssTemp "installer.iss"
 
 $IssLines = @(
@@ -222,7 +222,7 @@ $IssLines = @(
     'PrivilegesRequired=lowest'
     'PrivilegesRequiredOverridesAllowed=dialog commandline'
     'ArchitecturesInstallIn64BitMode=x64'
-    'UninstallDisplayName=memstroy-inator'
+    'UninstallDisplayName=Memstroy-inator'
     $(if ($HasBundleIcon) {
         # Branded icon shipped in the bundle: point both the Setup.exe
         # itself (icon shown for the .exe in Explorer) and the
@@ -274,19 +274,19 @@ $IssLines = @(
         # Anchor every shortcut to {app}\catost.ico so the Start Menu
         # entry and Desktop shortcut survive a future change in how
         # the .exe carries (or doesn't carry) its embedded icon.
-        "Name: `"{group}\memstroy-inator`"; Filename: `"{app}\bin\$AppExeName`"; IconFilename: `"{app}\catost.ico`""
+        "Name: `"{group}\Memstroy-inator`"; Filename: `"{app}\bin\$AppExeName`"; IconFilename: `"{app}\catost.ico`""
     } else {
-        "Name: `"{group}\memstroy-inator`"; Filename: `"{app}\bin\$AppExeName`""
+        "Name: `"{group}\Memstroy-inator`"; Filename: `"{app}\bin\$AppExeName`""
     })
-    "Name: `"{group}\{cm:UninstallProgram,memstroy-inator}`"; Filename: `"{uninstallexe}`""
+    "Name: `"{group}\{cm:UninstallProgram,Memstroy-inator}`"; Filename: `"{uninstallexe}`""
     $(if ($HasBundleIcon) {
-        "Name: `"{autodesktop}\memstroy-inator`"; Filename: `"{app}\bin\$AppExeName`"; IconFilename: `"{app}\catost.ico`"; Tasks: desktopicon"
+        "Name: `"{autodesktop}\Memstroy-inator`"; Filename: `"{app}\bin\$AppExeName`"; IconFilename: `"{app}\catost.ico`"; Tasks: desktopicon"
     } else {
-        "Name: `"{autodesktop}\memstroy-inator`"; Filename: `"{app}\bin\$AppExeName`"; Tasks: desktopicon"
+        "Name: `"{autodesktop}\Memstroy-inator`"; Filename: `"{app}\bin\$AppExeName`"; Tasks: desktopicon"
     })
     ''
     '[Run]'
-    "Filename: `"{app}\bin\$AppExeName`"; Description: `"{cm:LaunchProgram,memstroy-inator}`"; Flags: nowait postinstall skipifsilent"
+    "Filename: `"{app}\bin\$AppExeName`"; Description: `"{cm:LaunchProgram,Memstroy-inator}`"; Flags: nowait postinstall skipifsilent"
 )
 [System.IO.File]::WriteAllLines($IssPath, $IssLines, (New-Object System.Text.UTF8Encoding $false))
 

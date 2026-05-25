@@ -19,7 +19,7 @@ const COL_ELEMENT_BORDER: Color32 = Color32::from_rgb(180, 180, 200);
 const COL_SELECTED_BORDER: Color32 = Color32::from_rgb(255, 220, 80);
 const COL_INACTIVE_TINT: Color32 = Color32::from_rgba_premultiplied(255, 255, 255, 100);
 const COL_OVERLAY_IMAGE: Color32 = Color32::from_rgb(100, 180, 255);
-const COL_OVERLAY_VIDEO: Color32 = Color32::from_rgb(200, 100, 255);
+const COL_OVERLAY_VIDEO: Color32 = Color32::from_rgb(255, 200, 80);
 const COL_BACKGROUND: Color32 = Color32::from_rgb(60, 130, 220);
 const COL_RENDER_FRAME_HANDLE: Color32 = Color32::from_rgb(255, 120, 120);
 const COL_ROTATION_HANDLE: Color32 = Color32::from_rgb(120, 220, 255);
@@ -144,14 +144,38 @@ pub fn canvas_preview(ui: &mut egui::Ui, state: &mut EditorState) {
         handle_mask_draw_input(ui, &response, state, full_rect, viewport_size);
     }
 
+    // ── Skeleton authoring — when the inspector's Skeleton tab is
+    //    active and the user has the matching video-layer element
+    //    selected, dragging on top of an existing skeleton point on
+    //    the canvas writes a keyframe at the current playhead. The
+    //    handler runs BEFORE `draw_canvas_elements` so it can short-
+    //    circuit `decide_drag_mode` and stop the click from also
+    //    moving the host actor.
+    let skeleton_drag_active =
+        handle_canvas_skeleton_input(ui, &response, state, full_rect, viewport_size);
+
     // ── Draw grid ──
     draw_canvas_grid(&painter, full_rect, &state.canvas_viewport, viewport_size);
 
     // ── Draw elements (actors, overlays) ──
     draw_canvas_elements(ui, &painter, full_rect, state, viewport_size);
 
+    // ── Draw skeleton-point overlay for the active video-layer
+    //    selection (when the inspector's Skeleton tab / section is
+    //    visible). Drawn AFTER elements so the markers sit on top of
+    //    the actor preview but BEFORE the gizmo so the rotation /
+    //    resize handles still appear above them.
+    draw_canvas_skeleton_overlay(ui, &painter, full_rect, state, viewport_size);
+
     // ── Draw element gizmo for selected ──
-    draw_selection_gizmo(ui, &painter, &response, full_rect, state, viewport_size);
+    // Skip the regular drag state machine while a skeleton-point drag
+    // owns the gesture so corner / resize handles don't fight the
+    // point drag.
+    if !skeleton_drag_active {
+        draw_selection_gizmo(ui, &painter, &response, full_rect, state, viewport_size);
+    } else {
+        draw_selection_handles(&painter, full_rect, state, viewport_size);
+    }
 
     // ── Draw multi-select outlines (every secondary entry in canvas_selection) ──
     draw_multi_selection_borders(&painter, full_rect, state, viewport_size);
@@ -1279,8 +1303,8 @@ fn draw_canvas_elements(
         if !frame_shown {
             // Placeholder rectangle
             let fill = match display_mode {
-                DisplayMode::Active => Color32::from_rgb(40, 40, 55),
-                _ => Color32::from_rgb(30, 30, 40),
+                DisplayMode::Active => Color32::from_rgb(44, 42, 28),
+                _ => Color32::from_rgb(32, 30, 20),
             };
             painter.rect_filled(elem_rect, Rounding::same(3.0), fill);
             painter.text(
@@ -3007,16 +3031,24 @@ fn apply_drag(
 
         CanvasDragMode::MoveActorLegacy { actor_idx, initial_pos } => {
             if actor_idx < state.scene.actors.len() {
+                // World-fixed dims — `pos` is interpreted against the
+                // resolution rectangle anchored at world (0, 0). The
+                // render frame is a pure CAMERA: editing rf.pos /
+                // rf.zoom never drags world-space elements (per
+                // `draw_canvas_overlays` / `get_element_world_pos`),
+                // so the drag math must match. Without this, dragging
+                // an element after moving the rf produced a snap-back
+                // jump because the inverse formula assumed a different
+                // anchor than the renderer.
                 let rf = &state.scene.render_frame;
-                let rf_state = sample_render_frame(rf, state.playhead);
                 let [rw, rh] = rf.resolution;
-                let world_w = rw as f32 / rf_state.zoom;
-                let world_h = rh as f32 / rf_state.zoom;
+                let world_w = rw as f32;
+                let world_h = rh as f32;
 
                 let proposed_norm_x = initial_pos[0] + world_dx / world_w;
                 let proposed_norm_y = initial_pos[1] + world_dy / world_h;
-                let world_x = rf_state.pos.x - world_w * 0.5 + proposed_norm_x * world_w;
-                let world_y = rf_state.pos.y - world_h * 0.5 + proposed_norm_y * world_h;
+                let world_x = proposed_norm_x * world_w;
+                let world_y = proposed_norm_y * world_h;
                 let (snapped_world_x, snapped_world_y, guides) = snap_world_center(
                     state,
                     world_x,
@@ -3027,10 +3059,8 @@ fn apply_drag(
                 set_selection_world_center(state, [snapped_world_x, snapped_world_y]);
                 // Broadcast snapped delta in world coords so non-primary
                 // elements track the primary's actual on-screen motion.
-                let prim_initial_world_x =
-                    rf_state.pos.x - world_w * 0.5 + initial_pos[0] * world_w;
-                let prim_initial_world_y =
-                    rf_state.pos.y - world_h * 0.5 + initial_pos[1] * world_h;
+                let prim_initial_world_x = initial_pos[0] * world_w;
+                let prim_initial_world_y = initial_pos[1] * world_h;
                 let total_dx = snapped_world_x - prim_initial_world_x;
                 let total_dy = snapped_world_y - prim_initial_world_y;
                 broadcast_multi_translation(state, total_dx, total_dy);
@@ -3039,17 +3069,17 @@ fn apply_drag(
 
         CanvasDragMode::MoveOverlay { overlay_idx, initial_pos } => {
             if overlay_idx < state.scene.overlays.len() {
+                // World-fixed dims — see `MoveActorLegacy` above.
                 let rf = &state.scene.render_frame;
-                let rf_state = sample_render_frame(rf, state.playhead);
                 let [rw, rh] = rf.resolution;
-                let world_w = rw as f32 / rf_state.zoom;
-                let world_h = rh as f32 / rf_state.zoom;
+                let world_w = rw as f32;
+                let world_h = rh as f32;
                 let dx_norm = world_dx / world_w;
                 let dy_norm = world_dy / world_h;
                 let proposed_norm_x = initial_pos[0] + dx_norm;
                 let proposed_norm_y = initial_pos[1] + dy_norm;
-                let world_x = rf_state.pos.x - world_w * 0.5 + proposed_norm_x * world_w;
-                let world_y = rf_state.pos.y - world_h * 0.5 + proposed_norm_y * world_h;
+                let world_x = proposed_norm_x * world_w;
+                let world_y = proposed_norm_y * world_h;
                 let (snapped_world_x, snapped_world_y, guides) = snap_world_center(
                     state,
                     world_x,
@@ -3059,10 +3089,8 @@ fn apply_drag(
                 state.canvas_drag.snap_guides = guides;
                 set_selection_world_center(state, [snapped_world_x, snapped_world_y]);
                 // Broadcast snapped world delta to other selected items.
-                let prim_initial_world_x =
-                    rf_state.pos.x - world_w * 0.5 + initial_pos[0] * world_w;
-                let prim_initial_world_y =
-                    rf_state.pos.y - world_h * 0.5 + initial_pos[1] * world_h;
+                let prim_initial_world_x = initial_pos[0] * world_w;
+                let prim_initial_world_y = initial_pos[1] * world_h;
                 let total_dx = snapped_world_x - prim_initial_world_x;
                 let total_dy = snapped_world_y - prim_initial_world_y;
                 broadcast_multi_translation(state, total_dx, total_dy);
@@ -4175,12 +4203,20 @@ fn overlay_clip_local_time_at(state: &EditorState, ov_idx: usize, scene_t: f32) 
 fn sniff_hit(state: &EditorState, pos: WorldPos) -> Option<Selection> {
     let t = state.playhead;
     let rf = &state.scene.render_frame;
-    let rf_state = sample_render_frame(rf, t);
     let [rw, rh] = rf.resolution;
-    let world_w = rw as f32 / rf_state.zoom;
-    let world_h = rh as f32 / rf_state.zoom;
-    let frame_tl_x = rf_state.pos.x - world_w * 0.5;
-    let frame_tl_y = rf_state.pos.y - world_h * 0.5;
+    // ── World-fixed dims for overlay / actor hit-tests ──
+    //
+    // Mirrors `draw_canvas_overlays` and `get_element_world_pos`:
+    // the legacy normalised `pos` is interpreted against a FIXED
+    // reference rectangle of size `rf.resolution`, anchored at world
+    // (0, 0). Without this fix, moving the render frame shifted
+    // every collider away from its visible element — the user's
+    // "позиция рендера... коллайдеры в неверных местах" report.
+    //
+    // (sniff_hit doesn't test backgrounds, so the camera-relative
+    // dims aren't needed here.)
+    let world_w = rw as f32;
+    let world_h = rh as f32;
 
     // Overlays first (top of z-order). Sort by track index ascending — the
     // topmost row on the timeline panel hits first. Overlays drawn BEHIND
@@ -4210,8 +4246,8 @@ fn sniff_hit(state: &EditorState, pos: WorldPos) -> Option<Selection> {
             else if t < t_in { 0.0 } else { t_out - t_in };
         let ov_state = keyframe::sample(layout, sample_t).unwrap_or_default();
         let ov_world = WorldPos {
-            x: frame_tl_x + ov_state.pos[0] * world_w,
-            y: frame_tl_y + ov_state.pos[1] * world_h,
+            x: ov_state.pos[0] * world_w,
+            y: ov_state.pos[1] * world_h,
         };
         let (ew, eh) = overlay_bbox_with_state(overlay, &ov_state, state);
         if pos.x >= ov_world.x - ew * 0.5 && pos.x <= ov_world.x + ew * 0.5
@@ -4282,16 +4318,19 @@ fn selected_element_screen_rect(
             };
             let sample_t = if t >= t_in && t <= t_out { t - t_in } else { 0.0 };
             let ov_state = keyframe::sample(layout, sample_t).unwrap_or_default();
+            // World-fixed dims — `pos` is interpreted against the
+            // resolution rectangle anchored at world (0, 0).
+            // Mirrors `draw_canvas_overlays`: the render frame is a
+            // pure camera, its pos / zoom never drag world-space
+            // elements, so the gizmo / hit-test must NOT shift with
+            // rf either.
             let rf = &state.scene.render_frame;
-            let rf_state = sample_render_frame(rf, t);
             let [rw, rh] = rf.resolution;
-            let world_w = rw as f32 / rf_state.zoom;
-            let world_h = rh as f32 / rf_state.zoom;
-            let frame_tl_x = rf_state.pos.x - world_w * 0.5;
-            let frame_tl_y = rf_state.pos.y - world_h * 0.5;
+            let world_w = rw as f32;
+            let world_h = rh as f32;
             let world_pos = WorldPos {
-                x: frame_tl_x + ov_state.pos[0] * world_w,
-                y: frame_tl_y + ov_state.pos[1] * world_h,
+                x: ov_state.pos[0] * world_w,
+                y: ov_state.pos[1] * world_h,
             };
             // Use the texture-aware bbox so resize handles snap to the
             // image's real dimensions instead of the legacy 200×200
@@ -4421,14 +4460,20 @@ fn actor_kf_world_pos(
             }
         }
     }
-    // Legacy normalised → world-pixel relative to the render frame.
-    let world_w = rf_resolution[0] as f32 / rf_state.zoom;
-    let world_h = rf_resolution[1] as f32 / rf_state.zoom;
-    let frame_tl_x = rf_state.pos.x - world_w * 0.5;
-    let frame_tl_y = rf_state.pos.y - world_h * 0.5;
+    // Legacy normalised → world-pixel.
+    //
+    // The render frame is now a pure CAMERA: its pos / zoom never
+    // shifts world-space elements (per `get_element_world_pos` and
+    // `draw_canvas_overlays`). The trajectory drawing must follow
+    // the same convention so the dots line up with the actor's
+    // visible centre on the canvas. Without this fix, moving the
+    // render frame dragged the trajectory away from the actor.
+    let _ = rf_state;
+    let world_w = rf_resolution[0] as f32;
+    let world_h = rf_resolution[1] as f32;
     WorldPos {
-        x: frame_tl_x + actor_state.pos[0] * world_w,
-        y: frame_tl_y + actor_state.pos[1] * world_h,
+        x: actor_state.pos[0] * world_w,
+        y: actor_state.pos[1] * world_h,
     }
 }
 
@@ -4468,14 +4513,17 @@ fn draw_selection_keyframe_trajectory(
                 Overlay::Video(v) => &v.layout,
             };
             if layout.len() < 2 { return; }
-            let world_w = rf_resolution[0] as f32 / rf_state.zoom;
-            let world_h = rf_resolution[1] as f32 / rf_state.zoom;
-            let frame_tl_x = rf_state.pos.x - world_w * 0.5;
-            let frame_tl_y = rf_state.pos.y - world_h * 0.5;
+            // World-fixed dims — `pos` is interpreted against the
+            // resolution rectangle anchored at world (0, 0). Mirrors
+            // the renderer in `draw_canvas_overlays`. Without this
+            // the trajectory drifts off the visible overlay path
+            // whenever the user repositions the render frame.
+            let world_w = rf_resolution[0] as f32;
+            let world_h = rf_resolution[1] as f32;
             layout.iter().map(|kf| {
                 let world = WorldPos {
-                    x: frame_tl_x + kf.value.pos[0] * world_w,
-                    y: frame_tl_y + kf.value.pos[1] * world_h,
+                    x: kf.value.pos[0] * world_w,
+                    y: kf.value.pos[1] * world_h,
                 };
                 KfPoint { world }
             }).collect()
@@ -4628,16 +4676,14 @@ fn draw_element_resize_handles(
             };
             let sample_t = if t >= t_in && t <= t_out { t - t_in } else { 0.0 };
             let ov_state = keyframe::sample(layout, sample_t).unwrap_or_default();
+            // World-fixed dims — see the matching block above.
             let rf = &state.scene.render_frame;
-            let rf_state = sample_render_frame(rf, t);
             let [rw, rh] = rf.resolution;
-            let world_w = rw as f32 / rf_state.zoom;
-            let world_h = rh as f32 / rf_state.zoom;
-            let frame_tl_x = rf_state.pos.x - world_w * 0.5;
-            let frame_tl_y = rf_state.pos.y - world_h * 0.5;
+            let world_w = rw as f32;
+            let world_h = rh as f32;
             let world_pos = WorldPos {
-                x: frame_tl_x + ov_state.pos[0] * world_w,
-                y: frame_tl_y + ov_state.pos[1] * world_h,
+                x: ov_state.pos[0] * world_w,
+                y: ov_state.pos[1] * world_h,
             };
             let (elem_w, elem_h) = overlay_bbox_with_state(overlay, &ov_state, state);
             let center_screen = state.canvas_viewport.world_to_screen(world_pos, viewport_size);
@@ -4931,7 +4977,21 @@ fn ensure_image_loaded(
     // sticker PNGs are small and the result is cached after the first
     // hit; bumping this to a background thread is a follow-up if very
     // large images become common.
-    let decoded = image::open(path).map(|img| img.to_rgba8());
+    //
+    // Path resolution: when the scene saves a RELATIVE path
+    // (e.g. `assets/images/foo.png`) we have to anchor it against
+    // `state.assets_root` before opening, otherwise `image::open`
+    // resolves it relative to the process CWD and silently fails on
+    // any project loaded from a path different from the cwd. The
+    // failure cached the slot as `Failed`, so the bbox stayed at
+    // the 200×200 placeholder forever — the user's "при сохранении
+    // и открытии слетают коллайдеры у изображений" report.
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        state.assets_root.join(path)
+    };
+    let decoded = image::open(&resolved).map(|img| img.to_rgba8());
     let (handle, size) = match decoded {
         Ok(rgba) => {
             let w = rgba.width();
@@ -5076,10 +5136,23 @@ fn try_select_at(state: &mut EditorState, pos: WorldPos) {
     let rf = &state.scene.render_frame;
     let rf_state = sample_render_frame(rf, t);
     let [rw, rh] = rf.resolution;
-    let world_w = rw as f32 / rf_state.zoom;
-    let world_h = rh as f32 / rf_state.zoom;
-    let frame_tl_x = rf_state.pos.x - world_w * 0.5;
-    let frame_tl_y = rf_state.pos.y - world_h * 0.5;
+    // ── Camera-relative dims (used by background + render-frame
+    //    hit-tests only). The render frame IS a camera, so its
+    //    visible rectangle moves / scales with rf.pos / rf.zoom.
+    let cam_world_w = rw as f32 / rf_state.zoom.max(1e-6);
+    let cam_world_h = rh as f32 / rf_state.zoom.max(1e-6);
+    let frame_tl_x = rf_state.pos.x - cam_world_w * 0.5;
+    let frame_tl_y = rf_state.pos.y - cam_world_h * 0.5;
+    // ── World-fixed dims (used by every overlay / actor hit-test).
+    //    Mirrors the renderer in `draw_canvas_overlays` /
+    //    `get_element_world_pos`: the legacy normalised `pos` is
+    //    interpreted against a FIXED reference rectangle of size
+    //    `rf.resolution` anchored at world (0, 0). Without this fix
+    //    moving / zooming the render frame shifted every collider
+    //    away from its visible element — the user's "коллайдеры
+    //    в неверных местах" report.
+    let world_w = rw as f32;
+    let world_h = rh as f32;
 
     // ── Build a unified hit-test order across actors + overlays ──
     //
@@ -5140,8 +5213,8 @@ fn try_select_at(state: &mut EditorState, pos: WorldPos) {
                 let ov_state = keyframe::sample(layout, sample_t).unwrap_or_default();
 
                 let ov_world = WorldPos {
-                    x: frame_tl_x + ov_state.pos[0] * world_w,
-                    y: frame_tl_y + ov_state.pos[1] * world_h,
+                    x: ov_state.pos[0] * world_w,
+                    y: ov_state.pos[1] * world_h,
                 };
                 let (ew, eh) = overlay_bbox_with_state(overlay, &ov_state, state);
                 if pos.x >= ov_world.x - ew * 0.5 && pos.x <= ov_world.x + ew * 0.5
@@ -5178,8 +5251,8 @@ fn try_select_at(state: &mut EditorState, pos: WorldPos) {
     // Check backgrounds (click inside render frame area)
     for (idx, bg) in state.scene.backgrounds.iter().enumerate().rev() {
         let bg_end = bg.start + bg.duration;
-        if pos.x >= frame_tl_x && pos.x <= frame_tl_x + world_w
-            && pos.y >= frame_tl_y && pos.y <= frame_tl_y + world_h
+        if pos.x >= frame_tl_x && pos.x <= frame_tl_x + cam_world_w
+            && pos.y >= frame_tl_y && pos.y <= frame_tl_y + cam_world_h
         {
             if t >= bg.start && t <= bg_end {
                 state.selection = Selection::Background(idx);
@@ -5201,8 +5274,8 @@ fn try_select_at(state: &mut EditorState, pos: WorldPos) {
     let dy = pos.y - rf_state.pos.y;
     let lx = dx * cs + dy * sn;
     let ly = -dx * sn + dy * cs;
-    let half_w = world_w * 0.5;
-    let half_h = world_h * 0.5;
+    let half_w = cam_world_w * 0.5;
+    let half_h = cam_world_h * 0.5;
     if lx >= -half_w && lx <= half_w && ly >= -half_h && ly <= half_h {
         state.selection = Selection::RenderFrame;
         return;
@@ -5234,13 +5307,13 @@ fn is_point_on_selection(state: &EditorState, pos: WorldPos) -> bool {
         }
         Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
             let overlay = &state.scene.overlays[idx];
+            // World-fixed dims — `pos` is anchored at world (0, 0)
+            // so the render frame's pos / zoom never shifts the
+            // collider off the visible image.
             let rf = &state.scene.render_frame;
-            let rf_state = sample_render_frame(rf, t);
             let [rw, rh] = rf.resolution;
-            let world_w = rw as f32 / rf_state.zoom;
-            let world_h = rh as f32 / rf_state.zoom;
-            let frame_tl_x = rf_state.pos.x - world_w * 0.5;
-            let frame_tl_y = rf_state.pos.y - world_h * 0.5;
+            let world_w = rw as f32;
+            let world_h = rh as f32;
             let (t_in, t_out, layout) = match overlay {
                 Overlay::Text(txt) => (txt.t_in, txt.t_out, &txt.layout),
                 Overlay::Image(img) => (img.t_in, img.t_out, &img.layout),
@@ -5249,8 +5322,8 @@ fn is_point_on_selection(state: &EditorState, pos: WorldPos) -> bool {
             let sample_t = if t >= t_in && t <= t_out { t - t_in } else { 0.0 };
             let ov_state = keyframe::sample(layout, sample_t).unwrap_or_default();
             let ov_world = WorldPos {
-                x: frame_tl_x + ov_state.pos[0] * world_w,
-                y: frame_tl_y + ov_state.pos[1] * world_h,
+                x: ov_state.pos[0] * world_w,
+                y: ov_state.pos[1] * world_h,
             };
             let (ew, eh) = overlay_bbox_with_state(overlay, &ov_state, state);
             pos.x >= ov_world.x - ew * 0.5 && pos.x <= ov_world.x + ew * 0.5
@@ -5475,7 +5548,7 @@ fn draw_mask_toolbar(
         let galley = painter.layout_no_wrap(
             label,
             egui::FontId::proportional(11.0),
-            Color32::from_rgb(20, 20, 30),
+            Color32::from_rgb(24, 22, 12),
         );
         let pad = Vec2::new(8.0, 3.0);
         let bg_rect = Rect::from_center_size(
@@ -5490,7 +5563,7 @@ fn draw_mask_toolbar(
         painter.galley(
             bg_rect.min + pad,
             galley,
-            Color32::from_rgb(20, 20, 30),
+            Color32::from_rgb(24, 22, 12),
         );
     }
 }
@@ -6732,7 +6805,7 @@ pub fn handle_canvas_asset_drag(
             .tint(Color32::from_white_alpha(220));
         img.paint_at(ui, thumb_rect);
     } else {
-        painter.rect_filled(thumb_rect, Rounding::same(3.0), Color32::from_rgb(40, 40, 60));
+        painter.rect_filled(thumb_rect, Rounding::same(3.0), Color32::from_rgb(44, 42, 28));
         painter.text(
             thumb_rect.center(),
             egui::Align2::CENTER_CENTER,
@@ -6798,13 +6871,17 @@ pub fn handle_canvas_asset_drag(
                 // centre default.
                 if matches!(kind, crate::state::AssetDragKind::Image
                     | crate::state::AssetDragKind::Particle) {
+                    // Convert the world-pixel drop point back to
+                    // normalised `pos` coords. Mirrors the inverse of
+                    // `draw_canvas_overlays`'s
+                    // `world_pos = ov_state.pos * world_size` so the
+                    // dropped overlay materialises EXACTLY under the
+                    // cursor regardless of where the render frame is
+                    // / how it's zoomed.
                     let rf = &state.scene.render_frame;
-                    let rf_state = sample_render_frame(rf, state.playhead);
                     let [rw, rh] = rf.resolution;
-                    let world_w = rw as f32 / rf_state.zoom.max(1e-4);
-                    let world_h = rh as f32 / rf_state.zoom.max(1e-4);
-                    let frame_tl_x = rf_state.pos.x - world_w * 0.5;
-                    let frame_tl_y = rf_state.pos.y - world_h * 0.5;
+                    let world_w = rw as f32;
+                    let world_h = rh as f32;
                     if let Some(last) = state.scene.overlays.last_mut() {
                         let layout = match last {
                             Overlay::Image(im) => &mut im.layout,
@@ -6813,8 +6890,8 @@ pub fn handle_canvas_asset_drag(
                         };
                         if let Some(kf) = layout.first_mut() {
                             kf.value.pos = [
-                                ((world.x - frame_tl_x) / world_w).clamp(-2.0, 3.0),
-                                ((world.y - frame_tl_y) / world_h).clamp(-2.0, 3.0),
+                                (world.x / world_w).clamp(-2.0, 3.0),
+                                (world.y / world_h).clamp(-2.0, 3.0),
                             ];
                         }
                     }
@@ -6828,4 +6905,328 @@ pub fn handle_canvas_asset_drag(
         state.asset_drag.label.clear();
         state.asset_drag.thumbnail = None;
     }
+}
+
+
+// ─── SKELETON-POINT CANVAS OVERLAY ───────────────────────────────────
+//
+// The standalone "Skeleton Editor" floating window has been retired —
+// every piece of skeleton authoring lives in the inspector now. Point
+// PLACEMENT is the one piece that didn't fit comfortably in the
+// inspector (the user needs to see the actor full-size to align a
+// point against a real feature), so it now happens directly on the
+// main canvas: the markers are drawn over the host actor / video
+// overlay, and dragging one writes a keyframe at the current playhead
+// in clip-local time.
+
+/// Hint at which clip the inspector is currently editing the skeleton
+/// for. Returns the source-clip context for the active selection
+/// (actor or video overlay) so the canvas overlay can resolve / draw
+/// the matching template.
+fn active_skeleton_ctx(
+    state: &EditorState,
+) -> Option<crate::skeleton_editor::SourceClipCtx> {
+    match state.selection {
+        Selection::Actor(i) => crate::skeleton_editor::SourceClipCtx::from_actor(state, i),
+        Selection::Overlay(i) => {
+            crate::skeleton_editor::SourceClipCtx::from_video_overlay(state, i)
+        }
+        _ => None,
+    }
+}
+
+/// Compute the on-canvas screen rectangle that the skeleton points are
+/// projected through. Mirrors the per-element projection used by the
+/// renderer for `SkeletonAttachment` so dragging a point on the canvas
+/// directly correlates with the source-clip's normalised [0,1] coords.
+fn skeleton_host_screen_rect(
+    state: &EditorState,
+    full_rect: Rect,
+    viewport_size: [f32; 2],
+) -> Option<Rect> {
+    match state.selection {
+        Selection::Actor(i) => actor_screen_rect(state, full_rect, viewport_size, i),
+        Selection::Overlay(i) => {
+            // Reuse the overlay AABB and convert it to screen.
+            let (mn, mx) = overlay_world_aabb(state, i)?;
+            let center = [(mn[0] + mx[0]) * 0.5, (mn[1] + mx[1]) * 0.5];
+            let center_screen = state
+                .canvas_viewport
+                .world_to_screen(WorldPos { x: center[0], y: center[1] }, viewport_size);
+            let zoom = state.canvas_viewport.zoom.max(0.0001);
+            let half_w = (mx[0] - mn[0]) * 0.5 * zoom;
+            let half_h = (mx[1] - mn[1]) * 0.5 * zoom;
+            Some(Rect::from_center_size(
+                Pos2::new(
+                    full_rect.min.x + center_screen[0],
+                    full_rect.min.y + center_screen[1],
+                ),
+                Vec2::new(half_w * 2.0, half_h * 2.0),
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Draw skeleton-point markers over the selected video-layer element
+/// (and the per-point guide images, if any).
+fn draw_canvas_skeleton_overlay(
+    ui: &mut egui::Ui,
+    painter: &egui::Painter,
+    full_rect: Rect,
+    state: &EditorState,
+    viewport_size: [f32; 2],
+) {
+    let Some(ctx) = active_skeleton_ctx(state) else { return; };
+    let Some(tmpl_idx) = state.skeleton_editor.template_idx else { return; };
+    if state
+        .skeleton_editor
+        .clip_path
+        .as_deref()
+        .map(|p| p != ctx.source && p.file_name() != ctx.source.file_name())
+        .unwrap_or(true)
+    {
+        // Selection is a video-layer element but the inspector is
+        // tracking a different clip's template (stale state from the
+        // previous selection). Skip until the next inspector paint
+        // syncs the template index.
+        return;
+    }
+    let Some(host_rect) = skeleton_host_screen_rect(state, full_rect, viewport_size) else {
+        return;
+    };
+    let Some(template) = state.scene.skeleton_templates.get(tmpl_idx) else { return; };
+
+    let clip_t = ctx.clip_local_time(state.playhead);
+    let dragging = state.skeleton_editor.dragging_point.clone();
+    let selected_name = state.skeleton_editor.selected_point.clone();
+
+    // Optional per-point guide images, drawn first so the markers sit
+    // on top.
+    for (name, point) in &template.points {
+        let Some(img_path) = state.skeleton_editor.point_guide_images.get(name) else {
+            continue;
+        };
+        let ps = crate::skeleton_editor::sample_point_at(point, clip_t);
+        let cx = host_rect.min.x + ps.x * host_rect.width();
+        let cy = host_rect.min.y + ps.y * host_rect.height();
+        let size = (host_rect.width() * 0.22).clamp(40.0, 240.0);
+        let img_rect =
+            egui::Rect::from_center_size(Pos2::new(cx, cy), Vec2::splat(size));
+        let uri = format!("file://{}", img_path.display());
+        let img = egui::Image::from_uri(uri)
+            .fit_to_exact_size(Vec2::splat(size))
+            .maintain_aspect_ratio(true)
+            .tint(Color32::from_rgba_unmultiplied(255, 255, 255, 140));
+        img.paint_at(ui, img_rect);
+    }
+
+    // Marker stroke / fill.
+    for (name, point) in &template.points {
+        let ps = crate::skeleton_editor::sample_point_at(point, clip_t);
+        let sx = host_rect.min.x + ps.x * host_rect.width();
+        let sy = host_rect.min.y + ps.y * host_rect.height();
+        let pos = Pos2::new(sx, sy);
+
+        let is_selected = selected_name.as_deref() == Some(name);
+        let is_dragging = dragging.as_deref() == Some(name);
+        let color = if is_selected || is_dragging {
+            Color32::from_rgb(255, 220, 80)
+        } else {
+            Color32::from_rgb(point.color[0], point.color[1], point.color[2])
+        };
+        let radius = if is_selected || is_dragging { 9.0 } else { 6.5 };
+
+        painter.circle_filled(
+            pos + Vec2::new(0.0, 1.0),
+            radius + 0.5,
+            Color32::from_black_alpha(180),
+        );
+        painter.circle_filled(pos, radius, color);
+        painter.circle_stroke(pos, radius, Stroke::new(1.5, Color32::WHITE));
+        painter.text(
+            Pos2::new(pos.x + 11.0, pos.y - 6.0),
+            egui::Align2::LEFT_CENTER,
+            name,
+            egui::FontId::proportional(11.0),
+            color,
+        );
+
+        // Diamond indicator if there's a kf within ~one frame of `t`.
+        let fps = state.skeleton_editor.fps.max(1.0);
+        let kf_proximity = 1.0 / fps * 0.6;
+        let has_kf = point.track.iter().any(|kf| (kf.t - clip_t).abs() < kf_proximity);
+        if has_kf {
+            painter.text(
+                Pos2::new(pos.x, pos.y - radius - 4.0),
+                egui::Align2::CENTER_BOTTOM,
+                "\u{25C6}",
+                egui::FontId::proportional(9.0),
+                Color32::from_rgb(255, 200, 50),
+            );
+        }
+    }
+}
+
+/// Pointer interaction over the canvas skeleton-point overlay.
+///
+/// Returns `true` when the gesture is owned by skeleton authoring
+/// (hover near a marker, active drag on a marker, or click placement
+/// of a freshly-selected point) so the caller short-circuits the
+/// regular drag pipeline. Public draw + interact split mirrors the
+/// `mask_tool_active` short-circuit pattern in `canvas_preview()`.
+fn handle_canvas_skeleton_input(
+    ui: &mut egui::Ui,
+    response: &egui::Response,
+    state: &mut EditorState,
+    full_rect: Rect,
+    viewport_size: [f32; 2],
+) -> bool {
+    let Some(ctx) = active_skeleton_ctx(state) else {
+        // Cancel any in-flight drag if the user changed selection
+        // mid-gesture.
+        state.skeleton_editor.dragging_point = None;
+        return false;
+    };
+    let Some(tmpl_idx) = state.skeleton_editor.template_idx else {
+        state.skeleton_editor.dragging_point = None;
+        return false;
+    };
+    if state
+        .skeleton_editor
+        .clip_path
+        .as_deref()
+        .map(|p| p != ctx.source && p.file_name() != ctx.source.file_name())
+        .unwrap_or(true)
+    {
+        state.skeleton_editor.dragging_point = None;
+        return false;
+    }
+    let Some(host_rect) = skeleton_host_screen_rect(state, full_rect, viewport_size) else {
+        state.skeleton_editor.dragging_point = None;
+        return false;
+    };
+
+    let pointer_pos = response.interact_pointer_pos();
+    let primary_down = ui.input(|i| i.pointer.primary_down());
+    let primary_released = ui.input(|i| i.pointer.any_released());
+
+    let clip_t = ctx.clip_local_time(state.playhead);
+
+    // Hit-test: closest marker to the cursor (within ~14 px).
+    let mut hovered_point: Option<String> = None;
+    if state.skeleton_editor.dragging_point.is_none() {
+        if let Some(pos) = pointer_pos {
+            if host_rect.contains(pos) {
+                let template = &state.scene.skeleton_templates[tmpl_idx];
+                let mut best: Option<(String, f32)> = None;
+                for (name, point) in &template.points {
+                    let ps = crate::skeleton_editor::sample_point_at(point, clip_t);
+                    let sx = host_rect.min.x + ps.x * host_rect.width();
+                    let sy = host_rect.min.y + ps.y * host_rect.height();
+                    let dist = ((pos.x - sx).powi(2) + (pos.y - sy).powi(2)).sqrt();
+                    if dist < 14.0 && best.as_ref().map(|b| dist < b.1).unwrap_or(true) {
+                        best = Some((name.clone(), dist));
+                    }
+                }
+                if let Some((name, _)) = best {
+                    hovered_point = Some(name);
+                }
+            }
+        }
+    }
+
+    // Continue or finish an in-flight drag.
+    if let Some(name) = state.skeleton_editor.dragging_point.clone() {
+        if primary_down {
+            if let Some(pos) = pointer_pos {
+                let nx = ((pos.x - host_rect.min.x) / host_rect.width().max(1.0))
+                    .clamp(0.0, 1.0);
+                let ny = ((pos.y - host_rect.min.y) / host_rect.height().max(1.0))
+                    .clamp(0.0, 1.0);
+                crate::skeleton_editor::place_point_at_clip_time(
+                    state, &name, nx, ny, clip_t,
+                );
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            }
+            return true;
+        }
+        if primary_released || !primary_down {
+            state.skeleton_editor.dragging_point = None;
+        }
+        return false;
+    }
+
+    // Begin a drag when the user presses on (or near) a marker.
+    if response.drag_started() {
+        if let Some(name) = hovered_point.clone() {
+            state.skeleton_editor.selected_point = Some(name.clone());
+            state.skeleton_editor.dragging_point = Some(name.clone());
+            if let Some(pos) = pointer_pos {
+                let nx = ((pos.x - host_rect.min.x) / host_rect.width().max(1.0))
+                    .clamp(0.0, 1.0);
+                let ny = ((pos.y - host_rect.min.y) / host_rect.height().max(1.0))
+                    .clamp(0.0, 1.0);
+                crate::skeleton_editor::place_point_at_clip_time(
+                    state, &name, nx, ny, clip_t,
+                );
+            }
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            return true;
+        }
+        // No marker under the cursor — but a point is selected and the
+        // user grabbed the host rect → start placing the selected
+        // point at the cursor (matches the old preview-window
+        // "place-by-drag" behaviour).
+        if let Some(name) = state.skeleton_editor.selected_point.clone() {
+            if let Some(pos) = pointer_pos {
+                if host_rect.contains(pos) {
+                    state.skeleton_editor.dragging_point = Some(name.clone());
+                    let nx = ((pos.x - host_rect.min.x) / host_rect.width().max(1.0))
+                        .clamp(0.0, 1.0);
+                    let ny = ((pos.y - host_rect.min.y) / host_rect.height().max(1.0))
+                        .clamp(0.0, 1.0);
+                    crate::skeleton_editor::place_point_at_clip_time(
+                        state, &name, nx, ny, clip_t,
+                    );
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                    return true;
+                }
+            }
+        }
+    }
+
+    // Click on a marker → just select it (no kf write).
+    if response.clicked() {
+        if let Some(name) = hovered_point.clone() {
+            state.skeleton_editor.selected_point = Some(name);
+            return true;
+        }
+        // Click on empty host area with a selected point → drop a kf.
+        if let Some(name) = state.skeleton_editor.selected_point.clone() {
+            if let Some(pos) = pointer_pos {
+                if host_rect.contains(pos) {
+                    let nx = ((pos.x - host_rect.min.x) / host_rect.width().max(1.0))
+                        .clamp(0.0, 1.0);
+                    let ny = ((pos.y - host_rect.min.y) / host_rect.height().max(1.0))
+                        .clamp(0.0, 1.0);
+                    crate::skeleton_editor::place_point_at_clip_time(
+                        state, &name, nx, ny, clip_t,
+                    );
+                    return true;
+                }
+            }
+        }
+    }
+
+    // Hover cursor hint.
+    if hovered_point.is_some() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+        // Hovering over a marker is enough to reserve the gesture for
+        // the skeleton overlay so the user doesn't accidentally start
+        // moving the host actor on the next press.
+        return true;
+    }
+
+    false
 }

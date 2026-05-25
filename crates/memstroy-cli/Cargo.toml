@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "CLI for memstroy-inator"
+description = "CLI for Memstroy-inator"
 
 [[bin]]
 name = "memstroy"

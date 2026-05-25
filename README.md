@@ -1,11 +1,11 @@
-# memstroy-inator
+# Memstroy-inator
 
 Десктоп-редактор для сборки коротких вертикальных мемов в стиле
 Mellstroy (Shorts / Reels / TikTok). Workspace и имена крейтов
 (`memstroy-core`, `memstroy-gui` и т. д.) сохранены как
 `memstroy_generator` ради совместимости со скриптами и существующими
 проектами; в UI и в описаниях Cargo продукт называется
-**memstroy-inator**.
+**Memstroy-inator**.
 
 Интерфейс полностью двуязычный — русский и английский. Переключение
 языка: **Settings → Language**.
@@ -177,11 +177,11 @@ HTTP-эндпоинты описаны в
 ```bash
 # Linux / macOS
 scripts/package-client.sh --server-url https://assets.your-domain.example
-# → dist/memstroy-inator-<os>-<arch>-<ver>/
+# → dist/Memstroy-inator-<os>-<arch>-<ver>/
 
 # Windows PowerShell
 pwsh scripts/package-client.ps1 -ServerUrl https://assets.your-domain.example
-# → dist\memstroy-inator-windows-<arch>-<ver>\
+# → dist\Memstroy-inator-windows-<arch>-<ver>\
 ```
 
 Скрипты по умолчанию **отказываются** работать с loopback-адресом
@@ -198,8 +198,8 @@ pwsh scripts/package-client.ps1 -ServerUrl https://assets.your-domain.example
 
 1. `bin/memstroy-gui` (плюс `bin/memstroy` CLI на поддерживаемых ОС);
 2. `examples/*.yaml` и `README.md`;
-3. Лаунчер верхнего уровня (`memstroy-inator.sh` /
-   `memstroy-inator.bat`), запускающий GUI.
+3. Лаунчер верхнего уровня (`Memstroy-inator.sh` /
+   `Memstroy-inator.bat`), запускающий GUI.
 
 ## Сборка установщика «в один файл»
 
@@ -211,11 +211,11 @@ pwsh scripts/package-client.ps1 -ServerUrl https://assets.your-domain.example
 ```bash
 # Linux: само-распаковывающийся .run, без внешних зависимостей
 scripts/make-installer.sh --server-url https://assets.your-domain.example
-# → dist/memstroy-inator-linux-<arch>-<ver>.run
+# → dist/Memstroy-inator-linux-<arch>-<ver>.run
 
 # Windows PowerShell: требуется Inno Setup 6 (https://jrsoftware.org/isinfo.php)
 pwsh scripts/make-installer.ps1 -ServerUrl https://assets.your-domain.example
-# → dist\memstroy-inator-windows-<arch>-<ver>-Setup.exe
+# → dist\Memstroy-inator-windows-<arch>-<ver>-Setup.exe
 ```
 
 В конце работы оба скрипта печатают абсолютный путь до получившегося
@@ -224,19 +224,19 @@ pwsh scripts/make-installer.ps1 -ServerUrl https://assets.your-domain.example
 Если бандл уже готов и нужно только обернуть его без пересборки:
 
 ```bash
-scripts/make-installer.sh --bundle-dir dist/memstroy-inator-linux-x86_64-0.1.0
-pwsh scripts/make-installer.ps1 -BundleDir .\dist\memstroy-inator-windows-amd64-0.1.0
+scripts/make-installer.sh --bundle-dir dist/Memstroy-inator-linux-x86_64-0.1.0
+pwsh scripts/make-installer.ps1 -BundleDir .\dist\Memstroy-inator-windows-amd64-0.1.0
 ```
 
 Куда установщики кладут файлы по умолчанию:
 
-- **Windows.** `%ProgramFiles%\memstroy-inator\` (системная установка)
-  или `%LocalAppData%\Programs\memstroy-inator\` (для текущего
-  пользователя). Группа в меню «Пуск» — **memstroy-inator** —
+- **Windows.** `%ProgramFiles%\Memstroy-inator\` (системная установка)
+  или `%LocalAppData%\Programs\Memstroy-inator\` (для текущего
+  пользователя). Группа в меню «Пуск» — **Memstroy-inator** —
   с редактором и деинсталлятором, ярлык на рабочем столе и запись в
   *Параметры → Приложения → Установленные приложения*.
-- **Linux.** `/opt/memstroy-inator/` при запуске под `sudo`, иначе
-  `~/.local/share/memstroy-inator/`. `.desktop`-файл в меню
+- **Linux.** `/opt/Memstroy-inator/` при запуске под `sudo`, иначе
+  `~/.local/share/Memstroy-inator/`. `.desktop`-файл в меню
   приложений, ярлык на `~/Desktop/` (только при пользовательской
   установке), симлинк `memstroy-gui` в `PATH` и скрипт
   `uninstall.sh` в каталоге установки.

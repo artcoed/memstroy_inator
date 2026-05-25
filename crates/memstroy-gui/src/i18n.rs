@@ -102,6 +102,10 @@ fn ru_lookup(key: &str) -> Option<&'static str> {
         "\u{1F4BE} Save scene" => "\u{1F4BE} Сохранить сцену",
         "Save scene as..." => "Сохранить сцену как…",
         "\u{1F4BE} Save scene as..." => "\u{1F4BE} Сохранить сцену как…",
+        "\u{1F504} Open last autosave" => "\u{1F504} Открыть последний автосейв",
+        "\u{1F504} Open autosave" => "\u{1F504} Открыть автосейв",
+        "(no autosaves yet)" => "(автосейвов пока нет)",
+        "recent" => "недавно",
         "Settings" => "Настройки",
         "Settings..." => "Настройки…",
         "\u{2699} Settings..." => "\u{2699} Настройки…",
@@ -986,6 +990,41 @@ fn ru_lookup(key: &str) -> Option<&'static str> {
             "К этому клипу скелет ещё не привязан.\n\
              Откройте Вид \u{2192} Редактор скелета и сохраните \
              файл-спутник рядом с исходным.",
+        "No skeleton bound to this clip yet.\n\
+                 Switch to the \"Skeleton\" tab on this actor to \
+                 create one — the sidecar is saved next to the source file." =>
+            "К этому клипу скелет ещё не привязан.\n\
+             Перейдите на вкладку «Скелет» этого актёра — \
+             файл-спутник сохранится рядом с исходным.",
+        "Skeleton" => "Скелет",
+        "Loop fragment" => "Зациклить фрагмент",
+        "Loop just this clip's [in, out] range during playback \
+                 instead of the whole scene. Click again to release." =>
+            "Зациклить только диапазон [in, out] этого клипа во время воспроизведения \
+             вместо всей сцены. Повторное нажатие — снять цикл.",
+        "Drag points directly on the canvas while the timeline \
+                 plays — every drag sample becomes a keyframe at the \
+                 current playhead." =>
+            "Перетаскивайте точки прямо на холсте во время воспроизведения — \
+             каждое перемещение становится кейфреймом на текущей позиции.",
+        "No skeleton for this clip yet. Hit \"Create Skeleton\" \
+                 to start placing points on the canvas." =>
+            "У этого клипа ещё нет скелета. Нажмите «+ Создать скелет», \
+             чтобы начать ставить точки на холсте.",
+        "\u{1F4BE} Save" => "\u{1F4BE} Сохранить",
+        "Create a fresh <clip>.skeleton.json sidecar for this source." =>
+            "Создать новый файл <clip>.skeleton.json для этого исходника.",
+        "Track: loop scene playback over this point's keyframe range" =>
+            "Отслеживание: цикл воспроизведения сцены по диапазону кейфреймов этой точки",
+        "Add a new point with an auto-generated name and \
+                     start placing it on the canvas." =>
+            "Добавить новую точку с авто-именем и начать её размещение на холсте.",
+        "Drag it on the canvas to record keyframes." =>
+            "Перетаскивайте на холсте, чтобы записать кейфреймы.",
+        "Actor source could not be resolved." =>
+            "Не удалось определить исходник актёра.",
+        "Video overlay source could not be resolved." =>
+            "Не удалось определить исходник видео-оверлея.",
         "Layer:" => "Слой:",
         "Attach" => "Привязать",
         "to" => "к",

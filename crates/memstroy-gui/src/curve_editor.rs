@@ -18,7 +18,7 @@ use std::collections::BTreeSet;
 
 use egui::{Color32, Pos2, Rect, Rounding, Sense, Stroke, Vec2};
 use memstroy_core::{
-    param_ids, ActorState, Easing, Keyframe, OverlayState,
+    param_ids, ActorState, Easing, Keyframe, OverlayState, RenderFrameState,
 };
 
 /// Property indices for the curve editor (transform parameters).
@@ -65,6 +65,15 @@ pub enum CurveEditorTarget<'a> {
         /// Clip-local time of the playhead (audio kfs are stored in
         /// clip-local seconds).
         t_local: f32,
+    },
+    /// Transform layout of the render frame (output camera). The
+    /// render frame is scene-time anchored (no `t_in` offset, like
+    /// actors) and exposes Scale / Pos X / Pos Y / Rotation but no
+    /// Opacity — the inspector's "Scale" slider maps to `1 / zoom`,
+    /// so the curve editor mirrors that here for round-trip parity.
+    RenderFrame {
+        layout: &'a mut Vec<Keyframe<RenderFrameState>>,
+        animated_params: &'a mut BTreeSet<String>,
     },
 }
 
@@ -135,6 +144,39 @@ fn set_overlay_property(state: &mut OverlayState, prop: usize, value: f32) {
         PROP_POS_X => state.pos[0] = value,
         PROP_POS_Y => state.pos[1] = value,
         PROP_OPACITY => state.opacity = value,
+        PROP_ROTATION => state.rotation_deg = value,
+        _ => {}
+    }
+}
+
+/// Render-frame property accessor.
+///
+/// The inspector exposes `1 / zoom` as the user-facing "Scale"
+/// concept (see `inspector_render_frame` in `panels.rs`). The
+/// curve editor mirrors the same convention so the displayed
+/// keyframe value matches what the inspector shows.
+fn get_render_frame_property(state: &RenderFrameState, prop: usize) -> f32 {
+    match prop {
+        PROP_SCALE => 1.0 / state.zoom.max(1e-4),
+        PROP_POS_X => state.pos.x,
+        PROP_POS_Y => state.pos.y,
+        // OPACITY isn't a render-frame concept; return 1.0 so any
+        // accidental sample reads a no-op value rather than zero.
+        PROP_OPACITY => 1.0,
+        PROP_ROTATION => state.rotation_deg,
+        _ => 0.0,
+    }
+}
+
+fn set_render_frame_property(state: &mut RenderFrameState, prop: usize, value: f32) {
+    match prop {
+        PROP_SCALE => state.zoom = (1.0 / value.max(1e-4)).clamp(0.001, 1000.0),
+        PROP_POS_X => state.pos.x = value,
+        PROP_POS_Y => state.pos.y = value,
+        // OPACITY isn't render-frame state; ignore writes so the
+        // shared transform_curve_editor doesn't have to special-case
+        // its diamond toggle for this target.
+        PROP_OPACITY => {}
         PROP_ROTATION => state.rotation_deg = value,
         _ => {}
     }
@@ -271,6 +313,23 @@ pub fn curve_editor_panel(
                 OverlayState::default,
             );
         }
+        CurveEditorTarget::RenderFrame { layout, animated_params } => {
+            // Render-frame kfs are stored in scene time, same as
+            // actors — pass `time_offset = 0.0` so the editor's
+            // X-axis is direct scene-time.
+            transform_curve_editor::<RenderFrameState>(
+                ui,
+                layout,
+                animated_params,
+                duration,
+                selected_property,
+                playhead,
+                /* time_offset */ 0.0,
+                get_render_frame_property,
+                set_render_frame_property,
+                RenderFrameState::default,
+            );
+        }
         CurveEditorTarget::Audio {
             kfs,
             animated_params,
@@ -287,7 +346,7 @@ pub fn curve_editor_panel(
                     egui::RichText::new(t("Curve Editor"))
                         .size(13.0)
                         .strong()
-                        .color(Color32::from_rgb(200, 180, 255)),
+                        .color(Color32::WHITE),
                 );
                 ui.separator();
                 ui.label(
@@ -377,7 +436,7 @@ fn transform_curve_editor<T>(
             egui::RichText::new(t("Curve Editor"))
                 .size(13.0)
                 .strong()
-                .color(Color32::from_rgb(200, 180, 255)),
+                .color(Color32::WHITE),
         );
         ui.separator();
         for (i, name) in PROPERTY_NAMES.iter().enumerate() {
@@ -482,11 +541,11 @@ fn transform_curve_editor<T>(
 
     let painter = ui.painter_at(graph_rect);
 
-    painter.rect_filled(graph_rect, Rounding::same(4.0), Color32::from_rgb(12, 12, 20));
+    painter.rect_filled(graph_rect, Rounding::same(4.0), Color32::from_rgb(16, 15, 8));
     painter.rect_stroke(
         graph_rect,
         Rounding::same(4.0),
-        Stroke::new(1.0, Color32::from_rgb(40, 40, 60)),
+        Stroke::new(1.0, Color32::from_rgb(44, 42, 28)),
     );
 
     let prop = *selected_property;
@@ -583,7 +642,7 @@ fn transform_curve_editor<T>(
                     egui::Align2::CENTER_BOTTOM,
                     easing_l,
                     egui::FontId::proportional(8.0),
-                    Color32::from_rgb(160, 140, 200),
+                    Color32::WHITE,
                 );
             }
         }
@@ -689,11 +748,11 @@ fn scalar_curve_editor(
     );
 
     let painter = ui.painter_at(graph_rect);
-    painter.rect_filled(graph_rect, Rounding::same(4.0), Color32::from_rgb(12, 12, 20));
+    painter.rect_filled(graph_rect, Rounding::same(4.0), Color32::from_rgb(16, 15, 8));
     painter.rect_stroke(
         graph_rect,
         Rounding::same(4.0),
-        Stroke::new(1.0, Color32::from_rgb(40, 40, 60)),
+        Stroke::new(1.0, Color32::from_rgb(44, 42, 28)),
     );
 
     let (val_min, val_max) = value_range;
@@ -867,7 +926,7 @@ fn interpolate_at<T>(
 
 /// Draw background grid lines.
 fn draw_grid(painter: &egui::Painter, rect: Rect, t_min: f32, t_max: f32, v_min: f32, v_max: f32) {
-    let grid_color = Color32::from_rgb(30, 30, 45);
+    let grid_color = Color32::from_rgb(32, 30, 20);
     let text_color = Color32::from_rgb(80, 80, 100);
 
     let num_h_lines = 5;
