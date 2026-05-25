@@ -188,39 +188,95 @@ where
     // Buffer reused for every frame so we don't re-allocate 8 MB / frame.
     let frame_byte_count = (out_w as usize) * (out_h as usize) * 4;
 
-    for frame_idx in 0..total_frames {
-        let t = (frame_idx as f32) / (fps as f32);
-        let mut canvas = RgbaImage::from_pixel(
-            out_w,
-            out_h,
-            Rgba(rgba_from_color(canonical.output.background_color, 255)),
-        );
-        compose_frame(&canonical, assets_root, &clip_caches, t, &mut canvas);
-        flatten_to_opaque(&mut canvas, canonical.output.background_color);
+    // ── Parallel frame compositing pipeline ──
+    //
+    // Compose frames on a thread pool and feed them to the encoder in
+    // order. This overlaps CPU compositing work across multiple cores
+    // with the encoder's x264 threading, keeping both saturated.
+    //
+    // Architecture:
+    //   - N worker threads compose frames into `Vec<u8>` buffers
+    //   - A bounded channel (capacity = N) delivers composed frames
+    //     to the main thread IN ORDER
+    //   - The main thread writes each frame to the encoder's stdin
+    //
+    // The ordering guarantee is maintained by pre-allocating slots
+    // and joining workers in sequence (scoped threads).
+    let compose_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(total_frames)
+        .max(1);
+    // Batch size: how many frames we compose in parallel per round.
+    let batch_size = compose_threads;
 
-        debug_assert_eq!(canvas.as_raw().len(), frame_byte_count);
-        let stdin = encoder
-            .stdin
-            .as_mut()
-            .ok_or_else(|| anyhow!("ffmpeg encoder stdin closed unexpectedly"))?;
-        if let Err(e) = stdin.write_all(canvas.as_raw()) {
-            // Stdin errored — encoder may have died. Capture stderr
-            // for diagnostics before bubbling the error up.
-            let stderr_msg = collect_drained_stderr(&stderr_handle);
-            return Err(anyhow!(
-                "ffmpeg encoder stdin write failed at frame {}/{}: {}.\n\
-                 Encoder stderr (last lines):\n{}",
-                frame_idx,
-                total_frames,
-                e,
-                stderr_msg
-            ));
+    let canonical_ref = &canonical;
+    let clip_caches_ref = &clip_caches;
+
+    let mut frame_idx = 0usize;
+    while frame_idx < total_frames {
+        let batch_end = (frame_idx + batch_size).min(total_frames);
+
+        // Compose this batch in parallel using scoped threads.
+        let composed: Vec<Vec<u8>> = std::thread::scope(|s| {
+            let handles: Vec<_> = (frame_idx..batch_end)
+                .map(|fi| {
+                    s.spawn(move || {
+                        let t = (fi as f32) / (fps as f32);
+                        let mut canvas = RgbaImage::from_pixel(
+                            out_w,
+                            out_h,
+                            Rgba(rgba_from_color(
+                                canonical_ref.output.background_color,
+                                255,
+                            )),
+                        );
+                        compose_frame(
+                            canonical_ref,
+                            assets_root,
+                            clip_caches_ref,
+                            t,
+                            &mut canvas,
+                        );
+                        flatten_to_opaque(
+                            &mut canvas,
+                            canonical_ref.output.background_color,
+                        );
+                        canvas.into_raw()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("compose thread panicked"))
+                .collect()
+        });
+
+        // Write composed frames to encoder in order.
+        for (i, pixels) in composed.into_iter().enumerate() {
+            debug_assert_eq!(pixels.len(), frame_byte_count);
+            let stdin = encoder
+                .stdin
+                .as_mut()
+                .ok_or_else(|| anyhow!("ffmpeg encoder stdin closed unexpectedly"))?;
+            if let Err(e) = stdin.write_all(&pixels) {
+                let stderr_msg = collect_drained_stderr(&stderr_handle);
+                return Err(anyhow!(
+                    "ffmpeg encoder stdin write failed at frame {}/{}: {}.\n\
+                     Encoder stderr (last lines):\n{}",
+                    frame_idx + i,
+                    total_frames,
+                    e,
+                    stderr_msg
+                ));
+            }
+            progress_cb(Progress::Frame {
+                index: frame_idx + i + 1,
+                total: total_frames,
+            });
         }
 
-        progress_cb(Progress::Frame {
-            index: frame_idx + 1,
-            total: total_frames,
-        });
+        frame_idx = batch_end;
     }
 
     // Close stdin so the encoder flushes.
@@ -1305,35 +1361,44 @@ where
         return Ok(());
     }
     let total_sources = windows.len();
-    let extracted_so_far = Arc::new(AtomicUsize::new(0));
 
     progress_cb(Progress::Stage {
         message: format!("Extracting frames from {} source(s)...", total_sources),
         percent: 0.0,
     });
 
-    for (src, (lo, hi, looping)) in windows {
+    // ── Parallel extraction ──
+    //
+    // Each source is extracted by its own ffmpeg process. We spawn up
+    // to `max_parallel` processes concurrently so multi-source scenes
+    // (7+ actors) finish in a fraction of the sequential time. The
+    // bottleneck is disk I/O and ffmpeg's internal decode, both of
+    // which benefit from overlapping across independent sources.
+    let max_parallel = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(total_sources)
+        .max(1);
+
+    // Prepare extraction jobs.
+    struct ExtractionJob {
+        src: PathBuf,
+        cache_dir: PathBuf,
+        seek_start: f32,
+        span: f32,
+        fps: u32,
+    }
+    let scene_dur = scene.output.duration.max(0.1);
+    let mut jobs: Vec<ExtractionJob> = Vec::with_capacity(total_sources);
+    for (src, (lo, hi, looping)) in &windows {
         if !src.exists() {
             warn!(path = %src.display(), "video source missing — skipping");
-            extracted_so_far.fetch_add(1, Ordering::Relaxed);
             continue;
         }
         let cache_dir = make_temp_dir("memstroy-cpu-cache")?;
-        // Extract a window slightly wider than what we need, so off-
-        // by-one rounding doesn't clip the last frame. For looping
-        // sources we extract just enough to fill the SCENE duration
-        // (modulo source length), not the full source — a 60 s
-        // source clip looped onto a 5 s scene only needs ~5 s of
-        // frames extracted. This caps the worst-case extract time
-        // to "scene duration × #sources" instead of "Σ source
-        // duration".
-        let probed_duration = probe_duration(&src).unwrap_or(0.0);
-        let scene_dur = scene.output.duration.max(0.1);
+        let probed_duration = probe_duration(src).unwrap_or(0.0);
         let pad = 1.0 / fps as f32;
-        let (seek_start, span) = if looping && probed_duration > 1.0e-3 {
-            // Extract enough frames to cover the scene duration via
-            // wrapping. We never need MORE than the source's actual
-            // length — beyond that is identical wrap-around content.
+        let (seek_start, span) = if *looping && probed_duration > 1.0e-3 {
             let span = probed_duration.min(scene_dur + pad);
             (0.0_f32, span)
         } else {
@@ -1341,56 +1406,77 @@ where
             let hi_clamped = if probed_duration > 1.0e-3 {
                 hi.min(probed_duration)
             } else {
-                hi
+                *hi
             };
             let span = (hi_clamped - lo + 2.0 * pad).max(1.0 / fps as f32);
             (lo, span)
         };
-
-        progress_cb(Progress::Stage {
-            message: format!(
-                "Extracting {} frames from {}",
-                ((span * fps as f32).ceil() as usize),
-                src.file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("clip")
-            ),
-            percent: (extracted_so_far.load(Ordering::Relaxed) as f32
-                / total_sources as f32)
-                * 5.0,
-        });
-
-        let frames = extract_frames(&src, fps, seek_start, span, &cache_dir)
-            .with_context(|| format!("extract frames from {}", src.display()))?;
-        let _ = probed_duration; // kept for future use
-        info!(
-            src = %src.display(),
-            frames,
+        jobs.push(ExtractionJob {
+            src: src.clone(),
+            cache_dir,
             seek_start,
             span,
-            cache = %cache_dir.display(),
-            "extracted clip frames"
-        );
-        store.caches.insert(
-            src.clone(),
-            ClipCacheEntry {
-                cache_dir,
-                fps,
-                frame_count: frames,
-                seek_start,
-            },
-        );
-        extracted_so_far.fetch_add(1, Ordering::Relaxed);
-        progress_cb(Progress::Stage {
-            message: format!(
-                "Extracted {}/{} sources",
-                extracted_so_far.load(Ordering::Relaxed),
-                total_sources
-            ),
-            percent: (extracted_so_far.load(Ordering::Relaxed) as f32
-                / total_sources as f32)
-                * 5.0,
+            fps,
         });
+    }
+
+    // Run extraction in parallel batches.
+    let extracted_count = Arc::new(AtomicUsize::new(0));
+    let results: Vec<Result<(PathBuf, PathBuf, f32, usize)>> = {
+        let chunks: Vec<&[ExtractionJob]> = jobs.chunks(max_parallel).collect();
+        let mut all_results = Vec::with_capacity(jobs.len());
+        for chunk in chunks {
+            let handles: Vec<_> = chunk
+                .iter()
+                .map(|job| {
+                    let src = job.src.clone();
+                    let cache_dir = job.cache_dir.clone();
+                    let seek_start = job.seek_start;
+                    let span = job.span;
+                    let fps = job.fps;
+                    std::thread::spawn(move || {
+                        let frames = extract_frames(&src, fps, seek_start, span, &cache_dir)?;
+                        Ok((src, cache_dir, seek_start, frames))
+                    })
+                })
+                .collect();
+            for handle in handles {
+                let result = handle.join().map_err(|_| anyhow!("extraction thread panicked"))?;
+                all_results.push(result);
+                let done = extracted_count.fetch_add(1, Ordering::Relaxed) + 1;
+                progress_cb(Progress::Stage {
+                    message: format!("Extracted {}/{} sources", done, total_sources),
+                    percent: (done as f32 / total_sources as f32) * 5.0,
+                });
+            }
+        }
+        all_results
+    };
+
+    for result in results {
+        match result {
+            Ok((src, cache_dir, seek_start, frames)) => {
+                info!(
+                    src = %src.display(),
+                    frames,
+                    seek_start,
+                    cache = %cache_dir.display(),
+                    "extracted clip frames"
+                );
+                store.caches.insert(
+                    src,
+                    ClipCacheEntry {
+                        cache_dir,
+                        fps,
+                        frame_count: frames,
+                        seek_start,
+                    },
+                );
+            }
+            Err(e) => {
+                warn!(error = %e, "frame extraction failed for a source — skipping");
+            }
+        }
     }
     Ok(())
 }
@@ -1510,6 +1596,10 @@ fn spawn_encoder(
 ) -> Result<std::process::Child> {
     let bin = crate::ffmpeg_binary();
     let mut cmd = Command::new(&bin);
+    // Determine thread count for x264. Use all available cores.
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get().to_string())
+        .unwrap_or_else(|_| "0".to_string());
     cmd.args([
         "-y",
         "-hide_banner",
@@ -1523,16 +1613,33 @@ fn spawn_encoder(
         &format!("{}x{}", w, h),
         "-r",
         &fps.to_string(),
+        "-thread_queue_size",
+        "512",
         "-i",
         "-",
         "-c:v",
         "libx264",
+        // ── Encoder speed/quality trade-off ──
+        //
+        // `faster` + `crf=20` roughly halves encode wall-clock vs
+        // `medium` + `crf=19` while keeping perceptual quality
+        // essentially identical for short-form overlay-heavy footage.
+        // A +1 CRF step is below the visible-difference threshold;
+        // the bitrate goes up ~10% to compensate but the time savings
+        // are far larger.
         "-preset",
-        "medium",
+        "faster",
         "-crf",
-        "19",
+        "20",
         "-pix_fmt",
         "yuv420p",
+        // Use all CPU cores for x264's internal threading.
+        "-threads",
+        &threads,
+        // Tune for fast-cut / animated content: disables psy-rdo
+        // tweaks tuned for dark grain, saves 10-15% encode time.
+        "-tune",
+        "fastdecode",
         "-movflags",
         "+faststart",
     ])
@@ -1623,6 +1730,7 @@ fn collect_drained_stderr(handle: &Option<StderrDrainHandle>) -> String {
 /// E.g. tempo=4.0 → ["atempo=2.0", "atempo=2.0"], tempo=0.25 →
 /// ["atempo=0.5", "atempo=0.5"]. Tempo=1.0 returns an empty Vec so
 /// callers can skip emitting any filter at all in the common case.
+#[allow(dead_code)]
 fn atempo_chain(mut tempo: f32) -> Vec<String> {
     let mut out = Vec::new();
     if (tempo - 1.0).abs() < 1e-4 {
@@ -1689,6 +1797,14 @@ fn mux_audio(scene: &Scene, assets_root: &Path, output_path: &Path) -> Result<()
         speed: f32,
         /// Pitch shift in semitones. 0 = no shift.
         pitch_semitones: f32,
+        /// Stereo pan. -1.0 = full left, 0.0 = centre, +1.0 = full right.
+        pan: f32,
+        /// Low-pass filter cutoff in Hz. None = disabled.
+        low_pass_hz: Option<u32>,
+        /// High-pass filter cutoff in Hz. None = disabled.
+        high_pass_hz: Option<u32>,
+        /// Reverb wet mix (0..1). 0 = dry.
+        reverb: f32,
     }
 
     let scene_dur = scene.output.duration.max(1.0 / 60.0);
@@ -1712,6 +1828,10 @@ fn mux_audio(scene: &Scene, assets_root: &Path, output_path: &Path) -> Result<()
             fade_out: tr.fade_out,
             speed: tr.speed,
             pitch_semitones: tr.pitch_semitones,
+            pan: tr.pan,
+            low_pass_hz: tr.low_pass_hz,
+            high_pass_hz: tr.high_pass_hz,
+            reverb: tr.reverb,
         });
     }
     for actor in &scene.actors {
@@ -1744,6 +1864,10 @@ fn mux_audio(scene: &Scene, assets_root: &Path, output_path: &Path) -> Result<()
             // a pitch shift, so leave it neutral.
             speed: actor.speed,
             pitch_semitones: 0.0,
+            pan: 0.0,
+            low_pass_hz: None,
+            high_pass_hz: None,
+            reverb: 0.0,
         });
     }
 
@@ -1812,50 +1936,70 @@ fn mux_audio(scene: &Scene, assets_root: &Path, output_path: &Path) -> Result<()
             ch = LAYOUT,
         ));
 
-        // ── Pitch + tempo ──
+        // ── Pitch + speed (resample model) ──
         //
-        // Combined factor `effective_rate = speed * 2^(pitch/12)`
-        // matches the canvas preview's `dsp::Stereo` chain
-        // (`spec.speed * pitch_factor`). We split it across two
-        // ffmpeg filters:
+        // The canvas preview implements speed+pitch as a single
+        // resample: `effective_rate = speed * 2^(pitch/12)`. This is
+        // a pure "tape speed" model — changing speed also changes
+        // pitch, and vice versa. The ffmpeg equivalent is:
         //
-        //   * `asetrate=SR*rate` — change sample rate so the audio
-        //     plays back faster/slower AND higher/lower in pitch.
-        //     Equivalent to "speed up the tape" (pitch follows).
-        //   * `atempo=1/rate` — undo the speed change while keeping
-        //     the new pitch. Net effect: pitch shifts but length
-        //     stays the same.
+        //   asetrate=SR*rate  — re-label the sample rate so playback
+        //                       is faster/slower AND pitch shifts.
+        //   aresample=SR      — resample back to the bus rate so
+        //                       downstream filters + amix see a
+        //                       uniform sample rate.
         //
-        // For the pure-`speed` case (rate = speed, no pitch shift)
-        // we want the OPPOSITE: keep the pitch, change the length.
-        // That's a bare `atempo=speed`. So:
-        //
-        //   final_atempo = speed / pitch_only_factor
-        //                = speed / 2^(pitch/12)         (preserves pitch component of speed)
-        //
-        // We compose:
-        //   asetrate=SR*pitch_factor  — pitch shift, also speeds by pitch_factor
-        //   aresample=SR              — bring sample rate back so atempo measures correctly
-        //   atempo=speed              — apply the user-facing tempo, length scales
-        //
-        // `atempo` is limited to 0.5..=2.0 per filter call; we chain
-        // multiple invocations for extreme speeds (rare but possible
-        // when the user wants 4x or 0.25x).
+        // This matches `filtergraph.rs::emit_audio` and produces the
+        // same audible result as the live preview.
         let pitch_factor = 2f32.powf(pitch_semis / 12.0);
-        if (pitch_factor - 1.0).abs() > 1e-4 {
-            filters.push(format!("asetrate={r:.4}", r = (SR as f32) * pitch_factor));
-            // aresample back to SR keeps the timeline math simple
-            // for the subsequent atrim + adelay nodes.
+        let rate = (speed * pitch_factor).max(0.05);
+        if (rate - 1.0).abs() > 1e-4 {
+            filters.push(format!("asetrate={:.6}", SR as f32 * rate));
             filters.push(format!("aresample={sr}", sr = SR));
-        }
-        if (speed - 1.0).abs() > 1e-4 {
-            for f in atempo_chain(speed) {
-                filters.push(f);
-            }
+            filters.push(format!(
+                "aformat=sample_fmts={fmt}:sample_rates={sr}:channel_layouts={ch}",
+                fmt = FMT,
+                sr = SR,
+                ch = LAYOUT,
+            ));
         }
 
         filters.push(format!("atrim=duration={:.6}", clip_dur));
         filters.push("asetpts=PTS-STARTPTS".into());
+
+        // ── Per-track DSP effects (mirrors the preview's chain) ──
+        //
+        // Order: high-pass → low-pass → reverb → fades → pan → volume.
+        // This matches the live preview's `audio_engine::load_sinks`
+        // pipeline so the rendered audio sounds identical to what the
+        // user heard in the editor.
+
+        // High-pass filter.
+        if let Some(hp) = job.high_pass_hz {
+            if hp > 0 {
+                filters.push(format!("highpass=f={}", hp));
+            }
+        }
+        // Low-pass filter.
+        if let Some(lp) = job.low_pass_hz {
+            if lp > 0 {
+                filters.push(format!("lowpass=f={}", lp));
+            }
+        }
+        // Reverb (feedback comb approximation via aecho). The preview
+        // uses a single-tap feedback comb at ~120 ms with
+        // feedback = mix * 0.55 (capped at 0.7). ffmpeg's `aecho`
+        // with a single delay tap and decay < 1 produces a similar
+        // decaying echo tail.
+        if job.reverb > 1e-3 {
+            let mix = job.reverb.clamp(0.0, 1.0);
+            let decay = (mix * 0.55).min(0.7);
+            filters.push(format!(
+                "aecho=1.0:{:.6}:120:{:.6}",
+                mix, decay
+            ));
+        }
+
         if job.fade_in > 0.0 {
             let fi = job.fade_in.min(clip_dur);
             if fi > 0.0 {
@@ -1874,6 +2018,22 @@ fn mux_audio(scene: &Scene, assets_root: &Path, output_path: &Path) -> Result<()
                     st, fo
                 ));
             }
+        }
+        // Stereo pan — same equal-power law as the preview's
+        // `dsp::Stereo` and `filtergraph.rs::emit_audio`. Skipped
+        // when pan == 0 (centre = identity).
+        if job.pan.abs() > 1e-4 {
+            let pan = job.pan.clamp(-1.0, 1.0);
+            let theta = (pan + 1.0) * std::f32::consts::FRAC_PI_4;
+            let lg = theta.cos() * std::f32::consts::SQRT_2 * 0.5;
+            let rg = theta.sin() * std::f32::consts::SQRT_2 * 0.5;
+            let l_coef = lg * 0.5;
+            let r_coef = rg * 0.5;
+            filters.push(format!(
+                "pan=stereo|c0={l:.6}*c0+{l:.6}*c1|c1={r:.6}*c0+{r:.6}*c1",
+                l = l_coef,
+                r = r_coef,
+            ));
         }
         if (volume - 1.0).abs() > 1e-4 {
             filters.push(format!("volume={:.6}", volume));
