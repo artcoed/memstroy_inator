@@ -794,7 +794,19 @@ impl App {
                                 entry.scene_path.display().to_string()
                             };
                             if ui.button(label).on_hover_text(hover).clicked() {
-                                match Scene::load(&entry.scene_path) {
+                                let is_memstroy = entry.scene_path
+                                    .extension()
+                                    .and_then(|e| e.to_str())
+                                    .map(|s| s.eq_ignore_ascii_case("memstroy"))
+                                    .unwrap_or(false);
+                                let load_result = if is_memstroy {
+                                    self.state.load_memstroy(&entry.scene_path)
+                                        .map_err(|e| e.to_string())
+                                } else {
+                                    Scene::load(&entry.scene_path)
+                                        .map_err(|e| e.to_string())
+                                };
+                                match load_result {
                                     Ok(scene) => {
                                         self.state.scene = scene;
                                         // Restore the original project
@@ -2984,7 +2996,7 @@ impl App {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        match self.state.scene.save(&path) {
+        match self.state.save_memstroy(&path) {
             Ok(()) => {
                 crate::autosave::write_meta(
                     &slot,
@@ -3064,14 +3076,34 @@ impl App {
         }
 
         match decision {
-            Some("yes") => match Scene::load(&autosave_path) {
-                Ok(scene) => {
-                    self.state.scene = scene;
-                    self.state.scene_path = None;
-                    self.state.status = crate::i18n::t("\u{2705} Recovered scene loaded.").into();
-                }
-                Err(e) => {
-                    self.state.status = format!("{} {e}", crate::i18n::t("\u{274C} Recovery failed:"));
+            Some("yes") => {
+                let is_memstroy = autosave_path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|s| s.eq_ignore_ascii_case("memstroy"))
+                    .unwrap_or(false);
+                if is_memstroy {
+                    match self.state.load_memstroy(&autosave_path) {
+                        Ok(scene) => {
+                            self.state.scene = scene;
+                            self.state.scene_path = None;
+                            self.state.status = crate::i18n::t("\u{2705} Recovered scene loaded.").into();
+                        }
+                        Err(e) => {
+                            self.state.status = format!("{} {e}", crate::i18n::t("\u{274C} Recovery failed:"));
+                        }
+                    }
+                } else {
+                    match Scene::load(&autosave_path) {
+                        Ok(scene) => {
+                            self.state.scene = scene;
+                            self.state.scene_path = None;
+                            self.state.status = crate::i18n::t("\u{2705} Recovered scene loaded.").into();
+                        }
+                        Err(e) => {
+                            self.state.status = format!("{} {e}", crate::i18n::t("\u{274C} Recovery failed:"));
+                        }
+                    }
                 }
             },
             Some("no") => {
