@@ -1,12 +1,12 @@
 # scripts/package-client.ps1
 #
 # Windows PowerShell variant of `package-client.sh`. Builds a hardened
-# release bundle of the memstroy-inator editor for distribution to
+# release bundle of the Memstroy-inator editor for distribution to
 # clients.
 #
 # What ships:
 #   * bin\memstroy-gui.exe + bin\memstroy.exe
-#   * examples\*.yaml, README.md, memstroy-inator.bat launcher
+#   * examples\*.yaml, README.md, Memstroy-inator.bat launcher
 #
 # What deliberately does NOT ship:
 #   * Any assets\ directory. Client builds load every clip / image /
@@ -35,7 +35,7 @@
 # Optional:
 #   -Out <path>             Output directory (default: .\dist).
 #   -Name <name>            Bundle name (default:
-#                           memstroy-inator-windows-<arch>-<version>).
+#                           Memstroy-inator-windows-<arch>-<version>).
 #   -Zip                    Also produce <bundle-name>.zip.
 #   -AllowLoopback          Allow -ServerUrl to point at 127.* / ::1
 #                           / localhost. Off by default to catch typos.
@@ -76,14 +76,14 @@ $Version = (Select-String -Path "Cargo.toml" -Pattern '^version\s*=\s*"([^"]+)"'
 if ([string]::IsNullOrWhiteSpace($Version)) { $Version = "dev" }
 
 $Arch = $env:PROCESSOR_ARCHITECTURE.ToLower()
-$DefaultName = "memstroy-inator-windows-$Arch-$Version"
+$DefaultName = "Memstroy-inator-windows-$Arch-$Version"
 
 if ([string]::IsNullOrEmpty($Out))  { $Out  = Join-Path $RootDir "dist" }
 if ([string]::IsNullOrEmpty($Name)) { $Name = $DefaultName }
 
 $BundleDir = Join-Path $Out $Name
 
-Write-Host "==> memstroy-inator client packager"
+Write-Host "==> Memstroy-inator client packager"
 Write-Host "    workspace  : $RootDir"
 Write-Host "    bundle     : $BundleDir"
 Write-Host "    server URL : $ServerUrl"
@@ -144,12 +144,12 @@ if (Test-Path $IconPngSrc) {
 # launcher was invoked from.
 @'
 @echo off
-REM Launch the memstroy-inator editor.
+REM Launch the Memstroy-inator editor.
 REM
 REM All assets are fetched from the configured assets-server on demand
 REM and cached under %USERPROFILE%\.memstroy\cache\.
 "%~dp0bin\memstroy-gui.exe" %*
-'@ | Set-Content -Path (Join-Path $BundleDir "memstroy-inator.bat") -Encoding ASCII
+'@ | Set-Content -Path (Join-Path $BundleDir "Memstroy-inator.bat") -Encoding ASCII
 
 # ── Optional .zip ───────────────────────────────────────────────────
 if ($Zip) {
@@ -161,4 +161,4 @@ if ($Zip) {
 }
 
 Write-Host "==> done"
-Write-Host "    run with: $BundleDir\memstroy-inator.bat"
+Write-Host "    run with: $BundleDir\Memstroy-inator.bat"

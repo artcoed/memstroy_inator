@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "egui/eframe editor for memstroy-inator scenes"
+description = "egui/eframe editor for Memstroy-inator scenes"
 # `build.rs` bakes two compile-time signals into the binary: the
 # obfstr-wrapped default assets-server URL, and a flag that flips the
 # editor between developer defaults (cwd-relative `./assets/`,

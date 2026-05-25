@@ -14,6 +14,7 @@
 
 mod app;
 mod audio_engine;
+mod autosave;
 mod build_info;
 mod canvas_preview;
 mod curve_editor;
@@ -21,7 +22,6 @@ mod curve_editor;
 mod frame_snapshot;
 mod gpu_preview;
 mod i18n;
-mod image_editor;
 mod image_effects;
 mod image_fx_cache;
 mod image_fx_worker;
@@ -82,7 +82,7 @@ fn main() -> Result<()> {
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1480.0, 900.0])
         .with_min_inner_size([1100.0, 700.0])
-        .with_title("memstroy-inator");
+        .with_title("Memstroy-inator");
     const APP_ICON_PNG: &[u8] =
         include_bytes!("../../../assets/internal_images/catost.png");
     match image::load_from_memory(APP_ICON_PNG) {

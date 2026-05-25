@@ -156,16 +156,16 @@ fn embed_windows_version_info() {
     let pkg_version = env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".to_string());
 
     let mut res = winresource::WindowsResource::new();
-    res.set("CompanyName", "memstroy-inator contributors");
-    res.set("FileDescription", "memstroy-inator editor");
-    res.set("ProductName", "memstroy-inator");
+    res.set("CompanyName", "Memstroy-inator contributors");
+    res.set("FileDescription", "Memstroy-inator editor");
+    res.set("ProductName", "Memstroy-inator");
     res.set("InternalName", "memstroy-gui");
     res.set("OriginalFilename", "memstroy-gui.exe");
     res.set("FileVersion", &pkg_version);
     res.set("ProductVersion", &pkg_version);
     res.set(
         "LegalCopyright",
-        "Copyright (c) memstroy-inator contributors",
+        "Copyright (c) Memstroy-inator contributors",
     );
     res.set_version_info(winresource::VersionInfo::FILEVERSION, packed);
     res.set_version_info(winresource::VersionInfo::PRODUCTVERSION, packed);

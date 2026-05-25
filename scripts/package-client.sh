@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/package-client.sh
 #
-# Build a hardened release bundle of the memstroy-inator editor for
+# Build a hardened release bundle of the Memstroy-inator editor for
 # distribution to clients. The output is a self-contained directory
 # the operator can zip and ship.
 #
@@ -17,7 +17,7 @@
 #
 # What the bundle ships:
 #   * `bin/memstroy-gui` (+ `bin/memstroy` CLI) — that's it.
-#   * `examples/`, `README.md` and a small launcher `memstroy-inator.sh`.
+#   * `examples/`, `README.md` and a small launcher `Memstroy-inator.sh`.
 #
 # What the bundle deliberately does NOT ship:
 #   * Any `assets/` directory. Client builds load every clip / image /
@@ -41,7 +41,7 @@
 # Optional:
 #   --out <path>         Output directory (default: ./dist).
 #   --name <name>        Bundle name (default:
-#                        memstroy-inator-<os>-<arch>-<version>).
+#                        Memstroy-inator-<os>-<arch>-<version>).
 #   --zip                Also produce <bundle-name>.zip alongside the
 #                        directory.
 #   --allow-loopback     Allow `--server-url` to point at 127.* / ::1
@@ -62,7 +62,7 @@ cd "${ROOT_DIR}"
 OS_NAME="$(uname -s | tr '[:upper:]' '[:lower:]')"
 ARCH_NAME="$(uname -m)"
 VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/' || echo "dev")"
-DEFAULT_NAME="memstroy-inator-${OS_NAME}-${ARCH_NAME}-${VERSION}"
+DEFAULT_NAME="Memstroy-inator-${OS_NAME}-${ARCH_NAME}-${VERSION}"
 
 OUT_DIR="${ROOT_DIR}/dist"
 BUNDLE_NAME="${DEFAULT_NAME}"
@@ -117,7 +117,7 @@ esac
 
 BUNDLE_DIR="${OUT_DIR}/${BUNDLE_NAME}"
 
-echo "==> memstroy-inator client packager"
+echo "==> Memstroy-inator client packager"
 echo "    workspace  : ${ROOT_DIR}"
 echo "    bundle     : ${BUNDLE_DIR}"
 echo "    server URL : ${SERVER_URL}"
@@ -196,9 +196,9 @@ fi
 # directory — there isn't one in client mode. The editor reads its
 # cache from `~/.memstroy/cache/` regardless of where the launcher was
 # invoked from, so we just exec the binary.
-cat > "${BUNDLE_DIR}/memstroy-inator.sh" <<'LAUNCH'
+cat > "${BUNDLE_DIR}/Memstroy-inator.sh" <<'LAUNCH'
 #!/usr/bin/env bash
-# Launch the memstroy-inator editor.
+# Launch the Memstroy-inator editor.
 #
 # All assets are fetched from the configured assets-server on demand
 # and cached under ~/.memstroy/cache/. Override the server URL through
@@ -208,7 +208,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 exec "${SCRIPT_DIR}/bin/memstroy-gui" "$@"
 LAUNCH
-chmod +x "${BUNDLE_DIR}/memstroy-inator.sh"
+chmod +x "${BUNDLE_DIR}/Memstroy-inator.sh"
 
 # ─── Optional zip ────────────────────────────────────────────────────
 if [[ "${MAKE_ZIP}" -eq 1 ]]; then
@@ -218,4 +218,4 @@ if [[ "${MAKE_ZIP}" -eq 1 ]]; then
 fi
 
 echo "==> done"
-echo "    run with: ${BUNDLE_DIR}/memstroy-inator.sh"
+echo "    run with: ${BUNDLE_DIR}/Memstroy-inator.sh"

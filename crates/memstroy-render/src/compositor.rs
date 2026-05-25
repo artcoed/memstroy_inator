@@ -1,0 +1,2009 @@
+//! CPU-side frame compositor — guaranteed pixel parity with the canvas.
+//!
+//! ## Why this exists
+//!
+//! The previous renderer leaned entirely on FFmpeg's filter graph
+//! (`overlay`, `chromakey`, `eq`, `colorbalance`, `rotate`, …). It
+//! produced output that frequently disagreed with the canvas preview
+//! by enough that users couldn't trust what they were seeing — the
+//! recurring complaint that "выходное изображение не похоже на
+//! выделенную область на холсте". The two pipelines used different
+//! sampling, easing approximations, and rotation models, and any
+//! single inconsistency cascaded through the per-pixel result.
+//!
+//! This module composes every output frame on the CPU using the same
+//! math the canvas snapshot rasterizer uses (`frame_snapshot` in
+//! `memstroy-gui`). Frames are then piped into FFmpeg via stdin for
+//! encoding to MP4 — FFmpeg sees only a raw RGBA stream, no filter
+//! graph involved. Result: bit-exact match between
+//! `frame_snapshot::compose_frame` (which is what the canvas paints)
+//! and the rendered MP4.
+//!
+//! ## Pipeline shape
+//!
+//! 1. `extract_video_clips` — for every distinct video source in the
+//!    scene, extract ONLY the frames we'll actually need (clipped to
+//!    `[t_in, t_out]` and the source's `duration`) at the output's
+//!    `fps`. Frames land in `<temp>/memstroy-cpu-cache-…/000001.jpg`.
+//!    This step is the single largest time cost of a render; we
+//!    parallelise across distinct sources and emit live progress so
+//!    the UI never freezes at "0%" for ages.
+//!
+//! 2. `compose_frame` per output frame — sample every actor /
+//!    overlay's animated state at scene-time `t`, world-pixel
+//!    transform via `world_to_output` (mirrors `frame_snapshot`),
+//!    composite onto a fresh `RgbaImage` of the output resolution.
+//!
+//! 3. Each composed frame is fed into a long-running FFmpeg encoder
+//!    process via stdin (`-f rawvideo -pix_fmt rgba`). The encoder
+//!    does the heavy YUV / x264 work in parallel with the next
+//!    frame's compositing — the rendering loop and the encoder's
+//!    pipeline overlap.
+//!
+//! 4. Audio is muxed in via a second FFmpeg invocation that uses the
+//!    legacy filter-graph path (which was already working for
+//!    audio); the two MP4 streams are then `-c copy`-muxed.
+//!
+//! ## Progress reporting
+//!
+//! `render_scene_cpu` invokes its `progress_cb` parameter at every
+//! meaningful step (extraction start / per-source completion / per
+//! composed frame / encoder finalisation). The closure itself must
+//! be cheap because it's hit hundreds of times during a render; the
+//! GUI converts the messages into a percentage + status line.
+//!
+//! ## What's covered
+//!
+//! - **Backgrounds** — solid color, image, video (all `Fit` modes)
+//! - **Actor clips** — chromakey + color correction + opacity
+//!   + scale + rotation + flips, sampled at the correct scene-time
+//! - **Image overlays** — full transform pipeline + chromakey mask
+//! - **Video overlays** — frame extraction + chromakey + transform
+//! - **Text overlays** — routed through `text_rasterize::rasterize_text_overlay`
+//! - **Render frame** — pos / zoom / rotation animated camera
+//! - **Easing / modifiers** — uses `keyframe::sample` /
+//!   `evaluate_modifiers` directly, no expression rewriting
+//! - **z_order** — actors and overlays interleave by z_order
+//!
+//! ## Out of scope (deferred)
+//!
+//! - **Per-element effect stack (blur, glow, mask, …)** — for now
+//!   scenes that use these get a clear log warning and the effects
+//!   are skipped. The layout still composes correctly.
+
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+use anyhow::{anyhow, Context, Result};
+use image::{Rgba, RgbaImage};
+use memstroy_core::{
+    canvas::WorldPos, keyframe, ChromaKeyParams, ColorCorrection, Fit, MediaSource, Overlay,
+    RenderFrame, RenderFrameState, Scene,
+};
+use tracing::{info, warn};
+
+use crate::proc;
+
+// ─── PROGRESS REPORTING ─────────────────────────────────────────────
+
+/// Live progress events emitted by the compositor. The renderer
+/// thread builds these and forwards them to the calling code via the
+/// `progress_cb` closure. Keep variants small — every string here
+/// gets re-encoded into a `JobEvent::RenderLog` on the GUI side.
+#[derive(Debug, Clone)]
+pub enum Progress {
+    /// One-line status update with a free-form message and an
+    /// optional 0..100 percentage.
+    Stage { message: String, percent: f32 },
+    /// One frame has been composed and pushed to the encoder.
+    Frame { index: usize, total: usize },
+}
+
+impl Progress {
+    pub fn to_log_line(&self) -> String {
+        match self {
+            Progress::Stage { message, percent } => {
+                format!("[{:5.1}%] {}", percent, message)
+            }
+            Progress::Frame { index, total } => {
+                let pct = (*index as f32 / (*total).max(1) as f32) * 100.0;
+                format!("frame {}/{} ({:.1}%)", index, total, pct)
+            }
+        }
+    }
+}
+
+// ─── ENTRY POINTS ────────────────────────────────────────────────────
+
+/// Render the full scene to `output_path` as MP4 using the CPU
+/// compositor.
+///
+/// `progress_cb` is called from the rendering thread on every
+/// meaningful step (extraction stage, frame encoded, mux done). The
+/// callback closure must be `Send` because it is dispatched from a
+/// `spawn_blocking` worker; it should be cheap (forwarding to a
+/// channel is the typical implementation).
+pub fn render_scene_cpu<F>(
+    scene: &Scene,
+    assets_root: &Path,
+    output_path: &Path,
+    mut progress_cb: F,
+) -> Result<()>
+where
+    F: FnMut(Progress) + Send,
+{
+    let canonical = canonicalise_scene(scene);
+    let [out_w, out_h] = canonical.output.resolution;
+    let fps = canonical.output.fps.max(1);
+    let duration = canonical.output.duration.max(1.0 / fps as f32);
+    let total_frames = ((duration * fps as f32).ceil() as usize).max(1);
+
+    info!(
+        out_w,
+        out_h,
+        fps,
+        total_frames,
+        "starting CPU render pipeline",
+    );
+    progress_cb(Progress::Stage {
+        message: format!(
+            "Rendering {}×{} @ {}fps, {} frames",
+            out_w, out_h, fps, total_frames
+        ),
+        percent: 0.0,
+    });
+
+    // ── Stage 1: extract video frames ──
+    let mut clip_caches: ClipCacheStore = ClipCacheStore::default();
+    extract_video_clips(
+        &canonical,
+        assets_root,
+        fps,
+        &mut clip_caches,
+        &mut progress_cb,
+    )?;
+
+    // ── Stage 2: compose + encode per frame ──
+    progress_cb(Progress::Stage {
+        message: format!("Encoding {} frames...", total_frames),
+        percent: 5.0,
+    });
+
+    let mut encoder = spawn_encoder(out_w, out_h, fps, output_path)?;
+
+    // Drain the encoder's stderr in a background thread so it never
+    // fills its pipe buffer (which would deadlock the encoder when
+    // it tries to flush a warning while we're blocked on stdin).
+    // The buffered output is also surfaced if the encoder errors out
+    // mid-render.
+    let stderr_handle = if let Some(stderr) = encoder.stderr.take() {
+        Some(spawn_stderr_drain(stderr))
+    } else {
+        None
+    };
+
+    // Buffer reused for every frame so we don't re-allocate 8 MB / frame.
+    let frame_byte_count = (out_w as usize) * (out_h as usize) * 4;
+
+    for frame_idx in 0..total_frames {
+        let t = (frame_idx as f32) / (fps as f32);
+        let mut canvas = RgbaImage::from_pixel(
+            out_w,
+            out_h,
+            Rgba(rgba_from_color(canonical.output.background_color, 255)),
+        );
+        compose_frame(&canonical, assets_root, &clip_caches, t, &mut canvas);
+        flatten_to_opaque(&mut canvas, canonical.output.background_color);
+
+        debug_assert_eq!(canvas.as_raw().len(), frame_byte_count);
+        let stdin = encoder
+            .stdin
+            .as_mut()
+            .ok_or_else(|| anyhow!("ffmpeg encoder stdin closed unexpectedly"))?;
+        if let Err(e) = stdin.write_all(canvas.as_raw()) {
+            // Stdin errored — encoder may have died. Capture stderr
+            // for diagnostics before bubbling the error up.
+            let stderr_msg = collect_drained_stderr(&stderr_handle);
+            return Err(anyhow!(
+                "ffmpeg encoder stdin write failed at frame {}/{}: {}.\n\
+                 Encoder stderr (last lines):\n{}",
+                frame_idx,
+                total_frames,
+                e,
+                stderr_msg
+            ));
+        }
+
+        progress_cb(Progress::Frame {
+            index: frame_idx + 1,
+            total: total_frames,
+        });
+    }
+
+    // Close stdin so the encoder flushes.
+    drop(encoder.stdin.take());
+    progress_cb(Progress::Stage {
+        message: "Finalising MP4 (encoder flush)...".into(),
+        percent: 90.0,
+    });
+    let status = encoder
+        .wait()
+        .context("wait for ffmpeg encoder process")?;
+    if !status.success() {
+        let stderr_msg = collect_drained_stderr(&stderr_handle);
+        return Err(anyhow!(
+            "ffmpeg encoder exited with status {:?}.\n\
+             Encoder stderr (last lines):\n{}",
+            status.code(),
+            stderr_msg
+        ));
+    }
+    // Drop the stderr handle so the drain thread shuts down.
+    drop(stderr_handle);
+
+    // ── Stage 3: mux audio (best-effort) ──
+    //
+    // Was previously gated on `!canonical.audio.is_empty()`, which
+    // skipped the audio mux entirely whenever the scene had no
+    // explicit `AudioTrack` rows — even if every actor video clip
+    // carried an embedded soundtrack the GUI preview was happily
+    // playing. The legacy filtergraph plan now folds actor source
+    // soundtracks into the audio mix when no AudioTrack already
+    // covers the same source path (mirroring `app.rs::build_sources`
+    // for the engine), so we always attempt the mux when at least
+    // one audio source exists. `build_plan` returns `map_audio = None`
+    // when nothing was produced, which `mux_audio` short-circuits
+    // on cheaply.
+    let scene_has_audio_source = !canonical.audio.is_empty()
+        || canonical.actors.iter().any(|a| a.visible);
+    if scene_has_audio_source {
+        progress_cb(Progress::Stage {
+            message: "Muxing audio tracks...".into(),
+            percent: 95.0,
+        });
+        if let Err(e) = mux_audio(&canonical, assets_root, output_path) {
+            warn!(error = %e, "audio mux failed — output has no sound");
+            progress_cb(Progress::Stage {
+                message: format!("Audio mux skipped ({})", e),
+                percent: 98.0,
+            });
+        }
+    }
+
+    clip_caches.cleanup();
+    progress_cb(Progress::Stage {
+        message: "Render complete.".into(),
+        percent: 100.0,
+    });
+    Ok(())
+}
+
+/// Render a single frame at time `t` to a PNG file. Used by the GUI
+/// scrubber.
+pub fn render_preview_frame_cpu(
+    scene: &Scene,
+    assets_root: &Path,
+    t: f32,
+    out_png: &Path,
+) -> Result<()> {
+    let canonical = canonicalise_scene(scene);
+    let [out_w, out_h] = canonical.output.resolution;
+    let fps = canonical.output.fps.max(1);
+
+    let mut clip_caches: ClipCacheStore = ClipCacheStore::default();
+    let mut noop = |_| {};
+    extract_video_clips(&canonical, assets_root, fps, &mut clip_caches, &mut noop)?;
+
+    let mut canvas = RgbaImage::from_pixel(
+        out_w,
+        out_h,
+        Rgba(rgba_from_color(canonical.output.background_color, 255)),
+    );
+    compose_frame(&canonical, assets_root, &clip_caches, t, &mut canvas);
+    flatten_to_opaque(&mut canvas, canonical.output.background_color);
+    canvas
+        .save(out_png)
+        .with_context(|| format!("save preview to {}", out_png.display()))?;
+
+    clip_caches.cleanup();
+    Ok(())
+}
+
+// ─── SCENE CANONICALISATION ──────────────────────────────────────────
+
+fn canonicalise_scene(scene: &Scene) -> Scene {
+    // Same contract as the FFmpeg-path renderer: the render-frame's
+    // resolution is the single source of truth for output dimensions.
+    // The canvas preview's world-pixel math also keys off
+    // `render_frame.resolution`, so syncing here keeps the two
+    // pipelines pointing at the same reference rectangle.
+    let mut out = scene.clone();
+    out.output.resolution = out.render_frame.resolution;
+    out
+}
+
+// ─── COMPOSITOR ──────────────────────────────────────────────────────
+
+fn compose_frame(
+    scene: &Scene,
+    assets_root: &Path,
+    clip_caches: &ClipCacheStore,
+    t: f32,
+    canvas: &mut RgbaImage,
+) {
+    let rf = &scene.render_frame;
+    let [rw, rh] = rf.resolution;
+    let rf_state = sample_render_frame_eased(rf, t);
+
+    // ── Backgrounds ──
+    for bg in &scene.backgrounds {
+        if t < bg.start || t > bg.start + bg.duration {
+            continue;
+        }
+        match &bg.source {
+            MediaSource::SolidColor { color } => {
+                paint_solid_background(canvas, *color);
+            }
+            MediaSource::Image { path } => {
+                let resolved = resolve_path(assets_root, path);
+                if let Ok(layer) = image::open(&resolved).map(|i| i.to_rgba8()) {
+                    composite_fit(canvas, &layer, bg.fit, rw, rh);
+                } else {
+                    warn!(path = %resolved.display(), "missing/undecodable bg image");
+                }
+            }
+            MediaSource::Video { path, r#loop, start_at } => {
+                let local = (t - bg.start).max(0.0) + *start_at;
+                let resolved = resolve_path(assets_root, path);
+                if let Some(layer) = clip_caches.frame_at(&resolved, local, *r#loop) {
+                    composite_fit(canvas, &layer, bg.fit, rw, rh);
+                } else {
+                    warn!(path = %resolved.display(), "video bg frame unavailable");
+                }
+            }
+        }
+    }
+
+    // ── Actors and overlays interleaved by z_order ──
+    let mut paint_ops = build_paint_ops(scene);
+    paint_ops.sort_by(|a, b| {
+        a.z_order
+            .cmp(&b.z_order)
+            .then(a.secondary.cmp(&b.secondary))
+            .then(a.scene_index.cmp(&b.scene_index))
+    });
+
+    for op in paint_ops {
+        match op.kind {
+            PaintOpKind::Actor(idx) => {
+                paint_actor(scene, idx, assets_root, clip_caches, &rf_state, rw, rh, t, canvas);
+            }
+            PaintOpKind::OverlayImage(idx) => {
+                paint_image_overlay(scene, idx, assets_root, &rf_state, rw, rh, t, canvas);
+            }
+            PaintOpKind::OverlayText(idx) => {
+                paint_text_overlay(scene, idx, &rf_state, rw, rh, t, canvas);
+            }
+            PaintOpKind::OverlayVideo(idx) => {
+                paint_video_overlay(scene, idx, assets_root, clip_caches, &rf_state, rw, rh, t, canvas);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PaintOp {
+    z_order: i32,
+    secondary: i32,
+    scene_index: usize,
+    kind: PaintOpKind,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PaintOpKind {
+    Actor(usize),
+    OverlayImage(usize),
+    OverlayText(usize),
+    OverlayVideo(usize),
+}
+
+fn build_paint_ops(scene: &Scene) -> Vec<PaintOp> {
+    let any_explicit = scene.actors.iter().any(|a| a.z_order != 0)
+        || scene.overlays.iter().any(|ov| match ov {
+            Overlay::Text(t) => t.z_order != 0,
+            Overlay::Image(i) => i.z_order != 0,
+            Overlay::Video(v) => v.z_order != 0,
+        });
+
+    let mut ops = Vec::with_capacity(scene.actors.len() + scene.overlays.len());
+
+    for (i, a) in scene.actors.iter().enumerate() {
+        let z = if any_explicit { a.z_order } else { 100 };
+        ops.push(PaintOp {
+            z_order: z,
+            secondary: 0,
+            scene_index: i,
+            kind: PaintOpKind::Actor(i),
+        });
+    }
+    for (i, ov) in scene.overlays.iter().enumerate() {
+        let (z, sec, kind) = if any_explicit {
+            let z = match ov {
+                Overlay::Text(t) => t.z_order,
+                Overlay::Image(o) => o.z_order,
+                Overlay::Video(v) => v.z_order,
+            };
+            let sec = match ov {
+                Overlay::Text(t) => t.z_index,
+                _ => 100,
+            };
+            let kind = match ov {
+                Overlay::Text(_) => PaintOpKind::OverlayText(i),
+                Overlay::Image(_) => PaintOpKind::OverlayImage(i),
+                Overlay::Video(_) => PaintOpKind::OverlayVideo(i),
+            };
+            (z, sec, kind)
+        } else {
+            // Legacy fallback: text-behind-actors below, others above.
+            match ov {
+                Overlay::Text(t) if t.behind_actors => {
+                    (0, t.z_index, PaintOpKind::OverlayText(i))
+                }
+                Overlay::Text(t) => (200, t.z_index, PaintOpKind::OverlayText(i)),
+                Overlay::Image(_) => (200, 100, PaintOpKind::OverlayImage(i)),
+                Overlay::Video(_) => (200, 100, PaintOpKind::OverlayVideo(i)),
+            }
+        };
+        ops.push(PaintOp {
+            z_order: z,
+            secondary: sec,
+            scene_index: i,
+            kind,
+        });
+    }
+    ops
+}
+
+// ─── HELPERS — RENDER FRAME / WORLD ─────────────────────────────────
+
+fn sample_render_frame_eased(rf: &RenderFrame, t: f32) -> RenderFrameState {
+    let mut s = keyframe::sample(&rf.layout, t).unwrap_or_default();
+    if rf.modifiers.is_empty() {
+        return s;
+    }
+    let delta = keyframe::evaluate_modifiers(&rf.modifiers, t);
+    s.pos.x += delta.dx;
+    s.pos.y += delta.dy;
+    s.rotation_deg += delta.d_rotation_deg;
+    if delta.d_scale.abs() > 1e-4 {
+        let mult = (1.0 + delta.d_scale).max(1.0e-3);
+        s.zoom = (s.zoom / mult).max(1.0e-3);
+    }
+    s
+}
+
+/// World → output mapping. Mirrors `frame_snapshot::world_to_output`.
+fn world_to_output(world: WorldPos, rf_state: &RenderFrameState, rw: u32, rh: u32) -> (f32, f32) {
+    let dx = world.x - rf_state.pos.x;
+    let dy = world.y - rf_state.pos.y;
+    let theta = -rf_state.rotation_deg.to_radians();
+    let cos_t = theta.cos();
+    let sin_t = theta.sin();
+    let rx = dx * cos_t - dy * sin_t;
+    let ry = dx * sin_t + dy * cos_t;
+    let zoom = rf_state.zoom.max(1.0e-3);
+    let ox = (rw as f32) * 0.5 + rx * zoom;
+    let oy = (rh as f32) * 0.5 + ry * zoom;
+    (ox, oy)
+}
+
+fn element_world_pos(scene: &Scene, element_id: &str, t: f32) -> Option<WorldPos> {
+    let cl = scene
+        .canvas_layouts
+        .iter()
+        .find(|cl| cl.element_id == element_id)?;
+    let transform = keyframe::sample(&cl.keyframes, t)?;
+    Some(transform.pos)
+}
+
+fn resolve_path(root: &Path, p: &Path) -> PathBuf {
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        root.join(p)
+    }
+}
+
+// ─── PAINT — ACTOR ──────────────────────────────────────────────────
+
+fn paint_actor(
+    scene: &Scene,
+    actor_idx: usize,
+    assets_root: &Path,
+    clip_caches: &ClipCacheStore,
+    rf_state: &RenderFrameState,
+    rw: u32,
+    rh: u32,
+    t: f32,
+    canvas: &mut RgbaImage,
+) {
+    let actor = match scene.actors.get(actor_idx) {
+        Some(a) => a,
+        None => return,
+    };
+    if !actor.visible {
+        return;
+    }
+    let scene_dur = scene.output.duration;
+    let t_in = actor.t_in.unwrap_or(0.0);
+    let t_out = actor.t_out.unwrap_or(scene_dur);
+    if t < t_in || t > t_out {
+        return;
+    }
+
+    // Sample state with modifiers — same recipe as canvas_preview's actor pass.
+    let mut actor_state = keyframe::sample(&actor.layout, t).unwrap_or_default();
+    let mod_delta = keyframe::evaluate_modifiers(&actor.modifiers, t - t_in);
+    actor_state.scale = (actor_state.scale + mod_delta.d_scale).max(0.001);
+    actor_state.rotation_deg += mod_delta.d_rotation_deg;
+
+    // Pull the frame for this scene-time from the pre-extracted cache.
+    let speed = actor.speed.max(1.0e-4);
+    let local_t = (t - t_in) * speed + actor.source_start;
+    let resolved = resolve_path(assets_root, &actor.source);
+    let mut layer = match clip_caches.frame_at(&resolved, local_t, actor.loop_source) {
+        Some(img) => img,
+        None => return,
+    };
+    let src_w = layer.width();
+    let src_h = layer.height();
+    if src_w == 0 || src_h == 0 {
+        return;
+    }
+
+    // Apply chromakey + colour correction in place.
+    let cc_local_t = (t - t_in).max(0.0);
+    let cc = actor.color_correction.sampled_at(cc_local_t);
+    apply_chroma_and_cc(&mut layer, &actor.chroma_key, &cc);
+
+    // World position: skeleton attachment overrides → canvas_layouts → legacy.
+    // Skeleton attachments aren't supported in the CPU compositor yet.
+    let world_pos = element_world_pos(scene, &actor.id, t).unwrap_or_else(|| WorldPos {
+        x: actor_state.pos[0] * rw as f32,
+        y: actor_state.pos[1] * rh as f32,
+    });
+    let world_pos = WorldPos {
+        x: world_pos.x + mod_delta.dx,
+        y: world_pos.y + mod_delta.dy,
+    };
+    let (cx, cy) = world_to_output(world_pos, rf_state, rw, rh);
+
+    let combined_x = if actor.flip_horizontal {
+        -actor_state.flip_x_anim
+    } else {
+        actor_state.flip_x_anim
+    };
+    let combined_y = actor_state.flip_y_anim;
+    let flip_x = combined_x < 0.0;
+    let flip_y = combined_y < 0.0;
+    let abs_fx = combined_x.abs().max(0.02);
+    let abs_fy = combined_y.abs().max(0.02);
+
+    let out_w = (src_w as f32) * actor_state.scale * abs_fx * rf_state.zoom;
+    let out_h =
+        (src_h as f32) * actor_state.scale * actor_state.scale_y * abs_fy * rf_state.zoom;
+    let rotation_rad = (actor_state.rotation_deg - rf_state.rotation_deg).to_radians();
+
+    paint_layer_rgba(
+        canvas,
+        &layer,
+        cx,
+        cy,
+        out_w,
+        out_h,
+        rotation_rad,
+        flip_x,
+        flip_y,
+        actor_state.opacity,
+    );
+}
+
+// ─── PAINT — IMAGE OVERLAY ──────────────────────────────────────────
+
+fn paint_image_overlay(
+    scene: &Scene,
+    overlay_idx: usize,
+    assets_root: &Path,
+    rf_state: &RenderFrameState,
+    rw: u32,
+    rh: u32,
+    t: f32,
+    canvas: &mut RgbaImage,
+) {
+    let img_ov = match scene.overlays.get(overlay_idx) {
+        Some(Overlay::Image(o)) => o,
+        _ => return,
+    };
+    if t < img_ov.t_in || t > img_ov.t_out {
+        return;
+    }
+    let sample_t = t - img_ov.t_in;
+    let mut ov_state = keyframe::sample(&img_ov.layout, sample_t).unwrap_or_default();
+    let mod_delta = keyframe::evaluate_modifiers(&img_ov.modifiers, sample_t);
+    ov_state.scale = (ov_state.scale + mod_delta.d_scale).max(0.001);
+    ov_state.rotation_deg += mod_delta.d_rotation_deg;
+
+    let resolved = resolve_path(assets_root, &img_ov.source);
+    let mut layer = match image::open(&resolved) {
+        Ok(img) => img.to_rgba8(),
+        Err(_) => {
+            warn!(path = %resolved.display(), "missing image overlay source");
+            return;
+        }
+    };
+    if let Some(ck) = &img_ov.chroma_key {
+        apply_chroma_and_cc(&mut layer, ck, &ColorCorrection::default());
+    }
+    let src_w = layer.width();
+    let src_h = layer.height();
+    if src_w == 0 || src_h == 0 {
+        return;
+    }
+
+    let world_pos = element_world_pos(scene, &img_ov.id, t).unwrap_or_else(|| WorldPos {
+        x: ov_state.pos[0] * rw as f32,
+        y: ov_state.pos[1] * rh as f32,
+    });
+    let world_pos = WorldPos {
+        x: world_pos.x + mod_delta.dx,
+        y: world_pos.y + mod_delta.dy,
+    };
+    let (cx, cy) = world_to_output(world_pos, rf_state, rw, rh);
+
+    let abs_fx = ov_state.flip_x_anim.abs().max(0.02);
+    let abs_fy = ov_state.flip_y_anim.abs().max(0.02);
+    let out_w = (src_w as f32) * ov_state.scale * abs_fx * rf_state.zoom;
+    let out_h =
+        (src_h as f32) * ov_state.scale * ov_state.scale_y * abs_fy * rf_state.zoom;
+    let rotation_rad = (ov_state.rotation_deg - rf_state.rotation_deg).to_radians();
+    let flip_x = ov_state.flip_x_anim < 0.0;
+    let flip_y = ov_state.flip_y_anim < 0.0;
+
+    paint_layer_rgba(
+        canvas,
+        &layer,
+        cx,
+        cy,
+        out_w,
+        out_h,
+        rotation_rad,
+        flip_x,
+        flip_y,
+        ov_state.opacity,
+    );
+}
+
+// ─── PAINT — VIDEO OVERLAY ──────────────────────────────────────────
+
+fn paint_video_overlay(
+    scene: &Scene,
+    overlay_idx: usize,
+    assets_root: &Path,
+    clip_caches: &ClipCacheStore,
+    rf_state: &RenderFrameState,
+    rw: u32,
+    rh: u32,
+    t: f32,
+    canvas: &mut RgbaImage,
+) {
+    let vid = match scene.overlays.get(overlay_idx) {
+        Some(Overlay::Video(v)) => v,
+        _ => return,
+    };
+    if t < vid.t_in || t > vid.t_out {
+        return;
+    }
+    let sample_t = t - vid.t_in;
+    let mut ov_state = keyframe::sample(&vid.layout, sample_t).unwrap_or_default();
+    let mod_delta = keyframe::evaluate_modifiers(&vid.modifiers, sample_t);
+    ov_state.scale = (ov_state.scale + mod_delta.d_scale).max(0.001);
+    ov_state.rotation_deg += mod_delta.d_rotation_deg;
+
+    let speed = vid.speed.max(1.0e-4);
+    let local_t = sample_t * speed + vid.source_start;
+    let resolved = resolve_path(assets_root, &vid.source);
+    let mut layer = match clip_caches.frame_at(&resolved, local_t, vid.loop_source) {
+        Some(img) => img,
+        None => return,
+    };
+    if let Some(ck) = &vid.chroma_key {
+        apply_chroma_and_cc(&mut layer, ck, &ColorCorrection::default());
+    }
+    let src_w = layer.width();
+    let src_h = layer.height();
+    if src_w == 0 || src_h == 0 {
+        return;
+    }
+
+    let world_pos = element_world_pos(scene, &vid.id, t).unwrap_or_else(|| WorldPos {
+        x: ov_state.pos[0] * rw as f32,
+        y: ov_state.pos[1] * rh as f32,
+    });
+    let world_pos = WorldPos {
+        x: world_pos.x + mod_delta.dx,
+        y: world_pos.y + mod_delta.dy,
+    };
+    let (cx, cy) = world_to_output(world_pos, rf_state, rw, rh);
+
+    let abs_fx = ov_state.flip_x_anim.abs().max(0.02);
+    let abs_fy = ov_state.flip_y_anim.abs().max(0.02);
+    let out_w = (src_w as f32) * ov_state.scale * abs_fx * rf_state.zoom;
+    let out_h = (src_h as f32) * ov_state.scale * ov_state.scale_y * abs_fy * rf_state.zoom;
+    let rotation_rad = (ov_state.rotation_deg - rf_state.rotation_deg).to_radians();
+    let flip_x = ov_state.flip_x_anim < 0.0;
+    let flip_y = ov_state.flip_y_anim < 0.0;
+
+    paint_layer_rgba(
+        canvas,
+        &layer,
+        cx,
+        cy,
+        out_w,
+        out_h,
+        rotation_rad,
+        flip_x,
+        flip_y,
+        ov_state.opacity,
+    );
+}
+
+// ─── PAINT — TEXT OVERLAY ───────────────────────────────────────────
+
+fn paint_text_overlay(
+    scene: &Scene,
+    overlay_idx: usize,
+    rf_state: &RenderFrameState,
+    rw: u32,
+    rh: u32,
+    t: f32,
+    canvas: &mut RgbaImage,
+) {
+    let txt = match scene.overlays.get(overlay_idx) {
+        Some(Overlay::Text(t)) => t,
+        _ => return,
+    };
+    if t < txt.t_in || t > txt.t_out {
+        return;
+    }
+    let sample_t = t - txt.t_in;
+    let mut ov_state = keyframe::sample(&txt.layout, sample_t).unwrap_or_default();
+    let mod_delta = keyframe::evaluate_modifiers(&txt.modifiers, sample_t);
+    ov_state.scale = (ov_state.scale + mod_delta.d_scale).max(0.001);
+    ov_state.rotation_deg += mod_delta.d_rotation_deg;
+
+    let raster = match crate::text_rasterize::rasterize_text_overlay(txt, rw, rh) {
+        Ok(Some(r)) => r,
+        Ok(None) => return,
+        Err(e) => {
+            warn!(error = %e, "text rasterise failed");
+            return;
+        }
+    };
+    let layer = match image::open(&raster.png_path).map(|i| i.to_rgba8()) {
+        Ok(img) => img,
+        Err(_) => {
+            let _ = std::fs::remove_file(&raster.png_path);
+            return;
+        }
+    };
+    let png_w = raster.width as f32;
+    let png_h = raster.height as f32;
+    if png_w < 1.0 || png_h < 1.0 {
+        let _ = std::fs::remove_file(&raster.png_path);
+        return;
+    }
+
+    let world_w = rw as f32;
+    let world_h = rh as f32;
+    let world_pos = WorldPos {
+        x: ov_state.pos[0] * world_w + mod_delta.dx,
+        y: ov_state.pos[1] * world_h + mod_delta.dy,
+    };
+    let (cx, cy) = world_to_output(world_pos, rf_state, rw, rh);
+
+    let abs_fx = ov_state.flip_x_anim.abs().max(0.02);
+    let abs_fy = ov_state.flip_y_anim.abs().max(0.02);
+    let scale_x = ov_state.scale * abs_fx * rf_state.zoom;
+    let scale_y = ov_state.scale * ov_state.scale_y * abs_fy * rf_state.zoom;
+    let out_w = png_w * scale_x;
+    let out_h = png_h * scale_y;
+
+    let mut local_dx = raster.anchor_dx_from_left - png_w * 0.5;
+    let mut local_dy = raster.anchor_dy_from_top - png_h * 0.5;
+    let flip_x = ov_state.flip_x_anim < 0.0;
+    let flip_y = ov_state.flip_y_anim < 0.0;
+    if flip_x {
+        local_dx = -local_dx;
+    }
+    if flip_y {
+        local_dy = -local_dy;
+    }
+    let out_dx = local_dx * scale_x;
+    let out_dy = local_dy * scale_y;
+    let rotation_rad = (ov_state.rotation_deg - rf_state.rotation_deg).to_radians();
+    let cos_r = rotation_rad.cos();
+    let sin_r = rotation_rad.sin();
+    let rot_dx = out_dx * cos_r - out_dy * sin_r;
+    let rot_dy = out_dx * sin_r + out_dy * cos_r;
+
+    paint_layer_rgba(
+        canvas,
+        &layer,
+        cx - rot_dx,
+        cy - rot_dy,
+        out_w,
+        out_h,
+        rotation_rad,
+        flip_x,
+        flip_y,
+        ov_state.opacity,
+    );
+
+    let _ = std::fs::remove_file(&raster.png_path);
+}
+
+// ─── BACKGROUND HELPERS ─────────────────────────────────────────────
+
+fn paint_solid_background(canvas: &mut RgbaImage, color: [u8; 3]) {
+    for px in canvas.pixels_mut() {
+        *px = Rgba([color[0], color[1], color[2], 255]);
+    }
+}
+
+fn composite_fit(canvas: &mut RgbaImage, layer: &RgbaImage, fit: Fit, rw: u32, rh: u32) {
+    if rw == 0 || rh == 0 {
+        return;
+    }
+    let lw = layer.width().max(1);
+    let lh = layer.height().max(1);
+    let aspect_layer = lw as f32 / lh as f32;
+    let aspect_canvas = rw as f32 / rh as f32;
+
+    let (target_w, target_h) = match fit {
+        Fit::Stretch => (rw as f32, rh as f32),
+        Fit::Cover => {
+            if aspect_layer > aspect_canvas {
+                (rh as f32 * aspect_layer, rh as f32)
+            } else {
+                (rw as f32, rw as f32 / aspect_layer)
+            }
+        }
+        Fit::Contain => {
+            if aspect_layer > aspect_canvas {
+                (rw as f32, rw as f32 / aspect_layer)
+            } else {
+                (rh as f32 * aspect_layer, rh as f32)
+            }
+        }
+        Fit::Original => (lw as f32, lh as f32),
+    };
+    let cx = rw as f32 * 0.5;
+    let cy = rh as f32 * 0.5;
+    paint_layer_rgba(canvas, layer, cx, cy, target_w, target_h, 0.0, false, false, 1.0);
+}
+
+// ─── CHROMAKEY + COLOR CORRECTION (FFmpeg-faithful) ─────────────────
+
+fn apply_chroma_and_cc(layer: &mut RgbaImage, ck: &ChromaKeyParams, cc: &ColorCorrection) {
+    let similarity = if ck.similarity.is_finite() {
+        ck.similarity.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let blend = if ck.blend.is_finite() {
+        ck.blend.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let spill = if ck.spill.is_finite() {
+        ck.spill.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let chroma_active = similarity >= 1.0e-5;
+    let (key_cb, key_cr) = rgb_to_cbcr_bt601(ck.key_color);
+    let dist_norm = 255.0 * std::f32::consts::SQRT_2;
+
+    let cc_active = !cc.is_identity();
+    let gain = [
+        cc.gain[0].max(0.0),
+        cc.gain[1].max(0.0),
+        cc.gain[2].max(0.0),
+    ];
+    let inv_gamma = [
+        1.0 / cc.gamma[0].max(0.05),
+        1.0 / cc.gamma[1].max(0.05),
+        1.0 / cc.gamma[2].max(0.05),
+    ];
+
+    for px in layer.pixels_mut() {
+        let r = px.0[0] as f32;
+        let g = px.0[1] as f32;
+        let b = px.0[2] as f32;
+
+        // Match `video_cache::apply_effects_cpu` semantics exactly:
+        // when chromakey is disabled, `alpha = 1.0` (treat the frame
+        // as fully opaque). When active, the alpha is the per-pixel
+        // keep factor derived from the BT.601 Cb/Cr distance.
+        let alpha = if !chroma_active {
+            1.0
+        } else {
+            let cb = -0.169 * r - 0.331 * g + 0.500 * b + 128.0;
+            let cr = 0.500 * r - 0.419 * g - 0.081 * b + 128.0;
+            let du = cb - key_cb;
+            let dv = cr - key_cr;
+            let diff = (du * du + dv * dv).sqrt() / dist_norm;
+            if diff < similarity {
+                0.0
+            } else if blend > 0.0 && diff < similarity + blend {
+                ((diff - similarity) / blend).clamp(0.0, 1.0)
+            } else {
+                1.0
+            }
+        };
+
+        let (mut or_, mut og, mut ob) = (r, g, b);
+        if alpha > 0.0 && spill > 0.0 && g > (r + b) * 0.5 {
+            let avg_rb = (r + b) * 0.5;
+            og = g - (g - avg_rb) * spill;
+        }
+
+        if cc_active {
+            // brightness/contrast/saturation/temperature
+            or_ = (or_ + cc.brightness * 255.0).clamp(0.0, 255.0);
+            og = (og + cc.brightness * 255.0).clamp(0.0, 255.0);
+            ob = (ob + cc.brightness * 255.0).clamp(0.0, 255.0);
+            or_ = ((or_ - 128.0) * cc.contrast + 128.0).clamp(0.0, 255.0);
+            og = ((og - 128.0) * cc.contrast + 128.0).clamp(0.0, 255.0);
+            ob = ((ob - 128.0) * cc.contrast + 128.0).clamp(0.0, 255.0);
+            let gray = 0.299 * or_ + 0.587 * og + 0.114 * ob;
+            or_ = (gray + (or_ - gray) * cc.saturation).clamp(0.0, 255.0);
+            og = (gray + (og - gray) * cc.saturation).clamp(0.0, 255.0);
+            ob = (gray + (ob - gray) * cc.saturation).clamp(0.0, 255.0);
+            if cc.temperature != 0.0 {
+                or_ = (or_ + cc.temperature * 30.0).clamp(0.0, 255.0);
+                ob = (ob - cc.temperature * 30.0).clamp(0.0, 255.0);
+            }
+
+            // LGG (lift / gain / gamma)
+            let mut nr = or_ / 255.0;
+            let mut ng = og / 255.0;
+            let mut nb = ob / 255.0;
+            nr = nr + cc.lift[0] * (1.0 - nr);
+            ng = ng + cc.lift[1] * (1.0 - ng);
+            nb = nb + cc.lift[2] * (1.0 - nb);
+            nr = (nr * gain[0]).max(0.0);
+            ng = (ng * gain[1]).max(0.0);
+            nb = (nb * gain[2]).max(0.0);
+            nr = nr.powf(inv_gamma[0]);
+            ng = ng.powf(inv_gamma[1]);
+            nb = nb.powf(inv_gamma[2]);
+            or_ = (nr * 255.0).clamp(0.0, 255.0);
+            og = (ng * 255.0).clamp(0.0, 255.0);
+            ob = (nb * 255.0).clamp(0.0, 255.0);
+        }
+
+        let a_out = (alpha * 255.0).clamp(0.0, 255.0) as u8;
+        px.0[0] = or_ as u8;
+        px.0[1] = og as u8;
+        px.0[2] = ob as u8;
+        px.0[3] = a_out;
+    }
+}
+
+#[inline]
+fn rgb_to_cbcr_bt601(rgb: [u8; 3]) -> (f32, f32) {
+    let r = rgb[0] as f32;
+    let g = rgb[1] as f32;
+    let b = rgb[2] as f32;
+    let cb = -0.169 * r - 0.331 * g + 0.500 * b + 128.0;
+    let cr = 0.500 * r - 0.419 * g - 0.081 * b + 128.0;
+    (cb, cr)
+}
+
+// ─── LAYER COMPOSITOR (inverse-mapping affine + bilinear) ──────────
+
+fn paint_layer_rgba(
+    canvas: &mut RgbaImage,
+    layer: &RgbaImage,
+    cx: f32,
+    cy: f32,
+    out_w: f32,
+    out_h: f32,
+    rotation_rad: f32,
+    flip_x: bool,
+    flip_y: bool,
+    opacity: f32,
+) {
+    let lw = layer.width();
+    let lh = layer.height();
+    if lw == 0 || lh == 0 || out_w < 0.5 || out_h < 0.5 || opacity <= 1.0e-3 {
+        return;
+    }
+    let cw = canvas.width() as i32;
+    let ch = canvas.height() as i32;
+    if cw == 0 || ch == 0 {
+        return;
+    }
+
+    let half_w = out_w * 0.5;
+    let half_h = out_h * 0.5;
+    let cos_r = rotation_rad.cos();
+    let sin_r = rotation_rad.sin();
+
+    let extent_x = half_w * cos_r.abs() + half_h * sin_r.abs();
+    let extent_y = half_w * sin_r.abs() + half_h * cos_r.abs();
+    let x_min = ((cx - extent_x).floor() as i32).max(0);
+    let x_max = ((cx + extent_x).ceil() as i32).min(cw - 1);
+    let y_min = ((cy - extent_y).floor() as i32).max(0);
+    let y_max = ((cy + extent_y).ceil() as i32).min(ch - 1);
+    if x_min > x_max || y_min > y_max {
+        return;
+    }
+
+    let inv_half_w = 1.0 / half_w;
+    let inv_half_h = 1.0 / half_h;
+    let lw_f = lw as f32;
+    let lh_f = lh as f32;
+    let opacity = opacity.clamp(0.0, 1.0);
+
+    for y in y_min..=y_max {
+        for x in x_min..=x_max {
+            let dx = (x as f32 + 0.5) - cx;
+            let dy = (y as f32 + 0.5) - cy;
+            let lx = dx * cos_r + dy * sin_r;
+            let ly = -dx * sin_r + dy * cos_r;
+            let mut nx = lx * inv_half_w;
+            let mut ny = ly * inv_half_h;
+            if flip_x {
+                nx = -nx;
+            }
+            if flip_y {
+                ny = -ny;
+            }
+            if nx < -1.0 || nx > 1.0 || ny < -1.0 || ny > 1.0 {
+                continue;
+            }
+            let u = (nx + 1.0) * 0.5;
+            let v = (ny + 1.0) * 0.5;
+            let src_x = u * lw_f - 0.5;
+            let src_y = v * lh_f - 0.5;
+            let sample = sample_bilinear(layer, src_x, src_y);
+            let src_a = (sample[3] as f32) * opacity;
+            if src_a < 0.5 {
+                continue;
+            }
+            let p = canvas.get_pixel_mut(x as u32, y as u32);
+            let dst_a = p[3] as f32;
+            let src_a_n = src_a / 255.0;
+            let inv_n = 1.0 - src_a_n;
+            let out_a = src_a + dst_a * inv_n;
+            if out_a < 1.0e-3 {
+                continue;
+            }
+            let out_r =
+                (sample[0] as f32 * src_a_n * 255.0 + p[0] as f32 * dst_a * inv_n) / out_a;
+            let out_g =
+                (sample[1] as f32 * src_a_n * 255.0 + p[1] as f32 * dst_a * inv_n) / out_a;
+            let out_b =
+                (sample[2] as f32 * src_a_n * 255.0 + p[2] as f32 * dst_a * inv_n) / out_a;
+            *p = Rgba([
+                out_r.clamp(0.0, 255.0) as u8,
+                out_g.clamp(0.0, 255.0) as u8,
+                out_b.clamp(0.0, 255.0) as u8,
+                out_a.clamp(0.0, 255.0) as u8,
+            ]);
+        }
+    }
+}
+
+fn sample_bilinear(img: &RgbaImage, x: f32, y: f32) -> [u8; 4] {
+    let w = img.width() as i32;
+    let h = img.height() as i32;
+    if w == 0 || h == 0 {
+        return [0, 0, 0, 0];
+    }
+    let x0 = x.floor() as i32;
+    let y0 = y.floor() as i32;
+    let x1 = x0 + 1;
+    let y1 = y0 + 1;
+    let fx = x - x0 as f32;
+    let fy = y - y0 as f32;
+    let get = |xx: i32, yy: i32| -> [f32; 4] {
+        let cx = xx.clamp(0, w - 1) as u32;
+        let cy = yy.clamp(0, h - 1) as u32;
+        let p = img.get_pixel(cx, cy).0;
+        [p[0] as f32, p[1] as f32, p[2] as f32, p[3] as f32]
+    };
+    let p00 = get(x0, y0);
+    let p10 = get(x1, y0);
+    let p01 = get(x0, y1);
+    let p11 = get(x1, y1);
+    let w00 = (1.0 - fx) * (1.0 - fy);
+    let w10 = fx * (1.0 - fy);
+    let w01 = (1.0 - fx) * fy;
+    let w11 = fx * fy;
+    let blend = |i: usize| -> u8 {
+        (p00[i] * w00 + p10[i] * w10 + p01[i] * w01 + p11[i] * w11)
+            .clamp(0.0, 255.0) as u8
+    };
+    [blend(0), blend(1), blend(2), blend(3)]
+}
+
+fn flatten_to_opaque(canvas: &mut RgbaImage, bg_color: [u8; 3]) {
+    for px in canvas.pixels_mut() {
+        let a = px.0[3] as f32 / 255.0;
+        if a >= 0.999 {
+            px.0[3] = 255;
+            continue;
+        }
+        let r = px.0[0] as f32 * a + bg_color[0] as f32 * (1.0 - a);
+        let g = px.0[1] as f32 * a + bg_color[1] as f32 * (1.0 - a);
+        let b = px.0[2] as f32 * a + bg_color[2] as f32 * (1.0 - a);
+        px.0[0] = r.clamp(0.0, 255.0) as u8;
+        px.0[1] = g.clamp(0.0, 255.0) as u8;
+        px.0[2] = b.clamp(0.0, 255.0) as u8;
+        px.0[3] = 255;
+    }
+}
+
+#[inline]
+fn rgba_from_color(c: [u8; 3], a: u8) -> [u8; 4] {
+    [c[0], c[1], c[2], a]
+}
+
+// ─── CLIP CACHE — FFMPEG-EXTRACTED FRAMES ───────────────────────────
+
+/// Shared (path → cache directory + metadata) store used during a
+/// single render pass. Frames are extracted lazily *per source* into
+/// per-source temp directories; on Drop / `cleanup` every directory
+/// is removed best-effort.
+#[derive(Default)]
+pub(crate) struct ClipCacheStore {
+    caches: std::collections::HashMap<PathBuf, ClipCacheEntry>,
+}
+
+struct ClipCacheEntry {
+    cache_dir: PathBuf,
+    fps: u32,
+    /// Number of frames ACTUALLY in `cache_dir`. The first frame is
+    /// always `000001.jpg`; the last is `cache_dir/{frame_count:06}.jpg`.
+    frame_count: usize,
+    /// Absolute scene-time of the first cached frame. The cache only
+    /// holds frames inside the source's `[seek_start, seek_end]`
+    /// window; values outside this clamp to first / last.
+    seek_start: f32,
+}
+
+impl ClipCacheStore {
+    /// Look up a frame for the source at `path`, given a clip-local
+    /// time `local_t`. Returns `None` only when the cache entry is
+    /// missing or the clip is empty; otherwise clamps to the nearest
+    /// extracted frame.
+    fn frame_at(&self, path: &Path, local_t: f32, looping: bool) -> Option<RgbaImage> {
+        let entry = self.caches.get(path)?;
+        if entry.frame_count == 0 {
+            return None;
+        }
+        let extracted_span = (entry.frame_count as f32) / (entry.fps as f32);
+        let mut local = local_t;
+        if looping && extracted_span > 1.0e-3 {
+            // We may have only extracted a window of the looping
+            // source. Wrap on the EXTRACTED span, since beyond that
+            // we'd just see the wrap-around again. This works
+            // because for looping sources we always extract from
+            // `seek_start = 0`.
+            local = local.rem_euclid(extracted_span);
+        }
+        if local < entry.seek_start {
+            local = entry.seek_start;
+        }
+        let rel = (local - entry.seek_start).max(0.0);
+        let frame_idx = ((rel * entry.fps as f32).floor() as usize)
+            .min(entry.frame_count.saturating_sub(1));
+        let p = entry.cache_dir.join(format!("{:06}.jpg", frame_idx + 1));
+        match image::open(&p) {
+            Ok(img) => Some(img.to_rgba8()),
+            Err(e) => {
+                warn!(
+                    path = %p.display(),
+                    error = %e,
+                    "failed to load cached video frame"
+                );
+                None
+            }
+        }
+    }
+
+    fn cleanup(self) {
+        for (_, e) in self.caches {
+            let _ = std::fs::remove_dir_all(&e.cache_dir);
+        }
+    }
+}
+
+/// Build the list of (source path → time-window we'll need) from
+/// every actor / overlay / background, deduplicating by source path.
+/// Returns the windows in `[start, end]` scene-time relative to the
+/// SOURCE clip (post-`source_start`, pre-loop).
+fn collect_source_windows(
+    scene: &Scene,
+    assets_root: &Path,
+) -> std::collections::HashMap<PathBuf, (f32, f32, bool)> {
+    use std::collections::HashMap;
+    let mut by_path: HashMap<PathBuf, (f32, f32, bool)> = HashMap::new();
+    let scene_dur = scene.output.duration;
+
+    let mut add = |path: &Path,
+                   src_start: f32,
+                   span: f32,
+                   speed: f32,
+                   loop_source: bool| {
+        let speed = speed.max(1.0e-4);
+        let lo = src_start.max(0.0);
+        let hi = (src_start + span * speed).max(lo + 0.1);
+        let resolved = resolve_path(assets_root, path);
+        let entry = by_path.entry(resolved).or_insert((lo, hi, loop_source));
+        entry.0 = entry.0.min(lo);
+        entry.1 = entry.1.max(hi);
+        entry.2 |= loop_source;
+    };
+
+    for a in &scene.actors {
+        if !a.visible {
+            continue;
+        }
+        let t_in = a.t_in.unwrap_or(0.0);
+        let t_out = a.t_out.unwrap_or(scene_dur);
+        let span = (t_out - t_in).max(0.1);
+        add(&a.source, a.source_start, span, a.speed, a.loop_source);
+    }
+    for ov in &scene.overlays {
+        if let Overlay::Video(v) = ov {
+            let span = (v.t_out - v.t_in).max(0.1);
+            add(&v.source, v.source_start, span, v.speed, v.loop_source);
+        }
+    }
+    for bg in &scene.backgrounds {
+        if let MediaSource::Video {
+            path,
+            r#loop,
+            start_at,
+        } = &bg.source
+        {
+            add(path, *start_at, bg.duration.max(0.1), 1.0, *r#loop);
+        }
+    }
+    by_path
+}
+
+fn extract_video_clips<F>(
+    scene: &Scene,
+    assets_root: &Path,
+    fps: u32,
+    store: &mut ClipCacheStore,
+    progress_cb: &mut F,
+) -> Result<()>
+where
+    F: FnMut(Progress),
+{
+    let windows = collect_source_windows(scene, assets_root);
+    if windows.is_empty() {
+        return Ok(());
+    }
+    let total_sources = windows.len();
+    let extracted_so_far = Arc::new(AtomicUsize::new(0));
+
+    progress_cb(Progress::Stage {
+        message: format!("Extracting frames from {} source(s)...", total_sources),
+        percent: 0.0,
+    });
+
+    for (src, (lo, hi, looping)) in windows {
+        if !src.exists() {
+            warn!(path = %src.display(), "video source missing — skipping");
+            extracted_so_far.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        let cache_dir = make_temp_dir("memstroy-cpu-cache")?;
+        // Extract a window slightly wider than what we need, so off-
+        // by-one rounding doesn't clip the last frame. For looping
+        // sources we extract just enough to fill the SCENE duration
+        // (modulo source length), not the full source — a 60 s
+        // source clip looped onto a 5 s scene only needs ~5 s of
+        // frames extracted. This caps the worst-case extract time
+        // to "scene duration × #sources" instead of "Σ source
+        // duration".
+        let probed_duration = probe_duration(&src).unwrap_or(0.0);
+        let scene_dur = scene.output.duration.max(0.1);
+        let pad = 1.0 / fps as f32;
+        let (seek_start, span) = if looping && probed_duration > 1.0e-3 {
+            // Extract enough frames to cover the scene duration via
+            // wrapping. We never need MORE than the source's actual
+            // length — beyond that is identical wrap-around content.
+            let span = probed_duration.min(scene_dur + pad);
+            (0.0_f32, span)
+        } else {
+            let lo = (lo - pad).max(0.0);
+            let hi_clamped = if probed_duration > 1.0e-3 {
+                hi.min(probed_duration)
+            } else {
+                hi
+            };
+            let span = (hi_clamped - lo + 2.0 * pad).max(1.0 / fps as f32);
+            (lo, span)
+        };
+
+        progress_cb(Progress::Stage {
+            message: format!(
+                "Extracting {} frames from {}",
+                ((span * fps as f32).ceil() as usize),
+                src.file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("clip")
+            ),
+            percent: (extracted_so_far.load(Ordering::Relaxed) as f32
+                / total_sources as f32)
+                * 5.0,
+        });
+
+        let frames = extract_frames(&src, fps, seek_start, span, &cache_dir)
+            .with_context(|| format!("extract frames from {}", src.display()))?;
+        let _ = probed_duration; // kept for future use
+        info!(
+            src = %src.display(),
+            frames,
+            seek_start,
+            span,
+            cache = %cache_dir.display(),
+            "extracted clip frames"
+        );
+        store.caches.insert(
+            src.clone(),
+            ClipCacheEntry {
+                cache_dir,
+                fps,
+                frame_count: frames,
+                seek_start,
+            },
+        );
+        extracted_so_far.fetch_add(1, Ordering::Relaxed);
+        progress_cb(Progress::Stage {
+            message: format!(
+                "Extracted {}/{} sources",
+                extracted_so_far.load(Ordering::Relaxed),
+                total_sources
+            ),
+            percent: (extracted_so_far.load(Ordering::Relaxed) as f32
+                / total_sources as f32)
+                * 5.0,
+        });
+    }
+    Ok(())
+}
+
+fn make_temp_dir(prefix: &str) -> Result<PathBuf> {
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir =
+        std::env::temp_dir().join(format!("{}-{}-{}-{}", prefix, pid, nanos, counter));
+    std::fs::create_dir_all(&dir).context("create temp dir for clip cache")?;
+    Ok(dir)
+}
+
+static TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+fn extract_frames(
+    src: &Path,
+    fps: u32,
+    seek_start: f32,
+    span: f32,
+    out_dir: &Path,
+) -> Result<usize> {
+    let bin = crate::ffmpeg_binary();
+    let mut cmd = Command::new(&bin);
+    cmd.args(["-y", "-hide_banner", "-loglevel", "error"]);
+    if seek_start > 1.0e-3 {
+        cmd.args(["-ss", &format!("{:.3}", seek_start)]);
+    }
+    cmd.args(["-i"]).arg(src);
+    if span > 0.0 {
+        cmd.args(["-t", &format!("{:.3}", span)]);
+    }
+    // Frames are extracted at the SAME downscaled resolution the GUI's
+    // `FrameCache` uses (`scale=480:-1`). This is the size the canvas
+    // preview reads as `source_width`/`source_height`, and every
+    // `actor.scale` value the user authored on the canvas was sized
+    // against this 480-px-wide reference. If we extract at native
+    // resolution instead, the rendered output would show every actor
+    // ~2.25× too large compared to the canvas (`1080 / 480`) — which
+    // is exactly the user-reported "rendered output doesn't look like
+    // what's inside the render frame on the canvas" bug.
+    //
+    // Quality is fine because:
+    //   * the canvas already locks the user's effective resolution at
+    //     480 wide, so any `actor.scale` they dialed in is calibrated
+    //     for that size,
+    //   * the output frame is up-scaled into the render-frame's
+    //     1080×1920 (or whatever) rectangle via bilinear sampling,
+    //     which preserves the subjective look of the canvas.
+    cmd.args([
+        "-vf",
+        &format!("fps={},scale=480:-1", fps),
+        "-q:v",
+        "3",
+    ])
+    .arg(out_dir.join("%06d.jpg"))
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped());
+    proc::hide_console_std(&mut cmd);
+
+    let output = cmd.output().context("spawn ffmpeg for frame extraction")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!(
+            "ffmpeg frame extraction failed for {}:\n{}",
+            src.display(),
+            stderr.lines().take(20).collect::<Vec<_>>().join("\n")
+        ));
+    }
+
+    let mut n = 0;
+    for entry in std::fs::read_dir(out_dir).context("read clip cache dir")? {
+        let entry = entry?;
+        if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+fn probe_duration(src: &Path) -> Option<f32> {
+    let bin = crate::ffmpeg_binary();
+    let mut probe = bin.clone();
+    probe.set_file_name("ffprobe");
+    if !probe.exists() {
+        probe = std::path::PathBuf::from("ffprobe");
+    }
+    let mut cmd = Command::new(&probe);
+    cmd.args([
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+    ])
+    .arg(src)
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null());
+    proc::hide_console_std(&mut cmd);
+    let out = cmd.output().ok()?;
+    let s = String::from_utf8_lossy(&out.stdout);
+    s.trim().parse::<f32>().ok()
+}
+
+// ─── ENCODER (raw RGBA → MP4 via ffmpeg stdin) ──────────────────────
+
+fn spawn_encoder(
+    w: u32,
+    h: u32,
+    fps: u32,
+    output_path: &Path,
+) -> Result<std::process::Child> {
+    let bin = crate::ffmpeg_binary();
+    let mut cmd = Command::new(&bin);
+    cmd.args([
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgba",
+        "-s",
+        &format!("{}x{}", w, h),
+        "-r",
+        &fps.to_string(),
+        "-i",
+        "-",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "medium",
+        "-crf",
+        "19",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+    ])
+    .arg(output_path)
+    .stdin(Stdio::piped())
+    .stdout(Stdio::null())
+    // Capture stderr so we can include it in error messages when the
+    // encoder dies mid-stream. Without this, a stdin write failure
+    // surfaced as a generic "broken pipe" with no actionable detail.
+    .stderr(Stdio::piped());
+    proc::hide_console_std(&mut cmd);
+    cmd.spawn().context("spawn ffmpeg encoder")
+}
+
+/// Handle to a background thread reading the encoder's stderr into a
+/// shared `Mutex<String>`. Dropping the handle does NOT kill the
+/// thread — it just lets the caller stop holding a reference. The
+/// thread terminates naturally when the encoder closes its stderr
+/// pipe (i.e. the encoder process exits).
+struct StderrDrainHandle {
+    buffer: Arc<std::sync::Mutex<String>>,
+    _join: std::thread::JoinHandle<()>,
+}
+
+fn spawn_stderr_drain(stderr: std::process::ChildStderr) -> StderrDrainHandle {
+    use std::io::Read;
+    let buffer = Arc::new(std::sync::Mutex::new(String::with_capacity(8 * 1024)));
+    let buffer_inner = buffer.clone();
+    let join = std::thread::spawn(move || {
+        let mut stderr = stderr;
+        let mut chunk = [0u8; 4096];
+        loop {
+            match stderr.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let s = String::from_utf8_lossy(&chunk[..n]).to_string();
+                    if let Ok(mut buf) = buffer_inner.lock() {
+                        buf.push_str(&s);
+                        // Cap the buffer so a chatty encoder doesn't
+                        // grow it unboundedly. We keep the LAST 32 KB
+                        // since recent lines are the most useful for
+                        // diagnostics.
+                        const MAX: usize = 32 * 1024;
+                        if buf.len() > MAX {
+                            let drop_n = buf.len() - MAX;
+                            buf.drain(..drop_n);
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    StderrDrainHandle {
+        buffer,
+        _join: join,
+    }
+}
+
+/// Snapshot the current contents of the drained stderr buffer for
+/// inclusion in error messages. Returns the LAST few non-empty lines,
+/// since FFmpeg prints the actual error message right before exiting.
+fn collect_drained_stderr(handle: &Option<StderrDrainHandle>) -> String {
+    let Some(h) = handle else {
+        return "(stderr unavailable)".into();
+    };
+    let Ok(buf) = h.buffer.lock() else {
+        return "(stderr lock poisoned)".into();
+    };
+    let lines: Vec<&str> = buf
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    let tail: Vec<&str> = lines.iter().rev().take(15).copied().collect();
+    tail.into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+// ─── AUDIO MUX (delegate to FFmpeg-path renderer) ───────────────────
+
+/// Decompose an arbitrary tempo factor into a chain of `atempo=…`
+/// filters whose product equals the factor. ffmpeg's `atempo` filter
+/// requires its argument in [0.5, 2.0]; values outside that range
+/// have to be split across multiple filter invocations.
+///
+/// E.g. tempo=4.0 → ["atempo=2.0", "atempo=2.0"], tempo=0.25 →
+/// ["atempo=0.5", "atempo=0.5"]. Tempo=1.0 returns an empty Vec so
+/// callers can skip emitting any filter at all in the common case.
+fn atempo_chain(mut tempo: f32) -> Vec<String> {
+    let mut out = Vec::new();
+    if (tempo - 1.0).abs() < 1e-4 {
+        return out;
+    }
+    while tempo > 2.0 + 1e-4 {
+        out.push("atempo=2.0".to_string());
+        tempo /= 2.0;
+    }
+    while tempo < 0.5 - 1e-4 {
+        out.push("atempo=0.5".to_string());
+        tempo *= 2.0;
+    }
+    if (tempo - 1.0).abs() > 1e-4 {
+        out.push(format!("atempo={:.6}", tempo.clamp(0.5, 2.0)));
+    }
+    out
+}
+
+fn mux_audio(scene: &Scene, assets_root: &Path, output_path: &Path) -> Result<()> {
+    let temp_audio = output_path.with_extension("audio.m4a");
+
+    // ── Audio-only filter graph ──
+    //
+    // Earlier we delegated to `crate::plan::build_plan` and ran the
+    // whole video+audio plan with `-vn` to skip the video output.
+    // That worked when the scene was simple but had two failure
+    // modes that surfaced as "video has no sound":
+    //
+    //   1. The full plan added every video / image / overlay input
+    //      to the cmdline. `-loop 1` on an image input requires a
+    //      paired `-t`, which the audio sub-call didn't supply, so
+    //      ffmpeg hung waiting for the looped image to terminate
+    //      (it never does without `-t`), the parent gave up after
+    //      the next stage, and the audio file was never written.
+    //   2. The video filter chain references generated `[base]`
+    //      labels that depend on side-tables (e.g. mask PNG exports)
+    //      the audio sub-call doesn't actually need but still has
+    //      to evaluate at graph-init time. A single rasterisation
+    //      failure in any of those nodes would abort the whole
+    //      filter graph and ffmpeg would exit with no audio output.
+    //
+    // The fix is to build an AUDIO-ONLY filter graph: enumerate the
+    // explicit `Scene::audio` rows + every visible actor whose
+    // source has an audio stream (mirrors `app.rs::build_sources` so
+    // the rendered audio matches what plays in the canvas preview),
+    // wire each through the same per-track normalisation chain that
+    // `emit_audio` uses for graph-init stability, and feed it
+    // straight to the AAC encoder. Everything video-related stays
+    // out of the cmdline so the audio render can't be poisoned by
+    // an unrelated overlay / mask glitch.
+
+    struct AudioJob {
+        source: PathBuf,
+        t_in: f32,
+        t_out: f32,
+        source_start: f32,
+        volume: f32,
+        mute: bool,
+        fade_in: f32,
+        fade_out: f32,
+        /// Playback rate multiplier: 1.0 = unchanged, 0.5 = half
+        /// speed (sounds twice as long), 2.0 = double speed.
+        speed: f32,
+        /// Pitch shift in semitones. 0 = no shift.
+        pitch_semitones: f32,
+    }
+
+    let scene_dur = scene.output.duration.max(1.0 / 60.0);
+    let mut jobs: Vec<AudioJob> = Vec::new();
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    for tr in &scene.audio {
+        let path = if tr.source.is_absolute() {
+            tr.source.clone()
+        } else {
+            assets_root.join(&tr.source)
+        };
+        seen.insert(path.clone());
+        jobs.push(AudioJob {
+            source: path,
+            t_in: tr.t_in,
+            t_out: tr.t_out.unwrap_or(scene_dur),
+            source_start: tr.source_start,
+            volume: tr.volume,
+            mute: tr.mute,
+            fade_in: tr.fade_in,
+            fade_out: tr.fade_out,
+            speed: tr.speed,
+            pitch_semitones: tr.pitch_semitones,
+        });
+    }
+    for actor in &scene.actors {
+        if !actor.visible {
+            continue;
+        }
+        let path = if actor.source.is_absolute() {
+            actor.source.clone()
+        } else {
+            assets_root.join(&actor.source)
+        };
+        if seen.contains(&path) {
+            continue;
+        }
+        seen.insert(path.clone());
+        let t_in = actor.t_in.unwrap_or(0.0);
+        let t_out = actor.t_out.unwrap_or(scene_dur);
+        jobs.push(AudioJob {
+            source: path,
+            t_in,
+            t_out,
+            source_start: actor.source_start,
+            volume: 1.0,
+            mute: false,
+            fade_in: 0.0,
+            fade_out: 0.0,
+            // Mirror the actor's speed onto its embedded soundtrack so
+            // a slowed-down video clip's audio also slows down (and
+            // its rendered window stays in sync). Actors don't expose
+            // a pitch shift, so leave it neutral.
+            speed: actor.speed,
+            pitch_semitones: 0.0,
+        });
+    }
+
+    if jobs.is_empty() {
+        return Ok(());
+    }
+
+    // Drop tracks with missing files / no audio stream BEFORE we
+    // build the cmdline so each `[idx:a]` reference resolves.
+    jobs.retain(|j| {
+        if !j.source.exists() {
+            warn!(
+                path = %j.source.display(),
+                "audio mux: source missing, skipping",
+            );
+            return false;
+        }
+        if !crate::proc::probe_has_audio_stream(&j.source) {
+            warn!(
+                path = %j.source.display(),
+                "audio mux: source has no audio stream, skipping",
+            );
+            return false;
+        }
+        true
+    });
+    if jobs.is_empty() {
+        return Ok(());
+    }
+
+    const SR: u32 = 44_100;
+    const FMT: &str = "fltp";
+    const LAYOUT: &str = "stereo";
+
+    // Build the cmdline: every job becomes a `-i <path>` followed by
+    // a per-track normalise-trim-delay-pad chain. Tracks are then
+    // mixed (or just format-pinned for the single-track case) and
+    // fed straight to the AAC encoder.
+    let bin = crate::ffmpeg_binary();
+    let mut cmd = Command::new(&bin);
+    cmd.args(["-y", "-hide_banner", "-loglevel", "error"]);
+
+    for job in &jobs {
+        if job.source_start > 0.0 {
+            cmd.args(["-ss", &format!("{:.3}", job.source_start)]);
+        }
+        cmd.args(["-i"]).arg(&job.source);
+    }
+
+    let mut chunks: Vec<String> = Vec::new();
+    let mut labels: Vec<String> = Vec::new();
+    for (idx, job) in jobs.iter().enumerate() {
+        let t_in = job.t_in.max(0.0).min(scene_dur);
+        let t_out = job.t_out.clamp(t_in, scene_dur);
+        let clip_dur = (t_out - t_in).max(1.0 / 60.0);
+        let volume = if job.mute { 0.0 } else { job.volume.max(0.0) };
+        let speed = job.speed.max(0.05);
+        let pitch_semis = job.pitch_semitones;
+
+        let mut filters: Vec<String> = Vec::with_capacity(12);
+        filters.push(format!("aresample={sr}", sr = SR));
+        filters.push(format!(
+            "aformat=sample_fmts={fmt}:sample_rates={sr}:channel_layouts={ch}",
+            fmt = FMT,
+            sr = SR,
+            ch = LAYOUT,
+        ));
+
+        // ── Pitch + tempo ──
+        //
+        // Combined factor `effective_rate = speed * 2^(pitch/12)`
+        // matches the canvas preview's `dsp::Stereo` chain
+        // (`spec.speed * pitch_factor`). We split it across two
+        // ffmpeg filters:
+        //
+        //   * `asetrate=SR*rate` — change sample rate so the audio
+        //     plays back faster/slower AND higher/lower in pitch.
+        //     Equivalent to "speed up the tape" (pitch follows).
+        //   * `atempo=1/rate` — undo the speed change while keeping
+        //     the new pitch. Net effect: pitch shifts but length
+        //     stays the same.
+        //
+        // For the pure-`speed` case (rate = speed, no pitch shift)
+        // we want the OPPOSITE: keep the pitch, change the length.
+        // That's a bare `atempo=speed`. So:
+        //
+        //   final_atempo = speed / pitch_only_factor
+        //                = speed / 2^(pitch/12)         (preserves pitch component of speed)
+        //
+        // We compose:
+        //   asetrate=SR*pitch_factor  — pitch shift, also speeds by pitch_factor
+        //   aresample=SR              — bring sample rate back so atempo measures correctly
+        //   atempo=speed              — apply the user-facing tempo, length scales
+        //
+        // `atempo` is limited to 0.5..=2.0 per filter call; we chain
+        // multiple invocations for extreme speeds (rare but possible
+        // when the user wants 4x or 0.25x).
+        let pitch_factor = 2f32.powf(pitch_semis / 12.0);
+        if (pitch_factor - 1.0).abs() > 1e-4 {
+            filters.push(format!("asetrate={r:.4}", r = (SR as f32) * pitch_factor));
+            // aresample back to SR keeps the timeline math simple
+            // for the subsequent atrim + adelay nodes.
+            filters.push(format!("aresample={sr}", sr = SR));
+        }
+        if (speed - 1.0).abs() > 1e-4 {
+            for f in atempo_chain(speed) {
+                filters.push(f);
+            }
+        }
+
+        filters.push(format!("atrim=duration={:.6}", clip_dur));
+        filters.push("asetpts=PTS-STARTPTS".into());
+        if job.fade_in > 0.0 {
+            let fi = job.fade_in.min(clip_dur);
+            if fi > 0.0 {
+                filters.push(format!(
+                    "afade=t=in:st=0:d={:.6}:curve=tri",
+                    fi
+                ));
+            }
+        }
+        if job.fade_out > 0.0 {
+            let fo = job.fade_out.min(clip_dur);
+            if fo > 0.0 {
+                let st = (clip_dur - fo).max(0.0);
+                filters.push(format!(
+                    "afade=t=out:st={:.6}:d={:.6}:curve=tri",
+                    st, fo
+                ));
+            }
+        }
+        if (volume - 1.0).abs() > 1e-4 {
+            filters.push(format!("volume={:.6}", volume));
+        }
+        let delay_ms = (t_in * 1000.0).round().max(0.0) as u64;
+        if delay_ms > 0 {
+            filters.push(format!("adelay={d}:all=1", d = delay_ms));
+        }
+        filters.push(format!("apad=whole_dur={:.6}", scene_dur));
+        filters.push(format!("atrim=duration={:.6}", scene_dur));
+        filters.push("asetpts=PTS-STARTPTS".into());
+
+        let lbl = format!("[a{}]", idx);
+        chunks.push(format!(
+            "[{idx}:a]{filters}{out}",
+            idx = idx,
+            filters = filters.join(","),
+            out = lbl,
+        ));
+        labels.push(lbl);
+    }
+
+    let mix_label = "[amix]".to_string();
+    if labels.len() == 1 {
+        chunks.push(format!(
+            "{src}aformat=sample_fmts={fmt}:sample_rates={sr}:channel_layouts={ch}{out}",
+            src = labels[0],
+            fmt = FMT,
+            sr = SR,
+            ch = LAYOUT,
+            out = mix_label,
+        ));
+    } else {
+        let inputs = labels.join("");
+        let raw = "[amixraw]";
+        chunks.push(format!(
+            "{inputs}amix=inputs={n}:duration=longest:dropout_transition=0:normalize=0{out}",
+            inputs = inputs,
+            n = labels.len(),
+            out = raw,
+        ));
+        chunks.push(format!(
+            "{raw}aformat=sample_fmts={fmt}:sample_rates={sr}:channel_layouts={ch}{out}",
+            raw = raw,
+            fmt = FMT,
+            sr = SR,
+            ch = LAYOUT,
+            out = mix_label,
+        ));
+    }
+
+    let filter_complex = chunks.join(";");
+
+    cmd.args(["-filter_complex", &filter_complex])
+        .args(["-map", &mix_label])
+        .args([
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-ar",
+            "44100",
+            "-ac",
+            "2",
+            "-t",
+            &format!("{:.3}", scene.output.duration),
+            "-vn",
+        ])
+        .arg(&temp_audio)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    proc::hide_console_std(&mut cmd);
+
+    let output = cmd.output().context("ffmpeg audio render")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        warn!(
+            stderr = %stderr.lines().take(20).collect::<Vec<_>>().join("\n"),
+            "audio render returned non-zero, skipping mux"
+        );
+        let _ = std::fs::remove_file(&temp_audio);
+        return Ok(());
+    }
+    // Sanity check: an empty m4a means the encode silently produced
+    // nothing. Fail-soft so the silent video still ships.
+    let audio_meta = match std::fs::metadata(&temp_audio) {
+        Ok(m) => m,
+        Err(e) => {
+            warn!(error = %e, "audio mux: temp file vanished after encode");
+            return Ok(());
+        }
+    };
+    if audio_meta.len() < 1024 {
+        warn!(
+            size = audio_meta.len(),
+            path = %temp_audio.display(),
+            "audio mux: temp file too small, skipping mux step",
+        );
+        let _ = std::fs::remove_file(&temp_audio);
+        return Ok(());
+    }
+
+    // Mux audio onto the silent MP4 by stream-copying both.
+    let muxed = output_path.with_extension("muxed.mp4");
+    let mut cmd = Command::new(&bin);
+    cmd.args(["-y", "-hide_banner", "-loglevel", "error"])
+        .args(["-i"])
+        .arg(output_path)
+        .args(["-i"])
+        .arg(&temp_audio)
+        .args([
+            "-c:v", "copy", "-c:a", "copy", "-map", "0:v:0", "-map", "1:a:0", "-shortest",
+        ])
+        .arg(&muxed)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    proc::hide_console_std(&mut cmd);
+
+    let output = cmd.output().context("ffmpeg audio mux")?;
+    let _ = std::fs::remove_file(&temp_audio);
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        warn!(
+            stderr = %stderr.lines().take(20).collect::<Vec<_>>().join("\n"),
+            "audio mux returned non-zero, output has no audio"
+        );
+        let _ = std::fs::remove_file(&muxed);
+        return Ok(());
+    }
+
+    std::fs::rename(&muxed, output_path).context("move muxed file into place")?;
+    Ok(())
+}

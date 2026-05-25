@@ -227,6 +227,36 @@ pub struct TimelineDrag {
     /// every timeline() pass and at drag-end so a stale guide can't
     /// linger after the snap goes away.
     pub snap_indicator: Option<f32>,
+    /// Snapshot of every multi-selected peer's start time at the
+    /// moment the user began the current group drag. The primary's
+    /// per-frame delta is broadcast onto each anchor so the whole
+    /// group moves as a rigid body even when peers live on different
+    /// lanes / layer kinds. Cleared on drag end.
+    pub group_anchor: Vec<GroupMoveAnchor>,
+    /// Drag token whose start frame populated `group_anchor`. Lets
+    /// the broadcast helper detect when a fresh gesture begins (token
+    /// changes) so it can re-snapshot the peers.
+    pub group_anchor_token: Option<u64>,
+    /// The primary mover's own anchor t_in. Tracked separately because
+    /// the primary's mutation is the source of truth — peers shift
+    /// by `(primary_now - mover_anchor)` rather than the per-frame
+    /// delta arg, which can drift when arms apply different clamps.
+    pub group_mover_anchor: Option<f32>,
+}
+
+/// Per-peer snapshot used by the group-move broadcast helper.
+#[derive(Clone, Copy)]
+pub struct GroupMoveAnchor {
+    pub sel: Selection,
+    pub t_in: f32,
+}
+
+impl std::fmt::Debug for GroupMoveAnchor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GroupMoveAnchor")
+            .field("t_in", &self.t_in)
+            .finish()
+    }
 }
 
 /// Lightweight mirror of `panels::MovedClipKind` used to persist
@@ -403,15 +433,22 @@ pub struct EditorState {
     /// `EditorState::mutate_drag` for the full contract — the short
     /// version is "one undo snapshot per drag gesture, automatically".
     pub last_drag_group: Option<u64>,
-    /// Snapshot of the scene captured the last time a pointer button
-    /// was pressed. Used by `app.rs::update` as a frame-level catch-all
-    /// for inspector edits (slider drags, button clicks, …) that don't
-    /// route through `mutate_drag`. On pointer-release, if the scene
-    /// has diverged from this snapshot AND no `mutate_drag` token
-    /// fired during the gesture, the snapshot is pushed to the undo
-    /// stack — yielding "one Ctrl+Z = one user gesture" everywhere,
-    /// not just on the canvas / timeline.
-    pub pre_press_scene: Option<memstroy_core::Scene>,
+    /// Snapshot of the editor state captured the last time a pointer
+    /// button was pressed. Used by `app.rs::update` as a frame-level
+    /// catch-all for inspector edits (slider drags, button clicks, …)
+    /// that don't route through `mutate_drag`. On pointer-release,
+    /// if the snapshot has diverged from the current state AND no
+    /// `mutate_drag` token fired during the gesture, the snapshot is
+    /// pushed to the undo stack — yielding "one Ctrl+Z = one user
+    /// gesture" everywhere, not just on the canvas / timeline.
+    ///
+    /// Stores the FULL editor state (scene + lane assignment maps),
+    /// not just the scene. Without the assignments, undoing a
+    /// "drag clip from lane 1 to lane 2" gesture restored the old
+    /// scene contents but left the assignment map pointing at lane
+    /// 2 — exactly the user's "ctrl z должны учитываться слои"
+    /// report.
+    pub pre_press_scene: Option<crate::undo::UndoSnapshot>,
     /// Playback state
     pub playing: bool,
     /// Playback speed multiplier (1.0 = normal, 2.0 = 2x, 0.5 = half)
@@ -470,15 +507,6 @@ pub struct EditorState {
     /// the user has multiple compatible elements multi-selected and
     /// picks one in the in-window dropdown.
     pub curve_editor_active_idx: usize,
-    /// Whether image editor window is open (image-only filters / crop).
-    pub image_editor_open: bool,
-    /// Interactive-brush state for the image editor's preview area —
-    /// holds the currently armed tool, in-progress polygon points
-    /// (sampled in source-image UV 0..1), and the parameters the
-    /// commit step bakes into a new `EffectKind::Mask` / `Crop`
-    /// entry on the selected image overlay. Only consulted while the
-    /// image editor window is open.
-    pub image_brush: ImageEditorBrush,
 
     /// Index of text overlay currently being inline-edited on the preview
     pub editing_text_overlay: Option<usize>,
@@ -732,104 +760,6 @@ pub struct EditorState {
     pub web_image_search: crate::web_image_search::WebImageSearchState,
 }
 
-/// Brush / interactive-tool state owned by the image editor floating
-/// window. Lives on `EditorState` (instead of being module-local) so
-/// it persists across show/hide cycles of the window and so the
-/// (potentially many) painted polygon points round-trip with the
-/// surrounding mutable state without per-frame `egui` memory
-/// shuffling.
-///
-/// All in-progress points are sampled in **source-image UV (0..1)**.
-/// On commit they are baked into the selected overlay's effect stack
-/// as either an `EffectKind::Mask { Polygon, .. }` or an
-/// `EffectKind::Crop { .. }` entry depending on the active tool.
-#[derive(Clone)]
-pub struct ImageEditorBrush {
-    pub tool: ImageBrushTool,
-    /// Soft edge applied to a freshly committed polygon mask
-    /// (UV-space fraction 0..0.5).
-    pub feather: f32,
-    /// When set, the freshly committed mask uses `invert: true`. The
-    /// "Cutout" tool flips this on automatically; the "Brush" tool
-    /// leaves it off.
-    pub invert: bool,
-    /// Live polygon being painted by the user. Cleared on every
-    /// pointer release (after commit) and on tool changes.
-    pub draft: Vec<[f32; 2]>,
-    /// Anchor point for rectangle-style drags (Crop). Stored in
-    /// source-image UV. `None` outside an active drag.
-    pub crop_drag_start: Option<[f32; 2]>,
-
-    // ─── Preview viewport state ───────────────────────────────────
-    /// Height (in pixels) of the preview pane inside the editor
-    /// window. The user can drag the splitter handle below the
-    /// preview to give the picture more (or less) vertical room
-    /// without resizing the whole window.
-    pub preview_height: f32,
-    /// Multiplicative zoom applied to the rendered preview. `1.0`
-    /// is "fit to pane" — the value is multiplied on top of the
-    /// aspect-fit scale so the picture grows / shrinks around the
-    /// pane centre. Range is clamped to `0.1..=8.0` at the call
-    /// site so the preview never disappears or explodes.
-    pub preview_zoom: f32,
-    /// Pan offset (screen pixels) applied to the zoomed preview so
-    /// the user can scroll the picture around inside the pane when
-    /// zoomed past `1.0`. Reset to `[0.0, 0.0]` whenever the zoom
-    /// returns to a fit-or-smaller value.
-    pub preview_pan: [f32; 2],
-}
-
-impl Default for ImageEditorBrush {
-    fn default() -> Self {
-        Self {
-            tool: ImageBrushTool::default(),
-            feather: 0.0,
-            invert: false,
-            draft: Vec::new(),
-            crop_drag_start: None,
-            preview_height: 260.0,
-            preview_zoom: 1.0,
-            preview_pan: [0.0, 0.0],
-        }
-    }
-}
-
-/// Image-editor brush mode. Mirrors the tool buttons in the
-/// floating window's toolbar; selecting `None` is the "no
-/// interactive tool" fallback that lets the preview behave as a
-/// passive thumbnail.
-#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
-pub enum ImageBrushTool {
-    /// Default — preview is non-interactive.
-    #[default]
-    None,
-    /// Freehand brush: the painted polygon becomes the visible
-    /// region (`invert: false`). Pixels outside the polygon are
-    /// masked away.
-    Brush,
-    /// Cutout brush: the painted polygon becomes the *masked* region
-    /// (`invert: true`). Useful for erasing watermarks / unwanted
-    /// objects without leaving the editor.
-    Cutout,
-    /// Rectangle drag — the rectangle painted by the user is baked
-    /// into the overlay's `EffectKind::Crop` entry.
-    Crop,
-    /// Rectangle drag — the rectangle painted by the user is baked
-    /// into a fresh `EffectKind::Mask { Rect, ... }` entry. Honours
-    /// the editor's current `feather` / `invert` brush params so the
-    /// user can swap between "rectangle keep" and "rectangle cut"
-    /// without relabelling.
-    RectMask,
-    /// Ellipse drag — same as RectMask but with an elliptical mask
-    /// shape. The drag rectangle becomes the ellipse's bounding box.
-    EllipseMask,
-    /// Click-to-sample colour-key tool. A click on the preview
-    /// samples the underlying source pixel colour and pushes (or
-    /// updates) an `EffectKind::ColorKey` entry on the overlay's
-    /// effect stack so close-by colours become transparent.
-    Eyedropper,
-}
-
 /// Cached state for one image-overlay source. `Loading` is held only
 /// briefly while the synchronous decode runs (we keep it as a state
 /// rather than `Option<Result<...>>` so future async loaders can fit
@@ -858,6 +788,27 @@ pub struct SceneTab {
     pub name: String,
     pub path: Option<PathBuf>,
     pub scene: Scene,
+    /// Stable per-tab seed used by the autosave manager to keep
+    /// Untitled tabs writing into one consistent slot for the whole
+    /// session (instead of creating a fresh autosave file every
+    /// interval). Saved tabs ignore this and key off `path` instead.
+    pub autosave_seed: u64,
+}
+
+impl SceneTab {
+    /// Allocate a fresh per-tab autosave seed. Combines the current
+    /// monotonic instant with a process-global counter so two tabs
+    /// created in the same nanosecond still get distinct seeds.
+    pub fn fresh_seed() -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(1);
+        let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        nanos.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(counter)
+    }
 }
 
 #[derive(Default)]
@@ -942,6 +893,13 @@ pub struct RenderProgress {
     pub error: Option<String>,
     /// Render progress as a float (0.0 - 1.0), parsed from ffmpeg output.
     pub progress: f32,
+    /// Wall-clock elapsed at the moment the render finished (success
+    /// OR failure). `None` while in flight; set once and never
+    /// rewritten so the progress window's elapsed counter freezes
+    /// at the moment the render actually finished instead of ticking
+    /// forever until the user dismisses the dialog. Addresses
+    /// "после рендера видео в окне рендера останавливай счетчик".
+    pub finished_elapsed: Option<std::time::Duration>,
 }
 
 impl EditorState {
@@ -974,8 +932,6 @@ impl EditorState {
         s.curve_editor_open = false;
         s.curve_editor_property = 0;
         s.curve_editor_active_idx = 0;
-        s.image_editor_open = false;
-        s.image_brush = ImageEditorBrush::default();
 
         s.editing_text_overlay = None;
 
@@ -1003,6 +959,7 @@ impl EditorState {
             name: "Untitled".into(),
             path: None,
             scene: Scene::default(),
+            autosave_seed: SceneTab::fresh_seed(),
         }];
         s.active_tab = 0;
 
@@ -1073,7 +1030,13 @@ impl EditorState {
         std::env::temp_dir().join("memstroy")
     }
 
-    /// Path of the autosave scene file.
+    /// Legacy single-file autosave path. Retained for backward
+    /// compatibility — the active autosave manager now writes per-
+    /// project slots into `autosave_dir().join("autosaves")`. This
+    /// method only exists so old shipped builds (and the autosave
+    /// migration code in `crate::autosave`) can still locate the
+    /// pre-multi-project snapshot.
+    #[allow(dead_code)]
     pub fn autosave_path() -> PathBuf {
         Self::autosave_dir().join("autosave.scene.yaml")
     }
@@ -1118,12 +1081,36 @@ impl EditorState {
         std::env::temp_dir().join("memstroy").join("cache")
     }
 
+    /// Build an UndoSnapshot from the current scene + lane
+    /// assignment maps. Used by every push/undo/redo path so the
+    /// history stack always carries the layer placement alongside
+    /// the scene tree.
+    pub fn build_undo_snapshot(&self) -> crate::undo::UndoSnapshot {
+        crate::undo::UndoSnapshot {
+            scene: self.scene.clone(),
+            actor_track_assignments: self.actor_track_assignments.clone(),
+            overlay_track_assignments: self.overlay_track_assignments.clone(),
+            audio_track_assignments: self.audio_track_assignments.clone(),
+        }
+    }
+
+    /// Replace `self.scene` and the lane assignment maps with the
+    /// contents of an UndoSnapshot. Wrapper around the per-field
+    /// reassignment so undo / redo flows always restore both.
+    pub fn restore_undo_snapshot(&mut self, snap: crate::undo::UndoSnapshot) {
+        self.scene = snap.scene;
+        self.actor_track_assignments = snap.actor_track_assignments;
+        self.overlay_track_assignments = snap.overlay_track_assignments;
+        self.audio_track_assignments = snap.audio_track_assignments;
+    }
+
     /// Save undo snapshot, then apply a mutation via the closure.
     pub fn mutate(&mut self, f: impl FnOnce(&mut Scene)) {
         // Any explicit `mutate` call ends the previous drag-group, so the
         // next drag starts a fresh undo entry.
         self.last_drag_group = None;
-        self.undo.push(&self.scene);
+        let snap = self.build_undo_snapshot();
+        self.undo.push_full(snap);
         f(&mut self.scene);
     }
 
@@ -1144,7 +1131,8 @@ impl EditorState {
         F: FnOnce(&mut Scene),
     {
         if self.last_drag_group != Some(token) {
-            self.undo.push(&self.scene);
+            let snap = self.build_undo_snapshot();
+            self.undo.push_full(snap);
             self.last_drag_group = Some(token);
         }
         f(&mut self.scene);
@@ -1173,8 +1161,9 @@ impl EditorState {
         // Pressing Ctrl+Z must finalise any in-flight drag group so the
         // next drag pushes a fresh snapshot afterwards.
         self.last_drag_group = None;
-        if let Some(prev) = self.undo.undo(&self.scene) {
-            self.scene = prev;
+        let cur = self.build_undo_snapshot();
+        if let Some(prev) = self.undo.undo_full(cur) {
+            self.restore_undo_snapshot(prev);
             self.status = "\u{21A9} Undo".into();
         }
     }
@@ -1182,8 +1171,9 @@ impl EditorState {
     /// Redo the last undone action.
     pub fn redo(&mut self) {
         self.last_drag_group = None;
-        if let Some(next) = self.undo.redo(&self.scene) {
-            self.scene = next;
+        let cur = self.build_undo_snapshot();
+        if let Some(next) = self.undo.redo_full(cur) {
+            self.restore_undo_snapshot(next);
             self.status = "\u{21AA} Redo".into();
         }
     }
@@ -1439,6 +1429,7 @@ impl EditorState {
             name,
             path: None,
             scene: Scene::default(),
+            autosave_seed: SceneTab::fresh_seed(),
         });
         self.active_tab = self.scene_tabs.len() - 1;
         self.sync_tab_to_scene();
@@ -1472,6 +1463,7 @@ impl EditorState {
                 name: "Untitled".into(),
                 path: None,
                 scene: Scene::default(),
+                autosave_seed: SceneTab::fresh_seed(),
             };
             self.active_tab = 0;
             self.scene = Scene::default();
@@ -1539,7 +1531,6 @@ impl EditorState {
             "track_heights": track_heights,
             "curve_editor_open": self.curve_editor_open,
             "curve_editor_property": self.curve_editor_property,
-            "image_editor_open": self.image_editor_open,
             "web_image_search_open": self.web_image_search_open,
             "web_image_search_query": self.web_image_search.query,
         });
@@ -1565,7 +1556,41 @@ impl EditorState {
         if let Some(scroll) = data.get("timeline_scroll").and_then(|v| v.as_f64()) {
             self.timeline_scroll = scroll as f32;
         }
-        if let Some(heights) = data.get("track_heights").and_then(|v| v.as_array()) {
+        // ── Tracks (full layout) ──
+        // When the bundle carries a `tracks` array we rebuild
+        // `self.tracks` from it verbatim so kind ordering, names,
+        // mute / lock state, and heights match what the user saved.
+        // Falling back to the legacy `track_heights` keeps older
+        // bundles loading correctly.
+        if let Some(arr) = data.get("tracks").and_then(|v| v.as_array()) {
+            let mut new_tracks: Vec<Track> = Vec::with_capacity(arr.len());
+            for entry in arr {
+                let name = entry
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let kind = match entry.get("kind").and_then(|v| v.as_str()) {
+                    Some("audio") => TrackKind::Audio,
+                    _ => TrackKind::Video,
+                };
+                let muted = entry.get("muted").and_then(|v| v.as_bool()).unwrap_or(false);
+                let locked = entry.get("locked").and_then(|v| v.as_bool()).unwrap_or(false);
+                let visible = entry.get("visible").and_then(|v| v.as_bool()).unwrap_or(true);
+                let height = entry.get("height").and_then(|v| v.as_f64()).unwrap_or(40.0) as f32;
+                new_tracks.push(Track {
+                    name,
+                    kind,
+                    muted,
+                    locked,
+                    visible,
+                    height,
+                });
+            }
+            if !new_tracks.is_empty() {
+                self.tracks = new_tracks;
+            }
+        } else if let Some(heights) = data.get("track_heights").and_then(|v| v.as_array()) {
             for (i, h) in heights.iter().enumerate() {
                 if i < self.tracks.len() {
                     if let Some(hf) = h.as_f64() {
@@ -1574,14 +1599,45 @@ impl EditorState {
                 }
             }
         }
+        // ── Track assignments ──
+        // Without restoring these, every clip falls back to the
+        // first video / audio lane on reload — exactly the user's
+        // "элементы по слоям слетают" report. Stored as a sorted
+        // `[[clip_idx, track_idx], …]` array in JSON so the format
+        // is human-readable (HashMap doesn't have a stable JSON
+        // shape).
+        let read_assignments =
+            |val: &serde_json::Value| -> std::collections::HashMap<usize, usize> {
+                let mut out = std::collections::HashMap::new();
+                if let Some(arr) = val.as_array() {
+                    for pair in arr {
+                        if let Some(p) = pair.as_array() {
+                            if p.len() == 2 {
+                                if let (Some(k), Some(v)) =
+                                    (p[0].as_u64(), p[1].as_u64())
+                                {
+                                    out.insert(k as usize, v as usize);
+                                }
+                            }
+                        }
+                    }
+                }
+                out
+            };
+        if let Some(v) = data.get("actor_track_assignments") {
+            self.actor_track_assignments = read_assignments(v);
+        }
+        if let Some(v) = data.get("audio_track_assignments") {
+            self.audio_track_assignments = read_assignments(v);
+        }
+        if let Some(v) = data.get("overlay_track_assignments") {
+            self.overlay_track_assignments = read_assignments(v);
+        }
         if let Some(ce_open) = data.get("curve_editor_open").and_then(|v| v.as_bool()) {
             self.curve_editor_open = ce_open;
         }
         if let Some(ce_prop) = data.get("curve_editor_property").and_then(|v| v.as_u64()) {
             self.curve_editor_property = ce_prop as usize;
-        }
-        if let Some(clip_open) = data.get("image_editor_open").and_then(|v| v.as_bool()) {
-            self.image_editor_open = clip_open;
         }
         if let Some(open) = data.get("web_image_search_open").and_then(|v| v.as_bool()) {
             self.web_image_search_open = open;
@@ -1598,13 +1654,49 @@ impl EditorState {
     /// heights, etc.). Used by both `save_layout` and `save_memstroy`.
     fn build_layout_json(&self) -> serde_json::Value {
         let track_heights: Vec<f32> = self.tracks.iter().map(|t| t.height).collect();
+        // Mirror the timeline's `tracks` Vec into a JSON-friendly
+        // shape so `.memstroy` round-trips the layer panel exactly:
+        // kind ordering, names, mute / lock toggles, heights. Without
+        // this, every reload reconstructed `tracks` from defaults and
+        // every clip's `*_track_assignments` entry pointed into a
+        // freshly-rebuilt Vec, which is why the user reported
+        // "элементы по слоям слетают" after reopening a project.
+        let tracks_json: Vec<serde_json::Value> = self
+            .tracks
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "name": t.name,
+                    "kind": match t.kind {
+                        TrackKind::Video => "video",
+                        TrackKind::Audio => "audio",
+                    },
+                    "muted": t.muted,
+                    "locked": t.locked,
+                    "visible": t.visible,
+                    "height": t.height,
+                })
+            })
+            .collect();
+        let dump_assignments = |m: &std::collections::HashMap<usize, usize>| {
+            let mut pairs: Vec<(usize, usize)> =
+                m.iter().map(|(&k, &v)| (k, v)).collect();
+            pairs.sort_by_key(|(k, _)| *k);
+            pairs
+                .into_iter()
+                .map(|(k, v)| serde_json::json!([k, v]))
+                .collect::<Vec<_>>()
+        };
         serde_json::json!({
             "timeline_zoom": self.timeline_zoom,
             "timeline_scroll": self.timeline_scroll,
             "track_heights": track_heights,
+            "tracks": tracks_json,
+            "actor_track_assignments": dump_assignments(&self.actor_track_assignments),
+            "audio_track_assignments": dump_assignments(&self.audio_track_assignments),
+            "overlay_track_assignments": dump_assignments(&self.overlay_track_assignments),
             "curve_editor_open": self.curve_editor_open,
             "curve_editor_property": self.curve_editor_property,
-            "image_editor_open": self.image_editor_open,
             "web_image_search_open": self.web_image_search_open,
             "web_image_search_query": self.web_image_search.query,
             "library_split": self.library_split,

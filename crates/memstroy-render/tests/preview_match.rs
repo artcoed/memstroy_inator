@@ -286,8 +286,17 @@ fn animated_opacity_emits_geq_alpha_filter() {
 
     let graph = build_filter_graph(&scene);
     assert!(
-        graph.contains("geq=a='clip(alpha(X,Y)*("),
+        graph.contains(":a='clip(alpha(X,Y)*("),
         "animated opacity didn't emit per-frame geq alpha multiplier:\n{graph}",
+    );
+    // The geq filter requires an explicit luminance/RGB expression
+    // alongside the alpha — otherwise ffmpeg aborts graph init with
+    // "A luminance or RGB expression is mandatory". We feed the YUV
+    // passthrough triplet `lum=p(X,Y) / cb=p(X,Y) / cr=p(X,Y)` so the
+    // colour channels are unchanged.
+    assert!(
+        graph.contains("geq=lum='p(X,Y)':cb='p(X,Y)':cr='p(X,Y)':a='"),
+        "animated alpha geq missing the YUV passthrough triplet — ffmpeg will reject the filter:\n{graph}",
     );
     // The piecewise expression must use uppercase `T` (geq's
     // vocabulary) and reference the keyframe boundary at t=1.
@@ -444,7 +453,98 @@ fn image_overlay_inherits_full_pipeline() {
 }
 
 
-// ─── PR #62 follow-up: effect animation / LGG curves / skeleton ───
+#[test]
+fn animated_rotation_quotes_angle_to_protect_internal_commas() {
+    // Regression: the per-element `rotate=` filter used to embed the
+    // unquoted angle expression directly, e.g.
+    //   rotate=if(lt(t,2),0,30)*PI/180:c=none:ow=hypot(iw\,ih):oh=hypot(iw\,ih)
+    // FFmpeg's filtergraph parser splits filter chains on bare commas.
+    // The commas inside `if(lt(t,X),Y,Z)` were therefore parsed as
+    // chain separators, producing the user-visible
+    //   "No option name near 'none:ow=hypot(iw,ih):oh=hypot(iw,ih)'"
+    // error that crashed every render with an animated rotation OR
+    // an animated render-frame rotation. Wrapping the angle in
+    // single quotes (`rotate='...':c=none:...`) tells the parser to
+    // treat the whole expression as one positional argument and
+    // restores the export.
+    let mut scene = baseline_scene();
+    let mut actor = baseline_actor("a1");
+    actor.layout = vec![
+        Keyframe::new(0.0, ActorState { rotation_deg: 0.0, ..ActorState::default() }),
+        Keyframe::new(2.0, Easing::default().into_state_with_rot(45.0)),
+    ];
+    scene.actors.push(actor);
+
+    let graph = build_filter_graph(&scene);
+    // The angle MUST be quoted with `'...'`. Anything that produces
+    // a bare `rotate=if(` (without the leading single quote) is the
+    // regressed form.
+    assert!(
+        graph.contains("rotate='"),
+        "rotate angle is not single-quoted; animated rotation expressions will trip the filtergraph parser:\n{graph}",
+    );
+    assert!(
+        !graph.contains("rotate=if(lt"),
+        "rotate angle is unquoted with internal commas — ffmpeg will misparse the chain:\n{graph}",
+    );
+}
+
+trait IntoActorStateExt {
+    fn into_state_with_rot(self, deg: f32) -> ActorState;
+}
+impl IntoActorStateExt for Easing {
+    fn into_state_with_rot(self, deg: f32) -> ActorState {
+        ActorState { rotation_deg: deg, ..ActorState::default() }
+    }
+}
+
+#[test]
+fn overlay_layout_uses_clip_local_time_base() {
+    // Regression: the renderer used to lower overlay layout
+    // keyframes against the bare scene-time `t`, but the canvas
+    // preview samples them at `t - t_in` (clip-local). For an
+    // overlay with `t_in > 0` and a non-trivial position animation,
+    // the rendered MP4 was therefore shifted by `t_in` seconds
+    // relative to the preview — matching the user's "после рендера
+    // не так, как на холсте" report. The fix passes
+    // `LayoutTimeBase::ClipLocal { t_in }` so the piecewise
+    // expressions evaluate against `(t - t_in)` instead of `t`.
+    //
+    // We exercise this with an overlay whose layout has two
+    // keyframes (forces piecewise lowering) at clip-local times
+    // 0.0 and 1.0, placed on the timeline at scene-time `t_in=2.0`.
+    // The rendered expression for X must contain the
+    // `(t-2.000000)` substitution so the boundary `lt(t-2, 1)` lands
+    // at scene-time 3, matching where the canvas preview's
+    // `keyframe::sample` reaches the 2nd keyframe.
+    let mut scene = baseline_scene();
+    scene.output.duration = 6.0;
+    scene.overlays.push(Overlay::Image(ImageOverlay {
+        id: "im1".into(),
+        source: PathBuf::from("img.png"),
+        t_in: 2.0,
+        t_out: 5.0,
+        layout: vec![
+            Keyframe::new(0.0, OverlayState { pos: [0.2, 0.5], ..OverlayState::default() }),
+            Keyframe::new(1.0, OverlayState { pos: [0.8, 0.5], ..OverlayState::default() }),
+        ],
+        modifiers: Vec::new(),
+        skeleton_attachment: None,
+        effects: Vec::new(),
+        animated_params: Default::default(),
+        chroma_key: None,
+        z_order: 0,
+    }));
+
+    let graph = build_filter_graph(&scene);
+
+    // The clip-local substitution must appear in the overlay's
+    // position expression.
+    assert!(
+        graph.contains("(t-2.000000)"),
+        "overlay layout didn't render against clip-local time `(t - t_in)`:\n{graph}",
+    );
+}
 //
 // PR #62 wired in the keyframe / modifier / world-pixel pipeline but
 // left three further preview-vs-render parity gaps open: per-frame
@@ -940,6 +1040,391 @@ fn audio_track_with_no_audio_stream_is_skipped() {
     // Cleanup: don't leak the test artifact into /tmp.
     let _ = std::fs::remove_file(&bad_path);
 }
+
+// ─── Inspector-knob regression tests ─────────────────────────────────
+//
+// These pin the contract that every inspector-exposed audio param
+// (speed, pitch, pan, low-pass / high-pass cutoff, reverb) is wired
+// through the renderer's filter graph. Until the fix, the renderer
+// captured only volume/mute/fades and silently dropped the rest, so
+// the rendered video sounded different from the live preview — the
+// user's "звук в видео рендериться, но без измененных в инспекторе
+// параметров" report.
+
+#[test]
+fn audio_speed_lowers_to_asetrate_resample() {
+    // 2× speed mirrors the live preview's `Source::speed(2.0)`. The
+    // closest ffmpeg equivalent that DOES change pitch (matching the
+    // preview's no-time-stretch behaviour) is
+    // `asetrate=SR*rate, aresample=SR`.
+    let mut scene = baseline_scene();
+    let mut tr = audio_track("fast", 0.0);
+    tr.speed = 2.0;
+    scene.audio.push(tr);
+    let graph = build_filter_graph(&scene);
+
+    assert!(
+        graph.contains("asetrate=88200"),
+        "speed=2.0 must double the bus rate via asetrate:\n{graph}",
+    );
+    // After asetrate the chain MUST aresample back to the canonical
+    // bus rate so amix / the AAC encoder see a stable PCM stream.
+    let resample_count = graph.matches("aresample=44100").count();
+    assert!(
+        resample_count >= 2,
+        "asetrate must be followed by aresample=44100 to re-pin the bus \
+         rate (got {resample_count} aresample filters):\n{graph}",
+    );
+}
+
+#[test]
+fn audio_pitch_semitones_fold_into_resample_factor() {
+    // +12 semitones = 1 octave up = factor 2.0. With a default
+    // speed=1.0 the effective rate is 2.0 → asetrate=88200 just like
+    // a 2× speed track.
+    let mut scene = baseline_scene();
+    let mut tr = audio_track("octup", 0.0);
+    tr.pitch_semitones = 12.0;
+    scene.audio.push(tr);
+    let graph = build_filter_graph(&scene);
+
+    assert!(
+        graph.contains("asetrate=88200"),
+        "pitch_semitones=+12 must fold into a 2× resample factor:\n{graph}",
+    );
+}
+
+#[test]
+fn audio_default_speed_pitch_skip_asetrate_node() {
+    // The unmodified-defaults case must NOT spend graph budget on a
+    // resample no-op (the previous implementation's chain stayed
+    // tight on the common path; we don't want this regression).
+    let mut scene = baseline_scene();
+    scene.audio.push(audio_track("plain", 0.0));
+    let graph = build_filter_graph(&scene);
+
+    assert!(
+        !graph.contains("asetrate="),
+        "default-rate track should not emit an asetrate filter:\n{graph}",
+    );
+}
+
+#[test]
+fn audio_pan_emits_equal_power_pan_filter() {
+    // Pan = +1.0 (full right). Equal-power law: theta = π/2,
+    // cos(theta)=0, sin(theta)=1. After folding the 0.5/0.5 mono
+    // downmix and the sqrt(2)*0.5 normaliser, the right coefficient
+    // is sqrt(2)/4 ≈ 0.353553 and the left coefficient is 0 (the
+    // floating-point representation of cos(π/2) is a hair below zero
+    // so it formats as `-0.000000`, which is fine — both signs
+    // multiply to mute the left channel).
+    let mut scene = baseline_scene();
+    let mut tr = audio_track("right", 0.0);
+    tr.pan = 1.0;
+    scene.audio.push(tr);
+    let graph = build_filter_graph(&scene);
+
+    // Right-channel coefficient is the load-bearing signal that the
+    // equal-power law was applied. The left-channel coefficient is
+    // zero modulo float noise — assert separately on its absolute
+    // value so the test is robust to the sign bit.
+    assert!(
+        graph.contains("c1=0.353553*c0+0.353553*c1"),
+        "pan=+1 didn't lower into the equal-power right-channel mix:\n{graph}",
+    );
+    assert!(
+        graph.contains("c0=0.000000*c0+0.000000*c1")
+            || graph.contains("c0=-0.000000*c0+-0.000000*c1"),
+        "pan=+1 left-channel coefficients should be zero:\n{graph}",
+    );
+}
+
+#[test]
+fn audio_pan_centre_skips_pan_filter() {
+    // pan=0 is identity — emitting a `pan=` would be a wasted node.
+    let mut scene = baseline_scene();
+    let mut tr = audio_track("center", 0.0);
+    tr.pan = 0.0;
+    scene.audio.push(tr);
+    let graph = build_filter_graph(&scene);
+
+    assert!(
+        !graph.contains("pan=stereo|"),
+        "pan=0 (centred) should not allocate a pan filter:\n{graph}",
+    );
+}
+
+#[test]
+fn audio_low_pass_high_pass_emit_biquad_filters() {
+    let mut scene = baseline_scene();
+    let mut tr = audio_track("filtered", 0.0);
+    tr.low_pass_hz = Some(8000);
+    tr.high_pass_hz = Some(120);
+    scene.audio.push(tr);
+    let graph = build_filter_graph(&scene);
+
+    assert!(
+        graph.contains("highpass=f=120"),
+        "high_pass_hz didn't lower into a highpass filter:\n{graph}",
+    );
+    assert!(
+        graph.contains("lowpass=f=8000"),
+        "low_pass_hz didn't lower into a lowpass filter:\n{graph}",
+    );
+}
+
+#[test]
+fn audio_disabled_filters_emit_no_pass_filters() {
+    // `low_pass_hz = None` / `high_pass_hz = None` represent the
+    // inspector toggle being OFF — no biquad filter should be emitted.
+    let mut scene = baseline_scene();
+    let mut tr = audio_track("clean", 0.0);
+    tr.low_pass_hz = None;
+    tr.high_pass_hz = None;
+    scene.audio.push(tr);
+    let graph = build_filter_graph(&scene);
+
+    assert!(
+        !graph.contains("lowpass=f="),
+        "lowpass should not be emitted when low_pass_hz=None:\n{graph}",
+    );
+    assert!(
+        !graph.contains("highpass=f="),
+        "highpass should not be emitted when high_pass_hz=None:\n{graph}",
+    );
+}
+
+#[test]
+fn audio_reverb_emits_aecho_with_preview_parameters() {
+    // The preview's `dsp::Reverb` uses ~120 ms delay and
+    // feedback = mix * 0.55 (capped at 0.7). The renderer's `aecho`
+    // approximation must use the same constants so the rendered tail
+    // matches what the user heard.
+    let mut scene = baseline_scene();
+    let mut tr = audio_track("wet", 0.0);
+    tr.reverb = 0.5;
+    scene.audio.push(tr);
+    let graph = build_filter_graph(&scene);
+
+    // mix=0.5 → aecho mix=0.5, decay=0.275.
+    assert!(
+        graph.contains("aecho=1.0:0.500000:120:0.275000"),
+        "reverb didn't lower into aecho with preview-matching constants:\n{graph}",
+    );
+}
+
+#[test]
+fn audio_reverb_zero_skips_aecho_node() {
+    let mut scene = baseline_scene();
+    let mut tr = audio_track("dry", 0.0);
+    tr.reverb = 0.0;
+    scene.audio.push(tr);
+    let graph = build_filter_graph(&scene);
+
+    assert!(
+        !graph.contains("aecho="),
+        "reverb=0 should not allocate an aecho filter:\n{graph}",
+    );
+}
+
+#[test]
+fn audio_volume_keyframes_lower_to_per_segment_chain() {
+    // Two keyframes (0.0 → 1.0 across 2 s) with `"volume"` flagged as
+    // animated must lower into a chain of
+    // `volume=…:enable='between(t,a,b)'` clauses, mirroring how
+    // `expr.rs::effect_animated_filter_chain` lowers animated video
+    // effects. The static `volume` field MUST NOT leak through as an
+    // unconditional filter — that would override the keyed envelope.
+    use memstroy_core::{Easing, Keyframe};
+
+    let mut scene = baseline_scene();
+    scene.output.duration = 2.0;
+    let mut tr = audio_track("envelope", 0.0);
+    tr.t_out = Some(2.0);
+    tr.volume = 0.5; // static fallback; should not appear as bare filter
+    tr.animated_params.insert("volume".into());
+    tr.volume_kfs = vec![
+        Keyframe { t: 0.0, value: 0.0_f32, easing: Easing::default() },
+        Keyframe { t: 2.0, value: 1.0_f32, easing: Easing::default() },
+    ];
+    scene.audio.push(tr);
+    let graph = build_filter_graph(&scene);
+
+    // Per-segment volume filters MUST exist.
+    assert!(
+        graph.contains("volume=") && graph.contains(":enable='between(t,"),
+        "animated volume didn't lower into per-segment chain:\n{graph}",
+    );
+    // The static fallback (0.5) MUST NOT escape as an unconditional
+    // filter — every emitted volume node has to be gated by enable=.
+    // Look for the bare `volume=0.500000,` (followed by a comma —
+    // i.e. a chain separator, not part of an enable expression) or
+    // `volume=0.500000[` (label terminator). Either pattern would
+    // mean the static value leaked through.
+    assert!(
+        !graph.contains("volume=0.500000,") && !graph.contains("volume=0.500000["),
+        "static volume value leaked through as unconditional filter:\n{graph}",
+    );
+}
+
+#[test]
+fn audio_pan_keyframes_lower_to_per_segment_chain() {
+    use memstroy_core::{Easing, Keyframe};
+    let mut scene = baseline_scene();
+    scene.output.duration = 2.0;
+    let mut tr = audio_track("sweep", 0.0);
+    tr.t_out = Some(2.0);
+    tr.animated_params.insert("pan".into());
+    tr.pan_kfs = vec![
+        Keyframe { t: 0.0, value: -1.0_f32, easing: Easing::default() },
+        Keyframe { t: 2.0, value: 1.0_f32, easing: Easing::default() },
+    ];
+    scene.audio.push(tr);
+    let graph = build_filter_graph(&scene);
+
+    // Per-segment pan filters are emitted as
+    // `pan=stereo|...|...:enable='between(t,a,b)'`. Counting
+    // distinct `pan=stereo|` opener occurrences each followed by
+    // an `:enable='between(t,` is robust to the commas living
+    // inside the enable expression.
+    let pan_segments = graph.matches("pan=stereo|").count();
+    assert!(
+        pan_segments >= 2,
+        "expected ≥2 per-segment pan filters, got {pan_segments}:\n{graph}",
+    );
+    // Every per-segment pan filter must carry an enable clause —
+    // the count of `pan=stereo|` openers should equal the count of
+    // `pan=...enable=` patterns when animation is active.
+    let gated = graph.matches(":enable='between(t,").count();
+    assert!(
+        gated >= 2,
+        "expected pan-segment filters to be enable-gated, found {gated} \
+         enable= clauses total in graph:\n{graph}",
+    );
+}
+
+#[test]
+fn audio_low_pass_keyframes_lower_to_per_segment_chain() {
+    use memstroy_core::{Easing, Keyframe};
+    let mut scene = baseline_scene();
+    scene.output.duration = 2.0;
+    let mut tr = audio_track("sweepfilter", 0.0);
+    tr.t_out = Some(2.0);
+    tr.low_pass_hz = Some(8000); // enables animation path
+    tr.animated_params.insert("low_pass".into());
+    tr.low_pass_kfs = vec![
+        Keyframe { t: 0.0, value: 1000.0_f32, easing: Easing::default() },
+        Keyframe { t: 2.0, value: 8000.0_f32, easing: Easing::default() },
+    ];
+    scene.audio.push(tr);
+    let graph = build_filter_graph(&scene);
+
+    let lp_count = graph.matches("lowpass=f=").count();
+    assert!(
+        lp_count >= 2,
+        "expected ≥2 per-segment lowpass filters, got {lp_count}:\n{graph}",
+    );
+    // Every emitted lowpass must be enable-gated when animated.
+    // Confirm at least one segment carries an enable clause adjacent
+    // to a lowpass filter.
+    assert!(
+        graph.contains("lowpass=f=") && graph.contains(":enable='between(t,"),
+        "animated lowpass missing enable= gates:\n{graph}",
+    );
+}
+
+#[test]
+fn audio_low_pass_disabled_in_inspector_skips_animation() {
+    // Even when keyframes are authored, an OFF inspector toggle
+    // (`low_pass_hz == None`) must short-circuit the animation path
+    // — otherwise the user's "off" click is a no-op in the export.
+    use memstroy_core::{Easing, Keyframe};
+    let mut scene = baseline_scene();
+    scene.output.duration = 2.0;
+    let mut tr = audio_track("offswitch", 0.0);
+    tr.t_out = Some(2.0);
+    tr.low_pass_hz = None;
+    tr.animated_params.insert("low_pass".into());
+    tr.low_pass_kfs = vec![
+        Keyframe { t: 0.0, value: 1000.0_f32, easing: Easing::default() },
+        Keyframe { t: 2.0, value: 8000.0_f32, easing: Easing::default() },
+    ];
+    scene.audio.push(tr);
+    let graph = build_filter_graph(&scene);
+
+    assert!(
+        !graph.contains("lowpass=f="),
+        "low_pass_hz=None must disable the filter even with keyframes set:\n{graph}",
+    );
+}
+
+#[test]
+fn audio_reverb_keyframes_lower_to_per_segment_chain() {
+    use memstroy_core::{Easing, Keyframe};
+    let mut scene = baseline_scene();
+    scene.output.duration = 2.0;
+    let mut tr = audio_track("reverbenv", 0.0);
+    tr.t_out = Some(2.0);
+    tr.animated_params.insert("reverb".into());
+    tr.reverb_kfs = vec![
+        Keyframe { t: 0.0, value: 0.0_f32, easing: Easing::default() },
+        Keyframe { t: 2.0, value: 0.8_f32, easing: Easing::default() },
+    ];
+    scene.audio.push(tr);
+    let graph = build_filter_graph(&scene);
+
+    let aecho_count = graph.matches("aecho=").count();
+    assert!(
+        aecho_count >= 2,
+        "expected ≥2 per-segment aecho filters, got {aecho_count}:\n{graph}",
+    );
+    assert!(
+        graph.contains("aecho=") && graph.contains(":enable='between(t,"),
+        "animated reverb missing enable= gates:\n{graph}",
+    );
+}
+
+#[test]
+fn audio_mute_overrides_animated_volume() {
+    // The GUI's M button is a hard mute. Even when the user has
+    // authored a volume envelope, mute must collapse the chain to
+    // silence — not "play the keyframe values".
+    use memstroy_core::{Easing, Keyframe};
+    let mut scene = baseline_scene();
+    scene.output.duration = 2.0;
+    let mut tr = audio_track("mutedanim", 0.0);
+    tr.t_out = Some(2.0);
+    tr.mute = true;
+    tr.animated_params.insert("volume".into());
+    tr.volume_kfs = vec![
+        Keyframe { t: 0.0, value: 0.5_f32, easing: Easing::default() },
+        Keyframe { t: 2.0, value: 1.0_f32, easing: Easing::default() },
+    ];
+    scene.audio.push(tr);
+    let graph = build_filter_graph(&scene);
+
+    // Hard `volume=0.000000` somewhere in the chain.
+    assert!(
+        graph.contains("volume=0.000000"),
+        "mute didn't override the animated volume envelope:\n{graph}",
+    );
+    // No per-segment volume filters should leak through — the chain
+    // collapses to the unconditional silence node. If any
+    // `volume=…` appears with an `:enable=between(t,` immediately
+    // after, that means a per-segment filter was emitted alongside
+    // the mute (a regression).
+    let segmented_volume = graph
+        .matches("volume=")
+        .count()
+        > 1
+        || graph.contains("volume=0.500000:enable=")
+        || graph.contains("volume=1.000000:enable=");
+    assert!(
+        !segmented_volume,
+        "mute should suppress per-segment animated volume filters:\n{graph}",
+    );
+}
+
 
 #[test]
 fn output_stream_is_normalised_to_yuv420p_cfr() {
@@ -1551,4 +2036,302 @@ fn default_render_frame_skips_zoom_rotate_fast_path() {
         !graph.contains("rotate="),
         "default rf shouldn't emit a rotate filter on a non-rotated actor:\n{graph}",
     );
+}
+
+
+
+// ─── CPU compositor parity ─────────────────────────────────────────
+//
+// The new CPU pipeline (`compositor.rs`) is the canonical render path.
+// These tests pin the contract that simple scenes produce sane output
+// and that the pipeline doesn't regress when scenes contain mixes of
+// elements that historically failed in the FFmpeg-graph backend.
+
+use memstroy_render::render_preview_frame_cpu;
+use std::path::Path;
+
+fn _temp_assets_root_unused() -> PathBuf {
+    PathBuf::from(".")
+}
+
+fn temp_out_path(name: &str) -> PathBuf {
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!(
+        "memstroy-cputest-{}-{}-{}.png",
+        name, pid, nanos
+    ))
+}
+
+#[test]
+fn cpu_pipeline_produces_image_of_expected_dimensions() {
+    let mut scene = baseline_scene();
+    scene.format_version = 2;
+    scene.output.duration = 0.5;
+    scene.output.resolution = [1080, 1920];
+    scene.render_frame.resolution = [1080, 1920];
+    scene.output.background_color = [10, 20, 30];
+
+    let out = temp_out_path("dims");
+    let result = render_preview_frame_cpu(&scene, Path::new("."), 0.0, &out);
+    if let Err(e) = &result {
+        eprintln!("CPU preview failed: {}", e);
+    }
+    assert!(result.is_ok(), "CPU preview must succeed for empty scene");
+    let img = image::open(&out).expect("decode preview").to_rgba8();
+    assert_eq!(img.width(), 1080);
+    assert_eq!(img.height(), 1920);
+    let _ = std::fs::remove_file(&out);
+}
+
+#[test]
+fn cpu_pipeline_paints_background_color_when_empty() {
+    // An empty scene should produce a uniform fill in the configured
+    // background colour. Sample several pixels to confirm.
+    let mut scene = baseline_scene();
+    scene.format_version = 2;
+    scene.output.duration = 0.5;
+    scene.output.resolution = [1080, 1920];
+    scene.render_frame.resolution = [1080, 1920];
+    scene.output.background_color = [200, 100, 50];
+
+    let out = temp_out_path("bgcolor");
+    render_preview_frame_cpu(&scene, Path::new("."), 0.0, &out)
+        .expect("CPU preview must succeed");
+
+    let img = image::open(&out).expect("decode preview").to_rgba8();
+    let samples = [
+        (50u32, 50u32),
+        (img.width() / 2, img.height() / 2),
+        (img.width() - 50, img.height() - 50),
+    ];
+    for (x, y) in &samples {
+        let p = img.get_pixel(*x, *y).0;
+        assert!(
+            (p[0] as i32 - 200).abs() < 5
+                && (p[1] as i32 - 100).abs() < 5
+                && (p[2] as i32 - 50).abs() < 5,
+            "background colour mismatch at ({},{}): {:?}",
+            x, y, p
+        );
+        assert_eq!(p[3], 255, "expected fully opaque");
+    }
+    let _ = std::fs::remove_file(&out);
+}
+
+
+#[test]
+fn cpu_pipeline_places_image_overlay_at_world_position() {
+    // Create a synthetic image overlay at a known position and verify
+    // the rendered output puts its centre at the expected output
+    // coordinates. Uses a tiny coloured PNG generated on the fly so
+    // the test doesn't depend on any committed asset.
+    use memstroy_core::{Easing, ImageOverlay, OverlayState};
+
+    // 100×100 solid red PNG.
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "memstroy-cputest-asset-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&tmp_dir).expect("mkdir asset dir");
+    let img_path = tmp_dir.join("red.png");
+    let red = image::RgbaImage::from_pixel(100, 100, image::Rgba([255, 0, 0, 255]));
+    red.save(&img_path).expect("write red.png");
+
+    // Scene: 200×200, image overlay at pos (0.5, 0.5), scale=1, no rf zoom.
+    let mut scene = baseline_scene();
+    scene.format_version = 2;
+    scene.output.resolution = [200, 200];
+    scene.render_frame.resolution = [200, 200];
+    // The default `RenderFrameState` carries a 1080×1920-era pos
+    // (540, 960). For a 200×200 scene we must reposition the rf to
+    // the centre of its own output rectangle so the legacy
+    // normalised pos of (0.5, 0.5) lands at the rf centre.
+    scene.render_frame.layout = vec![Keyframe {
+        t: 0.0,
+        value: memstroy_core::RenderFrameState {
+            pos: memstroy_core::canvas::WorldPos { x: 100.0, y: 100.0 },
+            zoom: 1.0,
+            rotation_deg: 0.0,
+        },
+        easing: Easing::Linear,
+    }];
+    scene.output.duration = 0.5;
+    scene.output.background_color = [0, 200, 0]; // bright green
+
+    // Image overlay using the relative path from the temp dir.
+    scene.overlays.push(Overlay::Image(ImageOverlay {
+        id: "img1".into(),
+        source: PathBuf::from("red.png"),
+        t_in: 0.0,
+        t_out: 0.5,
+        layout: vec![Keyframe {
+            t: 0.0,
+            value: OverlayState {
+                pos: [0.5, 0.5], // dead centre
+                scale: 1.0,
+                scale_y: 1.0,
+                rotation_deg: 0.0,
+                opacity: 1.0,
+                flip_x_anim: 1.0,
+                flip_y_anim: 1.0,
+            },
+            easing: Easing::Linear,
+        }],
+        modifiers: Vec::new(),
+        skeleton_attachment: None,
+        effects: Vec::new(),
+        animated_params: Default::default(),
+        chroma_key: None,
+        z_order: 0,
+    }));
+
+    let out_path = std::env::temp_dir().join(format!(
+        "memstroy-cputest-place-{}.png",
+        std::process::id()
+    ));
+    render_preview_frame_cpu(&scene, &tmp_dir, 0.0, &out_path)
+        .expect("CPU preview must succeed");
+    let img = image::open(&out_path).expect("decode preview").to_rgba8();
+    assert_eq!(img.width(), 200);
+    assert_eq!(img.height(), 200);
+
+    // The 100×100 red image is centred on (100, 100) → rectangle
+    // covers x in [50..150], y in [50..150]. Pixels inside should be
+    // red; pixels outside should be the green background.
+    let center = img.get_pixel(100, 100).0;
+    assert!(
+        center[0] > 240 && center[1] < 30 && center[2] < 30,
+        "centre pixel should be red, got {:?}",
+        center
+    );
+    // Just inside the right edge of the image — still red.
+    let inside_edge = img.get_pixel(140, 100).0;
+    assert!(
+        inside_edge[0] > 200 && inside_edge[1] < 80 && inside_edge[2] < 80,
+        "pixel just inside right edge of overlay should be red, got {:?}",
+        inside_edge
+    );
+    // Outside the image — green background.
+    let outside = img.get_pixel(180, 100).0;
+    assert!(
+        outside[1] > 150 && outside[0] < 80 && outside[2] < 80,
+        "pixel outside overlay should be the green background, got {:?}",
+        outside
+    );
+
+    let _ = std::fs::remove_file(&out_path);
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+#[test]
+fn cpu_pipeline_honours_render_frame_pos_offset() {
+    // When `render_frame.pos` shifts AWAY from the world origin, the
+    // output should show world content at a translated offset:
+    //   output_centre = render_frame.pos
+    //   world (rf.pos + d) → output (W/2 + d)
+    //
+    // We place an image overlay at world (700, 1100) with the
+    // render-frame at (700, 1100) so the overlay's centre lands on
+    // the output's centre regardless of the rf shift.
+    use memstroy_core::{
+        canvas::{CanvasTransform, RenderFrameState, WorldPos},
+        CanvasLayout, Easing, ImageOverlay, OverlayState,
+    };
+
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "memstroy-cputest-rfpos-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&tmp_dir).expect("mkdir asset dir");
+    let img_path = tmp_dir.join("blue.png");
+    let blue = image::RgbaImage::from_pixel(100, 100, image::Rgba([0, 0, 255, 255]));
+    blue.save(&img_path).expect("write blue.png");
+
+    let mut scene = baseline_scene();
+    scene.format_version = 2;
+    scene.output.resolution = [400, 400];
+    scene.render_frame.resolution = [400, 400];
+    scene.output.duration = 0.5;
+    scene.output.background_color = [200, 200, 200];
+
+    // Render frame centred at world (700, 1100).
+    scene.render_frame.layout = vec![Keyframe {
+        t: 0.0,
+        value: RenderFrameState {
+            pos: WorldPos { x: 700.0, y: 1100.0 },
+            zoom: 1.0,
+            rotation_deg: 0.0,
+        },
+        easing: Easing::Linear,
+    }];
+
+    // Image overlay anchored at world (700, 1100) via canvas_layouts.
+    scene.overlays.push(Overlay::Image(ImageOverlay {
+        id: "blue1".into(),
+        source: PathBuf::from("blue.png"),
+        t_in: 0.0,
+        t_out: 0.5,
+        layout: vec![Keyframe {
+            t: 0.0,
+            value: OverlayState::default(),
+            easing: Easing::Linear,
+        }],
+        modifiers: Vec::new(),
+        skeleton_attachment: None,
+        effects: Vec::new(),
+        animated_params: Default::default(),
+        chroma_key: None,
+        z_order: 0,
+    }));
+    scene.canvas_layouts.push(CanvasLayout {
+        element_id: "blue1".into(),
+        keyframes: vec![Keyframe {
+            t: 0.0,
+            value: CanvasTransform {
+                pos: WorldPos { x: 700.0, y: 1100.0 },
+                width: 100.0,
+                scale: 1.0,
+                rotation_deg: 0.0,
+                opacity: 1.0,
+            },
+            easing: Easing::Linear,
+        }],
+    });
+
+    let out_path = std::env::temp_dir().join(format!(
+        "memstroy-cputest-rfpos-{}.png",
+        std::process::id()
+    ));
+    render_preview_frame_cpu(&scene, &tmp_dir, 0.0, &out_path)
+        .expect("CPU preview must succeed");
+    let img = image::open(&out_path).expect("decode").to_rgba8();
+
+    // The blue 100×100 image should be centred at output (200, 200).
+    let center = img.get_pixel(200, 200).0;
+    assert!(
+        center[2] > 200 && center[0] < 60 && center[1] < 60,
+        "centre pixel should be blue when rf.pos == overlay world pos, got {:?}",
+        center
+    );
+    let outside = img.get_pixel(20, 20).0;
+    assert!(
+        outside[0] > 150 && outside[1] > 150 && outside[2] > 150,
+        "outside pixel should be the grey background, got {:?}",
+        outside
+    );
+
+    let _ = std::fs::remove_file(&out_path);
+    let _ = std::fs::remove_dir_all(&tmp_dir);
 }

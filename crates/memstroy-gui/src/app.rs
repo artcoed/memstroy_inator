@@ -10,7 +10,6 @@ use tokio::runtime::Runtime;
 use crate::jobs::{spawn_refresh, spawn_render, JobEvent};
 use crate::panels;
 use crate::state::{EditorState, Selection};
-use crate::image_editor;
 use crate::audio_engine::AudioEngine;
 
 pub struct App {
@@ -119,28 +118,10 @@ impl App {
         let mut audio_engine = AudioEngine::new();
         audio_engine.set_master_volume(state.settings.master_volume);
 
-        // Recovery: if an autosave from a previous session exists and is newer
-        // than the user's current scene file, surface a recovery dialog.
-        let autosave_path = EditorState::autosave_path();
-        if autosave_path.exists() {
-            let autosave_modified = std::fs::metadata(&autosave_path)
-                .and_then(|m| m.modified())
-                .ok();
-            // If there is no scene file, any autosave is a candidate.
-            // If there is one, only show recovery when the autosave is newer.
-            let should_offer = match (&state.scene_path, autosave_modified) {
-                (None, Some(_)) => true,
-                (Some(p), Some(am)) => match std::fs::metadata(p).and_then(|m| m.modified()) {
-                    Ok(scene_modified) => am > scene_modified,
-                    Err(_) => true,
-                },
-                _ => true,
-            };
-            if should_offer {
-                state.recovery_pending = Some(autosave_path);
-                state.recovery_dialog_open = true;
-            }
-        }
+        // Recovery: if an autosave from a previous session exists we don't
+        // pop a modal anymore. The autosave is exposed as a menu entry under
+        // File > Open last autosave, so the user can open it on demand
+        // without an interruption on launch.
 
         Self {
             rt,
@@ -236,9 +217,24 @@ impl App {
                 JobEvent::RenderLog(line) => {
                     if let Some(rp) = self.state.render_progress.as_mut() {
                         rp.last_log = line.clone();
-                        // Parse ffmpeg progress from log lines
-                        // Look for "frame= 120" or "time=00:00:04.00"
-                        if let Some(time_progress) = parse_ffmpeg_time(&line) {
+                        // Parse progress from CPU compositor log lines:
+                        //
+                        //   "[12.5%] Encoding 120 frames..."   ← stage update
+                        //   "frame 30/120 (25.0%)"             ← per-frame
+                        //
+                        // Falling back to the legacy ffmpeg formats
+                        // (`frame=  120` / `time=00:00:04.00`) for
+                        // users who flip `MEMSTROY_RENDER_BACKEND=ffmpeg`.
+                        if let Some(p) = parse_compositor_percent(&line) {
+                            rp.progress = (p / 100.0).clamp(0.0, 1.0);
+                        } else if let Some((cur, total)) =
+                            parse_compositor_frame(&line)
+                        {
+                            if total > 0 {
+                                rp.progress = (cur as f32 / total as f32)
+                                    .clamp(0.0, 1.0);
+                            }
+                        } else if let Some(time_progress) = parse_ffmpeg_time(&line) {
                             let total = self.state.scene.output.duration;
                             if total > 0.0 {
                                 rp.progress = (time_progress / total).clamp(0.0, 1.0);
@@ -256,6 +252,16 @@ impl App {
                     self.state.status = format!("{} {}", crate::i18n::t("\u{2705} Rendered:"), p.display());
                     if let Some(rp) = self.state.render_progress.as_mut() {
                         rp.done = true;
+                        rp.progress = 1.0;
+                        // Freeze the elapsed counter at the moment the
+                        // render actually finished. Without this the
+                        // window keeps ticking the timer until the
+                        // user clicks Close, which is exactly the
+                        // "после рендера видео в окне рендера
+                        // останавливай счетчик" report.
+                        if rp.finished_elapsed.is_none() {
+                            rp.finished_elapsed = Some(rp.started.elapsed());
+                        }
                     }
                 }
                 JobEvent::RenderFinished(Err(e)) => {
@@ -263,6 +269,9 @@ impl App {
                     if let Some(rp) = self.state.render_progress.as_mut() {
                         rp.done = true;
                         rp.error = Some(e);
+                        if rp.finished_elapsed.is_none() {
+                            rp.finished_elapsed = Some(rp.started.elapsed());
+                        }
                     }
                 }
                 JobEvent::RefreshProgress(msg) => {
@@ -486,7 +495,7 @@ impl App {
             egui::ScrollArea::horizontal()
                 .id_source("scene_tabs_scroll")
                 .max_width(scroll_w)
-                .auto_shrink([false, true])
+                .auto_shrink([true, true])
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing.x = 4.0;
 
@@ -504,15 +513,15 @@ impl App {
 
                         let (fill, stroke_col, text_col, accent) = if is_active {
                             (
-                                Color32::from_rgb(40, 40, 58),
-                                Color32::from_rgb(120, 100, 220),
+                                Color32::from_rgb(44, 42, 28),
+                                Color32::from_rgb(255, 242, 0),
                                 Color32::from_rgb(255, 255, 255),
-                                Some(Color32::from_rgb(140, 100, 255)),
+                                Some(Color32::from_rgb(255, 242, 0)),
                             )
                         } else {
                             (
-                                Color32::from_rgb(26, 26, 36),
-                                Color32::from_rgb(50, 50, 70),
+                                Color32::from_rgb(30, 28, 18),
+                                Color32::from_rgb(54, 52, 36),
                                 Color32::from_rgb(160, 160, 180),
                                 None,
                             )
@@ -630,11 +639,11 @@ impl App {
                 RichText::new("+")
                     .size(15.0)
                     .strong()
-                    .color(Color32::from_rgb(160, 220, 160)),
+                    .color(Color32::from_rgb(255, 230, 120)),
             )
-            .fill(Color32::from_rgb(28, 36, 28))
+            .fill(Color32::from_rgb(44, 38, 16))
             .rounding(Rounding::same(7.0))
-            .stroke(Stroke::new(1.0, Color32::from_rgb(50, 80, 50)))
+            .stroke(Stroke::new(1.0, Color32::from_rgb(120, 100, 40)))
             .min_size(Vec2::new(26.0, 22.0));
             if ui.add(plus_btn).on_hover_text(crate::i18n::t("New scene tab")).clicked() {
                 self.state.new_tab();
@@ -722,6 +731,120 @@ impl App {
                     ui.close_menu();
                 }
                 ui.separator();
+
+                // ── Autosaves submenu ─────────────────────────────
+                // Replaces the old single "open last autosave" entry.
+                // Every per-project autosave slot the manager has on
+                // disk shows up here as one row, sorted newest-first.
+                // Each row carries the original project name + age so
+                // the user can pick a specific recovery point instead
+                // of being limited to "the most recent one across all
+                // projects".
+                let autosave_entries = crate::autosave::list_entries();
+                ui.menu_button(t("\u{1F504} Open autosave"), |ui| {
+                    if autosave_entries.is_empty() {
+                        ui.add_enabled(
+                            false,
+                            egui::Button::new(t("(no autosaves yet)")),
+                        );
+                    } else {
+                        // Cap the visible list so the menu doesn't grow
+                        // unboundedly when long-running editors pile up
+                        // dozens of slots. The cap is generous enough
+                        // that anyone routinely flipping between a
+                        // handful of projects sees them all.
+                        const MAX_ROWS: usize = 30;
+                        for entry in autosave_entries.iter().take(MAX_ROWS) {
+                            let display_name = entry
+                                .meta
+                                .as_ref()
+                                .map(|m| {
+                                    if !m.name.is_empty() {
+                                        m.name.clone()
+                                    } else if let Some(p) = m.original_path.as_ref() {
+                                        p.file_stem()
+                                            .and_then(|s| s.to_str())
+                                            .unwrap_or("Scene")
+                                            .to_string()
+                                    } else {
+                                        t("Untitled").to_string()
+                                    }
+                                })
+                                .unwrap_or_else(|| {
+                                    entry
+                                        .scene_path
+                                        .file_stem()
+                                        .and_then(|s| s.to_str())
+                                        .unwrap_or("Scene")
+                                        .to_string()
+                                });
+                            let age = crate::autosave::format_age(entry.mtime);
+                            let label = format!("{display_name}  ·  {age}");
+                            let hover = if let Some(orig) = entry
+                                .meta
+                                .as_ref()
+                                .and_then(|m| m.original_path.as_ref())
+                            {
+                                format!(
+                                    "{}\n{}",
+                                    orig.display(),
+                                    entry.scene_path.display()
+                                )
+                            } else {
+                                entry.scene_path.display().to_string()
+                            };
+                            if ui.button(label).on_hover_text(hover).clicked() {
+                                match Scene::load(&entry.scene_path) {
+                                    Ok(scene) => {
+                                        self.state.scene = scene;
+                                        // Restore the original project
+                                        // path when the metadata
+                                        // recorded one, so saving
+                                        // straight after recovery
+                                        // overwrites the same file the
+                                        // user was working on.
+                                        self.state.scene_path = entry
+                                            .meta
+                                            .as_ref()
+                                            .and_then(|m| m.original_path.clone());
+                                        self.state.status = t(
+                                            "\u{2705} Recovered scene loaded.",
+                                        )
+                                        .into();
+                                        if self.state.active_tab
+                                            < self.state.scene_tabs.len()
+                                        {
+                                            let idx = self.state.active_tab;
+                                            let tab_name = entry
+                                                .meta
+                                                .as_ref()
+                                                .map(|m| m.name.clone())
+                                                .filter(|s| !s.is_empty())
+                                                .unwrap_or_else(|| {
+                                                    self.state.scene_tabs[idx]
+                                                        .name
+                                                        .clone()
+                                                });
+                                            self.state.scene_tabs[idx].name = tab_name;
+                                            self.state.scene_tabs[idx].path =
+                                                self.state.scene_path.clone();
+                                            self.state.scene_tabs[idx].scene =
+                                                self.state.scene.clone();
+                                        }
+                                    }
+                                    Err(e) => {
+                                        self.state.status = format!(
+                                            "{} {e}",
+                                            t("\u{274C} Recovery failed:")
+                                        );
+                                    }
+                                }
+                                ui.close_menu();
+                            }
+                        }
+                    }
+                });
+                ui.separator();
                 if ui.button(t("\u{2699} Settings...")).clicked() {
                     self.state.settings_open = true;
                     ui.close_menu();
@@ -752,14 +875,10 @@ impl App {
                     &mut self.state.curve_editor_open,
                     t("\u{1F4C8} Curve Editor"),
                 );
-                ui.checkbox(
-                    &mut self.state.image_editor_open,
-                    t("\u{1F5BC} Image Editor"),
-                );
-                ui.checkbox(
-                    &mut self.state.skeleton_editor.open,
-                    t("\u{2692} Skeleton Editor"),
-                );
+                // Skeleton editor used to live as a floating window
+                // here. It now belongs to the inspector for any video
+                // layer element (actor / video overlay), so the menu
+                // entry was retired alongside the window.
             });
 
             // Status indicator on the right
@@ -767,11 +886,15 @@ impl App {
                 if self.state.refreshing {
                     ui.spinner();
                     ui.label(RichText::new(t("refreshing...")).color(Color32::from_rgb(255, 200, 50)).size(11.0));
-                } else if let Some(rp) = &self.state.render_progress {
-                    if !rp.done {
-                        ui.add(egui::ProgressBar::new(rp.progress).text(format!("{:.0}%", rp.progress * 100.0)));
-                    }
                 }
+                // The render progress bar that used to live here was
+                // removed per user request — the dedicated render
+                // window (`show_render_progress_window`) is the single
+                // source of truth for render status. Duplicating it on
+                // the menu bar made the toolbar busy and the user
+                // explicitly asked for "шкала рендера не нужна, оставь
+                // только в окне рендера".
+
                 // Show status text (trimmed)
                 let status = &self.state.status;
                 if !status.is_empty() && !status.starts_with("__") {
@@ -820,8 +943,15 @@ impl App {
         let modifiers = ctx.input(|i| i.modifiers);
         let ctrl = modifiers.ctrl || modifiers.mac_cmd;
 
-        // ── Modifier-based shortcuts — always run. ──
-        if ctrl {
+        // ── Modifier-based shortcuts — always run unless a text
+        //    widget has focus. ──
+        //
+        // Ctrl+Z / Ctrl+Y / Ctrl+D have semantics specific to a
+        // focused TextEdit (per-field undo, redo, duplicate-line)
+        // that the user expects to take precedence when they're
+        // editing text. Gating these behind `!typing` lets the
+        // text widget see the chord natively.
+        if ctrl && !typing {
             // Ctrl+Z = Undo (NOT Shift+Z, which is redo).
             if !modifiers.shift && ctx.input_mut(|i| {
                 i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z)
@@ -900,7 +1030,29 @@ impl App {
         //    `Event::Copy` / `Event::Cut` regardless of clipboard
         //    state — there is no `if !contents.is_empty()` gate on
         //    that path.
-        let drained = swallow_clipboard_events(ctx);
+        //
+        // ── Inspector TextEdit / DragValue carve-out ──
+        //
+        // When the user is typing into a TextEdit (or editing a
+        // numeric field via its temporary text-edit popup) we MUST
+        // leave Ctrl+C / Ctrl+X / Ctrl+V to the focused widget so
+        // they act on the field's text — copy a phrase, paste a
+        // number — instead of duplicating the canvas selection.
+        // `wants_keyboard_input()` flips to true precisely while a
+        // text widget owns focus, so we use it to gate both the
+        // event drain and the chord/release fallbacks. Without this
+        // gate the inspector behaved as the user reported: pressing
+        // Ctrl+V in a text field pasted layers onto the canvas
+        // instead of the clipboard text into the field.
+        let drained = swallow_clipboard_events(ctx, typing);
+        if typing {
+            // Suspend the canvas-side copy/paste pipeline entirely
+            // for this frame. We still drained "presence" booleans
+            // above, but we don't act on them — the focused widget
+            // handles its own clipboard ops, and the V-release
+            // fallback below is short-circuited.
+            return;
+        }
         let chord_copy = ctrl
             && !modifiers.shift
             && ctx.input_mut(|i| {
@@ -1073,16 +1225,11 @@ impl App {
             return;
         }
 
-        // Don't fire main-canvas plain-key shortcuts (Space, Delete,
-        // Esc) while the skeleton editor window is open. Its own
-        // `handle_input` already consumed the relevant keys earlier
-        // this frame, but we belt-and-brace gate the block too so a
-        // future edit that adds another plain-key shortcut (M, T, …)
-        // doesn't accidentally double-handle while the user is in
-        // the skeleton editor.
-        if self.state.skeleton_editor.open {
-            return;
-        }
+        // (The skeleton editor used to gate plain-key shortcuts here
+        // because its own floating window owned Space / Arrow / Home /
+        // End. The window has been retired and replaced by an
+        // inspector section that does not steal those keys, so the
+        // gate is no longer needed.)
 
         ctx.input(|i| {
             // Space = Play/Pause
@@ -1220,6 +1367,7 @@ impl App {
             Actor,
             Overlay,
             Audio,
+            RenderFrame,
         }
         let mut candidates: Vec<(String, Selection, CandidateKind)> = Vec::new();
         // Single primary selection always comes first so it stays the
@@ -1253,6 +1401,13 @@ impl App {
                     CandidateKind::Audio,
                 ));
             }
+            Selection::RenderFrame => {
+                candidates.push((
+                    t("Render Frame").into(),
+                    Selection::RenderFrame,
+                    CandidateKind::RenderFrame,
+                ));
+            }
             _ => {}
         }
         // Multi-selected actors (Ctrl+click) extend the candidate set so
@@ -1272,6 +1427,20 @@ impl App {
                 format!("{} {}", t("Actor"), id),
                 Selection::Actor(mi),
                 CandidateKind::Actor,
+            ));
+        }
+        // Render Frame is always available as a candidate even when
+        // it isn't the primary selection — it's a global element so
+        // the user can always edit its curves without leaving the
+        // current selection. Match the way the canvas handles it.
+        if !candidates
+            .iter()
+            .any(|(_, sel, _)| matches!(*sel, Selection::RenderFrame))
+        {
+            candidates.push((
+                t("Render Frame").into(),
+                Selection::RenderFrame,
+                CandidateKind::RenderFrame,
             ));
         }
 
@@ -1453,10 +1622,182 @@ impl App {
                     }
                 }
             }
+            CandidateKind::RenderFrame => {
+                let rf = &mut self.state.scene.render_frame;
+                let target = CurveEditorTarget::RenderFrame {
+                    layout: &mut rf.layout,
+                    animated_params: &mut rf.animated_params,
+                };
+                curve_editor_panel(
+                    ui,
+                    target,
+                    duration,
+                    &mut self.state.curve_editor_property,
+                    playhead,
+                );
+            }
         }
     }
 
     fn delete_selected(&mut self) {
+        // ── Multi-select delete ──
+        //
+        // When `canvas_selection` holds more than one element, delete
+        // every entry, not just the primary. We snapshot the full
+        // editor state ONCE at the top so the entire batch collapses
+        // into one undo step (and so Ctrl+Z restores both the scene
+        // tree and every layer assignment we wiped).
+        //
+        // Each per-kind branch below already shifts the relevant
+        // index-based side tables (frame_caches, audio_waveforms,
+        // *_track_assignments), so the only extra trick we need here
+        // is to walk the selection in **DESCENDING** index order per
+        // kind. Removing higher indices first leaves every lower
+        // index valid as we go, so the precomputed entries don't
+        // require remapping. The kinds themselves are independent
+        // (actors / overlays / audio / backgrounds live in separate
+        // Vecs) so the order across kinds doesn't matter.
+        let multi_targets: Vec<Selection> = if state_canvas_selection_count(self) > 1 {
+            self.state.canvas_selection.clone()
+        } else {
+            Vec::new()
+        };
+
+        if !multi_targets.is_empty() {
+            // Single undo entry for the whole batch.
+            self.state.last_drag_group = None;
+            self.state
+                .undo
+                .push_full(self.state.build_undo_snapshot());
+
+            // Bucket selections by kind, then delete in descending
+            // index order. Keep the helper-driven cascade behaviour
+            // (deleting an actor also wipes its bound audio rows,
+            // deleting an audio with a `parent_actor` cascades to
+            // the parent actor, etc.) by routing each entry through
+            // the existing per-kind branches below — but with the
+            // undo push already done, so the inner branches must NOT
+            // re-snapshot.
+            let mut actor_idxs: Vec<usize> = Vec::new();
+            let mut overlay_idxs: Vec<usize> = Vec::new();
+            let mut audio_idxs: Vec<usize> = Vec::new();
+            let mut bg_idxs: Vec<usize> = Vec::new();
+            for sel in &multi_targets {
+                match *sel {
+                    Selection::Actor(i) => actor_idxs.push(i),
+                    Selection::Overlay(i) => overlay_idxs.push(i),
+                    Selection::Audio(i) => audio_idxs.push(i),
+                    Selection::Background(i) => bg_idxs.push(i),
+                    _ => {}
+                }
+            }
+            actor_idxs.sort_unstable();
+            actor_idxs.dedup();
+            overlay_idxs.sort_unstable();
+            overlay_idxs.dedup();
+            audio_idxs.sort_unstable();
+            audio_idxs.dedup();
+            bg_idxs.sort_unstable();
+            bg_idxs.dedup();
+
+            // ── Cascade preview ──
+            // Audio rows whose `parent_actor` matches an actor we're
+            // about to remove get cleaned up by
+            // `remove_audio_bound_to_actor` already. To avoid
+            // double-cleanup (and the index-shift drift that comes
+            // with it) drop those audio indices BEFORE we run the
+            // audio loop.
+            let actor_ids_being_deleted: std::collections::HashSet<String> =
+                actor_idxs
+                    .iter()
+                    .filter_map(|i| self.state.scene.actors.get(*i).map(|a| a.id.clone()))
+                    .collect();
+            audio_idxs.retain(|aui| {
+                let parent = self
+                    .state
+                    .scene
+                    .audio
+                    .get(*aui)
+                    .and_then(|a| a.parent_actor.clone());
+                match parent {
+                    Some(pid) => !actor_ids_being_deleted.contains(&pid),
+                    None => true,
+                }
+            });
+
+            // Walk descending so removing higher indices keeps
+            // lower ones valid.
+            for i in actor_idxs.into_iter().rev() {
+                if i >= self.state.scene.actors.len() {
+                    continue;
+                }
+                let actor_id = self.state.scene.actors[i].id.clone();
+                let removed_audio = crate::panels::remove_audio_bound_to_actor(
+                    &mut self.state,
+                    &actor_id,
+                );
+                let mut sorted = removed_audio.clone();
+                sorted.sort_unstable();
+                for ai in sorted.into_iter().rev() {
+                    if ai < self.waveform_extract_results.len() {
+                        self.waveform_extract_results.remove(ai);
+                    }
+                }
+                // Use raw vec mutation here (not `mutate()`) because
+                // we already pushed the batch undo snapshot above.
+                self.state.scene.actors.remove(i);
+                if i < self.state.frame_caches.len() {
+                    self.state.frame_caches.remove(i);
+                }
+                if i < self.frame_extract_results.len() {
+                    self.frame_extract_results.remove(i);
+                }
+                crate::panels::shift_assignments_after_remove(
+                    &mut self.state.actor_track_assignments,
+                    i,
+                );
+            }
+            for i in overlay_idxs.into_iter().rev() {
+                if i >= self.state.scene.overlays.len() {
+                    continue;
+                }
+                self.state.scene.overlays.remove(i);
+                crate::panels::shift_assignments_after_remove(
+                    &mut self.state.overlay_track_assignments,
+                    i,
+                );
+            }
+            for i in audio_idxs.into_iter().rev() {
+                if i >= self.state.scene.audio.len() {
+                    continue;
+                }
+                self.state.scene.audio.remove(i);
+                if i < self.state.audio_waveforms.len() {
+                    self.state.audio_waveforms.remove(i);
+                }
+                if i < self.waveform_extract_results.len() {
+                    self.waveform_extract_results.remove(i);
+                }
+                crate::panels::shift_assignments_after_remove(
+                    &mut self.state.audio_track_assignments,
+                    i,
+                );
+            }
+            for i in bg_idxs.into_iter().rev() {
+                if i >= self.state.scene.backgrounds.len() {
+                    continue;
+                }
+                self.state.scene.backgrounds.remove(i);
+            }
+
+            self.state.selection = Selection::None;
+            self.state.canvas_selection.clear();
+            self.state.multi_select.clear();
+            self.state.status =
+                crate::i18n::t("\u{1F5D1} Selected layers deleted.").into();
+            return;
+        }
+
         match self.state.selection {
             Selection::Actor(i) if i < self.state.scene.actors.len() => {
                 let actor_id = self.state.scene.actors[i].id.clone();
@@ -1650,7 +1991,10 @@ impl App {
             return false;
         }
         let mut right = bg.clone();
-        right.id = format!("{}_R", right.id);
+        right.id = crate::panels::unique_background_id_in_scene(
+            &self.state.scene.backgrounds,
+            &right.id,
+        );
         right.start = t;
         right.duration = end - t;
         let left_dur = t - start;
@@ -1667,11 +2011,13 @@ impl App {
     /// audio that was bound to this actor over to the right half.
     /// Returns `None` when `t` lies outside the actor's window.
     ///
-    /// This intentionally preserves the (pre-existing) "actor layout
-    /// kfs treated as clip-local time inside split" behaviour — even
-    /// though the timeline's MOVE handler treats them as scene-time.
-    /// Fixing that inconsistency is a separate task; this rewrite
-    /// only adds the cascade logic on top of the existing split.
+    /// Actor `layout` keyframes are stored in **scene-time**
+    /// (see `Scene::Actor` in memstroy-core, and
+    /// `canvas_preview` / renderer both call
+    /// `keyframe::sample(&actor.layout, scene_t)`). The split
+    /// therefore partitions the kfs by their absolute `kf.t` against
+    /// the cut point `t` — no local-time conversion is needed and
+    /// the right half's kfs keep their scene-time as-is.
     fn split_actor_at(&mut self, i: usize, t: f32) -> Option<(usize, String)> {
         if i >= self.state.scene.actors.len() {
             return None;
@@ -1685,28 +2031,36 @@ impl App {
             return None;
         }
         let mut right = a.clone();
-        right.id = format!("{}_R", right.id);
+        // Disambiguate the new id against every actor (and the
+        // original) so a second cut on the same clip doesn't
+        // produce duplicate ids that confuse `parent_actor`
+        // bindings down the line.
+        right.id = crate::panels::unique_actor_id_in_scene(&self.state.scene.actors, &a.id);
         let right_id = right.id.clone();
         right.t_in = Some(t);
         right.t_out = Some(end);
         right.source_start = a.source_start + (t - start);
-        let local_split = t - start;
-        right.layout.retain(|kf| kf.t >= local_split);
-        for kf in right.layout.iter_mut() {
-            kf.t -= local_split;
-        }
+        // Right half: keep kfs whose scene-time is at or after the
+        // cut. Their `t` stays in scene-time so the renderer / canvas
+        // sample them at the right absolute moment.
+        right.layout.retain(|kf| kf.t >= t - 1.0e-3);
         if right.layout.is_empty() {
             let last_state = a.layout.last().map(|k| k.value).unwrap_or_default();
-            right.layout.push(memstroy_core::Keyframe::new(0.0, last_state));
+            // Anchor the seed kf at the right half's t_in so static
+            // sampling falls back to the last authored state.
+            right.layout.push(memstroy_core::Keyframe::new(t, last_state));
         }
-        let local_split_for_left = local_split;
         let original_lane = self.state.actor_track_assignments.get(&i).copied();
         self.state.mutate(move |s| {
             s.actors[i].t_out = Some(t);
-            s.actors[i].layout.retain(|kf| kf.t <= local_split_for_left);
+            // Left half: drop kfs whose scene-time runs past the
+            // cut point. Anything authored AFTER the new t_out is
+            // outside the visible window.
+            s.actors[i].layout.retain(|kf| kf.t <= t + 1.0e-3);
             if s.actors[i].layout.is_empty() {
+                let seed_t = s.actors[i].t_in.unwrap_or(0.0);
                 s.actors[i].layout.push(memstroy_core::Keyframe::new(
-                    0.0,
+                    seed_t,
                     memstroy_core::ActorState::default(),
                 ));
             }
@@ -1795,6 +2149,12 @@ impl App {
 
     /// Split the overlay at index `i` at scene-time `t`. Overlays have
     /// no parent / child relationships so this never cascades.
+    ///
+    /// Overlay `layout` keyframes are stored in **clip-local time**
+    /// (sampled with `kf.t = scene_t - t_in`), so the right half's
+    /// kfs need their `t` rebased to the new t_in. Video overlays
+    /// also bump `source_start` so playback continues seamlessly
+    /// across the cut.
     fn split_overlay_at(&mut self, i: usize, t: f32) -> bool {
         if i >= self.state.scene.overlays.len() {
             return false;
@@ -1814,28 +2174,49 @@ impl App {
         let local_split = t - start;
         match &mut right {
             memstroy_core::Overlay::Text(txt) => {
-                txt.id = format!("{}_R", txt.id);
+                txt.id = crate::panels::unique_overlay_id_in_scene(
+                    &self.state.scene.overlays,
+                    &txt.id,
+                );
                 txt.t_in = t;
-                txt.layout.retain(|kf| kf.t >= local_split);
-                for kf in txt.layout.iter_mut() { kf.t -= local_split; }
+                txt.layout.retain(|kf| kf.t >= local_split - 1.0e-3);
+                for kf in txt.layout.iter_mut() {
+                    kf.t = (kf.t - local_split).max(0.0);
+                }
                 if txt.layout.is_empty() {
                     txt.layout.push(memstroy_core::Keyframe::new(0.0, memstroy_core::OverlayState::default()));
                 }
             }
             memstroy_core::Overlay::Image(im) => {
-                im.id = format!("{}_R", im.id);
+                im.id = crate::panels::unique_overlay_id_in_scene(
+                    &self.state.scene.overlays,
+                    &im.id,
+                );
                 im.t_in = t;
-                im.layout.retain(|kf| kf.t >= local_split);
-                for kf in im.layout.iter_mut() { kf.t -= local_split; }
+                im.layout.retain(|kf| kf.t >= local_split - 1.0e-3);
+                for kf in im.layout.iter_mut() {
+                    kf.t = (kf.t - local_split).max(0.0);
+                }
                 if im.layout.is_empty() {
                     im.layout.push(memstroy_core::Keyframe::new(0.0, memstroy_core::OverlayState::default()));
                 }
             }
             memstroy_core::Overlay::Video(v) => {
-                v.id = format!("{}_R", v.id);
+                v.id = crate::panels::unique_overlay_id_in_scene(
+                    &self.state.scene.overlays,
+                    &v.id,
+                );
                 v.t_in = t;
-                v.layout.retain(|kf| kf.t >= local_split);
-                for kf in v.layout.iter_mut() { kf.t -= local_split; }
+                // Advance `source_start` so the right half plays
+                // from the correct point in the underlying file.
+                // Without this, the right half restarts from
+                // source_start = 0 and the user sees the first
+                // frame again.
+                v.source_start = v.source_start + local_split.max(0.0);
+                v.layout.retain(|kf| kf.t >= local_split - 1.0e-3);
+                for kf in v.layout.iter_mut() {
+                    kf.t = (kf.t - local_split).max(0.0);
+                }
                 if v.layout.is_empty() {
                     v.layout.push(memstroy_core::Keyframe::new(0.0, memstroy_core::OverlayState::default()));
                 }
@@ -1848,21 +2229,21 @@ impl App {
             match &mut s.overlays[i] {
                 memstroy_core::Overlay::Text(txt) => {
                     txt.t_out = t;
-                    txt.layout.retain(|kf| kf.t <= local_split_left);
+                    txt.layout.retain(|kf| kf.t <= local_split_left + 1.0e-3);
                     if txt.layout.is_empty() {
                         txt.layout.push(memstroy_core::Keyframe::new(0.0, memstroy_core::OverlayState::default()));
                     }
                 }
                 memstroy_core::Overlay::Image(im) => {
                     im.t_out = t;
-                    im.layout.retain(|kf| kf.t <= local_split_left);
+                    im.layout.retain(|kf| kf.t <= local_split_left + 1.0e-3);
                     if im.layout.is_empty() {
                         im.layout.push(memstroy_core::Keyframe::new(0.0, memstroy_core::OverlayState::default()));
                     }
                 }
                 memstroy_core::Overlay::Video(v) => {
                     v.t_out = t;
-                    v.layout.retain(|kf| kf.t <= local_split_left);
+                    v.layout.retain(|kf| kf.t <= local_split_left + 1.0e-3);
                     if v.layout.is_empty() {
                         v.layout.push(memstroy_core::Keyframe::new(0.0, memstroy_core::OverlayState::default()));
                     }
@@ -1911,16 +2292,51 @@ impl App {
             return None;
         }
         let mut right = au.clone();
-        right.id = format!("{}_R", right.id);
+        right.id = crate::panels::unique_audio_id_in_scene(
+            &self.state.scene.audio,
+            &au.id,
+        );
         right.t_in = t;
         right.t_out = Some(end);
         right.source_start = au.source_start + (t - start).max(0.0);
         if let Some(rp) = right_parent {
             right.parent_actor = Some(rp);
         }
+        // Audio per-param keyframe vectors live in CLIP-LOCAL time.
+        // Split them at `local_split = t - t_in_original`: the left
+        // half keeps kfs with `kf.t <= local_split`, the right half
+        // keeps `kf.t >= local_split` and rebases their times so
+        // `kf.t = 0` matches the right half's `t_in`.
+        let local_split = (t - start).max(0.0);
+        let crop_right = |kfs: &mut Vec<memstroy_core::Keyframe<f32>>, edge: f32| {
+            kfs.retain(|kf| kf.t >= edge - 1.0e-3);
+            for kf in kfs.iter_mut() {
+                kf.t = (kf.t - edge).max(0.0);
+            }
+        };
+        crop_right(&mut right.volume_kfs, local_split);
+        crop_right(&mut right.speed_kfs, local_split);
+        crop_right(&mut right.pitch_kfs, local_split);
+        crop_right(&mut right.pan_kfs, local_split);
+        crop_right(&mut right.low_pass_kfs, local_split);
+        crop_right(&mut right.high_pass_kfs, local_split);
         let original_lane = self.state.audio_track_assignments.get(&i).copied();
+        let local_split_left = local_split;
         self.state.mutate(move |s| {
             s.audio[i].t_out = Some(t);
+            // Crop left-half kfs whose clip-local time runs past
+            // the cut. Done one field at a time so the borrow
+            // checker is happy with sequential `&mut` borrows of
+            // disjoint fields.
+            let crop = |kfs: &mut Vec<memstroy_core::Keyframe<f32>>, edge: f32| {
+                kfs.retain(|kf| kf.t <= edge + 1.0e-3);
+            };
+            crop(&mut s.audio[i].volume_kfs, local_split_left);
+            crop(&mut s.audio[i].speed_kfs, local_split_left);
+            crop(&mut s.audio[i].pitch_kfs, local_split_left);
+            crop(&mut s.audio[i].pan_kfs, local_split_left);
+            crop(&mut s.audio[i].low_pass_kfs, local_split_left);
+            crop(&mut s.audio[i].high_pass_kfs, local_split_left);
             s.audio.insert(i + 1, right);
         });
         let pivot = i + 1;
@@ -2321,6 +2737,7 @@ impl App {
             done: false,
             error: None,
             progress: 0.0,
+            finished_elapsed: None,
         });
         // Use the scene's actual output resolution for the render.
         // The render-frame defines what portion of the canvas ends up
@@ -2394,7 +2811,10 @@ impl App {
         let Some(rp) = self.state.render_progress.clone() else {
             return;
         };
-        let elapsed = rp.started.elapsed();
+        // Freeze the elapsed counter once the render is done. The
+        // RenderFinished handler stamps `finished_elapsed`; until
+        // then we tick live off `started.elapsed()`.
+        let elapsed = rp.finished_elapsed.unwrap_or_else(|| rp.started.elapsed());
         let elapsed_secs = elapsed.as_secs_f32();
         let progress = rp.progress.clamp(0.0, 1.0);
         let mut dismiss = false;
@@ -2409,12 +2829,19 @@ impl App {
 
         egui::Window::new(title)
             .id(egui::Id::new("render_progress_window"))
-            .anchor(egui::Align2::RIGHT_TOP, [-16.0, 16.0])
+            // Free-floating: seed a default position on first open
+            // (top-right of the screen, where the render bar used to
+            // live) but DON'T anchor — the user can then drag the
+            // window anywhere and egui remembers the position across
+            // frames. Earlier we anchored it to RIGHT_TOP every
+            // frame, so dragging it had no visible effect.
+            .default_pos(egui::pos2(800.0, 16.0))
             .default_size([360.0, 180.0])
             .min_width(280.0)
             .max_width(520.0)
             .collapsible(true)
             .resizable(true)
+            .movable(true)
             .show(ctx, |ui| {
                 use egui::{Color32, RichText};
                 ui.add_space(4.0);
@@ -2515,8 +2942,9 @@ impl App {
 
     // ─── AUTO-SAVE / RECOVERY ────────────────────────────────────────
 
-    /// Periodically saves the current scene to `~/.memstroy/autosave.scene.yaml`.
-    /// Triggered from `update()`. Updates `last_autosave` and shows a 2 s toast.
+    /// Periodically saves the current scene into the autosave manager's
+    /// per-project slot. Triggered from `update()`. Updates
+    /// `last_autosave` and shows a 2 s toast.
     fn tick_autosave(&mut self) {
         let interval = self.state.autosave_interval;
         let due = match self.state.last_autosave {
@@ -2534,12 +2962,38 @@ impl App {
             return;
         }
 
-        let path = EditorState::autosave_path();
+        // Resolve the slot id from the active tab. Saved tabs hash on
+        // their canonical path so the same project always reuses the
+        // same slot across editor restarts; Untitled tabs hash on the
+        // tab's session-stable seed so they update one consistent slot
+        // for the whole session.
+        let active = self.state.active_tab;
+        let (slot, tab_name, original_path) = if active < self.state.scene_tabs.len() {
+            let tab = &self.state.scene_tabs[active];
+            let slot = crate::autosave::slot_id(tab.path.as_deref(), tab.autosave_seed);
+            (slot, tab.name.clone(), tab.path.clone())
+        } else {
+            // Defensive fallback: no active tab somehow. Use the legacy
+            // single-file path so we still produce *something* the user
+            // can recover.
+            let slot = crate::autosave::slot_id(self.state.scene_path.as_deref(), 0);
+            (slot, "Scene".to_string(), self.state.scene_path.clone())
+        };
+
+        let path = crate::autosave::slot_scene_path(&slot);
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         match self.state.scene.save(&path) {
             Ok(()) => {
+                crate::autosave::write_meta(
+                    &slot,
+                    &crate::autosave::AutosaveMeta {
+                        name: tab_name,
+                        original_path,
+                        saved_at_ms: crate::autosave::now_unix_ms(),
+                    },
+                );
                 self.state.last_autosave = Some(std::time::Instant::now());
                 self.state.autosave_toast_until =
                     Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
@@ -2658,7 +3112,7 @@ impl App {
                     RichText::new(crate::i18n::t("Pick a title template"))
                         .strong()
                         .size(14.0)
-                        .color(Color32::from_rgb(180, 140, 255)),
+                        .color(Color32::WHITE),
                 );
                 ui.add_space(6.0);
                 ui.label(
@@ -2676,9 +3130,9 @@ impl App {
                     .show(ui, |ui| {
                         for (i, tpl) in crate::title_templates::TEMPLATES.iter().enumerate() {
                             let frame = egui::Frame::none()
-                                .fill(Color32::from_rgb(32, 32, 48))
+                                .fill(Color32::from_rgb(36, 34, 22))
                                 .rounding(Rounding::same(8.0))
-                                .stroke(Stroke::new(1.0, Color32::from_rgb(60, 60, 80)))
+                                .stroke(Stroke::new(1.0, Color32::from_rgb(62, 60, 42)))
                                 .inner_margin(egui::Margin::same(8.0));
 
                             let resp = frame
@@ -2764,6 +3218,29 @@ fn parse_ffmpeg_frame(line: &str) -> Option<u32> {
     num_str.parse().ok()
 }
 
+/// Parse the CPU compositor's stage marker, e.g. `[12.5%] Encoding ...`.
+/// Returns the percent (0..100) or `None` when the line isn't a stage.
+fn parse_compositor_percent(line: &str) -> Option<f32> {
+    let trimmed = line.trim_start();
+    let rest = trimmed.strip_prefix('[')?;
+    let close = rest.find('%')?;
+    let pct_str = &rest[..close];
+    pct_str.trim().parse::<f32>().ok()
+}
+
+/// Parse the CPU compositor's per-frame marker `frame N/M (PCT%)`.
+/// Returns `(N, M)` or `None`.
+fn parse_compositor_frame(line: &str) -> Option<(u32, u32)> {
+    let trimmed = line.trim_start();
+    let rest = trimmed.strip_prefix("frame ")?;
+    let mut parts = rest.split_whitespace();
+    let nm = parts.next()?;
+    let mut nm_iter = nm.split('/');
+    let n: u32 = nm_iter.next()?.trim().parse().ok()?;
+    let m: u32 = nm_iter.next()?.trim().parse().ok()?;
+    Some((n, m))
+}
+
 /// Format a wall-clock duration like `0:42`, `2:13`, `1:05:21`. Used
 /// by the render-progress window to show elapsed time and ETA without
 /// pulling in the `humantime` crate just for this.
@@ -2817,21 +3294,36 @@ struct ClipboardDrain {
 /// running its own copy/paste logic on the same physical keypress.
 /// The combination means Ctrl+C/V always reaches the editor's clip
 /// clipboard regardless of whether a text input is focused.
-fn swallow_clipboard_events(ctx: &egui::Context) -> ClipboardDrain {
+///
+/// **Caller-controlled gating.** When a TextEdit / DragValue is
+/// focused the user expects Ctrl+C / Ctrl+V to act on the field's
+/// contents — copying selected text, pasting numbers into a value
+/// box — not on the canvas selection. The `let_text_widget_handle`
+/// flag, set by the shortcut handler when `wants_keyboard_input()`
+/// is true, leaves the synthetic events in the queue so the focused
+/// widget can process them natively. We still report which kinds
+/// were observed so the chord-fallback path stays consistent, but
+/// no events are removed.
+fn swallow_clipboard_events(
+    ctx: &egui::Context,
+    let_text_widget_handle: bool,
+) -> ClipboardDrain {
     let mut out = ClipboardDrain::default();
     ctx.input_mut(|input| {
         input.events.retain(|ev| match ev {
             egui::Event::Copy => {
                 out.copied = true;
-                false
+                // Keep the event for the focused widget when the
+                // caller asked us to defer to it.
+                let_text_widget_handle
             }
             egui::Event::Cut => {
                 out.cut = true;
-                false
+                let_text_widget_handle
             }
             egui::Event::Paste(_) => {
                 out.pasted = true;
-                false
+                let_text_widget_handle
             }
             _ => true,
         });
@@ -2875,21 +3367,13 @@ impl eframe::App for App {
             }
         }
 
-        // ── Skeleton-editor keyboard handling ──
-        // The skeleton editor is a floating window with its own
-        // transport. When it's open, Space / arrow keys / Home / End
-        // must drive its playhead, not the main canvas's. We consume
-        // those keys here BEFORE `handle_shortcuts` runs so the main
-        // app's `key_pressed(...)` checks no longer see them.
-        let skeleton_consumed_keys = if self.state.skeleton_editor.open {
-            crate::skeleton_editor::handle_input(ctx, &mut self.state)
-        } else {
-            false
-        };
+        // The skeleton-editor floating window with its own keyboard
+        // transport (Space / Arrow / Home / End) was retired. The
+        // inspector section that replaced it shares the main scene's
+        // playhead, so no per-window key consumption is needed here.
 
         // Keyboard shortcuts
         self.handle_shortcuts(ctx);
-        let _ = skeleton_consumed_keys;
 
         // ── Auto-rescan local asset directories ──
         // Cheap mtime-fingerprint poll (debounced to ~2 s) that picks
@@ -2914,7 +3398,7 @@ impl eframe::App for App {
         // has had a chance to mutate `state.scene`.
         let pressed_this_frame = ctx.input(|i| i.pointer.any_pressed());
         if pressed_this_frame && self.state.pre_press_scene.is_none() {
-            self.state.pre_press_scene = Some(self.state.scene.clone());
+            self.state.pre_press_scene = Some(self.state.build_undo_snapshot());
         }
 
         // Snapshot the scene at the *very* start of every frame so we
@@ -2925,7 +3409,7 @@ impl eframe::App for App {
         // Without it, those edits would never get an undo snapshot, and
         // the user only sees ONE history entry for an entire session
         // (which manifests as "Ctrl+Z bounces between two states").
-        let frame_start_scene = self.state.scene.clone();
+        let frame_start_scene = self.state.build_undo_snapshot();
 
         // ── End the active drag-undo group when no mouse button is down ──
         // The undo/redo system snapshots once per drag gesture by tracking
@@ -2997,14 +3481,14 @@ impl eframe::App for App {
 
         // Top menu bar
         egui::TopBottomPanel::top("menu")
-            .frame(egui::Frame::none().fill(Color32::from_rgb(25, 25, 35)).inner_margin(6.0))
+            .frame(egui::Frame::none().fill(Color32::from_rgb(30, 28, 20)).inner_margin(6.0))
             .show(ctx, |ui| self.menu(ctx, ui));
 
         // ── Tab bar for multiple scenes ──
         egui::TopBottomPanel::top("tab_bar")
             .frame(
                 egui::Frame::none()
-                    .fill(Color32::from_rgb(18, 18, 26))
+                    .fill(Color32::from_rgb(22, 21, 14))
                     .inner_margin(egui::Margin {
                         left: 8.0,
                         right: 8.0,
@@ -3024,7 +3508,7 @@ impl eframe::App for App {
             .width_range(180.0..=560.0)
             .frame(
                 egui::Frame::none()
-                    .fill(Color32::from_rgb(22, 22, 32))
+                    .fill(Color32::from_rgb(26, 25, 18))
                     .inner_margin(10.0),
             )
             .show(ctx, |ui| {
@@ -3394,7 +3878,7 @@ impl eframe::App for App {
             .width_range(220.0..=620.0)
             .frame(
                 egui::Frame::none()
-                    .fill(Color32::from_rgb(22, 22, 32))
+                    .fill(Color32::from_rgb(26, 25, 18))
                     .inner_margin(10.0),
             )
             .show(ctx, |ui| {
@@ -3408,7 +3892,7 @@ impl eframe::App for App {
             .height_range(140.0..=720.0)
             .frame(
                 egui::Frame::none()
-                    .fill(Color32::from_rgb(18, 18, 28))
+                    .fill(Color32::from_rgb(22, 21, 12))
                     .inner_margin(8.0),
             )
             .show(ctx, |ui| {
@@ -3419,7 +3903,7 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::none()
-                    .fill(Color32::from_rgb(15, 15, 22))
+                    .fill(Color32::from_rgb(18, 17, 12))
                     .inner_margin(10.0),
             )
             .show(ctx, |ui| {
@@ -3431,26 +3915,31 @@ impl eframe::App for App {
         // Curve editor floating window
         if self.state.curve_editor_open {
             let mut curve_open = self.state.curve_editor_open;
+            // Free-floating: only seed a default position the FIRST
+            // time the window opens (`default_pos`); after that the
+            // user can drag it anywhere on screen and egui remembers
+            // the position across frames. Earlier we used `.anchor(
+            // LEFT_BOTTOM, …)` which pinned the window to the
+            // bottom-left corner every frame — exactly the user's
+            // "окно… нужно иметь возможность свободно двигать"
+            // report.
             egui::Window::new(crate::i18n::t("Curve Editor"))
                 .open(&mut curve_open)
+                .default_pos(egui::pos2(20.0, 400.0))
                 .default_size([600.0, 240.0])
                 .resizable(true)
                 .collapsible(true)
-                .anchor(egui::Align2::LEFT_BOTTOM, [10.0, -10.0])
+                .movable(true)
                 .show(ctx, |ui| {
                     self.draw_curve_editor_body(ui);
                 });
             self.state.curve_editor_open = curve_open;
         }
 
-        // Image editor floating window (replaces the old clip editor —
-        // image-only editing logic that doesn't apply to videos).
-        if self.state.image_editor_open {
-            self.state.image_editor_open = image_editor::image_editor_window(ctx, &mut self.state);
-        }
-
-        // Skeleton editor floating window
-        crate::skeleton_editor::skeleton_editor_window(ctx, &mut self.state);
+        // The standalone "Skeleton Editor" floating window was retired —
+        // every piece of skeleton authoring is now embedded into the
+        // inspector for any video-layer element, and points are placed
+        // by dragging directly on the main canvas.
 
         // Title-templates picker (popup grid of preset captions)
         self.show_title_picker(ctx);
@@ -3527,11 +4016,17 @@ impl eframe::App for App {
                 let mutate_drag_handled = self.state.last_drag_group.is_some();
                 release_block_handled_undo = true;
                 if !mutate_drag_handled {
-                    let pre_yaml = serde_yaml::to_string(&pre).unwrap_or_default();
+                    let pre_yaml = serde_yaml::to_string(&pre.scene).unwrap_or_default();
                     let cur_yaml =
                         serde_yaml::to_string(&self.state.scene).unwrap_or_default();
-                    if pre_yaml != cur_yaml {
-                        self.state.undo.push(&pre);
+                    let assignments_changed = pre.actor_track_assignments
+                        != self.state.actor_track_assignments
+                        || pre.overlay_track_assignments
+                            != self.state.overlay_track_assignments
+                        || pre.audio_track_assignments
+                            != self.state.audio_track_assignments;
+                    if pre_yaml != cur_yaml || assignments_changed {
+                        self.state.undo.push_full(pre);
                     }
                 }
             }
@@ -3560,36 +4055,64 @@ impl eframe::App for App {
             && self.state.pre_press_scene.is_none()
         {
             let pre_yaml =
-                serde_yaml::to_string(&frame_start_scene).unwrap_or_default();
+                serde_yaml::to_string(&frame_start_scene.scene).unwrap_or_default();
             let cur_yaml =
                 serde_yaml::to_string(&self.state.scene).unwrap_or_default();
-            if pre_yaml != cur_yaml {
-                self.state.undo.push(&frame_start_scene);
+            let assignments_changed = frame_start_scene.actor_track_assignments
+                != self.state.actor_track_assignments
+                || frame_start_scene.overlay_track_assignments
+                    != self.state.overlay_track_assignments
+                || frame_start_scene.audio_track_assignments
+                    != self.state.audio_track_assignments;
+            if pre_yaml != cur_yaml || assignments_changed {
+                self.state.undo.push_full(frame_start_scene);
             }
         }
     }
 }
 
-/// Apply a modern dark theme with accent colors.
+/// Helper for `delete_selected`: how many entries the canvas
+/// multi-selection currently holds. Pulled out so the multi-select
+/// short-circuit at the top of `delete_selected` reads cleanly.
+fn state_canvas_selection_count(app: &App) -> usize {
+    app.state.canvas_selection.len()
+}
+
+/// Apply a modern dark theme built around shades of `#fff200`
+/// (HSL 57°, 100 %, 50 %). Backgrounds are near-black yellows,
+/// interactive widget states climb the yellow tonal scale, and the
+/// pure brand colour is reserved for selection / accent strokes so it
+/// stays attention-grabbing instead of drowning every panel in saturated
+/// yellow.
 fn apply_style(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
     let mut visuals = egui::Visuals::dark();
 
-    // Background colors
-    visuals.panel_fill = Color32::from_rgb(20, 20, 30);
-    visuals.window_fill = Color32::from_rgb(28, 28, 40);
-    visuals.extreme_bg_color = Color32::from_rgb(12, 12, 18);
+    // Background colors — neutral warm darks (R ≈ G > B by a few
+    // points). Reads as "warm grey" rather than the previous cool
+    // blue-grey, but stays low-saturation so panels don't fight with
+    // foreground accents.
+    visuals.panel_fill = Color32::from_rgb(28, 26, 18); // ~10 % L
+    visuals.window_fill = Color32::from_rgb(34, 32, 22); // ~12 % L
+    visuals.extreme_bg_color = Color32::from_rgb(18, 17, 10); // ~6 % L
 
-    // Widget colors
-    visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(35, 35, 50);
-    visuals.widgets.inactive.bg_fill = Color32::from_rgb(40, 40, 58);
-    visuals.widgets.hovered.bg_fill = Color32::from_rgb(60, 60, 90);
-    visuals.widgets.active.bg_fill = Color32::from_rgb(80, 60, 180);
+    // Widget colors — climb the warm-grey scale, ending on a saturated
+    // brand yellow for the pressed/active state so interactions still
+    // pop.
+    visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(40, 38, 26);
+    visuals.widgets.inactive.bg_fill = Color32::from_rgb(48, 46, 30);
+    visuals.widgets.hovered.bg_fill = Color32::from_rgb(82, 78, 32);
+    visuals.widgets.active.bg_fill = Color32::from_rgb(204, 193, 0);
 
-    // Accent colors
-    visuals.selection.bg_fill = Color32::from_rgb(100, 60, 200);
-    visuals.selection.stroke = Stroke::new(1.0, Color32::from_rgb(180, 140, 255));
-    visuals.hyperlink_color = Color32::from_rgb(140, 100, 255);
+    // Strokes — bright yellow on hover/active gives the button "glow".
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, Color32::from_rgb(255, 242, 0));
+    visuals.widgets.active.bg_stroke = Stroke::new(1.0, Color32::from_rgb(255, 246, 102));
+
+    // Accent colors — the pure #fff200 lives here so selections /
+    // links pop against the dark yellow chassis.
+    visuals.selection.bg_fill = Color32::from_rgb(204, 193, 0);
+    visuals.selection.stroke = Stroke::new(1.0, Color32::from_rgb(255, 242, 0));
+    visuals.hyperlink_color = Color32::from_rgb(255, 246, 102);
 
     // Rounded corners
     visuals.widgets.noninteractive.rounding = Rounding::same(6.0);
@@ -3598,8 +4121,9 @@ fn apply_style(ctx: &egui::Context) {
     visuals.widgets.active.rounding = Rounding::same(6.0);
     visuals.window_rounding = Rounding::same(10.0);
 
-    // Text
-    visuals.override_text_color = Some(Color32::from_rgb(220, 220, 240));
+    // Text — neutral white reads cleanly on the deep yellow chassis
+    // without dragging the brand colour into prose.
+    visuals.override_text_color = Some(Color32::WHITE);
 
     style.visuals = visuals;
     style.spacing.item_spacing = Vec2::new(8.0, 6.0);

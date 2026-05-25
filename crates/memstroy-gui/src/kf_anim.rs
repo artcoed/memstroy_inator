@@ -543,7 +543,7 @@ pub fn keyframe_strip(
             memstroy_core::Easing::Linear => egui::Color32::from_rgb(160, 200, 255),
             memstroy_core::Easing::EaseIn => egui::Color32::from_rgb(255, 200, 120),
             memstroy_core::Easing::EaseOut => egui::Color32::from_rgb(120, 220, 200),
-            memstroy_core::Easing::EaseInOut => egui::Color32::from_rgb(200, 160, 255),
+            memstroy_core::Easing::EaseInOut => egui::Color32::from_rgb(255, 242, 0),
             memstroy_core::Easing::Cubic => egui::Color32::from_rgb(255, 160, 200),
         };
 
@@ -556,7 +556,7 @@ pub fn keyframe_strip(
         ui.painter().add(egui::Shape::convex_polygon(
             pts,
             fill,
-            egui::Stroke::new(1.0, egui::Color32::from_rgb(20, 20, 30)),
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(24, 22, 12)),
         ));
 
         if resp.hovered() {
