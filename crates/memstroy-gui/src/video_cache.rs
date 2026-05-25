@@ -11,7 +11,11 @@ use egui::{ColorImage, TextureHandle, TextureOptions};
 use tokio::runtime::Handle;
 
 /// Number of frames to keep pre-loaded in the ring buffer.
-const BUFFER_SIZE: usize = 30;
+/// With 7+ actors on screen, a larger buffer reduces the frequency of
+/// disk-seek stalls during playback. 90 frames = 3 seconds at 30fps,
+/// which gives the preload thread enough runway to stay ahead of the
+/// playhead even when multiple actors are competing for I/O bandwidth.
+const BUFFER_SIZE: usize = 90;
 
 /// Frame-cache: extracts video frames to disk via ffmpeg, then pre-loads
 /// frames into a memory ring buffer and uploads them to a single reusable
@@ -178,7 +182,7 @@ impl FrameCache {
                     self.last_displayed_frame = frame_index;
                     let buffer_end = self.buffer_start + self.buffer_size;
                     let remaining = buffer_end.saturating_sub(frame_index);
-                    if remaining < self.buffer_size / 3 && !self.preloading {
+                    if remaining < self.buffer_size / 2 && !self.preloading {
                         self.trigger_preload(frame_index);
                     }
                 }
@@ -245,7 +249,7 @@ impl FrameCache {
                 self.last_displayed_frame = frame_index;
                 let buffer_end = self.buffer_start + self.buffer_size;
                 let frames_remaining = buffer_end.saturating_sub(frame_index);
-                if frames_remaining < self.buffer_size / 3 && !self.preloading {
+                if frames_remaining < self.buffer_size / 2 && !self.preloading {
                     self.trigger_preload(frame_index);
                 }
             }
@@ -271,7 +275,7 @@ impl FrameCache {
             // If we're approaching the end of the buffer, trigger pre-load ahead
             let buffer_end = self.buffer_start + self.buffer_size;
             let frames_remaining = buffer_end.saturating_sub(frame_index);
-            if frames_remaining < self.buffer_size / 3 && !self.preloading {
+            if frames_remaining < self.buffer_size / 2 && !self.preloading {
                 // Pre-load next chunk starting from current position
                 self.trigger_preload(frame_index);
             }
@@ -378,35 +382,38 @@ impl FrameCache {
         let buffer_size = self.buffer_size;
         let slot = self.preload_slot.clone();
 
-        thread::spawn(move || {
-            let mut frames = Vec::with_capacity(buffer_size);
-            for i in 0..buffer_size {
-                let idx = start_frame + i;
-                if idx >= frame_count {
-                    frames.push(None);
-                    continue;
-                }
-                let file_name = format!("{:06}.jpg", idx + 1);
-                let frame_path = cache_dir.join(&file_name);
-                let img = match image::open(&frame_path) {
-                    Ok(img) => {
-                        let rgba = img.to_rgba8();
-                        let size = [rgba.width() as usize, rgba.height() as usize];
-                        let pixels = rgba.into_raw();
-                        Some(ColorImage::from_rgba_unmultiplied(size, &pixels))
+        thread::Builder::new()
+            .name("memstroy-frame-preload".into())
+            .spawn(move || {
+                let mut frames = Vec::with_capacity(buffer_size);
+                for i in 0..buffer_size {
+                    let idx = start_frame + i;
+                    if idx >= frame_count {
+                        frames.push(None);
+                        continue;
                     }
-                    Err(_) => None,
-                };
-                frames.push(img);
-            }
+                    let file_name = format!("{:06}.jpg", idx + 1);
+                    let frame_path = cache_dir.join(&file_name);
+                    let img = match image::open(&frame_path) {
+                        Ok(img) => {
+                            let rgba = img.to_rgba8();
+                            let size = [rgba.width() as usize, rgba.height() as usize];
+                            let pixels = rgba.into_raw();
+                            Some(ColorImage::from_rgba_unmultiplied(size, &pixels))
+                        }
+                        Err(_) => None,
+                    };
+                    frames.push(img);
+                }
 
-            if let Ok(mut guard) = slot.lock() {
-                *guard = Some(PreloadResult {
-                    start: start_frame,
-                    frames,
-                });
-            }
-        });
+                if let Ok(mut guard) = slot.lock() {
+                    *guard = Some(PreloadResult {
+                        start: start_frame,
+                        frames,
+                    });
+                }
+            })
+            .ok(); // Ignore spawn failure — worst case we fall back to sync load.
     }
 
     /// Poll for completed background pre-load and apply results.

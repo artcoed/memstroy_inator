@@ -1112,255 +1112,276 @@ fn draw_canvas_elements(
     viewport_size: [f32; 2],
 ) {
     let t = state.playhead;
-    let duration = state.scene.output.duration;
 
     // Draw backgrounds first (bottom layer)
     draw_canvas_backgrounds(painter, full_rect, state, viewport_size);
 
-    // Draw text overlays explicitly placed below the actors.
-    draw_canvas_overlays(painter, full_rect, state, viewport_size, OverlayPass::BehindActors);
+    // ── Unified z-ordered pass ──
+    //
+    // Actors and overlays are interleaved by their timeline track index
+    // so the canvas stacking matches what the user sees in the layer
+    // panel. Lower track index = higher on the panel = drawn LAST (on
+    // top). This replaces the old three-phase approach (overlays-behind
+    // → all actors → overlays-on-top) which couldn't handle an overlay
+    // sitting between two actors on different tracks.
+    //
+    // We build a unified list of (track_index, element_kind, scene_index)
+    // tuples, sort by track_index DESCENDING (so the bottom-of-panel
+    // elements are drawn first and end up visually behind), then draw
+    // each element in order.
 
-    // Pick one actor per track to actually draw (closest-to-playhead rule).
+    #[derive(Clone, Copy)]
+    enum ElementKind { Actor, Overlay }
+
     let actors_to_draw = pick_actors_for_canvas(state, t);
+    let overlays_to_draw = pick_overlays_for_canvas(state, t);
 
-    // Draw actors
+    let mut elements: Vec<(usize, ElementKind, usize)> = Vec::new();
+
+    // Collect actors.
     for (idx, actor) in state.scene.actors.iter().enumerate() {
         if !actor.visible { continue; }
         if !actors_to_draw.contains(&idx) { continue; }
-
-        let t_in = actor.t_in.unwrap_or(0.0);
-        let t_out = actor.t_out.unwrap_or(duration);
-
-        // Determine display mode: active, before-start (first frame), after-end (last frame)
-        let display_mode = if t >= t_in && t <= t_out {
-            DisplayMode::Active
-        } else if t < t_in {
-            DisplayMode::BeforeStart // show first frame
-        } else {
-            DisplayMode::AfterEnd // show last frame
-        };
-
-        // Get world position from canvas_layouts or legacy layout
-        let world_pos = get_element_world_pos(state, &actor.id, &actor.layout, t);
-        // Use actual source dimensions from frame cache (native aspect ratio preserved)
-        let (src_w, src_h) = if let Some(fc) = state.frame_caches.get(idx) {
-            if fc.is_ready() && fc.frame_count > 0 {
-                (fc.source_width as f32, fc.source_height as f32)
-            } else {
-                // Default to 9:16 vertical video (common for mellstroy clips)
-                (1080.0_f32, 1920.0)
-            }
-        } else {
-            (1080.0_f32, 1920.0)
-        };
-        // Apply actor scale from layout
-        let actor_state = keyframe::sample(&actor.layout, t)
-            .unwrap_or_default();
-        let actor_scale = actor_state.scale;
-        let actor_scale_y = actor_state.scale_y;
-        // Modifiers (wobble/shake/pulse/spin) layered on top of the eased
-        // sample. They are additive and only run while the clip is active
-        // — outside the clip's window we use the raw sample so the static
-        // first/last preview doesn't shake.
-        let mod_delta = if matches!(display_mode, DisplayMode::Active) {
-            keyframe::evaluate_modifiers(&actor.modifiers, t - t_in)
-        } else {
-            keyframe::ModifierDelta::default()
-        };
-        let actor_rotation = actor_state.rotation_deg + mod_delta.d_rotation_deg;
-        let actor_opacity = actor_state.opacity;
-        let actor_flip_x = actor_state.flip_x_anim;
-        let actor_flip_y = actor_state.flip_y_anim;
-        // Apply per-axis scale: scale_y stretches Y on top of uniform scale.
-        // Modifiers are added uniformly to keep the aspect ratio sensible.
-        let scale_eff = (actor_scale + mod_delta.d_scale).max(0.001);
-        let elem_width = src_w * scale_eff;
-        let elem_height = src_h * scale_eff * actor_scale_y;
-
-        // Convert to screen coordinates
-        // Modifier (shake/wobble) offsets are added in world pixels.
-        let world_pos_with_mod = WorldPos {
-            x: world_pos.x + mod_delta.dx,
-            y: world_pos.y + mod_delta.dy,
-        };
-        let center_screen = state.canvas_viewport.world_to_screen(world_pos_with_mod, viewport_size);
-        let half_w = elem_width * 0.5 * state.canvas_viewport.zoom;
-        let half_h = elem_height * 0.5 * state.canvas_viewport.zoom;
-
-        let elem_rect = Rect::from_center_size(
-            Pos2::new(full_rect.min.x + center_screen[0], full_rect.min.y + center_screen[1]),
-            Vec2::new(half_w * 2.0, half_h * 2.0),
-        );
-
-        // Skip if fully offscreen
-        if !full_rect.intersects(elem_rect) { continue; }
-
-        // Draw the element placeholder (frame from cache if available)
-        let base_tint = match display_mode {
-            DisplayMode::Active => Color32::WHITE,
-            _ => COL_INACTIVE_TINT,
-        };
-        // Apply opacity from keyframe
-        let alpha = (actor_opacity * (base_tint.a() as f32 / 255.0)).clamp(0.0, 1.0);
-        let tint = Color32::from_rgba_unmultiplied(base_tint.r(), base_tint.g(), base_tint.b(), (alpha * 255.0) as u8);
-
-        // Try to show actual frame from cache. Apply `actor.speed` to
-        // the source-time so a >1.0 multiplier actually plays the file
-        // faster (consumes more source seconds per scene-second) — the
-        // previous formula stretched the visible window without
-        // touching the frame index, which made fast-mode look identical
-        // to a regular trim.
-        let speed = actor.speed.max(0.0001);
-        let local_t = match display_mode {
-            DisplayMode::Active => (t - t_in) * speed + actor.source_start,
-            DisplayMode::BeforeStart => actor.source_start, // first frame
-            DisplayMode::AfterEnd => {
-                // last frame: source_start + visible_dur_in_source
-                actor.source_start + (t_out - t_in) * speed
-            }
-        };
-
-        let mut frame_shown = false;
-        if let Some(fc) = state.frame_caches.get_mut(idx) {
-            if fc.is_ready() {
-                // Apply chromakey on the raw frame data if actor has non-default settings
-                let actor_ck = &state.scene.actors[idx].chroma_key;
-                // Sample CC + effect-stack params at the actor's local
-                // playhead so animated diamonds materialise into the
-                // running preview. Without this the inspector would
-                // show kfs but the picture would stay frozen at the
-                // static field values.
-                let actor_t_in = state.scene.actors[idx].t_in.unwrap_or(0.0);
-                let local_for_anim = (state.playhead - actor_t_in).max(0.0);
-                let actor_cc_owned: memstroy_core::ColorCorrection =
-                    state.scene.actors[idx].color_correction.sampled_at(local_for_anim);
-                let actor_cc = &actor_cc_owned;
-                let actor_fx_owned: Vec<memstroy_core::Effect> = state
-                    .scene
-                    .actors[idx]
-                    .effects
-                    .iter()
-                    .map(|e| e.sampled_at(local_for_anim))
-                    .collect();
-                let actor_fx = &actor_fx_owned;
-                // Bypass the (expensive) preview pipeline when chroma /
-                // colour correction / and the effect stack are all
-                // empty / identity. Otherwise route through the processed
-                // path which layers the user's effect stack on top.
-                let any_fx_active = actor_fx.iter().any(|e| e.enabled && e.intensity > 0.001);
-                let has_effects = actor_ck.similarity > 0.01
-                    || !actor_cc.is_identity()
-                    || any_fx_active;
-
-                let texture = if has_effects {
-                    fc.processed_frame_at_time(local_t, actor_ck, actor_cc, actor_fx, ui.ctx())
-                } else {
-                    fc.frame_at_time(local_t, ui.ctx())
-                };
-
-                if let Some(tex) = texture {
-                    let rotation_rad = actor_rotation.to_radians();
-                    // Flip + 3D-fold: the local half-extents shrink with
-                    // |flip_x_anim| / |flip_y_anim| so a value going from 1
-                    // through 0 to −1 produces a "card-flip" silhouette.
-                    // Static `flip_horizontal` still toggles UV mirroring.
-                    let static_hflip = state.scene.actors[idx].flip_horizontal;
-                    let combined_x = if static_hflip { -actor_flip_x } else { actor_flip_x };
-                    let combined_y = actor_flip_y;
-                    let abs_fx = combined_x.abs().max(0.02);
-                    let abs_fy = combined_y.abs().max(0.02);
-                    let center = elem_rect.center();
-                    let hw = elem_rect.width() * 0.5 * abs_fx;
-                    let hh = elem_rect.height() * 0.5 * abs_fy;
-                    let cos_r = rotation_rad.cos();
-                    let sin_r = rotation_rad.sin();
-                    let corners_local = [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]];
-                    // Build UV corners that respect the sign of the flip.
-                    let (uv_l, uv_r) = if combined_x < 0.0 { (1.0, 0.0) } else { (0.0, 1.0) };
-                    let (uv_t, uv_b) = if combined_y < 0.0 { (1.0, 0.0) } else { (0.0, 1.0) };
-                    let uv_corners = [
-                        Pos2::new(uv_l, uv_t), Pos2::new(uv_r, uv_t),
-                        Pos2::new(uv_r, uv_b), Pos2::new(uv_l, uv_b),
-                    ];
-                    let mut mesh = egui::Mesh::with_texture(tex.id());
-                    for ci in 0..4 {
-                        let [lx, ly] = corners_local[ci];
-                        let rx = lx * cos_r - ly * sin_r + center.x;
-                        let ry = lx * sin_r + ly * cos_r + center.y;
-                        mesh.vertices.push(egui::epaint::Vertex {
-                            pos: Pos2::new(rx, ry),
-                            uv: uv_corners[ci],
-                            color: tint,
-                        });
-                    }
-                    mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
-                    painter.add(egui::Shape::mesh(mesh));
-                    frame_shown = true;
-                }
-            }
-        }
-
-        if !frame_shown {
-            // Placeholder rectangle
-            let fill = match display_mode {
-                DisplayMode::Active => Color32::from_rgb(44, 42, 28),
-                _ => Color32::from_rgb(32, 30, 20),
-            };
-            painter.rect_filled(elem_rect, Rounding::same(3.0), fill);
-            painter.text(
-                elem_rect.center(), egui::Align2::CENTER_CENTER,
-                &actor.id, egui::FontId::proportional(10.0),
-                Color32::from_rgb(140, 140, 160),
-            );
-        }
-
-        // Border. Primary selection gets the bright yellow gizmo
-        // border; multi-selection (Ctrl+click) shows a slimmer dashed
-        // border so the user can see every element in the set without
-        // confusing it with the primary "edit me" target.
-        let multi_selected = state
-            .canvas_selection
-            .iter()
-            .any(|s| *s == Selection::Actor(idx));
-        let border_col = if state.selection == Selection::Actor(idx) {
-            COL_SELECTED_BORDER
-        } else if multi_selected {
-            Color32::from_rgb(255, 180, 60)
-        } else {
-            COL_ELEMENT_BORDER
-        };
-        let border_width = if state.selection == Selection::Actor(idx) {
-            2.0
-        } else if multi_selected {
-            1.5
-        } else {
-            1.0
-        };
-        painter.rect_stroke(elem_rect, Rounding::same(3.0), Stroke::new(border_width, border_col));
-
-        // Display mode indicator
-        if display_mode != DisplayMode::Active {
-            let badge = match display_mode {
-                DisplayMode::BeforeStart => crate::i18n::t("FIRST"),
-                DisplayMode::AfterEnd => crate::i18n::t("LAST"),
-                _ => "",
-            };
-            painter.text(
-                Pos2::new(elem_rect.min.x + 4.0, elem_rect.min.y + 4.0),
-                egui::Align2::LEFT_TOP, badge,
-                egui::FontId::proportional(9.0),
-                Color32::from_rgb(255, 180, 80),
-            );
-        }
+        let track = actor_track_index(state, idx);
+        elements.push((track, ElementKind::Actor, idx));
     }
 
-    // Draw overlays on top of actors
-    draw_canvas_overlays(painter, full_rect, state, viewport_size, OverlayPass::OnTop);
+    // Collect overlays (image/video filtered by pick, text always included).
+    for (idx, ov) in state.scene.overlays.iter().enumerate() {
+        let dominated = match ov {
+            Overlay::Text(_) => false, // text always drawn
+            _ => !overlays_to_draw.contains(&idx),
+        };
+        if dominated { continue; }
+        let track = overlay_track_index(state, idx);
+        elements.push((track, ElementKind::Overlay, idx));
+    }
+
+    // Sort: larger track index drawn FIRST (visually behind), smaller
+    // track index drawn LAST (visually on top). Within the same track,
+    // preserve scene order (stable sort).
+    elements.sort_by(|a, b| b.0.cmp(&a.0).then(a.2.cmp(&b.2)));
+
+    // Draw each element in z-order.
+    for &(_, kind, idx) in &elements {
+        match kind {
+            ElementKind::Actor => {
+                draw_single_actor(ui, painter, full_rect, state, viewport_size, idx);
+            }
+            ElementKind::Overlay => {
+                draw_single_overlay(painter, full_rect, state, viewport_size, idx);
+            }
+        }
+    }
 
     // Draw the keyframe trajectory for the selected element on top of
     // everything else, so the user can see the animation path with numbered
     // points and per-keyframe parameter callouts.
     draw_selection_keyframe_trajectory(painter, full_rect, state, viewport_size);
+}
+
+// ─── SINGLE-ELEMENT DRAWING (used by unified z-order pass) ──────────
+
+/// Draw a single actor on the canvas. Extracted from the old per-actor
+/// loop so the unified z-order pass can interleave actors with overlays.
+fn draw_single_actor(
+    ui: &mut egui::Ui,
+    painter: &egui::Painter,
+    full_rect: Rect,
+    state: &mut EditorState,
+    viewport_size: [f32; 2],
+    idx: usize,
+) {
+    let t = state.playhead;
+    let duration = state.scene.output.duration;
+    let actor = &state.scene.actors[idx];
+
+    let t_in = actor.t_in.unwrap_or(0.0);
+    let t_out = actor.t_out.unwrap_or(duration);
+
+    let display_mode = if t >= t_in && t <= t_out {
+        DisplayMode::Active
+    } else if t < t_in {
+        DisplayMode::BeforeStart
+    } else {
+        DisplayMode::AfterEnd
+    };
+
+    let world_pos = get_element_world_pos(state, &actor.id, &actor.layout, t);
+    let (src_w, src_h) = if let Some(fc) = state.frame_caches.get(idx) {
+        if fc.is_ready() && fc.frame_count > 0 {
+            (fc.source_width as f32, fc.source_height as f32)
+        } else {
+            (1080.0_f32, 1920.0)
+        }
+    } else {
+        (1080.0_f32, 1920.0)
+    };
+    let actor_state = keyframe::sample(&actor.layout, t).unwrap_or_default();
+    let actor_scale = actor_state.scale;
+    let actor_scale_y = actor_state.scale_y;
+    let mod_delta = if matches!(display_mode, DisplayMode::Active) {
+        keyframe::evaluate_modifiers(&actor.modifiers, t - t_in)
+    } else {
+        keyframe::ModifierDelta::default()
+    };
+    let actor_rotation = actor_state.rotation_deg + mod_delta.d_rotation_deg;
+    let actor_opacity = actor_state.opacity;
+    let actor_flip_x = actor_state.flip_x_anim;
+    let actor_flip_y = actor_state.flip_y_anim;
+    let scale_eff = (actor_scale + mod_delta.d_scale).max(0.001);
+    let elem_width = src_w * scale_eff;
+    let elem_height = src_h * scale_eff * actor_scale_y;
+
+    let world_pos_with_mod = WorldPos {
+        x: world_pos.x + mod_delta.dx,
+        y: world_pos.y + mod_delta.dy,
+    };
+    let center_screen = state.canvas_viewport.world_to_screen(world_pos_with_mod, viewport_size);
+    let half_w = elem_width * 0.5 * state.canvas_viewport.zoom;
+    let half_h = elem_height * 0.5 * state.canvas_viewport.zoom;
+
+    let elem_rect = Rect::from_center_size(
+        Pos2::new(full_rect.min.x + center_screen[0], full_rect.min.y + center_screen[1]),
+        Vec2::new(half_w * 2.0, half_h * 2.0),
+    );
+
+    if !full_rect.intersects(elem_rect) { return; }
+
+    let base_tint = match display_mode {
+        DisplayMode::Active => Color32::WHITE,
+        _ => COL_INACTIVE_TINT,
+    };
+    let alpha = (actor_opacity * (base_tint.a() as f32 / 255.0)).clamp(0.0, 1.0);
+    let tint = Color32::from_rgba_unmultiplied(base_tint.r(), base_tint.g(), base_tint.b(), (alpha * 255.0) as u8);
+
+    let speed = actor.speed.max(0.0001);
+    let local_t = match display_mode {
+        DisplayMode::Active => (t - t_in) * speed + actor.source_start,
+        DisplayMode::BeforeStart => actor.source_start,
+        DisplayMode::AfterEnd => actor.source_start + (t_out - t_in) * speed,
+    };
+
+    let mut frame_shown = false;
+    if let Some(fc) = state.frame_caches.get_mut(idx) {
+        if fc.is_ready() {
+            let actor_ck = &state.scene.actors[idx].chroma_key;
+            let actor_t_in = state.scene.actors[idx].t_in.unwrap_or(0.0);
+            let local_for_anim = (state.playhead - actor_t_in).max(0.0);
+            let actor_cc_owned: memstroy_core::ColorCorrection =
+                state.scene.actors[idx].color_correction.sampled_at(local_for_anim);
+            let actor_cc = &actor_cc_owned;
+            let actor_fx_owned: Vec<memstroy_core::Effect> = state
+                .scene.actors[idx].effects
+                .iter()
+                .map(|e| e.sampled_at(local_for_anim))
+                .collect();
+            let actor_fx = &actor_fx_owned;
+            let any_fx_active = actor_fx.iter().any(|e| e.enabled && e.intensity > 0.001);
+            let has_effects = actor_ck.similarity > 0.01
+                || !actor_cc.is_identity()
+                || any_fx_active;
+
+            let texture = if has_effects {
+                fc.processed_frame_at_time(local_t, actor_ck, actor_cc, actor_fx, ui.ctx())
+            } else {
+                fc.frame_at_time(local_t, ui.ctx())
+            };
+
+            if let Some(tex) = texture {
+                let rotation_rad = actor_rotation.to_radians();
+                let static_hflip = state.scene.actors[idx].flip_horizontal;
+                let combined_x = if static_hflip { -actor_flip_x } else { actor_flip_x };
+                let combined_y = actor_flip_y;
+                let abs_fx = combined_x.abs().max(0.02);
+                let abs_fy = combined_y.abs().max(0.02);
+                let center = elem_rect.center();
+                let hw = elem_rect.width() * 0.5 * abs_fx;
+                let hh = elem_rect.height() * 0.5 * abs_fy;
+                let cos_r = rotation_rad.cos();
+                let sin_r = rotation_rad.sin();
+                let corners_local = [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]];
+                let (uv_l, uv_r) = if combined_x < 0.0 { (1.0, 0.0) } else { (0.0, 1.0) };
+                let (uv_t, uv_b) = if combined_y < 0.0 { (1.0, 0.0) } else { (0.0, 1.0) };
+                let uv_corners = [
+                    Pos2::new(uv_l, uv_t), Pos2::new(uv_r, uv_t),
+                    Pos2::new(uv_r, uv_b), Pos2::new(uv_l, uv_b),
+                ];
+                let mut mesh = egui::Mesh::with_texture(tex.id());
+                for ci in 0..4 {
+                    let [lx, ly] = corners_local[ci];
+                    let rx = lx * cos_r - ly * sin_r + center.x;
+                    let ry = lx * sin_r + ly * cos_r + center.y;
+                    mesh.vertices.push(egui::epaint::Vertex {
+                        pos: Pos2::new(rx, ry),
+                        uv: uv_corners[ci],
+                        color: tint,
+                    });
+                }
+                mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+                painter.add(egui::Shape::mesh(mesh));
+                frame_shown = true;
+            }
+        }
+    }
+
+    if !frame_shown {
+        let fill = match display_mode {
+            DisplayMode::Active => Color32::from_rgb(44, 42, 28),
+            _ => Color32::from_rgb(32, 30, 20),
+        };
+        painter.rect_filled(elem_rect, Rounding::same(3.0), fill);
+        painter.text(
+            elem_rect.center(), egui::Align2::CENTER_CENTER,
+            &state.scene.actors[idx].id, egui::FontId::proportional(10.0),
+            Color32::from_rgb(140, 140, 160),
+        );
+    }
+
+    let multi_selected = state.canvas_selection.iter().any(|s| *s == Selection::Actor(idx));
+    let border_col = if state.selection == Selection::Actor(idx) {
+        COL_SELECTED_BORDER
+    } else if multi_selected {
+        Color32::from_rgb(255, 180, 60)
+    } else {
+        COL_ELEMENT_BORDER
+    };
+    let border_width = if state.selection == Selection::Actor(idx) {
+        2.0
+    } else if multi_selected {
+        1.5
+    } else {
+        1.0
+    };
+    painter.rect_stroke(elem_rect, Rounding::same(3.0), Stroke::new(border_width, border_col));
+
+    if display_mode != DisplayMode::Active {
+        let badge = match display_mode {
+            DisplayMode::BeforeStart => crate::i18n::t("FIRST"),
+            DisplayMode::AfterEnd => crate::i18n::t("LAST"),
+            _ => "",
+        };
+        painter.text(
+            Pos2::new(elem_rect.min.x + 4.0, elem_rect.min.y + 4.0),
+            egui::Align2::LEFT_TOP, badge,
+            egui::FontId::proportional(9.0),
+            Color32::from_rgb(255, 180, 80),
+        );
+    }
+}
+
+/// Draw a single overlay on the canvas. Delegates to the existing
+/// `draw_canvas_overlays` infrastructure but for a single element.
+fn draw_single_overlay(
+    painter: &egui::Painter,
+    full_rect: Rect,
+    state: &EditorState,
+    viewport_size: [f32; 2],
+    idx: usize,
+) {
+    // Draw this single overlay using the shared overlay drawing path.
+    // Pass `Some(idx)` to restrict drawing to just this one element.
+    draw_canvas_overlays_impl(painter, full_rect, state, viewport_size, None, Some(idx));
 }
 
 // ─── BACKGROUNDS ON CANVAS ───────────────────────────────────────────
@@ -1472,6 +1493,7 @@ fn draw_canvas_backgrounds(
 // ─── OVERLAYS ON CANVAS ──────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 enum OverlayPass {
     /// Overlays that should render UNDER the actors. An overlay is
     /// classified into this pass dynamically when its timeline row sits
@@ -1483,12 +1505,29 @@ enum OverlayPass {
     OnTop,
 }
 
+#[allow(dead_code)]
 fn draw_canvas_overlays(
     painter: &egui::Painter,
     full_rect: Rect,
     state: &EditorState,
     viewport_size: [f32; 2],
     pass: OverlayPass,
+) {
+    draw_canvas_overlays_impl(painter, full_rect, state, viewport_size, Some(pass), None);
+}
+
+/// Core overlay drawing implementation.
+/// - `pass`: if `Some`, filter overlays by BehindActors/OnTop classification.
+///   If `None`, draw regardless of pass (used by the unified z-order path).
+/// - `only_idx`: if `Some(idx)`, draw only the overlay at that index.
+///   If `None`, draw all overlays that pass the filter.
+fn draw_canvas_overlays_impl(
+    painter: &egui::Painter,
+    full_rect: Rect,
+    state: &EditorState,
+    viewport_size: [f32; 2],
+    pass: Option<OverlayPass>,
+    only_idx: Option<usize>,
 ) {
     let t = state.playhead;
 
@@ -1511,12 +1550,19 @@ fn draw_canvas_overlays(
     // for every overlay kind, not just text.
     let mut order: Vec<(usize, usize)> = state.scene.overlays.iter().enumerate()
         .filter(|(idx, ov)| {
-            let behind = overlay_is_behind_actors(state, *idx);
-            let kind_ok = match pass {
-                OverlayPass::BehindActors => behind,
-                OverlayPass::OnTop => !behind,
-            };
-            if !kind_ok { return false; }
+            // Single-element mode: only draw the requested overlay.
+            if let Some(only) = only_idx {
+                return *idx == only;
+            }
+            // Pass filter (legacy two-phase path).
+            if let Some(p) = pass {
+                let behind = overlay_is_behind_actors(state, *idx);
+                let kind_ok = match p {
+                    OverlayPass::BehindActors => behind,
+                    OverlayPass::OnTop => !behind,
+                };
+                if !kind_ok { return false; }
+            }
             // Image / Video overlays on the same lane: only the chosen
             // one. Text overlays bypass the filter (always allowed).
             match ov {
