@@ -112,7 +112,12 @@ impl FrameCache {
 
     /// Same as `start_extraction` but uses a plain OS thread instead of a
     /// tokio runtime handle. Useful for callers that don't have access to
-    /// the App's runtime (e.g. the Skeleton Constructor side panel).
+    /// the App's runtime. Originally added for the floating Skeleton
+    /// Constructor side panel; the constructor was retired in favour of
+    /// the inspector skeleton tab, but the helper is kept on the API so
+    /// future panels can extract previews without dragging the runtime
+    /// around with them.
+    #[allow(dead_code)]
     pub fn start_extraction_thread(
         source: PathBuf,
         on_done: impl FnOnce(f32, usize, PathBuf) + Send + 'static,

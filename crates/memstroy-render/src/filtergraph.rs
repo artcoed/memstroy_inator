@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+﻿use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use memstroy_core::*;
@@ -605,6 +605,12 @@ impl<'a> FilterGraphBuilder<'a> {
                 &actor.modifiers,
                 t_in_clip,
                 actor.skeleton_attachments.first(),
+                // Actor layouts are authored in **scene-time** —
+                // `canvas_preview` calls `keyframe::sample(&actor.layout, t)`
+                // with the scene playhead. The renderer's piecewise
+                // expressions match this directly with the bare `t`
+                // ffmpeg time variable.
+                crate::expr::LayoutTimeBase::Scene,
             );
             if xform.opacity_animated {
                 tracing::debug!(
@@ -708,7 +714,7 @@ impl<'a> FilterGraphBuilder<'a> {
                     // `c=none` keeps the corners transparent so the
                     // rotated frame composites cleanly over the canvas.
                     tail_filters.push(format!(
-                        "rotate={r}:c=none:ow=hypot(iw\\,ih):oh=hypot(iw\\,ih)",
+                        "rotate='{r}':c=none:ow=hypot(iw\\,ih):oh=hypot(iw\\,ih)",
                         r = rot,
                     ));
                 }
@@ -770,7 +776,7 @@ impl<'a> FilterGraphBuilder<'a> {
                 if let Some(rot) = &xform.rot_expr {
                     chain.push(',');
                     chain.push_str(&format!(
-                        "rotate={r}:c=none:ow=hypot(iw\\,ih):oh=hypot(iw\\,ih)",
+                        "rotate='{r}':c=none:ow=hypot(iw\\,ih):oh=hypot(iw\\,ih)",
                         r = rot,
                     ));
                 }
@@ -1003,6 +1009,13 @@ impl<'a> FilterGraphBuilder<'a> {
             &t.modifiers,
             t.t_in,
             t.skeleton_attachment.as_ref(),
+            // Overlay layouts are authored in **clip-local** time —
+            // `canvas_preview` samples them at `sample_t = t - t_in`.
+            // Without telling the renderer's piecewise builder about
+            // this offset every overlay animation in a clip with
+            // `t_in > 0` would render shifted by `t_in` seconds (the
+            // user-visible "preview ↔ render mismatch" bug).
+            crate::expr::LayoutTimeBase::ClipLocal { t_in: t.t_in },
         );
         let scale_part = format!(
             "scale=w='max(2,iw*({sx}))':h='max(2,ih*({sy}))':eval=frame",
@@ -1027,7 +1040,7 @@ impl<'a> FilterGraphBuilder<'a> {
         let vflip = xform.vflip;
         let rot_part = xform.rot_expr.as_ref().map(|r| {
             format!(
-                "rotate={r}:c=none:ow=hypot(iw\\,ih):oh=hypot(iw\\,ih)",
+                "rotate='{r}':c=none:ow=hypot(iw\\,ih):oh=hypot(iw\\,ih)",
                 r = r,
             )
         });
@@ -1149,6 +1162,11 @@ impl<'a> FilterGraphBuilder<'a> {
             &ov.modifiers,
             ov.t_in,
             ov.skeleton_attachment.as_ref(),
+            // Image overlays use clip-local time for layout kfs —
+            // see `canvas_preview::draw_canvas_overlays` (`sample_t =
+            // t - t_in`). Pass the offset so the renderer's
+            // piecewise expressions evaluate at the same axis.
+            crate::expr::LayoutTimeBase::ClipLocal { t_in: ov.t_in },
         );
         if xform.opacity_animated {
             tracing::debug!(
@@ -1209,7 +1227,7 @@ impl<'a> FilterGraphBuilder<'a> {
             tail.push(scale_part);
             if let Some(rot) = &xform.rot_expr {
                 tail.push(format!(
-                    "rotate={r}:c=none:ow=hypot(iw\\,ih):oh=hypot(iw\\,ih)",
+                    "rotate='{r}':c=none:ow=hypot(iw\\,ih):oh=hypot(iw\\,ih)",
                     r = rot,
                 ));
             }
@@ -1249,7 +1267,7 @@ impl<'a> FilterGraphBuilder<'a> {
             if let Some(rot) = &xform.rot_expr {
                 chain.push(',');
                 chain.push_str(&format!(
-                    "rotate={r}:c=none:ow=hypot(iw\\,ih):oh=hypot(iw\\,ih)",
+                    "rotate='{r}':c=none:ow=hypot(iw\\,ih):oh=hypot(iw\\,ih)",
                     r = rot,
                 ));
             }
@@ -1290,6 +1308,8 @@ impl<'a> FilterGraphBuilder<'a> {
             &ov.modifiers,
             ov.t_in,
             ov.skeleton_attachment.as_ref(),
+            // Video overlays use clip-local time for layout kfs.
+            crate::expr::LayoutTimeBase::ClipLocal { t_in: ov.t_in },
         );
         if xform.opacity_animated {
             tracing::debug!(
@@ -1341,7 +1361,7 @@ impl<'a> FilterGraphBuilder<'a> {
             tail.push(scale_part);
             if let Some(rot) = &xform.rot_expr {
                 tail.push(format!(
-                    "rotate={r}:c=none:ow=hypot(iw\\,ih):oh=hypot(iw\\,ih)",
+                    "rotate='{r}':c=none:ow=hypot(iw\\,ih):oh=hypot(iw\\,ih)",
                     r = rot,
                 ));
             }
@@ -1381,7 +1401,7 @@ impl<'a> FilterGraphBuilder<'a> {
             if let Some(rot) = &xform.rot_expr {
                 chain.push(',');
                 chain.push_str(&format!(
-                    "rotate={r}:c=none:ow=hypot(iw\\,ih):oh=hypot(iw\\,ih)",
+                    "rotate='{r}':c=none:ow=hypot(iw\\,ih):oh=hypot(iw\\,ih)",
                     r = rot,
                 ));
             }
@@ -1680,9 +1700,324 @@ impl<'a> FilterGraphBuilder<'a> {
     }
 
     fn emit_audio(&mut self) -> Result<()> {
-        if self.scene.audio.is_empty() {
+        // Snapshot of every audio-bearing source we should mix into
+        // the output. Sourced from two pools:
+        //
+        //   1. Explicit `Scene::audio` tracks (volume / pan / fades
+        //      / chained DSP all honoured).
+        //   2. Actor video clips whose source contains an audio
+        //      stream BUT no `AudioTrack` already references that
+        //      same source path. Mirrors the GUI preview's behaviour
+        //      in `app.rs::build_sources`: an actor dropped on the
+        //      canvas plays its embedded soundtrack even when the
+        //      user hasn't manually added an AudioTrack row. Without
+        //      this branch the rendered video had silence for every
+        //      actor clip whose `_audio` row had been deleted (or
+        //      never existed in older saved scenes), even though the
+        //      preview played it just fine — exactly the user's
+        //      "звуковая дорожка в итоговом видео не включается"
+        //      report.
+        //
+        // We materialise both pools into a unified `AudioJob` list
+        // so the per-track filter chain below stays single-purpose.
+        //
+        // Every inspector-exposed knob that the live preview honours
+        // (`speed`, `pitch_semitones`, `pan`, `low_pass_hz`,
+        // `high_pass_hz`, `reverb`, on top of `volume`/`mute`/fades)
+        // is wired through here. The previous implementation only
+        // threaded volume + mute + fades, so all the other inspector
+        // tweaks were silently dropped at render time even though
+        // the in-editor preview applied them — exactly the user's
+        // "звук в видео рендериться, но без измененных в инспекторе
+        // параметров" report.
+        //
+        // ── Animation handling ────────────────────────────────────
+        //
+        // Animated audio params (when `animated_params` contains the
+        // param id AND the matching kf list has ≥2 keyframes) are
+        // lowered into a per-segment chain of filters gated with
+        // `enable='between(t,a,b)'`, mirroring how
+        // `expr.rs::effect_animated_filter_chain` lowers animated
+        // video effects. The segment times are taken from the union
+        // of the param's keyframe times (capped at MAX_SEGMENTS to
+        // keep the filter graph within ffmpeg's expression-length
+        // limits), each segment is sampled at its midpoint via the
+        // existing `*_at(t_local)` helpers, and `enable` clauses are
+        // expressed in CLIP-LOCAL seconds because the filters live
+        // BEFORE `adelay` in the chain (so the audio PTS starts at
+        // zero — same convention the live preview uses when feeding
+        // the rodio sink).
+        //
+        // Speed/pitch are intentionally left as a static snapshot
+        // sampled at the clip midpoint: changing the resample factor
+        // mid-clip would require rebuilding the whole filter graph
+        // because `asetrate` shifts the sample rate (and the chain
+        // downstream of it depends on a stable rate). The live
+        // preview behaves the same way — the rodio sink is rebuilt
+        // when speed/pitch change, but doesn't sweep them within a
+        // single playback. Sampling at the midpoint gives the most
+        // representative value across the clip's lifetime.
+        struct AudioJob<'a> {
+            id: &'a str,
+            source: std::path::PathBuf,
+            t_in: f32,
+            t_out: f32,
+            source_start: f32,
+            mute: bool,
+            fade_in: f32,
+            fade_out: f32,
+            /// Static snapshot of speed × pitch_semitones, sampled at
+            /// the clip's midpoint (animation cannot be threaded
+            /// through `asetrate` mid-clip without rebuilding the
+            /// graph).
+            rate: f32,
+            /// Keyframe-aware envelopes. `Static(v)` means "emit a
+            /// single static filter with this value"; `Animated`
+            /// means "emit one filter per segment, sampled at each
+            /// segment's midpoint via the corresponding *_at()
+            /// helper".
+            volume_env: AudioEnv,
+            pan_env: AudioEnv,
+            low_pass_env: AudioCutoffEnv,
+            high_pass_env: AudioCutoffEnv,
+            reverb_env: AudioEnv,
+            /// Backing `AudioTrack` reference for kf sampling — kept
+            /// alive for the duration of the borrow so per-segment
+            /// samplers can look up easing-aware values without
+            /// re-holding `self`.
+            track: Option<&'a memstroy_core::AudioTrack>,
+        }
+
+        /// Static-or-animated envelope for a scalar audio param. The
+        /// `Animated` variant carries the segment list in clip-local
+        /// time (already capped at `MAX_AUDIO_SEGMENTS`) so the
+        /// filter loop below doesn't need to re-walk the keyframe
+        /// list.
+        enum AudioEnv {
+            Static(f32),
+            Animated { segments: Vec<(f32, f32)> },
+        }
+
+        /// Same as [`AudioEnv`] but for params whose enabled state
+        /// is encoded as `Option<u32>` (low-pass / high-pass cutoffs).
+        /// `None` means the inspector switch is OFF — emit nothing.
+        enum AudioCutoffEnv {
+            Disabled,
+            Static(u32),
+            Animated { segments: Vec<(f32, f32)> },
+        }
+
+        /// Maximum number of segments we'll lower an animated audio
+        /// param into. Mirrors `expr.rs::effect_segments`'s
+        /// `MAX_SEGMENTS = 24` so audio and video animation budgets
+        /// stay symmetric. ffmpeg can handle longer lists but the
+        /// filter-complex string grows quadratically with segment
+        /// count when multiple params animate, and the per-segment
+        /// `enable=` enumeration is already a coarse approximation —
+        /// 24 segments yield ~40 ms resolution on a 1 s clip, which
+        /// is finer than the human ear can resolve for envelope
+        /// changes (volume, pan, etc.).
+        const MAX_AUDIO_SEGMENTS: usize = 24;
+
+        /// Build a segment list (clip-local seconds) from a keyframe
+        /// track. The strategy mirrors `expr.rs::effect_segments`:
+        ///
+        ///   * union of the keyframe times, clamped to `[0, clip_dur]`,
+        ///   * densified up to `MIN_POINTS = 8` samples so 2-3 sparse
+        ///     keyframes still produce smooth segment-level interp,
+        ///   * capped at `MAX_AUDIO_SEGMENTS + 1` boundary points.
+        ///
+        /// Returns an empty `Vec` when `clip_dur` collapses to zero
+        /// (the caller falls back to the static path so we still
+        /// emit a meaningful filter).
+        fn audio_segments(
+            kfs: &[memstroy_core::Keyframe<f32>],
+            clip_dur: f32,
+        ) -> Vec<(f32, f32)> {
+            const MIN_POINTS: usize = 8;
+            if clip_dur <= 1e-3 {
+                return Vec::new();
+            }
+            let mut times: Vec<f32> = kfs
+                .iter()
+                .map(|kf| kf.t.clamp(0.0, clip_dur))
+                .collect();
+            times.push(0.0);
+            times.push(clip_dur);
+            times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            times.dedup_by(|a, b| (*a - *b).abs() < 1e-4);
+            if times.len() < MIN_POINTS {
+                let span = clip_dur;
+                let stride = span / (MIN_POINTS as f32 - 1.0);
+                for i in 0..MIN_POINTS {
+                    times.push((i as f32) * stride);
+                }
+                times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                times.dedup_by(|a, b| (*a - *b).abs() < 1e-4);
+            }
+            if times.len() > MAX_AUDIO_SEGMENTS + 1 {
+                let stride = ((times.len() - 1) as f32 / MAX_AUDIO_SEGMENTS as f32)
+                    .ceil() as usize;
+                let mut sub: Vec<f32> = times
+                    .iter()
+                    .step_by(stride.max(1))
+                    .copied()
+                    .collect();
+                if sub.last().map_or(true, |&l| l < clip_dur - 1e-4) {
+                    sub.push(clip_dur);
+                }
+                times = sub;
+            }
+            times
+                .windows(2)
+                .filter(|w| w[1] > w[0] + 1e-4)
+                .map(|w| (w[0], w[1]))
+                .collect()
+        }
+
+        /// Build an [`AudioEnv`] for a scalar audio param. Returns
+        /// `Static(static_value)` when the inspector toggle for
+        /// `param_id` is OFF or there's only a single keyframe (no
+        /// animation possible). Otherwise returns `Animated` with a
+        /// pre-computed segment list.
+        fn build_audio_env(
+            tr: &memstroy_core::AudioTrack,
+            param_id: &str,
+            kfs: &[memstroy_core::Keyframe<f32>],
+            static_value: f32,
+            clip_dur: f32,
+        ) -> AudioEnv {
+            if !tr.animated_params.contains(param_id) || kfs.len() < 2 {
+                return AudioEnv::Static(static_value);
+            }
+            let segments = audio_segments(kfs, clip_dur);
+            if segments.is_empty() {
+                return AudioEnv::Static(static_value);
+            }
+            AudioEnv::Animated { segments }
+        }
+
+        /// Cutoff variant of [`build_audio_env`]. Honours the
+        /// inspector's `Option<u32>` enable switch first — when the
+        /// filter is disabled in the inspector we ALWAYS emit
+        /// [`AudioCutoffEnv::Disabled`] regardless of any orphaned
+        /// keyframes.
+        fn build_cutoff_env(
+            tr: &memstroy_core::AudioTrack,
+            param_id: &str,
+            kfs: &[memstroy_core::Keyframe<f32>],
+            static_hz: Option<u32>,
+            clip_dur: f32,
+        ) -> AudioCutoffEnv {
+            let Some(hz) = static_hz else { return AudioCutoffEnv::Disabled };
+            if !tr.animated_params.contains(param_id) || kfs.len() < 2 {
+                return AudioCutoffEnv::Static(hz);
+            }
+            let segments = audio_segments(kfs, clip_dur);
+            if segments.is_empty() {
+                return AudioCutoffEnv::Static(hz);
+            }
+            AudioCutoffEnv::Animated { segments }
+        }
+
+        let scene_dur = self.scene.output.duration.max(1.0 / 60.0);
+
+        let mut jobs: Vec<AudioJob> = Vec::new();
+        let mut seen: std::collections::HashSet<std::path::PathBuf> =
+            std::collections::HashSet::new();
+        for tr in &self.scene.audio {
+            let path = self.resolve(&tr.source);
+            seen.insert(path.clone());
+            let t_in = tr.t_in;
+            let t_out = tr.t_out.unwrap_or(scene_dur);
+            let clip_dur = (t_out.max(t_in) - t_in).max(1.0 / 60.0);
+            // Speed/pitch snapshot: sample at the clip midpoint so
+            // very front-loaded keyframes (e.g. a step-change at
+            // t=0.0) don't distort the static rate emitted to the
+            // graph. The preview rebuilds the sink whenever this
+            // value changes, so animating it across a single export
+            // pass would diverge from the preview anyway.
+            let mid = clip_dur * 0.5;
+            let rate = (tr.speed_at(mid)
+                * 2.0_f32.powf(tr.pitch_at(mid) / 12.0)).max(0.05);
+            jobs.push(AudioJob {
+                id: tr.id.as_str(),
+                source: path,
+                t_in,
+                t_out,
+                source_start: tr.source_start,
+                mute: tr.mute,
+                fade_in: tr.fade_in,
+                fade_out: tr.fade_out,
+                rate,
+                volume_env: build_audio_env(
+                    tr,
+                    "volume",
+                    &tr.volume_kfs,
+                    tr.volume,
+                    clip_dur,
+                ),
+                pan_env: build_audio_env(
+                    tr,
+                    "pan",
+                    &tr.pan_kfs,
+                    tr.pan,
+                    clip_dur,
+                ),
+                low_pass_env: build_cutoff_env(
+                    tr,
+                    "low_pass",
+                    &tr.low_pass_kfs,
+                    tr.low_pass_hz,
+                    clip_dur,
+                ),
+                high_pass_env: build_cutoff_env(
+                    tr,
+                    "high_pass",
+                    &tr.high_pass_kfs,
+                    tr.high_pass_hz,
+                    clip_dur,
+                ),
+                reverb_env: build_audio_env(
+                    tr,
+                    "reverb",
+                    &tr.reverb_kfs,
+                    tr.reverb,
+                    clip_dur,
+                ),
+                track: Some(tr),
+            });
+        }
+        for actor in &self.scene.actors {
+            if !actor.visible { continue; }
+            let path = self.resolve(&actor.source);
+            if seen.contains(&path) { continue; }
+            seen.insert(path.clone());
+            let t_in = actor.t_in.unwrap_or(0.0);
+            let t_out = actor.t_out.unwrap_or(scene_dur);
+            jobs.push(AudioJob {
+                id: actor.id.as_str(),
+                source: path,
+                t_in,
+                t_out,
+                source_start: actor.source_start,
+                mute: false,
+                fade_in: 0.0,
+                fade_out: 0.0,
+                rate: 1.0,
+                volume_env: AudioEnv::Static(1.0),
+                pan_env: AudioEnv::Static(0.0),
+                low_pass_env: AudioCutoffEnv::Disabled,
+                high_pass_env: AudioCutoffEnv::Disabled,
+                reverb_env: AudioEnv::Static(0.0),
+                track: None,
+            });
+        }
+
+        if jobs.is_empty() {
             return Ok(());
         }
+
         // ── Audio pipeline ─────────────────────────────────────────
         //
         // The previous implementation wired every track straight into
@@ -1738,11 +2073,9 @@ impl<'a> FilterGraphBuilder<'a> {
         const FMT: &str = "fltp";
         const LAYOUT: &str = "stereo";
 
-        let scene_dur = self.scene.output.duration.max(1.0 / 60.0);
-
         let mut audio_labels = Vec::new();
-        for tr in &self.scene.audio {
-            let path = self.resolve(&tr.source);
+        for job in jobs {
+            let path = job.source.clone();
             // Defence in depth: if the audio file went missing (user
             // moved/deleted it after dropping it on the timeline) the
             // filter `[idx:a]` reference would fail at graph init.
@@ -1750,7 +2083,7 @@ impl<'a> FilterGraphBuilder<'a> {
             // runs.
             if !path.exists() {
                 tracing::warn!(
-                    track_id = %tr.id,
+                    track_id = %job.id,
                     path = %path.display(),
                     "audio track source not found on disk; skipping",
                 );
@@ -1776,7 +2109,7 @@ impl<'a> FilterGraphBuilder<'a> {
             // export.
             if !crate::proc::probe_has_audio_stream(&path) {
                 tracing::warn!(
-                    track_id = %tr.id,
+                    track_id = %job.id,
                     path = %path.display(),
                     "audio track source has no audio stream; skipping (silent source clip?)",
                 );
@@ -1787,23 +2120,27 @@ impl<'a> FilterGraphBuilder<'a> {
                 path,
                 kind: InputKind::Audio,
                 r#loop: false,
-                seek: if tr.source_start > 0.0 { Some(tr.source_start) } else { None },
+                seek: if job.source_start > 0.0 { Some(job.source_start) } else { None },
                 t: None,
             });
 
-            let t_in = tr.t_in.max(0.0).min(scene_dur);
-            let t_out = tr
-                .t_out
-                .unwrap_or(scene_dur)
-                .clamp(t_in, scene_dur);
+            let t_in = job.t_in.max(0.0).min(scene_dur);
+            let t_out = job.t_out.clamp(t_in, scene_dur);
             let clip_dur = (t_out - t_in).max(1.0 / 60.0);
 
-            // Mute overrides the static volume completely — the GUI's
-            // M button is a hard mute, not a "remember the volume"
-            // switch.
-            let volume = if tr.mute { 0.0 } else { tr.volume.max(0.0) };
+            // Effective resample factor mirrors the live preview:
+            // `effective_rate = speed * 2^(pitch_semitones / 12)`.
+            // The preview implements this via `rodio::Source::speed`,
+            // which is a pure resample (no time-stretching), so pitch
+            // shift also changes effective duration. The closest
+            // single-filter ffmpeg equivalent is `asetrate=SR*rate`
+            // followed by `aresample=SR` to restore the canonical
+            // sample rate amix expects. Skip both nodes when the
+            // factor is 1.0 to keep the graph string short on the
+            // common case.
+            let rate = job.rate.max(0.05);
 
-            let mut filters: Vec<String> = Vec::with_capacity(10);
+            let mut filters: Vec<String> = Vec::with_capacity(20);
             filters.push(format!("aresample={sr}", sr = SR));
             filters.push(format!(
                 "aformat=sample_fmts={fmt}:sample_rates={sr}:channel_layouts={ch}",
@@ -1811,10 +2148,127 @@ impl<'a> FilterGraphBuilder<'a> {
                 sr = SR,
                 ch = LAYOUT,
             ));
+            // Speed + pitch (resample). After `asetrate` the nominal
+            // sample rate changes, so we MUST `aresample={SR}` again
+            // to restore the bus rate before `amix` sees the stream.
+            // We also re-pin the format so `aformat`'s contract holds
+            // (asetrate doesn't touch sample format / layout but
+            // belt-and-braces never hurt the encoder).
+            if (rate - 1.0).abs() > 1e-4 {
+                filters.push(format!("asetrate={:.6}", SR as f32 * rate));
+                filters.push(format!("aresample={sr}", sr = SR));
+                filters.push(format!(
+                    "aformat=sample_fmts={fmt}:sample_rates={sr}:channel_layouts={ch}",
+                    fmt = FMT,
+                    sr = SR,
+                    ch = LAYOUT,
+                ));
+            }
+            // After speed/pitch the source emits scene-time at 1×;
+            // `clip_dur` (scene seconds) is the on-timeline length
+            // we want regardless of the source's own duration.
             filters.push(format!("atrim=duration={:.6}", clip_dur));
             filters.push("asetpts=PTS-STARTPTS".into());
-            if tr.fade_in > 0.0 {
-                let fi = tr.fade_in.min(clip_dur);
+
+            // High-pass / low-pass filters. The preview uses one-pole
+            // IIRs; ffmpeg's default `highpass` / `lowpass` are
+            // biquads, which is a slightly different roll-off but
+            // close enough for the editor's "trim out rumble / soften
+            // hiss" use cases. Disabled when the inspector slider is
+            // unset (None). Animated cutoffs lower into a per-segment
+            // chain of `highpass=f=…:enable='between(t,a,b)'` clauses
+            // so the export sweeps in lock-step with the canvas
+            // preview's `tr.high_pass_at(t_local)` sampler.
+            match &job.high_pass_env {
+                AudioCutoffEnv::Disabled => {}
+                AudioCutoffEnv::Static(hp) => {
+                    if *hp > 0 {
+                        filters.push(format!("highpass=f={}", hp));
+                    }
+                }
+                AudioCutoffEnv::Animated { segments } => {
+                    for (a, b) in segments {
+                        let mid = ((a + b) * 0.5).max(*a);
+                        let v = job
+                            .track
+                            .and_then(|t| t.high_pass_at(mid))
+                            .unwrap_or(0);
+                        if v == 0 {
+                            continue;
+                        }
+                        filters.push(format!(
+                            "highpass=f={v}:enable='between(t,{a:.4},{b:.4})'",
+                        ));
+                    }
+                }
+            }
+            match &job.low_pass_env {
+                AudioCutoffEnv::Disabled => {}
+                AudioCutoffEnv::Static(lp) => {
+                    if *lp > 0 {
+                        filters.push(format!("lowpass=f={}", lp));
+                    }
+                }
+                AudioCutoffEnv::Animated { segments } => {
+                    for (a, b) in segments {
+                        let mid = ((a + b) * 0.5).max(*a);
+                        let v = job
+                            .track
+                            .and_then(|t| t.low_pass_at(mid))
+                            .unwrap_or(0);
+                        if v == 0 {
+                            continue;
+                        }
+                        filters.push(format!(
+                            "lowpass=f={v}:enable='between(t,{a:.4},{b:.4})'",
+                        ));
+                    }
+                }
+            }
+
+            // Reverb: preview is a single-tap feedback comb at ~120 ms
+            // delay with feedback = `mix * 0.55` (capped at 0.7) and
+            // wet mix = `mix`. ffmpeg's `aecho` is the closest match —
+            // it doesn't expose feedback, but stacking decay+mix on
+            // top of `aecho`'s tap gives the same "small room" feel.
+            // Skip when reverb is effectively zero (matches the live
+            // preview's `enabled = mix > 1e-3` gate). When the user
+            // animated reverb across keyframes we emit one `aecho`
+            // per segment with `enable='between(...)'` so the wet mix
+            // ramps with the curve.
+            match &job.reverb_env {
+                AudioEnv::Static(v) => {
+                    if *v > 1e-3 {
+                        let mix = v.clamp(0.0, 1.0);
+                        let decay = (mix * 0.55).min(0.7);
+                        filters.push(format!(
+                            "aecho=1.0:{:.6}:120:{:.6}",
+                            mix, decay
+                        ));
+                    }
+                }
+                AudioEnv::Animated { segments } => {
+                    for (a, b) in segments {
+                        let mid = ((a + b) * 0.5).max(*a);
+                        let v = job
+                            .track
+                            .map(|t| t.reverb_at(mid))
+                            .unwrap_or(0.0);
+                        if v <= 1e-3 {
+                            continue;
+                        }
+                        let mix = v.clamp(0.0, 1.0);
+                        let decay = (mix * 0.55).min(0.7);
+                        filters.push(format!(
+                            "aecho=1.0:{:.6}:120:{:.6}:enable='between(t,{a:.4},{b:.4})'",
+                            mix, decay,
+                        ));
+                    }
+                }
+            }
+
+            if job.fade_in > 0.0 {
+                let fi = job.fade_in.min(clip_dur);
                 if fi > 0.0 {
                     filters.push(format!(
                         "afade=t=in:st=0:d={:.6}:curve=tri",
@@ -1822,8 +2276,8 @@ impl<'a> FilterGraphBuilder<'a> {
                     ));
                 }
             }
-            if tr.fade_out > 0.0 {
-                let fo = tr.fade_out.min(clip_dur);
+            if job.fade_out > 0.0 {
+                let fo = job.fade_out.min(clip_dur);
                 if fo > 0.0 {
                     let st = (clip_dur - fo).max(0.0);
                     filters.push(format!(
@@ -1832,10 +2286,92 @@ impl<'a> FilterGraphBuilder<'a> {
                     ));
                 }
             }
-            // `volume=1` is a no-op — skip emitting it to keep the
-            // graph string short for the common unmuted-default case.
-            if (volume - 1.0).abs() > 1e-4 {
-                filters.push(format!("volume={:.6}", volume));
+
+            // Stereo pan with the same equal-power law as the preview's
+            // `dsp::Stereo` (theta = (pan+1)*π/4, gain = cos/sin
+            // scaled so that the centre position has unity power).
+            // ffmpeg's `pan` filter writes per-output-channel mixing
+            // expressions — we average the input channels first and
+            // then apply the pan gains so mono and stereo sources
+            // both behave like the preview. Skipped when pan == 0
+            // because the centred case collapses to identity.
+            // Animated pan lowers into one `pan=...` filter per
+            // segment, gated by `enable='between(...)'`.
+            let pan_filter = |pan: f32| -> Option<String> {
+                if pan.abs() <= 1e-4 {
+                    return None;
+                }
+                let pan = pan.clamp(-1.0, 1.0);
+                let theta = (pan + 1.0) * std::f32::consts::FRAC_PI_4;
+                let lg = theta.cos() * std::f32::consts::SQRT_2 * 0.5;
+                let rg = theta.sin() * std::f32::consts::SQRT_2 * 0.5;
+                let l_coef = lg * 0.5;
+                let r_coef = rg * 0.5;
+                Some(format!(
+                    "pan=stereo|c0={l:.6}*c0+{l:.6}*c1|c1={r:.6}*c0+{r:.6}*c1",
+                    l = l_coef,
+                    r = r_coef,
+                ))
+            };
+            match &job.pan_env {
+                AudioEnv::Static(v) => {
+                    if let Some(f) = pan_filter(*v) {
+                        filters.push(f);
+                    }
+                }
+                AudioEnv::Animated { segments } => {
+                    for (a, b) in segments {
+                        let mid = ((a + b) * 0.5).max(*a);
+                        let v = job
+                            .track
+                            .map(|t| t.pan_at(mid))
+                            .unwrap_or(0.0);
+                        let Some(f) = pan_filter(v) else { continue };
+                        filters.push(format!(
+                            "{f}:enable='between(t,{a:.4},{b:.4})'",
+                        ));
+                    }
+                }
+            }
+
+            // Volume — `volume=1` is a no-op so we skip emitting it
+            // for the common unmuted-default case. Mute always wins
+            // and forces a hard `volume=0` on the chain regardless of
+            // any keyframes the user authored, matching the GUI's
+            // "M" button semantics. Animated volume lowers into per-
+            // segment `volume=v:enable='between(t,a,b)'` filters that
+            // mirror the live preview's frame-by-frame
+            // `tr.volume_at(t_local)` sampling.
+            if job.mute {
+                filters.push("volume=0.000000".into());
+            } else {
+                match &job.volume_env {
+                    AudioEnv::Static(v) => {
+                        let v = v.max(0.0);
+                        if (v - 1.0).abs() > 1e-4 {
+                            filters.push(format!("volume={:.6}", v));
+                        }
+                    }
+                    AudioEnv::Animated { segments } => {
+                        for (a, b) in segments {
+                            let mid = ((a + b) * 0.5).max(*a);
+                            let v = job
+                                .track
+                                .map(|t| t.volume_at(mid).max(0.0))
+                                .unwrap_or(1.0);
+                            // Even unity segments still need to emit a
+                            // filter when *other* segments aren't unity,
+                            // so the chain length matches the segment
+                            // count and `enable=` covers the whole
+                            // clip. Use `volume=1.0:enable=...` rather
+                            // than skipping.
+                            filters.push(format!(
+                                "volume={:.6}:enable='between(t,{a:.4},{b:.4})'",
+                                v,
+                            ));
+                        }
+                    }
+                }
             }
             let delay_ms = (t_in * 1000.0).round().max(0.0) as u64;
             if delay_ms > 0 {
@@ -2294,12 +2830,26 @@ fn time_align_filters(
 /// keyframes were authored on, so the geq sample matches the
 /// preview's `keyframe::sample(&layout, scene_t)` result.
 fn animated_alpha_filter(opacity_expr_t: &str) -> String {
-    // Single-quote the value so the commas inside `alpha(X,Y)` don't
-    // get interpreted as filter separators by the filter_complex
-    // parser. The inner expression has no quotes so the surrounding
-    // single-quote pair is unambiguous.
+    // The `geq=` filter rejects expressions that only target the
+    // alpha plane. Without an explicit `r/g/b` (RGB pixel format)
+    // OR `lum/cb/cr` (YUV pixel format) expression, ffmpeg aborts
+    // graph init with "A luminance or RGB expression is mandatory"
+    // and tears down both encoder threads (the user-visible
+    // "ffmpeg failed: exit code -22" + 0-byte mp4 the user hit on
+    // every animated-opacity export).
+    //
+    // The element's pre-geq stream is `format=yuva420p` (set by
+    // every emitter's first filter), so we feed `geq` the YUV
+    // passthrough triplet `lum=p(X,Y)` / `cb=p(X,Y)` / `cr=p(X,Y)`
+    // which copies each plane verbatim. The alpha plane is the
+    // only one that gets the per-frame multiplier; the colour
+    // channels are unchanged.
+    //
+    // Single-quote each value so the commas inside `alpha(X,Y)` /
+    // `if(lt(t,…),…,…)` don't get interpreted as filter
+    // separators by the filter_complex parser.
     format!(
-        "geq=a='clip(alpha(X,Y)*({expr}),0,255)'",
+        "geq=lum='p(X,Y)':cb='p(X,Y)':cr='p(X,Y)':a='clip(alpha(X,Y)*({expr}),0,255)'",
         expr = opacity_expr_t,
     )
 }

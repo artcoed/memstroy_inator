@@ -182,6 +182,7 @@ fn run_bake(
 /// The `crop_inset` is `(left, top, right, bottom)` in normalised
 /// 0..1 — the caller's mesh / preview rect should shrink to this
 /// rectangle so the user sees the same crop the export will produce.
+#[allow(dead_code)]
 pub fn lookup_or_dispatch_image_fx(
     state: &crate::state::EditorState,
     path: &std::path::Path,

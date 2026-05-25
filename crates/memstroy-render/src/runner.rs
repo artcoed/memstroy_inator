@@ -17,9 +17,26 @@ pub fn ffmpeg_binary() -> PathBuf {
     PathBuf::from("ffmpeg")
 }
 
-/// Render `scene` into `output_path`. Streams FFmpeg's stderr line by
-/// line through the optional progress callback so the GUI can show a
-/// progress bar.
+/// Render `scene` into `output_path`. Switches between the CPU
+/// compositor (default) and the legacy FFmpeg filtergraph path
+/// based on the `MEMSTROY_RENDER_BACKEND` env var.
+///
+/// The CPU compositor mirrors the canvas snapshot rasterizer pixel
+/// for pixel — every transform (world→output, camera, modifiers,
+/// chromakey, color correction) uses the same math `frame_snapshot`
+/// uses on the canvas. This is the only way to guarantee that what
+/// the user sees in the editor matches the rendered MP4.
+///
+/// `on_log` is called for every diagnostic line (or progress update)
+/// produced by the renderer in real time. The GUI converts these
+/// into status-bar / progress-bar updates. The closure must be
+/// `FnMut(&str) + Send` because the CPU path runs on a blocking
+/// worker thread; we marshal the progress events back to the caller
+/// via a `std::sync::mpsc` channel and replay them as `&str` calls
+/// from the async context.
+///
+/// `MEMSTROY_RENDER_BACKEND=ffmpeg` falls back to the legacy
+/// filtergraph path for users who hit a regression in the CPU path.
 pub async fn render_scene<F>(
     scene: &Scene,
     assets_root: &Path,
@@ -27,10 +44,68 @@ pub async fn render_scene<F>(
     mut on_log: F,
 ) -> Result<()>
 where
-    F: FnMut(&str),
+    F: FnMut(&str) + Send,
 {
-    let plan = build_plan(scene, output_path, assets_root)?;
-    run_plan(&plan, &mut on_log).await
+    if use_legacy_filtergraph_backend() {
+        let plan = build_plan(scene, output_path, assets_root)?;
+        return run_plan(&plan, &mut on_log).await;
+    }
+
+    // CPU path. We stream progress back to the caller in real time
+    // through a `std::sync::mpsc` channel — the worker thread sends
+    // events as soon as they happen, the async side polls them at a
+    // tight cadence so the GUI sees frame-by-frame progress instead
+    // of "0% for 5 minutes, then jump to 100%". Without the channel
+    // the user reported "бесконечный 0%" because we only flushed
+    // log events AFTER the worker returned.
+    on_log("CPU compositor: preparing scene...");
+
+    let scene_owned = scene.clone();
+    let assets_root_owned = assets_root.to_path_buf();
+    let output_path_owned = output_path.to_path_buf();
+    let (prog_tx, prog_rx) = std::sync::mpsc::channel::<crate::compositor::Progress>();
+
+    let join_handle = tokio::task::spawn_blocking(move || {
+        crate::compositor::render_scene_cpu(
+            &scene_owned,
+            &assets_root_owned,
+            &output_path_owned,
+            |progress| {
+                let _ = prog_tx.send(progress);
+            },
+        )
+    });
+
+    // Drain the progress channel while the worker runs. We poll on a
+    // 100 ms cadence so the async runtime stays responsive but we
+    // don't burn CPU. The channel is closed (i.e. `recv` returns
+    // `Disconnected`) once the worker has completed and its
+    // `prog_tx` has dropped — at which point we await the join handle
+    // for the actual `Result`.
+    loop {
+        match prog_rx.try_recv() {
+            Ok(p) => on_log(&p.to_log_line()),
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+        }
+    }
+    // Worker is done — drain anything left in the channel before we
+    // surface its result.
+    while let Ok(p) = prog_rx.try_recv() {
+        on_log(&p.to_log_line());
+    }
+    join_handle.await.context("CPU compositor task panicked")?
+}
+
+fn use_legacy_filtergraph_backend() -> bool {
+    matches!(
+        std::env::var("MEMSTROY_RENDER_BACKEND")
+            .map(|s| s.to_ascii_lowercase())
+            .as_deref(),
+        Ok("ffmpeg") | Ok("filtergraph") | Ok("legacy")
+    )
 }
 
 /// Render a single still frame at time `t` to `out_png`. Useful for
@@ -39,6 +114,28 @@ where
 /// build a one-frame plan by overriding duration to a tiny window
 /// and asking FFmpeg for one frame.
 pub async fn render_preview_frame(
+    scene: &Scene,
+    assets_root: &Path,
+    t: f32,
+    out_png: &Path,
+) -> Result<()> {
+    if use_legacy_filtergraph_backend() {
+        return render_preview_frame_filtergraph(scene, assets_root, t, out_png).await;
+    }
+
+    // CPU path — runs on a blocking worker so async callers don't
+    // stall their runtime.
+    let scene = scene.clone();
+    let assets_root = assets_root.to_path_buf();
+    let out_png = out_png.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        crate::compositor::render_preview_frame_cpu(&scene, &assets_root, t, &out_png)
+    })
+    .await
+    .context("CPU preview task panicked")?
+}
+
+async fn render_preview_frame_filtergraph(
     scene: &Scene,
     assets_root: &Path,
     t: f32,

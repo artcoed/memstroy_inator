@@ -2,24 +2,24 @@
 # scripts/make-installer.sh
 #
 # Build a self-extracting Linux installer (.run) for the
-# memstroy-inator client bundle produced by `scripts/package-client.sh`.
+# Memstroy-inator client bundle produced by `scripts/package-client.sh`.
 #
 # Layout the produced installer ends up creating on the target machine:
 #
-#   ~/.local/share/memstroy-inator/        (per-user, default)
+#   ~/.local/share/Memstroy-inator/        (per-user, default)
 #       bin/memstroy-gui                   the editor
 #       bin/memstroy                       the CLI
 #       examples/, README.md
-#       memstroy-inator.sh                 launcher copied from the bundle
+#       Memstroy-inator.sh                 launcher copied from the bundle
 #       uninstall.sh                       uninstaller (removes everything)
 #
 #   ~/.local/bin/memstroy-gui              symlink → bin/memstroy-gui
 #   ~/.local/share/applications/
-#       memstroy-inator.desktop            menu entry
-#   ~/Desktop/memstroy-inator.desktop      desktop shortcut (chmod +x)
+#       Memstroy-inator.desktop            menu entry
+#   ~/Desktop/Memstroy-inator.desktop      desktop shortcut (chmod +x)
 #
 # If the user runs the installer with `sudo`, it switches to a
-# system-wide install at `/opt/memstroy-inator/` with menu entries in
+# system-wide install at `/opt/Memstroy-inator/` with menu entries in
 # `/usr/share/applications/` and the binary symlinked to
 # `/usr/local/bin/memstroy-gui`. The desktop shortcut is skipped in
 # that mode (no single "Desktop" to drop it on).
@@ -30,11 +30,11 @@
 #
 #   # reuse an already-staged bundle directory (skips cargo build)
 #   scripts/make-installer.sh \
-#       --bundle-dir dist/memstroy-inator-linux-x86_64-0.1.0
+#       --bundle-dir dist/Memstroy-inator-linux-x86_64-0.1.0
 #
 #   # custom output dir / installer name
 #   scripts/make-installer.sh --server-url https://assets.example.com \
-#       --out ./build --name memstroy-inator-1.2.3
+#       --out ./build --name Memstroy-inator-1.2.3
 #
 # Required (one of):
 #   --server-url <URL>     Forwarded to package-client.sh to build a
@@ -104,7 +104,7 @@ if [[ -z "${BUNDLE_DIR}" ]]; then
     OS_NAME="$(uname -s | tr '[:upper:]' '[:lower:]')"
     ARCH_NAME="$(uname -m)"
     VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/' || echo "dev")"
-    BUNDLE_DIR="${ROOT_DIR}/dist/memstroy-inator-${OS_NAME}-${ARCH_NAME}-${VERSION}"
+    BUNDLE_DIR="${ROOT_DIR}/dist/Memstroy-inator-${OS_NAME}-${ARCH_NAME}-${VERSION}"
 fi
 
 if [[ ! -d "${BUNDLE_DIR}" ]]; then
@@ -163,7 +163,7 @@ tar -C "$(dirname "${BUNDLE_DIR_ABS}")" \
 HEADER="${TMP_DIR}/header.sh"
 cat > "${HEADER}" <<HEADER_EOF
 #!/usr/bin/env bash
-# memstroy-inator installer (self-extracting).
+# Memstroy-inator installer (self-extracting).
 #
 # Run me directly:
 #     chmod +x ${INSTALLER_NAME}.run
@@ -173,8 +173,8 @@ cat > "${HEADER}" <<HEADER_EOF
 #     sudo ./${INSTALLER_NAME}.run
 set -euo pipefail
 
-APP_NAME="memstroy-inator"
-APP_TITLE="memstroy-inator"
+APP_NAME="Memstroy-inator"
+APP_TITLE="Memstroy-inator"
 APP_VERSION="${BUNDLE_BASENAME}"
 PAYLOAD_BASENAME="${BUNDLE_BASENAME}"
 HAS_BUNDLE_ICON=${HAS_BUNDLE_ICON}
@@ -235,7 +235,7 @@ echo "==> extracting payload"
 tail -n +"${ARCHIVE_LINE}" "$0" | tar -xz -C "${EXTRACT_TMP}"
 
 # The tarball was built with the bundle's own directory at the top,
-# e.g. memstroy-inator-linux-x86_64-0.1.0/. Move its contents into
+# e.g. Memstroy-inator-linux-x86_64-0.1.0/. Move its contents into
 # INSTALL_DIR so the layout becomes flat: INSTALL_DIR/bin/, etc.
 PAYLOAD_ROOT="${EXTRACT_TMP}/${PAYLOAD_BASENAME}"
 if [[ ! -d "${PAYLOAD_ROOT}" ]]; then
@@ -250,7 +250,7 @@ cp -a "${PAYLOAD_ROOT}/." "${INSTALL_DIR}/"
 
 chmod +x "${INSTALL_DIR}/bin/memstroy-gui" 2>/dev/null || true
 chmod +x "${INSTALL_DIR}/bin/memstroy"     2>/dev/null || true
-chmod +x "${INSTALL_DIR}/memstroy-inator.sh" 2>/dev/null || true
+chmod +x "${INSTALL_DIR}/Memstroy-inator.sh" 2>/dev/null || true
 
 # ─── App icon (branding logo) ────────────────────────────────────────
 # When the bundle carried a catost.png, place a copy under
@@ -281,7 +281,7 @@ DESKTOP_FILE="${DESKTOP_DIR}/${APP_NAME}.desktop"
 {
     echo "[Desktop Entry]"
     echo "Type=Application"
-    echo "Name=memstroy-inator"
+    echo "Name=Memstroy-inator"
     echo "GenericName=Meme Video Editor"
     echo "Comment=Assemble Mellstroy-style memes for vertical short videos"
     echo "Exec=${INSTALL_DIR}/bin/memstroy-gui %F"
@@ -317,7 +317,7 @@ fi
 UNINSTALL_SCRIPT="${INSTALL_DIR}/uninstall.sh"
 cat > "${UNINSTALL_SCRIPT}" <<UNINSTALL
 #!/usr/bin/env bash
-# memstroy-inator uninstaller.
+# Memstroy-inator uninstaller.
 set -e
 
 INSTALL_DIR="${INSTALL_DIR}"

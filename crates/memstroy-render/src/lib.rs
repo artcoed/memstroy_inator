@@ -21,6 +21,7 @@ pub mod runner;
 pub mod fonts;
 pub mod text_rasterize;
 pub mod proc;
+pub mod compositor;
 mod expr;
 
 pub use plan::*;
@@ -29,3 +30,4 @@ pub use runner::*;
 pub use fonts::*;
 pub use text_rasterize::*;
 pub use proc::*;
+pub use compositor::{render_scene_cpu, render_preview_frame_cpu};

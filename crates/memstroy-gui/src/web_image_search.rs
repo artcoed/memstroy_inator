@@ -353,7 +353,7 @@ fn results_grid(ui: &mut egui::Ui, state: &mut EditorState, tx: &Sender<JobEvent
             ui.label(
                 RichText::new("\u{1F50D}")
                     .size(40.0)
-                    .color(Color32::from_rgb(60, 60, 80)),
+                    .color(Color32::from_rgb(62, 60, 42)),
             );
             ui.label(
                 RichText::new(crate::i18n::t("No results yet."))
@@ -413,7 +413,7 @@ fn draw_card(
     let hit = state.web_image_search.results[idx].clone();
 
     let frame = egui::Frame::none()
-        .fill(Color32::from_rgb(28, 28, 42))
+        .fill(Color32::from_rgb(32, 30, 18))
         .rounding(Rounding::same(5.0))
         .inner_margin(egui::Margin::same(4.0))
         .stroke(Stroke::new(
@@ -423,7 +423,7 @@ fn draw_card(
                 // — they're the ones that support drag.
                 Color32::from_rgb(70, 110, 70)
             } else {
-                Color32::from_rgb(50, 50, 70)
+                Color32::from_rgb(54, 52, 36)
             },
         ));
 
@@ -437,7 +437,7 @@ fn draw_card(
             ui.painter().rect_filled(
                 rect,
                 Rounding::same(3.0),
-                Color32::from_rgb(18, 18, 28),
+                Color32::from_rgb(22, 21, 12),
             );
             // Use the thumbnail URL as-is — egui_extras' image
             // loaders fetch HTTPS resources transparently because
