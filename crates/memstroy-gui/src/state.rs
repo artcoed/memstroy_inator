@@ -1989,7 +1989,16 @@ impl EditorState {
         for sel in targets {
             match sel {
                 Selection::Actor(i) if i < self.scene.actors.len() => {
-                    buf.push(ClipboardItem::Actor(self.scene.actors[i].clone()));
+                    let actor = &self.scene.actors[i];
+                    buf.push(ClipboardItem::Actor(actor.clone()));
+                    // Also copy any audio tracks bound to this actor so
+                    // pasting a video clip also brings its linked audio.
+                    let actor_id = &actor.id;
+                    for au in &self.scene.audio {
+                        if au.parent_actor.as_deref() == Some(actor_id) {
+                            buf.push(ClipboardItem::Audio(au.clone()));
+                        }
+                    }
                 }
                 Selection::Overlay(i) if i < self.scene.overlays.len() => {
                     buf.push(ClipboardItem::Overlay(self.scene.overlays[i].clone()));
@@ -1998,7 +2007,15 @@ impl EditorState {
                     buf.push(ClipboardItem::Background(self.scene.backgrounds[i].clone()));
                 }
                 Selection::Audio(i) if i < self.scene.audio.len() => {
-                    buf.push(ClipboardItem::Audio(self.scene.audio[i].clone()));
+                    // Skip if this audio was already added as part of a
+                    // copied actor above (avoid duplicates in clipboard).
+                    let au = &self.scene.audio[i];
+                    let already = buf.iter().any(|item| {
+                        matches!(item, ClipboardItem::Audio(existing) if existing.id == au.id)
+                    });
+                    if !already {
+                        buf.push(ClipboardItem::Audio(au.clone()));
+                    }
                 }
                 _ => {}
             }
@@ -2028,10 +2045,18 @@ impl EditorState {
         self.last_drag_group = None;
         self.undo.push(&self.scene);
 
+        // Mapping from old actor id → new actor id, so bound audio
+        // tracks copied alongside their parent actor can re-link to
+        // the freshly-pasted duplicate instead of becoming orphans.
+        let mut actor_id_remap: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+
         for item in buf {
             match item {
                 ClipboardItem::Actor(mut a) => {
+                    let old_id = a.id.clone();
                     a.id = unique_actor_id(&self.scene.actors, &a.id);
+                    actor_id_remap.insert(old_id, a.id.clone());
                     // Re-anchor the duplicate to the current playhead so
                     // it lands where the user expects to see it. The
                     // original clip-local duration is preserved.
@@ -2093,14 +2118,33 @@ impl EditorState {
                 }
                 ClipboardItem::Audio(mut au) => {
                     au.id = unique_audio_id(&self.scene.audio, &au.id);
-                    // Standalone copy — never inherit a parent_actor
-                    // binding, otherwise the duplicate would shadow the
-                    // source's actor sync logic.
-                    au.parent_actor = None;
-                    au.t_in = playhead;
+                    // If this audio was bound to an actor that was also
+                    // pasted in this batch, re-link to the new actor id
+                    // so the duplicate pair stays connected. Otherwise
+                    // clear the binding (standalone copy).
+                    match au.parent_actor.as_ref().and_then(|old| actor_id_remap.get(old).cloned()) {
+                        Some(new_parent_id) => {
+                            au.parent_actor = Some(new_parent_id.clone());
+                            // Sync audio timing to the freshly-pasted
+                            // parent actor so they stay in lock-step.
+                            if let Some(parent) = self.scene.actors.iter().find(|a| a.id == new_parent_id) {
+                                au.t_in = parent.t_in.unwrap_or(playhead);
+                                au.t_out = parent.t_out;
+                                au.source_start = parent.source_start;
+                            } else {
+                                au.t_in = playhead;
+                            }
+                        }
+                        None => {
+                            au.parent_actor = None;
+                            au.t_in = playhead;
+                        }
+                    }
                     let new_idx = self.scene.audio.len();
                     self.scene.audio.push(au);
-                    let new_track = self.insert_audio_track_at_top();
+                    let new_track = self.pick_or_create_empty_audio_lane_for_range(
+                        playhead, playhead + 1.0,
+                    );
                     self.audio_track_assignments.insert(new_idx, new_track);
                     new_selections.push(Selection::Audio(new_idx));
                 }
