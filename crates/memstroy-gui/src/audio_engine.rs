@@ -367,14 +367,16 @@ impl AudioEngine {
             let rate = (spec.speed * pitch_factor).max(0.05);
             let stream = stream.speed(rate);
 
-            // (2) Skip into the source. The user's `source_start` plus the
-            // amount of clip time already elapsed since `t_in`.
-            let skip_secs =
-                (spec.source_start + (live_playhead - spec.t_in).max(0.0)).max(0.0);
-            // skip / take are stated in scene-time seconds; multiply by
-            // `rate` to recover the wall-clock seconds the now-faster
-            // source needs to consume.
-            let stream = stream.skip_duration(Duration::from_secs_f32(skip_secs * rate));
+            // (2) Skip into the source. After `speed(rate)`, the stream's
+            // time axis is in wall-clock (output) seconds:
+            //   - `skip_duration(d)` skips `d` seconds of output time.
+            //   - `source_start` is in SOURCE seconds; at the modified
+            //     rate, those source seconds occupy `source_start / rate`
+            //     output seconds.
+            //   - `(live_playhead - t_in)` is already in scene/output time.
+            let elapsed_scene = (live_playhead - spec.t_in).max(0.0);
+            let skip_output_secs = (spec.source_start / rate + elapsed_scene).max(0.0);
+            let stream = stream.skip_duration(Duration::from_secs_f32(skip_output_secs));
 
             // (3) Take only the visible duration. The audio engine no
             // longer loops sources — when the visible window outlasts
@@ -384,13 +386,15 @@ impl AudioEngine {
             let stream = dsp::DynSource::new(stream);
 
             // (4) Take only the visible duration.
+            // After `speed(rate)`, `take_duration(d)` takes `d` seconds
+            // of output/wall-clock time. The visible window is already
+            // in scene time (= output time), so use it directly.
             let take_secs = spec.t_out.map(|end| {
                 let visible_start = live_playhead.max(spec.t_in);
                 (end - visible_start).max(0.0)
             });
-            let take_total_secs = take_secs.map(|s| s * rate);
 
-            let stream: Box<dyn Source<Item = f32> + Send> = match take_total_secs {
+            let stream: Box<dyn Source<Item = f32> + Send> = match take_secs {
                 Some(td) if td > 0.0 => {
                     Box::new(stream.take_duration(Duration::from_secs_f32(td)))
                 }
@@ -406,15 +410,22 @@ impl AudioEngine {
             let stream = dsp::Reverb::new(stream, spec.reverb);
 
             // (8) Final stereo bus: pan + volume + fade in/out.
+            // After `speed(rate)`, `stream.sample_rate()` reports the
+            // modified rate (original_sr * rate). Fade durations are in
+            // scene-time seconds; converting to sample counts at the
+            // stream's reported rate gives the correct number of samples
+            // that will flow through the Stereo adapter during that
+            // wall-clock interval.
+            let sr = stream.sample_rate() as f32;
             let fade_in_samples = if spec.fade_in > 0.0 {
-                Some((spec.fade_in * rate * stream.sample_rate() as f32) as u64)
+                Some((spec.fade_in * sr) as u64)
             } else {
                 None
             };
-            let total_samples = take_total_secs
-                .map(|td| (td * stream.sample_rate() as f32) as u64);
+            let total_samples = take_secs
+                .map(|td| (td * sr) as u64);
             let fade_out_samples = if spec.fade_out > 0.0 && total_samples.is_some() {
-                Some((spec.fade_out * rate * stream.sample_rate() as f32) as u64)
+                Some((spec.fade_out * sr) as u64)
             } else {
                 None
             };
