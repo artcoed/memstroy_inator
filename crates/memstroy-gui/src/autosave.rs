@@ -103,7 +103,16 @@ pub fn slot_id(path: Option<&Path>, seed: u64) -> String {
 }
 
 /// Path to the scene file for a given slot id.
+/// Uses `.memstroy` format to preserve full editor state (layout, track
+/// assignments, zoom, etc.) — not just the bare scene YAML.
 pub fn slot_scene_path(slot: &str) -> PathBuf {
+    autosaves_dir().join(format!("{slot}.memstroy"))
+}
+
+/// Legacy `.scene.yaml` slot path. Used by the entry scanner to surface
+/// autosaves written by older editor versions that used bare YAML.
+#[allow(dead_code)]
+pub fn slot_scene_path_legacy(slot: &str) -> PathBuf {
     autosaves_dir().join(format!("{slot}.scene.yaml"))
 }
 
@@ -152,10 +161,14 @@ pub fn list_entries() -> Vec<AutosaveEntry> {
             let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
                 continue;
             };
-            if !name.ends_with(".scene.yaml") {
+            // Accept both new `.memstroy` and legacy `.scene.yaml` slots.
+            let slot = if name.ends_with(".memstroy") {
+                &name[..name.len() - ".memstroy".len()]
+            } else if name.ends_with(".scene.yaml") {
+                &name[..name.len() - ".scene.yaml".len()]
+            } else {
                 continue;
-            }
-            let slot = &name[..name.len() - ".scene.yaml".len()];
+            };
             let meta_path = slot_meta_path(slot);
             let meta = std::fs::read_to_string(&meta_path)
                 .ok()
