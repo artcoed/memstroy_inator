@@ -17,6 +17,16 @@ use tokio::runtime::Handle;
 /// playhead even when multiple actors are competing for I/O bandwidth.
 const BUFFER_SIZE: usize = 90;
 
+/// Maximum number of concurrent preload threads across ALL frame caches.
+/// When many actors are playing simultaneously, unlimited preload threads
+/// compete for disk I/O bandwidth and cause stalls. This semaphore limits
+/// the concurrency so at most N caches are reading from disk at once.
+/// The remaining caches wait their turn, which paradoxically improves
+/// throughput because the disk's sequential read pattern isn't broken
+/// by random seeks across 6+ temp directories.
+static PRELOAD_SEMAPHORE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+const MAX_CONCURRENT_PRELOADS: usize = 3;
+
 /// Frame-cache: extracts video frames to disk via ffmpeg, then pre-loads
 /// frames into a memory ring buffer and uploads them to a single reusable
 /// texture handle for smooth playback.
@@ -104,6 +114,7 @@ impl FrameCache {
     /// Spawns ffprobe to get duration, then ffmpeg to extract frames at 30fps/480px
     /// with quality level 8 (fast, smaller files).
     /// Calls `on_done` with (duration, frame_count, cache_dir) when finished.
+    #[allow(dead_code)]
     pub fn start_extraction(
         source: PathBuf,
         rt: &Handle,
@@ -318,8 +329,12 @@ impl FrameCache {
         // Miss: get the raw frame and apply effects on a downscaled copy
         // for fast preview. Chromakey/CC quality at preview-resolution is
         // sufficient and avoids per-pixel CPU work on full HD frames.
+        // Adaptive quality: when many actors are playing simultaneously,
+        // the downscale target is reduced further to keep the frame budget.
         let raw = self.raw_frame_at_time(t)?;
-        let scaled = downscale_for_preview(&raw, 360);
+        let active_caches = PRELOAD_SEMAPHORE.load(std::sync::atomic::Ordering::Relaxed);
+        let preview_dim = if active_caches >= 4 { 180 } else if active_caches >= 2 { 240 } else { 360 };
+        let scaled = downscale_for_preview(&raw, preview_dim);
         let mut processed = apply_effects_cpu(&scaled, ck, cc);
         // Stack the user's post-process effects on top, in declared order.
         if !effects.is_empty() {
@@ -375,6 +390,16 @@ impl FrameCache {
         if self.preloading {
             return;
         }
+        // Check the global preload semaphore — if too many caches are
+        // already preloading, skip this request. The next frame's
+        // poll_preload / read-ahead check will retry, and by then one
+        // of the other preloads will have finished and released its
+        // slot. This prevents 6+ threads hammering the disk in parallel.
+        let current = PRELOAD_SEMAPHORE.load(std::sync::atomic::Ordering::Relaxed);
+        if current >= MAX_CONCURRENT_PRELOADS {
+            return;
+        }
+        PRELOAD_SEMAPHORE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.preloading = true;
 
         let cache_dir = self.cache_dir.clone();
@@ -412,6 +437,8 @@ impl FrameCache {
                         frames,
                     });
                 }
+                // Release the semaphore slot so other caches can preload.
+                PRELOAD_SEMAPHORE.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             })
             .ok(); // Ignore spawn failure — worst case we fall back to sync load.
     }
@@ -1416,6 +1443,17 @@ fn extract_frames_blocking(
     source: PathBuf,
     on_done: impl FnOnce(f32, usize, PathBuf) + Send + 'static,
 ) {
+    extract_frames_blocking_with_scale(source, 480, on_done);
+}
+
+/// Same as `extract_frames_blocking` but with a configurable max width.
+/// Used by the adaptive-quality system to extract at lower resolution
+/// when many actors are on screen simultaneously.
+pub fn extract_frames_blocking_with_scale(
+    source: PathBuf,
+    max_width: u32,
+    on_done: impl FnOnce(f32, usize, PathBuf) + Send + 'static,
+) {
     let ffmpeg = memstroy_render::ffmpeg_binary();
     let ffprobe = {
         let mut p = ffmpeg.clone();
@@ -1463,11 +1501,12 @@ fn extract_frames_blocking(
     };
 
     let output_pattern = cache_dir.join("%06d.jpg");
+    let scale_filter = format!("fps=30,scale={}:-1", max_width);
     let status = {
         let mut cmd = std::process::Command::new(&ffmpeg);
         cmd.args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
             .arg(&source)
-            .args(["-vf", "fps=30,scale=480:-1", "-q:v", "8"])
+            .args(["-vf", &scale_filter, "-q:v", "8"])
             .arg(&output_pattern);
         memstroy_render::hide_console_std(&mut cmd).status()
     };

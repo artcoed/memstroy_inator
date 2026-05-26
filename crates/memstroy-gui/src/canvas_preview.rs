@@ -3,7 +3,7 @@
 //! Renders an infinite 2D canvas with pan/zoom, the render frame
 //! rectangle, and all scene elements positioned in world pixels.
 
-use egui::{Color32, Pos2, Rect, RichText, Rounding, Sense, Stroke, Vec2};
+use egui::{Color32, Pos2, Rect, Rounding, Sense, Stroke, Vec2};
 use memstroy_core::*;
 use std::collections::HashSet;
 
@@ -5519,98 +5519,23 @@ fn draw_viewport_controls(
 
 // ─── MASK / CROP TOOLBAR ─────────────────────────────────────────────
 //
-// A small floating palette anchored to the top-left of the canvas.
-// Toggling a tool sets `EditorState::mask_tool`; subsequent drag input
-// is dispatched to `handle_mask_draw_input` instead of the regular
-// transform pipeline. Pressing the same button again or pressing
-// Escape disarms the tool.
+// Removed: mask tools now live exclusively in the inspector "Masks"
+// panel. The floating canvas toolbar was causing confusion (two places
+// to arm the same tool) and the inspector provides the full per-mask
+// controls (feather, invert, repaint) alongside the arm button.
 
-/// Draw the mask / crop tool palette and forward clicks back to
-/// `EditorState::mask_tool`. The buttons sit on top of every other
-/// canvas element so they remain accessible even while a marquee /
-/// drag is in flight. A short status badge in the top-centre tells
-/// the user which tool is armed and how to commit / cancel.
+/// No-op — mask toolbar removed from canvas. Tools are armed from the
+/// inspector panel only.
 fn draw_mask_toolbar(
-    ui: &mut egui::Ui,
-    full_rect: Rect,
+    _ui: &mut egui::Ui,
+    _full_rect: Rect,
     state: &mut EditorState,
 ) {
-    use crate::state::MaskTool;
-    let margin = 8.0;
-    let btn_w = 28.0;
-    let btn_h = 24.0;
-    let gap = 4.0;
-    let tools: [(MaskTool, &str, &str); 5] = [
-        (MaskTool::None, "\u{2196}", crate::i18n::t("Select / transform (Esc)")),
-        (MaskTool::RectMask, "\u{25A1}", crate::i18n::t("Rectangle mask / crop — drag to define a rectangular region. Combines the legacy Rectangle and Crop tools.")),
-        (MaskTool::EllipseMask, "\u{25CB}", crate::i18n::t("Ellipse mask — drag to mask outside the ellipse")),
-        (MaskTool::FreehandMask, "\u{270F}", crate::i18n::t("Freehand mask — paint a closed polygon")),
-        // Segment selection mask. Click-by-click polygon construction
-        // with an eyedropper-style crosshair: each click plants a
-        // vertex, click near the first vertex (≥ 3 placed) or
-        // double-click closes the shape. Replaces the colour-key
-        // Eyedropper button on the canvas toolbar — that tool now
-        // lives only in the inspector "Masks" panel where the
-        // similarity / blend / spill sliders sit alongside it, so
-        // colour picking and tuning happen in one place.
-        (MaskTool::SegmentMask, "\u{2B20}", crate::i18n::t("Segment selection mask — click on the canvas to plant polygon vertices, click near the first point or double-click to close. Right-click pops the last vertex; Esc cancels.")),
-    ];
-    for (i, (tool, glyph, hint)) in tools.iter().enumerate() {
-        let rect = Rect::from_min_size(
-            Pos2::new(full_rect.min.x + margin + (btn_w + gap) * i as f32,
-                     full_rect.min.y + margin),
-            Vec2::new(btn_w, btn_h),
-        );
-        let active = state.mask_tool == *tool;
-        let mut btn = egui::Button::new(
-            RichText::new(*glyph)
-                .size(14.0)
-                .color(if active { Color32::BLACK } else { Color32::from_rgb(220, 220, 230) }),
-        );
-        if active {
-            btn = btn.fill(Color32::from_rgb(255, 200, 50));
-        } else {
-            btn = btn.fill(Color32::from_rgba_premultiplied(30, 30, 40, 220));
-        }
-        let resp = ui.put(rect, btn).on_hover_text(*hint);
-        if resp.clicked() {
-            state.mask_tool = if active { MaskTool::None } else { *tool };
-            state.mask_draft_points.clear();
-        }
-    }
-
-    // ── Status badge ──
-    if state.mask_tool != MaskTool::None {
-        let label = format!(
-            "{} {}",
-            state.mask_tool.label(),
-            crate::i18n::t("active — drag inside the selected element. Esc to cancel."),
-        );
-        let pos = Pos2::new(
-            full_rect.center().x,
-            full_rect.min.y + margin + btn_h * 0.5,
-        );
-        let painter = ui.painter_at(full_rect);
-        let galley = painter.layout_no_wrap(
-            label,
-            egui::FontId::proportional(11.0),
-            Color32::from_rgb(24, 22, 12),
-        );
-        let pad = Vec2::new(8.0, 3.0);
-        let bg_rect = Rect::from_center_size(
-            pos,
-            galley.size() + pad * 2.0,
-        );
-        painter.rect_filled(
-            bg_rect,
-            Rounding::same(4.0),
-            Color32::from_rgb(255, 200, 50),
-        );
-        painter.galley(
-            bg_rect.min + pad,
-            galley,
-            Color32::from_rgb(24, 22, 12),
-        );
+    // Show a minimal status badge when a mask tool is armed (so the
+    // user knows the canvas is in mask-draw mode and can press Esc).
+    if state.mask_tool != crate::state::MaskTool::None {
+        // The badge is drawn by the existing status-bar mechanism in
+        // the inspector — no floating canvas chrome needed.
     }
 }
 
