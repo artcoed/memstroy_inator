@@ -86,6 +86,29 @@ pub enum JobEvent {
     /// unprocessed image, so the UI never blocks on the effect
     /// pipeline. See `image_fx_worker::submit_image_fx_job`.
     ImageFxReady(crate::image_fx_worker::ImageFxResult),
+    /// A lazy-download of a server-only clip has completed. The GUI
+    /// drops the clip onto canvas/timeline at `drop_target` once
+    /// the bytes have landed locally. Carries the local path so the
+    /// caller can update the library list (mark as downloaded).
+    ClipDownloaded {
+        server_id: String,
+        result: Result<PathBuf, String>,
+        drop_target: ClipDropTarget,
+    },
+}
+
+/// Where to drop a freshly-downloaded clip when the lazy-download
+/// path completes. The caller picks the target at the moment of
+/// drag-end so the deferred completion knows what to do.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub enum ClipDropTarget {
+    /// Drop on canvas at world position.
+    CanvasAt { world_x: f32, world_y: f32 },
+    /// Drop on timeline at scene-time.
+    TimelineAt { t: f32 },
+    /// Just download into the cache; don't auto-place.
+    None,
 }
 
 #[derive(Debug, Clone)]
@@ -280,26 +303,19 @@ pub fn spawn_refresh(
         let thumbs_dir = clips_dir.join("thumbs");
         let _ = tokio::fs::create_dir_all(&thumbs_dir).await;
 
-        // 3. Poll the server while it ingests, mirroring as we go. A
-        //    high `limit=` is essential here: the server now allows
-        //    up to 5000 entries per response, and using anything
-        //    smaller would silently truncate channels with large
-        //    backlogs.
+        // 3. Poll the server while it ingests. We mirror ONLY metadata
+        //    (descriptions) and thumbnails — not the full clip bodies.
+        //    Clips download lazily when the user actually drags them
+        //    onto the canvas / timeline (see `download_clip_on_demand`
+        //    below). This keeps the refresh fast and avoids burning
+        //    bandwidth on clips the user might never use.
         let list_url = format!(
             "{}/api/assets?kind=clip&limit={}",
             server,
-            // Pull a bit more than the requested limit so a server
-            // that already had clips before the ingest started still
-            // surfaces all of them.
             (limit as u64).saturating_mul(2).max(1000),
         );
 
         // ── Polling parameters ──
-        // - POLL_INTERVAL: how often we list + mirror.
-        // - MAX_WAIT: hard ceiling so a flaky server can't hang us
-        //   forever (the user can Refresh again afterwards).
-        // - STABLE_WINDOW: when the server's clip count hasn't
-        //   changed for this long, we assume the ingest is done.
         const POLL_INTERVAL: Duration = Duration::from_secs(3);
         const MAX_WAIT: Duration = Duration::from_secs(600);
         const STABLE_WINDOW: Duration = Duration::from_secs(8);
@@ -308,26 +324,16 @@ pub fn spawn_refresh(
         let mut last_change = started;
         let mut last_total: u64 = 0;
         let mut new_count = 0usize;
-        let mut failed = 0usize;
-        // Most recent server-side clip count, for the final summary
-        // report. The `_assigns` allow is intentional: the inner loop
-        // overwrites this every iteration, but we still need a sane
-        // default so the post-loop send compiles in the unlikely case
-        // the loop terminates without listing once (network down +
-        // MAX_WAIT both hit on the first attempt).
+        let failed = 0usize;
         #[allow(unused_assignments)]
         let mut total_seen: u64 = 0;
-        // Track which ids we've already attempted (succeeded or not)
-        // so we don't keep retrying the same broken download every
-        // poll cycle.
-        let mut attempted: std::collections::HashSet<String> =
+        // Track ids whose metadata we've already mirrored — we re-poll
+        // the server during ingest, so we want to skip already-seen
+        // entries to avoid redundant filesystem writes.
+        let mut metadata_seen: std::collections::HashSet<String> =
             std::collections::HashSet::new();
 
         loop {
-            // Snapshot `new_count` at the top of the round so we can
-            // tell at the bottom whether we actually downloaded
-            // anything new this iteration (used to decide whether to
-            // ping the GUI for a partial library reload).
             let new_count_at_round_start = new_count;
 
             let listing: ListResponse = match client.get(&list_url).send().await {
@@ -335,7 +341,6 @@ pub fn spawn_refresh(
                     Ok(v) => v,
                     Err(e) => {
                         warn!(error = %e, "couldn't parse server listing during poll");
-                        // Soft-fail one round; try again next poll.
                         tokio::time::sleep(POLL_INTERVAL).await;
                         continue;
                     }
@@ -358,21 +363,18 @@ pub fn spawn_refresh(
                 last_change = std::time::Instant::now();
             }
 
-            // Mirror anything we don't have yet.
+            // Mirror metadata and thumbnails for new entries.
             for item in &listing.items {
-                if !attempted.insert(item.id.clone()) {
-                    // Already tried this id (success or persistent
-                    // failure) — skip until next refresh.
+                if !metadata_seen.insert(item.id.clone()) {
                     continue;
                 }
-                let file_name = format!("{}.mp4", sanitise_id(&item.id));
-                let local_path = clips_dir.join(&file_name);
 
-                // Always mirror the description sidecar (server is
-                // the source of truth and may have re-cleaned it).
-                if !item.description.is_empty() {
-                    let txt_path =
-                        clips_dir.join(format!("{}.txt", sanitise_id(&item.id)));
+                let safe_id = sanitise_id(&item.id);
+                let txt_path = clips_dir.join(format!("{}.txt", safe_id));
+
+                // Mirror description sidecar so the UI can show
+                // captions even before the clip itself is downloaded.
+                if !item.description.is_empty() && !txt_path.exists() {
                     if let Err(e) =
                         tokio::fs::write(&txt_path, item.description.as_bytes()).await
                     {
@@ -383,40 +385,32 @@ pub fn spawn_refresh(
                         );
                     }
                 }
-                if local_path.exists() {
-                    continue;
+
+                // Pre-fetch thumbnail (small, fast). The library card
+                // shows it whether or not the full clip is downloaded.
+                let thumb_jpg = thumbs_dir.join(format!("{}.jpg", safe_id));
+                if !thumb_jpg.exists() {
+                    let thumb_url = format!(
+                        "{}/api/assets/{}/preview", server, item.id
+                    );
+                    let _ = download_file(&client, &thumb_url, &thumb_jpg).await;
                 }
-                let dl_url = format!("{}/api/assets/{}/download", server, item.id);
-                match download_file(&client, &dl_url, &local_path).await {
-                    Ok(_) => {
-                        info!(id = %item.id, "downloaded clip from server");
-                        new_count += 1;
-                    }
-                    Err(e) => {
-                        warn!(id = %item.id, error = %e, "clip download failed");
-                        failed += 1;
-                    }
-                }
+                new_count += 1;
             }
 
             progress(format!(
-                "Server has {} clip(s); local mirror: {} new, {} failed",
-                listing.total, new_count, failed
+                "Server has {} clip(s); metadata synced: {}",
+                listing.total, new_count
             ));
 
-            // If new files actually landed in `clips_dir` this round,
-            // ping the GUI to re-scan its library so the user sees
-            // them straight away. Without this signal the list would
-            // stay frozen until the full refresh finished, which on
-            // large channels is dozens of seconds away.
             if new_count > new_count_at_round_start {
                 let _ = tx.send(JobEvent::RefreshLibraryReloaded(format!(
-                    "Synced {} / {} clips...",
+                    "Synced {} / {} clip metadata...",
                     new_count, listing.total
                 )));
             }
 
-            // Termination conditions, in priority order.
+            // Termination conditions.
             if started.elapsed() >= MAX_WAIT {
                 info!("refresh: hit MAX_WAIT, stopping poll loop");
                 break;
@@ -430,19 +424,12 @@ pub fn spawn_refresh(
                 );
                 break;
             }
-            // No clips at all yet AND no time elapsed → keep waiting,
-            // server may still be on its first scrape.
             if listing.total == 0 && started.elapsed() < Duration::from_secs(20) {
                 tokio::time::sleep(POLL_INTERVAL).await;
                 continue;
             }
 
             tokio::time::sleep(POLL_INTERVAL).await;
-        }
-
-        if new_count > 0 {
-            progress("Generating thumbnails...".into());
-            generate_thumbnails(&clips_dir, &thumbs_dir).await;
         }
 
         let _ = tx.send(JobEvent::RefreshFinished(Ok(RefreshSummary {
@@ -505,8 +492,54 @@ fn sanitise_id(id: &str) -> String {
         .collect()
 }
 
+/// Lazy download of a server-only clip. Used when the user drags an
+/// undownloaded library entry onto the canvas / timeline. Spawns a
+/// background task that fetches `/api/assets/{server_id}/download`
+/// into `local_path`. On completion sends a `ClipDownloaded` event so
+/// the App can spawn the actor at `drop_target`.
+pub fn spawn_clip_download(
+    rt: &Handle,
+    tx: Sender<JobEvent>,
+    server_url: String,
+    server_id: String,
+    local_path: PathBuf,
+    drop_target: ClipDropTarget,
+) {
+    rt.spawn(async move {
+        let server = crate::state::rewrite_server_url_for_client(&server_url)
+            .trim_end_matches('/')
+            .to_string();
+        let client = match reqwest::Client::builder()
+            .timeout(Duration::from_secs(120))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = tx.send(JobEvent::ClipDownloaded {
+                    server_id: server_id.clone(),
+                    result: Err(format!("HTTP client init: {e}")),
+                    drop_target,
+                });
+                return;
+            }
+        };
+        let url = format!("{}/api/assets/{}/download", server, server_id);
+        if let Some(parent) = local_path.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        let result = download_file(&client, &url, &local_path).await
+            .map(|_| local_path.clone());
+        let _ = tx.send(JobEvent::ClipDownloaded {
+            server_id,
+            result,
+            drop_target,
+        });
+    });
+}
+
 /// For every `*.mp4` file in `clips_dir` without a matching
 /// `thumbs/<stem>.jpg`, run a quick ffmpeg pass to extract a frame.
+#[allow(dead_code)]
 async fn generate_thumbnails(clips_dir: &std::path::Path, thumbs_dir: &std::path::Path) {
     let bin = ffmpeg_binary();
     let ffmpeg_ok = {
@@ -644,7 +677,7 @@ async fn run_web_image_search(
 ) -> Result<(Vec<WebImageHit>, Option<u32>), String> {
     let client = reqwest::Client::builder()
         .user_agent(UA)
-        .timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(12))
         .build()
         .map_err(|e| format!("HTTP client init failed: {e}"))?;
 

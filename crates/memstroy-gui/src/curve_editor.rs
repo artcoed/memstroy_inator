@@ -290,12 +290,21 @@ fn easing_label(e: Easing) -> &'static str {
 /// `selected_property` is only meaningful for Actor / Overlay targets
 /// (transform property index). For Audio targets the property is fixed
 /// and the slot is ignored.
+///
+/// `marquee` and `ce_selected` are the curve-editor marquee state and
+/// the set of selected keyframe indices (for multi-select / multi-drag).
+/// `ce_multi_drag` / `ce_multi_drag_delta` track the in-progress
+/// multi-drag gesture.
 pub fn curve_editor_panel(
     ui: &mut egui::Ui,
     target: CurveEditorTarget<'_>,
     duration: f32,
     selected_property: &mut usize,
     playhead: f32,
+    marquee: &mut Option<crate::state::CurveEditorMarquee>,
+    ce_selected: &mut Vec<usize>,
+    ce_multi_drag: &mut bool,
+    ce_multi_drag_delta: &mut egui::Vec2,
 ) {
     use crate::i18n::t;
 
@@ -312,6 +321,10 @@ pub fn curve_editor_panel(
                 get_actor_property,
                 set_actor_property,
                 ActorState::default,
+                marquee,
+                ce_selected,
+                ce_multi_drag,
+                ce_multi_drag_delta,
             );
         }
         CurveEditorTarget::Overlay { layout, animated_params, t_in } => {
@@ -326,6 +339,10 @@ pub fn curve_editor_panel(
                 get_overlay_property,
                 set_overlay_property,
                 OverlayState::default,
+                marquee,
+                ce_selected,
+                ce_multi_drag,
+                ce_multi_drag_delta,
             );
         }
         CurveEditorTarget::RenderFrame { layout, animated_params } => {
@@ -343,6 +360,10 @@ pub fn curve_editor_panel(
                 get_render_frame_property,
                 set_render_frame_property,
                 RenderFrameState::default,
+                marquee,
+                ce_selected,
+                ce_multi_drag,
+                ce_multi_drag_delta,
             );
         }
         CurveEditorTarget::Audio {
@@ -414,6 +435,10 @@ pub fn curve_editor_panel(
                 value_range,
                 static_value,
                 t_local,
+                marquee,
+                ce_selected,
+                ce_multi_drag,
+                ce_multi_drag_delta,
             );
         }
         CurveEditorTarget::EffectParam {
@@ -492,6 +517,10 @@ pub fn curve_editor_panel(
                 value_range,
                 static_value,
                 t_local,
+                marquee,
+                ce_selected,
+                ce_multi_drag,
+                ce_multi_drag_delta,
             );
         }
     }
@@ -519,6 +548,10 @@ fn transform_curve_editor<T>(
     get_property: fn(&T, usize) -> f32,
     set_property: fn(&mut T, usize, f32),
     default_value: fn() -> T,
+    marquee: &mut Option<crate::state::CurveEditorMarquee>,
+    ce_selected: &mut Vec<usize>,
+    ce_multi_drag: &mut bool,
+    ce_multi_drag_delta: &mut egui::Vec2,
 ) where
     T: Clone,
 {
@@ -532,14 +565,21 @@ fn transform_curve_editor<T>(
                 .color(Color32::WHITE),
         );
         ui.separator();
+        // Only show properties that are flagged as animated.
+        // If none are animated, show all as a fallback so the user
+        // can still pick one to start animating.
+        let any_animated = PROPERTY_NAMES.iter().enumerate().any(|(i, _)| {
+            animated_params.contains(prop_to_param_id(i))
+        });
         for (i, name) in PROPERTY_NAMES.iter().enumerate() {
-            let color = property_color(i);
-            let selected = *selected_property == i;
             let param_id = prop_to_param_id(i);
             let is_animated = animated_params.contains(param_id);
-            // Add a small diamond marker to the label when the
-            // parameter is currently flagged as animated so the user
-            // can tell at a glance which curve they're authoring.
+            // Skip non-animated params when at least one is animated
+            if any_animated && !is_animated {
+                continue;
+            }
+            let color = property_color(i);
+            let selected = *selected_property == i;
             let prefix = if is_animated { "\u{25C6} " } else { "" };
             let display = format!("{}{}", prefix, t(*name));
             let text = egui::RichText::new(display).size(11.0).color(if selected {
@@ -738,8 +778,11 @@ fn transform_curve_editor<T>(
     // in scale menu" bug.
     let diamond_size = 6.0;
     let mut drag_idx: Option<usize> = None;
+    let mut click_idx: Option<usize> = None;
     let mut delete_idx: Option<usize> = None;
     let mut easing_change: Option<(usize, Easing)> = None;
+    let ctrl_held = ui.input(|i| i.modifiers.ctrl || i.modifiers.mac_cmd);
+    let shift_held = ui.input(|i| i.modifiers.shift);
 
     for (ki, kf) in keyframes.iter().enumerate() {
         let v = get_property(&kf.value, prop);
@@ -762,17 +805,37 @@ fn transform_curve_editor<T>(
             continue;
         }
 
+        let is_ce_selected = ce_selected.contains(&ki);
+
+        // Apply multi-drag offset for display.
+        let display_center = if is_ce_selected && *ce_multi_drag {
+            Pos2::new(center.x + ce_multi_drag_delta.x, center.y + ce_multi_drag_delta.y)
+        } else {
+            center
+        };
+
         let diamond_points = vec![
-            Pos2::new(center.x, center.y - diamond_size),
-            Pos2::new(center.x + diamond_size, center.y),
-            Pos2::new(center.x, center.y + diamond_size),
-            Pos2::new(center.x - diamond_size, center.y),
+            Pos2::new(display_center.x, display_center.y - diamond_size),
+            Pos2::new(display_center.x + diamond_size, display_center.y),
+            Pos2::new(display_center.x, display_center.y + diamond_size),
+            Pos2::new(display_center.x - diamond_size, display_center.y),
         ];
+
+        let fill = if is_ce_selected {
+            Color32::from_rgb(255, 230, 80)
+        } else {
+            curve_color
+        };
+        let stroke_color = if is_ce_selected {
+            Color32::from_rgb(255, 200, 0)
+        } else {
+            Color32::WHITE
+        };
 
         painter.add(egui::Shape::convex_polygon(
             diamond_points,
-            curve_color,
-            Stroke::new(1.0, Color32::WHITE),
+            fill,
+            Stroke::new(1.0, stroke_color),
         ));
 
         if keyframes.len() > 1 && ki > 0 {
@@ -786,7 +849,7 @@ fn transform_curve_editor<T>(
             };
             if !easing_l.is_empty() {
                 painter.text(
-                    Pos2::new(center.x, center.y - diamond_size - 6.0),
+                    Pos2::new(display_center.x, display_center.y - diamond_size - 6.0),
                     egui::Align2::CENTER_BOTTOM,
                     easing_l,
                     egui::FontId::proportional(8.0),
@@ -795,12 +858,31 @@ fn transform_curve_editor<T>(
             }
         }
 
-        let diamond_rect = Rect::from_center_size(center, Vec2::splat(diamond_size * 2.5));
+        let diamond_rect = Rect::from_center_size(display_center, Vec2::splat(diamond_size * 2.5));
         let id = ui.make_persistent_id(("curve_kf", ki));
         let kf_resp = ui.interact(diamond_rect, id, Sense::click_and_drag());
 
+        if kf_resp.drag_started() {
+            if is_ce_selected && ce_selected.len() > 1 {
+                // Start multi-drag.
+                *ce_multi_drag = true;
+                *ce_multi_drag_delta = egui::Vec2::ZERO;
+            }
+        }
         if kf_resp.dragged() {
-            drag_idx = Some(ki);
+            if is_ce_selected && *ce_multi_drag {
+                *ce_multi_drag_delta += kf_resp.drag_delta();
+            } else {
+                drag_idx = Some(ki);
+            }
+        }
+        if kf_resp.drag_stopped() && is_ce_selected && *ce_multi_drag {
+            // Defer commit to after the loop (can't mutate keyframes
+            // while iterating).
+            drag_idx = None; // suppress single-drag path
+        }
+        if kf_resp.clicked() {
+            click_idx = Some(ki);
         }
         kf_resp.context_menu(|ui| {
             ui.label(egui::RichText::new(t("Interpolation")).size(10.0).strong());
@@ -827,6 +909,50 @@ fn transform_curve_editor<T>(
         });
     }
 
+    // ── Multi-drag commit (deferred from the loop) ──
+    // Detect drag-stop by checking if the pointer was just released
+    // while multi-drag was active.
+    let multi_drag_just_ended = *ce_multi_drag && !ui.input(|i| i.pointer.any_down());
+    if multi_drag_just_ended {
+        let dx = ce_multi_drag_delta.x;
+        let dy = ce_multi_drag_delta.y;
+        let mut sorted_sel: Vec<usize> = ce_selected.clone();
+        sorted_sel.sort();
+        for &si in &sorted_sel {
+            if si < keyframes.len() {
+                let old_v = get_property(&keyframes[si].value, prop);
+                let old_cx = time_to_graph_x(keyframes[si].t, time_min, time_max, inner_rect);
+                let old_cy = value_to_graph_y(old_v, val_min, val_max, inner_rect);
+                let new_t = graph_x_to_time(old_cx + dx, time_min, time_max, inner_rect)
+                    .clamp(0.0, time_max);
+                let new_v = graph_y_to_value(old_cy + dy, val_min, val_max, inner_rect)
+                    .clamp(val_min, val_max);
+                keyframes[si].t = new_t;
+                set_property(&mut keyframes[si].value, prop, new_v);
+            }
+        }
+        keyframes.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap());
+        ce_selected.clear();
+        *ce_multi_drag = false;
+        *ce_multi_drag_delta = egui::Vec2::ZERO;
+    }
+
+    // Handle click on a diamond — toggle selection.
+    if let Some(ki) = click_idx {
+        if ctrl_held || shift_held {
+            // Toggle in/out of selection.
+            if let Some(pos) = ce_selected.iter().position(|&x| x == ki) {
+                ce_selected.remove(pos);
+            } else {
+                ce_selected.push(ki);
+            }
+        } else {
+            // Replace selection.
+            ce_selected.clear();
+            ce_selected.push(ki);
+        }
+    }
+
     if let Some((ki, e)) = easing_change {
         if let Some(kf) = keyframes.get_mut(ki) {
             kf.easing = e;
@@ -835,6 +961,14 @@ fn transform_curve_editor<T>(
     if let Some(ki) = delete_idx {
         if ki < keyframes.len() {
             keyframes.remove(ki);
+            // Remove from selection.
+            ce_selected.retain(|&x| x != ki);
+            // Adjust indices > ki.
+            for idx in ce_selected.iter_mut() {
+                if *idx > ki {
+                    *idx -= 1;
+                }
+            }
         }
     }
 
@@ -866,6 +1000,92 @@ fn transform_curve_editor<T>(
         }
     }
 
+    // ── Marquee (rubber-band) selection ──
+    // Starts when the user drags from empty space inside the graph
+    // (no diamond hit). On release, selects all relevant diamonds
+    // whose centers fall inside the rectangle.
+    if drag_idx.is_none() && !*ce_multi_drag {
+        let primary_pressed = ui.input(|i| i.pointer.primary_pressed());
+        let press_origin = ui.input(|i| i.pointer.press_origin());
+        let any_down = ui.input(|i| i.pointer.any_down());
+
+        // Start marquee on press in empty space inside graph_rect.
+        if marquee.is_none() && primary_pressed {
+            if let Some(p) = press_origin {
+                if inner_rect.contains(p) {
+                    // Check no diamond is under the press.
+                    let mut on_diamond = false;
+                    for (ki, kf) in keyframes.iter().enumerate() {
+                        if !relevant_indices.contains(&ki) {
+                            continue;
+                        }
+                        let v = get_property(&kf.value, prop);
+                        let cx = time_to_graph_x(kf.t, time_min, time_max, inner_rect);
+                        let cy_kf = value_to_graph_y(v, val_min, val_max, inner_rect);
+                        let dr = Rect::from_center_size(
+                            Pos2::new(cx, cy_kf),
+                            Vec2::splat(diamond_size * 2.5),
+                        );
+                        if dr.contains(p) {
+                            on_diamond = true;
+                            break;
+                        }
+                    }
+                    if !on_diamond {
+                        *marquee = Some(crate::state::CurveEditorMarquee {
+                            start: p,
+                            end: p,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Update live marquee.
+        if let Some(ref mut m) = marquee {
+            if let Some(p) = ui.input(|i| i.pointer.interact_pos().or(i.pointer.hover_pos())) {
+                m.end = p;
+            }
+            let rect = m.rect();
+            painter.rect_filled(
+                rect,
+                Rounding::ZERO,
+                Color32::from_rgba_premultiplied(80, 180, 255, 30),
+            );
+            painter.rect_stroke(
+                rect,
+                Rounding::ZERO,
+                Stroke::new(1.0, Color32::from_rgb(80, 180, 255)),
+            );
+        }
+
+        // Commit on release.
+        if !any_down {
+            if let Some(m) = marquee.take() {
+                let rect = m.rect();
+                if rect.width() > 2.0 && rect.height() > 2.0 {
+                    let extend = ctrl_held || shift_held;
+                    if !extend {
+                        ce_selected.clear();
+                    }
+                    for (ki, kf) in keyframes.iter().enumerate() {
+                        if !relevant_indices.contains(&ki) {
+                            continue;
+                        }
+                        let v = get_property(&kf.value, prop);
+                        let cx = time_to_graph_x(kf.t, time_min, time_max, inner_rect);
+                        let cy_kf = value_to_graph_y(v, val_min, val_max, inner_rect);
+                        if rect.contains(Pos2::new(cx, cy_kf)) {
+                            if !ce_selected.contains(&ki) {
+                                ce_selected.push(ki);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let _ = NUM_TRANSFORM_PROPS;
 }
 
@@ -884,6 +1104,10 @@ fn scalar_curve_editor(
     value_range: (f32, f32),
     static_value: f32,
     t_local: f32,
+    marquee: &mut Option<crate::state::CurveEditorMarquee>,
+    ce_selected: &mut Vec<usize>,
+    ce_multi_drag: &mut bool,
+    ce_multi_drag_delta: &mut egui::Vec2,
 ) {
     use crate::i18n::t;
     let available = ui.available_size();
@@ -948,31 +1172,73 @@ fn scalar_curve_editor(
 
     let diamond_size = 6.0;
     let mut drag_idx: Option<usize> = None;
+    let mut click_idx: Option<usize> = None;
     let mut delete_idx: Option<usize> = None;
     let mut easing_change: Option<(usize, Easing)> = None;
+    let ctrl_held = ui.input(|i| i.modifiers.ctrl || i.modifiers.mac_cmd);
+    let shift_held = ui.input(|i| i.modifiers.shift);
 
     for (ki, kf) in kfs.iter().enumerate() {
         let cx = time_to_graph_x(kf.t, time_min, time_max, inner_rect);
         let cy = value_to_graph_y(kf.value, val_min, val_max, inner_rect);
         let center = Pos2::new(cx, cy);
+
+        let is_ce_selected = ce_selected.contains(&ki);
+
+        // Apply multi-drag offset for display.
+        let display_center = if is_ce_selected && *ce_multi_drag {
+            Pos2::new(center.x + ce_multi_drag_delta.x, center.y + ce_multi_drag_delta.y)
+        } else {
+            center
+        };
+
+        let fill = if is_ce_selected {
+            Color32::from_rgb(255, 230, 80)
+        } else {
+            color
+        };
+        let stroke_color = if is_ce_selected {
+            Color32::from_rgb(255, 200, 0)
+        } else {
+            Color32::WHITE
+        };
+
         let pts = vec![
-            Pos2::new(center.x, center.y - diamond_size),
-            Pos2::new(center.x + diamond_size, center.y),
-            Pos2::new(center.x, center.y + diamond_size),
-            Pos2::new(center.x - diamond_size, center.y),
+            Pos2::new(display_center.x, display_center.y - diamond_size),
+            Pos2::new(display_center.x + diamond_size, display_center.y),
+            Pos2::new(display_center.x, display_center.y + diamond_size),
+            Pos2::new(display_center.x - diamond_size, display_center.y),
         ];
         painter.add(egui::Shape::convex_polygon(
             pts,
-            color,
-            Stroke::new(1.0, Color32::WHITE),
+            fill,
+            Stroke::new(1.0, stroke_color),
         ));
 
         let diamond_rect =
-            Rect::from_center_size(center, Vec2::splat(diamond_size * 2.5));
+            Rect::from_center_size(display_center, Vec2::splat(diamond_size * 2.5));
         let id = ui.make_persistent_id(("audio_curve_kf", ki));
         let kf_resp = ui.interact(diamond_rect, id, Sense::click_and_drag());
+
+        if kf_resp.drag_started() {
+            if is_ce_selected && ce_selected.len() > 1 {
+                *ce_multi_drag = true;
+                *ce_multi_drag_delta = egui::Vec2::ZERO;
+            }
+        }
         if kf_resp.dragged() {
-            drag_idx = Some(ki);
+            if is_ce_selected && *ce_multi_drag {
+                *ce_multi_drag_delta += kf_resp.drag_delta();
+            } else {
+                drag_idx = Some(ki);
+            }
+        }
+        if kf_resp.drag_stopped() && is_ce_selected && *ce_multi_drag {
+            // Defer commit to after the loop.
+            drag_idx = None;
+        }
+        if kf_resp.clicked() {
+            click_idx = Some(ki);
         }
         kf_resp.context_menu(|ui| {
             ui.label(egui::RichText::new(t("Interpolation")).size(10.0).strong());
@@ -999,6 +1265,45 @@ fn scalar_curve_editor(
         });
     }
 
+    // ── Multi-drag commit (deferred from the loop) ──
+    let multi_drag_just_ended = *ce_multi_drag && !ui.input(|i| i.pointer.any_down());
+    if multi_drag_just_ended {
+        let dx = ce_multi_drag_delta.x;
+        let dy = ce_multi_drag_delta.y;
+        let mut sorted_sel: Vec<usize> = ce_selected.clone();
+        sorted_sel.sort();
+        for &si in &sorted_sel {
+            if si < kfs.len() {
+                let old_cx = time_to_graph_x(kfs[si].t, time_min, time_max, inner_rect);
+                let old_cy = value_to_graph_y(kfs[si].value, val_min, val_max, inner_rect);
+                let new_t = graph_x_to_time(old_cx + dx, time_min, time_max, inner_rect)
+                    .clamp(0.0, time_max);
+                let new_v = graph_y_to_value(old_cy + dy, val_min, val_max, inner_rect)
+                    .clamp(val_min, val_max);
+                kfs[si].t = new_t;
+                kfs[si].value = new_v;
+            }
+        }
+        kfs.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap());
+        ce_selected.clear();
+        *ce_multi_drag = false;
+        *ce_multi_drag_delta = egui::Vec2::ZERO;
+    }
+
+    // Handle click on a diamond — toggle selection.
+    if let Some(ki) = click_idx {
+        if ctrl_held || shift_held {
+            if let Some(pos) = ce_selected.iter().position(|&x| x == ki) {
+                ce_selected.remove(pos);
+            } else {
+                ce_selected.push(ki);
+            }
+        } else {
+            ce_selected.clear();
+            ce_selected.push(ki);
+        }
+    }
+
     if let Some((ki, e)) = easing_change {
         if let Some(kf) = kfs.get_mut(ki) {
             kf.easing = e;
@@ -1007,6 +1312,12 @@ fn scalar_curve_editor(
     if let Some(ki) = delete_idx {
         if ki < kfs.len() {
             kfs.remove(ki);
+            ce_selected.retain(|&x| x != ki);
+            for idx in ce_selected.iter_mut() {
+                if *idx > ki {
+                    *idx -= 1;
+                }
+            }
         }
     }
     if let Some(ki) = drag_idx {
@@ -1033,6 +1344,77 @@ fn scalar_curve_editor(
             kfs.push(Keyframe::new(new_t, new_v));
             kfs.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap());
             animated_params.insert(param_id.to_string());
+        }
+    }
+
+    // ── Marquee (rubber-band) selection ──
+    if drag_idx.is_none() && !*ce_multi_drag {
+        let primary_pressed = ui.input(|i| i.pointer.primary_pressed());
+        let press_origin = ui.input(|i| i.pointer.press_origin());
+        let any_down = ui.input(|i| i.pointer.any_down());
+
+        if marquee.is_none() && primary_pressed {
+            if let Some(p) = press_origin {
+                if inner_rect.contains(p) {
+                    let mut on_diamond = false;
+                    for (_ki, kf) in kfs.iter().enumerate() {
+                        let cx = time_to_graph_x(kf.t, time_min, time_max, inner_rect);
+                        let cy_kf = value_to_graph_y(kf.value, val_min, val_max, inner_rect);
+                        let dr = Rect::from_center_size(
+                            Pos2::new(cx, cy_kf),
+                            Vec2::splat(diamond_size * 2.5),
+                        );
+                        if dr.contains(p) {
+                            on_diamond = true;
+                            break;
+                        }
+                    }
+                    if !on_diamond {
+                        *marquee = Some(crate::state::CurveEditorMarquee {
+                            start: p,
+                            end: p,
+                        });
+                    }
+                }
+            }
+        }
+
+        if let Some(ref mut m) = marquee {
+            if let Some(p) = ui.input(|i| i.pointer.interact_pos().or(i.pointer.hover_pos())) {
+                m.end = p;
+            }
+            let rect = m.rect();
+            painter.rect_filled(
+                rect,
+                Rounding::ZERO,
+                Color32::from_rgba_premultiplied(80, 180, 255, 30),
+            );
+            painter.rect_stroke(
+                rect,
+                Rounding::ZERO,
+                Stroke::new(1.0, Color32::from_rgb(80, 180, 255)),
+            );
+        }
+
+        if !any_down {
+            if let Some(m) = marquee.take() {
+                let rect = m.rect();
+                if rect.width() > 2.0 && rect.height() > 2.0 {
+                    let extend = ctrl_held || shift_held;
+                    if !extend {
+                        ce_selected.clear();
+                    }
+                    for (ki, kf) in kfs.iter().enumerate() {
+                        let cx = time_to_graph_x(kf.t, time_min, time_max, inner_rect);
+                        let cy_kf = value_to_graph_y(kf.value, val_min, val_max, inner_rect);
+                        if rect.contains(Pos2::new(cx, cy_kf)) {
+                            if !ce_selected.contains(&ki) {
+                                ce_selected.push(ki);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }

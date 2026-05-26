@@ -643,6 +643,10 @@ fn ru_lookup(key: &str) -> Option<&'static str> {
             "Добавить пустой аудио-слой снизу",
         "\u{2728} New video layer." => "\u{2728} Новый видео-слой.",
         "\u{2728} New audio layer." => "\u{2728} Новый аудио-слой.",
+        "+ FX Layer" => "+ FX-слой",
+        "Add an effect layer that applies effects to all layers below it" =>
+            "Добавить слой эффектов, который применяет эффекты ко всем слоям ниже",
+        "\u{2728} New effect layer." => "\u{2728} Новый слой эффектов.",
         "Clear multi-selection" => "Сбросить мульти-выделение",
 
         // ── Library panel ──────────────────────────────────────

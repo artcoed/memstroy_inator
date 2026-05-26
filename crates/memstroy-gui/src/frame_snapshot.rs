@@ -142,6 +142,104 @@ pub fn extract_frame_to_image_layer(state: &mut EditorState) -> Result<usize, St
 
 // ─── COMPOSITOR ────────────────────────────────────────────────────
 
+/// World-space bounding box of every actor / overlay / background in
+/// `subset` at time `t`. Returns `None` when nothing in the subset
+/// resolves to a valid bbox. Used by the subset-mode extract to size
+/// the output canvas exactly to the union of selected element bounds
+/// (no render-frame clipping).
+fn compute_subset_world_bbox(
+    state: &EditorState,
+    scene: &Scene,
+    subset: &[Selection],
+    t: f32,
+) -> Option<([f32; 2], [f32; 2])> {
+    use memstroy_core::keyframe;
+    let [rw, rh] = scene.render_frame.resolution;
+    let world_w = rw as f32;
+    let world_h = rh as f32;
+    let mut min_x = f32::INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    let mut any = false;
+    for sel in subset {
+        let bbox = match *sel {
+            Selection::Actor(ai) => {
+                let actor = scene.actors.get(ai)?;
+                if !actor.visible { continue; }
+                let t_in = actor.t_in.unwrap_or(0.0);
+                let t_out = actor.t_out.unwrap_or(scene.output.duration);
+                if t < t_in || t > t_out { continue; }
+                let astate = keyframe::sample(&actor.layout, t).unwrap_or_default();
+                let world_pos = element_world_pos(scene, &actor.id, t)
+                    .unwrap_or_else(|| WorldPos {
+                        x: astate.pos[0] * world_w,
+                        y: astate.pos[1] * world_h,
+                    });
+                let (sw, sh) = state.frame_caches.get(ai)
+                    .filter(|fc| fc.is_ready() && fc.frame_count > 0)
+                    .map(|fc| (fc.source_width as f32, fc.source_height as f32))
+                    .unwrap_or((1080.0, 1920.0));
+                let elem_w = sw * astate.scale;
+                let elem_h = sh * astate.scale * astate.scale_y;
+                Some((
+                    [world_pos.x - elem_w * 0.5, world_pos.y - elem_h * 0.5],
+                    [world_pos.x + elem_w * 0.5, world_pos.y + elem_h * 0.5],
+                ))
+            }
+            Selection::Overlay(oi) => {
+                let ov = scene.overlays.get(oi)?;
+                let (t_in, t_out) = match ov {
+                    Overlay::Text(o) => (o.t_in, o.t_out),
+                    Overlay::Image(o) => (o.t_in, o.t_out),
+                    Overlay::Video(o) => (o.t_in, o.t_out),
+                };
+                if t < t_in || t > t_out { continue; }
+                let local_t = (t - t_in).max(0.0);
+                let layout = match ov {
+                    Overlay::Text(o) => &o.layout,
+                    Overlay::Image(o) => &o.layout,
+                    Overlay::Video(o) => &o.layout,
+                };
+                let ostate = keyframe::sample(layout, local_t).unwrap_or_default();
+                let center_x = ostate.pos[0] * world_w;
+                let center_y = ostate.pos[1] * world_h;
+                // Use texture size when available, else 200x200 default
+                let (sw, sh) = match ov {
+                    Overlay::Image(im) => state.image_textures.lock().ok()
+                        .and_then(|m| match m.get(&im.source) {
+                            Some(crate::state::ImageTextureSlot::Loaded { size, .. }) => {
+                                Some((size[0] as f32, size[1] as f32))
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or((200.0, 200.0)),
+                    _ => (200.0, 200.0),
+                };
+                let elem_w = sw * ostate.scale;
+                let elem_h = sh * ostate.scale * ostate.scale_y;
+                Some((
+                    [center_x - elem_w * 0.5, center_y - elem_h * 0.5],
+                    [center_x + elem_w * 0.5, center_y + elem_h * 0.5],
+                ))
+            }
+            _ => None,
+        };
+        if let Some((mn, mx)) = bbox {
+            min_x = min_x.min(mn[0]);
+            min_y = min_y.min(mn[1]);
+            max_x = max_x.max(mx[0]);
+            max_y = max_y.max(mx[1]);
+            any = true;
+        }
+    }
+    if any {
+        Some(([min_x, min_y], [max_x, max_y]))
+    } else {
+        None
+    }
+}
+
 #[derive(Default)]
 struct CompositeSummary {
     image: RgbaImage,
@@ -158,10 +256,54 @@ fn compose_frame(
 ) -> CompositeSummary {
     let scene_clone = state.scene.clone();
     let rf = &scene_clone.render_frame;
-    let [rw, rh] = rf.resolution;
-    let rw = rw.max(1);
-    let rh = rh.max(1);
+    let [rw_full, rh_full] = rf.resolution;
+    let rw_full = rw_full.max(1);
+    let rh_full = rh_full.max(1);
     let rf_state = sample_render_frame_eased(rf, t);
+
+    // ── Determine output canvas size and projection ──
+    //
+    // Full-frame: canvas = render-frame resolution, project via
+    // `world_to_output` honouring rf rotation/zoom (current export
+    // behaviour).
+    //
+    // Subset: canvas = world-space bounding box of selected elements
+    // (no render-frame clipping). Project via `world_to_subset` which
+    // is a simple translate (world.x - bbox.min.x, world.y - bbox.min.y).
+    let (rw, rh, subset_bbox_min) = if full_frame {
+        (rw_full, rh_full, None)
+    } else {
+        // Compute world AABB of every selected element
+        let bbox = compute_subset_world_bbox(state, &scene_clone, subset, t);
+        match bbox {
+            Some((mn, mx)) => {
+                // Add a small padding so element edges aren't clipped
+                let pad = 4.0_f32;
+                let bw = ((mx[0] - mn[0]) + pad * 2.0).max(8.0).round() as u32;
+                let bh = ((mx[1] - mn[1]) + pad * 2.0).max(8.0).round() as u32;
+                (bw.max(8), bh.max(8), Some([mn[0] - pad, mn[1] - pad]))
+            }
+            None => (rw_full, rh_full, None), // fallback if no bbox computable
+        }
+    };
+
+    // Override rf_state in subset mode so `world_to_output` projects
+    // world coords directly into the bbox-sized canvas with no
+    // rotation/zoom (identity). Centre the synthetic rf at the bbox
+    // centre so `world_to_output`'s `(rw/2 + (world - rf.pos))`
+    // formula maps `bbox_min` → `(0, 0)` and `bbox_max` → `(rw, rh)`.
+    let rf_state = if let Some(bmin) = subset_bbox_min {
+        RenderFrameState {
+            pos: WorldPos {
+                x: bmin[0] + (rw as f32) * 0.5,
+                y: bmin[1] + (rh as f32) * 0.5,
+            },
+            zoom: 1.0,
+            rotation_deg: 0.0,
+        }
+    } else {
+        rf_state
+    };
 
     // Output canvas. Full-frame mode: pre-fill with scene background
     // colour at full alpha. Subset mode: stay transparent so the
@@ -340,6 +482,14 @@ fn compose_frame(
                 paint_actor(state, &scene_clone, ai, &rf_state, rw, rh, t, &mut canvas);
             }
         }
+    }
+
+    // ── Pass 3: effect layers ────────────────────────────────────
+    //
+    // Effect layers operate on the already-composited canvas within
+    // their bounding box. Applied after all content layers.
+    if !scene_clone.effect_layers.is_empty() {
+        apply_snapshot_effect_layers(&scene_clone, &rf_state, rw, rh, t, &mut canvas);
     }
 
     summary.image = canvas;
@@ -648,26 +798,51 @@ fn element_world_pos(scene: &Scene, element_id: &str, t: f32) -> Option<WorldPos
     Some(transform.pos)
 }
 
-/// Load the JPEG at the actor's frame-cache path corresponding to
-/// `local_t`. Returns `(rgba, w, h)` or `None` when the cache isn't
-/// ready (frames haven't finished extracting yet).
+/// Load the RGBA frame for an actor at clip-local time `local_t`.
+///
+/// Primary path: read from the pre-extracted frame cache (fast, no
+/// subprocess spawn). Fallback: when the cache isn't ready yet (e.g.
+/// extraction still in progress, or the actor was just added), we
+/// invoke ffmpeg synchronously to pull a single frame — the same
+/// approach `paint_video_overlay` uses. This ensures the "extract
+/// selected layer" button always renders actors regardless of cache
+/// state.
 fn load_actor_frame_rgba(
     state: &EditorState,
     actor_idx: usize,
     local_t: f32,
 ) -> Option<(Vec<u8>, u32, u32)> {
-    let fc = state.frame_caches.get(actor_idx)?;
-    if !fc.is_ready() || fc.frame_count == 0 {
-        return None;
+    // Try the fast path first: pre-extracted frame cache.
+    if let Some(fc) = state.frame_caches.get(actor_idx) {
+        if fc.is_ready() && fc.frame_count > 0 {
+            let frame_index = ((local_t * fc.fps).floor() as usize)
+                .clamp(0, fc.frame_count.saturating_sub(1));
+            // FrameCache writes 1-based 6-digit frame names: `000001.jpg`.
+            let path = fc.cache_dir.join(format!("{:06}.jpg", frame_index + 1));
+            if let Ok(img) = image::open(&path) {
+                let rgba = img.to_rgba8();
+                let w = rgba.width();
+                let h = rgba.height();
+                return Some((rgba.into_raw(), w, h));
+            }
+        }
     }
-    let frame_index = ((local_t * fc.fps).floor() as usize)
-        .clamp(0, fc.frame_count.saturating_sub(1));
-    // FrameCache writes 1-based 6-digit frame names: `000001.jpg`.
-    let path = fc.cache_dir.join(format!("{:06}.jpg", frame_index + 1));
-    let img = image::open(&path).ok()?.to_rgba8();
-    let w = img.width();
-    let h = img.height();
-    Some((img.into_raw(), w, h))
+
+    // Fallback: extract a single frame via ffmpeg synchronously.
+    // This covers the case where the frame cache hasn't finished
+    // extracting (or doesn't exist at all for this actor).
+    let actor = state.scene.actors.get(actor_idx)?;
+    let source = &actor.source;
+    // Handle looping: wrap seek time around source duration.
+    let seek = if actor.loop_source {
+        match probe_video_duration_sync(source) {
+            Some(dur) if dur > 0.001 => local_t.rem_euclid(dur),
+            _ => local_t.max(0.0),
+        }
+    } else {
+        local_t.max(0.0)
+    };
+    extract_video_frame_sync(source, seek)
 }
 
 /// Apply chroma-key + colour-correction + effect-stack to an RGBA8
@@ -708,6 +883,94 @@ fn apply_actor_processing(
             let g = (c.g() as f32 * scale).min(255.0) as u8;
             let b = (c.b() as f32 * scale).min(255.0) as u8;
             rgba.extend_from_slice(&[r, g, b, a]);
+        }
+    }
+}
+
+// ─── EFFECT LAYERS ─────────────────────────────────────────────────
+
+/// Apply all active effect layers to the snapshot canvas. Mirrors the
+/// CPU compositor's `apply_effect_layers` logic.
+fn apply_snapshot_effect_layers(
+    scene: &Scene,
+    rf_state: &RenderFrameState,
+    rw: u32,
+    rh: u32,
+    t: f32,
+    canvas: &mut RgbaImage,
+) {
+    let mut sorted: Vec<(i32, usize)> = scene
+        .effect_layers
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.z_order, i))
+        .collect();
+    sorted.sort_by_key(|&(z, i)| (z, i));
+
+    for (_, idx) in sorted {
+        let fx_ov = &scene.effect_layers[idx];
+        if t < fx_ov.t_in || t > fx_ov.t_out {
+            continue;
+        }
+        if fx_ov.effects.is_empty() {
+            continue;
+        }
+        let sample_t = t - fx_ov.t_in;
+        let mut ov_state = keyframe::sample(&fx_ov.layout, sample_t).unwrap_or_default();
+        let mod_delta = keyframe::evaluate_modifiers(&fx_ov.modifiers, sample_t);
+        ov_state.scale = (ov_state.scale + mod_delta.d_scale).max(0.001);
+        ov_state.rotation_deg += mod_delta.d_rotation_deg;
+
+        let base_size = 200.0_f32;
+        let world_w = base_size * ov_state.scale;
+        let world_h = base_size * ov_state.scale * ov_state.scale_y;
+
+        let world_pos = element_world_pos(scene, &fx_ov.id, t).unwrap_or_else(|| WorldPos {
+            x: ov_state.pos[0] * rw as f32 + mod_delta.dx,
+            y: ov_state.pos[1] * rh as f32 + mod_delta.dy,
+        });
+        let (cx, cy) = world_to_output(world_pos, rf_state, rw, rh);
+
+        let half_w = world_w * rf_state.zoom * 0.5;
+        let half_h = world_h * rf_state.zoom * 0.5;
+        let x_min = ((cx - half_w).floor() as i32).max(0) as u32;
+        let y_min = ((cy - half_h).floor() as i32).max(0) as u32;
+        let x_max = ((cx + half_w).ceil() as i32).min(rw as i32 - 1).max(0) as u32;
+        let y_max = ((cy + half_h).ceil() as i32).min(rh as i32 - 1).max(0) as u32;
+
+        let region_w = x_max.saturating_sub(x_min) + 1;
+        let region_h = y_max.saturating_sub(y_min) + 1;
+        if region_w == 0 || region_h == 0 {
+            continue;
+        }
+
+        // Extract region.
+        let mut region = RgbaImage::new(region_w, region_h);
+        for y in 0..region_h {
+            for x in 0..region_w {
+                let px = canvas.get_pixel(x_min + x, y_min + y);
+                region.put_pixel(x, y, *px);
+            }
+        }
+
+        // Apply effects via the image_effects module (same path as
+        // image overlays use in the snapshot).
+        let baked: Vec<Effect> = fx_ov
+            .effects
+            .iter()
+            .map(|e| e.sampled_at(sample_t))
+            .collect();
+        let mut buf = region.into_raw();
+        image_effects::apply_effect_stack(&mut buf, region_w, region_h, &baked, sample_t);
+        let region = RgbaImage::from_raw(region_w, region_h, buf)
+            .expect("effect layer region buffer matches dims");
+
+        // Write back.
+        for y in 0..region_h {
+            for x in 0..region_w {
+                let px = region.get_pixel(x, y);
+                canvas.put_pixel(x_min + x, y_min + y, *px);
+            }
         }
     }
 }

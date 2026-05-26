@@ -19,13 +19,19 @@ use tracing_subscriber::EnvFilter;
     about = "HTTP server that serves shared editor assets to the GUI"
 )]
 struct Cli {
-    /// Address to bind the HTTP server on.
+    /// Address to bind the HTTP server on. When `PORT` env var is set
+    /// (e.g. on Railway / Heroku-style hosts), the server binds to
+    /// `0.0.0.0:$PORT` regardless of this flag.
     #[arg(long, default_value = "0.0.0.0:8765")]
     addr: SocketAddr,
 
     /// Asset root directory. Expected to contain `clips/`, `videos/`,
     /// `images/`, `sounds/`, `particles/`, `text/` subdirectories.
     /// Missing subdirectories are created on start-up.
+    ///
+    /// On Railway this should point at a mounted volume so the
+    /// scraped asset library survives container restarts (e.g.
+    /// `--root /data/assets`).
     #[arg(long)]
     root: Option<PathBuf>,
 }
@@ -35,11 +41,24 @@ async fn main() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
 
+    // Honour PORT env var for cloud platforms (Railway, Heroku, etc.).
+    // These platforms inject `PORT=12345` and expect the app to listen
+    // on `0.0.0.0:12345`. Falls back to the CLI default otherwise.
+    let addr: SocketAddr = match std::env::var("PORT") {
+        Ok(p) => format!("0.0.0.0:{}", p)
+            .parse()
+            .with_context(|| format!("parsing PORT={p}"))?,
+        Err(_) => cli.addr,
+    };
+
     let root = match cli.root {
         Some(p) => p,
-        None => std::env::current_dir()
-            .context("getting current dir")?
-            .join("assets"),
+        None => match std::env::var("ASSETS_ROOT") {
+            Ok(p) => PathBuf::from(p),
+            Err(_) => std::env::current_dir()
+                .context("getting current dir")?
+                .join("assets"),
+        },
     };
     tokio::fs::create_dir_all(&root)
         .await
@@ -52,7 +71,7 @@ async fn main() -> Result<()> {
         tracing::info!(kind = ?kind, count, "indexed");
     }
 
-    let handle = start(cli.addr, store);
+    let handle = start(addr, store);
     handle.await.context("server task crashed")?;
     Ok(())
 }
