@@ -2093,12 +2093,17 @@ impl App {
         self.state.actor_track_assignments = shifted;
         // Frame caches mirror the actors Vec by index — slot a
         // placeholder in for the right half so the rest of the
-        // cache table stays index-aligned with the scene.
+        // cache table stays index-aligned with the scene. We pass
+        // the actual source path so `ensure_frame_caches` can
+        // detect it needs extraction and kick it off on the next
+        // frame — previously the empty PathBuf meant the right half
+        // had no preview until a full re-extract was triggered.
+        let right_source = self.state.scene.actors[pivot].source.clone();
         if pivot <= self.state.frame_caches.len() {
             self.state.frame_caches.insert(
                 pivot,
                 crate::video_cache::FrameCache::new(
-                    std::path::PathBuf::new(),
+                    right_source,
                     pivot,
                 ),
             );
@@ -2106,6 +2111,34 @@ impl App {
         if pivot <= self.frame_extract_results.len() {
             self.frame_extract_results.insert(pivot, std::sync::Arc::new(std::sync::Mutex::new(None)));
         }
+
+        // Duplicate the canvas_layouts entry for the right half so it
+        // inherits the same world-pixel position track as the original.
+        // Without this, the right half falls back to the legacy normalised
+        // layout and renders at a different position — the user sees two
+        // overlapping clips instead of a clean cut.
+        let original_id = self.state.scene.actors[i].id.clone();
+        if let Some(cl_idx) = self.state.scene.canvas_layouts.iter().position(|cl| cl.element_id == original_id) {
+            let mut right_cl = self.state.scene.canvas_layouts[cl_idx].clone();
+            right_cl.element_id = right_id.clone();
+            // Trim the right half's keyframes to only those at or after
+            // the cut point (same logic as the actor layout kfs).
+            right_cl.keyframes.retain(|kf| kf.t >= t - 1.0e-3);
+            if right_cl.keyframes.is_empty() {
+                // Seed with the sampled position at the cut point so the
+                // right half starts where the left half ended.
+                if let Some(sampled) = memstroy_core::keyframe::sample(
+                    &self.state.scene.canvas_layouts[cl_idx].keyframes, t,
+                ) {
+                    right_cl.keyframes.push(memstroy_core::Keyframe::new(t, sampled));
+                }
+            }
+            // Also trim the LEFT half's canvas_layouts to kfs at or before
+            // the cut point so it doesn't carry stale future keyframes.
+            self.state.scene.canvas_layouts[cl_idx].keyframes.retain(|kf| kf.t <= t + 1.0e-3);
+            self.state.scene.canvas_layouts.push(right_cl);
+        }
+
         Some((pivot, right_id))
     }
 
@@ -2276,6 +2309,37 @@ impl App {
             shifted.insert(pivot, lane);
         }
         self.state.overlay_track_assignments = shifted;
+
+        // Duplicate canvas_layouts for the right half overlay (same
+        // logic as the actor split — prevents the right half from
+        // falling back to legacy positioning and overlapping the left).
+        let original_ov_id = match &self.state.scene.overlays[i] {
+            memstroy_core::Overlay::Text(txt) => txt.id.clone(),
+            memstroy_core::Overlay::Image(im) => im.id.clone(),
+            memstroy_core::Overlay::Video(v) => v.id.clone(),
+        };
+        let right_ov_id = match &self.state.scene.overlays[pivot] {
+            memstroy_core::Overlay::Text(txt) => txt.id.clone(),
+            memstroy_core::Overlay::Image(im) => im.id.clone(),
+            memstroy_core::Overlay::Video(v) => v.id.clone(),
+        };
+        if let Some(cl_idx) = self.state.scene.canvas_layouts.iter().position(|cl| cl.element_id == original_ov_id) {
+            let mut right_cl = self.state.scene.canvas_layouts[cl_idx].clone();
+            right_cl.element_id = right_ov_id;
+            // Overlay canvas_layouts keyframes are in scene-time.
+            // Trim to kfs at or after the cut point for the right half.
+            right_cl.keyframes.retain(|kf| kf.t >= t - 1.0e-3);
+            if right_cl.keyframes.is_empty() {
+                if let Some(sampled) = memstroy_core::keyframe::sample(
+                    &self.state.scene.canvas_layouts[cl_idx].keyframes, t,
+                ) {
+                    right_cl.keyframes.push(memstroy_core::Keyframe::new(t, sampled));
+                }
+            }
+            self.state.scene.canvas_layouts[cl_idx].keyframes.retain(|kf| kf.t <= t + 1.0e-3);
+            self.state.scene.canvas_layouts.push(right_cl);
+        }
+
         self.state.status = crate::i18n::t("\u{2702} Overlay split at playhead.").into();
         true
     }
@@ -2598,6 +2662,19 @@ impl App {
             self.frame_extract_results.push(Arc::new(Mutex::new(None)));
         }
 
+        // Adaptive extraction resolution: when many actors are present,
+        // extract at lower resolution to reduce disk I/O and memory
+        // pressure. The visual quality at 320px is still sufficient for
+        // preview purposes (the canvas typically shows actors at 200-400px
+        // on screen anyway).
+        let extract_width: u32 = if num_actors >= 6 {
+            280
+        } else if num_actors >= 4 {
+            360
+        } else {
+            480
+        };
+
         for actor_idx in 0..num_actors {
             let source = self.state.scene.actors[actor_idx].source.clone();
 
@@ -2623,15 +2700,19 @@ impl App {
                 *slot = None;
             }
 
-            crate::video_cache::FrameCache::start_extraction(
-                source,
-                self.rt.handle(),
-                move |duration, frame_count, cache_dir| {
-                    if let Ok(mut slot) = result_slot.lock() {
-                        *slot = Some((duration, frame_count, cache_dir));
-                    }
-                },
-            );
+            let width = extract_width;
+            let rt_handle = self.rt.handle().clone();
+            rt_handle.spawn(async move {
+                crate::video_cache::extract_frames_blocking_with_scale(
+                    source,
+                    width,
+                    move |duration, frame_count, cache_dir| {
+                        if let Ok(mut slot) = result_slot.lock() {
+                            *slot = Some((duration, frame_count, cache_dir));
+                        }
+                    },
+                );
+            });
         }
 
         self.state.status = crate::i18n::t("\u{1F3AC} Extracting preview frames...").into();
@@ -3757,6 +3838,7 @@ impl eframe::App for App {
                         animated_params: Default::default(),
                         chroma_key: None,
                         z_order: 0,
+                        parent_id: None,
                     });
                     self.state.scene.overlays.push(overlay);
                     let new_idx = self.state.scene.overlays.len() - 1;
@@ -4006,7 +4088,18 @@ impl eframe::App for App {
         // - When idle/paused: only repaint if jobs are running (reactive mode)
         if self.state.playing {
             if self.state.frame_caches.iter().any(|fc| fc.is_ready()) {
-                ctx.request_repaint_after(std::time::Duration::from_millis(16));
+                // Adaptive frame rate: when many actors are playing
+                // simultaneously, reduce the repaint cadence to 30fps
+                // (33ms) instead of 60fps (16ms). This halves the
+                // number of texture uploads and per-pixel effect passes
+                // per second, which is the dominant cost with 6+ actors.
+                // The visual difference between 30fps and 60fps preview
+                // is negligible for editing purposes.
+                let ready_count = self.state.frame_caches.iter()
+                    .filter(|fc| fc.is_ready())
+                    .count();
+                let interval_ms = if ready_count >= 5 { 33 } else { 16 };
+                ctx.request_repaint_after(std::time::Duration::from_millis(interval_ms));
             } else {
                 ctx.request_repaint_after(std::time::Duration::from_millis(33));
             }

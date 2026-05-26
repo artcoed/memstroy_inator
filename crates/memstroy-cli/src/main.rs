@@ -266,6 +266,7 @@ fn starter_scene() -> Scene {
         effects: Vec::new(),
         animated_params: Default::default(),
         z_order: 0,
+        parent_id: None,
     });
     Scene {
         format_version: 1,
