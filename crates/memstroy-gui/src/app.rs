@@ -37,6 +37,9 @@ pub struct App {
     /// "did we add a track" debug checks; the live-update logic itself
     /// uses the signature above.
     prev_audio_source_count: usize,
+    /// Native pixels-per-point captured on the first frame. Used to
+    /// restore system DPI when the user sets UI scale back to "Auto".
+    native_ppp: Option<f32>,
 
     /// Number of V-key release events to ignore as "already-handled
     /// Ctrl+V chords". See [`Self::handle_shortcuts`] for why this
@@ -135,6 +138,7 @@ impl App {
             prev_playhead: 0.0,
             prev_audio_signature: 0,
             prev_audio_source_count: 0,
+            native_ppp: None,
             pending_v_release_skips: 0,
             ctrl_held_grace_frames: 0,
             last_internal_copy_at: None,
@@ -397,9 +401,34 @@ impl App {
                     );
                     match result {
                         Ok(asset) => {
-                            // Refresh library so the file appears on
-                            // the Images tab (matches Ctrl+V flow).
-                            self.state.reload_library();
+                            // Instead of a full reload_library() which
+                            // rebuilds all asset lists and causes every
+                            // thumbnail to re-enter the load budget queue,
+                            // just append the new asset to the images list
+                            // and update the fingerprint so the periodic
+                            // auto-rescan doesn't trigger a redundant full
+                            // reload on the next tick.
+                            let new_lib_asset = crate::state::LibraryAsset {
+                                id: asset.id.clone(),
+                                path: asset.path.clone(),
+                                label: asset.label.clone(),
+                                thumbnail: asset.thumbnail.clone(),
+                            };
+                            // Only add if not already present (avoid dupes
+                            // if the auto-rescan raced us).
+                            if !self.state.library.images.iter().any(|a| a.path == new_lib_asset.path) {
+                                self.state.library.images.push(new_lib_asset);
+                                self.state.library.images.sort_by(|a, b| {
+                                    a.label.to_ascii_lowercase().cmp(&b.label.to_ascii_lowercase())
+                                });
+                            }
+                            // Bump the fingerprint so the periodic rescan
+                            // doesn't immediately trigger a full rebuild.
+                            self.state.library_dir_fingerprint =
+                                self.state.compute_library_dir_fingerprint();
+                            self.state.last_library_rescan =
+                                Some(std::time::Instant::now());
+
                             self.state.web_image_search.status = format!(
                                 "{} \u{2192} {}",
                                 crate::i18n::t("\u{2705} Saved"),
@@ -426,6 +455,54 @@ impl App {
                 JobEvent::ImageFxReady(result) => {
                     self.handle_image_fx_ready(ctx, result);
                 }
+                JobEvent::ClipDownloaded { server_id, result, drop_target } => {
+                    self.handle_clip_downloaded(server_id, result, drop_target);
+                }
+            }
+        }
+    }
+
+    /// Finalise a lazy clip download. Reload the library so the new
+    /// `.mp4` file replaces its server-stub entry, then if a drop
+    /// target was specified, spawn an actor / canvas drop at that
+    /// position.
+    fn handle_clip_downloaded(
+        &mut self,
+        server_id: String,
+        result: Result<std::path::PathBuf, String>,
+        drop_target: crate::jobs::ClipDropTarget,
+    ) {
+        match result {
+            Ok(path) => {
+                // Reload library so the new file replaces its stub
+                self.state.reload_library();
+                // Spawn the actor at the requested drop target
+                use crate::jobs::ClipDropTarget;
+                match drop_target {
+                    ClipDropTarget::CanvasAt { world_x, world_y } => {
+                        crate::panels::add_actor_from_clip_at_canvas(
+                            &mut self.state, &path, [world_x, world_y]
+                        );
+                    }
+                    ClipDropTarget::TimelineAt { t } => {
+                        crate::panels::add_actor_from_clip_at_time(
+                            &mut self.state, &path, t
+                        );
+                    }
+                    ClipDropTarget::None => {}
+                }
+                self.state.status = format!(
+                    "{} {}",
+                    crate::i18n::t("\u{2B07} Clip downloaded:"),
+                    server_id
+                );
+            }
+            Err(e) => {
+                self.state.status = format!(
+                    "{} {}: {}",
+                    crate::i18n::t("\u{274C} Clip download failed:"),
+                    server_id, e
+                );
             }
         }
     }
@@ -750,10 +827,8 @@ impl App {
                     } else {
                         // Cap the visible list so the menu doesn't grow
                         // unboundedly when long-running editors pile up
-                        // dozens of slots. The cap is generous enough
-                        // that anyone routinely flipping between a
-                        // handful of projects sees them all.
-                        const MAX_ROWS: usize = 30;
+                        // dozens of slots.
+                        const MAX_ROWS: usize = 8;
                         for entry in autosave_entries.iter().take(MAX_ROWS) {
                             let display_name = entry
                                 .meta
@@ -1511,6 +1586,10 @@ impl App {
                             duration,
                             &mut self.state.curve_editor_property,
                             playhead,
+                            &mut self.state.curve_editor_marquee,
+                            &mut self.state.curve_editor_selected,
+                            &mut self.state.curve_editor_multi_drag,
+                            &mut self.state.curve_editor_multi_drag_delta,
                         );
                         // Effect animated params — show a scalar curve
                         // editor for each animated effect parameter.
@@ -1556,6 +1635,10 @@ impl App {
                                     duration,
                                     &mut self.state.curve_editor_property,
                                     playhead,
+                                    &mut self.state.curve_editor_marquee,
+                                    &mut self.state.curve_editor_selected,
+                                    &mut self.state.curve_editor_multi_drag,
+                                    &mut self.state.curve_editor_multi_drag_delta,
                                 );
                             }
                         }
@@ -1593,6 +1676,10 @@ impl App {
                             duration,
                             &mut self.state.curve_editor_property,
                             playhead,
+                            &mut self.state.curve_editor_marquee,
+                            &mut self.state.curve_editor_selected,
+                            &mut self.state.curve_editor_multi_drag,
+                            &mut self.state.curve_editor_multi_drag_delta,
                         );
                         // Effect animated params for overlay.
                         let overlay_t_in = t_in;
@@ -1642,6 +1729,10 @@ impl App {
                                     duration,
                                     &mut self.state.curve_editor_property,
                                     playhead,
+                                    &mut self.state.curve_editor_marquee,
+                                    &mut self.state.curve_editor_selected,
+                                    &mut self.state.curve_editor_multi_drag,
+                                    &mut self.state.curve_editor_multi_drag_delta,
                                 );
                             }
                         }
@@ -1728,6 +1819,10 @@ impl App {
                             duration,
                             &mut self.state.curve_editor_property,
                             playhead,
+                            &mut self.state.curve_editor_marquee,
+                            &mut self.state.curve_editor_selected,
+                            &mut self.state.curve_editor_multi_drag,
+                            &mut self.state.curve_editor_multi_drag_delta,
                         );
                     }
                 }
@@ -1744,6 +1839,10 @@ impl App {
                     duration,
                     &mut self.state.curve_editor_property,
                     playhead,
+                    &mut self.state.curve_editor_marquee,
+                    &mut self.state.curve_editor_selected,
+                    &mut self.state.curve_editor_multi_drag,
+                    &mut self.state.curve_editor_multi_drag_delta,
                 );
             }
         }
@@ -2494,7 +2593,18 @@ impl App {
         crop_right(&mut right.pan_kfs, local_split);
         crop_right(&mut right.low_pass_kfs, local_split);
         crop_right(&mut right.high_pass_kfs, local_split);
-        let original_lane = self.state.audio_track_assignments.get(&i).copied();
+        // Resolve the audio's CURRENT lane. If no explicit assignment
+        // exists (round-robin fallback was being used), compute what
+        // lane the timeline draws this audio on RIGHT NOW so both
+        // split halves end up on the same lane.
+        let original_lane = self.state.audio_track_assignments.get(&i).copied()
+            .unwrap_or_else(|| {
+                let audio_tracks: Vec<usize> = (0..self.state.tracks.len())
+                    .filter(|ti| self.state.tracks[*ti].kind == crate::state::TrackKind::Audio)
+                    .collect();
+                if audio_tracks.is_empty() { 0 }
+                else { audio_tracks[i % audio_tracks.len()] }
+            });
         let local_split_left = local_split;
         self.state.mutate(move |s| {
             s.audio[i].t_out = Some(t);
@@ -2518,9 +2628,14 @@ impl App {
             &mut self.state.audio_track_assignments,
             pivot,
         );
-        if let Some(lane) = original_lane {
-            self.state.audio_track_assignments.insert(pivot, lane);
-        }
+        // Ensure BOTH halves have explicit assignments to the same
+        // lane. Without an explicit assignment for the LEFT half, the
+        // round-robin fallback in the timeline draw might place it on
+        // a different lane than the resolved `original_lane` we used
+        // for the RIGHT half — and the user would see the audio jump
+        // between lanes after split.
+        self.state.audio_track_assignments.insert(i, original_lane);
+        self.state.audio_track_assignments.insert(pivot, original_lane);
         if pivot <= self.state.audio_waveforms.len() {
             self.state.audio_waveforms.insert(pivot, crate::state::AudioWaveform::default());
         }
@@ -3544,6 +3659,20 @@ fn swallow_clipboard_events(
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // ── Apply UI scale from settings ──
+        // Capture the native pixels_per_point on the very first frame
+        // so we can restore it when the user picks "Auto" (0.0).
+        if self.native_ppp.is_none() {
+            self.native_ppp = Some(ctx.pixels_per_point());
+        }
+        let ui_scale = self.state.settings.ui_scale;
+        if ui_scale > 0.01 {
+            ctx.set_pixels_per_point(ui_scale);
+        } else if let Some(native) = self.native_ppp {
+            // "Auto" — restore system DPI.
+            ctx.set_pixels_per_point(native);
+        }
+
         self.pump_events(ctx);
         self.poll_frame_extraction();
         self.poll_waveform_extraction();
@@ -3716,7 +3845,7 @@ impl eframe::App for App {
         egui::SidePanel::left("library")
             .resizable(true)
             .default_width(300.0)
-            .width_range(180.0..=560.0)
+            .width_range(140.0..=560.0)
             .frame(
                 egui::Frame::none()
                     .fill(Color32::from_rgb(26, 25, 18))
@@ -4087,7 +4216,7 @@ impl eframe::App for App {
         egui::SidePanel::right("inspector")
             .resizable(true)
             .default_width(350.0)
-            .width_range(220.0..=620.0)
+            .width_range(180.0..=620.0)
             .frame(
                 egui::Frame::none()
                     .fill(Color32::from_rgb(26, 25, 18))
@@ -4139,10 +4268,13 @@ impl eframe::App for App {
                 .open(&mut curve_open)
                 .default_pos(egui::pos2(20.0, 400.0))
                 .default_size([600.0, 240.0])
+                .min_height(120.0)
+                .max_height(400.0)
                 .resizable(true)
                 .collapsible(true)
                 .movable(true)
                 .show(ctx, |ui| {
+                    ui.set_max_height(380.0);
                     self.draw_curve_editor_body(ui);
                 });
             self.state.curve_editor_open = curve_open;

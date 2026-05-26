@@ -183,29 +183,22 @@ pub fn show_window(
     let mut open = state.web_image_search_open;
     egui::Window::new(format!("\u{1F310} {}", crate::i18n::t("Web Image Search")))
         .open(&mut open)
-        // ── Size constraints (fix for "window grows wider on every search") ──
-        // The window auto-resized to fit the inner grid. As soon as
-        // results landed, the inner grid measured wider than the
-        // initial 520 px and the window pumped wider on every frame.
-        // We pin the default + max widths so the window never grows
-        // sideways during a search; the user can still drag-resize
-        // within the [min..max] range, and `auto_shrink([true, false])`
-        // on the inner ScrollArea (see `window_body`) lets the panel
-        // shrink horizontally when the user makes it narrower.
         .default_size([560.0, 640.0])
-        .min_width(360.0)
-        .max_width(720.0)
+        .min_width(300.0)
+        .max_width(1200.0)
         .min_height(280.0)
         .max_height(1200.0)
         .resizable([true, true])
         .collapsible(true)
+        .scroll(false)
         .show(ctx, |ui| {
-            // Hard-cap the inner UI's max width so child widgets
-            // (search bar, grid rows) cannot push past the window's
-            // own max_width. Without this `ui.set_max_width(...)` the
-            // grid's `ui.horizontal(...)` would still measure wider
-            // than the panel and the next-frame layout would jitter.
-            ui.set_max_width(700.0);
+            // Cap inner UI width to whatever the user has dragged the
+            // window to — without this, the grid's measured min-width
+            // (cards × col count) would push the window wider every
+            // time results expand.
+            let avail = ui.available_width();
+            ui.set_max_width(avail);
+            ui.set_min_width(avail);
             window_body(ui, state, tx);
         });
     state.web_image_search_open = open;
@@ -232,28 +225,59 @@ fn window_body(ui: &mut egui::Ui, state: &mut EditorState, tx: &Sender<JobEvent>
         }
         if state.web_image_search.searching {
             ui.spinner();
+            ui.label(
+                RichText::new(t("searching..."))
+                    .size(10.0)
+                    .color(Color32::from_rgb(255, 200, 80)),
+            );
         }
     });
 
     // ── Status / hint line ─────────────────────────────────────────
-    let hint = if !state.web_image_search.status.is_empty() {
-        state.web_image_search.status.clone()
-    } else if state.web_image_search.results.is_empty() {
-        t("Type a query and press Enter. Click a result to drop it on the canvas at the playhead, or drag it onto the canvas / timeline.").to_string()
+    let status = &state.web_image_search.status;
+    let is_error = status.starts_with('\u{274C}');
+    if is_error {
+        // Error state — show prominently with a retry button
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(status.as_str())
+                    .size(12.0)
+                    .color(Color32::from_rgb(255, 100, 100))
+                    .strong(),
+            );
+        });
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            if ui.button(format!("\u{1F504} {}", t("Retry"))).clicked() {
+                kick_search(state, tx, /*append=*/ false);
+            }
+            ui.label(
+                RichText::new(t("Check your internet connection or try a different query."))
+                    .size(10.0)
+                    .italics()
+                    .color(Color32::from_rgb(160, 160, 180)),
+            );
+        });
     } else {
-        format!(
-            "{} {} \u{2014} {}",
-            t("Found"),
-            state.web_image_search.results.len(),
-            t("click an image to add it to the project, or drag it onto the canvas."),
-        )
-    };
-    ui.label(
-        RichText::new(hint)
-            .size(10.5)
-            .italics()
-            .color(Color32::from_rgb(160, 160, 180)),
-    );
+        let hint = if !status.is_empty() {
+            status.clone()
+        } else if state.web_image_search.results.is_empty() {
+            t("Type a query and press Enter. Click a result to add it to the project.").to_string()
+        } else {
+            format!(
+                "{} {}",
+                t("Found"),
+                state.web_image_search.results.len(),
+            )
+        };
+        ui.label(
+            RichText::new(hint)
+                .size(10.5)
+                .italics()
+                .color(Color32::from_rgb(160, 160, 180)),
+        );
+    }
     ui.add_space(4.0);
 
     ui.separator();
@@ -261,24 +285,33 @@ fn window_body(ui: &mut egui::Ui, state: &mut EditorState, tx: &Sender<JobEvent>
 
     // ── Results grid ───────────────────────────────────────────────
     egui::ScrollArea::vertical()
-        // Allow the panel to shrink HORIZONTALLY when the user resizes
-        // the window narrower (`true` for the X axis), but keep it
-        // pinned vertically so the grid doesn't collapse against its
-        // content height (`false` for the Y axis). This stops the
-        // "грид сам растягивается" feedback loop reported by the
-        // user — the inner ScrollArea no longer dictates the window's
-        // width.
-        .auto_shrink([true, false])
+        .auto_shrink([false, false])
         .show(ui, |ui| {
+            // When searching and no results yet, show a centered loading state
+            if state.web_image_search.searching && state.web_image_search.results.is_empty() {
+                ui.add_space(40.0);
+                ui.vertical_centered(|ui| {
+                    ui.spinner();
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(t("Searching DuckDuckGo..."))
+                            .size(13.0)
+                            .color(Color32::from_rgb(200, 200, 220)),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(t("This may take a few seconds."))
+                            .size(10.0)
+                            .italics()
+                            .color(Color32::from_rgb(140, 140, 160)),
+                    );
+                });
+                return;
+            }
+
             results_grid(ui, state, tx);
 
             // ── Pagination control ──────────────────────────────
-            // When the backend reported a `next_offset` we expose a
-            // single "Load more" button at the bottom of the grid.
-            // Clicking it appends the next batch onto `results`
-            // instead of replacing them, so the user can keep
-            // scrolling past the first ~100 hits without losing
-            // their place.
             let has_more = state.web_image_search.next_offset.is_some()
                 && !state.web_image_search.searching
                 && state.web_image_search.results.len() < MAX_TOTAL_RESULTS;
@@ -294,7 +327,7 @@ fn window_body(ui: &mut egui::Ui, state: &mut EditorState, tx: &Sender<JobEvent>
                     if ui
                         .button(RichText::new(label).size(12.0))
                         .on_hover_text(t(
-                            "Fetch the next page of results from the search engine and append it below.",
+                            "Fetch the next page of results.",
                         ))
                         .clicked()
                     {
@@ -305,18 +338,19 @@ fn window_body(ui: &mut egui::Ui, state: &mut EditorState, tx: &Sender<JobEvent>
             } else if state.web_image_search.searching
                 && !state.web_image_search.results.is_empty()
             {
-                // While a "Load more" fetch is in flight, surface a
-                // spinner where the button used to be so the user
-                // sees the request is being processed.
                 ui.add_space(8.0);
                 ui.vertical_centered(|ui| {
                     ui.spinner();
+                    ui.label(
+                        RichText::new(t("Loading more..."))
+                            .size(10.0)
+                            .color(Color32::from_rgb(200, 200, 220)),
+                    );
                 });
                 ui.add_space(8.0);
             } else if state.web_image_search.next_offset.is_none()
                 && state.web_image_search.results.len() >= MAX_RESULTS_PER_PAGE
             {
-                // Reached either the per-engine end or our own cap.
                 ui.add_space(6.0);
                 ui.vertical_centered(|ui| {
                     ui.label(

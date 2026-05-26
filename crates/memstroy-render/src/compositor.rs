@@ -450,6 +450,13 @@ fn compose_frame(
             }
         }
     }
+
+    // ── Effect layers — applied AFTER all content layers ──
+    //
+    // Effect layers operate on the already-composited canvas within
+    // their bounding box. They are sorted by z_order so the user can
+    // control the order of effect application.
+    apply_effect_layers(scene, &rf_state, rw, rh, t, canvas);
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1702,6 +1709,101 @@ fn flatten_to_opaque(canvas: &mut RgbaImage, bg_color: [u8; 3]) {
 #[inline]
 fn rgba_from_color(c: [u8; 3], a: u8) -> [u8; 4] {
     [c[0], c[1], c[2], a]
+}
+
+// ─── EFFECT LAYERS ──────────────────────────────────────────────────
+
+/// Apply all active effect layers to the canvas. Each effect layer
+/// defines a spatial region; pixels within that region are extracted,
+/// the effect stack is applied, and the result is written back.
+///
+/// Effect layers are sorted by `z_order` so the user can control
+/// application order. Layers listed in an effect layer's `exclude_ids`
+/// are NOT handled here (exclusion is a future enhancement that would
+/// require a multi-pass compositor with per-layer buffers).
+fn apply_effect_layers(
+    scene: &Scene,
+    rf_state: &RenderFrameState,
+    rw: u32,
+    rh: u32,
+    t: f32,
+    canvas: &mut RgbaImage,
+) {
+    if scene.effect_layers.is_empty() {
+        return;
+    }
+
+    // Sort by z_order (lower = applied first).
+    let mut sorted: Vec<(i32, usize)> = scene
+        .effect_layers
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.z_order, i))
+        .collect();
+    sorted.sort_by_key(|&(z, i)| (z, i));
+
+    for (_, idx) in sorted {
+        let fx_ov = &scene.effect_layers[idx];
+        if t < fx_ov.t_in || t > fx_ov.t_out {
+            continue;
+        }
+        if fx_ov.effects.is_empty() {
+            continue;
+        }
+        let sample_t = t - fx_ov.t_in;
+        let mut ov_state = keyframe::sample(&fx_ov.layout, sample_t).unwrap_or_default();
+        let mod_delta = keyframe::evaluate_modifiers(&fx_ov.modifiers, sample_t);
+        ov_state.scale = (ov_state.scale + mod_delta.d_scale).max(0.001);
+        ov_state.rotation_deg += mod_delta.d_rotation_deg;
+
+        // Effect layer bounding box. The default "intrinsic size" is
+        // 200×200 world pixels — the user resizes via scale on the
+        // canvas. This matches how image overlays use src_w × scale.
+        let base_size = 200.0_f32;
+        let world_w = base_size * ov_state.scale;
+        let world_h = base_size * ov_state.scale * ov_state.scale_y;
+
+        let world_pos = element_world_pos(scene, &fx_ov.id, t).unwrap_or_else(|| {
+            memstroy_core::canvas::WorldPos {
+                x: ov_state.pos[0] * rw as f32 + mod_delta.dx,
+                y: ov_state.pos[1] * rh as f32 + mod_delta.dy,
+            }
+        });
+        let (cx, cy) = world_to_output(world_pos, rf_state, rw, rh);
+
+        let half_w = world_w * rf_state.zoom * 0.5;
+        let half_h = world_h * rf_state.zoom * 0.5;
+        let x_min = ((cx - half_w).floor() as i32).max(0) as u32;
+        let y_min = ((cy - half_h).floor() as i32).max(0) as u32;
+        let x_max = ((cx + half_w).ceil() as i32).min(rw as i32 - 1).max(0) as u32;
+        let y_max = ((cy + half_h).ceil() as i32).min(rh as i32 - 1).max(0) as u32;
+
+        let region_w = x_max.saturating_sub(x_min) + 1;
+        let region_h = y_max.saturating_sub(y_min) + 1;
+        if region_w == 0 || region_h == 0 {
+            continue;
+        }
+
+        // Extract the region from the canvas.
+        let mut region = RgbaImage::new(region_w, region_h);
+        for y in 0..region_h {
+            for x in 0..region_w {
+                let px = canvas.get_pixel(x_min + x, y_min + y);
+                region.put_pixel(x, y, *px);
+            }
+        }
+
+        // Apply the effect stack.
+        apply_effect_stack_rgba(&mut region, &fx_ov.effects, sample_t);
+
+        // Write back.
+        for y in 0..region_h {
+            for x in 0..region_w {
+                let px = region.get_pixel(x, y);
+                canvas.put_pixel(x_min + x, y_min + y, *px);
+            }
+        }
+    }
 }
 
 // ─── CLIP CACHE — FFMPEG-EXTRACTED FRAMES ───────────────────────────

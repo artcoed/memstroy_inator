@@ -473,8 +473,19 @@ fn actor_world_aabb(state: &EditorState, idx: usize) -> Option<([f32; 2], [f32; 
     } else { (1080.0_f32, 1920.0) };
 
     let actor_state = keyframe::sample(&actor.layout, t).unwrap_or_default();
-    let elem_w = src_w * actor_state.scale;
-    let elem_h = src_h * actor_state.scale * actor_state.scale_y;
+    let mut effective_scale = actor_state.scale;
+    let mut effective_scale_y = actor_state.scale_y;
+    // Apply parent's scale if this actor has a parent (mirrors the
+    // draw path's `effective_scale *= parent_xform.scale`).
+    if let Some(ref pid) = actor.parent_id {
+        let mut visited = vec![actor.id.clone()];
+        if let Some(pxf) = resolve_parent_transform(state, pid, t, &mut visited) {
+            effective_scale *= pxf.scale;
+            effective_scale_y *= pxf.scale;
+        }
+    }
+    let elem_w = src_w * effective_scale;
+    let elem_h = src_h * effective_scale * effective_scale_y;
     let half_w = elem_w * 0.5;
     let half_h = elem_h * 0.5;
 
@@ -496,24 +507,38 @@ fn overlay_world_aabb(state: &EditorState, idx: usize) -> Option<([f32; 2], [f32
     };
     let sample_t = if t >= t_in && t <= t_out { t - t_in }
         else if t < t_in { 0.0 } else { (t_out - t_in).max(0.0) };
-    let ov_state = keyframe::sample(layout, sample_t).unwrap_or_default();
+    let mut ov_state = keyframe::sample(layout, sample_t).unwrap_or_default();
 
-    // ── World position is decoupled from the render frame ──
-    //
-    // The legacy `pos` field is a `[0..1]` vector interpreted against
-    // a FIXED reference rectangle of size `output.resolution` anchored
-    // at world (0, 0). Editing the render frame (move / resize /
-    // rotate) therefore no longer drags this overlay along on the
-    // canvas — exactly the contract the user asked for ("область
-    // рендера — самостоятельный отдельный независимый элемент"). The
-    // rf is now a pure viewport / camera over the world; what gets
-    // captured to the output is the `[w, h]` rectangle around `rf.pos`
-    // (rotated and scaled by the rf's own state).
     let [out_w, out_h] = state.scene.render_frame.resolution;
     let world_w = out_w as f32;
     let world_h = out_h as f32;
-    let center_x = ov_state.pos[0] * world_w;
-    let center_y = ov_state.pos[1] * world_h;
+    let mut center_x = ov_state.pos[0] * world_w;
+    let mut center_y = ov_state.pos[1] * world_h;
+
+    // Apply parent transform (position + scale) so marquee-select and
+    // hit-testing match what the user actually sees on canvas.
+    let parent_id = match overlay {
+        Overlay::Text(o) => o.parent_id.clone(),
+        Overlay::Image(o) => o.parent_id.clone(),
+        Overlay::Video(o) => o.parent_id.clone(),
+    };
+    let element_id = match overlay {
+        Overlay::Text(o) => o.id.clone(),
+        Overlay::Image(o) => o.id.clone(),
+        Overlay::Video(o) => o.id.clone(),
+    };
+    if let Some(pid) = parent_id {
+        let mut visited = vec![element_id];
+        if let Some(pxf) = resolve_parent_transform(state, &pid, t, &mut visited) {
+            // Apply parent translation + scale to the local position
+            let world_pos = apply_parent_transform(
+                WorldPos { x: center_x, y: center_y }, &pxf,
+            );
+            center_x = world_pos.x;
+            center_y = world_pos.y;
+            ov_state.scale *= pxf.scale;
+        }
+    }
 
     // Use the texture-aware bbox so image overlays use real PNG
     // dimensions (not the legacy 200×200 placeholder), keeping the
@@ -523,6 +548,66 @@ fn overlay_world_aabb(state: &EditorState, idx: usize) -> Option<([f32; 2], [f32
         [center_x - ew * 0.5, center_y - eh * 0.5],
         [center_x + ew * 0.5, center_y + eh * 0.5],
     ))
+}
+
+/// Pick a tint color for an FX zone based on the dominant active
+/// effect. Returns `None` when there are no active effects (empty
+/// or all-disabled stack) — caller draws just the outline.
+///
+/// The tint is intentionally translucent (~30% alpha) so the user
+/// can still see lower layers through the FX zone while getting
+/// quick visual feedback about which effect is active.
+fn fx_zone_tint_for_effects(effects: &[memstroy_core::effects::Effect]) -> Option<Color32> {
+    use memstroy_core::effects::EffectKind as K;
+    // Use the first ENABLED effect with intensity > 0 to drive the tint.
+    let dominant = effects.iter().find(|e| e.enabled && e.intensity > 0.001)?;
+    let alpha: u8 = 70; // ~27% — visible but not blocking
+    let c = match &dominant.kind {
+        K::Blur { .. } | K::Bloom { .. } | K::Glow { .. } => {
+            Color32::from_rgba_unmultiplied(180, 200, 255, alpha)
+        }
+        K::Grayscale => Color32::from_rgba_unmultiplied(160, 160, 170, alpha),
+        K::Sepia => Color32::from_rgba_unmultiplied(220, 190, 140, alpha),
+        K::Invert => Color32::from_rgba_unmultiplied(80, 60, 220, alpha),
+        K::HueShift { .. } => Color32::from_rgba_unmultiplied(255, 100, 200, alpha),
+        K::Vignette { .. } => Color32::from_rgba_unmultiplied(40, 30, 60, alpha + 20),
+        K::Pixelate { .. } => Color32::from_rgba_unmultiplied(220, 220, 100, alpha),
+        K::Posterize { .. } => Color32::from_rgba_unmultiplied(180, 200, 80, alpha),
+        K::Brightness { amount } => {
+            if *amount > 0.0 {
+                Color32::from_rgba_unmultiplied(255, 240, 180, alpha)
+            } else {
+                Color32::from_rgba_unmultiplied(40, 50, 80, alpha)
+            }
+        }
+        K::Contrast { .. } => Color32::from_rgba_unmultiplied(220, 100, 100, alpha),
+        K::Saturation { amount } => {
+            if *amount > 0.0 {
+                Color32::from_rgba_unmultiplied(255, 130, 200, alpha)
+            } else {
+                Color32::from_rgba_unmultiplied(180, 180, 180, alpha)
+            }
+        }
+        K::EdgeDetect { .. } => Color32::from_rgba_unmultiplied(40, 220, 220, alpha),
+        K::MirrorH | K::MirrorV => {
+            Color32::from_rgba_unmultiplied(140, 200, 140, alpha)
+        }
+        K::ChromaticAberration { .. } => {
+            Color32::from_rgba_unmultiplied(255, 80, 220, alpha)
+        }
+        K::Noise { .. } => Color32::from_rgba_unmultiplied(180, 180, 180, alpha),
+        K::Wave { .. } => Color32::from_rgba_unmultiplied(80, 200, 220, alpha),
+        K::OldFilm => Color32::from_rgba_unmultiplied(180, 150, 100, alpha),
+        K::Vhs => Color32::from_rgba_unmultiplied(200, 100, 220, alpha),
+        K::Glitch { .. } => Color32::from_rgba_unmultiplied(255, 80, 80, alpha),
+        K::Sharpen { .. } => Color32::from_rgba_unmultiplied(220, 220, 100, alpha),
+        K::Crop { .. } => Color32::from_rgba_unmultiplied(255, 140, 220, alpha),
+        K::Mask { .. } => Color32::from_rgba_unmultiplied(255, 200, 80, alpha),
+        K::ColorKey { color, .. } => Color32::from_rgba_unmultiplied(
+            color[0], color[1], color[2], alpha,
+        ),
+    };
+    Some(c)
 }
 
 /// AABB ∩ AABB test (both expressed as `(min, max)` world-pixel pairs).
@@ -1225,11 +1310,21 @@ fn draw_single_actor(
     } else {
         keyframe::ModifierDelta::default()
     };
-    let actor_rotation = actor_state.rotation_deg + mod_delta.d_rotation_deg;
+    let mut actor_rotation = actor_state.rotation_deg + mod_delta.d_rotation_deg;
     let actor_opacity = actor_state.opacity;
     let actor_flip_x = actor_state.flip_x_anim;
     let actor_flip_y = actor_state.flip_y_anim;
-    let scale_eff = (actor_scale + mod_delta.d_scale).max(0.001);
+    let mut scale_eff = (actor_scale + mod_delta.d_scale).max(0.001);
+
+    // ── Parent transform inheritance (rotation + scale) ──
+    if let Some(ref pid) = actor.parent_id {
+        let mut visited = vec![actor.id.clone()];
+        if let Some(parent_xform) = resolve_parent_transform(state, pid, t, &mut visited) {
+            actor_rotation += parent_xform.rotation_deg;
+            scale_eff *= parent_xform.scale;
+        }
+    }
+
     let elem_width = src_w * scale_eff;
     let elem_height = src_h * scale_eff * actor_scale_y;
 
@@ -1614,6 +1709,26 @@ fn draw_canvas_overlays_impl(
         ov_state.scale = (ov_state.scale + mod_delta.d_scale).max(0.001);
         ov_state.rotation_deg += mod_delta.d_rotation_deg;
 
+        // ── Parent transform inheritance (rotation + scale + position) ──
+        let overlay_parent_id: Option<&String> = match overlay {
+            Overlay::Text(txt) => txt.parent_id.as_ref(),
+            Overlay::Image(img) => img.parent_id.as_ref(),
+            Overlay::Video(vid) => vid.parent_id.as_ref(),
+        };
+        let overlay_id: &str = match overlay {
+            Overlay::Text(txt) => &txt.id,
+            Overlay::Image(img) => &img.id,
+            Overlay::Video(vid) => &vid.id,
+        };
+        let parent_xform_resolved = overlay_parent_id.and_then(|pid| {
+            let mut visited = vec![overlay_id.to_string()];
+            resolve_parent_transform(state, pid, t, &mut visited)
+        });
+        if let Some(ref pxf) = parent_xform_resolved {
+            ov_state.rotation_deg += pxf.rotation_deg;
+            ov_state.scale *= pxf.scale;
+        }
+
         let rf = &state.scene.render_frame;
         // World-space size of the FIXED reference rectangle that the
         // legacy normalised `pos` is interpreted against. Decoupled
@@ -1631,6 +1746,11 @@ fn draw_canvas_overlays_impl(
             x: ov_state.pos[0] * world_w + mod_delta.dx,
             y: ov_state.pos[1] * world_h + mod_delta.dy,
         };
+
+        // ── Apply parent position transform ──
+        if let Some(ref pxf) = parent_xform_resolved {
+            world_pos = apply_parent_transform(world_pos, pxf);
+        }
 
         // Skeleton attachment: if this overlay is bound to a host actor's
         // skeleton point, compute the point's world position from the
@@ -1658,6 +1778,142 @@ fn draw_canvas_overlays_impl(
             Overlay::Image(img) => {
                 let zoom = state.canvas_viewport.zoom;
                 let real_size = ensure_image_loaded(state, &img.source, painter.ctx());
+                // ── FX element fast path ──
+                // When the source path is empty, this overlay is an
+                // FX zone — it has no image content, only effects that
+                // (at export time) apply to layers below it. On the
+                // canvas preview we just draw the bounding box outline
+                // and a small "FX" label so the user can see / move /
+                // resize the zone. The actual effect-on-lower-layers
+                // compositing only happens during export.
+                let is_fx_zone = img.source.as_os_str().is_empty();
+                if is_fx_zone {
+                    // FX zones default to a larger box so they're
+                    // immediately useful as effect regions.
+                    let fx_w = 600.0_f32 * ov_state.scale;
+                    let fx_h = 400.0_f32 * ov_state.scale * ov_state.scale_y;
+                    let half_w = fx_w * 0.5 * zoom;
+                    let half_h = fx_h * 0.5 * zoom;
+                    let elem_rect = Rect::from_center_size(
+                        center_pos,
+                        Vec2::new(half_w * 2.0, half_h * 2.0),
+                    );
+                    if !full_rect.intersects(elem_rect) { continue; }
+
+                    // ── Live FX preview ──
+                    // Try to bake/fetch a preview that shows the FX
+                    // zone's effect stack applied to the composite of
+                    // image overlays drawn BEFORE this one within its
+                    // bbox. Falls back to the simple tint when no
+                    // image overlays contribute (no preview possible)
+                    // OR when the cache miss can't decode the source
+                    // image yet.
+                    //
+                    // Compute world-space bbox of the FX zone.
+                    let fx_bbox_min = [
+                        world_pos.x - fx_w * 0.5,
+                        world_pos.y - fx_h * 0.5,
+                    ];
+                    let fx_bbox_max = [
+                        world_pos.x + fx_w * 0.5,
+                        world_pos.y + fx_h * 0.5,
+                    ];
+                    let fx_preview_tex = crate::fx_preview::ensure_fx_preview(
+                        state,
+                        &state.fx_preview_cache,
+                        idx,
+                        &img.id,
+                        fx_bbox_min,
+                        fx_bbox_max,
+                        &img.effects,
+                        t,
+                        painter.ctx(),
+                    );
+
+                    // Rotated rect corners
+                    let rotation_rad = ov_state.rotation_deg.to_radians();
+                    let cos_r = rotation_rad.cos();
+                    let sin_r = rotation_rad.sin();
+                    let center = elem_rect.center();
+                    let corners_local = [[-half_w, -half_h], [half_w, -half_h], [half_w, half_h], [-half_w, half_h]];
+                    let corners: [Pos2; 4] = std::array::from_fn(|i| {
+                        let lx = corners_local[i][0];
+                        let ly = corners_local[i][1];
+                        Pos2::new(
+                            center.x + lx * cos_r - ly * sin_r,
+                            center.y + lx * sin_r + ly * cos_r,
+                        )
+                    });
+
+                    if let Some(tex) = fx_preview_tex {
+                        // Draw the baked preview as a textured quad
+                        // matching the FX bbox. Egui's Mesh handles
+                        // rotation via per-vertex positions.
+                        let mut mesh = egui::Mesh::with_texture(tex.id());
+                        let uvs = [
+                            egui::pos2(0.0, 0.0),
+                            egui::pos2(1.0, 0.0),
+                            egui::pos2(1.0, 1.0),
+                            egui::pos2(0.0, 1.0),
+                        ];
+                        for (i, c) in corners.iter().enumerate() {
+                            mesh.vertices.push(egui::epaint::Vertex {
+                                pos: *c,
+                                uv: uvs[i],
+                                color: Color32::WHITE,
+                            });
+                        }
+                        mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+                        painter.add(egui::Shape::mesh(mesh));
+                    } else {
+                        // Fallback: tint based on dominant effect
+                        let tint = fx_zone_tint_for_effects(&img.effects);
+                        if let Some(fill) = tint {
+                            if ov_state.rotation_deg.abs() > 0.5 {
+                                painter.add(egui::Shape::convex_polygon(
+                                    corners.to_vec(),
+                                    fill,
+                                    Stroke::NONE,
+                                ));
+                            } else {
+                                painter.rect_filled(elem_rect, Rounding::ZERO, fill);
+                            }
+                        }
+                    }
+
+                    // Pink dashed outline always
+                    let stroke = Stroke::new(2.0, Color32::from_rgb(255, 140, 220));
+                    for i in 0..4 {
+                        painter.line_segment([corners[i], corners[(i + 1) % 4]], stroke);
+                    }
+
+                    // Label in top-left with effect summary
+                    let label_pos = Pos2::new(
+                        center.x - half_w * cos_r + half_h * sin_r + 8.0,
+                        center.y - half_w * sin_r - half_h * cos_r + 12.0,
+                    );
+                    let active_count = img.effects.iter().filter(|e| e.enabled).count();
+                    let label_text = if active_count == 0 {
+                        format!("FX: {}", img.id)
+                    } else if active_count == 1 {
+                        let kind_label = img.effects.iter()
+                            .find(|e| e.enabled)
+                            .map(|e| e.kind.label())
+                            .unwrap_or("FX");
+                        format!("FX [{}]", kind_label)
+                    } else {
+                        format!("FX [{}× effects]", active_count)
+                    };
+                    painter.text(
+                        label_pos,
+                        egui::Align2::LEFT_TOP,
+                        label_text,
+                        egui::FontId::proportional(11.0),
+                        Color32::from_rgb(255, 140, 220),
+                    );
+                    // Skip the rest of the image-overlay rendering for FX zones
+                    continue;
+                }
                 // Fall back to a 200×200 logical box when the file
                 // hasn't been decoded (yet or at all). Once the texture
                 // is loaded, the real PNG dimensions drive the bbox so
@@ -2073,7 +2329,9 @@ fn draw_text_overlay(
     // "неравномерный фон должен в другом режиме".
     let line_plate_rects: Vec<Rect> = if matches!(style.box_kind, TextBoxKind::Wrap) {
         let mut out = Vec::with_capacity(galleys.len());
-        let mut y_top = plate_rect.min.y;
+        // Start at the text's actual top (plate_rect already includes
+        // padding, so the text content begins at min.y + padding).
+        let mut y_top = plate_rect.min.y + padding;
         for galley in &galleys {
             let line_w = galley.size().x;
             let line_total_w = line_w + padding * 2.0;
@@ -2091,29 +2349,19 @@ fn draw_text_overlay(
             };
             let lp = Rect::from_min_max(
                 Pos2::new(line_center_x - half - pad_extra_l, y_top),
-                Pos2::new(line_center_x + half + pad_extra_r, y_top + line_h + padding * 0.0),
+                Pos2::new(line_center_x + half + pad_extra_r, y_top + line_h),
             );
-            // Each line plate height = line_h + small vertical pad
-            // so neighbouring lines visually touch but the plate
-            // still has breathing room. We use 0 vertical extension
-            // here because consecutive lines already share boundaries;
-            // the block's outer top/bottom padding is added below.
             out.push(lp);
             y_top += line_h;
         }
-        // Apply the block's top/bottom padding to the first/last
-        // plate so the block as a whole looks padded vertically.
-        if let (Some(first), Some(last)) =
-            (out.first_mut().map(|r| *r), out.last_mut().map(|r| *r))
-        {
+        // Apply the block's top/bottom padding symmetrically to the
+        // first and last plate so the block as a whole looks padded
+        // equally on both sides.
+        if !out.is_empty() {
             let first_idx = 0;
             let last_idx = out.len() - 1;
-            let mut f = first;
-            f.min.y -= padding;
-            out[first_idx] = f;
-            let mut l = last;
-            l.max.y += padding;
-            out[last_idx] = l;
+            out[first_idx].min.y -= padding;
+            out[last_idx].max.y += padding;
         }
         out
     } else {
@@ -2519,6 +2767,170 @@ enum DisplayMode {
 
 /// Get the world-pixel position of an element, checking canvas_layouts
 /// first, then falling back to legacy normalised layout converted to
+/// Resolved parent transform: position, rotation, and scale accumulated
+/// from the parent chain. Used to transform child elements relative to
+/// their parent.
+#[derive(Clone, Copy, Debug)]
+struct ParentTransform {
+    /// Parent's world position (centre).
+    pos: WorldPos,
+    /// Parent's accumulated rotation in degrees.
+    rotation_deg: f32,
+    /// Parent's accumulated uniform scale.
+    scale: f32,
+}
+
+impl Default for ParentTransform {
+    fn default() -> Self {
+        Self {
+            pos: WorldPos { x: 0.0, y: 0.0 },
+            rotation_deg: 0.0,
+            scale: 1.0,
+        }
+    }
+}
+
+/// Resolve the full parent transform chain for an element identified by
+/// `parent_id`. Walks up the parent hierarchy (with cycle detection) and
+/// accumulates position, rotation, and scale. Returns `None` when the
+/// element has no parent or the parent can't be resolved.
+fn resolve_parent_transform(
+    state: &EditorState,
+    parent_id: &str,
+    t: f32,
+    visited: &mut Vec<String>,
+) -> Option<ParentTransform> {
+    // Cycle detection: if we've already visited this id, bail out.
+    if visited.contains(&parent_id.to_string()) {
+        return None;
+    }
+    visited.push(parent_id.to_string());
+
+    // Special case: render frame as parent
+    if parent_id == "__render_frame__" {
+        let rf = &state.scene.render_frame;
+        let rf_state = keyframe::sample(&rf.layout, t).unwrap_or_default();
+        let mod_delta = keyframe::evaluate_modifiers(&rf.modifiers, t);
+        return Some(ParentTransform {
+            pos: WorldPos {
+                x: rf_state.pos.x + mod_delta.dx,
+                y: rf_state.pos.y + mod_delta.dy,
+            },
+            rotation_deg: rf_state.rotation_deg + mod_delta.d_rotation_deg,
+            // Render frame zoom is inverse scale (zoom > 1 = zoomed in = smaller world area)
+            // For parenting purposes, we treat it as scale = 1 (the rf doesn't scale children)
+            scale: 1.0,
+        });
+    }
+
+    // Try to find the parent as an actor
+    if let Some(actor) = state.scene.actors.iter().find(|a| a.id == parent_id) {
+        let actor_t_in = actor.t_in.unwrap_or(0.0);
+        let actor_state = keyframe::sample(&actor.layout, t).unwrap_or_default();
+        let mod_delta = keyframe::evaluate_modifiers(&actor.modifiers, (t - actor_t_in).max(0.0));
+
+        let rf = &state.scene.render_frame;
+        let [rw, rh] = rf.resolution;
+        let world_w = rw as f32;
+        let world_h = rh as f32;
+
+        let mut pos = WorldPos {
+            x: actor_state.pos[0] * world_w + mod_delta.dx,
+            y: actor_state.pos[1] * world_h + mod_delta.dy,
+        };
+        let mut rotation = actor_state.rotation_deg + mod_delta.d_rotation_deg;
+        let mut scale = (actor_state.scale + mod_delta.d_scale).max(0.001);
+
+        // Recursively resolve this element's own parent
+        if let Some(ref grandparent_id) = actor.parent_id {
+            if let Some(gp) = resolve_parent_transform(state, grandparent_id, t, visited) {
+                // Apply grandparent transform to this parent's local transform
+                let rad = gp.rotation_deg.to_radians();
+                let cos_r = rad.cos();
+                let sin_r = rad.sin();
+                let local_x = (pos.x - gp.pos.x) * gp.scale;
+                let local_y = (pos.y - gp.pos.y) * gp.scale;
+                pos = WorldPos {
+                    x: gp.pos.x + local_x * cos_r - local_y * sin_r,
+                    y: gp.pos.y + local_x * sin_r + local_y * cos_r,
+                };
+                rotation += gp.rotation_deg;
+                scale *= gp.scale;
+            }
+        }
+
+        return Some(ParentTransform { pos, rotation_deg: rotation, scale });
+    }
+
+    // Try to find the parent as an overlay
+    if let Some(ov) = state.scene.overlays.iter().find(|ov| {
+        match ov {
+            Overlay::Text(o) => o.id == parent_id,
+            Overlay::Image(o) => o.id == parent_id,
+            Overlay::Video(o) => o.id == parent_id,
+        }
+    }) {
+        let (t_in, layout, parent_pid, modifiers): (f32, &[Keyframe<OverlayState>], Option<&String>, &[keyframe::TrackModifier]) = match ov {
+            Overlay::Text(o) => (o.t_in, &o.layout, o.parent_id.as_ref(), &o.modifiers),
+            Overlay::Image(o) => (o.t_in, &o.layout, o.parent_id.as_ref(), &o.modifiers),
+            Overlay::Video(o) => (o.t_in, &o.layout, o.parent_id.as_ref(), &o.modifiers),
+        };
+        let local_t = (t - t_in).max(0.0);
+        let ov_state = keyframe::sample(layout, local_t).unwrap_or_default();
+        let mod_delta = keyframe::evaluate_modifiers(modifiers, local_t);
+
+        let rf = &state.scene.render_frame;
+        let [rw, rh] = rf.resolution;
+        let world_w = rw as f32;
+        let world_h = rh as f32;
+
+        let mut pos = WorldPos {
+            x: ov_state.pos[0] * world_w + mod_delta.dx,
+            y: ov_state.pos[1] * world_h + mod_delta.dy,
+        };
+        let mut rotation = ov_state.rotation_deg + mod_delta.d_rotation_deg;
+        let mut scale = (ov_state.scale + mod_delta.d_scale).max(0.001);
+
+        // Recursively resolve this overlay's own parent
+        if let Some(grandparent_id) = parent_pid {
+            if let Some(gp) = resolve_parent_transform(state, grandparent_id, t, visited) {
+                let rad = gp.rotation_deg.to_radians();
+                let cos_r = rad.cos();
+                let sin_r = rad.sin();
+                let local_x = (pos.x - gp.pos.x) * gp.scale;
+                let local_y = (pos.y - gp.pos.y) * gp.scale;
+                pos = WorldPos {
+                    x: gp.pos.x + local_x * cos_r - local_y * sin_r,
+                    y: gp.pos.y + local_x * sin_r + local_y * cos_r,
+                };
+                rotation += gp.rotation_deg;
+                scale *= gp.scale;
+            }
+        }
+
+        return Some(ParentTransform { pos, rotation_deg: rotation, scale });
+    }
+
+    None
+}
+
+/// Apply a parent transform to a child's local world position. The child's
+/// position is treated as an offset from the parent's centre, rotated by
+/// the parent's rotation and scaled by the parent's scale.
+fn apply_parent_transform(child_pos: WorldPos, parent: &ParentTransform) -> WorldPos {
+    let rad = parent.rotation_deg.to_radians();
+    let cos_r = rad.cos();
+    let sin_r = rad.sin();
+    // Child's position is relative to the world origin; compute offset
+    // from parent centre, scale it, rotate it, then translate back.
+    let dx = (child_pos.x - parent.pos.x) * parent.scale;
+    let dy = (child_pos.y - parent.pos.y) * parent.scale;
+    WorldPos {
+        x: parent.pos.x + dx * cos_r - dy * sin_r,
+        y: parent.pos.y + dx * sin_r + dy * cos_r,
+    }
+}
+
 /// world coords relative to the render frame.
 fn get_element_world_pos(
     state: &EditorState,
@@ -2582,7 +2994,7 @@ fn get_element_world_pos(
     let world_w = rw as f32;
     let world_h = rh as f32;
 
-    if let Some(actor_state) = keyframe::sample(legacy_layout, t) {
+    let base_pos = if let Some(actor_state) = keyframe::sample(legacy_layout, t) {
         WorldPos {
             x: actor_state.pos[0] * world_w,
             y: actor_state.pos[1] * world_h,
@@ -2593,7 +3005,31 @@ fn get_element_world_pos(
             x: world_w * 0.5,
             y: world_h * 0.5,
         }
+    };
+
+    // ── Parent transform propagation ──
+    // If this element has a parent, apply the parent's accumulated
+    // transform (position, rotation, scale) to the child's local pos.
+    let parent_id = state.scene.actors.iter()
+        .find(|a| a.id == element_id)
+        .and_then(|a| a.parent_id.clone())
+        .or_else(|| {
+            state.scene.overlays.iter().find_map(|ov| match ov {
+                Overlay::Text(o) if o.id == element_id => o.parent_id.clone(),
+                Overlay::Image(o) if o.id == element_id => o.parent_id.clone(),
+                Overlay::Video(o) if o.id == element_id => o.parent_id.clone(),
+                _ => None,
+            })
+        });
+
+    if let Some(pid) = parent_id {
+        let mut visited = vec![element_id.to_string()];
+        if let Some(parent_xform) = resolve_parent_transform(state, &pid, t, &mut visited) {
+            return apply_parent_transform(base_pos, &parent_xform);
+        }
     }
+
+    base_pos
 }
 
 
@@ -2630,7 +3066,7 @@ fn draw_selection_gizmo(
     }
 
     // Drag state machine
-    if response.drag_started() {
+    if response.drag_started() && response.hovered() {
         if let Some(start_resp) = response.interact_pointer_pos() {
             // ── Use the EXACT press location, not the drift-after-egui-
             // ── decided-it's-a-drag location.
@@ -3237,9 +3673,9 @@ fn apply_drag(
             } else { initial_pos_world[1] };
 
             // Derive scale, scale_y from final dims.
-            let new_scale = (final_w / base_w.max(1e-3)).clamp(0.05, 20.0);
-            let new_scale_y_total = (final_h / base_h.max(1e-3)).clamp(0.05, 20.0);
-            let new_scale_y = (new_scale_y_total / new_scale.max(1e-3)).clamp(0.05, 20.0);
+            let new_scale = (final_w / base_w.max(1e-3)).clamp(0.05, 100.0);
+            let new_scale_y_total = (final_h / base_h.max(1e-3)).clamp(0.05, 100.0);
+            let new_scale_y = (new_scale_y_total / new_scale.max(1e-3)).clamp(0.05, 100.0);
 
             set_selection_scale(state, new_scale);
             set_selection_scale_y(state, new_scale_y);
@@ -3449,7 +3885,7 @@ fn current_selection_scale(state: &EditorState) -> Option<f32> {
             // Render frame uses inverse zoom as its "scale" — bigger value
             // = larger frame on the canvas.
             let rf_state = sample_render_frame(&state.scene.render_frame, t);
-            Some((1.0 / rf_state.zoom.max(1e-4)).clamp(0.05, 20.0))
+            Some((1.0 / rf_state.zoom.max(1e-4)).clamp(0.05, 100.0))
         }
         _ => None,
     }
@@ -3704,7 +4140,7 @@ fn sample_selection_transform(state: &EditorState, sel: Selection) -> (f32, f32,
         Selection::RenderFrame => {
             let rf_state = sample_render_frame(&state.scene.render_frame, t);
             (
-                (1.0 / rf_state.zoom.max(1e-4)).clamp(0.05, 20.0),
+                (1.0 / rf_state.zoom.max(1e-4)).clamp(0.05, 100.0),
                 1.0,
                 rf_state.rotation_deg,
             )
@@ -3746,8 +4182,8 @@ fn broadcast_multi_scale(state: &mut EditorState, scale_factor: f32, scale_y_fac
     let snapshot = state.canvas_drag.multi_drag_snapshot.clone();
     for entry in snapshot {
         if entry.selection == primary { continue; }
-        let new_scale = (entry.initial_scale * scale_factor).clamp(0.05, 20.0);
-        let new_scale_y = (entry.initial_scale_y * scale_y_factor).clamp(0.05, 20.0);
+        let new_scale = (entry.initial_scale * scale_factor).clamp(0.05, 100.0);
+        let new_scale_y = (entry.initial_scale_y * scale_y_factor).clamp(0.05, 100.0);
         write_selection_scale(state, entry.selection, new_scale, token_x);
         write_selection_scale_y(state, entry.selection, new_scale_y, token_y);
     }
@@ -3907,7 +4343,7 @@ fn write_selection_scale_y(
     new_scale_y: f32,
     token: u64,
 ) {
-    let s = new_scale_y.clamp(0.05, 20.0);
+    let s = new_scale_y.clamp(0.05, 100.0);
     let t = state.canvas_drag.drag_start_playhead.unwrap_or(state.playhead);
     if state.last_drag_group != Some(token) {
         state.undo.push(&state.scene);
@@ -3950,7 +4386,7 @@ fn write_selection_scale(
     new_scale: f32,
     token: u64,
 ) {
-    let s = new_scale.clamp(0.05, 20.0);
+    let s = new_scale.clamp(0.05, 100.0);
     let t = state.canvas_drag.drag_start_playhead.unwrap_or(state.playhead);
     if state.last_drag_group != Some(token) {
         state.undo.push(&state.scene);
@@ -4797,14 +5233,14 @@ fn draw_element_resize_handles(
                     match state.selection {
                         Selection::Actor(idx) if idx < state.scene.actors.len() => {
                             if let Some(kf) = state.scene.actors[idx].layout.first_mut() {
-                                kf.value.scale = (kf.value.scale * scale_factor).clamp(0.05, 10.0);
+                                kf.value.scale = (kf.value.scale * scale_factor).clamp(0.05, 100.0);
                             }
                         }
                         Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
                             match &mut state.scene.overlays[idx] {
-                                Overlay::Text(t) => { if let Some(kf) = t.layout.first_mut() { kf.value.scale = (kf.value.scale * scale_factor).clamp(0.05, 10.0); } }
-                                Overlay::Image(i) => { if let Some(kf) = i.layout.first_mut() { kf.value.scale = (kf.value.scale * scale_factor).clamp(0.05, 10.0); } }
-                                Overlay::Video(v) => { if let Some(kf) = v.layout.first_mut() { kf.value.scale = (kf.value.scale * scale_factor).clamp(0.05, 10.0); } }
+                                Overlay::Text(t) => { if let Some(kf) = t.layout.first_mut() { kf.value.scale = (kf.value.scale * scale_factor).clamp(0.05, 100.0); } }
+                                Overlay::Image(i) => { if let Some(kf) = i.layout.first_mut() { kf.value.scale = (kf.value.scale * scale_factor).clamp(0.05, 100.0); } }
+                                Overlay::Video(v) => { if let Some(kf) = v.layout.first_mut() { kf.value.scale = (kf.value.scale * scale_factor).clamp(0.05, 100.0); } }
                             }
                         }
                         _ => {}
@@ -4971,6 +5407,13 @@ fn overlay_bbox_with_state(
     state: &EditorState,
 ) -> (f32, f32) {
     if let Overlay::Image(img) = overlay {
+        // FX zone (empty source): use a fixed default bbox so resize
+        // handles and hit-testing work.
+        if img.source.as_os_str().is_empty() {
+            let sx = ov_state.scale;
+            let sy = ov_state.scale * ov_state.scale_y;
+            return (600.0 * sx, 400.0 * sy);
+        }
         if let Ok(map) = state.image_textures.lock() {
             if let Some(crate::state::ImageTextureSlot::Loaded { size, .. }) =
                 map.get(&img.source)
@@ -4995,6 +5438,10 @@ fn ensure_image_loaded(
     ctx: &egui::Context,
 ) -> Option<(u32, u32)> {
     use crate::state::ImageTextureSlot;
+    // Empty path = FX zone with no source. Skip the load entirely.
+    if path.as_os_str().is_empty() {
+        return None;
+    }
     // Cool-down between repeat decode attempts on a previously-failed
     // path. 500 ms is short enough that the user perceives the file
     // appearing "as soon as it's written", but long enough that we
@@ -5115,6 +5562,11 @@ fn ensure_image_fx_loaded(
     ctx: &egui::Context,
 ) -> Option<(egui::TextureHandle, [f32; 4])> {
     use crate::image_fx_cache::LookupOutcome;
+
+    // Empty path = FX zone, no source to bake.
+    if path.as_os_str().is_empty() {
+        return None;
+    }
 
     let sig = crate::image_effects::signature(effects);
 
@@ -6817,7 +7269,37 @@ pub fn handle_canvas_asset_drag(
         let kind = state.asset_drag.kind;
         match kind {
             crate::state::AssetDragKind::Clip | crate::state::AssetDragKind::Video => {
-                crate::panels::add_actor_from_clip_at_canvas(state, &asset_path, [world.x, world.y]);
+                // Lazy download: when the clip's local file doesn't
+                // exist yet, the user dragged a server-only stub.
+                // Kick a background download and place the actor
+                // when the bytes land.
+                if !asset_path.exists() {
+                    if let (Some(handle), Some(tx)) =
+                        (state.tokio_handle.clone(), state.image_fx_tx.clone())
+                    {
+                        let server_id = asset_path
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if !server_id.is_empty() {
+                            crate::jobs::spawn_clip_download(
+                                &handle,
+                                tx,
+                                state.server_url.clone(),
+                                server_id,
+                                asset_path.clone(),
+                                crate::jobs::ClipDropTarget::CanvasAt {
+                                    world_x: world.x,
+                                    world_y: world.y,
+                                },
+                            );
+                            state.status = crate::i18n::t("\u{2B07} Downloading clip from server...").into();
+                        }
+                    }
+                } else {
+                    crate::panels::add_actor_from_clip_at_canvas(state, &asset_path, [world.x, world.y]);
+                }
             }
             crate::state::AssetDragKind::Sound
             | crate::state::AssetDragKind::Image
