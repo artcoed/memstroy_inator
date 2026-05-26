@@ -3,7 +3,7 @@
 # server binary so Railway builds stay fast.
 
 [phases.setup]
-nixPkgs = ["rustup", "ffmpeg"]
+nixPkgs = ["gcc", "rustup", "ffmpeg"]
 
 [phases.build]
 cmds = ["cargo build --release --bin memstroy-assets-server"]
