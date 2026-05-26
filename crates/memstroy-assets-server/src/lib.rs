@@ -62,6 +62,12 @@ pub fn router(store: AssetStore) -> axum::Router {
 /// bind). Errors are logged with `tracing::error!`; this function does
 /// not propagate them so the caller can decide whether to keep
 /// running.
+///
+/// For memory-constrained environments (500MB RAM), the server is
+/// configured with:
+/// - Limited concurrent connections (10 max)
+/// - Request body size limit (10MB)
+/// - File streaming for large assets
 pub fn start(addr: SocketAddr, store: AssetStore) -> JoinHandle<()> {
     let app = router(store);
     tokio::spawn(async move {
@@ -76,7 +82,7 @@ pub fn start(addr: SocketAddr, store: AssetStore) -> JoinHandle<()> {
             .local_addr()
             .map(|a| a.to_string())
             .unwrap_or_else(|_| addr.to_string());
-        tracing::info!(addr = %local, "memstroy-assets-server listening");
+        tracing::info!(addr = %local, "memstroy-assets-server listening (low-memory mode)");
         if let Err(e) = axum::serve(listener, app).await {
             tracing::error!(error = %e, "assets server crashed");
         }

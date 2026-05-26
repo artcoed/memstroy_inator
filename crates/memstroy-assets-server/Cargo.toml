@@ -26,6 +26,7 @@ axum = "0.7"
 tower-http = { version = "0.5", features = ["cors", "fs"] }
 mime_guess = "2"
 walkdir = "2"
+tokio-util = { version = "0.7", features = ["io"] }
 
 memstroy-tg = { workspace = true }
 

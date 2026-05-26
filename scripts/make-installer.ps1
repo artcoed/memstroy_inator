@@ -285,6 +285,10 @@ $IssLines = @(
         "Name: `"{autodesktop}\Memstroy-inator`"; Filename: `"{app}\bin\$AppExeName`"; Tasks: desktopicon"
     })
     ''
+    '[UninstallDelete]'
+    '; Clean up the user cache directory when uninstalling'
+    'Type: filesandordirs; Name: "{userappdata}\.memstroy"'
+    ''
     '[Run]'
     "Filename: `"{app}\bin\$AppExeName`"; Description: `"{cm:LaunchProgram,Memstroy-inator}`"; Flags: nowait postinstall skipifsilent"
 )

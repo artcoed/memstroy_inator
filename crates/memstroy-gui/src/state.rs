@@ -497,6 +497,10 @@ pub struct EditorState {
     pub timeline_v_scroll: f32,
     /// Split tool active: when true, clicking on a clip cuts it at the click position.
     pub split_tool_active: bool,
+    /// Queued split from the timeline razor tool: (element, scene-time cut).
+    /// Drained by the app immediately after the timeline panel paints so the
+    /// cut uses the click position, not a playhead that may move next frame.
+    pub pending_timeline_split: Option<(Selection, f32)>,
     /// Library search filter text.
     pub library_search: String,
     /// Currently visible sub-library tab (Clips / Sounds / Images / Particles).
@@ -556,6 +560,8 @@ pub struct EditorState {
     pub recovery_dialog_open: bool,
     /// Time when the "Auto-saved" toast started (for fading the message after 2s).
     pub autosave_toast_until: Option<std::time::Instant>,
+    /// Time when the startup toast started (for fading the message after 5s).
+    pub startup_toast_until: Option<std::time::Instant>,
 
     // ─── Loop preview ──────────────────────────────────────────────
     /// Whether loop-preview mode is active.
@@ -1031,6 +1037,7 @@ impl EditorState {
         s.recovery_pending = None;
         s.recovery_dialog_open = false;
         s.autosave_toast_until = None;
+        s.startup_toast_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
 
         // Loop preview defaults
         s.loop_mode = false;
