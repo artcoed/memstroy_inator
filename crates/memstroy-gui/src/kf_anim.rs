@@ -298,6 +298,53 @@ pub fn animated_toggle(
     false
 }
 
+/// Seed the first keyframe for an actor param at the given time when
+/// the param was just toggled to animated and the layout is non-empty.
+/// If `t` is beyond the scene duration or before the clip, seeds at 0.
+/// Does nothing if the param already has a distinct keyframe at `t`.
+pub fn seed_actor_kf_on_toggle(
+    layout: &mut Vec<Keyframe<memstroy_core::ActorState>>,
+    t: f32,
+) {
+    // Ensure there's at least one kf (the layout should never be empty,
+    // but guard anyway).
+    if layout.is_empty() {
+        layout.push(memstroy_core::Keyframe::new(0.0, memstroy_core::ActorState::default()));
+        return;
+    }
+    // If layout has only one kf (or the playhead time already has one),
+    // nothing extra to do — the one existing kf IS the initial kf.
+    let insert_t = t.max(0.0);
+    let already_exists = layout.iter().any(|kf| (kf.t - insert_t).abs() < 1.0e-3);
+    if already_exists {
+        return;
+    }
+    // Insert a kf at the current playhead with the interpolated state.
+    let seed = sample_actor(layout, insert_t);
+    layout.push(memstroy_core::Keyframe::new(insert_t, seed));
+    layout.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap());
+}
+
+/// Seed the first keyframe for an overlay param — same logic as actor.
+#[allow(dead_code)]
+pub fn seed_overlay_kf_on_toggle(
+    layout: &mut Vec<Keyframe<memstroy_core::OverlayState>>,
+    t: f32,
+) {
+    if layout.is_empty() {
+        layout.push(memstroy_core::Keyframe::new(0.0, memstroy_core::OverlayState::default()));
+        return;
+    }
+    let insert_t = t.max(0.0);
+    let already_exists = layout.iter().any(|kf| (kf.t - insert_t).abs() < 1.0e-3);
+    if already_exists {
+        return;
+    }
+    let seed = sample_overlay(layout, insert_t);
+    layout.push(memstroy_core::Keyframe::new(insert_t, seed));
+    layout.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap());
+}
+
 // ─── Keyframe selection in the timeline ──────────────────────────────
 
 /// One entry in the layer's keyframe-selection list.

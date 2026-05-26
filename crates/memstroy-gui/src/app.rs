@@ -1512,6 +1512,53 @@ impl App {
                             &mut self.state.curve_editor_property,
                             playhead,
                         );
+                        // Effect animated params — show a scalar curve
+                        // editor for each animated effect parameter.
+                        let actor_t_in = a.t_in.unwrap_or(0.0);
+                        let t_local = (playhead - actor_t_in).max(0.0);
+                        for (fx_idx, eff) in a.effects.iter_mut().enumerate() {
+                            let kind_label = eff.kind.label().to_string();
+                            let animated_keys: Vec<String> =
+                                eff.animated_params.iter().cloned().collect();
+                            for key in animated_keys {
+                                let param_label_owned = format!(
+                                    "{} {}",
+                                    kind_label,
+                                    match key.as_str() {
+                                        "intensity" => "Intensity",
+                                        "p0" => "Param",
+                                        "p1" => "Param 2",
+                                        "p2" => "Param 3",
+                                        "p3" => "Param 4",
+                                        other => other,
+                                    }
+                                );
+                                let static_val =
+                                    crate::curve_editor::effect_param_static_value(eff, &key);
+                                let range =
+                                    crate::curve_editor::effect_param_value_range(&key);
+                                let kfs = eff.param_kfs.entry(key.clone()).or_default();
+                                ui.add_space(6.0);
+                                ui.separator();
+                                let target = CurveEditorTarget::EffectParam {
+                                    kfs,
+                                    animated_params: &mut eff.animated_params,
+                                    param_id: &key,
+                                    param_label: &param_label_owned,
+                                    param_color: crate::curve_editor::effect_param_color(fx_idx),
+                                    value_range: range,
+                                    static_value: static_val,
+                                    t_local,
+                                };
+                                curve_editor_panel(
+                                    ui,
+                                    target,
+                                    duration,
+                                    &mut self.state.curve_editor_property,
+                                    playhead,
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -1547,6 +1594,57 @@ impl App {
                             &mut self.state.curve_editor_property,
                             playhead,
                         );
+                        // Effect animated params for overlay.
+                        let overlay_t_in = t_in;
+                        let t_local = (playhead - overlay_t_in).max(0.0);
+                        let effects: &mut Vec<memstroy_core::Effect> = match ov {
+                            memstroy_core::Overlay::Text(o) => &mut o.effects,
+                            memstroy_core::Overlay::Image(o) => &mut o.effects,
+                            memstroy_core::Overlay::Video(o) => &mut o.effects,
+                        };
+                        for (fx_idx, eff) in effects.iter_mut().enumerate() {
+                            let kind_label = eff.kind.label().to_string();
+                            let animated_keys: Vec<String> =
+                                eff.animated_params.iter().cloned().collect();
+                            for key in animated_keys {
+                                let param_label_owned = format!(
+                                    "{} {}",
+                                    kind_label,
+                                    match key.as_str() {
+                                        "intensity" => "Intensity",
+                                        "p0" => "Param",
+                                        "p1" => "Param 2",
+                                        "p2" => "Param 3",
+                                        "p3" => "Param 4",
+                                        other => other,
+                                    }
+                                );
+                                let static_val =
+                                    crate::curve_editor::effect_param_static_value(eff, &key);
+                                let range =
+                                    crate::curve_editor::effect_param_value_range(&key);
+                                let kfs = eff.param_kfs.entry(key.clone()).or_default();
+                                ui.add_space(6.0);
+                                ui.separator();
+                                let target = CurveEditorTarget::EffectParam {
+                                    kfs,
+                                    animated_params: &mut eff.animated_params,
+                                    param_id: &key,
+                                    param_label: &param_label_owned,
+                                    param_color: crate::curve_editor::effect_param_color(fx_idx),
+                                    value_range: range,
+                                    static_value: static_val,
+                                    t_local,
+                                };
+                                curve_editor_panel(
+                                    ui,
+                                    target,
+                                    duration,
+                                    &mut self.state.curve_editor_property,
+                                    playhead,
+                                );
+                            }
+                        }
                     }
                 }
             }

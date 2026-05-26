@@ -75,6 +75,21 @@ pub enum CurveEditorTarget<'a> {
         layout: &'a mut Vec<Keyframe<RenderFrameState>>,
         animated_params: &'a mut BTreeSet<String>,
     },
+    /// Single effect-parameter scalar track. Re-uses the same graph
+    /// as Audio (scalar `Vec<Keyframe<f32>>`) but with its own
+    /// header and parameter metadata. The caller resolves which
+    /// effect + param key to bind.
+    EffectParam {
+        kfs: &'a mut Vec<Keyframe<f32>>,
+        animated_params: &'a mut BTreeSet<String>,
+        param_id: &'a str,
+        param_label: &'a str,
+        param_color: Color32,
+        value_range: (f32, f32),
+        static_value: f32,
+        /// Clip-local time of the playhead.
+        t_local: f32,
+    },
 }
 
 const PROPERTY_NAMES: &[&str] =
@@ -367,6 +382,84 @@ pub fn curve_editor_panel(
                         animated_params.remove(param_id);
                     } else {
                         animated_params.insert(param_id.to_string());
+                    }
+                }
+                ui.with_layout(
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        if ui
+                            .small_button(t("+ Key"))
+                            .on_hover_text(t("Add keyframe at playhead"))
+                            .clicked()
+                        {
+                            let value = sample_f32_kfs(kfs, t_local, static_value);
+                            kfs.push(Keyframe::new(t_local.max(0.0), value));
+                            kfs.sort_by(|a, b| {
+                                a.t.partial_cmp(&b.t).unwrap()
+                            });
+                            animated_params.insert(param_id.to_string());
+                        }
+                    },
+                );
+            });
+
+            ui.add_space(4.0);
+            scalar_curve_editor(
+                ui,
+                kfs,
+                animated_params,
+                param_id,
+                param_color,
+                duration,
+                value_range,
+                static_value,
+                t_local,
+            );
+        }
+        CurveEditorTarget::EffectParam {
+            kfs,
+            animated_params,
+            param_id,
+            param_label,
+            param_color,
+            value_range,
+            static_value,
+            t_local,
+        } => {
+            // Header for effect param — mirrors the Audio variant but
+            // with an "Effect" badge and the effect-specific label.
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(t("Curve Editor"))
+                        .size(13.0)
+                        .strong()
+                        .color(Color32::WHITE),
+                );
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(param_label)
+                        .size(11.0)
+                        .color(param_color),
+                );
+                let on = animated_params.contains(param_id);
+                let toggle_label = if on { t("Animated") } else { t("Static") };
+                if ui
+                    .selectable_label(on, toggle_label)
+                    .on_hover_text(t(
+                        "Toggle whether this parameter is animatable (changes will create keyframes)",
+                    ))
+                    .clicked()
+                {
+                    if on {
+                        animated_params.remove(param_id);
+                    } else {
+                        animated_params.insert(param_id.to_string());
+                        // Auto-create a keyframe at the current playhead
+                        // position (or t=0 if outside range).
+                        let entry_t = t_local.max(0.0);
+                        if kfs.is_empty() {
+                            kfs.push(Keyframe::new(entry_t, static_value));
+                        }
                     }
                 }
                 ui.with_layout(
@@ -971,4 +1064,72 @@ fn draw_grid(painter: &egui::Painter, rect: Rect, t_min: f32, t_max: f32, v_min:
         );
         t += step;
     }
+}
+
+
+// ─── Effect-param helpers for the curve editor ───────────────────────
+
+/// Resolve the static value of an effect parameter (intensity or kind-
+/// specific). Used by `app.rs` when constructing a `CurveEditorTarget::EffectParam`.
+pub fn effect_param_static_value(eff: &memstroy_core::Effect, key: &str) -> f32 {
+    if key == "intensity" {
+        return eff.intensity;
+    }
+    // Delegate to the kind's static getter (same logic as the inspector).
+    use memstroy_core::EffectKind as K;
+    match &eff.kind {
+        K::Blur { radius } if key == "p0" => *radius,
+        K::Sharpen { amount } if key == "p0" => *amount,
+        K::HueShift { degrees } if key == "p0" => *degrees,
+        K::Vignette { strength } if key == "p0" => *strength,
+        K::Pixelate { block_size } if key == "p0" => *block_size,
+        K::Posterize { levels } if key == "p0" => *levels as f32,
+        K::Glow { radius, .. } if key == "p0" => *radius,
+        K::Glow { intensity, .. } if key == "p1" => *intensity,
+        K::Brightness { amount } if key == "p0" => *amount,
+        K::Contrast { amount } if key == "p0" => *amount,
+        K::Saturation { amount } if key == "p0" => *amount,
+        K::EdgeDetect { threshold } if key == "p0" => *threshold,
+        K::ChromaticAberration { offset } if key == "p0" => *offset,
+        K::Noise { amount } if key == "p0" => *amount,
+        K::Wave { amplitude, .. } if key == "p0" => *amplitude,
+        K::Wave { wavelength, .. } if key == "p1" => *wavelength,
+        K::Glitch { strength } if key == "p0" => *strength,
+        K::Bloom { radius } if key == "p0" => *radius,
+        K::Crop { left, .. } if key == "p0" => *left,
+        K::Crop { top, .. } if key == "p1" => *top,
+        K::Crop { right, .. } if key == "p2" => *right,
+        K::Crop { bottom, .. } if key == "p3" => *bottom,
+        K::Mask { feather, .. } if key == "p0" => *feather,
+        K::ColorKey { similarity, .. } if key == "p0" => *similarity,
+        K::ColorKey { blend, .. } if key == "p1" => *blend,
+        K::ColorKey { spill, .. } if key == "p2" => *spill,
+        _ => 0.0,
+    }
+}
+
+/// Reasonable value range for an effect parameter key.
+pub fn effect_param_value_range(key: &str) -> (f32, f32) {
+    match key {
+        "intensity" => (0.0, 1.0),
+        "p0" => (0.0, 100.0), // conservative wide range
+        "p1" => (0.0, 100.0),
+        "p2" => (0.0, 1.0),
+        "p3" => (0.0, 1.0),
+        _ => (0.0, 1.0),
+    }
+}
+
+/// Distinct colour for effect param curves, cycling through a palette
+/// keyed by effect index.
+pub fn effect_param_color(fx_idx: usize) -> Color32 {
+    const PALETTE: &[Color32] = &[
+        Color32::from_rgb(255, 140, 200),
+        Color32::from_rgb(140, 220, 255),
+        Color32::from_rgb(200, 255, 140),
+        Color32::from_rgb(255, 200, 100),
+        Color32::from_rgb(180, 140, 255),
+        Color32::from_rgb(100, 255, 200),
+    ];
+    PALETTE[fx_idx % PALETTE.len()]
 }
