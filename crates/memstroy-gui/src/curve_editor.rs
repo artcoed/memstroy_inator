@@ -586,18 +586,45 @@ fn transform_curve_editor<T>(
 
     ui.add_space(4.0);
 
+    // ── Compute which keyframes are relevant for the selected property ──
+    // A keyframe is "relevant" if it's the first kf, or the value of the
+    // selected property differs from the previous kf. This prevents
+    // position-only keyframes from cluttering the Scale view (the core
+    // bug report: "position kfs showing in scale menu").
+    let prop = *selected_property;
+    let relevant_indices: Vec<usize> = {
+        let mut indices = Vec::new();
+        const EPS: f32 = 1.0e-4;
+        for (ki, kf) in keyframes.iter().enumerate() {
+            if ki == 0 {
+                // Always include the first kf — it establishes the
+                // initial value for the property.
+                indices.push(ki);
+            } else {
+                let prev_val = get_property(&keyframes[ki - 1].value, prop);
+                let cur_val = get_property(&kf.value, prop);
+                if (cur_val - prev_val).abs() > EPS {
+                    indices.push(ki);
+                }
+            }
+        }
+        indices
+    };
+
     // ── Easing picker for the selected kf at the playhead ──
-    if !keyframes.is_empty() {
+    // Only considers keyframes that are relevant to the selected property
+    // so the user isn't editing easing on a position-only kf while viewing
+    // the Scale curve.
+    if !relevant_indices.is_empty() {
         let local_t = (playhead - time_offset).max(0.0);
-        let nearest_idx = keyframes
+        let nearest_idx = relevant_indices
             .iter()
-            .enumerate()
-            .min_by(|(_, a), (_, b)| {
-                let da = (a.t - local_t).abs();
-                let db = (b.t - local_t).abs();
+            .copied()
+            .min_by(|&a, &b| {
+                let da = (keyframes[a].t - local_t).abs();
+                let db = (keyframes[b].t - local_t).abs();
                 da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
             })
-            .map(|(i, _)| i)
             .unwrap_or(0);
         ui.horizontal(|ui| {
             ui.label(
@@ -609,10 +636,18 @@ fn transform_curve_editor<T>(
             if let Some(next) = easing_picker(ui, cur_easing) {
                 keyframes[nearest_idx].easing = next;
             }
+            // Show the kf number relative to relevant-only count so
+            // the user reads "kf #2 of 3" (only property-relevant kfs)
+            // instead of "kf #5 of 12" (all kfs including other props).
+            let display_num = relevant_indices
+                .iter()
+                .position(|&i| i == nearest_idx)
+                .map(|p| p + 1)
+                .unwrap_or(1);
             ui.label(
                 egui::RichText::new(format!(
                     "kf #{} @ {:.2}s",
-                    nearest_idx + 1,
+                    display_num,
                     keyframes[nearest_idx].t,
                 ))
                 .size(10.0)
@@ -641,7 +676,6 @@ fn transform_curve_editor<T>(
         Stroke::new(1.0, Color32::from_rgb(44, 42, 28)),
     );
 
-    let prop = *selected_property;
     let (val_min, val_max) = property_range(prop);
     let time_min = 0.0_f32;
     let time_max = duration.max(0.1);
@@ -696,6 +730,12 @@ fn transform_curve_editor<T>(
     }
 
     // Draw keyframe diamonds (draggable).
+    // Only keyframes RELEVANT to the selected property get full-size
+    // interactive diamonds. Irrelevant kfs (where the selected property
+    // didn't change) are shown as tiny dimmed dots so the user still
+    // sees the overall timeline structure but can't confuse them with
+    // actual property changes — this fixes the "position kfs showing
+    // in scale menu" bug.
     let diamond_size = 6.0;
     let mut drag_idx: Option<usize> = None;
     let mut delete_idx: Option<usize> = None;
@@ -706,6 +746,21 @@ fn transform_curve_editor<T>(
         let cx = time_to_graph_x(kf.t, time_min, time_max, inner_rect);
         let cy = value_to_graph_y(v, val_min, val_max, inner_rect);
         let center = Pos2::new(cx, cy);
+
+        let is_relevant = relevant_indices.contains(&ki);
+
+        if !is_relevant {
+            // Irrelevant kf: draw a tiny dimmed circle as a hint, no
+            // interaction. This prevents the user from accidentally
+            // dragging/editing a kf that belongs to another property.
+            let ghost_r = 2.5;
+            painter.circle_filled(
+                center,
+                ghost_r,
+                Color32::from_rgba_premultiplied(140, 140, 160, 60),
+            );
+            continue;
+        }
 
         let diamond_points = vec![
             Pos2::new(center.x, center.y - diamond_size),
