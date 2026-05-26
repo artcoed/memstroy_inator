@@ -44,6 +44,8 @@ pub fn router(store: AssetStore) -> Router {
         .route("/api/ingest/tg", post(post_ingest_tg))
         .with_state(store)
         .layer(cors)
+        // Limit request body size to 10MB to prevent OOM
+        .layer(axum::extract::DefaultBodyLimit::max(10 * 1024 * 1024))
 }
 
 // ---------------------------------------------------------------------------
@@ -75,15 +77,14 @@ struct ListQuery {
 }
 
 const DEFAULT_LIMIT: u64 = 24;
-// Lifted from 200 → 5000 because the GUI's "Refresh from Telegram"
-// flow asks for the **whole** clip catalogue (`?kind=clip&limit=…`)
-// in a single call so it can mirror new files into its local cache.
-// With a 200-row cap, channels that contained 400+ clips silently
-// got truncated and the user only ever saw the first 200 — exactly
-// the "клипы с сервера не подгружаются" symptom they reported.
-// 5000 is a comfortable headroom for any single Telegram channel
-// while still keeping a single response under a few MB.
-const MAX_LIMIT: u64 = 5000;
+// Reduced from 5000 to 500 for memory-constrained environments (500MB RAM).
+// Large responses can cause OOM on small servers. Clients should paginate
+// through the catalogue instead of requesting everything at once.
+const MAX_LIMIT: u64 = 500;
+
+// Maximum file size to load into memory at once (50MB).
+// Files larger than this will be streamed chunk-by-chunk.
+const MAX_IN_MEMORY_SIZE: u64 = 50 * 1024 * 1024;
 
 #[derive(Debug, Serialize)]
 struct ListResponse {
@@ -143,18 +144,24 @@ async fn get_preview(
 ) -> Result<Response, ApiError> {
     let entry = store.get(&id).ok_or(ApiError::NotFound)?;
     let thumb = entry.thumbnail.ok_or(ApiError::NotFound)?;
-    let bytes = tokio::fs::read(&thumb)
+    
+    // Stream thumbnails to avoid loading large images into memory
+    let file = tokio::fs::File::open(&thumb)
         .await
         .map_err(|e| {
-            warn!(path = %thumb.display(), error = %e, "thumbnail read failed");
+            warn!(path = %thumb.display(), error = %e, "thumbnail open failed");
             ApiError::NotFound
         })?;
+    
     let mime = mime_guess::from_path(&thumb).first_or_octet_stream();
+    let stream = tokio_util::io::ReaderStream::new(file);
+    let body = Body::from_stream(stream);
+    
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, mime.as_ref())
         .header(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=300"))
-        .body(Body::from(bytes))
+        .body(body)
         .expect("valid response"))
 }
 
@@ -167,10 +174,13 @@ async fn get_download(
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
     let entry = store.get(&id).ok_or(ApiError::NotFound)?;
-    let bytes = tokio::fs::read(&entry.path).await.map_err(|e| {
-        warn!(path = %entry.path.display(), error = %e, "asset read failed");
+    
+    // Check file size and stream large files instead of loading into memory
+    let metadata = tokio::fs::metadata(&entry.path).await.map_err(|e| {
+        warn!(path = %entry.path.display(), error = %e, "metadata read failed");
         ApiError::NotFound
     })?;
+    
     let mime = mime_guess::from_path(&entry.path).first_or_octet_stream();
     let filename = entry
         .path
@@ -179,11 +189,32 @@ async fn get_download(
         .map(sanitize_filename)
         .unwrap_or_else(|| entry.id.clone());
     let disposition = format!("attachment; filename=\"{}\"", filename);
+    
+    let file_size = metadata.len();
+    
+    // For small files, load into memory for better performance
+    // For large files, stream to avoid OOM
+    let body = if file_size <= MAX_IN_MEMORY_SIZE {
+        let bytes = tokio::fs::read(&entry.path).await.map_err(|e| {
+            warn!(path = %entry.path.display(), error = %e, "asset read failed");
+            ApiError::NotFound
+        })?;
+        Body::from(bytes)
+    } else {
+        let file = tokio::fs::File::open(&entry.path).await.map_err(|e| {
+            warn!(path = %entry.path.display(), error = %e, "asset open failed");
+            ApiError::NotFound
+        })?;
+        let stream = tokio_util::io::ReaderStream::new(file);
+        Body::from_stream(stream)
+    };
+    
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, mime.as_ref())
         .header(header::CONTENT_DISPOSITION, disposition)
-        .body(Body::from(bytes))
+        .header(header::CONTENT_LENGTH, file_size.to_string())
+        .body(body)
         .expect("valid response"))
 }
 
@@ -208,6 +239,21 @@ async fn get_text(
     if entry.kind != AssetKind::Text {
         return Err(ApiError::NotFound);
     }
+    
+    // Check file size before loading
+    let metadata = tokio::fs::metadata(&entry.path).await.map_err(|e| {
+        warn!(path = %entry.path.display(), error = %e, "metadata read failed");
+        ApiError::NotFound
+    })?;
+    
+    // Limit text file size to prevent OOM (10MB max for text files)
+    const MAX_TEXT_SIZE: u64 = 10 * 1024 * 1024;
+    if metadata.len() > MAX_TEXT_SIZE {
+        return Err(ApiError::BadRequest(
+            format!("Text file too large: {} bytes (max {})", metadata.len(), MAX_TEXT_SIZE).into()
+        ));
+    }
+    
     let body = tokio::fs::read_to_string(&entry.path)
         .await
         .map_err(|e| {
@@ -236,14 +282,10 @@ struct TgIngestRequest {
 }
 
 fn default_ingest_limit() -> u32 {
-    // Default catalog depth for a fresh ingest. The previous default
-    // of 32 capped channels at the most recent ~32 posts, which made
-    // the "Refresh from Telegram" button feel anaemic on rich
-    // channels that already have hundreds of clips. 500 is enough to
-    // pull the typical multi-year backlog while still respecting
-    // Telegram's preview-page rate (≈16 posts per page → ~32 page
-    // fetches with the existing 250 ms delay between pages).
-    500
+    // Reduced from 500 to 100 for memory-constrained environments (500MB RAM).
+    // Large ingests can cause OOM on small servers. Users can run multiple
+    // smaller ingests if needed.
+    100
 }
 
 async fn post_ingest_tg(
