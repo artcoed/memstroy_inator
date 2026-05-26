@@ -54,7 +54,7 @@ pub fn spawn_tg_ingest(store: AssetStore, channel: String, limit: u32) {
         posts.sort_by(|a, b| b.id.cmp(&a.id));
         posts.truncate(limit as usize);
 
-        match memstroy_tg::download_videos(&posts, &clips_dir, false, 4).await {
+        match memstroy_tg::download_videos(&posts, &clips_dir, false, 2).await {
             Ok(stats) => info!(
                 downloaded = stats.downloaded,
                 skipped = stats.skipped,

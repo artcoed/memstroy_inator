@@ -1542,32 +1542,11 @@ impl App {
             return;
         }
 
-        // ── Element picker (only shown when there's more than one) ──
-        let mut chosen_idx = self
-            .state
-            .curve_editor_active_idx
-            .min(candidates.len().saturating_sub(1));
-        if candidates.len() > 1 {
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new(t("Element"))
-                        .size(11.0)
-                        .color(Color32::from_rgb(160, 160, 180)),
-                );
-                egui::ComboBox::from_id_source("curve_editor_element_picker")
-                    .selected_text(&candidates[chosen_idx].0)
-                    .show_ui(ui, |ui| {
-                        for (i, (label, _sel, _kind)) in
-                            candidates.iter().enumerate()
-                        {
-                            ui.selectable_value(&mut chosen_idx, i, label);
-                        }
-                    });
-            });
-            ui.add_space(2.0);
-        }
-        self.state.curve_editor_active_idx = chosen_idx;
-
+        // The curve editor is always bound to the primary selection.
+        // The previous "element picker" made it too easy to edit curves
+        // on a different element than the one currently selected on the
+        // canvas/timeline.
+        let chosen_idx = 0usize;
         let (_label, sel, kind) = candidates[chosen_idx].clone();
         let duration = self.state.scene.output.duration;
         let playhead = self.state.playhead;
@@ -3859,6 +3838,17 @@ impl eframe::App for App {
                 // Refresh button at top of library
             });
 
+        // Timeline razor/split: drain the queued split immediately after the
+        // timeline has painted so the cut uses the click position and the
+        // exact clicked element (not whatever was previously selected).
+        if let Some((sel, cut_t)) = self.state.pending_timeline_split.take() {
+            // Mirror the old split behavior: move playhead to the cut and
+            // focus the clicked element, then perform a split at that time.
+            self.state.playhead = cut_t;
+            self.state.selection = sel;
+            self.split_at_playhead();
+        }
+
         // Check if refresh was requested via flag
         if self.state.status == "__REFRESH_REQUESTED__" {
             self.state.status = String::new();
@@ -4421,6 +4411,29 @@ impl eframe::App for App {
                     != self.state.audio_track_assignments;
             if pre_yaml != cur_yaml || assignments_changed {
                 self.state.undo.push_full(frame_start_scene);
+            }
+        }
+
+        // ── Toast notifications ──
+        // Show startup toast notification
+        if let Some(until) = self.state.startup_toast_until {
+            if std::time::Instant::now() < until {
+                egui::Window::new("")
+                    .title_bar(false)
+                    .resizable(false)
+                    .collapsible(false)
+                    .anchor(egui::Align2::CENTER_TOP, [0.0, 50.0])
+                    .frame(egui::Frame::popup(&ctx.style()).fill(Color32::from_rgb(40, 38, 26)))
+                    .show(ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("📢").size(16.0));
+                            ui.label(RichText::new("Следите за обновлениями и жалуйтесь на баги в telegram: https://t.me/memstroy_inator")
+                                .size(12.0)
+                                .color(Color32::from_rgb(220, 220, 220)));
+                        });
+                    });
+            } else {
+                self.state.startup_toast_until = None;
             }
         }
     }

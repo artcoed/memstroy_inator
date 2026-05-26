@@ -142,6 +142,9 @@ pub struct WebImageSearchState {
     /// 1-indexed page counter for status display only ("Page 2: 100
     /// more results"). Resets to 0 on a fresh search.
     pub page_count: u32,
+    /// Last outer size of the floating window (remembered so opening /
+    /// searching does not reset the user's layout).
+    pub panel_size: Option<egui::Vec2>,
 }
 
 /// Mark the matching hit as "no longer downloading" and update its
@@ -181,9 +184,22 @@ pub fn show_window(
     tx: &Sender<JobEvent>,
 ) {
     let mut open = state.web_image_search_open;
+    let window_id = egui::Id::new("web_image_search_window");
+    if let Some(rect) = ctx.memory(|m| m.area_rect(window_id)) {
+        let sz = rect.size();
+        if sz.x >= 300.0 && sz.y >= 280.0 {
+            state.web_image_search.panel_size = Some(sz);
+        }
+    }
+    let default_sz = state
+        .web_image_search
+        .panel_size
+        .unwrap_or(egui::vec2(560.0, 640.0));
+
     egui::Window::new(format!("\u{1F310} {}", crate::i18n::t("Web Image Search")))
+        .id(window_id)
         .open(&mut open)
-        .default_size([560.0, 640.0])
+        .default_size(default_sz)
         .min_width(300.0)
         .max_width(1200.0)
         .min_height(280.0)
@@ -192,19 +208,36 @@ pub fn show_window(
         .collapsible(true)
         .scroll(false)
         .show(ctx, |ui| {
-            // Cap inner UI width to whatever the user has dragged the
-            // window to — without this, the grid's measured min-width
-            // (cards × col count) would push the window wider every
-            // time results expand.
-            let avail = ui.available_width();
-            ui.set_max_width(avail);
-            ui.set_min_width(avail);
-            window_body(ui, state, tx);
+            // Pin content to the current window interior width. Do NOT
+            // call `set_min_width(available_width())` — before the first
+            // layout pass `available_width` can be the full viewport,
+            // which is exactly what made the panel jump to screen width
+            // when a search started.
+            let body_w = ui.max_rect().width();
+            ui.set_width(body_w);
+            ui.set_max_width(body_w);
+
+            // Claim the full window body for pointer hits so clicks on
+            // padding / gaps between widgets don't fall through to the
+            // timeline / layers panel underneath.
+            let block_rect = ui.max_rect();
+            ui.interact(
+                block_rect,
+                ui.id().with("web_image_search_pointer_block"),
+                Sense::click(),
+            );
+
+            window_body(ui, state, tx, body_w);
         });
     state.web_image_search_open = open;
 }
 
-fn window_body(ui: &mut egui::Ui, state: &mut EditorState, tx: &Sender<JobEvent>) {
+fn window_body(
+    ui: &mut egui::Ui,
+    state: &mut EditorState,
+    tx: &Sender<JobEvent>,
+    body_w: f32,
+) {
     use crate::i18n::t;
 
     // ── Search bar ─────────────────────────────────────────────────
@@ -212,7 +245,7 @@ fn window_body(ui: &mut egui::Ui, state: &mut EditorState, tx: &Sender<JobEvent>
         let resp = ui.add(
             egui::TextEdit::singleline(&mut state.web_image_search.query)
                 .hint_text(t("Search images..."))
-                .desired_width(ui.available_width() - 110.0),
+                .desired_width((body_w - 110.0).max(80.0)),
         );
         let enter = resp.lost_focus()
             && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -252,11 +285,14 @@ fn window_body(ui: &mut egui::Ui, state: &mut EditorState, tx: &Sender<JobEvent>
             if ui.button(format!("\u{1F504} {}", t("Retry"))).clicked() {
                 kick_search(state, tx, /*append=*/ false);
             }
-            ui.label(
-                RichText::new(t("Check your internet connection or try a different query."))
-                    .size(10.0)
-                    .italics()
-                    .color(Color32::from_rgb(160, 160, 180)),
+            ui.add(
+                egui::Label::new(
+                    RichText::new(t("Check your internet connection or try a different query."))
+                        .size(10.0)
+                        .italics()
+                        .color(Color32::from_rgb(160, 160, 180)),
+                )
+                .wrap(),
             );
         });
     } else {
@@ -271,11 +307,14 @@ fn window_body(ui: &mut egui::Ui, state: &mut EditorState, tx: &Sender<JobEvent>
                 state.web_image_search.results.len(),
             )
         };
-        ui.label(
-            RichText::new(hint)
-                .size(10.5)
-                .italics()
-                .color(Color32::from_rgb(160, 160, 180)),
+        ui.add(
+            egui::Label::new(
+                RichText::new(hint)
+                    .size(10.5)
+                    .italics()
+                    .color(Color32::from_rgb(160, 160, 180)),
+            )
+            .wrap(),
         );
     }
     ui.add_space(4.0);

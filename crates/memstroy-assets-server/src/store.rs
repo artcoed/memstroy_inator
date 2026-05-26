@@ -50,6 +50,9 @@ impl AssetStore {
     /// treated as sidecars and skipped. Sibling files such as
     /// `<stem>.txt`, `<stem>.tags`, `<stem>.label`, `<stem>.thumb.png`
     /// are picked up as metadata for their primary asset.
+    ///
+    /// For memory-constrained environments (500MB RAM), descriptions
+    /// are truncated to 500 chars to reduce memory footprint.
     pub fn index_dir(&self, root: &Path) -> Result<()> {
         let root = root.to_path_buf();
         let mut by_id: BTreeMap<String, AssetEntry> = BTreeMap::new();
@@ -86,10 +89,19 @@ impl AssetStore {
                 let size_bytes = metadata.len();
 
                 let label = read_sidecar_string(&path, "label").unwrap_or_else(|| stem.clone());
+                
+                // Truncate descriptions to save memory (500 chars max)
                 let description = match kind {
-                    AssetKind::Text => std::fs::read_to_string(&path).unwrap_or_default(),
-                    _ => read_sidecar_string(&path, "txt").unwrap_or_default(),
+                    AssetKind::Text => {
+                        let full = std::fs::read_to_string(&path).unwrap_or_default();
+                        truncate_string(full, 500)
+                    },
+                    _ => {
+                        let full = read_sidecar_string(&path, "txt").unwrap_or_default();
+                        truncate_string(full, 500)
+                    }
                 };
+                
                 let tags = read_sidecar_string(&path, "tags")
                     .map(parse_tags)
                     .unwrap_or_default();
@@ -300,6 +312,16 @@ fn find_thumbnail(primary: &Path, kind: AssetKind) -> Option<PathBuf> {
     }
 
     None
+}
+
+/// Truncate a string to a maximum length, preserving UTF-8 boundaries.
+fn truncate_string(s: String, max_len: usize) -> String {
+    if s.len() <= max_len {
+        return s;
+    }
+    let mut truncated = s.chars().take(max_len).collect::<String>();
+    truncated.push_str("…");
+    truncated
 }
 
 #[allow(dead_code)]

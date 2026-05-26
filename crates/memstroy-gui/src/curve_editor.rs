@@ -635,17 +635,21 @@ fn transform_curve_editor<T>(
     let relevant_indices: Vec<usize> = {
         let mut indices = Vec::new();
         const EPS: f32 = 1.0e-4;
+        let mut last_kept: Option<f32> = None;
         for (ki, kf) in keyframes.iter().enumerate() {
+            let cur_val = get_property(&kf.value, prop);
             if ki == 0 {
                 // Always include the first kf — it establishes the
                 // initial value for the property.
                 indices.push(ki);
-            } else {
-                let prev_val = get_property(&keyframes[ki - 1].value, prop);
-                let cur_val = get_property(&kf.value, prop);
-                if (cur_val - prev_val).abs() > EPS {
-                    indices.push(ki);
-                }
+                last_kept = Some(cur_val);
+            } else if last_kept.is_none() || (cur_val - last_kept.unwrap()).abs() > EPS {
+                // Compare against the previous *relevant* keyframe's value,
+                // not the immediate predecessor. This yields per-parameter
+                // keyframe points even when other properties insert extra
+                // keyframes at times when this property is unchanged.
+                indices.push(ki);
+                last_kept = Some(cur_val);
             }
         }
         indices
@@ -814,13 +818,6 @@ fn transform_curve_editor<T>(
             center
         };
 
-        let diamond_points = vec![
-            Pos2::new(display_center.x, display_center.y - diamond_size),
-            Pos2::new(display_center.x + diamond_size, display_center.y),
-            Pos2::new(display_center.x, display_center.y + diamond_size),
-            Pos2::new(display_center.x - diamond_size, display_center.y),
-        ];
-
         let fill = if is_ce_selected {
             Color32::from_rgb(255, 230, 80)
         } else {
@@ -832,11 +829,24 @@ fn transform_curve_editor<T>(
             Color32::WHITE
         };
 
-        painter.add(egui::Shape::convex_polygon(
-            diamond_points,
-            fill,
-            Stroke::new(1.0, stroke_color),
-        ));
+        if kf.easing == Easing::Step {
+            // Instant transition: draw a square to distinguish step-hold keyframes.
+            let r = Rect::from_center_size(display_center, Vec2::splat(diamond_size * 2.0));
+            painter.rect_filled(r, Rounding::ZERO, fill);
+            painter.rect_stroke(r, Rounding::ZERO, Stroke::new(1.0, stroke_color));
+        } else {
+            let diamond_points = vec![
+                Pos2::new(display_center.x, display_center.y - diamond_size),
+                Pos2::new(display_center.x + diamond_size, display_center.y),
+                Pos2::new(display_center.x, display_center.y + diamond_size),
+                Pos2::new(display_center.x - diamond_size, display_center.y),
+            ];
+            painter.add(egui::Shape::convex_polygon(
+                diamond_points,
+                fill,
+                Stroke::new(1.0, stroke_color),
+            ));
+        }
 
         if keyframes.len() > 1 && ki > 0 {
             let easing_l = match kf.easing {

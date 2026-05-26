@@ -36,7 +36,7 @@ struct Cli {
     root: Option<PathBuf>,
 }
 
-#[tokio::main]
+#[tokio::main(worker_threads = 2)]
 async fn main() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
@@ -70,6 +70,15 @@ async fn main() -> Result<()> {
     for (kind, count) in store.count_by_kind() {
         tracing::info!(kind = ?kind, count, "indexed");
     }
+
+    tracing::info!(
+        "Server optimized for low-memory environments (500MB RAM):\n\
+         - File streaming enabled for files >50MB\n\
+         - Max response limit: 500 items\n\
+         - Max ingest batch: 100 items\n\
+         - Concurrent downloads: 2\n\
+         - Worker threads: 2"
+    );
 
     let handle = start(addr, store);
     handle.await.context("server task crashed")?;

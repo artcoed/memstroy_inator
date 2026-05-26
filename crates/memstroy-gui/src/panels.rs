@@ -170,7 +170,8 @@ fn maybe_auto_refresh(state: &mut EditorState, force: bool) {
     }
     if !force {
         if let Some(t) = state.last_auto_refresh {
-            if t.elapsed() < std::time::Duration::from_millis(500) {
+            // Reduced debounce from 500ms to 200ms for faster response
+            if t.elapsed() < std::time::Duration::from_millis(200) {
                 return;
             }
         }
@@ -296,13 +297,8 @@ fn library_clips_tab(ui: &mut egui::Ui, state: &mut EditorState) {
     let search_lower = state.library_search.to_lowercase();
     let clip_count = state.library.mellstroy_clips.len();
 
-    // ── Header row: clip count + channel badge + manual Refresh ──
-    // The library was historically refresh-on-search-only, but that
-    // left users with an empty cache (first launch / fresh install)
-    // with no obvious affordance: scrolling did nothing because the
-    // list was empty, and the search box still had to be tabbed into
-    // to fire a request. Surface the channel and an explicit
-    // Refresh button so the flow is discoverable.
+    // ── Header row: clip count + channel badge ──
+    // Clips are loaded automatically on scroll and search.
     ui.horizontal(|ui| {
         ui.label(
             RichText::new(format!("{} ({})", t("Clips"), clip_count))
@@ -317,22 +313,6 @@ fn library_clips_tab(ui: &mut egui::Ui, state: &mut EditorState) {
                 .color(COL_TEXT_DIM)
                 .italics(),
         );
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            // Disable the button while a refresh is already running
-            // so we don't fire concurrent ingest requests.
-            let label = if state.refreshing {
-                format!("\u{1F504} {}", t("refreshing..."))
-            } else {
-                format!("\u{1F504} {}", t("Refresh from Telegram"))
-            };
-            let resp = ui.add_enabled(
-                !state.refreshing,
-                egui::Button::new(RichText::new(label).size(11.0)),
-            );
-            if resp.clicked() {
-                maybe_auto_refresh(state, /*force=*/ true);
-            }
-        });
     });
     // Clips are server-managed by design — the Refresh action POSTs
     // to the in-process memstroy-assets-server which scrapes Telegram
@@ -361,21 +341,6 @@ fn library_clips_tab(ui: &mut egui::Ui, state: &mut EditorState) {
     }
     ui.add_space(2.0);
 
-    // ── First-show auto-fetch ──
-    // When the panel opens with an empty local cache and we haven't
-    // tried yet, kick a refresh automatically. This is what users
-    // expect from "open the editor and see Mellstroy clips" without
-    // having to discover the search-box trick. Guarded by
-    // `last_auto_refresh.is_none()` so we only do it once per session
-    // — subsequent empty states (e.g. user wipes the cache mid-session)
-    // can still trigger via the Refresh button above.
-    if state.library.mellstroy_clips.is_empty()
-        && state.last_auto_refresh.is_none()
-        && !state.refreshing
-    {
-        maybe_auto_refresh(state, /*force=*/ true);
-    }
-
     let scroll_out = egui::ScrollArea::vertical()
         .id_source("library_clips_scroll")
         .auto_shrink([false; 2])
@@ -384,7 +349,7 @@ fn library_clips_tab(ui: &mut egui::Ui, state: &mut EditorState) {
                 let hint = if state.refreshing {
                     t("Fetching clips from the server...")
                 } else {
-                    t("No clips yet — click Refresh from Telegram above to fetch the latest ones.")
+                    t("No clips yet — start typing in the search box or scroll down to load clips.")
                 };
                 ui.label(
                     RichText::new(hint)
@@ -392,6 +357,10 @@ fn library_clips_tab(ui: &mut egui::Ui, state: &mut EditorState) {
                         .color(COL_TEXT_DIM)
                         .size(11.0),
                 );
+                // Auto-trigger refresh when empty and not already refreshing
+                if !state.refreshing {
+                    maybe_auto_refresh(state, /*force=*/ false);
+                }
                 return;
             }
             // Build filtered indices once per frame
@@ -7926,10 +7895,13 @@ fn timeline_marquee_update(
         && !drag_in_flight
     {
         if let Some(p) = press_origin {
-            // Reject presses on the header column / scrollbars by
-            // checking that the press point lies inside the tracks
-            // rectangle proper.
-            if tracks_rect.contains(p) {
+            // Reject when a floating window (Web Image Search, Curve
+            // Editor, modals, …) sits above the timeline at the press
+            // point — the global `primary_pressed` path would
+            // otherwise clear / marquee-select through the overlay.
+            if pointer_blocked_by_floating_ui(ui.ctx(), p) {
+                // skip
+            } else if tracks_rect.contains(p) {
                 // Walk the on-screen clip rects and bail out if the
                 // press lands on top of any of them. The press will
                 // then propagate to the per-clip drag handler instead
@@ -8330,8 +8302,16 @@ fn classify_victims(
                 return;
             }
             // Mover is fully inside victim → split victim around mover.
+            // When the mover window is effectively a point (razor cut /
+            // zero-width overlap), use a single cut so the halves meet
+            // at `m_in` with no gap and no overlap.
             if v_in < m_in && v_out > m_out {
-                splits.push(SplitOp { victim, m_in, m_out });
+                let cut_right = if (m_out - m_in).abs() < 1.0e-4 { m_in } else { m_out };
+                splits.push(SplitOp {
+                    victim,
+                    m_in,
+                    m_out: cut_right,
+                });
                 return;
             }
             // Right-edge overlap: victim's tail intrudes into mover.
@@ -8589,6 +8569,15 @@ fn apply_remove(
         state.selection = Selection::None;
     }
     mover_out
+}
+
+/// Minimum duration of each half after a razor cut (seconds).
+const MIN_SPLIT_HALF_SEC: f32 = 0.05;
+
+/// Queue a timeline razor split at scene-time `cut_t` for `sel`.
+pub(crate) fn queue_timeline_split(state: &mut EditorState, sel: Selection, cut_t: f32) {
+    state.pending_timeline_split = Some((sel, cut_t));
+    state.playhead = cut_t;
 }
 
 fn sel_for_victim(victim: VictimKind) -> Selection {
@@ -8922,6 +8911,32 @@ pub(crate) fn unique_background_id_in_scene(
 
 
 // ─── TIMELINE ────────────────────────────────────────────────────────
+
+/// True when a floating window, modal, or other foreground UI occupies
+/// `pos`, so the timeline must not steal pointer input from it.
+fn pointer_blocked_by_floating_ui(ctx: &egui::Context, pos: egui::Pos2) -> bool {
+    ctx.layer_id_at(pos).is_some_and(|lid| {
+        lid.order != egui::Order::Background && lid.order != egui::Order::Middle
+    })
+}
+
+/// Best-effort pointer position for overlay blocking: prefer the press
+/// origin on the click frame, otherwise the active interact/hover point.
+fn timeline_pointer_for_overlay_block(ui: &egui::Ui) -> Option<egui::Pos2> {
+    ui.input(|i| {
+        i.pointer
+            .press_origin()
+            .or(i.pointer.interact_pos())
+            .or(i.pointer.hover_pos())
+    })
+}
+
+fn timeline_input_locked(ui: &egui::Ui) -> bool {
+    ui.data(|d| {
+        d.get_temp::<bool>(egui::Id::new("timeline_input_lock"))
+            .unwrap_or(false)
+    })
+}
 
 pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     // ── Prevent the panel from auto-growing ──
@@ -9273,14 +9288,19 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
         .unwrap_or(false);
     // Skip when a floating window (Curve Editor, Web Image Search,
     // popups, etc.) is on top of the timeline at the pointer's
-    // position. Without this, scrolling inside those windows also
-    // drove the timeline's vertical pan.
-    let blocked_by_window = if let Some(p) = pointer_pos_opt {
-        ui.ctx().layer_id_at(p)
-            .map(|lid| lid.order != egui::Order::Background
-                && lid.order != egui::Order::Middle)
-            .unwrap_or(false)
-    } else { false };
+    // position. Without this, scrolling / clicking inside those windows
+    // also drove the timeline underneath.
+    let blocked_by_window = pointer_pos_opt
+        .map(|p| pointer_blocked_by_floating_ui(ui.ctx(), p))
+        .unwrap_or(false);
+    let blocked_by_overlay = timeline_pointer_for_overlay_block(ui)
+        .map(|p| pointer_blocked_by_floating_ui(ui.ctx(), p))
+        .unwrap_or(false);
+    if blocked_by_overlay {
+        ui.data_mut(|d| {
+            d.insert_temp::<bool>(egui::Id::new("timeline_input_lock"), true);
+        });
+    }
     if pointer_in_viewport && !blocked_by_window && scroll_delta.y.abs() > 0.1 {
         let shift = ui.input(|i| i.modifiers.shift);
         if shift {
@@ -9292,7 +9312,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             state.timeline_v_scroll = (state.timeline_v_scroll - scroll_delta.y).max(0.0);
         }
     }
-    if pointer_in_viewport && scroll_delta.x.abs() > 0.1 {
+    if pointer_in_viewport && !blocked_by_window && scroll_delta.x.abs() > 0.1 {
         // Horizontal wheel (touchpad) = horizontal pan in seconds.
         state.timeline_scroll =
             (state.timeline_scroll - scroll_delta.x / pps.max(1.0)).max(0.0);
@@ -9338,7 +9358,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     }
 
     // Click ruler to seek
-    if ruler_resp.clicked() || ruler_resp.dragged() {
+    if (ruler_resp.clicked() || ruler_resp.dragged()) && !timeline_input_locked(ui) {
         if let Some(pos) = ruler_resp.interact_pointer_pos() {
             if pos.x >= track_left && pos.x <= track_right {
                 let clicked_t = x_to_time(pos.x, state.timeline_scroll, pps, track_left)
@@ -9470,7 +9490,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
         let primary_pressed = ui.input(|i| i.pointer.primary_pressed());
         let press_origin = ui.input(|i| i.pointer.press_origin());
 
-        if primary_pressed && !state.timeline_scrubbing_playhead {
+        if primary_pressed && !state.timeline_scrubbing_playhead && !blocked_by_overlay {
             if let (Some(ph_x_at_press), Some(p)) = (
                 time_to_x(state.playhead, state.timeline_scroll, pps_now, track_left, track_right),
                 press_origin,
@@ -9488,6 +9508,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                     // flight from a previous frame.
                     && state.timeline_drag.dragging_clip.is_none()
                     && state.asset_drag.dragging.is_none()
+                    && !pointer_blocked_by_floating_ui(ui.ctx(), p)
                 {
                     state.timeline_scrubbing_playhead = true;
                 }
@@ -9525,7 +9546,10 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     // per-clip interactors observe the latest value.
     if !state.timeline_scrubbing_playhead {
         ui.data_mut(|d| {
-            d.insert_temp::<bool>(egui::Id::new("timeline_input_lock"), false);
+            d.insert_temp::<bool>(
+                egui::Id::new("timeline_input_lock"),
+                blocked_by_overlay,
+            );
         });
     }
 
@@ -9961,7 +9985,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             // the row click and lose the seek-to-keyframe gesture.
             let row_id = egui::Id::new(("timeline_rf_row",));
             let row_resp = ui.interact(content_rect_rf, row_id, Sense::click());
-            if row_resp.clicked() {
+            if row_resp.clicked() && !timeline_input_locked(ui) {
                 // Mirror every other layer kind: plain click clears
                 // any prior multi-selection then re-seeds canvas_selection
                 // with just the render frame, while Ctrl+click toggles
@@ -10159,9 +10183,9 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                     token,
                                 );
                             } else if state.split_tool_active {
-                                to_select = Some(Selection::Background(bi));
-                                state.playhead = clicked;
-                                state.status = "__SPLIT_AT_PLAYHEAD__".into();
+                                let sel = Selection::Background(bi);
+                                to_select = Some(sel);
+                                queue_timeline_split(state, sel, clicked);
                             } else {
                                 let ctrl_held = ui.input(|i| i.modifiers.ctrl || i.modifiers.mac_cmd);
                                 let target_sel = Selection::Background(bi);
@@ -10483,6 +10507,12 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             defer_overlap_resolution(state, MovedClipKind::Actor(ai));
                             let ai_eff = ai;
                             sync_audio_to_actor(state, ai_eff);
+                            
+                            // Also defer overlap resolution for linked audio
+                            if let Some(au_idx) = find_audio_for_actor(state, &state.scene.actors[ai].id) {
+                                defer_overlap_resolution(state, MovedClipKind::Audio(au_idx));
+                            }
+                            
                             to_select = Some(Selection::Actor(ai_eff));
 
                             // ── Group move broadcast ──
@@ -10501,9 +10531,9 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                 token,
                             );
                         } else if state.split_tool_active {
-                            to_select = Some(Selection::Actor(ai));
-                            state.playhead = clicked;
-                            state.status = "__SPLIT_AT_PLAYHEAD__".into();
+                            let sel = Selection::Actor(ai);
+                            to_select = Some(sel);
+                            queue_timeline_split(state, sel, clicked);
                         } else {
                             // ── Ctrl+click multi-select ──
                             //
@@ -10821,9 +10851,9 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                 token,
                             );
                         } else if state.split_tool_active {
-                            to_select = Some(Selection::Overlay(oi));
-                            state.playhead = clicked;
-                            state.status = "__SPLIT_AT_PLAYHEAD__".into();
+                            let sel = Selection::Overlay(oi);
+                            to_select = Some(sel);
+                            queue_timeline_split(state, sel, clicked);
                         } else {
                             // Plain click clears the cross-element
                             // multi-selection so the inspector returns
@@ -11074,6 +11104,14 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             defer_overlap_resolution(state, MovedClipKind::Audio(aui));
                             let aui_eff = aui;
                             to_select = Some(Selection::Audio(aui_eff));
+                            
+                            // Group move broadcast for multi-selection
+                            broadcast_timeline_move_delta(
+                                state,
+                                MovedClipKind::Audio(aui),
+                                prev_t_in,
+                                token,
+                            );
                             broadcast_timeline_move_delta(
                                 state,
                                 MovedClipKind::Audio(aui),
@@ -11082,9 +11120,9 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             );
                         } else if state.split_tool_active {
                             // Split tool: cut the audio at the click position.
-                            to_select = Some(Selection::Audio(aui));
-                            state.playhead = clicked;
-                            state.status = "__SPLIT_AT_PLAYHEAD__".into();
+                            let sel = Selection::Audio(aui);
+                            to_select = Some(sel);
+                            queue_timeline_split(state, sel, clicked);
                         } else {
                             // Plain click clears the cross-element
                             // multi-selection so the inspector returns
@@ -12432,8 +12470,15 @@ fn draw_clip(
 
     if resp.clicked() {
         if split_mode {
-            if let Some(pos) = resp.interact_pointer_pos() {
-                let t = x_to_time(pos.x, scroll, pps, track_left);
+            let pos = resp
+                .interact_pointer_pos()
+                .or_else(|| ui.input(|i| i.pointer.press_origin()));
+            if let Some(pos) = pos {
+                let t = x_to_time(pos.x, scroll, pps, track_left)
+                    .clamp(
+                        clip_start + MIN_SPLIT_HALF_SEC,
+                        clip_end - MIN_SPLIT_HALF_SEC,
+                    );
                 return Some(t);
             }
         }
@@ -12757,6 +12802,10 @@ fn draw_audio_clip(
     let id = clip_id;
     let sense = if locked { Sense::hover() } else { Sense::click_and_drag() };
     let resp = ui.interact(bar_rect, id, sense);
+
+    if timeline_input_locked(ui) {
+        return None;
+    }
 
     let hover_pos = ui.input(|i| i.pointer.hover_pos());
     // Match `draw_clip`: only treat the visible bar edge as a logical
@@ -13821,6 +13870,7 @@ fn draw_mask_param_kf_rows(
 
     let ctrl_held = ui.input(|i| i.modifiers.ctrl || i.modifiers.mac_cmd);
     let shift_held = ui.input(|i| i.modifiers.shift);
+    let input_locked = timeline_input_locked(ui);
 
     for (ri, row) in rows.iter().enumerate() {
         let row_top = strip_top + (ri as f32) * row_h;
@@ -13911,23 +13961,25 @@ fn draw_mask_param_kf_rows(
                 egui::pos2(x, cy),
                 Vec2::new(half * 2.5, row_h.min(20.0)),
             );
-            let id = ui.id().with((
-                "mask_kf",
-                sel_layer_label,
-                &synth_param_id,
-                local_t.to_bits(),
-            ));
-            let r = ui.interact(hit, id, Sense::click_and_drag());
-            if r.clicked() {
-                outcome.click_hits.push(ParamRowClick {
-                    param_id: synth_param_id.clone(),
-                    t: local_t,
-                    extend: ctrl_held || shift_held,
-                    seek_to: scene_t,
-                });
-            }
-            if r.hovered() {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            if !input_locked {
+                let id = ui.id().with((
+                    "mask_kf",
+                    sel_layer_label,
+                    &synth_param_id,
+                    local_t.to_bits(),
+                ));
+                let r = ui.interact(hit, id, Sense::click_and_drag());
+                if r.clicked() {
+                    outcome.click_hits.push(ParamRowClick {
+                        param_id: synth_param_id.clone(),
+                        t: local_t,
+                        extend: ctrl_held || shift_held,
+                        seek_to: scene_t,
+                    });
+                }
+                if r.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
             }
         }
     }
@@ -13992,6 +14044,7 @@ fn draw_param_kf_rows(
 
     let ctrl_held = ui.input(|i| i.modifiers.ctrl || i.modifiers.mac_cmd);
     let shift_held = ui.input(|i| i.modifiers.shift);
+    let input_locked = timeline_input_locked(ui);
 
     for (pi, param_id) in params.iter().enumerate() {
         let row_top = expansion_top + (pi as f32) * row_h;
@@ -14145,6 +14198,10 @@ fn draw_param_kf_rows(
             // across frames) and one for drag tracking (locked to the
             // kf's index in the current row so drag survives the
             // post-commit re-sort that happens on the next frame).
+            if input_locked {
+                continue;
+            }
+
             let click_id =
                 ui.id().with(("param_kf", sel_layer_label, param_id, local_t.to_bits()));
             let r = ui.interact(hit, click_id.with(kf_drag_id), Sense::click_and_drag());
@@ -14379,7 +14436,9 @@ fn kf_marquee_update(
         && primary_pressed
     {
         if let Some(p) = press_origin {
-            if expansion_rect.contains(p) {
+            if pointer_blocked_by_floating_ui(ui.ctx(), p) {
+                // skip — click belongs to a floating window above
+            } else if expansion_rect.contains(p) {
                 // Check if the press lands on a keyframe diamond — if
                 // so, let the per-diamond handler own the press.
                 let mut on_diamond = false;
