@@ -1494,6 +1494,11 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
     let playhead = state.playhead;
     let a = &mut state.scene.actors[i];
 
+    // Snapshot animated_params BEFORE the toggle widgets run so we can
+    // detect newly-animated params and seed an initial keyframe.
+    let animated_before = a.animated_params.clone();
+    let a = &mut state.scene.actors[i];
+
     ui.label(RichText::new(t("Position & Scale")).size(12.0).strong());
     ui.add_space(4.0);
 
@@ -1759,6 +1764,15 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
     // Animation modifiers — wobble / shake / pulse / spin.
     ui.add_space(8.0);
     inspector_modifiers(ui, &mut a.modifiers, ("actor_mods", i));
+
+    // Auto-seed a keyframe at the playhead for any param that was just
+    // toggled to animated (wasn't animated before this frame, now is).
+    for pid in a.animated_params.iter() {
+        if !animated_before.contains(pid) {
+            kf_anim::seed_actor_kf_on_toggle(&mut a.layout, playhead);
+            break; // one seed pass is enough — it inserts the whole state
+        }
+    }
 }
 
 /// Color a param label gold when its kf was just clicked from the timeline.
@@ -11688,7 +11702,8 @@ fn single_selection_animated_params(
                 return None;
             }
             let a = state.scene.actors.get(ai)?;
-            let params = ordered_animated(&a.animated_params);
+            let mut params = ordered_animated(&a.animated_params);
+            collect_effect_animated_params(&a.effects, &mut params);
             Some((sel, params))
         }
         Selection::Overlay(oi) => {
@@ -11700,12 +11715,13 @@ fn single_selection_animated_params(
             if assigned != track_idx {
                 return None;
             }
-            let ap = match state.scene.overlays.get(oi)? {
-                Overlay::Text(t) => &t.animated_params,
-                Overlay::Image(im) => &im.animated_params,
-                Overlay::Video(v) => &v.animated_params,
+            let (ap, effects) = match state.scene.overlays.get(oi)? {
+                Overlay::Text(t) => (&t.animated_params, &t.effects),
+                Overlay::Image(im) => (&im.animated_params, &im.effects),
+                Overlay::Video(v) => (&v.animated_params, &v.effects),
             };
-            let params = ordered_animated(ap);
+            let mut params = ordered_animated(ap);
+            collect_effect_animated_params(effects, &mut params);
             Some((sel, params))
         }
         Selection::Audio(aui) => {
@@ -11763,6 +11779,70 @@ fn ordered_audio_animated(set: &std::collections::BTreeSet<String>) -> Vec<Strin
         }
     }
     out
+}
+
+/// Collect animated parameters from an element's effect stack and append
+/// them to the param list using the `fx_{idx}_{sub}` naming convention.
+/// Only effects that have at least one animated param appear.
+fn collect_effect_animated_params(effects: &[memstroy_core::Effect], out: &mut Vec<String>) {
+    for (fx_idx, eff) in effects.iter().enumerate() {
+        for key in &eff.animated_params {
+            let id = memstroy_core::param_ids::fx_param(fx_idx, key);
+            if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+    }
+}
+
+/// Human-readable label for an effect-parameter id (`fx_{idx}_{sub}`).
+/// Looks up the effect kind name and combines it with the sub-param.
+#[allow(dead_code)]
+fn fx_param_label(effects: &[memstroy_core::Effect], param_id: &str) -> String {
+    // Parse "fx_{idx}_{sub}" format
+    if let Some(rest) = param_id.strip_prefix("fx_") {
+        if let Some(sep) = rest.find('_') {
+            if let Ok(idx) = rest[..sep].parse::<usize>() {
+                let sub = &rest[sep + 1..];
+                let kind_label = effects
+                    .get(idx)
+                    .map(|e| e.kind.label())
+                    .unwrap_or("FX");
+                let sub_label = match sub {
+                    "intensity" => "Intensity",
+                    "p0" => "Param",
+                    "p1" => "Param 2",
+                    "p2" => "Param 3",
+                    "p3" => "Param 4",
+                    other => other,
+                };
+                return format!("{} {}", kind_label, sub_label);
+            }
+        }
+    }
+    param_id.to_string()
+}
+
+/// Short label for fx params used in the timeline row gutter where
+/// space is limited. Format: "FX{n} {sub}" (e.g. "FX0 Intensity").
+fn fx_param_short_label(param_id: &str) -> String {
+    if let Some(rest) = param_id.strip_prefix("fx_") {
+        if let Some(sep) = rest.find('_') {
+            if let Ok(idx) = rest[..sep].parse::<usize>() {
+                let sub = &rest[sep + 1..];
+                let sub_label = match sub {
+                    "intensity" => "Int",
+                    "p0" => "P0",
+                    "p1" => "P1",
+                    "p2" => "P2",
+                    "p3" => "P3",
+                    other => other,
+                };
+                return format!("FX{} {}", idx, sub_label);
+            }
+        }
+    }
+    param_id.to_string()
 }
 
 /// Extra height to add to a track row so the per-param keyframe rows of
@@ -12084,6 +12164,17 @@ fn compute_param_change_points(
                     pairs(changed_actor(&a.layout, |s| s.flip_x_anim), sel));
                 out.insert(p::FLIP_Y.to_string(),
                     pairs(changed_actor(&a.layout, |s| s.flip_y_anim), sel));
+                // Effect animated params — each kf in param_kfs is a
+                // real change-point the user authored.
+                for (fx_idx, eff) in a.effects.iter().enumerate() {
+                    for key in &eff.animated_params {
+                        let id = p::fx_param(fx_idx, key);
+                        if let Some(kfs) = eff.param_kfs.get(key.as_str()) {
+                            let times: Vec<f32> = kfs.iter().map(|kf| kf.t).collect();
+                            out.insert(id, pairs(times, sel));
+                        }
+                    }
+                }
             }
         }
         Selection::Overlay(oi) => {
@@ -12109,6 +12200,21 @@ fn compute_param_change_points(
                     pairs(changed_overlay(layout, |s| s.flip_x_anim), sel));
                 out.insert(p::FLIP_Y.to_string(),
                     pairs(changed_overlay(layout, |s| s.flip_y_anim), sel));
+                // Effect animated params.
+                let effects: &[memstroy_core::Effect] = match ov {
+                    Overlay::Text(t) => &t.effects,
+                    Overlay::Image(im) => &im.effects,
+                    Overlay::Video(v) => &v.effects,
+                };
+                for (fx_idx, eff) in effects.iter().enumerate() {
+                    for key in &eff.animated_params {
+                        let id = p::fx_param(fx_idx, key);
+                        if let Some(kfs) = eff.param_kfs.get(key.as_str()) {
+                            let times: Vec<f32> = kfs.iter().map(|kf| kf.t).collect();
+                            out.insert(id, pairs(times, sel));
+                        }
+                    }
+                }
             }
         }
         _ => {
@@ -12691,9 +12797,15 @@ fn draw_param_kf_rows(
 
         // Label on the far-left of the row. Falls back to the audio
         // param label table for audio param ids — `memstroy_core`'s
-        // global table only knows transform params.
+        // global table only knows transform params. Effect params
+        // (fx_*) get a short descriptive label from the encoded id.
         let core_label = memstroy_core::param_ids::label(param_id);
-        let label: &str = if core_label == "param" {
+        let label_owned: String;
+        let label: &str = if param_id.starts_with("fx_") {
+            // Parse "fx_{idx}_{sub}" → "FX{idx} {sub_label}"
+            label_owned = fx_param_short_label(param_id);
+            &label_owned
+        } else if core_label == "param" {
             crate::kf_anim::audio_param_ids::label(param_id)
         } else {
             core_label
