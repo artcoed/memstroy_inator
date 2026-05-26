@@ -7,11 +7,13 @@
 # What ships:
 #   * bin\memstroy-gui.exe + bin\memstroy.exe
 #   * examples\*.yaml, README.md, Memstroy-inator.bat launcher
+#   * catost.ico / catost.png (app icon for shortcuts & branding)
 #
 # What deliberately does NOT ship:
 #   * Any assets\ directory. Client builds load every clip / image /
 #     sound from the operator's remote memstroy-assets-server and
 #     cache them under %USERPROFILE%\.memstroy\cache\ on first use.
+#     Users can also add their own assets via the editor's UI.
 #   * The memstroy-assets-server.exe binary itself. The server is run
 #     by the operator on their backend, not by the client.
 #

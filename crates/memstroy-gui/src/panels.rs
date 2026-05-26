@@ -717,6 +717,7 @@ pub(crate) fn add_library_asset_at_playhead(
                 animated_params: Default::default(),
                 chroma_key: None,
                 z_order: 0,
+                parent_id: None,
             });
             state.scene.overlays.push(overlay);
             let new_idx = state.scene.overlays.len() - 1;
@@ -765,6 +766,7 @@ pub(crate) fn add_library_asset_at_playhead(
                 animated_params: Default::default(),
                 chroma_key: None,
                 z_order: 0,
+                parent_id: None,
             });
             state.scene.overlays.push(overlay);
             let new_idx = state.scene.overlays.len() - 1;
@@ -1492,6 +1494,55 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
     use memstroy_core::param_ids;
 
     let playhead = state.playhead;
+
+    // ── Parent element selector ──
+    {
+        ui.label(RichText::new(t("Parent element")).size(12.0).strong());
+        ui.add_space(2.0);
+        let actor_id = state.scene.actors[i].id.clone();
+        let current_parent = state.scene.actors[i].parent_id.clone();
+        let candidates = state.scene.all_element_ids_except(&actor_id);
+        let display_label = match &current_parent {
+            Some(pid) => candidates.iter()
+                .find(|(id, _)| id == pid)
+                .map(|(_, lbl)| lbl.clone())
+                .unwrap_or_else(|| format!("{} ({})", pid, t("missing"))),
+            None => t("None (absolute)").to_string(),
+        };
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_source(("actor_parent", i))
+                .selected_text(&display_label)
+                .width(180.0)
+                .show_ui(ui, |ui| {
+                    // "None" option to clear parent
+                    if ui.selectable_label(current_parent.is_none(), t("None (absolute)")).clicked() {
+                        state.scene.actors[i].parent_id = None;
+                    }
+                    for (cid, clabel) in &candidates {
+                        let selected = current_parent.as_deref() == Some(cid.as_str());
+                        if ui.selectable_label(selected, clabel).clicked() {
+                            state.scene.actors[i].parent_id = Some(cid.clone());
+                        }
+                    }
+                });
+            if current_parent.is_some() {
+                if ui.small_button("\u{2715}").on_hover_text(t("Clear parent")).clicked() {
+                    state.scene.actors[i].parent_id = None;
+                }
+            }
+        });
+        ui.add_space(2.0);
+        if current_parent.is_some() {
+            ui.label(
+                RichText::new(t("Position and scale are relative to parent"))
+                    .size(9.0).color(COL_TEXT_DIM).italics(),
+            );
+        }
+        ui.add_space(6.0);
+        ui.separator();
+        ui.add_space(4.0);
+    }
+
     let a = &mut state.scene.actors[i];
 
     ui.label(RichText::new(t("Position & Scale")).size(12.0).strong());
@@ -2672,7 +2723,7 @@ fn inspector_masks_section(
     mask_tool: &mut crate::state::MaskTool,
     salt: impl std::hash::Hash + Copy,
 ) {
-    use memstroy_core::{Effect, EffectKind, MaskShape};
+    use memstroy_core::{EffectKind, MaskShape};
     use crate::state::MaskTool;
 
     ui.label(
@@ -2896,32 +2947,20 @@ fn inspector_masks_section(
         .num_columns(2)
         .spacing([6.0, 6.0])
         .show(ui, |ui| {
-            // Rectangle mask serves as both "rectangle" and "crop" in the
-            // unified tool set — the legacy Crop button used to push an
-            // EffectKind::Crop here, but the two were nearly identical
-            // from the user's POV so we kept the more flexible mask
-            // form.
+            // Rectangle mask — arms the canvas tool. The actual effect
+            // is pushed by `commit_mask_draft` when the user finishes
+            // drawing on the canvas. No placeholder is created here to
+            // avoid the "two masks" bug.
             if ui.button(crate::i18n::t("\u{25AD} Rectangle / Crop")).clicked() {
-                effects.push(Effect::mask_rect());
                 *mask_tool = MaskTool::RectMask;
             }
             if ui.button(crate::i18n::t("\u{2B2D} Ellipse")).clicked() {
-                effects.push(Effect::mask_ellipse());
                 *mask_tool = MaskTool::EllipseMask;
             }
             ui.end_row();
             if ui.button(crate::i18n::t("\u{270D} Freehand")).clicked() {
-                effects.push(memstroy_core::Effect::mask_freehand());
                 *mask_tool = MaskTool::FreehandMask;
             }
-            // Segment selection mask. The bilingual sister tool to
-            // Freehand: the user lays down polygon vertices click-by-
-            // click instead of dragging a continuous trail. Useful
-            // for hard-edged outlines (sticker borders, geometric
-            // logos) where freehand drag is too noisy. Same shape
-            // type (`MaskShape::Polygon`) so the renderer / FFmpeg
-            // export pipeline doesn't need a new branch — only the
-            // editor input handler differs.
             if ui
                 .button(crate::i18n::t("\u{2B20} Segment selection"))
                 .on_hover_text(crate::i18n::t(
@@ -2929,16 +2968,16 @@ fn inspector_masks_section(
                 ))
                 .clicked()
             {
-                effects.push(memstroy_core::Effect::mask_freehand());
                 *mask_tool = MaskTool::SegmentMask;
             }
             ui.end_row();
-            // Eyedropper colour-key mask. Clicking arms the canvas
-            // tool AND pushes a placeholder ColorKey effect so the
-            // user can already tweak similarity / blend without
-            // having to commit a click first; the eyedropper click
-            // later overwrites the placeholder colour with the
-            // picked pixel.
+            // Eyedropper colour-key mask. Arms the canvas tool AND
+            // pushes a placeholder ColorKey effect so the user can
+            // tweak similarity / blend without committing a click
+            // first. The eyedropper click later overwrites the
+            // placeholder colour with the picked pixel. This is the
+            // only tool that needs a placeholder because the
+            // eyedropper is a single-click (no drag commit).
             if ui
                 .button(crate::i18n::t("\u{1F4A7} Eyedropper"))
                 .on_hover_text(crate::i18n::t(
@@ -3930,17 +3969,156 @@ fn inspector_overlay(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
     let overlay_count = state.scene.overlays.len();
     let playhead = state.playhead;
 
-    let ov = &mut state.scene.overlays[i];
+    // Determine overlay type without holding a long-lived mutable borrow
+    // (needed so we can call `all_element_ids_except` for the parent selector).
+    let overlay_kind = match &state.scene.overlays[i] {
+        Overlay::Text(_) => 0u8,
+        Overlay::Image(_) => 1u8,
+        Overlay::Video(_) => 2u8,
+    };
 
-    match ov {
-        Overlay::Text(t) => {
+    match overlay_kind {
+        0 => {
+            // ── Parent element selector (before the main text inspector) ──
+            let text_id = match &state.scene.overlays[i] {
+                Overlay::Text(txt) => txt.id.clone(),
+                _ => unreachable!(),
+            };
+            let current_parent = match &state.scene.overlays[i] {
+                Overlay::Text(txt) => txt.parent_id.clone(),
+                _ => unreachable!(),
+            };
+            let text_preview = match &state.scene.overlays[i] {
+                Overlay::Text(txt) => ellipsis(&txt.text, 16),
+                _ => unreachable!(),
+            };
+            let candidates = state.scene.all_element_ids_except(&text_id);
+            ui.label(RichText::new(format!("{} {}", crate::i18n::t("Text:"), text_preview))
+                .strong().size(14.0).color(COL_CLIP_OVERLAY));
+            ui.add_space(4.0);
+            ui.label(RichText::new(t("Parent element")).size(12.0).strong());
+            ui.add_space(2.0);
+            let display_label = match &current_parent {
+                Some(pid) => candidates.iter()
+                    .find(|(id, _)| id == pid)
+                    .map(|(_, lbl)| lbl.clone())
+                    .unwrap_or_else(|| format!("{} ({})", pid, t("missing"))),
+                None => t("None (absolute)").to_string(),
+            };
+            ui.horizontal(|ui| {
+                egui::ComboBox::from_id_source(("text_parent", i))
+                    .selected_text(&display_label)
+                    .width(180.0)
+                    .show_ui(ui, |ui| {
+                        if ui.selectable_label(current_parent.is_none(), t("None (absolute)")).clicked() {
+                            if let Some(Overlay::Text(t2)) = state.scene.overlays.get_mut(i) {
+                                t2.parent_id = None;
+                            }
+                        }
+                        for (cid, clabel) in &candidates {
+                            let selected = current_parent.as_deref() == Some(cid.as_str());
+                            if ui.selectable_label(selected, clabel).clicked() {
+                                if let Some(Overlay::Text(t2)) = state.scene.overlays.get_mut(i) {
+                                    t2.parent_id = Some(cid.clone());
+                                }
+                            }
+                        }
+                    });
+                if current_parent.is_some() {
+                    if ui.small_button("\u{2715}").on_hover_text(t("Clear parent")).clicked() {
+                        if let Some(Overlay::Text(t2)) = state.scene.overlays.get_mut(i) {
+                            t2.parent_id = None;
+                        }
+                    }
+                }
+            });
+            if current_parent.is_some() {
+                ui.label(
+                    RichText::new(t("Position and scale are relative to parent"))
+                        .size(9.0).color(COL_TEXT_DIM).italics(),
+                );
+            }
+            ui.add_space(4.0);
+            ui.separator();
+            ui.add_space(4.0);
+
+            // Re-borrow for the main text inspector
+            let txt = match &mut state.scene.overlays[i] {
+                Overlay::Text(t) => t,
+                _ => unreachable!(),
+            };
             // Returns Option<TextAction> for backward compat — currently
             // unused since the layer-order buttons were removed.
-            let _ = inspector_text_overlay(ui, t, i, overlay_count, duration, playhead);
+            let _ = inspector_text_overlay(ui, txt, i, overlay_count, duration, playhead);
         }
-        Overlay::Image(im) => {
-            ui.label(RichText::new(format!("{}: {}", t("Image"), im.id)).strong().size(14.0).color(COL_CLIP_OVERLAY));
+        1 => {
+            let img_id = match &state.scene.overlays[i] {
+                Overlay::Image(im) => im.id.clone(),
+                _ => unreachable!(),
+            };
+            ui.label(RichText::new(format!("{}: {}", t("Image"), &img_id)).strong().size(14.0).color(COL_CLIP_OVERLAY));
             ui.add_space(4.0);
+
+            // ── Parent element selector ──
+            {
+                ui.label(RichText::new(t("Parent element")).size(12.0).strong());
+                ui.add_space(2.0);
+                let current_parent = match &state.scene.overlays[i] {
+                    Overlay::Image(im) => im.parent_id.clone(),
+                    _ => unreachable!(),
+                };
+                let candidates = state.scene.all_element_ids_except(&img_id);
+                let display_label = match &current_parent {
+                    Some(pid) => candidates.iter()
+                        .find(|(id, _)| id == pid)
+                        .map(|(_, lbl)| lbl.clone())
+                        .unwrap_or_else(|| format!("{} ({})", pid, t("missing"))),
+                    None => t("None (absolute)").to_string(),
+                };
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_id_source(("img_parent", i))
+                        .selected_text(&display_label)
+                        .width(180.0)
+                        .show_ui(ui, |ui| {
+                            if ui.selectable_label(current_parent.is_none(), t("None (absolute)")).clicked() {
+                                if let Some(Overlay::Image(im2)) = state.scene.overlays.get_mut(i) {
+                                    im2.parent_id = None;
+                                }
+                            }
+                            for (cid, clabel) in &candidates {
+                                let selected = current_parent.as_deref() == Some(cid.as_str());
+                                if ui.selectable_label(selected, clabel).clicked() {
+                                    if let Some(Overlay::Image(im2)) = state.scene.overlays.get_mut(i) {
+                                        im2.parent_id = Some(cid.clone());
+                                    }
+                                }
+                            }
+                        });
+                    if current_parent.is_some() {
+                        if ui.small_button("\u{2715}").on_hover_text(t("Clear parent")).clicked() {
+                            if let Some(Overlay::Image(im2)) = state.scene.overlays.get_mut(i) {
+                                im2.parent_id = None;
+                            }
+                        }
+                    }
+                });
+                if current_parent.is_some() {
+                    ui.label(
+                        RichText::new(t("Position and scale are relative to parent"))
+                            .size(9.0).color(COL_TEXT_DIM).italics(),
+                    );
+                }
+                ui.add_space(4.0);
+                ui.separator();
+                ui.add_space(4.0);
+            }
+
+            // Re-borrow after parent selector
+            let im = match &mut state.scene.overlays[i] {
+                Overlay::Image(im) => im,
+                _ => unreachable!(),
+            };
+
             // The In / Out time controls were intentionally removed
             // from the inspector — the user adjusts an image's visible
             // window by dragging its clip edges in the layer panel.
@@ -3979,9 +4157,74 @@ fn inspector_overlay(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
                 inspector_image_presets_section(ui, &mut im2.effects, i);
             }
         }
-        Overlay::Video(v) => {
-            ui.label(RichText::new(format!("{}: {}", t("Video"), v.id)).strong().size(14.0).color(COL_CLIP_OVERLAY));
+        2 => {
+            let vid_id = match &state.scene.overlays[i] {
+                Overlay::Video(v) => v.id.clone(),
+                _ => unreachable!(),
+            };
+            ui.label(RichText::new(format!("{}: {}", t("Video"), &vid_id)).strong().size(14.0).color(COL_CLIP_OVERLAY));
             ui.add_space(4.0);
+
+            // ── Parent element selector ──
+            {
+                let current_parent = match &state.scene.overlays[i] {
+                    Overlay::Video(v) => v.parent_id.clone(),
+                    _ => unreachable!(),
+                };
+                let candidates = state.scene.all_element_ids_except(&vid_id);
+                ui.label(RichText::new(t("Parent element")).size(12.0).strong());
+                ui.add_space(2.0);
+                let display_label = match &current_parent {
+                    Some(pid) => candidates.iter()
+                        .find(|(id, _)| id == pid)
+                        .map(|(_, lbl)| lbl.clone())
+                        .unwrap_or_else(|| format!("{} ({})", pid, t("missing"))),
+                    None => t("None (absolute)").to_string(),
+                };
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_id_source(("vid_parent", i))
+                        .selected_text(&display_label)
+                        .width(180.0)
+                        .show_ui(ui, |ui| {
+                            if ui.selectable_label(current_parent.is_none(), t("None (absolute)")).clicked() {
+                                if let Some(Overlay::Video(v2)) = state.scene.overlays.get_mut(i) {
+                                    v2.parent_id = None;
+                                }
+                            }
+                            for (cid, clabel) in &candidates {
+                                let selected = current_parent.as_deref() == Some(cid.as_str());
+                                if ui.selectable_label(selected, clabel).clicked() {
+                                    if let Some(Overlay::Video(v2)) = state.scene.overlays.get_mut(i) {
+                                        v2.parent_id = Some(cid.clone());
+                                    }
+                                }
+                            }
+                        });
+                    if current_parent.is_some() {
+                        if ui.small_button("\u{2715}").on_hover_text(t("Clear parent")).clicked() {
+                            if let Some(Overlay::Video(v2)) = state.scene.overlays.get_mut(i) {
+                                v2.parent_id = None;
+                            }
+                        }
+                    }
+                });
+                if current_parent.is_some() {
+                    ui.label(
+                        RichText::new(t("Position and scale are relative to parent"))
+                            .size(9.0).color(COL_TEXT_DIM).italics(),
+                    );
+                }
+                ui.add_space(4.0);
+                ui.separator();
+                ui.add_space(4.0);
+            }
+
+            // Re-borrow after parent selector
+            let v = match &mut state.scene.overlays[i] {
+                Overlay::Video(v) => v,
+                _ => unreachable!(),
+            };
+
             ui.horizontal(|ui| {
                 ui.label(t("In:"));
                 ui.add(egui::DragValue::new(&mut v.t_in).range(0.0..=duration).speed(0.02).suffix("s"));
@@ -4059,6 +4302,7 @@ fn inspector_overlay(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
             // user isn't using it.
             inspector_video_overlay_skeleton(ui, state, i);
         }
+        _ => {}
     }
 }
 
@@ -9884,6 +10128,11 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                 clip_start,
                                 token,
                             );
+                        } else if state.split_tool_active {
+                            // Split tool: cut the audio at the click position.
+                            to_select = Some(Selection::Audio(aui));
+                            state.playhead = clicked;
+                            state.status = "__SPLIT_AT_PLAYHEAD__".into();
                         } else {
                             // Plain click clears the cross-element
                             // multi-selection so the inspector returns
@@ -11536,7 +11785,9 @@ fn draw_audio_clip(
         && hover_pos.map(|p| (p.x - bar_rect.max.x).abs() < 5.0).unwrap_or(false);
 
     if resp.hovered() && !locked {
-        if near_left_edge || near_right_edge {
+        if _split_mode {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+        } else if near_left_edge || near_right_edge {
             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
         } else {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
@@ -11544,17 +11795,25 @@ fn draw_audio_clip(
     }
 
     // Trim affordance bars on the audio clip's edges.
-    if !locked {
+    if !locked && !_split_mode {
         draw_clip_trim_handles(painter, bar_rect, near_left_edge, near_right_edge);
     }
 
-    if resp.clicked() { return Some(clip_start); }
+    if resp.clicked() {
+        if _split_mode {
+            if let Some(pos) = resp.interact_pointer_pos() {
+                let t = (pos.x - track_left) / pps + scroll;
+                return Some(t);
+            }
+        }
+        return Some(clip_start);
+    }
 
     let mode_id = id.with("drag_mode");
     let origin_id = id.with("press_origin_x");
     let original_start_id = id.with("original_start");
 
-    if resp.drag_started() && !locked {
+    if resp.drag_started() && !locked && !_split_mode {
         let press_x = ui
             .input(|i| i.pointer.press_origin())
             .map(|p| p.x)
@@ -11575,7 +11834,7 @@ fn draw_audio_clip(
         });
     }
 
-    if resp.dragged() && !locked {
+    if resp.dragged() && !locked && !_split_mode {
         let mode: Option<ClipDragMode> = ui.data(|d| d.get_temp(mode_id));
         let press_x: Option<f32> = ui.data(|d| d.get_temp(origin_id));
         let original_start: Option<f32> = ui.data(|d| d.get_temp(original_start_id));
@@ -13325,6 +13584,7 @@ pub fn add_text_overlay(state: &mut EditorState) -> usize {
         effects: Vec::new(),
         animated_params: Default::default(),
         z_order: 0,
+        parent_id: None,
     });
 
     state.scene.overlays.push(overlay);
@@ -13385,6 +13645,7 @@ pub(crate) fn add_actor_from_clip_at_time(state: &mut EditorState, path: &PathBu
         speed: 1.0,
         animated_params: Default::default(),
         z_order: 0,
+        parent_id: None,
     };
     state.scene.actors.push(actor);
     let new_actor_idx = state.scene.actors.len() - 1;

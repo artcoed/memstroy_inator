@@ -271,6 +271,29 @@ impl Scene {
         // it the same way we do for actors / overlays.
         backfill_render_frame(&mut self.render_frame);
     }
+
+    /// Collect all element IDs in the scene (actors + overlays).
+    /// Returns `(id, label)` pairs suitable for a dropdown selector.
+    /// Excludes the element with `exclude_id` (to prevent self-parenting).
+    pub fn all_element_ids_except(&self, exclude_id: &str) -> Vec<(String, String)> {
+        let mut result = Vec::new();
+        for a in &self.actors {
+            if a.id != exclude_id {
+                result.push((a.id.clone(), format!("Actor: {}", a.id)));
+            }
+        }
+        for ov in &self.overlays {
+            let (id, label) = match ov {
+                Overlay::Text(t) => (t.id.clone(), format!("Text: {}", t.id)),
+                Overlay::Image(im) => (im.id.clone(), format!("Image: {}", im.id)),
+                Overlay::Video(v) => (v.id.clone(), format!("Video: {}", v.id)),
+            };
+            if id != exclude_id {
+                result.push((id, label));
+            }
+        }
+        result
+    }
 }
 
 fn varies(values: impl IntoIterator<Item = f32>) -> bool {
@@ -555,6 +578,14 @@ pub struct Actor {
     /// everything-else-on-top" rule when ALL elements have z_order == 0.
     #[serde(default)]
     pub z_order: i32,
+    /// **Parent element**: when set, this actor's position and scale are
+    /// interpreted relative to the parent element. The parent is
+    /// identified by its `id` string (can be another actor or an
+    /// overlay). When the parent moves/scales/rotates, this child
+    /// follows automatically. `None` means the element lives in
+    /// absolute scene coordinates (the default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
 }
 
 fn default_true() -> bool { true }
@@ -916,6 +947,9 @@ pub struct TextOverlay {
     /// the GUI populates `z_order` on a fresh render it takes precedence.
     #[serde(default)]
     pub z_order: i32,
+    /// **Parent element**: see `Actor::parent_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
 }
 
 fn default_text_z() -> i32 { 100 }
@@ -1074,6 +1108,9 @@ pub struct ImageOverlay {
     /// **Stacking order at render time.** See `Actor::z_order`.
     #[serde(default)]
     pub z_order: i32,
+    /// **Parent element**: see `Actor::parent_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1110,6 +1147,9 @@ pub struct VideoOverlay {
     /// **Stacking order at render time.** See `Actor::z_order`.
     #[serde(default)]
     pub z_order: i32,
+    /// **Parent element**: see `Actor::parent_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]

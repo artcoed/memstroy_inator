@@ -56,10 +56,14 @@
 //!
 //! - **Backgrounds** — solid color, image, video (all `Fit` modes)
 //! - **Actor clips** — chromakey + color correction + opacity
-//!   + scale + rotation + flips, sampled at the correct scene-time
+//!   + scale + rotation + flips + effect stack, sampled at the
+//!   correct scene-time
 //! - **Image overlays** — full transform pipeline + chromakey mask
+//!   + effect stack
 //! - **Video overlays** — frame extraction + chromakey + transform
+//!   + effect stack
 //! - **Text overlays** — routed through `text_rasterize::rasterize_text_overlay`
+//!   + effect stack
 //! - **Render frame** — pos / zoom / rotation animated camera
 //! - **Easing / modifiers** — uses `keyframe::sample` /
 //!   `evaluate_modifiers` directly, no expression rewriting
@@ -67,9 +71,7 @@
 //!
 //! ## Out of scope (deferred)
 //!
-//! - **Per-element effect stack (blur, glow, mask, …)** — for now
-//!   scenes that use these get a clear log warning and the effects
-//!   are skipped. The layout still composes correctly.
+//! - **Skeleton attachments** — pose-driven element positioning
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -80,8 +82,8 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 use image::{Rgba, RgbaImage};
 use memstroy_core::{
-    canvas::WorldPos, keyframe, ChromaKeyParams, ColorCorrection, Fit, MediaSource, Overlay,
-    RenderFrame, RenderFrameState, Scene,
+    canvas::WorldPos, effects::{Effect, EffectKind, MaskShape}, keyframe, ChromaKeyParams,
+    ColorCorrection, Fit, MediaSource, Overlay, RenderFrame, RenderFrameState, Scene,
 };
 use tracing::{info, warn};
 
@@ -625,6 +627,11 @@ fn paint_actor(
     let cc = actor.color_correction.sampled_at(cc_local_t);
     apply_chroma_and_cc(&mut layer, &actor.chroma_key, &cc);
 
+    // Apply the per-element effect stack (blur, glow, mask, etc.)
+    if !actor.effects.is_empty() {
+        apply_effect_stack_rgba(&mut layer, &actor.effects, cc_local_t);
+    }
+
     // World position: skeleton attachment overrides → canvas_layouts → legacy.
     // Skeleton attachments aren't supported in the CPU compositor yet.
     let world_pos = element_world_pos(scene, &actor.id, t).unwrap_or_else(|| WorldPos {
@@ -703,6 +710,11 @@ fn paint_image_overlay(
     if let Some(ck) = &img_ov.chroma_key {
         apply_chroma_and_cc(&mut layer, ck, &ColorCorrection::default());
     }
+    // Apply the per-element effect stack.
+    if !img_ov.effects.is_empty() {
+        let local_t = t - img_ov.t_in;
+        apply_effect_stack_rgba(&mut layer, &img_ov.effects, local_t);
+    }
     let src_w = layer.width();
     let src_h = layer.height();
     if src_w == 0 || src_h == 0 {
@@ -778,6 +790,10 @@ fn paint_video_overlay(
     if let Some(ck) = &vid.chroma_key {
         apply_chroma_and_cc(&mut layer, ck, &ColorCorrection::default());
     }
+    // Apply the per-element effect stack.
+    if !vid.effects.is_empty() {
+        apply_effect_stack_rgba(&mut layer, &vid.effects, sample_t);
+    }
     let src_w = layer.width();
     let src_h = layer.height();
     if src_w == 0 || src_h == 0 {
@@ -848,13 +864,17 @@ fn paint_text_overlay(
             return;
         }
     };
-    let layer = match image::open(&raster.png_path).map(|i| i.to_rgba8()) {
+    let mut layer = match image::open(&raster.png_path).map(|i| i.to_rgba8()) {
         Ok(img) => img,
         Err(_) => {
             let _ = std::fs::remove_file(&raster.png_path);
             return;
         }
     };
+    // Apply the per-element effect stack to text overlays.
+    if !txt.effects.is_empty() {
+        apply_effect_stack_rgba(&mut layer, &txt.effects, sample_t);
+    }
     let png_w = raster.width as f32;
     let png_h = raster.height as f32;
     if png_w < 1.0 || png_h < 1.0 {
@@ -1068,6 +1088,469 @@ fn rgb_to_cbcr_bt601(rgb: [u8; 3]) -> (f32, f32) {
     let cb = -0.169 * r - 0.331 * g + 0.500 * b + 128.0;
     let cr = 0.500 * r - 0.419 * g - 0.081 * b + 128.0;
     (cb, cr)
+}
+
+// ─── EFFECT STACK (mirrors video_cache::apply_effect_stack_cpu) ─────
+
+/// Apply the full effect stack to an `RgbaImage` layer in-place.
+/// This is the render-time equivalent of the preview's
+/// `apply_effect_stack_cpu` — it runs every enabled effect in
+/// declared order so the exported MP4 matches what the canvas shows.
+fn apply_effect_stack_rgba(layer: &mut RgbaImage, effects: &[Effect], t_local: f32) {
+    for eff in effects {
+        if !eff.enabled {
+            continue;
+        }
+        let sampled = eff.sampled_at(t_local);
+        let intensity = sampled.intensity.clamp(0.0, 1.0);
+        if intensity <= 0.001 {
+            continue;
+        }
+        apply_single_effect_rgba(layer, &sampled.kind, intensity);
+    }
+}
+
+fn apply_single_effect_rgba(layer: &mut RgbaImage, kind: &EffectKind, intensity: f32) {
+    match kind {
+        EffectKind::Blur { radius } => fx_blur(layer, (*radius * intensity).round() as u32),
+        EffectKind::Sharpen { amount } => fx_sharpen(layer, *amount * intensity),
+        EffectKind::Grayscale => fx_grayscale(layer, intensity),
+        EffectKind::Sepia => fx_sepia(layer, intensity),
+        EffectKind::Invert => fx_invert(layer, intensity),
+        EffectKind::HueShift { degrees } => fx_hue_shift(layer, *degrees * intensity),
+        EffectKind::Vignette { strength } => fx_vignette(layer, (*strength * intensity).clamp(0.0, 1.0)),
+        EffectKind::Pixelate { block_size } => fx_pixelate(layer, (*block_size).max(1.0) as u32, intensity),
+        EffectKind::Posterize { levels } => fx_posterize(layer, *levels, intensity),
+        EffectKind::Glow { radius, intensity: i2 } => fx_glow(layer, *radius, *i2 * intensity),
+        EffectKind::Brightness { amount } => fx_brightness(layer, *amount * intensity),
+        EffectKind::Contrast { amount } => fx_contrast(layer, *amount * intensity),
+        EffectKind::Saturation { amount } => fx_saturation(layer, *amount * intensity),
+        EffectKind::EdgeDetect { threshold } => fx_edge_detect(layer, *threshold, intensity),
+        EffectKind::MirrorH => fx_mirror_h(layer, intensity),
+        EffectKind::MirrorV => fx_mirror_v(layer, intensity),
+        EffectKind::ChromaticAberration { offset } => fx_chromatic_aberration(layer, *offset * intensity),
+        EffectKind::Noise { amount } => fx_noise(layer, *amount * intensity),
+        EffectKind::Wave { amplitude, wavelength } => fx_wave(layer, *amplitude * intensity, *wavelength),
+        EffectKind::OldFilm => fx_old_film(layer, intensity),
+        EffectKind::Vhs => fx_vhs(layer, intensity),
+        EffectKind::Glitch { strength } => fx_glitch(layer, *strength * intensity),
+        EffectKind::Bloom { radius } => fx_bloom(layer, *radius, intensity),
+        EffectKind::Crop { left, top, right, bottom } => fx_crop_alpha(
+            layer,
+            (*left * intensity).clamp(0.0, 0.49),
+            (*top * intensity).clamp(0.0, 0.49),
+            (*right * intensity).clamp(0.0, 0.49),
+            (*bottom * intensity).clamp(0.0, 0.49),
+        ),
+        EffectKind::Mask { shape, feather, invert } => fx_mask(layer, shape, *feather, *invert, intensity),
+        EffectKind::ColorKey { color, similarity, blend, spill, invert } => {
+            fx_color_key(layer, *color, *similarity, *blend, *spill, *invert, intensity)
+        }
+    }
+}
+
+// ── Individual effect implementations on RgbaImage ──
+
+fn fx_blur(img: &mut RgbaImage, radius: u32) {
+    if radius == 0 { return; }
+    let r = radius.min(50);
+    let blurred = image::imageops::blur(img, r as f32);
+    *img = blurred;
+}
+
+fn fx_sharpen(img: &mut RgbaImage, amount: f32) {
+    if amount.abs() < 0.001 { return; }
+    let blurred = image::imageops::blur(img, 1.5);
+    let w = img.width();
+    let h = img.height();
+    for y in 0..h {
+        for x in 0..w {
+            let orig = img.get_pixel(x, y).0;
+            let blur = blurred.get_pixel(x, y).0;
+            let mut out = [0u8; 4];
+            for c in 0..3 {
+                let diff = orig[c] as f32 - blur[c] as f32;
+                out[c] = (orig[c] as f32 + diff * amount).clamp(0.0, 255.0) as u8;
+            }
+            out[3] = orig[3];
+            img.put_pixel(x, y, Rgba(out));
+        }
+    }
+}
+
+fn fx_grayscale(img: &mut RgbaImage, intensity: f32) {
+    for px in img.pixels_mut() {
+        let g = (0.299 * px.0[0] as f32 + 0.587 * px.0[1] as f32 + 0.114 * px.0[2] as f32)
+            .clamp(0.0, 255.0);
+        px.0[0] = lerp_f32(px.0[0] as f32, g, intensity) as u8;
+        px.0[1] = lerp_f32(px.0[1] as f32, g, intensity) as u8;
+        px.0[2] = lerp_f32(px.0[2] as f32, g, intensity) as u8;
+    }
+}
+
+fn fx_sepia(img: &mut RgbaImage, intensity: f32) {
+    for px in img.pixels_mut() {
+        let r = px.0[0] as f32; let g = px.0[1] as f32; let b = px.0[2] as f32;
+        let sr = (0.393 * r + 0.769 * g + 0.189 * b).clamp(0.0, 255.0);
+        let sg = (0.349 * r + 0.686 * g + 0.168 * b).clamp(0.0, 255.0);
+        let sb = (0.272 * r + 0.534 * g + 0.131 * b).clamp(0.0, 255.0);
+        px.0[0] = lerp_f32(r, sr, intensity) as u8;
+        px.0[1] = lerp_f32(g, sg, intensity) as u8;
+        px.0[2] = lerp_f32(b, sb, intensity) as u8;
+    }
+}
+
+fn fx_invert(img: &mut RgbaImage, intensity: f32) {
+    for px in img.pixels_mut() {
+        px.0[0] = lerp_f32(px.0[0] as f32, 255.0 - px.0[0] as f32, intensity) as u8;
+        px.0[1] = lerp_f32(px.0[1] as f32, 255.0 - px.0[1] as f32, intensity) as u8;
+        px.0[2] = lerp_f32(px.0[2] as f32, 255.0 - px.0[2] as f32, intensity) as u8;
+    }
+}
+
+fn fx_hue_shift(img: &mut RgbaImage, degrees: f32) {
+    let theta = degrees.to_radians();
+    let c = theta.cos();
+    let s = theta.sin();
+    let m00 = 0.213 + 0.787 * c - 0.213 * s;
+    let m01 = 0.213 - 0.213 * c + 0.413 * s;
+    let m02 = 0.213 - 0.213 * c - 0.787 * s;
+    let m10 = 0.715 - 0.715 * c - 0.715 * s;
+    let m11 = 0.715 + 0.285 * c + 0.140 * s;
+    let m12 = 0.715 - 0.715 * c + 0.715 * s;
+    let m20 = 0.072 - 0.072 * c + 0.928 * s;
+    let m21 = 0.072 - 0.072 * c - 0.283 * s;
+    let m22 = 0.072 + 0.928 * c + 0.072 * s;
+    for px in img.pixels_mut() {
+        let r = px.0[0] as f32; let g = px.0[1] as f32; let b = px.0[2] as f32;
+        px.0[0] = (m00 * r + m10 * g + m20 * b).clamp(0.0, 255.0) as u8;
+        px.0[1] = (m01 * r + m11 * g + m21 * b).clamp(0.0, 255.0) as u8;
+        px.0[2] = (m02 * r + m12 * g + m22 * b).clamp(0.0, 255.0) as u8;
+    }
+}
+
+fn fx_vignette(img: &mut RgbaImage, strength: f32) {
+    let w = img.width() as f32;
+    let h = img.height() as f32;
+    let cx = w * 0.5;
+    let cy = h * 0.5;
+    let max_dist = (cx * cx + cy * cy).sqrt();
+    for (x, y, px) in img.enumerate_pixels_mut() {
+        let dx = x as f32 - cx;
+        let dy = y as f32 - cy;
+        let dist = (dx * dx + dy * dy).sqrt() / max_dist;
+        let factor = 1.0 - (dist * strength).clamp(0.0, 1.0);
+        px.0[0] = (px.0[0] as f32 * factor).clamp(0.0, 255.0) as u8;
+        px.0[1] = (px.0[1] as f32 * factor).clamp(0.0, 255.0) as u8;
+        px.0[2] = (px.0[2] as f32 * factor).clamp(0.0, 255.0) as u8;
+    }
+}
+
+fn fx_pixelate(img: &mut RgbaImage, block_size: u32, intensity: f32) {
+    let bs = block_size.max(1).min(img.width().min(img.height()));
+    let effective_bs = ((bs as f32 * intensity).round() as u32).max(1);
+    if effective_bs <= 1 { return; }
+    let w = img.width();
+    let h = img.height();
+    let mut y = 0;
+    while y < h {
+        let mut x = 0;
+        while x < w {
+            let bw = effective_bs.min(w - x);
+            let bh = effective_bs.min(h - y);
+            let mut sr = 0u32; let mut sg = 0u32; let mut sb = 0u32;
+            let count = bw * bh;
+            for by in 0..bh {
+                for bx in 0..bw {
+                    let p = img.get_pixel(x + bx, y + by).0;
+                    sr += p[0] as u32; sg += p[1] as u32; sb += p[2] as u32;
+                }
+            }
+            let ar = (sr / count) as u8;
+            let ag = (sg / count) as u8;
+            let ab = (sb / count) as u8;
+            for by in 0..bh {
+                for bx in 0..bw {
+                    let p = img.get_pixel_mut(x + bx, y + by);
+                    p.0[0] = ar; p.0[1] = ag; p.0[2] = ab;
+                }
+            }
+            x += effective_bs;
+        }
+        y += effective_bs;
+    }
+}
+
+fn fx_posterize(img: &mut RgbaImage, levels: u32, intensity: f32) {
+    let levels = levels.max(2).min(256);
+    let step = 255.0 / (levels - 1) as f32;
+    for px in img.pixels_mut() {
+        for c in 0..3 {
+            let v = px.0[c] as f32;
+            let q = ((v / step).round() * step).clamp(0.0, 255.0);
+            px.0[c] = lerp_f32(v, q, intensity) as u8;
+        }
+    }
+}
+
+fn fx_glow(img: &mut RgbaImage, radius: f32, intensity: f32) {
+    if intensity < 0.001 { return; }
+    let blurred = image::imageops::blur(img, radius.max(1.0).min(30.0));
+    let w = img.width();
+    let h = img.height();
+    for y in 0..h {
+        for x in 0..w {
+            let orig = img.get_pixel(x, y).0;
+            let glow = blurred.get_pixel(x, y).0;
+            let mut out = [0u8; 4];
+            for c in 0..3 {
+                let added = orig[c] as f32 + glow[c] as f32 * intensity;
+                out[c] = added.clamp(0.0, 255.0) as u8;
+            }
+            out[3] = orig[3];
+            img.put_pixel(x, y, Rgba(out));
+        }
+    }
+}
+
+fn fx_brightness(img: &mut RgbaImage, amount: f32) {
+    let add = amount * 255.0;
+    for px in img.pixels_mut() {
+        px.0[0] = (px.0[0] as f32 + add).clamp(0.0, 255.0) as u8;
+        px.0[1] = (px.0[1] as f32 + add).clamp(0.0, 255.0) as u8;
+        px.0[2] = (px.0[2] as f32 + add).clamp(0.0, 255.0) as u8;
+    }
+}
+
+fn fx_contrast(img: &mut RgbaImage, amount: f32) {
+    let factor = (1.0 + amount).max(0.0);
+    for px in img.pixels_mut() {
+        px.0[0] = ((px.0[0] as f32 - 128.0) * factor + 128.0).clamp(0.0, 255.0) as u8;
+        px.0[1] = ((px.0[1] as f32 - 128.0) * factor + 128.0).clamp(0.0, 255.0) as u8;
+        px.0[2] = ((px.0[2] as f32 - 128.0) * factor + 128.0).clamp(0.0, 255.0) as u8;
+    }
+}
+
+fn fx_saturation(img: &mut RgbaImage, amount: f32) {
+    let factor = (1.0 + amount).max(0.0);
+    for px in img.pixels_mut() {
+        let r = px.0[0] as f32; let g = px.0[1] as f32; let b = px.0[2] as f32;
+        let gray = 0.299 * r + 0.587 * g + 0.114 * b;
+        px.0[0] = (gray + (r - gray) * factor).clamp(0.0, 255.0) as u8;
+        px.0[1] = (gray + (g - gray) * factor).clamp(0.0, 255.0) as u8;
+        px.0[2] = (gray + (b - gray) * factor).clamp(0.0, 255.0) as u8;
+    }
+}
+
+fn fx_edge_detect(img: &mut RgbaImage, _threshold: f32, intensity: f32) {
+    let w = img.width();
+    let h = img.height();
+    if w < 3 || h < 3 { return; }
+    let orig = img.clone();
+    for y in 1..h - 1 {
+        for x in 1..w - 1 {
+            let mut edge = 0.0f32;
+            for c in 0..3 {
+                let tl = orig.get_pixel(x - 1, y - 1).0[c] as f32;
+                let t = orig.get_pixel(x, y - 1).0[c] as f32;
+                let tr = orig.get_pixel(x + 1, y - 1).0[c] as f32;
+                let l = orig.get_pixel(x - 1, y).0[c] as f32;
+                let r = orig.get_pixel(x + 1, y).0[c] as f32;
+                let bl = orig.get_pixel(x - 1, y + 1).0[c] as f32;
+                let b = orig.get_pixel(x, y + 1).0[c] as f32;
+                let br = orig.get_pixel(x + 1, y + 1).0[c] as f32;
+                let gx = -tl - 2.0 * l - bl + tr + 2.0 * r + br;
+                let gy = -tl - 2.0 * t - tr + bl + 2.0 * b + br;
+                edge += (gx * gx + gy * gy).sqrt();
+            }
+            let e = (edge / 3.0).clamp(0.0, 255.0);
+            let px = img.get_pixel_mut(x, y);
+            let orig_px = orig.get_pixel(x, y).0;
+            px.0[0] = lerp_f32(orig_px[0] as f32, e, intensity) as u8;
+            px.0[1] = lerp_f32(orig_px[1] as f32, e, intensity) as u8;
+            px.0[2] = lerp_f32(orig_px[2] as f32, e, intensity) as u8;
+        }
+    }
+}
+
+fn fx_mirror_h(img: &mut RgbaImage, intensity: f32) {
+    if intensity < 0.5 { return; }
+    image::imageops::flip_horizontal_in_place(img);
+}
+
+fn fx_mirror_v(img: &mut RgbaImage, intensity: f32) {
+    if intensity < 0.5 { return; }
+    image::imageops::flip_vertical_in_place(img);
+}
+
+fn fx_chromatic_aberration(img: &mut RgbaImage, offset: f32) {
+    let off = offset.round() as i32;
+    if off == 0 { return; }
+    let w = img.width() as i32;
+    let h = img.height() as i32;
+    let orig = img.clone();
+    for y in 0..h {
+        for x in 0..w {
+            let px = img.get_pixel_mut(x as u32, y as u32);
+            // Shift red channel left, blue channel right
+            let rx = (x - off).clamp(0, w - 1) as u32;
+            let bx = (x + off).clamp(0, w - 1) as u32;
+            px.0[0] = orig.get_pixel(rx, y as u32).0[0];
+            px.0[2] = orig.get_pixel(bx, y as u32).0[2];
+        }
+    }
+}
+
+fn fx_noise(img: &mut RgbaImage, amount: f32) {
+    if amount < 0.001 { return; }
+    let sigma = amount * 50.0;
+    // Simple deterministic noise based on pixel position (no rand crate needed)
+    for (x, y, px) in img.enumerate_pixels_mut() {
+        let seed = (x as u32).wrapping_mul(1103515245).wrapping_add(y as u32 * 12345);
+        let noise_val = ((seed >> 16) as f32 / 32768.0 - 1.0) * sigma;
+        px.0[0] = (px.0[0] as f32 + noise_val).clamp(0.0, 255.0) as u8;
+        px.0[1] = (px.0[1] as f32 + noise_val).clamp(0.0, 255.0) as u8;
+        px.0[2] = (px.0[2] as f32 + noise_val).clamp(0.0, 255.0) as u8;
+    }
+}
+
+fn fx_wave(img: &mut RgbaImage, amplitude: f32, wavelength: f32) {
+    if amplitude < 0.5 || wavelength < 1.0 { return; }
+    let w = img.width();
+    let h = img.height();
+    let orig = img.clone();
+    for y in 0..h {
+        let offset = (amplitude * (2.0 * std::f32::consts::PI * y as f32 / wavelength).sin()).round() as i32;
+        for x in 0..w {
+            let sx = (x as i32 + offset).clamp(0, w as i32 - 1) as u32;
+            *img.get_pixel_mut(x, y) = *orig.get_pixel(sx, y);
+        }
+    }
+}
+
+fn fx_old_film(img: &mut RgbaImage, intensity: f32) {
+    fx_sepia(img, 0.6 * intensity);
+    fx_vignette(img, 0.4 * intensity);
+    fx_noise(img, 0.08 * intensity);
+}
+
+fn fx_vhs(img: &mut RgbaImage, intensity: f32) {
+    fx_chromatic_aberration(img, 3.0 * intensity);
+    // Slight desaturation
+    fx_saturation(img, -0.3 * intensity);
+}
+
+fn fx_glitch(img: &mut RgbaImage, strength: f32) {
+    if strength < 0.01 { return; }
+    let w = img.width();
+    let h = img.height();
+    let block_h = (h as f32 * 0.05).max(2.0) as u32;
+    let max_shift = (w as f32 * strength * 0.1).round() as i32;
+    if max_shift == 0 { return; }
+    let orig = img.clone();
+    let mut seed = 42u32;
+    let mut y = 0;
+    while y < h {
+        seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+        let shift = ((seed >> 16) as i32 % (max_shift * 2 + 1)) - max_shift;
+        let bh = block_h.min(h - y);
+        for dy in 0..bh {
+            for x in 0..w {
+                let sx = (x as i32 + shift).clamp(0, w as i32 - 1) as u32;
+                *img.get_pixel_mut(x, y + dy) = *orig.get_pixel(sx, y + dy);
+            }
+        }
+        y += bh;
+    }
+}
+
+fn fx_bloom(img: &mut RgbaImage, radius: f32, intensity: f32) {
+    fx_glow(img, radius, intensity * 0.5);
+}
+
+fn fx_crop_alpha(img: &mut RgbaImage, left: f32, top: f32, right: f32, bottom: f32) {
+    let w = img.width();
+    let h = img.height();
+    let lx = (left * w as f32).round() as u32;
+    let ty = (top * h as f32).round() as u32;
+    let rx = w.saturating_sub((right * w as f32).round() as u32);
+    let by = h.saturating_sub((bottom * h as f32).round() as u32);
+    for y in 0..h {
+        for x in 0..w {
+            if x < lx || x >= rx || y < ty || y >= by {
+                let px = img.get_pixel_mut(x, y);
+                px.0[3] = 0;
+            }
+        }
+    }
+}
+
+fn fx_mask(img: &mut RgbaImage, shape: &MaskShape, feather: f32, invert: bool, intensity: f32) {
+    let w = img.width();
+    let h = img.height();
+    if w == 0 || h == 0 { return; }
+    let inv_w = 1.0 / w as f32;
+    let inv_h = 1.0 / h as f32;
+    for y in 0..h {
+        let v = (y as f32 + 0.5) * inv_h;
+        for x in 0..w {
+            let u = (x as f32 + 0.5) * inv_w;
+            let keep = if feather > 0.001 {
+                let margin = shape.signed_margin_uv(u, v);
+                let raw = (margin / feather + 0.5).clamp(0.0, 1.0);
+                if invert { 1.0 - raw } else { raw }
+            } else {
+                let inside = shape.contains_uv(u, v);
+                if invert { if inside { 0.0 } else { 1.0 } } else { if inside { 1.0 } else { 0.0 } }
+            };
+            let px = img.get_pixel_mut(x, y);
+            let orig_a = px.0[3] as f32;
+            let target_a = orig_a * keep;
+            px.0[3] = (orig_a + (target_a - orig_a) * intensity).clamp(0.0, 255.0) as u8;
+        }
+    }
+}
+
+fn fx_color_key(
+    img: &mut RgbaImage,
+    key_color: [u8; 3],
+    similarity: f32,
+    blend: f32,
+    _spill: f32,
+    invert: bool,
+    intensity: f32,
+) {
+    let similarity = if similarity.is_finite() { similarity.clamp(0.0, 1.0) } else { 0.0 };
+    let blend = if blend.is_finite() { blend.clamp(0.0, 1.0) } else { 0.0 };
+    if similarity < 1.0e-5 && !invert { return; }
+    let (key_cb, key_cr) = rgb_to_cbcr_bt601(key_color);
+    let dist_norm = 255.0 * std::f32::consts::SQRT_2;
+    for px in img.pixels_mut() {
+        let r = px.0[0] as f32;
+        let g = px.0[1] as f32;
+        let b = px.0[2] as f32;
+        let cb = -0.169 * r - 0.331 * g + 0.500 * b + 128.0;
+        let cr = 0.500 * r - 0.419 * g - 0.081 * b + 128.0;
+        let du = cb - key_cb;
+        let dv = cr - key_cr;
+        let diff = (du * du + dv * dv).sqrt() / dist_norm;
+        let mut alpha_keep = if diff < similarity {
+            0.0
+        } else if blend > 0.0 && diff < similarity + blend {
+            ((diff - similarity) / blend).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        if invert { alpha_keep = 1.0 - alpha_keep; }
+        let orig_a = px.0[3] as f32;
+        let target_a = orig_a * alpha_keep;
+        px.0[3] = (orig_a + (target_a - orig_a) * intensity).clamp(0.0, 255.0) as u8;
+    }
+}
+
+#[inline]
+fn lerp_f32(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
 }
 
 // ─── LAYER COMPOSITOR (inverse-mapping affine + bilinear) ──────────
