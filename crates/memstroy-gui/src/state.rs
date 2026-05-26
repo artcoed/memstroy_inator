@@ -1037,7 +1037,7 @@ impl EditorState {
         s.recovery_pending = None;
         s.recovery_dialog_open = false;
         s.autosave_toast_until = None;
-        s.startup_toast_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
+        s.startup_toast_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(15));
 
         // Loop preview defaults
         s.loop_mode = false;
