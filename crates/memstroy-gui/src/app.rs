@@ -4423,13 +4423,21 @@ impl eframe::App for App {
                     .resizable(false)
                     .collapsible(false)
                     .anchor(egui::Align2::CENTER_TOP, [0.0, 50.0])
-                    .frame(egui::Frame::popup(&ctx.style()).fill(Color32::from_rgb(40, 38, 26)))
+                    .frame(egui::Frame::popup(&ctx.style())
+                        .fill(Color32::from_rgb(40, 38, 26))
+                        .inner_margin(egui::Margin::same(16.0)))
                     .show(ctx, |ui| {
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new("📢").size(16.0));
-                            ui.label(RichText::new("Следите за обновлениями и жалуйтесь на баги в telegram: https://t.me/memstroy_inator")
-                                .size(12.0)
+                            ui.label(RichText::new("📢").size(18.0));
+                            ui.label(RichText::new("Следите за обновлениями и жалуйтесь на баги в telegram: ")
+                                .size(13.0)
                                 .color(Color32::from_rgb(220, 220, 220)));
+                            ui.hyperlink_to(
+                                RichText::new("https://t.me/memstroy_inator")
+                                    .size(13.0)
+                                    .color(Color32::from_rgb(255, 242, 0)),
+                                "https://t.me/memstroy_inator"
+                            );
                         });
                     });
             } else {
