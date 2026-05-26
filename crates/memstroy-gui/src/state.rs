@@ -193,6 +193,34 @@ impl TimelineMarquee {
     }
 }
 
+/// Active rectangle (rubber-band) selection for keyframes in the
+/// per-param expansion rows of the timeline. Screen-pixel coordinates.
+#[derive(Clone, Copy, Debug)]
+pub struct KeyframeMarquee {
+    pub start: egui::Pos2,
+    pub end: egui::Pos2,
+}
+
+impl KeyframeMarquee {
+    pub fn rect(&self) -> egui::Rect {
+        egui::Rect::from_two_pos(self.start, self.end)
+    }
+}
+
+/// Active rectangle (rubber-band) selection for keyframes in the curve
+/// editor graph. Screen-pixel coordinates.
+#[derive(Clone, Copy, Debug)]
+pub struct CurveEditorMarquee {
+    pub start: egui::Pos2,
+    pub end: egui::Pos2,
+}
+
+impl CurveEditorMarquee {
+    pub fn rect(&self) -> egui::Rect {
+        egui::Rect::from_two_pos(self.start, self.end)
+    }
+}
+
 /// Drag state for clips already on the timeline. Tracks only whether a
 /// timeline clip is currently being dragged, so we can take a single undo
 /// snapshot at the start of the gesture.
@@ -249,12 +277,18 @@ pub struct TimelineDrag {
 pub struct GroupMoveAnchor {
     pub sel: Selection,
     pub t_in: f32,
+    /// Snapshot of the element's track index at drag start. Used by
+    /// the lane-change broadcast so peers move by the same offset
+    /// from their ORIGINAL lane each frame, instead of compounding
+    /// deltas across frames.
+    pub track: Option<usize>,
 }
 
 impl std::fmt::Debug for GroupMoveAnchor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GroupMoveAnchor")
             .field("t_in", &self.t_in)
+            .field("track", &self.track)
             .finish()
     }
 }
@@ -578,6 +612,35 @@ pub struct EditorState {
     /// by the inspector to flash the matching control so the user can
     /// follow the connection visually.
     pub kf_highlight: crate::kf_anim::KfHighlight,
+
+    // ─── Keyframe marquee (rubber-band multi-select in param rows) ─
+    /// Active marquee for selecting keyframes in the per-param expansion
+    /// rows. `Some` while the user is dragging from empty space inside
+    /// the param-row area. Screen-pixel coordinates.
+    pub kf_marquee: Option<KeyframeMarquee>,
+    /// Pending press position for the keyframe marquee — promoted into
+    /// a real marquee once the pointer travels past the drag threshold.
+    pub kf_marquee_pending: Option<egui::Pos2>,
+    /// True while a multi-keyframe drag is in progress (started by
+    /// dragging a selected keyframe). All selected keyframes move
+    /// together by the accumulated pixel offset stored here.
+    pub kf_multi_drag_active: bool,
+    /// Accumulated pixel offset for the in-progress multi-keyframe drag.
+    pub kf_multi_drag_dx: f32,
+
+    // ─── Curve editor marquee (rubber-band multi-select) ───────────
+    /// Active marquee for selecting keyframes in the curve editor.
+    /// Screen-pixel coordinates within the graph rect.
+    pub curve_editor_marquee: Option<CurveEditorMarquee>,
+    /// Indices of keyframes currently selected in the curve editor.
+    /// Used for multi-drag and batch operations.
+    pub curve_editor_selected: Vec<usize>,
+    /// True while a multi-keyframe drag is in progress in the curve
+    /// editor.
+    pub curve_editor_multi_drag: bool,
+    /// Accumulated delta for the curve editor multi-drag (pixels).
+    pub curve_editor_multi_drag_delta: egui::Vec2,
+
     /// Library panel screen rect, captured during library() so the
     /// app's external file-drop handler can route OS drops to the right
     /// asset directory based on which tab is visible.
@@ -709,6 +772,13 @@ pub struct EditorState {
     /// rebuild still goes through [`Self::reload_library`].
     pub library_dir_fingerprint: Vec<(u64, u64)>,
 
+    /// Cache of probed video durations keyed by absolute path. Avoids
+    /// re-running ffprobe on the same file (which blocks the UI thread
+    /// for 50-500ms per call) when a clip is dragged onto the canvas
+    /// repeatedly. Populated lazily — entries are added on first probe
+    /// and never expire within a session.
+    pub video_duration_cache: std::collections::HashMap<std::path::PathBuf, f32>,
+
     /// Tokio runtime handle injected by the App on startup so panels
     /// that talk to network services (the asset server, Telegram
     /// ingest, etc.) can spawn async tasks without rebuilding their
@@ -742,6 +812,12 @@ pub struct EditorState {
     /// so the worker can share ownership without cloning the cache
     /// state itself.
     pub image_fx_cache: std::sync::Arc<crate::image_fx_cache::ImageFxCache>,
+
+    /// Cache for FX zone live previews. Stores baked composites of
+    /// lower image overlays processed through an FX zone's effect
+    /// stack, keyed by FX zone id. See `crate::fx_preview` for the
+    /// pipeline.
+    pub fx_preview_cache: std::sync::Arc<crate::fx_preview::FxPreviewCache>,
 
     /// Sender used by the canvas paint loop to dispatch background
     /// image-effects bake jobs back to the App's `pump_events` drain.
@@ -863,10 +939,24 @@ pub enum LibraryTab {
 #[allow(dead_code)]
 pub struct LibraryClip {
     pub id: u64,
+    /// Local file path. For server-only clips (not yet downloaded),
+    /// this is the path where the file WILL be written when the user
+    /// uses it (drag onto canvas / timeline).
     pub path: PathBuf,
     pub description: String,
+    /// True when the file is locally cached. False for server-only
+    /// stubs that need a `/api/assets/:id/download` round-trip
+    /// before they can be played.
     pub downloaded: bool,
+    /// Local thumbnail path. For server-only clips this can be a
+    /// streamed `/api/assets/:id/preview` URL turned into a temp
+    /// file by the thumbnail prefetcher, or `None` while loading.
     pub thumbnail: Option<PathBuf>,
+    /// Server-side asset id (matches `AssetSummary::id`). Set for
+    /// every clip the server knows about, including ones already
+    /// downloaded — the GUI uses it to fetch downloads on demand.
+    /// `None` for purely-local clips that aren't on the server.
+    pub server_id: Option<String>,
 }
 
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
@@ -993,6 +1083,7 @@ impl EditorState {
         s.last_auto_refresh = None;
         s.last_library_rescan = None;
         s.library_dir_fingerprint = Vec::new();
+        s.video_duration_cache = std::collections::HashMap::new();
 
         // ── Load persistent editor preferences (language, master
         // volume, autosave interval, snap toggle) and apply the bits
@@ -1826,11 +1917,8 @@ impl EditorState {
                 // caption rather than the bare numeric id.
                 let txt_path = clips_dir.join(format!("{}.txt", stem));
                 let description = match std::fs::read_to_string(&txt_path) {
-                    Ok(s) => {
-                        let trimmed = s.trim().to_string();
-                        if trimmed.is_empty() { stem.clone() } else { trimmed }
-                    }
-                    Err(_) => stem.clone(),
+                    Ok(s) => s.trim().to_string(),
+                    Err(_) => String::new(),
                 };
                 clips.push(LibraryClip {
                     id,
@@ -1838,6 +1926,70 @@ impl EditorState {
                     description,
                     downloaded: true,
                     thumbnail,
+                    // Local clip — server_id is the file stem so the
+                    // GUI can match server listings to local entries
+                    // for de-duplication during refresh.
+                    server_id: Some(stem.clone()),
+                });
+            }
+        }
+
+        // ── Server-only clips (lazy download) ──
+        //
+        // Find `.txt` sidecars in clips_dir that don't have a
+        // corresponding `.mp4` — these are server-side clips whose
+        // metadata + thumbnail are mirrored locally but the body
+        // hasn't been downloaded yet. They render as "stubs" in the
+        // library; dragging one onto canvas/timeline triggers a
+        // background download via the lazy-download path.
+        if let Ok(entries) = std::fs::read_dir(&clips_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_file() { continue; }
+                let ext = path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .map(str::to_ascii_lowercase)
+                    .unwrap_or_default();
+                if ext != "txt" { continue; }
+                let stem = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                if stem.is_empty() { continue; }
+                let mp4_path = clips_dir.join(format!("{}.mp4", stem));
+                if mp4_path.exists() { continue; } // already a downloaded clip
+                // Skip if we already added this clip via the mp4 pass
+                if clips.iter().any(|c| c.server_id.as_deref() == Some(stem.as_str())) {
+                    continue;
+                }
+                let id: u64 = stem.parse::<u64>().unwrap_or_else(|_| {
+                    use std::collections::hash_map::DefaultHasher;
+                    use std::hash::{Hash, Hasher};
+                    let mut h = DefaultHasher::new();
+                    stem.hash(&mut h);
+                    h.finish()
+                });
+                let description = std::fs::read_to_string(&path)
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_default();
+                let thumb_jpg = thumbs_dir.join(format!("{}.jpg", stem));
+                let thumb_png = thumbs_dir.join(format!("{}.png", stem));
+                let thumbnail = if thumb_jpg.exists() {
+                    Some(thumb_jpg)
+                } else if thumb_png.exists() {
+                    Some(thumb_png)
+                } else {
+                    None
+                };
+                clips.push(LibraryClip {
+                    id,
+                    path: mp4_path,  // path where the .mp4 will be written on download
+                    description,
+                    downloaded: false,
+                    thumbnail,
+                    server_id: Some(stem),
                 });
             }
         }
@@ -1884,7 +2036,7 @@ impl EditorState {
     /// entry, well within "run on every UI frame".
     ///
     /// Returns one tuple per entry in [`Self::library_dirs`].
-    fn compute_library_dir_fingerprint(&self) -> Vec<(u64, u64)> {
+    pub(crate) fn compute_library_dir_fingerprint(&self) -> Vec<(u64, u64)> {
         let mut out = Vec::with_capacity(5);
         for dir in self.library_dirs() {
             out.push(dir_fingerprint(&dir));

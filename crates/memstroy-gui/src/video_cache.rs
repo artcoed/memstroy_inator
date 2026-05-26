@@ -326,20 +326,37 @@ impl FrameCache {
             }
         }
 
-        // Miss: get the raw frame and apply effects on a downscaled copy
-        // for fast preview. Chromakey/CC quality at preview-resolution is
-        // sufficient and avoids per-pixel CPU work on full HD frames.
-        // Adaptive quality: when many actors are playing simultaneously,
-        // the downscale target is reduced further to keep the frame budget.
+        // Fast path: when there are no user effects AND no active
+        // chroma/CC, skip the entire processing pipeline and just
+        // upload the downscaled raw frame. This saves the allocation
+        // + per-pixel loop on every frame during playback for the
+        // common case of "no color tweaks applied".
         let raw = self.raw_frame_at_time(t)?;
         let active_caches = PRELOAD_SEMAPHORE.load(std::sync::atomic::Ordering::Relaxed);
         let preview_dim = if active_caches >= 4 { 180 } else if active_caches >= 2 { 240 } else { 360 };
         let scaled = downscale_for_preview(&raw, preview_dim);
-        let mut processed = apply_effects_cpu(&scaled, ck, cc);
-        // Stack the user's post-process effects on top, in declared order.
-        if !effects.is_empty() {
-            processed = apply_effect_stack_cpu(&processed, effects);
-        }
+
+        let chroma_active = ck.similarity.is_finite() && ck.similarity >= 1.0e-5;
+        let cc_active = (cc.brightness.abs() > 1e-4)
+            || (cc.contrast.abs() > 1e-4)
+            || (cc.saturation.abs() > 1e-4)
+            || (cc.temperature.abs() > 1e-4)
+            || cc.lift.iter().any(|v| v.abs() > 1e-4)
+            || cc.gamma.iter().any(|v| (v - 1.0).abs() > 1e-4)
+            || cc.gain.iter().any(|v| (v - 1.0).abs() > 1e-4)
+            || !cc.curves.is_identity();
+        let effects_active = effects.iter().any(|e| e.enabled && e.intensity > 0.001);
+
+        let processed = if !chroma_active && !cc_active && !effects_active {
+            // No-op: just upload the scaled frame as-is.
+            scaled
+        } else {
+            let mut p = apply_effects_cpu(&scaled, ck, cc);
+            if effects_active {
+                p = apply_effect_stack_cpu(&p, effects);
+            }
+            p
+        };
         let options = TextureOptions::LINEAR;
         match self.fx_texture.as_mut() {
             Some(tex) => tex.set(processed, options),
@@ -628,6 +645,22 @@ pub fn apply_effects_cpu(
     ck: &memstroy_core::ChromaKeyParams,
     cc: &memstroy_core::ColorCorrection,
 ) -> ColorImage {
+    // Fast path: if neither chromakey nor color correction is active,
+    // skip the per-pixel loop entirely and just return a clone. This
+    // is the common case when the user hasn't touched any color
+    // controls — and saves a per-frame allocation+walk during playback.
+    let similarity_check = ck.similarity.is_finite() && ck.similarity >= 1.0e-5;
+    let cc_check = (cc.brightness.abs() > 1e-4)
+        || (cc.contrast.abs() > 1e-4)
+        || (cc.saturation.abs() > 1e-4)
+        || (cc.temperature.abs() > 1e-4)
+        || cc.lift.iter().any(|v| v.abs() > 1e-4)
+        || cc.gamma.iter().any(|v| (v - 1.0).abs() > 1e-4)
+        || cc.gain.iter().any(|v| (v - 1.0).abs() > 1e-4)
+        || !cc.curves.is_identity();
+    if !similarity_check && !cc_check {
+        return img.clone();
+    }
     let mut out = ColorImage::new(img.size, egui::Color32::TRANSPARENT);
     // ── Chromakey: FFmpeg-faithful YCbCr (BT.601) distance ──
     //
@@ -811,6 +844,10 @@ pub fn apply_effect_stack_cpu(
     img: &ColorImage,
     effects: &[memstroy_core::Effect],
 ) -> ColorImage {
+    // Fast path: skip the clone when there's nothing to do
+    if effects.is_empty() {
+        return img.clone();
+    }
     let mut current = img.clone();
     for eff in effects {
         if !eff.enabled { continue; }
@@ -878,6 +915,11 @@ fn apply_single_effect(
 /// Apply a [`memstroy_core::MaskShape`] to a `ColorImage`'s alpha
 /// channel. Mirrors `image_effects::apply_mask_alpha` but operates on
 /// the live frame buffer used by the video preview pipeline.
+///
+/// Optimized: takes ownership and mutates the alpha channel in place
+/// without allocating a fresh ColorImage. For simple shapes (Rect
+/// without feather), uses fast-path bounds checks instead of calling
+/// `sample_mask_alpha` per pixel.
 fn apply_mask_color_image(
     img: &ColorImage,
     shape: &memstroy_core::MaskShape,
@@ -886,12 +928,44 @@ fn apply_mask_color_image(
     intensity: f32,
 ) -> ColorImage {
     let mut out = img.clone();
-    let w = img.size[0];
-    let h = img.size[1];
+    let w = out.size[0];
+    let h = out.size[1];
     if w == 0 || h == 0 { return out; }
+    let i = intensity.clamp(0.0, 1.0);
+
+    // Fast path: hard-edge axis-aligned rectangle (no feather).
+    // Just clear alpha outside the rect (or inside if invert).
+    if let memstroy_core::MaskShape::Rect { left, top, right, bottom } = shape {
+        if feather <= 1e-6 && i >= 0.999 {
+            let lx = (left * w as f32) as i32;
+            let ty = (top * h as f32) as i32;
+            let rx = (right * w as f32) as i32;
+            let by = (bottom * h as f32) as i32;
+            for y in 0..h as i32 {
+                let inside_y = y >= ty && y <= by;
+                let row = (y as usize) * w;
+                for x in 0..w as i32 {
+                    let inside_x = x >= lx && x <= rx;
+                    let inside = inside_x && inside_y;
+                    let keep = if invert { !inside } else { inside };
+                    if !keep {
+                        let idx = row + x as usize;
+                        if idx < out.pixels.len() {
+                            let p = out.pixels[idx];
+                            out.pixels[idx] = egui::Color32::from_rgba_unmultiplied(
+                                p.r(), p.g(), p.b(), 0,
+                            );
+                        }
+                    }
+                }
+            }
+            return out;
+        }
+    }
+
+    // General path: per-pixel sample.
     let inv_w = 1.0 / (w as f32);
     let inv_h = 1.0 / (h as f32);
-    let i = intensity.clamp(0.0, 1.0);
     for y in 0..h {
         let v = (y as f32 + 0.5) * inv_h;
         let row = y * w;
@@ -900,6 +974,8 @@ fn apply_mask_color_image(
             let keep = crate::image_effects::sample_mask_alpha(
                 shape, u, v, feather, invert,
             );
+            // Skip pixels that don't change (keep == 1.0 and intensity full)
+            if keep >= 0.9999 && i >= 0.9999 { continue; }
             let idx = row + x;
             if idx < out.pixels.len() {
                 let p = out.pixels[idx];

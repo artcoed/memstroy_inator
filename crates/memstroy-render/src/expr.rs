@@ -430,6 +430,13 @@ pub(crate) struct ElementTransform {
 /// distinction every overlay animation in a clip whose `t_in > 0`
 /// rendered out-of-sync with the canvas preview (the preview samples
 /// at `t - t_in`, the renderer at `t`).
+///
+/// TODO: parent_id transform propagation. When an element has a
+/// `parent_id` set, its position/rotation/scale should be relative to
+/// the parent's transform. The canvas preview already handles this
+/// (see `resolve_parent_transform` in canvas_preview.rs), but the
+/// ffmpeg expression builder doesn't yet — exported video won't
+/// reflect parent-child relationships until this is implemented here.
 pub(crate) fn build_element_transform<S>(
     scene: &Scene,
     element_id: &str,

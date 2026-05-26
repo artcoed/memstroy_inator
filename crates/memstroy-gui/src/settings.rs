@@ -42,6 +42,12 @@ pub struct EditorSettings {
     /// Whether timeline snapping is enabled by default.
     #[serde(default = "default_true")]
     pub snap_enabled: bool,
+
+    /// UI scale factor (pixels per point). Default 0.0 means "use system
+    /// DPI". Values like 1.0, 1.25, 1.5, 2.0 override the system setting
+    /// so users on different monitors can scale the interface to taste.
+    #[serde(default)]
+    pub ui_scale: f32,
 }
 
 fn default_volume() -> f32 {
@@ -61,6 +67,7 @@ impl Default for EditorSettings {
             master_volume: 1.0,
             autosave_interval: 30.0,
             snap_enabled: true,
+            ui_scale: 0.0,
         }
     }
 }
@@ -211,15 +218,35 @@ pub fn show_settings_dialog(
 
             ui.add_space(8.0);
 
-            // ── Snap toggle ────────────────────────────────────
-            let mut snap = state.settings.snap_enabled;
-            if ui
-                .checkbox(&mut snap, i18n::t("Snap on timeline"))
-                .changed()
-            {
-                state.settings.snap_enabled = snap;
-                state.snap_enabled = snap;
-            }
+            // ── UI Scale ───────────────────────────────────────
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(i18n::t("UI Scale")).strong());
+                let scale = state.settings.ui_scale;
+                let label = if scale < 0.01 {
+                    "Auto".to_string()
+                } else {
+                    format!("{:.0}%", scale * 100.0)
+                };
+                ui.label(egui::RichText::new(label).size(13.0).strong());
+            });
+            ui.horizontal(|ui| {
+                if ui.button(egui::RichText::new(" \u{2212} ").size(14.0)).on_hover_text(i18n::t("Decrease scale")).clicked() {
+                    let cur = if state.settings.ui_scale < 0.01 { 1.0_f32 } else { state.settings.ui_scale };
+                    state.settings.ui_scale = (cur - 0.1).max(0.5);
+                }
+                if ui.button(egui::RichText::new(" + ").size(14.0)).on_hover_text(i18n::t("Increase scale")).clicked() {
+                    let cur = if state.settings.ui_scale < 0.01 { 1.0_f32 } else { state.settings.ui_scale };
+                    state.settings.ui_scale = (cur + 0.1).min(3.0);
+                }
+                if ui.button(egui::RichText::new("Auto").size(11.0)).on_hover_text(i18n::t("Reset to system default")).clicked() {
+                    state.settings.ui_scale = 0.0;
+                }
+                if ui.button(egui::RichText::new("100%").size(11.0)).on_hover_text(i18n::t("Set to 100%")).clicked() {
+                    state.settings.ui_scale = 1.0;
+                }
+            });
+
+            ui.add_space(8.0);
 
             ui.add_space(12.0);
             ui.separator();

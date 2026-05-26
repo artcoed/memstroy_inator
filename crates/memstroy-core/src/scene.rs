@@ -88,6 +88,12 @@ pub struct Scene {
     /// Each template defines named anchor points with per-frame positions.
     #[serde(default)]
     pub skeleton_templates: Vec<SkeletonTemplate>,
+    /// **Effect layers**: spatial regions that apply post-processing effects
+    /// to all layers below them in the stacking order. Stored separately
+    /// from `overlays` because they operate on the composite rather than
+    /// contributing content.
+    #[serde(default)]
+    pub effect_layers: Vec<EffectOverlay>,
 }
 
 /// Associates an element (by id) with a canvas-space keyframe track.
@@ -118,6 +124,7 @@ impl Default for Scene {
             render_frame: RenderFrame::default(),
             canvas_layouts: Vec::new(),
             skeleton_templates: Vec::new(),
+            effect_layers: Vec::new(),
         }
     }
 }
@@ -227,6 +234,12 @@ impl Scene {
             }
         }
 
+        for e in &mut self.effect_layers {
+            migrate_overlay_layout_pos(
+                &mut e.layout, e.t_in, &old_world, &new_norm,
+            );
+        }
+
         self.format_version = 2;
     }
 }
@@ -264,6 +277,9 @@ impl Scene {
                 Overlay::Video(v) => backfill_overlay_video(v),
             }
         }
+        for e in &mut self.effect_layers {
+            backfill_overlay_layout(&e.layout, &mut e.animated_params);
+        }
         // Render frame uses the same animated_params model now that
         // its inspector has per-param diamond toggles. Existing scene
         // files saved before the diamonds existed won't have the set
@@ -277,6 +293,8 @@ impl Scene {
     /// Excludes the element with `exclude_id` (to prevent self-parenting).
     pub fn all_element_ids_except(&self, exclude_id: &str) -> Vec<(String, String)> {
         let mut result = Vec::new();
+        // Render Frame is always available as a parent
+        result.push(("__render_frame__".to_string(), "Render Frame".to_string()));
         for a in &self.actors {
             if a.id != exclude_id {
                 result.push((a.id.clone(), format!("Actor: {}", a.id)));
@@ -290,6 +308,11 @@ impl Scene {
             };
             if id != exclude_id {
                 result.push((id, label));
+            }
+        }
+        for e in &self.effect_layers {
+            if e.id != exclude_id {
+                result.push((e.id.clone(), format!("Effect: {}", e.id)));
             }
         }
         result
@@ -1150,6 +1173,50 @@ pub struct VideoOverlay {
     /// **Parent element**: see `Actor::parent_id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
+}
+
+/// An **effect layer** — a spatial region on the canvas that applies
+/// post-processing effects to all layers below it in the stacking
+/// order. Think of it as a "filter rectangle" the user can position
+/// and resize freely; everything underneath it (within its bounds)
+/// gets the chosen effects applied.
+///
+/// The user creates one via the layers panel "+ FX Layer" button,
+/// then picks effects from the inspector's effect dropdown (same
+/// library as per-element effects: blur, pixelate, glow, etc.).
+/// The element's bounding box defines the affected region — only
+/// pixels within that rectangle are processed.
+///
+/// `exclude_ids` lists element IDs that should NOT be affected by
+/// this effect layer even if they sit below it in the stacking
+/// order. This lets the user exempt specific layers from a blanket
+/// effect (e.g. pixelate everything except the subtitle text).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EffectOverlay {
+    pub id: String,
+    /// Visible time window.
+    pub t_in: f32,
+    pub t_out: f32,
+    /// Position / size / rotation keyframes (same as other overlays).
+    pub layout: Vec<Keyframe<OverlayState>>,
+    /// Animation modifiers (wobble, shake, etc.).
+    #[serde(default)]
+    pub modifiers: Vec<crate::keyframe::TrackModifier>,
+    /// The effect stack applied to the composite of lower layers
+    /// within this element's bounding box.
+    #[serde(default)]
+    pub effects: Vec<crate::effects::Effect>,
+    /// Element IDs excluded from this effect layer's processing.
+    /// Layers with these IDs are composited AFTER the effect is
+    /// applied, so they appear unaffected.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude_ids: Vec<String>,
+    /// Animated parameter set — see Actor::animated_params.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub animated_params: BTreeSet<String>,
+    /// Stacking order at render time. See `Actor::z_order`.
+    #[serde(default)]
+    pub z_order: i32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]

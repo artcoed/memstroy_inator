@@ -20,6 +20,7 @@ mod canvas_preview;
 mod curve_editor;
 
 mod frame_snapshot;
+mod fx_preview;
 mod gpu_preview;
 mod i18n;
 mod image_effects;
