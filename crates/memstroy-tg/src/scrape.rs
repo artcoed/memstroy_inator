@@ -58,7 +58,7 @@ fn merge_video_urls(into: &mut Vec<String>, more: impl IntoIterator<Item = Strin
 /// If the channel preview page had no `<video src>`, try the public
 /// single-post embed (`t.me/{channel}/{id}?single`).
 pub async fn enrich_post_videos(client: &reqwest::Client, post: &mut TgPost) -> Result<()> {
-    if post.primary_video().is_some() {
+    if post.downloadable_video().is_some() {
         return Ok(());
     }
     let url = format!("https://t.me/{}?single", post.data_post);

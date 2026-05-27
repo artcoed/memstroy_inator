@@ -7168,17 +7168,21 @@ pub fn handle_canvas_asset_drag(
         return;
     }
 
-    let pointer_pos = ui.input(|i| i.pointer.hover_pos());
-    let in_canvas = pointer_pos.map(|p| full_rect.contains(p)).unwrap_or(false);
-
-    // Only render the ghost while the cursor is over the canvas (otherwise
-    // the timeline is responsible for it).
-    if !in_canvas {
-        return;
-    }
-
-    let drag_pos = pointer_pos.unwrap();
+    let pointer_pos = ui.input(|i| i.pointer.hover_pos().or(i.pointer.interact_pos()));
+    let drag_pos = pointer_pos.unwrap_or_else(|| {
+        egui::pos2(state.asset_drag.pos[0], state.asset_drag.pos[1])
+    });
     state.asset_drag.pos = [drag_pos.x, drag_pos.y];
+    let in_canvas = full_rect.contains(drag_pos);
+
+    // Ghost preview only while the cursor is over the canvas; drop handling
+    // below still uses `drag_pos` (with the last known position as fallback).
+    if !in_canvas {
+        let mouse_released = ui.input(|i| i.pointer.any_released());
+        if !mouse_released {
+            return;
+        }
+    } else {
 
     // Translucent crosshair at the proposed drop point.
     let painter = ui.painter_at(full_rect);
@@ -7257,10 +7261,11 @@ pub fn handle_canvas_asset_drag(
         egui::FontId::proportional(9.0),
         Color32::from_rgb(160, 160, 180),
     );
+    }
 
     // ── Accept drop on release ──
     let mouse_released = ui.input(|i| i.pointer.any_released());
-    if mouse_released {
+    if mouse_released && in_canvas {
         let world = state
             .canvas_viewport
             .screen_to_world([drag_pos.x - full_rect.min.x, drag_pos.y - full_rect.min.y], viewport_size);
@@ -7269,37 +7274,27 @@ pub fn handle_canvas_asset_drag(
         let kind = state.asset_drag.kind;
         match kind {
             crate::state::AssetDragKind::Clip | crate::state::AssetDragKind::Video => {
-                // Lazy download: when the clip's local file doesn't
-                // exist yet, the user dragged a server-only stub.
-                // Kick a background download and place the actor
-                // when the bytes land.
-                if !asset_path.exists() {
-                    if let (Some(handle), Some(tx)) =
-                        (state.tokio_handle.clone(), state.image_fx_tx.clone())
-                    {
-                        let server_id = asset_path
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("")
-                            .to_string();
-                        if !server_id.is_empty() {
-                            crate::jobs::spawn_clip_download(
-                                &handle,
-                                tx,
-                                state.server_url.clone(),
-                                server_id,
-                                asset_path.clone(),
-                                crate::jobs::ClipDropTarget::CanvasAt {
-                                    world_x: world.x,
-                                    world_y: world.y,
-                                },
-                            );
-                            state.status = crate::i18n::t("\u{2B07} Downloading clip from server...").into();
-                        }
-                    }
-                } else {
-                    crate::panels::add_actor_from_clip_at_canvas(state, &asset_path, [world.x, world.y]);
+                // Server-only stubs: download the full `.mp4` first;
+                // `ClipDownloaded` places the actor at the drop point.
+                if crate::panels::try_spawn_lazy_clip_download(
+                    state,
+                    &asset_path,
+                    crate::jobs::ClipDropTarget::CanvasAt {
+                        world_x: world.x,
+                        world_y: world.y,
+                    },
+                ) {
+                    state.asset_drag.dragging = None;
+                    state.asset_drag.kind = crate::state::AssetDragKind::None;
+                    state.asset_drag.label.clear();
+                    state.asset_drag.thumbnail = None;
+                    return;
                 }
+                crate::panels::add_actor_from_clip_at_canvas(
+                    state,
+                    &asset_path,
+                    [world.x, world.y],
+                );
             }
             crate::state::AssetDragKind::Sound
             | crate::state::AssetDragKind::Image

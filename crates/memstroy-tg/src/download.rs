@@ -10,7 +10,7 @@ use tracing::{info, warn};
 use crate::model::{ClipEntry, DownloadState, TgPost};
 use crate::scrape::{build_client, fetch_all};
 
-/// Download every `TgPost::primary_video()` into `dir`. Files are named
+/// Download every `TgPost::downloadable_video()` into `dir`. Files are named
 /// `{id}.mp4`. Existing files are skipped unless `overwrite` is true.
 pub async fn download_videos(
     posts: &[TgPost],
@@ -25,7 +25,7 @@ pub async fn download_videos(
     let work: Vec<(u64, String, PathBuf)> = posts
         .iter()
         .filter_map(|p| {
-            p.primary_video().map(|u| {
+            p.downloadable_video().map(|u| {
                 (p.id, u.to_string(), dir.join(format!("{}.mp4", p.id)))
             })
         })
@@ -97,7 +97,7 @@ pub async fn incremental_refresh(
                 p.body_contains(filter)
             }
         })
-        .filter(|p| p.primary_video().is_some())
+        .filter(|p| p.downloadable_video().is_some())
         .collect();
 
     on_progress(&format!(
@@ -155,7 +155,7 @@ pub async fn incremental_refresh(
         .iter()
         .filter_map(|id| {
             post_by_id.get(id).and_then(|p| {
-                p.primary_video().map(|url| {
+                p.downloadable_video().map(|url| {
                     (*id, url.to_string(), clips_dir.join(format!("{}.mp4", id)))
                 })
             })

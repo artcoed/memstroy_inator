@@ -1156,9 +1156,17 @@ fn clip_card_grid_item(ui: &mut egui::Ui, state: &mut EditorState, clip: &crate:
             state.asset_drag.pos = [pos.x, pos.y];
         }
     }
-    // Double-click adds at playhead
+    // Double-click adds at playhead (download first when server-only).
     if resp.double_clicked() {
-        crate::panels::add_actor_from_clip(state, &clip.path);
+        use crate::jobs::ClipDropTarget;
+        let t = state.playhead;
+        if !try_spawn_lazy_clip_download(
+            state,
+            &clip.path,
+            ClipDropTarget::TimelineAt { t },
+        ) {
+            add_actor_from_clip(state, &clip.path);
+        }
     }
 
     // Tooltip on hover
@@ -1263,8 +1271,15 @@ fn clip_card(ui: &mut egui::Ui, state: &mut EditorState, clip: &crate::state::Li
         }
     }
     if card_resp.double_clicked() {
-        // Convenience: double-click adds at playhead without needing to drag.
-        add_actor_from_clip(state, &clip.path);
+        use crate::jobs::ClipDropTarget;
+        let t = state.playhead;
+        if !try_spawn_lazy_clip_download(
+            state,
+            &clip.path,
+            ClipDropTarget::TimelineAt { t },
+        ) {
+            add_actor_from_clip(state, &clip.path);
+        }
     }
     ui.add_space(2.0);
 }
@@ -11892,41 +11907,18 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             let kind = state.asset_drag.kind;
 
             if matches!(kind, AssetDragKind::Clip | AssetDragKind::Video) {
-                // ── Lazy download for server-only stubs ──
-                // When the dragged clip's local file doesn't exist
-                // yet, the user is dragging a server-side stub. Kick
-                // a background download and place the actor when the
-                // file lands. The user sees a "Downloading..." status
-                // and can keep working while the bytes transfer.
-                if !asset_path.exists() {
-                    if let (Some(handle), Some(tx)) =
-                        (state.tokio_handle.clone(), state.image_fx_tx.clone())
-                    {
-                        let server_id = asset_path
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("")
-                            .to_string();
-                        if !server_id.is_empty() {
-                            crate::jobs::spawn_clip_download(
-                                &handle,
-                                tx,
-                                state.server_url.clone(),
-                                server_id,
-                                asset_path.clone(),
-                                crate::jobs::ClipDropTarget::TimelineAt { t: drop_time },
-                            );
-                            state.status = crate::i18n::t("\u{2B07} Downloading clip from server...").into();
-                            // Skip the rest of the clip drop — the
-                            // ClipDownloaded handler will spawn the
-                            // actor when the download completes.
-                            state.asset_drag.dragging = None;
-                            state.asset_drag.kind = AssetDragKind::None;
-                            state.asset_drag.label.clear();
-                            state.asset_drag.thumbnail = None;
-                            return;
-                        }
-                    }
+                // Server-only stubs: download the `.mp4` first; the
+                // `ClipDownloaded` handler spawns the actor when done.
+                if try_spawn_lazy_clip_download(
+                    state,
+                    &asset_path,
+                    crate::jobs::ClipDropTarget::TimelineAt { t: drop_time },
+                ) {
+                    state.asset_drag.dragging = None;
+                    state.asset_drag.kind = AssetDragKind::None;
+                    state.asset_drag.label.clear();
+                    state.asset_drag.thumbnail = None;
+                    return;
                 }
                 // Pick the destination video lane:
                 //   1. The lane under the cursor when it is an unlocked
@@ -15012,6 +15004,74 @@ fn clean_clip_text(raw: &str) -> String {
     for n in noise { s = s.replace(n, ""); }
     while s.contains("  ") { s = s.replace("  ", " "); }
     s.trim_matches(|c: char| c == ' ' || c == '-').to_string()
+}
+
+/// Mellstroy library entry for a clip path, when known.
+pub(crate) fn find_library_clip_by_path<'a>(
+    state: &'a EditorState,
+    path: &std::path::Path,
+) -> Option<&'a crate::state::LibraryClip> {
+    state.library.mellstroy_clips.iter().find(|c| c.path == path)
+}
+
+/// True when `path` points at a non-trivial video file on disk.
+pub(crate) fn is_usable_local_video(path: &std::path::Path) -> bool {
+    EditorState::is_usable_local_video(path)
+}
+
+/// Server-only / metadata-only clip that still needs the full video download.
+pub(crate) fn clip_video_needs_download(clip: &crate::state::LibraryClip) -> bool {
+    !clip.downloaded || !is_usable_local_video(&clip.path)
+}
+
+pub(crate) fn dragged_clip_needs_download(state: &EditorState, path: &std::path::Path) -> bool {
+    if let Some(clip) = find_library_clip_by_path(state, path) {
+        clip_video_needs_download(clip)
+    } else {
+        !is_usable_local_video(path)
+    }
+}
+
+/// Kick off a lazy clip download. Returns `true` when placement must wait
+/// for `ClipDownloaded` (caller should not spawn an actor/overlay yet).
+pub(crate) fn try_spawn_lazy_clip_download(
+    state: &mut EditorState,
+    clip_path: &std::path::Path,
+    drop_target: crate::jobs::ClipDropTarget,
+) -> bool {
+    if !dragged_clip_needs_download(state, clip_path) {
+        return false;
+    }
+    let server_id = find_library_clip_by_path(state, clip_path)
+        .and_then(|c| c.server_id.clone())
+        .or_else(|| {
+            clip_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(str::to_string)
+        })
+        .filter(|s| !s.is_empty());
+    let Some(server_id) = server_id else {
+        state.status =
+            crate::i18n::t("Cannot download clip: missing server id").into();
+        return true;
+    };
+    let (Some(handle), Some(tx)) = (state.tokio_handle.clone(), state.image_fx_tx.clone())
+    else {
+        state.status =
+            crate::i18n::t("Cannot download clip: background worker not ready").into();
+        return true;
+    };
+    crate::jobs::spawn_clip_download(
+        &handle,
+        tx,
+        state.server_url.clone(),
+        server_id,
+        clip_path.to_path_buf(),
+        drop_target,
+    );
+    state.status = crate::i18n::t("\u{2B07} Downloading clip from server...").into();
+    true
 }
 
 pub fn add_actor_from_clip(state: &mut EditorState, path: &PathBuf) {
