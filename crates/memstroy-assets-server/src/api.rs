@@ -36,6 +36,7 @@ pub fn router(store: AssetStore) -> Router {
 
     Router::new()
         .route("/api/health", get(health))
+        .route("/api/test-metadata", post(test_metadata))
         .route("/api/assets", get(list_assets))
         .route("/api/assets/:id", get(get_asset))
         .route("/api/assets/:id/preview", get(get_preview))
@@ -305,6 +306,39 @@ async fn post_ingest_tg(
         "channel": channel,
         "limit": limit,
     })))
+}
+
+// Test endpoint to verify metadata creation works
+async fn test_metadata(State(store): State<AssetStore>) -> Result<Json<serde_json::Value>, ApiError> {
+    let root = store.root();
+    let clips_dir = root.join("clips");
+    let test_id = "test123";
+    let test_txt = clips_dir.join(format!("{}.txt", test_id));
+    let test_content = "Test metadata content";
+    
+    match tokio::fs::write(&test_txt, test_content.as_bytes()).await {
+        Ok(_) => {
+            // Verify file exists
+            let exists = test_txt.exists();
+            let content = tokio::fs::read_to_string(&test_txt).await.unwrap_or_default();
+            
+            // Reindex to pick up the test file
+            let _ = store.index_dir(&root);
+            
+            Ok(Json(json!({
+                "success": true,
+                "test_file": test_txt.display().to_string(),
+                "exists": exists,
+                "content": content,
+                "clips_dir": clips_dir.display().to_string(),
+            })))
+        }
+        Err(e) => Ok(Json(json!({
+            "success": false,
+            "error": e.to_string(),
+            "clips_dir": clips_dir.display().to_string(),
+        })))
+    }
 }
 
 // ---------------------------------------------------------------------------
