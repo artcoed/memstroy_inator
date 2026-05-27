@@ -1926,6 +1926,11 @@ impl<'a> FilterGraphBuilder<'a> {
         let mut seen: std::collections::HashSet<std::path::PathBuf> =
             std::collections::HashSet::new();
         for tr in &self.scene.audio {
+            // Skip deleted audio tracks (marked as deleted instead of
+            // removed from the array to prevent index shifts in the UI).
+            if tr.deleted {
+                continue;
+            }
             let path = self.resolve(&tr.source);
             seen.insert(path.clone());
             let t_in = tr.t_in;
@@ -1990,6 +1995,13 @@ impl<'a> FilterGraphBuilder<'a> {
         }
         for actor in &self.scene.actors {
             if !actor.visible { continue; }
+            // Skip actors whose embedded audio has been explicitly muted.
+            // This honours the user's intent when they delete the auto-
+            // generated audio track or toggle the "mute audio" inspector
+            // checkbox — without this check the renderer would still mix
+            // the actor's soundtrack even after the user removed it from
+            // the timeline.
+            if actor.mute_audio { continue; }
             let path = self.resolve(&actor.source);
             if seen.contains(&path) { continue; }
             seen.insert(path.clone());

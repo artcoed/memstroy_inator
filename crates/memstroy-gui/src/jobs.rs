@@ -237,6 +237,9 @@ pub fn spawn_refresh(
         let progress = |s: String| {
             let _ = tx.send(JobEvent::RefreshProgress(s));
         };
+        
+        info!("spawn_refresh: clips_dir = {}", clips_dir.display());
+        
         // The GUI may have been configured with a wildcard bind URL
         // (e.g. `http://0.0.0.0:8765`) — that is a valid bind address
         // for the server but `connect(2)` to it fails on Windows with
@@ -250,7 +253,8 @@ pub fn spawn_refresh(
         progress(format!("Asking {} to ingest @{} (limit {})", server, channel, limit));
 
         let client = match reqwest::Client::builder()
-            .timeout(Duration::from_secs(120))
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(30))
             .build()
         {
             Ok(c) => c,
@@ -298,60 +302,78 @@ pub fn spawn_refresh(
         let thumbs_dir = clips_dir.join("thumbs");
         let _ = tokio::fs::create_dir_all(&thumbs_dir).await;
 
-        // 3. Download clips one by one sequentially. This ensures clips
-        //    are loaded into the project immediately and avoids the
-        //    infinite refresh loop. We download both metadata and the
-        //    actual video files.
+        // 3. Wait for server to ingest clips, then download metadata.
+        //    We poll the server every few seconds until clips appear.
         let list_url = format!(
             "{}/api/assets?kind=clip&limit={}",
             server,
             limit
         );
 
-        let _started = std::time::Instant::now();
+        progress("Waiting for server to ingest clips...".into());
+        
+        // Wait a bit for the server to start ingesting
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        
         let mut new_count = 0usize;
         let failed = 0usize;
         let mut downloaded_ids: std::collections::HashSet<String> =
             std::collections::HashSet::new();
 
-        // First, get the initial listing from the server
-        progress("Fetching clip list from server...".into());
+        // Poll the server for up to 60 seconds or until we get clips
+        let max_wait = Duration::from_secs(60);
+        let poll_interval = Duration::from_secs(3);
+        let started = std::time::Instant::now();
         
-        let listing: ListResponse = match client.get(&list_url).send().await {
-            Ok(resp) if resp.status().is_success() => match resp.json().await {
-                Ok(v) => v,
-                Err(e) => {
+        let listing: ListResponse = loop {
+            progress("Fetching clip list from server...".into());
+            
+            match client.get(&list_url).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    match resp.json::<ListResponse>().await {
+                        Ok(list) => {
+                            if list.items.is_empty() {
+                                if started.elapsed() >= max_wait {
+                                    let _ = tx.send(JobEvent::RefreshFinished(Err(
+                                        "Server returned no clips after 60 seconds. Try again or check the channel name.".to_string()
+                                    )));
+                                    return;
+                                }
+                                progress(format!(
+                                    "Server has no clips yet, waiting... ({:.0}s elapsed)",
+                                    started.elapsed().as_secs_f32()
+                                ));
+                                tokio::time::sleep(poll_interval).await;
+                                continue;
+                            }
+                            // Got clips!
+                            break list;
+                        }
+                        Err(e) => {
+                            let _ = tx.send(JobEvent::RefreshFinished(Err(format!(
+                                "Couldn't parse server listing: {e}"
+                            ))));
+                            return;
+                        }
+                    }
+                }
+                Ok(resp) => {
                     let _ = tx.send(JobEvent::RefreshFinished(Err(format!(
-                        "Couldn't parse server listing: {e}"
+                        "Server listing failed: HTTP {}",
+                        resp.status()
                     ))));
                     return;
                 }
-            },
-            Ok(resp) => {
-                let _ = tx.send(JobEvent::RefreshFinished(Err(format!(
-                    "Server listing failed: HTTP {}",
-                    resp.status()
-                ))));
-                return;
-            }
-            Err(e) => {
-                let _ = tx.send(JobEvent::RefreshFinished(Err(format!(
-                    "Couldn't fetch listing: {e}"
-                ))));
-                return;
+                Err(e) => {
+                    let _ = tx.send(JobEvent::RefreshFinished(Err(format!(
+                        "Couldn't fetch listing: {e}"
+                    ))));
+                    return;
+                }
             }
         };
 
         let total_clips = listing.items.len();
-        if total_clips == 0 {
-            let _ = tx.send(JobEvent::RefreshFinished(Ok(RefreshSummary {
-                new_clips: 0,
-                total_clips: 0,
-                failed: 0,
-            })));
-            return;
-        }
-
         progress(format!("Found {} clips on server, downloading metadata...", total_clips));
 
         // Download only metadata (description + thumbnail) for each clip
@@ -365,9 +387,20 @@ pub fn spawn_refresh(
             let txt_path = clips_dir.join(format!("{}.txt", safe_id));
             let thumb_jpg = thumbs_dir.join(format!("{}.jpg", safe_id));
 
+            info!(
+                "Processing clip {}/{}: id={}, safe_id={}, txt_path={}, thumb_path={}",
+                idx + 1,
+                total_clips,
+                item.id,
+                safe_id,
+                txt_path.display(),
+                thumb_jpg.display()
+            );
+
             // Skip if metadata already downloaded locally
             // We only download metadata (txt + thumbnail), not the video itself
             if txt_path.exists() && thumb_jpg.exists() {
+                info!("Clip {} already has metadata, skipping", safe_id);
                 downloaded_ids.insert(item.id.clone());
                 new_count += 1;
                 continue;
@@ -381,11 +414,22 @@ pub fn spawn_refresh(
             ));
 
             // Download description sidecar (always, even if video exists)
-            if !item.description.is_empty() && !txt_path.exists() {
+            if !item.description.is_empty() {
                 match tokio::fs::write(&txt_path, item.description.as_bytes()).await {
-                    Ok(_) => info!("Wrote description for {}", safe_id),
-                    Err(e) => warn!("Failed to write description for {}: {}", safe_id, e),
+                    Ok(_) => {
+                        info!("✓ Wrote description for {} ({} bytes)", safe_id, item.description.len());
+                        // Verify file was created
+                        if txt_path.exists() {
+                            info!("✓ Verified txt file exists: {}", txt_path.display());
+                        } else {
+                            warn!("✗ txt file not found after write: {}", txt_path.display());
+                        }
+                    }
+                    Err(e) => warn!("✗ Failed to write description for {}: {}", safe_id, e),
                 }
+            } else {
+                info!("Clip {} has no description, creating empty txt file", safe_id);
+                let _ = tokio::fs::write(&txt_path, b"").await;
             }
 
             // Download thumbnail (always, even if video exists)
@@ -394,10 +438,25 @@ pub fn spawn_refresh(
                     "{}/api/assets/{}/preview",
                     server, item.id
                 );
+                info!("Downloading thumbnail from: {}", thumb_url);
                 match download_file(&client, &thumb_url, &thumb_jpg).await {
-                    Ok(_) => info!("Downloaded thumbnail for {}", safe_id),
-                    Err(e) => warn!("Failed to download thumbnail for {}: {}", safe_id, e),
+                    Ok(_) => {
+                        info!("✓ Downloaded thumbnail for {}", safe_id);
+                        // Verify file was created
+                        if thumb_jpg.exists() {
+                            let metadata = tokio::fs::metadata(&thumb_jpg).await;
+                            match metadata {
+                                Ok(m) => info!("✓ Verified thumbnail exists: {} ({} bytes)", thumb_jpg.display(), m.len()),
+                                Err(e) => warn!("✗ Can't read thumbnail metadata: {}", e),
+                            }
+                        } else {
+                            warn!("✗ Thumbnail not found after download: {}", thumb_jpg.display());
+                        }
+                    }
+                    Err(e) => warn!("✗ Failed to download thumbnail for {}: {}", safe_id, e),
                 }
+            } else {
+                info!("Thumbnail already exists for {}", safe_id);
             }
 
             // Mark as "known" but not downloaded (video will be downloaded on first use)
@@ -493,7 +552,8 @@ pub fn spawn_clip_download(
             .trim_end_matches('/')
             .to_string();
         let client = match reqwest::Client::builder()
-            .timeout(Duration::from_secs(120))
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(30))
             .build()
         {
             Ok(c) => c,
@@ -660,6 +720,7 @@ async fn run_web_image_search(
 ) -> Result<(Vec<WebImageHit>, Option<u32>), String> {
     let client = reqwest::Client::builder()
         .user_agent(UA)
+        .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(12))
         .build()
         .map_err(|e| format!("HTTP client init failed: {e}"))?;
@@ -897,6 +958,7 @@ async fn run_web_image_download(
 ) -> Result<LibraryAsset, String> {
     let client = reqwest::Client::builder()
         .user_agent(UA)
+        .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(45))
         .build()
         .map_err(|e| format!("HTTP client init failed: {e}"))?;

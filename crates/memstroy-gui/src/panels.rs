@@ -7971,6 +7971,10 @@ fn for_each_clip_screen_rect(
     // ── Audio ──
     let audio_indices: Vec<usize> = state.audio_track_indices();
     for (aui, au) in state.scene.audio.iter().enumerate() {
+        // Skip deleted audio tracks
+        if au.deleted {
+            continue;
+        }
         let lane = state
             .audio_track_assignments
             .get(&aui)
@@ -8682,7 +8686,21 @@ fn apply_remove(
         }
         VictimKind::Audio(i) => {
             if i >= s.audio.len() { return; }
-            s.audio.remove(i);
+            // Instead of removing from the array (which shifts all
+            // subsequent indices and causes layers to "jump"), mark
+            // the track as deleted. The UI will hide it, and the
+            // renderer will skip it.
+            s.audio[i].deleted = true;
+            // When removing an audio track that's bound to an actor,
+            // mark the actor's embedded audio as muted so the renderer
+            // doesn't auto-mix it back in. This honours the user's
+            // intent: "I deleted the audio row, so I don't want to
+            // hear this actor's soundtrack."
+            if let Some(parent_id) = &s.audio[i].parent_actor {
+                if let Some(actor) = s.actors.iter_mut().find(|a| &a.id == parent_id) {
+                    actor.mute_audio = true;
+                }
+            }
         }
         VictimKind::Background(i) => {
             if i >= s.backgrounds.len() { return; }
@@ -8706,14 +8724,10 @@ fn apply_remove(
                 if i < moi { mover_out = MovedClipKind::Overlay(moi - 1); }
             }
         }
-        VictimKind::Audio(i) => {
-            if i < state.audio_waveforms.len() {
-                state.audio_waveforms.remove(i);
-            }
-            shift_assignments_after_remove(&mut state.audio_track_assignments, i);
-            if let MovedClipKind::Audio(mai) = mover_out {
-                if i < mai { mover_out = MovedClipKind::Audio(mai - 1); }
-            }
+        VictimKind::Audio(_i) => {
+            // Audio tracks are now marked as deleted instead of removed,
+            // so no index shift occurs and we don't need to update
+            // side-tables or adjust the mover index.
         }
         VictimKind::Background(i) => {
             if let MovedClipKind::Background(mbi) = mover_out {
@@ -14956,9 +14970,18 @@ fn load_chroma_for_clip(path: &PathBuf) -> ChromaKeyParams {
 /// Push an `AudioTrack` matching `actor` so the embedded audio shows up as
 /// its own row on the audio lanes. Returns the new index. The audio track is
 /// linked to its parent actor via `parent_actor` so we can keep them in sync
-/// (move / trim / delete together).
+/// (move / trim / delete together). Also unmutes the actor's embedded audio
+/// so the renderer includes it in the mix.
 fn push_audio_track_for_actor(state: &mut EditorState, actor_id: &str, source: &PathBuf,
                               t_in: f32, t_out: Option<f32>, source_start: f32) -> usize {
+    // Unmute the actor's embedded audio when adding an audio track for it,
+    // so the renderer includes it in the mix. This handles the case where
+    // the user deleted the audio track earlier (which set mute_audio=true)
+    // and now wants to add it back.
+    if let Some(actor) = state.scene.actors.iter_mut().find(|a| a.id == actor_id) {
+        actor.mute_audio = false;
+    }
+    
     let id = format!("{}_audio", actor_id);
     state.scene.audio.push(AudioTrack {
         id,
@@ -14995,28 +15018,24 @@ pub(crate) fn sync_audio_to_actor(state: &mut EditorState, actor_idx: usize) {
     }
 }
 
-/// Remove every audio track bound to the actor at `actor_idx` (called by the
-/// actor delete path so we never leave orphaned audio).
+/// Mark every audio track bound to the actor as deleted (instead of removing
+/// from the array to prevent index shifts). Also marks the actor's embedded
+/// audio as muted so the renderer doesn't auto-mix it back in.
 pub(crate) fn remove_audio_bound_to_actor(state: &mut EditorState, actor_id: &str)
     -> Vec<usize>
 {
+    // Mark the actor's embedded audio as muted BEFORE marking the
+    // audio tracks as deleted, so the renderer knows not to auto-mix
+    // the actor's soundtrack even after the user deleted the audio row.
+    if let Some(actor) = state.scene.actors.iter_mut().find(|a| a.id == actor_id) {
+        actor.mute_audio = true;
+    }
+    
     let mut removed = Vec::new();
-    let mut i = 0;
-    while i < state.scene.audio.len() {
-        if state.scene.audio[i].parent_actor.as_deref() == Some(actor_id) {
-            state.scene.audio.remove(i);
-            // Same-index side-tables (waveforms, extract results) and
-            // the {idx -> track} assignment map all need to slide down
-            // by one or the next-actor's audio renders / draws under
-            // the wrong row. Mirrors the bookkeeping `apply_remove`
-            // does for timeline-driven removals.
-            if i < state.audio_waveforms.len() {
-                state.audio_waveforms.remove(i);
-            }
-            shift_assignments_after_remove(&mut state.audio_track_assignments, i);
+    for (i, track) in state.scene.audio.iter_mut().enumerate() {
+        if track.parent_actor.as_deref() == Some(actor_id) {
+            track.deleted = true;
             removed.push(i);
-        } else {
-            i += 1;
         }
     }
     removed
@@ -15159,6 +15178,7 @@ pub(crate) fn add_actor_from_clip_at_time(state: &mut EditorState, path: &PathBu
         animated_params: Default::default(),
         z_order: 0,
         parent_id: None,
+        mute_audio: false,
     };
     state.scene.actors.push(actor);
     let new_actor_idx = state.scene.actors.len() - 1;

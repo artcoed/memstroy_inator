@@ -1938,17 +1938,14 @@ impl App {
                     continue;
                 }
                 let actor_id = self.state.scene.actors[i].id.clone();
-                let removed_audio = crate::panels::remove_audio_bound_to_actor(
+                // Mark bound audio as deleted (not removed) to prevent
+                // index shifts that cause other audio tracks to jump.
+                let _removed_audio = crate::panels::remove_audio_bound_to_actor(
                     &mut self.state,
                     &actor_id,
                 );
-                let mut sorted = removed_audio.clone();
-                sorted.sort_unstable();
-                for ai in sorted.into_iter().rev() {
-                    if ai < self.waveform_extract_results.len() {
-                        self.waveform_extract_results.remove(ai);
-                    }
-                }
+                // No need to remove from waveform_extract_results since
+                // audio tracks are just marked as deleted.
                 // Use raw vec mutation here (not `mutate()`) because
                 // we already pushed the batch undo snapshot above.
                 self.state.scene.actors.remove(i);
@@ -1973,21 +1970,18 @@ impl App {
                     i,
                 );
             }
-            for i in audio_idxs.into_iter().rev() {
+            for i in audio_idxs.into_iter() {
                 if i >= self.state.scene.audio.len() {
                     continue;
                 }
-                self.state.scene.audio.remove(i);
-                if i < self.state.audio_waveforms.len() {
-                    self.state.audio_waveforms.remove(i);
+                // Mark as deleted instead of removing to prevent index shifts
+                self.state.scene.audio[i].deleted = true;
+                // Mark actor's embedded audio as muted if this track is bound to an actor
+                if let Some(parent_id) = &self.state.scene.audio[i].parent_actor {
+                    if let Some(actor) = self.state.scene.actors.iter_mut().find(|a| &a.id == parent_id) {
+                        actor.mute_audio = true;
+                    }
                 }
-                if i < self.waveform_extract_results.len() {
-                    self.waveform_extract_results.remove(i);
-                }
-                crate::panels::shift_assignments_after_remove(
-                    &mut self.state.audio_track_assignments,
-                    i,
-                );
             }
             for i in bg_idxs.into_iter().rev() {
                 if i >= self.state.scene.backgrounds.len() {
@@ -2008,22 +2002,13 @@ impl App {
             Selection::Actor(i) if i < self.state.scene.actors.len() => {
                 let actor_id = self.state.scene.actors[i].id.clone();
                 // Bound audio (the AudioTrack created when the clip was
-                // dropped) follows the actor on delete so we never leak
-                // orphaned audio rows.
-                let removed_audio = crate::panels::remove_audio_bound_to_actor(
+                // dropped) is marked as deleted (not removed from array)
+                // so we never leak orphaned audio rows and other audio
+                // tracks don't shift indices.
+                let _removed_audio = crate::panels::remove_audio_bound_to_actor(
                     &mut self.state, &actor_id);
-                // App-side `waveform_extract_results` mirrors the
-                // audio Vec by index. `remove_audio_bound_to_actor`
-                // gives us the indices in scene-Vec order so removing
-                // back-to-front keeps every later index valid as we
-                // splice. (Front-to-back would tear the table.)
-                let mut sorted = removed_audio.clone();
-                sorted.sort_unstable();
-                for ai in sorted.into_iter().rev() {
-                    if ai < self.waveform_extract_results.len() {
-                        self.waveform_extract_results.remove(ai);
-                    }
-                }
+                // No need to remove from waveform_extract_results since
+                // audio tracks are just marked as deleted, not removed.
                 self.state.mutate(|s| { s.actors.remove(i); });
                 // Keep every side-table that mirrors the actors Vec in
                 // lock-step with the new index space. Without the
@@ -2061,6 +2046,11 @@ impl App {
                 self.state.status = crate::i18n::t("\u{1F5D1} Background deleted.").into();
             }
             Selection::Audio(i) if i < self.state.scene.audio.len() => {
+                // Skip if already deleted
+                if self.state.scene.audio[i].deleted {
+                    return;
+                }
+                
                 // Cascade audio → parent actor: deleting a sound that
                 // is bound to a video clip via `parent_actor` removes
                 // the parent clip too, which then removes every
@@ -2090,15 +2080,20 @@ impl App {
                     // through to a plain audio remove so the user can
                     // still get rid of the row.
                 }
-                self.state.mutate(|s| { s.audio.remove(i); });
-                if i < self.state.audio_waveforms.len() {
-                    self.state.audio_waveforms.remove(i);
+                // Mark as deleted instead of removing from array to prevent
+                // index shifts that cause other audio tracks to "jump" layers.
+                self.state.scene.audio[i].deleted = true;
+                // When removing an audio track that's bound to an actor,
+                // mark the actor's embedded audio as muted so the renderer
+                // doesn't auto-mix it back in.
+                if let Some(parent_id) = &self.state.scene.audio[i].parent_actor {
+                    if let Some(actor) = self.state.scene.actors.iter_mut().find(|a| &a.id == parent_id) {
+                        actor.mute_audio = true;
+                    }
                 }
-                if i < self.waveform_extract_results.len() {
-                    self.waveform_extract_results.remove(i);
-                }
-                crate::panels::shift_assignments_after_remove(
-                    &mut self.state.audio_track_assignments, i);
+                // No need to remove from side-tables since we're not
+                // removing from the array — the track is just marked
+                // as deleted and will be hidden in the UI.
                 self.state.selection = Selection::None;
                 self.state.canvas_selection.clear();
                 self.state.multi_select.clear();
