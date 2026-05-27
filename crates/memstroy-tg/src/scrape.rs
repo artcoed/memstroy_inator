@@ -80,7 +80,6 @@ pub fn parse_posts(html: &str) -> Vec<TgPost> {
         for v in node.select(&video_sel) {
             if let Some(src) = v.value().attr("src") {
                 videos.push(src.to_string());
-                eprintln!("Found video src: {}", src);
             }
         }
         
@@ -88,19 +87,15 @@ pub fn parse_posts(html: &str) -> Vec<TgPost> {
         // Telegram sometimes embeds video URLs in data attributes or as background thumbnails
         let video_player_sel = Selector::parse(".tgme_widget_message_video_player").unwrap();
         for player in node.select(&video_player_sel) {
-            eprintln!("Found video player element for post {}", id);
-            // The href points to the post, not the video
-            // But we can extract video from nested video tags
+            // The href points to the post, not the video. Still, some
+            // variants nest another <video src="..."> in here.
             let nested_video_sel = Selector::parse("video").unwrap();
             for v in player.select(&nested_video_sel) {
                 if let Some(src) = v.value().attr("src") {
                     videos.push(src.to_string());
-                    eprintln!("Found nested video src: {}", src);
                 }
             }
         }
-        
-        eprintln!("Post {} has {} videos", id, videos.len());
         
         // De-duplicate while preserving order.
         let mut seen = std::collections::HashSet::new();
@@ -130,6 +125,49 @@ pub fn parse_posts(html: &str) -> Vec<TgPost> {
             images,
             date,
             views,
+        });
+    }
+    if !out.is_empty() {
+        return out;
+    }
+
+    // web.telegram.org bubble HTML (no `data-post`).
+    let bubble_sel = Selector::parse("div.bubble.channel-post").unwrap();
+    let bubble_text_sel = Selector::parse(".translatable-message").unwrap();
+    let bubble_video_sel = Selector::parse("video.media-video, video").unwrap();
+    for node in doc.select(&bubble_sel) {
+        let data_mid = node.value().attr("data-mid").unwrap_or("0");
+        let id = data_mid.parse::<u64>().unwrap_or(0);
+        let peer = node.value().attr("data-peer-id").unwrap_or("unknown");
+        let data_post = format!("{}_{}", peer, data_mid);
+
+        let text = node
+            .select(&bubble_text_sel)
+            .next()
+            .map(|t| extract_text(&t))
+            .unwrap_or_default();
+
+        let mut videos: Vec<String> = node
+            .select(&bubble_video_sel)
+            .filter_map(|v| v.value().attr("src").map(|s| s.to_string()))
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        videos.retain(|u| seen.insert(u.clone()));
+
+        let images: Vec<String> = node
+            .select(&img_sel)
+            .filter_map(|v| v.value().attr("src").map(|s| s.to_string()))
+            .filter(|s| !s.contains("/file/sticker.tgs"))
+            .collect();
+
+        out.push(TgPost {
+            data_post,
+            id,
+            text,
+            videos,
+            images,
+            date: None,
+            views: None,
         });
     }
     out
@@ -208,6 +246,13 @@ fn extract_text(node: &scraper::ElementRef<'_>) -> String {
             _ => {}
         }
     }
-    // Collapse runs of whitespace but keep meaningful structure.
-    buf.split_whitespace().collect::<Vec<_>>().join(" ")
+    // Keep meaningful line structure but trim noise.
+    let lines: Vec<String> = buf
+        .replace("\r\n", "\n")
+        .split('\n')
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .map(|l| l.to_string())
+        .collect();
+    lines.join("\n")
 }

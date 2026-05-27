@@ -4219,6 +4219,10 @@ impl eframe::App for App {
             }
             for actor in &state.scene.actors {
                 if !actor.visible { continue; }
+                // Honour explicit user intent: if the actor's embedded audio
+                // was muted (e.g. because the user deleted/unlinked+deleted
+                // its audio row), do not auto-mix the fallback source.
+                if actor.mute_audio { continue; }
                 if seen.contains(&actor.source) { continue; }
                 out.push(crate::audio_engine::AudioSourceSpec {
                     path: actor.source.clone(),

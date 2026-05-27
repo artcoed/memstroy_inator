@@ -66,42 +66,45 @@ impl TgPost {
             }
         }
 
-        // Take text before footer
-        let before_footer = &text[..footer_start];
-
-        // Split by em-dash lines (format: "—Text")
-        let lines: Vec<&str> = before_footer
-            .split('—')
+        // Take text before footer and split into human lines.
+        let before_footer = text[..footer_start].replace("\r\n", "\n");
+        let mut lines: Vec<&str> = before_footer
+            .split('\n')
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
             .collect();
 
-        // Voting markers that should be excluded
-        let voting_markers = [
-            "Имба",
-            "Топчик", 
-            "Топ",
-            "Хрень",
-            "Херня",
-            "Такое себе",
-            "Танцует с бутылкой в руках",
-        ];
+        // Telegram часто форматирует как "—Текст". Срежем ведущую тире-обвязку.
+        for l in &mut lines {
+            *l = l.trim_start_matches(|c: char| c == '—' || c == '-' || c.is_whitespace());
+        }
 
-        // Find the main description line (first non-voting line)
-        let main_line = lines
-            .iter()
-            .find(|line| {
-                // Skip lines that are just voting markers
-                !voting_markers.iter().any(|marker| line.starts_with(marker))
-            })
-            .copied()
-            .unwrap_or("");
+        // Явные «голосовалки»/маркеры — их надо игнорировать, но не трогать
+        // реальный текст описания.
+        let is_vote_line = |s: &str| {
+            let low = s.to_lowercase();
+            low.starts_with("имба")
+                || low.starts_with("топчик")
+                || low.starts_with("топ")
+                || low.starts_with("хрень")
+                || low.starts_with("херн")
+                || low.starts_with("такое себе")
+                || low.starts_with("👍")
+                || low.starts_with("👎")
+        };
 
-        // Clean up emojis and special characters from the beginning
+        let main_line = lines.into_iter().find(|l| !is_vote_line(l)).unwrap_or("");
+
+        // Clean up leading emojis/punct from the beginning but keep quotes/brackets.
         let cleaned = main_line
             .trim_start_matches(|c: char| {
-                // Remove leading emojis, custom emoji placeholders, and whitespace
-                !c.is_alphanumeric() && c != '(' && c != ')' && c != '"' && c != '\''
+                !c.is_alphanumeric()
+                    && c != '('
+                    && c != ')'
+                    && c != '"'
+                    && c != '\''
+                    && c != '«'
+                    && c != '»'
             })
             .trim();
 
