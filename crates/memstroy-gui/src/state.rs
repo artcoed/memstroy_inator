@@ -1486,6 +1486,7 @@ impl EditorState {
         for &lane in audio_lanes.iter() {
             let mut busy = false;
             for (aui, au) in self.scene.audio.iter().enumerate() {
+                if au.deleted { continue; }
                 let assigned = self
                     .audio_track_assignments
                     .get(&aui)

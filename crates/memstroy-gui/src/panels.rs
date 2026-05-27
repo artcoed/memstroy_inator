@@ -3146,6 +3146,7 @@ fn inspector_actor_speed(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
     // audio playback rate matches the picture.
     let actor_speed = state.scene.actors[i].speed;
     for au in state.scene.audio.iter_mut() {
+        if au.deleted { continue; }
         if au.parent_actor.as_deref() == Some(&actor_id) {
             au.speed = actor_speed.max(0.05);
         }
@@ -6851,6 +6852,7 @@ fn collect_snap_targets(state: &EditorState, exclude: SnapExclude) -> Vec<f32> {
         out.push(e);
     }
     for (i, au) in state.scene.audio.iter().enumerate() {
+        if au.deleted { continue; }
         if let SnapExclude::Audio(j) = exclude {
             if i == j {
                 continue;
@@ -6968,6 +6970,7 @@ fn collect_clip_edges(state: &EditorState, exclude_actor: Option<usize>) -> Vec<
         edges.push(e);
     }
     for au in &state.scene.audio {
+        if au.deleted { continue; }
         edges.push(au.t_in);
         edges.push(au.t_out.unwrap_or(duration));
     }
@@ -8537,13 +8540,14 @@ fn classify_victims(
         }
         LayerKind::Audio(track_idx) => {
             for aui in 0..state.scene.audio.len() {
+                let a = &state.scene.audio[aui];
+                if a.deleted { continue; }
                 let assigned = state
                     .audio_track_assignments
                     .get(&aui)
                     .copied()
                     .unwrap_or(0);
                 if assigned != track_idx { continue; }
-                let a = &state.scene.audio[aui];
                 let t_in = a.t_in;
                 let t_out = a.t_out.unwrap_or(duration);
                 let skip = matches!(mover, MovedClipKind::Audio(mai) if mai == aui);
@@ -9373,6 +9377,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             max_end = max_end.max(end);
         }
         for au in &state.scene.audio {
+            if au.deleted { continue; }
             max_end = max_end.max(au.t_out.unwrap_or(0.0));
         }
         // Auto-fit: timeline length is the end of the longest layer.
@@ -11079,6 +11084,11 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                 for aui in 0..state.scene.audio.len() {
                     // Tolerate mid-iteration removal.
                     if aui >= state.scene.audio.len() { break; }
+                    
+                    let audio = &state.scene.audio[aui];
+                    // Skip deleted audio tracks
+                    if audio.deleted { continue; }
+                    
                     // Use explicit assignment if set, otherwise round-robin across audio tracks.
                     let target_track_idx = if let Some(&t) = state.audio_track_assignments.get(&aui) {
                         t
@@ -11088,8 +11098,6 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                         audio_tracks[aui % audio_tracks.len()]
                     };
                     if target_track_idx != track_idx { continue; }
-
-                    let audio = &state.scene.audio[aui];
                     let clip_start = audio.t_in;
                     let clip_end = audio.t_out.unwrap_or(duration);
                     let audio_source_start = audio.source_start;
@@ -14998,7 +15006,7 @@ fn push_audio_track_for_actor(state: &mut EditorState, actor_id: &str, source: &
 /// Find the index of the audio track bound to a given actor id, if any.
 fn find_audio_for_actor(state: &EditorState, actor_id: &str) -> Option<usize> {
     state.scene.audio.iter().position(|au| {
-        au.parent_actor.as_deref() == Some(actor_id)
+        !au.deleted && au.parent_actor.as_deref() == Some(actor_id)
     })
 }
 

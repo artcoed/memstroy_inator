@@ -56,6 +56,8 @@ async fn health(State(store): State<AssetStore>) -> Json<serde_json::Value> {
     Json(json!({
         "ok": true,
         "count": store.count(),
+        "version": env!("CARGO_PKG_VERSION"),
+        "git_hash": option_env!("GIT_HASH").unwrap_or("unknown"),
     }))
 }
 
