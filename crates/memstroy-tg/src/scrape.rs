@@ -1,11 +1,92 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
+use regex::Regex;
 use scraper::{Html, Selector};
 use tracing::{debug, info, warn};
 
 use crate::model::TgPost;
+
+static TELESCO_FILE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"https://cdn\d*\.telesco\.pe/file/[^\s"'<>\\]+"#).unwrap()
+});
+
+static TG_CDN_FILE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    // Telegram preview occasionally serves files from telegram-cdn* domains.
+    Regex::new(r#"https://[^\s"'<>\\]*telegram-cdn[^\s"'<>\\]*"#).unwrap()
+});
+
+static OG_VIDEO_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"property="og:video(?::url)?"\s+content="([^"]+)""#).unwrap()
+});
+
+fn is_likely_image_cdn_url(url: &str) -> bool {
+    let lower = url.to_lowercase();
+    lower.ends_with(".jpg")
+        || lower.ends_with(".jpeg")
+        || lower.ends_with(".png")
+        || lower.ends_with(".webp")
+        || lower.contains("thumb")
+        || lower.contains("/photo")
+}
+
+/// Pull direct CDN links from raw HTML (list page or `?single` embed).
+fn extract_cdn_video_urls(html: &str) -> Vec<String> {
+    let telesco = TELESCO_FILE_RE
+        .find_iter(html)
+        .map(|m| m.as_str().trim_end_matches('\\').to_string());
+    let tgcdn = TG_CDN_FILE_RE
+        .find_iter(html)
+        .map(|m| m.as_str().trim_end_matches('\\').to_string());
+    telesco
+        .chain(tgcdn)
+        .filter(|u| !is_likely_image_cdn_url(u))
+        .collect()
+}
+
+fn merge_video_urls(into: &mut Vec<String>, more: impl IntoIterator<Item = String>) {
+    let mut seen: HashSet<String> = into.iter().cloned().collect();
+    for u in more {
+        if seen.insert(u.clone()) {
+            into.push(u);
+        }
+    }
+}
+
+/// If the channel preview page had no `<video src>`, try the public
+/// single-post embed (`t.me/{channel}/{id}?single`).
+pub async fn enrich_post_videos(client: &reqwest::Client, post: &mut TgPost) -> Result<()> {
+    if post.primary_video().is_some() {
+        return Ok(());
+    }
+    let url = format!("https://t.me/{}?single", post.data_post);
+    debug!(url = %url, id = post.id, "enriching post videos");
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("GET {}", url))?;
+    if !resp.status().is_success() {
+        return Err(anyhow!("HTTP {} for {}", resp.status(), url));
+    }
+    let html = resp.text().await?;
+    for cap in OG_VIDEO_RE.captures_iter(&html) {
+        if let Some(u) = cap.get(1) {
+            post.videos.push(u.as_str().to_string());
+        }
+    }
+    let doc = Html::parse_document(&html);
+    let video_sel = Selector::parse("video").unwrap();
+    for v in doc.select(&video_sel) {
+        if let Some(src) = v.value().attr("src") {
+            post.videos.push(src.to_string());
+        }
+    }
+    merge_video_urls(&mut post.videos, extract_cdn_video_urls(&html));
+    Ok(())
+}
 
 const USER_AGENT: &str =
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) \
@@ -55,6 +136,7 @@ pub fn parse_posts(html: &str) -> Vec<TgPost> {
     let msg_sel = Selector::parse(".tgme_widget_message_wrap .tgme_widget_message").unwrap();
     let body_sel = Selector::parse(".tgme_widget_message_text").unwrap();
     let video_sel = Selector::parse("video").unwrap();
+    let grouped_sel = Selector::parse(".tgme_widget_message_grouped_layer").unwrap();
     let img_sel = Selector::parse("img").unwrap();
     let date_sel = Selector::parse("time").unwrap();
     let views_sel = Selector::parse(".tgme_widget_message_views").unwrap();
@@ -97,9 +179,15 @@ pub fn parse_posts(html: &str) -> Vec<TgPost> {
             }
         }
         
-        // De-duplicate while preserving order.
-        let mut seen = std::collections::HashSet::new();
-        videos.retain(|u| seen.insert(u.clone()));
+        merge_video_urls(&mut videos, extract_cdn_video_urls(&node.html()));
+        for layer in node.select(&grouped_sel) {
+            merge_video_urls(&mut videos, extract_cdn_video_urls(&layer.html()));
+            for v in layer.select(&video_sel) {
+                if let Some(src) = v.value().attr("src") {
+                    merge_video_urls(&mut videos, std::iter::once(src.to_string()));
+                }
+            }
+        }
 
         let images: Vec<String> = node
             .select(&img_sel)
@@ -151,8 +239,7 @@ pub fn parse_posts(html: &str) -> Vec<TgPost> {
             .select(&bubble_video_sel)
             .filter_map(|v| v.value().attr("src").map(|s| s.to_string()))
             .collect();
-        let mut seen = std::collections::HashSet::new();
-        videos.retain(|u| seen.insert(u.clone()));
+        merge_video_urls(&mut videos, extract_cdn_video_urls(&node.html()));
 
         let images: Vec<String> = node
             .select(&img_sel)
