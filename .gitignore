@@ -5,6 +5,12 @@ Cargo.lock.bak
 # Workspace artifacts
 /assets/mellstroy/*.mp4
 /assets/mellstroy/*.json
+/assets/clips/**
+/assets/images/**
+/assets/sounds/**
+/assets/videos/**
+/assets/particles/**
+/clips/**
 /out/
 /.cache/
 
