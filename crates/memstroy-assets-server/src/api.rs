@@ -286,10 +286,9 @@ struct TgIngestRequest {
 }
 
 fn default_ingest_limit() -> u32 {
-    // Reduced from 500 to 100 for memory-constrained environments (500MB RAM).
-    // Large ingests can cause OOM on small servers. Users can run multiple
-    // smaller ingests if needed.
-    100
+    // Limited to 10 clips to prevent excessive downloads and disk usage.
+    // Users can run multiple smaller ingests if needed.
+    10
 }
 
 async fn post_ingest_tg(
@@ -300,7 +299,8 @@ async fn post_ingest_tg(
     if channel.is_empty() {
         return Err(ApiError::BadRequest("channel must not be empty".into()));
     }
-    let limit = body.limit.max(1);
+    // Limit to maximum 10 clips per request
+    let limit = body.limit.max(1).min(10);
     ingest::spawn_tg_ingest(store, channel.clone(), limit);
     Ok(Json(json!({
         "started": true,

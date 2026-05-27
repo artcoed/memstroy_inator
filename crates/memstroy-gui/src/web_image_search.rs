@@ -221,19 +221,16 @@ pub fn show_window(
         window = window.current_pos(pos);
     }
     
-    window.show(ctx, |ui| {
-            // Get the actual window content width from the clip rect,
-            // which reflects the real allocated space for this window.
-            // This prevents the content from expanding beyond the window
-            // boundaries during text input or layout changes.
-            let body_w = ui.clip_rect().width() - ui.spacing().window_margin.sum().x;
+    let response = window.show(ctx, |ui| {
+            // Use the saved window size to calculate body width instead of clip_rect,
+            // which can fluctuate and cause unwanted expansion.
+            let window_size = state.web_image_search.panel_size.unwrap_or(egui::vec2(560.0, 640.0));
+            let margins = ui.spacing().window_margin.sum().x;
+            let body_w = (window_size.x - margins).max(280.0);
             
             // Hard-clamp the content width to prevent expansion.
-            // We use a fixed-size container that clips overflow to prevent
-            // any child widget (especially TextEdit) from pushing the window wider.
             ui.set_max_width(body_w);
             ui.set_width(body_w);
-            ui.set_clip_rect(ui.clip_rect()); // Enforce clipping
 
             // Claim the full window body for pointer hits so clicks on
             // padding / gaps between widgets don't fall through to the
@@ -247,6 +244,19 @@ pub fn show_window(
 
             window_body(ui, state, tx, body_w);
         });
+    
+    // Only update saved size when user is actively resizing (dragging edges)
+    if let Some(inner_response) = response {
+        if inner_response.response.dragged() || inner_response.response.drag_stopped() {
+            if let Some(new_rect) = ctx.memory(|m| m.area_rect(window_id)) {
+                let new_size = new_rect.size();
+                if new_size.x >= 300.0 && new_size.y >= 280.0 && new_size.x <= 1200.0 && new_size.y <= 1200.0 {
+                    state.web_image_search.panel_size = Some(new_size);
+                }
+            }
+        }
+    }
+    
     state.web_image_search_open = open;
 }
 
@@ -362,22 +372,29 @@ fn window_body(
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
+            // Constrain the scroll area content to prevent expansion
+            ui.set_max_width(body_w);
+            
             // When searching and no results yet, show a centered loading state
             if state.web_image_search.searching && state.web_image_search.results.is_empty() {
                 ui.add_space(40.0);
-                ui.vertical_centered(|ui| {
-                    ui.spinner();
-                    ui.add_space(8.0);
-                    ui.label(
-                        RichText::new(t("Searching DuckDuckGo..."))
-                            .size(13.0)
-                            .color(Color32::from_rgb(200, 200, 220)),
-                    );
-                    ui.add_space(4.0);
-                    ui.label(
-                        RichText::new(t("This may take a few seconds."))
-                            .size(10.0)
-                            .italics()
+                ui.allocate_ui_with_layout(
+                    egui::vec2(body_w, 100.0),
+                    egui::Layout::top_down(egui::Align::Center),
+                    |ui| {
+                        ui.set_max_width(body_w);
+                        ui.spinner();
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new(t("Searching DuckDuckGo..."))
+                                .size(13.0)
+                                .color(Color32::from_rgb(200, 200, 220)),
+                        );
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new(t("This may take a few seconds."))
+                                .size(10.0)
+                                .italics()
                             .color(Color32::from_rgb(140, 140, 160)),
                     );
                 });
@@ -392,49 +409,61 @@ fn window_body(
                 && state.web_image_search.results.len() < MAX_TOTAL_RESULTS;
             if has_more {
                 ui.add_space(8.0);
-                ui.vertical_centered(|ui| {
-                    let next_pg = state.web_image_search.page_count + 1;
-                    let label = format!(
-                        "\u{2B07} {} (page {})",
-                        t("Load more"),
-                        next_pg + 1,
-                    );
-                    if ui
-                        .button(RichText::new(label).size(12.0))
-                        .on_hover_text(t(
-                            "Fetch the next page of results.",
-                        ))
-                        .clicked()
-                    {
-                        kick_search(state, tx, /*append=*/ true);
-                    }
-                });
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), 40.0),
+                    egui::Layout::top_down(egui::Align::Center),
+                    |ui| {
+                        let next_pg = state.web_image_search.page_count + 1;
+                        let label = format!(
+                            "\u{2B07} {} (page {})",
+                            t("Load more"),
+                            next_pg + 1,
+                        );
+                        if ui
+                            .button(RichText::new(label).size(12.0))
+                            .on_hover_text(t(
+                                "Fetch the next page of results.",
+                            ))
+                            .clicked()
+                        {
+                            kick_search(state, tx, /*append=*/ true);
+                        }
+                    },
+                );
                 ui.add_space(8.0);
             } else if state.web_image_search.searching
                 && !state.web_image_search.results.is_empty()
             {
                 ui.add_space(8.0);
-                ui.vertical_centered(|ui| {
-                    ui.spinner();
-                    ui.label(
-                        RichText::new(t("Loading more..."))
-                            .size(10.0)
-                            .color(Color32::from_rgb(200, 200, 220)),
-                    );
-                });
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), 40.0),
+                    egui::Layout::top_down(egui::Align::Center),
+                    |ui| {
+                        ui.spinner();
+                        ui.label(
+                            RichText::new(t("Loading more..."))
+                                .size(10.0)
+                                .color(Color32::from_rgb(200, 200, 220)),
+                        );
+                    },
+                );
                 ui.add_space(8.0);
             } else if state.web_image_search.next_offset.is_none()
                 && state.web_image_search.results.len() >= MAX_RESULTS_PER_PAGE
             {
                 ui.add_space(6.0);
-                ui.vertical_centered(|ui| {
-                    ui.label(
-                        RichText::new(t("(end of results)"))
-                            .size(10.0)
-                            .italics()
-                            .color(Color32::from_rgb(120, 120, 140)),
-                    );
-                });
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), 30.0),
+                    egui::Layout::top_down(egui::Align::Center),
+                    |ui| {
+                        ui.label(
+                            RichText::new(t("(end of results)"))
+                                .size(10.0)
+                                .italics()
+                                .color(Color32::from_rgb(120, 120, 140)),
+                        );
+                    },
+                );
                 ui.add_space(6.0);
             }
         });
@@ -459,18 +488,22 @@ fn results_grid(ui: &mut egui::Ui, state: &mut EditorState, tx: &Sender<JobEvent
 
     if state.web_image_search.results.is_empty() {
         ui.add_space(12.0);
-        ui.vertical_centered(|ui| {
-            ui.label(
-                RichText::new("\u{1F50D}")
-                    .size(40.0)
-                    .color(Color32::from_rgb(62, 60, 42)),
-            );
-            ui.label(
-                RichText::new(crate::i18n::t("No results yet."))
-                    .size(11.0)
-                    .color(Color32::from_rgb(140, 140, 160)),
-            );
-        });
+        ui.allocate_ui_with_layout(
+            egui::vec2(avail_w, 80.0),
+            egui::Layout::top_down(egui::Align::Center),
+            |ui| {
+                ui.label(
+                    RichText::new("\u{1F50D}")
+                        .size(40.0)
+                        .color(Color32::from_rgb(62, 60, 42)),
+                );
+                ui.label(
+                    RichText::new(crate::i18n::t("No results yet."))
+                        .size(11.0)
+                        .color(Color32::from_rgb(140, 140, 160)),
+                );
+            },
+        );
         return;
     }
 
