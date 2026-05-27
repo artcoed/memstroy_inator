@@ -74,10 +74,29 @@ pub fn parse_posts(html: &str) -> Vec<TgPost> {
             .map(|t| extract_text(&t))
             .unwrap_or_default();
 
-        let mut videos: Vec<String> = node
-            .select(&video_sel)
-            .filter_map(|v| v.value().attr("src").map(|s| s.to_string()))
-            .collect();
+        let mut videos: Vec<String> = Vec::new();
+        
+        // Try to find video src from <video src="..."> tags
+        for v in node.select(&video_sel) {
+            if let Some(src) = v.value().attr("src") {
+                videos.push(src.to_string());
+            }
+        }
+        
+        // Also try to find video URLs from background-image in video player wrappers
+        // Telegram sometimes embeds video URLs in data attributes or as background thumbnails
+        let video_player_sel = Selector::parse(".tgme_widget_message_video_player").unwrap();
+        for player in node.select(&video_player_sel) {
+            // The href points to the post, not the video
+            // But we can extract video from nested video tags
+            let nested_video_sel = Selector::parse("video").unwrap();
+            for v in player.select(&nested_video_sel) {
+                if let Some(src) = v.value().attr("src") {
+                    videos.push(src.to_string());
+                }
+            }
+        }
+        
         // De-duplicate while preserving order.
         let mut seen = std::collections::HashSet::new();
         videos.retain(|u| seen.insert(u.clone()));
