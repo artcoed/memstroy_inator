@@ -152,6 +152,14 @@ fn ru_lookup(key: &str) -> Option<&'static str> {
             "Выберите актёра, оверлей или аудио-слой, чтобы редактировать его кривые.",
         "Transition into kf:" => "Переход в кейфрейм:",
         "Transition into kf" => "Переход в кейфрейм",
+        "No animated parameters" => "Нет анимированных параметров",
+        "Select a property above and click '+ Key' to start animating" => 
+            "Выберите параметр выше и нажмите '+ Key' для начала анимации",
+        "Parameter is not animated" => "Параметр не анимирован",
+        "Toggle 'Animated' above or click '+ Key' to start animating" =>
+            "Переключите 'Анимирован' выше или нажмите '+ Key' для начала анимации",
+        "Disable animation" => "Отключить анимацию",
+        "Enable animation" => "Включить анимацию",
         "Interpolation" => "Интерполяция",
         "Linear" => "Линейный",
         "Ease in" => "Замедление в начале",

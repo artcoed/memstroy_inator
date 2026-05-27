@@ -1569,6 +1569,9 @@ impl App {
                             &mut self.state.curve_editor_selected,
                             &mut self.state.curve_editor_multi_drag,
                             &mut self.state.curve_editor_multi_drag_delta,
+                            &mut self.state.curve_editor_pan_offset,
+                            &mut self.state.curve_editor_zoom,
+                            &mut self.state.curve_editor_panning,
                         );
                         // Effect animated params — show a scalar curve
                         // editor for each animated effect parameter.
@@ -1618,6 +1621,9 @@ impl App {
                                     &mut self.state.curve_editor_selected,
                                     &mut self.state.curve_editor_multi_drag,
                                     &mut self.state.curve_editor_multi_drag_delta,
+                                    &mut self.state.curve_editor_pan_offset,
+                                    &mut self.state.curve_editor_zoom,
+                                    &mut self.state.curve_editor_panning,
                                 );
                             }
                         }
@@ -1659,6 +1665,9 @@ impl App {
                             &mut self.state.curve_editor_selected,
                             &mut self.state.curve_editor_multi_drag,
                             &mut self.state.curve_editor_multi_drag_delta,
+                            &mut self.state.curve_editor_pan_offset,
+                            &mut self.state.curve_editor_zoom,
+                            &mut self.state.curve_editor_panning,
                         );
                         // Effect animated params for overlay.
                         let overlay_t_in = t_in;
@@ -1712,6 +1721,9 @@ impl App {
                                     &mut self.state.curve_editor_selected,
                                     &mut self.state.curve_editor_multi_drag,
                                     &mut self.state.curve_editor_multi_drag_delta,
+                                    &mut self.state.curve_editor_pan_offset,
+                                    &mut self.state.curve_editor_zoom,
+                                    &mut self.state.curve_editor_panning,
                                 );
                             }
                         }
@@ -1802,6 +1814,9 @@ impl App {
                             &mut self.state.curve_editor_selected,
                             &mut self.state.curve_editor_multi_drag,
                             &mut self.state.curve_editor_multi_drag_delta,
+                            &mut self.state.curve_editor_pan_offset,
+                            &mut self.state.curve_editor_zoom,
+                            &mut self.state.curve_editor_panning,
                         );
                     }
                 }
@@ -1822,6 +1837,9 @@ impl App {
                     &mut self.state.curve_editor_selected,
                     &mut self.state.curve_editor_multi_drag,
                     &mut self.state.curve_editor_multi_drag_delta,
+                    &mut self.state.curve_editor_pan_offset,
+                    &mut self.state.curve_editor_zoom,
+                    &mut self.state.curve_editor_panning,
                 );
             }
         }

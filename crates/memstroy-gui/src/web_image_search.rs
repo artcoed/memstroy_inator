@@ -213,7 +213,7 @@ pub fn show_window(
             // layout pass `available_width` can be the full viewport,
             // which is exactly what made the panel jump to screen width
             // when a search started.
-            let body_w = ui.max_rect().width();
+            let body_w = ui.available_width().min(ui.max_rect().width());
             ui.set_width(body_w);
             ui.set_max_width(body_w);
 
@@ -411,8 +411,9 @@ fn results_grid(ui: &mut egui::Ui, state: &mut EditorState, tx: &Sender<JobEvent
     // would otherwise compute different `cols` values, which makes
     // the grid jitter / overflow / "разъезжается" — the exact symptom
     // the user reported.
-    const VBAR_WIDTH: f32 = 14.0;
-    let avail_w = (ui.available_width() - VBAR_WIDTH).max(140.0);
+    const VBAR_WIDTH: f32 = 16.0;
+    const HORIZONTAL_MARGIN: f32 = 8.0;
+    let avail_w = (ui.available_width() - VBAR_WIDTH - HORIZONTAL_MARGIN).max(140.0);
     let card_w = 150.0_f32;
     let card_h = 180.0_f32;
     let gap = 6.0_f32;
@@ -454,6 +455,7 @@ fn results_grid(ui: &mut egui::Ui, state: &mut EditorState, tx: &Sender<JobEvent
             egui::Layout::left_to_right(egui::Align::TOP),
             |ui| {
                 ui.set_max_width(row_max_w);
+                ui.set_width(row_max_w);
                 for col in 0..cols {
                     let idx = i + col;
                     if idx >= n {

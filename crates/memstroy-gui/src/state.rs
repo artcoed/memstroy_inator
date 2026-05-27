@@ -647,6 +647,13 @@ pub struct EditorState {
     /// Accumulated delta for the curve editor multi-drag (pixels).
     pub curve_editor_multi_drag_delta: egui::Vec2,
 
+    /// Curve editor viewport pan offset (in time/value units)
+    pub curve_editor_pan_offset: egui::Vec2,
+    /// Curve editor zoom level (1.0 = default, >1.0 = zoomed in)
+    pub curve_editor_zoom: f32,
+    /// True while panning the curve editor with RMB
+    pub curve_editor_panning: bool,
+
     /// Library panel screen rect, captured during library() so the
     /// app's external file-drop handler can route OS drops to the right
     /// asset directory based on which tab is visible.
