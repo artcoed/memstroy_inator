@@ -1,0 +1,64 @@
+# Demo: camera zoom/pan over a background with text.
+# Render: memstroy render examples/camera_demo.scene.yaml -o out.mp4 --assets .
+format_version: 1
+
+output:
+  resolution: [1080, 1920]
+  fps: 60
+  duration: 6.0
+  background_color: [30, 30, 50]
+
+backgrounds:
+  - id: bg1
+    source:
+      type: solid_color
+      color: [60, 60, 100]
+    start: 0.0
+    duration: 3.0
+    fit: cover
+    transition: cut
+  - id: bg2
+    source:
+      type: solid_color
+      color: [100, 30, 30]
+    start: 3.0
+    duration: 3.0
+    fit: cover
+    transition: snap
+
+# Camera: starts wide, zooms in to top-left, then pans to center
+camera:
+  - t: 0.0
+    value: { zoom: 1.0, center: [0.5, 0.5], rotation_deg: 0.0 }
+    easing: linear
+  - t: 2.0
+    value: { zoom: 1.5, center: [0.3, 0.3], rotation_deg: 0.0 }
+    easing: ease_in_out
+  - t: 4.0
+    value: { zoom: 1.2, center: [0.5, 0.5], rotation_deg: 0.0 }
+    easing: ease_out
+  - t: 6.0
+    value: { zoom: 1.0, center: [0.5, 0.5], rotation_deg: 0.0 }
+    easing: ease_in_out
+
+actors: []
+
+overlays:
+  - type: text
+    id: zoom_text
+    text: "ZOOM TEST"
+    t_in: 0.0
+    t_out: 6.0
+    style:
+      font: DejaVuSans
+      font_size: 200.0
+      color: [255, 255, 255]
+      box_color: null
+      box_padding: 0.0
+      bold: true
+      align: center
+    layout:
+      - t: 0.0
+        value: { pos: [0.5, 0.5], scale: 1.0, rotation_deg: 0.0, opacity: 1.0 }
+
+audio: []

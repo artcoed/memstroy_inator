@@ -1,0 +1,68 @@
+# Демо: один актёр поверх серого фона + мем-текст.
+# Рендер: cargo run -p memstroy-cli -- render examples/actor_demo.scene.yaml -o actor_demo.mp4 --assets /tmp/mellstroy_smoke
+format_version: 1
+
+output:
+  resolution: [1080, 1920]
+  fps: 60
+  duration: 8.0
+  background_color: [240, 240, 240]
+
+backgrounds:
+  - id: grey
+    source:
+      type: solid_color
+      color: [240, 240, 240]
+    start: 0.0
+    duration: 8.0
+    fit: cover
+    transition: cut
+
+camera: []
+
+actors:
+  - id: mellstroy_919
+    source: "919.mp4"
+    anchors: null
+    chroma_key:
+      key_color: [0, 177, 64]
+      similarity: 0.20
+      blend: 0.10
+      spill: 0.30
+    layout:
+      - t: 0.0
+        value: { pos: [0.5, 0.65], scale: 0.85, rotation_deg: 0.0, opacity: 1.0 }
+        easing: linear
+      - t: 4.0
+        value: { pos: [0.4, 0.60], scale: 0.95, rotation_deg: 0.0, opacity: 1.0 }
+        easing: ease_out
+      - t: 8.0
+        value: { pos: [0.6, 0.65], scale: 0.85, rotation_deg: 0.0, opacity: 1.0 }
+        easing: ease_in_out
+    t_in: null
+    t_out: null
+    source_start: 0.0
+    loop_source: true
+    flip_horizontal: false
+    attachments: []
+
+overlays:
+  - type: text
+    id: title
+    text: "ИМБА"
+    t_in: 0.5
+    t_out: 7.5
+    style:
+      font: DejaVuSans
+      font_size: 160.0
+      color: [0, 0, 0]
+      box_color: [255, 255, 255]
+      box_padding: 28.0
+      bold: true
+      align: center
+    layout:
+      - t: 0.0
+        value: { pos: [0.5, 0.12], scale: 1.0, rotation_deg: 0.0, opacity: 1.0 }
+        easing: linear
+
+audio: []
