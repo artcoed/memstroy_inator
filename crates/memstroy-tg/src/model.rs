@@ -22,9 +22,32 @@ pub struct TgPost {
     pub views: Option<String>,
 }
 
+/// True when the URL can be fetched with a plain HTTP GET (not Telegram
+/// `stream/` embed tokens or `blob:` placeholders).
+pub fn is_downloadable_video_url(url: &str) -> bool {
+    let u = url.trim();
+    if u.is_empty() || u.starts_with("blob:") {
+        return false;
+    }
+    if !(u.starts_with("http://") || u.starts_with("https://")) {
+        return false;
+    }
+    let lower = u.to_ascii_lowercase();
+    !(lower.contains("/stream/") || lower.contains("stream%2f"))
+}
+
 impl TgPost {
     pub fn primary_video(&self) -> Option<&str> {
         self.videos.last().map(|s| s.as_str())
+    }
+
+    /// Best direct CDN URL suitable for `reqwest` download (skips stream/blob).
+    pub fn downloadable_video(&self) -> Option<&str> {
+        self.videos
+            .iter()
+            .filter(|u| is_downloadable_video_url(u))
+            .last()
+            .map(|s| s.as_str())
     }
 
     /// True when the body of the message contains the substring (case-

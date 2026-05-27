@@ -1119,6 +1119,26 @@ impl EditorState {
         self.assets_root.join("clips")
     }
 
+    /// True when `path` points at a non-trivial video file on disk (not a
+    /// thumbnail or empty stub accidentally named `.mp4`).
+    pub fn is_usable_local_video(path: &std::path::Path) -> bool {
+        if !path.is_file() {
+            return false;
+        }
+        let ext_ok = path.extension().and_then(|s| s.to_str()).is_some_and(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "mp4" | "mov" | "webm" | "mkv" | "m4v"
+            )
+        });
+        if !ext_ok {
+            return false;
+        }
+        std::fs::metadata(path)
+            .map(|m| m.len() > 4096)
+            .unwrap_or(false)
+    }
+
     /// Path to a sidecar state file for the clips directory. Reserved
     /// for an upcoming per-folder cache of last-used filters / scroll
     /// position that other parts of the GUI haven't started writing
@@ -1939,7 +1959,7 @@ impl EditorState {
                 });
                 
                 let mp4_path = clips_dir.join(format!("{}.mp4", stem));
-                let downloaded = mp4_path.exists();
+                let downloaded = Self::is_usable_local_video(&mp4_path);
                 
                 let description = std::fs::read_to_string(&path)
                     .map(|s| s.trim().to_string())
@@ -2004,7 +2024,7 @@ impl EditorState {
                 });
                 
                 let mp4_path = clips_dir.join(format!("{}.mp4", stem));
-                let downloaded = mp4_path.exists();
+                let downloaded = Self::is_usable_local_video(&mp4_path);
                 
                 let txt_path = clips_dir.join(format!("{}.txt", stem));
                 let description = std::fs::read_to_string(&txt_path)
