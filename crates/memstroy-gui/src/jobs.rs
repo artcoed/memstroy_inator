@@ -479,28 +479,28 @@ pub fn spawn_refresh(
 
 /// Asset summary returned by `GET /api/assets?kind=clip`.
 #[derive(Debug, Clone, Deserialize)]
-struct ServerAssetSummary {
-    id: String,
+pub struct ServerAssetSummary {
+    pub id: String,
     #[allow(dead_code)]
-    label: String,
+    pub label: String,
     /// Free-form description (cleaned Telegram caption for clips, or
     /// the contents of a `<id>.txt` sidecar for any other kind). The
     /// server already truncates this to 240 chars in `AssetSummary`.
     #[serde(default)]
-    description: String,
+    pub description: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct ListResponse {
+pub struct ListResponse {
     #[allow(dead_code)]
-    total: u64,
-    items: Vec<ServerAssetSummary>,
+    pub total: u64,
+    pub items: Vec<ServerAssetSummary>,
 }
 
 /// HTTP GET → file. Buffers the whole body in memory because the
 /// per-clip files are small enough (TG preview pages cap clip duration
 /// to ~60 s).
-async fn download_file(
+pub async fn download_file(
     client: &reqwest::Client,
     url: &str,
     target: &std::path::Path,
@@ -524,7 +524,7 @@ async fn download_file(
 
 /// Strip characters that aren't safe in filenames (defence-in-depth —
 /// the server already restricts ids to a sane character class).
-fn sanitise_id(id: &str) -> String {
+pub fn sanitise_id(id: &str) -> String {
     id.chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
         .collect()
