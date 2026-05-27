@@ -2098,6 +2098,10 @@ impl EditorState {
         self.library.sounds = scan_asset_dir(&self.sounds_dir(), AssetCategory::Sound);
         self.library.images = scan_asset_dir(&self.images_dir(), AssetCategory::Image);
         self.library.particles = scan_asset_dir(&self.particles_dir(), AssetCategory::Particle);
+
+        // Fetch server clip metadata after local filesystem scan completes
+        // This allows server-only clips to appear in the library immediately
+        self.fetch_server_clips_metadata();
         self.library.videos = scan_asset_dir(&self.videos_dir(), AssetCategory::Video);
 
         // Refresh the directory fingerprint so the next
@@ -2105,6 +2109,175 @@ impl EditorState {
         // reload when the on-disk state really did change.
         self.library_dir_fingerprint = self.compute_library_dir_fingerprint();
         self.last_library_rescan = Some(std::time::Instant::now());
+    }
+
+    /// Fetch clip metadata from the server and merge with local clips.
+    /// This is called automatically by `reload_library()` after the local
+    /// filesystem scan completes. It spawns an async task that:
+    /// 1. Fetches clip metadata from `/api/assets?kind=clip&limit=50`
+    /// 2. For each server clip not in local cache, downloads `.txt` and thumbnail
+    /// 3. Sends a `JobEvent::RefreshLibraryReloaded` to trigger UI refresh
+    ///
+    /// Gracefully degrades if server is unreachable (logs warning, continues with local-only clips).
+    fn fetch_server_clips_metadata(&self) {
+        // Check if server_url is configured
+        if self.server_url.trim().is_empty() {
+            tracing::debug!("server_url not configured, skipping server metadata fetch");
+            return;
+        }
+
+        // Check if we have tokio runtime handle and job event sender
+        let Some(handle) = self.tokio_handle.clone() else {
+            tracing::debug!("tokio runtime handle not available, skipping server metadata fetch");
+            return;
+        };
+        
+        let Some(tx) = self.image_fx_tx.clone() else {
+            tracing::debug!("job event sender not available, skipping server metadata fetch");
+            return;
+        };
+
+        let server_url = self.server_url.clone();
+        let clips_dir = self.clips_dir();
+        
+        // Get current local clip IDs to avoid duplicates
+        let local_clip_ids: std::collections::HashSet<String> = self
+            .library
+            .mellstroy_clips
+            .iter()
+            .filter_map(|c| c.server_id.clone())
+            .collect();
+
+        tracing::info!(
+            "Spawning async task to fetch server clip metadata (local clips: {})",
+            local_clip_ids.len()
+        );
+
+        // Spawn async task to fetch server metadata
+        handle.spawn(async move {
+            use std::time::Duration;
+            
+            // Rewrite server URL for client (handle 0.0.0.0 -> 127.0.0.1)
+            let server = crate::state::rewrite_server_url_for_client(&server_url)
+                .trim_end_matches('/')
+                .to_string();
+
+            // Build HTTP client with timeouts
+            let client = match reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(5))
+                .timeout(Duration::from_secs(10))
+                .build()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!("Failed to build HTTP client for server metadata fetch: {}", e);
+                    return;
+                }
+            };
+
+            // Fetch clip list from server
+            let list_url = format!("{}/api/assets?kind=clip&limit=50", server);
+            tracing::debug!("Fetching server clips from: {}", list_url);
+
+            let listing: crate::jobs::ListResponse = match client.get(&list_url).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    match resp.json().await {
+                        Ok(list) => list,
+                        Err(e) => {
+                            tracing::warn!("Failed to parse server clip listing: {}", e);
+                            return;
+                        }
+                    }
+                }
+                Ok(resp) => {
+                    tracing::warn!("Server returned error for clip listing: HTTP {}", resp.status());
+                    return;
+                }
+                Err(e) => {
+                    tracing::debug!("Server unreachable for clip metadata fetch: {} (this is normal if server is not running)", e);
+                    return;
+                }
+            };
+
+            if listing.items.is_empty() {
+                tracing::debug!("Server returned no clips");
+                return;
+            }
+
+            tracing::info!("Server returned {} clips, downloading metadata for new clips", listing.items.len());
+
+            // Create thumbs directory
+            let thumbs_dir = clips_dir.join("thumbs");
+            let _ = tokio::fs::create_dir_all(&thumbs_dir).await;
+
+            let mut new_clips_count = 0;
+
+            // Download metadata for each server clip not in local cache
+            for item in listing.items.iter() {
+                // Skip if already in local cache
+                if local_clip_ids.contains(&item.id) {
+                    continue;
+                }
+
+                let safe_id = crate::jobs::sanitise_id(&item.id);
+                let txt_path = clips_dir.join(format!("{}.txt", safe_id));
+                let thumb_jpg = thumbs_dir.join(format!("{}.jpg", safe_id));
+
+                // Skip if metadata already exists (race condition with manual refresh)
+                if txt_path.exists() && thumb_jpg.exists() {
+                    tracing::debug!("Metadata already exists for clip {}, skipping", safe_id);
+                    continue;
+                }
+
+                tracing::debug!("Downloading metadata for clip: {}", safe_id);
+
+                // Download description
+                if !item.description.is_empty() {
+                    match tokio::fs::write(&txt_path, item.description.as_bytes()).await {
+                        Ok(_) => {
+                            tracing::debug!("✓ Wrote description for {}", safe_id);
+                        }
+                        Err(e) => {
+                            tracing::warn!("✗ Failed to write description for {}: {}", safe_id, e);
+                            continue;
+                        }
+                    }
+                } else {
+                    // Create empty txt file
+                    let _ = tokio::fs::write(&txt_path, b"").await;
+                }
+
+                // Download thumbnail
+                if !thumb_jpg.exists() {
+                    let thumb_url = format!("{}/api/assets/{}/preview", server, item.id);
+                    match crate::jobs::download_file(&client, &thumb_url, &thumb_jpg).await {
+                        Ok(_) => {
+                            tracing::debug!("✓ Downloaded thumbnail for {}", safe_id);
+                        }
+                        Err(e) => {
+                            tracing::warn!("✗ Failed to download thumbnail for {}: {}", safe_id, e);
+                            // Continue even if thumbnail fails - we have the description
+                        }
+                    }
+                }
+
+                new_clips_count += 1;
+
+                // Small delay to avoid overwhelming the server
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+
+            if new_clips_count > 0 {
+                tracing::info!("Downloaded metadata for {} new server clips", new_clips_count);
+                
+                // Trigger UI refresh to reload library with new metadata
+                let _ = tx.send(crate::jobs::JobEvent::RefreshLibraryReloaded(
+                    format!("Loaded {} clips from server", new_clips_count)
+                ));
+            } else {
+                tracing::debug!("No new server clips to download");
+            }
+        });
     }
 
     /// Every asset directory the editor's library panel surfaces, in a

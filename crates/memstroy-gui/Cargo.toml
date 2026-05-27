@@ -38,6 +38,10 @@ local-server = ["dep:memstroy-assets-server"]
 # want the obfuscation back.
 obfuscate-server-url = ["dep:obfstr"]
 
+[lib]
+name = "memstroy_gui"
+path = "src/lib.rs"
+
 [[bin]]
 name = "memstroy-gui"
 path = "src/main.rs"
@@ -118,3 +122,7 @@ ab_glyph = "0.2"
 # Linux / macOS for any other target ignore it entirely.
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+wiremock = "0.6"

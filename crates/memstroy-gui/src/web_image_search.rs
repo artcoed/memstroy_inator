@@ -214,8 +214,7 @@ pub fn show_window(
         .max_height(1200.0)
         .resizable([true, true])
         .collapsible(true)
-        .scroll(false)
-        .auto_sized(); // Prevent auto-sizing based on content
+        .scroll(false);
     
     // Preserve window position if it exists
     if let Some(pos) = ctx.memory(|m| m.area_rect(window_id).map(|r| r.left_top())) {
