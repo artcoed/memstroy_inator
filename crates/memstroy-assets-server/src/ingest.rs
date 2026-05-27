@@ -87,16 +87,7 @@ async fn run_ingest(store: AssetStore, channel: String, limit: u32) {
     posts.truncate(limit as usize);
     info!("After sorting and truncating: {} posts", posts.len());
 
-    // ── Create metadata BEFORE downloading videos so it's available immediately
-    // Persist the per-post description as `<id>.txt` and an
-    // optional short label as `<id>.label` so the asset store's
-    // `index_dir` picks it up on the next pass. The store already
-    // reads these sidecars into `AssetEntry.description` /
-    // `AssetEntry.label`, which the API then surfaces in the
-    // listing the GUI consumes — restoring the pre-server flow
-    // where every clip card showed the original Telegram caption.
-    //
-    // Also download thumbnails from post.images into thumbs/ directory.
+    // Create thumbs directory upfront
     let thumbs_dir = clips_dir.join("thumbs");
     if let Err(e) = tokio::fs::create_dir_all(&thumbs_dir).await {
         warn!(error = %e, dir = %thumbs_dir.display(), "failed to create thumbs dir");
@@ -109,28 +100,71 @@ async fn run_ingest(store: AssetStore, channel: String, limit: u32) {
             None
         }
     };
+
+    // Download videos and create metadata sequentially (one by one)
+    // This ensures atomic operations: if disk fills up, we have complete clips with metadata
+    info!("Starting sequential download and metadata creation for {} posts", posts.len());
     
-    info!("Creating metadata for {} posts", posts.len());
-    for post in &posts {
+    let mut downloaded = 0usize;
+    let mut skipped = 0usize;
+    let mut failed = 0usize;
+    let mut total_bytes = 0u64;
+    
+    for (idx, post) in posts.iter().enumerate() {
         let stem = post.id.to_string();
-        let description = post.clean_description();
+        let video_path = clips_dir.join(format!("{}.mp4", stem));
         
-        // Create txt file with description (always, even if empty)
-        let txt_path = clips_dir.join(format!("{}.txt", stem));
-        if let Err(e) = tokio::fs::write(&txt_path, description.as_bytes()).await {
-            warn!(
-                error = %e,
-                path = %txt_path.display(),
-                "failed to write description sidecar"
-            );
+        info!("Processing clip {}/{}: id={}", idx + 1, posts.len(), post.id);
+        
+        // Step 1: Download video if it has a URL and doesn't exist
+        let video_downloaded = if let Some(video_url) = post.primary_video() {
+            if video_path.exists() {
+                info!("Video already exists for {}, skipping download", stem);
+                skipped += 1;
+                true
+            } else {
+                info!("Downloading video for {}", stem);
+                // Use memstroy_tg's download logic
+                let posts_slice = &[post.clone()];
+                match memstroy_tg::download_videos(posts_slice, &clips_dir, false, 1).await {
+                    Ok(stats) if stats.downloaded > 0 => {
+                        info!("✓ Downloaded video {} ({} bytes)", stem, stats.bytes);
+                        downloaded += 1;
+                        total_bytes += stats.bytes;
+                        true
+                    }
+                    Ok(_) => {
+                        warn!("✗ Video download returned 0 for {}", stem);
+                        failed += 1;
+                        false
+                    }
+                    Err(e) => {
+                        warn!("✗ Failed to download video {}: {}", stem, e);
+                        failed += 1;
+                        false
+                    }
+                }
+            }
         } else {
-            info!(id = post.id, desc_len = description.len(), "created txt metadata");
-        }
+            info!("Post {} has no video URL, skipping", stem);
+            false
+        };
         
-        // Create label file (only if description is not empty)
-        if !description.is_empty() {
-            let label_path = clips_dir.join(format!("{}.label", stem));
-            if !label_path.exists() {
+        // Step 2: Create metadata ONLY if video was downloaded successfully
+        if video_downloaded && video_path.exists() {
+            let description = post.clean_description();
+            
+            // Create txt file with description (always, even if empty)
+            let txt_path = clips_dir.join(format!("{}.txt", stem));
+            if let Err(e) = tokio::fs::write(&txt_path, description.as_bytes()).await {
+                warn!(error = %e, path = %txt_path.display(), "failed to write description");
+            } else {
+                info!("✓ Created txt metadata for {} ({} bytes)", stem, description.len());
+            }
+            
+            // Create label file (only if description is not empty)
+            if !description.is_empty() {
+                let label_path = clips_dir.join(format!("{}.label", stem));
                 let short_label: String = description
                     .chars()
                     .take(60)
@@ -139,58 +173,47 @@ async fn run_ingest(store: AssetStore, channel: String, limit: u32) {
                     .to_string();
                 if !short_label.is_empty() {
                     if let Err(e) = tokio::fs::write(&label_path, short_label.as_bytes()).await {
-                        warn!(
-                            error = %e,
-                            path = %label_path.display(),
-                            "failed to write label sidecar"
-                        );
+                        warn!(error = %e, path = %label_path.display(), "failed to write label");
                     }
                 }
             }
-        }
-        
-        // Download thumbnail from post.images (use first image as thumbnail)
-        let thumb_path = thumbs_dir.join(format!("{}.jpg", stem));
-        if !thumb_path.exists() && !post.images.is_empty() {
-            if let Some(ref client) = client {
-                if let Some(thumb_url) = post.images.first() {
-                    match client.get(thumb_url).send().await {
-                        Ok(resp) if resp.status().is_success() => {
-                            match resp.bytes().await {
-                                Ok(bytes) => {
-                                    if let Err(e) = tokio::fs::write(&thumb_path, &bytes).await {
-                                        warn!(
-                                            error = %e,
-                                            path = %thumb_path.display(),
-                                            "failed to write thumbnail"
-                                        );
-                                    } else {
-                                        info!(id = post.id, "downloaded thumbnail");
+            
+            // Download thumbnail
+            if let Some(ref http_client) = client {
+                let thumb_path = thumbs_dir.join(format!("{}.jpg", stem));
+                if !thumb_path.exists() && !post.images.is_empty() {
+                    if let Some(thumb_url) = post.images.first() {
+                        match http_client.get(thumb_url).send().await {
+                            Ok(resp) if resp.status().is_success() => {
+                                match resp.bytes().await {
+                                    Ok(bytes) => {
+                                        if let Err(e) = tokio::fs::write(&thumb_path, &bytes).await {
+                                            warn!(error = %e, path = %thumb_path.display(), "failed to write thumbnail");
+                                        } else {
+                                            info!("✓ Downloaded thumbnail for {}", stem);
+                                        }
                                     }
+                                    Err(e) => warn!(error = %e, id = post.id, "failed to read thumbnail bytes"),
                                 }
-                                Err(e) => warn!(error = %e, id = post.id, "failed to read thumbnail bytes"),
                             }
+                            Ok(resp) => warn!(id = post.id, status = %resp.status(), "thumbnail download failed"),
+                            Err(e) => warn!(error = %e, id = post.id, "thumbnail request failed"),
                         }
-                        Ok(resp) => warn!(id = post.id, status = %resp.status(), "thumbnail download failed"),
-                        Err(e) => warn!(error = %e, id = post.id, "thumbnail request failed"),
                     }
                 }
             }
+            
+            info!("✓ Completed clip {}/{}: {}", idx + 1, posts.len(), stem);
         }
     }
     
-    info!("Metadata creation complete, starting video downloads");
-
-    match memstroy_tg::download_videos(&posts, &clips_dir, false, 2).await {
-        Ok(stats) => info!(
-            downloaded = stats.downloaded,
-            skipped = stats.skipped,
-            failed = stats.failed,
-            bytes = stats.bytes,
-            "Telegram ingest complete"
-        ),
-        Err(e) => warn!(error = %e, "download_videos failed"),
-    }
+    info!(
+        downloaded = downloaded,
+        skipped = skipped,
+        failed = failed,
+        bytes = total_bytes,
+        "Sequential ingest complete"
+    );
 
     // Reindex after video downloads complete so clips appear with metadata
     info!("Reindexing store after ingest...");

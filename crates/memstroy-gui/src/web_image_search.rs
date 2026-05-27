@@ -208,14 +208,15 @@ pub fn show_window(
         .collapsible(true)
         .scroll(false)
         .show(ctx, |ui| {
-            // Pin content to the current window interior width. Do NOT
-            // call `set_min_width(available_width())` — before the first
-            // layout pass `available_width` can be the full viewport,
-            // which is exactly what made the panel jump to screen width
-            // when a search started.
-            let body_w = ui.available_width().min(ui.max_rect().width());
-            ui.set_width(body_w);
+            // Get the actual window content width from the clip rect,
+            // which reflects the real allocated space for this window.
+            // This prevents the content from expanding beyond the window
+            // boundaries during text input or layout changes.
+            let body_w = ui.clip_rect().width() - ui.spacing().window_margin.sum().x;
+            
+            // Hard-clamp the content width to prevent expansion
             ui.set_max_width(body_w);
+            ui.set_width(body_w);
 
             // Claim the full window body for pointer hits so clicks on
             // padding / gaps between widgets don't fall through to the
