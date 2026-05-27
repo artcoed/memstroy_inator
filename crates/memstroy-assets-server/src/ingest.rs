@@ -117,7 +117,7 @@ async fn run_ingest(store: AssetStore, channel: String, limit: u32) {
         info!("Processing clip {}/{}: id={}", idx + 1, posts.len(), post.id);
         
         // Step 1: Download video if it has a URL and doesn't exist
-        let video_downloaded = if let Some(video_url) = post.primary_video() {
+        let video_downloaded = if let Some(_video_url) = post.primary_video() {
             if video_path.exists() {
                 info!("Video already exists for {}, skipping download", stem);
                 skipped += 1;
@@ -181,23 +181,36 @@ async fn run_ingest(store: AssetStore, channel: String, limit: u32) {
             // Download thumbnail
             if let Some(ref http_client) = client {
                 let thumb_path = thumbs_dir.join(format!("{}.jpg", stem));
-                if !thumb_path.exists() && !post.images.is_empty() {
-                    if let Some(thumb_url) = post.images.first() {
-                        match http_client.get(thumb_url).send().await {
-                            Ok(resp) if resp.status().is_success() => {
-                                match resp.bytes().await {
-                                    Ok(bytes) => {
-                                        if let Err(e) = tokio::fs::write(&thumb_path, &bytes).await {
-                                            warn!(error = %e, path = %thumb_path.display(), "failed to write thumbnail");
-                                        } else {
-                                            info!("✓ Downloaded thumbnail for {}", stem);
+                if !thumb_path.exists() {
+                    // Generate thumbnail from first frame of video instead of downloading from Telegram
+                    info!("Generating thumbnail from video for {}", stem);
+                    match memstroy_tg::generate_thumbnail(&video_path, &thumb_path).await {
+                        Ok(_) => {
+                            info!("✓ Generated thumbnail from video for {}", stem);
+                        }
+                        Err(e) => {
+                            warn!(error = %e, id = post.id, "thumbnail generation from video failed");
+                            // Fallback: try to download thumbnail from Telegram
+                            if !post.images.is_empty() {
+                                if let Some(thumb_url) = post.images.first() {
+                                    match http_client.get(thumb_url).send().await {
+                                        Ok(resp) if resp.status().is_success() => {
+                                            match resp.bytes().await {
+                                                Ok(bytes) => {
+                                                    if let Err(e) = tokio::fs::write(&thumb_path, &bytes).await {
+                                                        warn!(error = %e, path = %thumb_path.display(), "failed to write thumbnail");
+                                                    } else {
+                                                        info!("✓ Downloaded thumbnail from Telegram for {}", stem);
+                                                    }
+                                                }
+                                                Err(e) => warn!(error = %e, id = post.id, "failed to read thumbnail bytes"),
+                                            }
                                         }
+                                        Ok(resp) => warn!(id = post.id, status = %resp.status(), "thumbnail download failed"),
+                                        Err(e) => warn!(error = %e, id = post.id, "thumbnail request failed"),
                                     }
-                                    Err(e) => warn!(error = %e, id = post.id, "failed to read thumbnail bytes"),
                                 }
                             }
-                            Ok(resp) => warn!(id = post.id, status = %resp.status(), "thumbnail download failed"),
-                            Err(e) => warn!(error = %e, id = post.id, "thumbnail request failed"),
                         }
                     }
                 }
