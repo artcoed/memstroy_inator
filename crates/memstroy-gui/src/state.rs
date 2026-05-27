@@ -1164,12 +1164,11 @@ impl EditorState {
     ///   bundle directory means re-installing the editor never wipes
     ///   downloaded media, and the user does not need write access to
     ///   the install location.
+    ///
+    /// **CHANGED**: Now always uses user_cache_dir() to ensure GUI and
+    /// server use the same directory structure (~/.memstroy/cache/).
     pub fn default_assets_root() -> PathBuf {
-        if crate::build_info::IS_CLIENT_BUILD {
-            Self::user_cache_dir()
-        } else {
-            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-        }
+        Self::user_cache_dir()
     }
 
     /// Per-user cache directory used as `assets_root` in client builds.

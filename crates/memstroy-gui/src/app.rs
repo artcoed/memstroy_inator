@@ -13,7 +13,7 @@ use crate::state::{EditorState, Selection};
 use crate::audio_engine::AudioEngine;
 
 pub struct App {
-    rt: Runtime,
+    rt: Option<Runtime>,
     state: EditorState,
     tx: Sender<JobEvent>,
     rx: Receiver<JobEvent>,
@@ -127,7 +127,7 @@ impl App {
         // without an interruption on launch.
 
         Self {
-            rt,
+            rt: Some(rt),
             state,
             tx,
             rx,
@@ -180,9 +180,10 @@ impl App {
 
         // Anchor the asset root at the editor's current `assets_root` so
         // the server indexes the same files the GUI's local library tab
-        // surfaces. Existing subdirectories (`assets/mellstroy/`,
-        // `assets/sounds/`, ...) are picked up by the walker.
-        let root = state.assets_root.join("assets");
+        // surfaces. The GUI now uses `~/.memstroy/cache/` directly as
+        // assets_root, so we pass it directly to the server without
+        // appending "assets" subdirectory.
+        let root = state.assets_root.clone();
         if let Err(e) = std::fs::create_dir_all(&root) {
             tracing::warn!(
                 root = %root.display(),
@@ -2803,7 +2804,7 @@ impl App {
             let result_slot: Arc<Mutex<Option<(Vec<f32>, f32)>>> = Arc::new(Mutex::new(None));
             let slot_clone = result_slot.clone();
 
-            self.rt.spawn(async move {
+            self.rt.as_ref().unwrap().spawn(async move {
                 let peaks = crate::state::AudioWaveform::extract_peaks(&source_clone, 512);
                 if let Ok(mut slot) = slot_clone.lock() {
                     *slot = peaks;
@@ -2906,7 +2907,7 @@ impl App {
             }
 
             let width = extract_width;
-            let rt_handle = self.rt.handle().clone();
+            let rt_handle = self.rt.as_ref().unwrap().handle().clone();
             rt_handle.spawn(async move {
                 crate::video_cache::extract_frames_blocking_with_scale(
                     source,
@@ -3058,7 +3059,7 @@ impl App {
         // top. See `populate_render_z_order` for the full mapping.
         crate::jobs::populate_render_z_order(&self.state, &mut scene_for_render);
         spawn_render(
-            self.rt.handle(),
+            self.rt.as_ref().unwrap().handle(),
             self.tx.clone(),
             scene_for_render,
             self.state.assets_root.clone(),
@@ -3077,7 +3078,7 @@ impl App {
         self.state.refreshing = true;
         self.state.status = crate::i18n::t("\u{1F504} Refreshing clips via assets-server...").into();
         spawn_refresh(
-            self.rt.handle(),
+            self.rt.as_ref().unwrap().handle(),
             self.tx.clone(),
             self.state.server_url.clone(),
             self.state.tg_channel.clone(),
@@ -3647,6 +3648,18 @@ fn swallow_clipboard_events(
         });
     });
     out
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        tracing::info!("App dropping, shutting down tokio runtime immediately...");
+        // Take the runtime out of the Option and call shutdown_background
+        // This will NOT wait for tasks to complete - they will be aborted immediately
+        if let Some(rt) = self.rt.take() {
+            rt.shutdown_background();
+            tracing::info!("Tokio runtime shutdown initiated (non-blocking)");
+        }
+    }
 }
 
 impl eframe::App for App {

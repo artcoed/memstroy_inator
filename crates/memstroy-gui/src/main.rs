@@ -68,6 +68,9 @@ fn main() -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("memstroy-bg")
+        .on_thread_stop(|| {
+            tracing::debug!("tokio worker thread stopping");
+        })
         .build()?;
 
     // ── Window / taskbar icon ───────────────────────────────────────
