@@ -7193,25 +7193,37 @@ fn broadcast_lane_change_to_peers(state: &mut EditorState, primary: Selection, t
     }
     let video_pos_of = |track: usize| video_tracks.iter().position(|&t| t == track);
 
+    let first_video = video_tracks.first().copied().unwrap_or(0);
+    let default_overlay_lane_now = default_overlay_lane(state);
+
     // ── Resolve "starting lane" of every peer ──
     let primary_start_track: usize = state.timeline_drag.group_anchor
         .iter()
         .find(|a| a.sel == primary)
         .and_then(|a| a.track)
-        .unwrap_or_else(|| match primary {
-            Selection::Actor(ai) => {
-                state.actor_track_assignments.get(&ai).copied()
+        .filter(|t| video_pos_of(*t).is_some())
+        .unwrap_or_else(|| {
+            match primary {
+                Selection::Actor(ai) => state
+                    .actor_track_assignments
+                    .get(&ai)
+                    .copied()
+                    .filter(|t| video_pos_of(*t).is_some())
+                    .unwrap_or(first_video),
+                Selection::Overlay(oi) => state
+                    .overlay_track_assignments
+                    .get(&oi)
+                    .copied()
+                    .filter(|t| video_pos_of(*t).is_some())
                     .unwrap_or_else(|| {
-                        (0..state.tracks.len())
-                            .find(|i| state.tracks[*i].kind == TrackKind::Video)
-                            .unwrap_or(0)
-                    })
+                        if video_pos_of(default_overlay_lane_now).is_some() {
+                            default_overlay_lane_now
+                        } else {
+                            first_video
+                        }
+                    }),
+                _ => first_video,
             }
-            Selection::Overlay(oi) => {
-                state.overlay_track_assignments.get(&oi).copied()
-                    .unwrap_or_else(|| default_overlay_lane(state))
-            }
-            _ => target_track,
         });
 
     // Work in VIDEO-lane coordinates (0..video_tracks.len()) rather than
@@ -7242,14 +7254,16 @@ fn broadcast_lane_change_to_peers(state: &mut EditorState, primary: Selection, t
         match sel {
             Selection::Actor(ai) => {
                 if ai < state.scene.actors.len() {
-                    let cur = peer_start.unwrap_or_else(|| {
-                        state.actor_track_assignments.get(&ai).copied()
-                            .unwrap_or_else(|| {
-                                (0..state.tracks.len())
-                                    .find(|i| state.tracks[*i].kind == TrackKind::Video)
-                                    .unwrap_or(0)
-                            })
-                    });
+                    let cur = peer_start
+                        .filter(|t| video_pos_of(*t).is_some())
+                        .unwrap_or_else(|| {
+                            state
+                                .actor_track_assignments
+                                .get(&ai)
+                                .copied()
+                                .filter(|t| video_pos_of(*t).is_some())
+                                .unwrap_or(first_video)
+                        });
                     let cur_pos = video_pos_of(cur).unwrap_or(primary_start_pos);
                     let new_pos = (cur_pos as i64 + delta)
                         .clamp(0, video_tracks.len().saturating_sub(1) as i64)
@@ -7260,10 +7274,22 @@ fn broadcast_lane_change_to_peers(state: &mut EditorState, primary: Selection, t
             }
             Selection::Overlay(oi) => {
                 if oi < state.scene.overlays.len() {
-                    let cur = peer_start.unwrap_or_else(|| {
-                        state.overlay_track_assignments.get(&oi).copied()
-                            .unwrap_or_else(|| default_overlay_lane(state))
-                    });
+                    let cur = peer_start
+                        .filter(|t| video_pos_of(*t).is_some())
+                        .unwrap_or_else(|| {
+                            state
+                                .overlay_track_assignments
+                                .get(&oi)
+                                .copied()
+                                .filter(|t| video_pos_of(*t).is_some())
+                                .unwrap_or_else(|| {
+                                    if video_pos_of(default_overlay_lane_now).is_some() {
+                                        default_overlay_lane_now
+                                    } else {
+                                        first_video
+                                    }
+                                })
+                        });
                     let cur_pos = video_pos_of(cur).unwrap_or(primary_start_pos);
                     let new_pos = (cur_pos as i64 + delta)
                         .clamp(0, video_tracks.len().saturating_sub(1) as i64)
@@ -15023,7 +15049,13 @@ fn push_audio_track_for_actor(state: &mut EditorState, actor_id: &str, source: &
         parent_actor: Some(actor_id.to_string()),
         ..Default::default()
     });
-    state.scene.audio.len() - 1
+    let new_idx = state.scene.audio.len() - 1;
+    let lane = state.pick_or_create_empty_audio_lane_for_range(
+        t_in,
+        t_out.unwrap_or(state.scene.output.duration.max(t_in + 0.1)),
+    );
+    state.audio_track_assignments.insert(new_idx, lane);
+    new_idx
 }
 
 /// Find the index of the audio track bound to a given actor id, if any.
