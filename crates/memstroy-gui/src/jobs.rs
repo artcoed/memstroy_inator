@@ -302,27 +302,23 @@ pub fn spawn_refresh(
         let thumbs_dir = clips_dir.join("thumbs");
         let _ = tokio::fs::create_dir_all(&thumbs_dir).await;
 
-        // 3. Wait for server to ingest clips, then download metadata.
-        //    We poll the server every few seconds until clips appear.
+        // 3. Poll server for clips. Start immediately without delay.
         let list_url = format!(
             "{}/api/assets?kind=clip&limit={}",
             server,
             limit
         );
 
-        progress("Waiting for server to ingest clips...".into());
-        
-        // Wait a bit for the server to start ingesting
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        progress("Fetching clip list from server...".into());
         
         let mut new_count = 0usize;
         let failed = 0usize;
         let mut downloaded_ids: std::collections::HashSet<String> =
             std::collections::HashSet::new();
 
-        // Poll the server for up to 60 seconds or until we get clips
-        let max_wait = Duration::from_secs(60);
-        let poll_interval = Duration::from_secs(3);
+        // Poll the server for up to 30 seconds or until we get clips
+        let max_wait = Duration::from_secs(30);
+        let poll_interval = Duration::from_millis(500); // Poll every 500ms for faster response
         let started = std::time::Instant::now();
         
         let listing: ListResponse = loop {
@@ -470,7 +466,7 @@ pub fn spawn_refresh(
             )));
 
             // Small delay to avoid overwhelming the server
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
         let _ = tx.send(JobEvent::RefreshFinished(Ok(RefreshSummary {
