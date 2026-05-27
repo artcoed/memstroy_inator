@@ -222,7 +222,12 @@ pub async fn incremental_refresh(
 
 /// Extract a thumbnail frame from a video at the first frame (t=0).
 pub async fn generate_thumbnail(video: &Path, output: &Path) -> Result<()> {
-    let status = tokio::process::Command::new("ffmpeg")
+    let ffmpeg = {
+        let mut p = memstroy_render::ffmpeg_binary();
+        p.set_file_name("ffmpeg");
+        if p.exists() { p } else { std::path::PathBuf::from("ffmpeg") }
+    };
+    let status = tokio::process::Command::new(&ffmpeg)
         .args([
             "-y", "-hide_banner", "-loglevel", "error",
             "-i",
