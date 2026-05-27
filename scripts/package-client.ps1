@@ -93,17 +93,21 @@ Write-Host "    server URL : $ServerUrl"
 # ── Build release binaries (client mode) ────────────────────────────
 # Pass the build-time signals through env vars so build.rs bakes the
 # obfstr-wrapped URL and the IS_CLIENT_BUILD flag into the artefact.
-# Explicitly disable the `local-server` feature for memstroy-gui so
-# the heavy `memstroy-assets-server` dependency (and its transitive
-# deps like `axum`, `tower-http`, `scraper` via `memstroy-tg`) are
-# excluded from the client binary. This cuts build time and binary size.
+# Explicitly disable heavy optional features:
+#   - GUI: `local-server` (excludes memstroy-assets-server + axum/tower-http)
+#   - CLI: `telegram` (excludes memstroy-tg + scraper/reqwest)
+# This cuts build time roughly in half and reduces binary size significantly.
 Write-Host "==> cargo build --release (client mode)"
 $env:MEMSTROY_CLIENT_BUILD        = "1"
 $env:MEMSTROY_DEFAULT_SERVER_URL  = $ServerUrl
-& cargo build --release `
-    -p memstroy-gui --no-default-features `
-    -p memstroy-cli
-if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
+
+# Build GUI without local-server feature
+& cargo build --release -p memstroy-gui --no-default-features
+if ($LASTEXITCODE -ne 0) { throw "cargo build failed (memstroy-gui)" }
+
+# Build CLI without telegram feature
+& cargo build --release -p memstroy-cli --no-default-features
+if ($LASTEXITCODE -ne 0) { throw "cargo build failed (memstroy-cli)" }
 
 # ── Stage the bundle ────────────────────────────────────────────────
 Write-Host "==> staging bundle"

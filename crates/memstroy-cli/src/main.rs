@@ -11,9 +11,12 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
+#[cfg(feature = "telegram")]
+use anyhow::Context;
 use clap::{Parser, Subcommand};
 use memstroy_core::Scene;
+#[cfg(feature = "telegram")]
 use memstroy_tg::{download_videos, fetch_all, ChannelCatalog};
 use memstroy_render::{render_preview_frame, render_scene};
 use tracing::info;
@@ -29,6 +32,7 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Cmd {
     /// Scrape a Telegram public channel and download all videos.
+    #[cfg(feature = "telegram")]
     Download {
         /// Channel handle, e.g. `MELLSTROYfonz`.
         #[arg(long, default_value = "MELLSTROYfonz")]
@@ -110,6 +114,7 @@ async fn main() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
     match cli.cmd {
+        #[cfg(feature = "telegram")]
         Cmd::Download { channel, out, filter, max_pages, overwrite, concurrency, catalog_only } => {
             run_download(channel, out, filter, max_pages, overwrite, concurrency, catalog_only).await
         }
@@ -126,14 +131,19 @@ async fn main() -> Result<()> {
 }
 
 fn init_tracing() {
+    #[cfg(feature = "telegram")]
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,memstroy_tg=info,memstroy_render=info"));
+    #[cfg(not(feature = "telegram"))]
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,memstroy_render=info"));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
         .try_init();
 }
 
+#[cfg(feature = "telegram")]
 async fn run_download(
     channel: String,
     out: PathBuf,
