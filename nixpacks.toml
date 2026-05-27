@@ -1,3 +1,7 @@
+[phases.setup]
+# Ensure ffmpeg is available in Railway/Nixpacks runtime.
+nixPkgs = ["ffmpeg"]
+
 [phases.build]
 cmds = ["cargo build --release -p memstroy-assets-server"]
 
