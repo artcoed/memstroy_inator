@@ -3702,7 +3702,8 @@ impl eframe::App for App {
         // when a track is dropped on the timeline.
         if !self.state.scene.audio.is_empty() {
             let needs_wf = self.state.scene.audio.iter().enumerate().any(|(i, au)| {
-                au.source.exists()
+                !au.deleted
+                    && au.source.exists()
                     && self.state.audio_waveforms.get(i)
                         .map(|wf| !wf.ready && !wf.extracting)
                         .unwrap_or(true)
@@ -4130,6 +4131,7 @@ impl eframe::App for App {
             let mut seen: std::collections::HashSet<std::path::PathBuf> =
                 std::collections::HashSet::new();
             for a in &state.scene.audio {
+                if a.deleted { continue; }
                 // Sample every animatable field at the playhead's
                 // clip-local time so a freshly-built sink reflects the
                 // user's animated values at the current moment. The
