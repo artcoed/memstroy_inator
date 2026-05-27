@@ -11,14 +11,15 @@
 //!   2. Wait a short grace period for the server to do its work
 //!      (Telegram preview pages are small, so a few seconds is usually
 //!      enough; the user can hit Refresh again to pick up more).
-//!   3. GET `/api/assets?kind=clip&limit=200` to enumerate every clip
+//!   3. GET `/api/assets?kind=clip&limit=N` to enumerate clips
 //!      the server now has.
-//!   4. For each clip the GUI doesn't yet have a local copy of, GET
+//!   4. For each clip, download it sequentially via
 //!      `/api/assets/<id>/download` and write the bytes into the
-//!      editor's `assets/mellstroy/` directory so the existing
-//!      `library_clips_tab` UI keeps reading from disk.
-//!   5. Generate a thumbnail per new clip via local ffmpeg, mirroring
-//!      what the old direct-scrape path did.
+//!      editor's `assets/mellstroy/` directory. After each clip is
+//!      downloaded, the GUI reloads the library so clips appear
+//!      immediately one by one.
+//!   5. Download thumbnails and description sidecars for each clip
+//!      so the library panel can show captions and previews.
 //!
 //! When the server is unreachable or the catalogue is empty, the user
 //! gets a clear status string instead of a silent no-op.
@@ -205,31 +206,25 @@ pub fn populate_render_z_order(state: &crate::state::EditorState, scene: &mut Sc
     }
 }
 
-/// Trigger a server-driven Telegram refresh and pull any new clips
-/// down into `clips_dir`. See the module-level docs for the full flow.
+/// Trigger a server-driven Telegram refresh and download clips
+/// one by one into `clips_dir`. See the module-level docs for the full flow.
 ///
 /// `server_url` should be the base URL of a `memstroy-assets-server`
 /// instance (no trailing slash necessary). `channel` and `limit` are
 /// forwarded as the `/api/ingest/tg` request body.
 ///
-/// ## Polling strategy
+/// ## Sequential download strategy
 ///
-/// The previous version slept exactly 6 seconds after kicking the
-/// server's ingest job and then fetched the listing once. For any
-/// reasonably large channel (≥ a few dozen videos) the server was
-/// still mid-download when we listed, so the GUI mirrored a small
-/// fraction of the catalogue and the user was left wondering why
-/// "клипы с сервера не подгружаются" — there were 400+ clips
-/// expected and the editor only saw the first ~30. We now poll the
-/// listing repeatedly: every `POLL_INTERVAL` we re-list, mirror any
-/// newly-arrived clips to local cache, and continue until either
-///
-///   * the catalogue stops growing for `STABLE_WINDOW`, or
-///   * we reach `MAX_WAIT` total time, or
-///   * we've already mirrored at least `limit` clips.
+/// The previous version only downloaded metadata and thumbnails,
+/// leaving the actual video files to be downloaded lazily when the
+/// user dragged them onto the canvas. This caused confusion because
+/// clips didn't appear in the project immediately. We now download
+/// clips **sequentially, one by one**, and reload the library after
+/// each download so the user sees clips appearing in real-time.
 ///
 /// Progress messages flow back through `JobEvent::RefreshProgress`
-/// so the user sees "X / Y synced" updating live in the status bar.
+/// and `JobEvent::RefreshLibraryReloaded` so the user sees
+/// "Downloaded X / Y clips" updating live in the status bar.
 pub fn spawn_refresh(
     rt: &Handle,
     tx: Sender<JobEvent>,
@@ -303,138 +298,119 @@ pub fn spawn_refresh(
         let thumbs_dir = clips_dir.join("thumbs");
         let _ = tokio::fs::create_dir_all(&thumbs_dir).await;
 
-        // 3. Poll the server while it ingests. We mirror ONLY metadata
-        //    (descriptions) and thumbnails — not the full clip bodies.
-        //    Clips download lazily when the user actually drags them
-        //    onto the canvas / timeline (see `download_clip_on_demand`
-        //    below). This keeps the refresh fast and avoids burning
-        //    bandwidth on clips the user might never use.
+        // 3. Download clips one by one sequentially. This ensures clips
+        //    are loaded into the project immediately and avoids the
+        //    infinite refresh loop. We download both metadata and the
+        //    actual video files.
         let list_url = format!(
             "{}/api/assets?kind=clip&limit={}",
             server,
-            (limit as u64).saturating_mul(2).max(1000),
+            limit
         );
 
-        // ── Polling parameters ──
-        const POLL_INTERVAL: Duration = Duration::from_secs(3);
-        const MAX_WAIT: Duration = Duration::from_secs(600);
-        const STABLE_WINDOW: Duration = Duration::from_secs(8);
-
-        let started = std::time::Instant::now();
-        let mut last_change = started;
-        let mut last_total: u64 = 0;
+        let _started = std::time::Instant::now();
         let mut new_count = 0usize;
         let failed = 0usize;
-        #[allow(unused_assignments)]
-        let mut total_seen: u64 = 0;
-        // Track ids whose metadata we've already mirrored — we re-poll
-        // the server during ingest, so we want to skip already-seen
-        // entries to avoid redundant filesystem writes.
-        let mut metadata_seen: std::collections::HashSet<String> =
+        let mut downloaded_ids: std::collections::HashSet<String> =
             std::collections::HashSet::new();
 
-        loop {
-            let new_count_at_round_start = new_count;
-
-            let listing: ListResponse = match client.get(&list_url).send().await {
-                Ok(resp) if resp.status().is_success() => match resp.json().await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        warn!(error = %e, "couldn't parse server listing during poll");
-                        tokio::time::sleep(POLL_INTERVAL).await;
-                        continue;
-                    }
-                },
-                Ok(resp) => {
-                    warn!(status = %resp.status(), "listing failed during poll");
-                    tokio::time::sleep(POLL_INTERVAL).await;
-                    continue;
-                }
+        // First, get the initial listing from the server
+        progress("Fetching clip list from server...".into());
+        
+        let listing: ListResponse = match client.get(&list_url).send().await {
+            Ok(resp) if resp.status().is_success() => match resp.json().await {
+                Ok(v) => v,
                 Err(e) => {
-                    warn!(error = %e, "listing failed during poll");
-                    tokio::time::sleep(POLL_INTERVAL).await;
-                    continue;
+                    let _ = tx.send(JobEvent::RefreshFinished(Err(format!(
+                        "Couldn't parse server listing: {e}"
+                    ))));
+                    return;
                 }
-            };
-
-            total_seen = listing.total;
-            if listing.total != last_total {
-                last_total = listing.total;
-                last_change = std::time::Instant::now();
+            },
+            Ok(resp) => {
+                let _ = tx.send(JobEvent::RefreshFinished(Err(format!(
+                    "Server listing failed: HTTP {}",
+                    resp.status()
+                ))));
+                return;
             }
-
-            // Mirror metadata and thumbnails for new entries.
-            for item in &listing.items {
-                if !metadata_seen.insert(item.id.clone()) {
-                    continue;
-                }
-
-                let safe_id = sanitise_id(&item.id);
-                let txt_path = clips_dir.join(format!("{}.txt", safe_id));
-
-                // Mirror description sidecar so the UI can show
-                // captions even before the clip itself is downloaded.
-                if !item.description.is_empty() && !txt_path.exists() {
-                    if let Err(e) =
-                        tokio::fs::write(&txt_path, item.description.as_bytes()).await
-                    {
-                        warn!(
-                            id = %item.id,
-                            error = %e,
-                            "failed to mirror description sidecar locally"
-                        );
-                    }
-                }
-
-                // Pre-fetch thumbnail (small, fast). The library card
-                // shows it whether or not the full clip is downloaded.
-                let thumb_jpg = thumbs_dir.join(format!("{}.jpg", safe_id));
-                if !thumb_jpg.exists() {
-                    let thumb_url = format!(
-                        "{}/api/assets/{}/preview", server, item.id
-                    );
-                    let _ = download_file(&client, &thumb_url, &thumb_jpg).await;
-                }
-                new_count += 1;
+            Err(e) => {
+                let _ = tx.send(JobEvent::RefreshFinished(Err(format!(
+                    "Couldn't fetch listing: {e}"
+                ))));
+                return;
             }
+        };
 
-            progress(format!(
-                "Server has {} clip(s); metadata synced: {}",
-                listing.total, new_count
-            ));
+        let total_clips = listing.items.len();
+        if total_clips == 0 {
+            let _ = tx.send(JobEvent::RefreshFinished(Ok(RefreshSummary {
+                new_clips: 0,
+                total_clips: 0,
+                failed: 0,
+            })));
+            return;
+        }
 
-            if new_count > new_count_at_round_start {
-                let _ = tx.send(JobEvent::RefreshLibraryReloaded(format!(
-                    "Synced {} / {} clip metadata...",
-                    new_count, listing.total
-                )));
-            }
+        progress(format!("Found {} clips on server, downloading metadata...", total_clips));
 
-            // Termination conditions.
-            if started.elapsed() >= MAX_WAIT {
-                info!("refresh: hit MAX_WAIT, stopping poll loop");
-                break;
-            }
-            if last_change.elapsed() >= STABLE_WINDOW
-                && listing.total > 0
-            {
-                info!(
-                    total = listing.total,
-                    "refresh: server count stable, stopping"
-                );
-                break;
-            }
-            if listing.total == 0 && started.elapsed() < Duration::from_secs(20) {
-                tokio::time::sleep(POLL_INTERVAL).await;
+        // Download only metadata (description + thumbnail) for each clip
+        // The actual video will be downloaded lazily when first used
+        for (idx, item) in listing.items.iter().enumerate() {
+            if downloaded_ids.contains(&item.id) {
                 continue;
             }
 
-            tokio::time::sleep(POLL_INTERVAL).await;
+            let safe_id = sanitise_id(&item.id);
+            let mp4_path = clips_dir.join(format!("{}.mp4", safe_id));
+            let txt_path = clips_dir.join(format!("{}.txt", safe_id));
+            let thumb_jpg = thumbs_dir.join(format!("{}.jpg", safe_id));
+
+            // Skip if already downloaded locally (both metadata and video)
+            if mp4_path.exists() && txt_path.exists() {
+                downloaded_ids.insert(item.id.clone());
+                new_count += 1;
+                continue;
+            }
+
+            progress(format!(
+                "Downloading metadata {} / {} ({})",
+                idx + 1,
+                total_clips,
+                safe_id
+            ));
+
+            // Download description sidecar (always, even if video exists)
+            if !item.description.is_empty() && !txt_path.exists() {
+                let _ = tokio::fs::write(&txt_path, item.description.as_bytes()).await;
+            }
+
+            // Download thumbnail (always, even if video exists)
+            if !thumb_jpg.exists() {
+                let thumb_url = format!(
+                    "{}/api/assets/{}/preview",
+                    server, item.id
+                );
+                let _ = download_file(&client, &thumb_url, &thumb_jpg).await;
+            }
+
+            // Mark as "known" but not downloaded (video will be downloaded on first use)
+            downloaded_ids.insert(item.id.clone());
+            new_count += 1;
+
+            // Notify UI to reload library after each metadata download
+            let _ = tx.send(JobEvent::RefreshLibraryReloaded(format!(
+                "Downloaded metadata {} / {} clips",
+                new_count, total_clips
+            )));
+
+            // Small delay to avoid overwhelming the server
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
         let _ = tx.send(JobEvent::RefreshFinished(Ok(RefreshSummary {
             new_clips: new_count,
-            total_clips: total_seen as usize,
+            total_clips: total_clips,
             failed,
         })));
     });
@@ -455,6 +431,7 @@ struct ServerAssetSummary {
 
 #[derive(Debug, Clone, Deserialize)]
 struct ListResponse {
+    #[allow(dead_code)]
     total: u64,
     items: Vec<ServerAssetSummary>,
 }

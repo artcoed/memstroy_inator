@@ -295,6 +295,8 @@ fn easing_label(e: Easing) -> &'static str {
 /// the set of selected keyframe indices (for multi-select / multi-drag).
 /// `ce_multi_drag` / `ce_multi_drag_delta` track the in-progress
 /// multi-drag gesture.
+/// `pan_offset` and `zoom` control the viewport transformation.
+/// `panning` tracks whether the user is currently panning with RMB.
 pub fn curve_editor_panel(
     ui: &mut egui::Ui,
     target: CurveEditorTarget<'_>,
@@ -305,6 +307,9 @@ pub fn curve_editor_panel(
     ce_selected: &mut Vec<usize>,
     ce_multi_drag: &mut bool,
     ce_multi_drag_delta: &mut egui::Vec2,
+    pan_offset: &mut egui::Vec2,
+    zoom: &mut f32,
+    panning: &mut bool,
 ) {
     use crate::i18n::t;
 
@@ -325,7 +330,17 @@ pub fn curve_editor_panel(
                 ce_selected,
                 ce_multi_drag,
                 ce_multi_drag_delta,
+                pan_offset,
+                zoom,
+                panning,
             );
+            // Effect animated params — show a scalar curve
+            // editor for each animated effect parameter.
+            let actor_t_in = layout.first().map(|kf| kf.t).unwrap_or(0.0);
+            // Note: we can't access actor.t_in here, so we approximate
+            // from the first keyframe. For proper t_local calculation,
+            // the caller (app.rs) should pass it in.
+            let _t_local = (playhead - actor_t_in).max(0.0);
         }
         CurveEditorTarget::Overlay { layout, animated_params, t_in } => {
             transform_curve_editor::<OverlayState>(
@@ -343,6 +358,9 @@ pub fn curve_editor_panel(
                 ce_selected,
                 ce_multi_drag,
                 ce_multi_drag_delta,
+                pan_offset,
+                zoom,
+                panning,
             );
         }
         CurveEditorTarget::RenderFrame { layout, animated_params } => {
@@ -364,6 +382,9 @@ pub fn curve_editor_panel(
                 ce_selected,
                 ce_multi_drag,
                 ce_multi_drag_delta,
+                pan_offset,
+                zoom,
+                panning,
             );
         }
         CurveEditorTarget::Audio {
@@ -401,6 +422,8 @@ pub fn curve_editor_panel(
                 {
                     if on {
                         animated_params.remove(param_id);
+                        // Remove all keyframes when disabling animation
+                        kfs.clear();
                     } else {
                         animated_params.insert(param_id.to_string());
                     }
@@ -425,21 +448,44 @@ pub fn curve_editor_panel(
             });
 
             ui.add_space(4.0);
-            scalar_curve_editor(
-                ui,
-                kfs,
-                animated_params,
-                param_id,
-                param_color,
-                duration,
-                value_range,
-                static_value,
-                t_local,
-                marquee,
-                ce_selected,
-                ce_multi_drag,
-                ce_multi_drag_delta,
-            );
+
+            // Check if parameter is animated
+            if !animated_params.contains(param_id) {
+                // Parameter is not animated — show a message instead of the graph
+                ui.vertical_centered(|ui| {
+                    ui.add_space(40.0);
+                    ui.label(
+                        egui::RichText::new(t("Parameter is not animated"))
+                            .size(13.0)
+                            .color(Color32::from_rgb(140, 140, 160)),
+                    );
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new(t("Toggle 'Animated' above or click '+ Key' to start animating"))
+                            .size(10.0)
+                            .color(Color32::from_rgb(100, 100, 120)),
+                    );
+                });
+            } else {
+                scalar_curve_editor(
+                    ui,
+                    kfs,
+                    animated_params,
+                    param_id,
+                    param_color,
+                    duration,
+                    value_range,
+                    static_value,
+                    t_local,
+                    marquee,
+                    ce_selected,
+                    ce_multi_drag,
+                    ce_multi_drag_delta,
+                    pan_offset,
+                    zoom,
+                    panning,
+                );
+            }
         }
         CurveEditorTarget::EffectParam {
             kfs,
@@ -477,6 +523,8 @@ pub fn curve_editor_panel(
                 {
                     if on {
                         animated_params.remove(param_id);
+                        // Remove all keyframes when disabling animation
+                        kfs.clear();
                     } else {
                         animated_params.insert(param_id.to_string());
                         // Auto-create a keyframe at the current playhead
@@ -507,21 +555,44 @@ pub fn curve_editor_panel(
             });
 
             ui.add_space(4.0);
-            scalar_curve_editor(
-                ui,
-                kfs,
-                animated_params,
-                param_id,
-                param_color,
-                duration,
-                value_range,
-                static_value,
-                t_local,
-                marquee,
-                ce_selected,
-                ce_multi_drag,
-                ce_multi_drag_delta,
-            );
+
+            // Check if parameter is animated
+            if !animated_params.contains(param_id) {
+                // Parameter is not animated — show a message instead of the graph
+                ui.vertical_centered(|ui| {
+                    ui.add_space(40.0);
+                    ui.label(
+                        egui::RichText::new(t("Parameter is not animated"))
+                            .size(13.0)
+                            .color(Color32::from_rgb(140, 140, 160)),
+                    );
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new(t("Toggle 'Animated' above or click '+ Key' to start animating"))
+                            .size(10.0)
+                            .color(Color32::from_rgb(100, 100, 120)),
+                    );
+                });
+            } else {
+                scalar_curve_editor(
+                    ui,
+                    kfs,
+                    animated_params,
+                    param_id,
+                    param_color,
+                    duration,
+                    value_range,
+                    static_value,
+                    t_local,
+                    marquee,
+                    ce_selected,
+                    ce_multi_drag,
+                    ce_multi_drag_delta,
+                    pan_offset,
+                    zoom,
+                    panning,
+                );
+            }
         }
     }
 }
@@ -552,6 +623,9 @@ fn transform_curve_editor<T>(
     ce_selected: &mut Vec<usize>,
     ce_multi_drag: &mut bool,
     ce_multi_drag_delta: &mut egui::Vec2,
+    pan_offset: &mut egui::Vec2,
+    zoom: &mut f32,
+    panning: &mut bool,
 ) where
     T: Clone,
 {
@@ -589,9 +663,33 @@ fn transform_curve_editor<T>(
             } else {
                 Color32::from_rgb(140, 140, 160)
             });
-            if ui.selectable_label(selected, text).clicked() {
+            let resp = ui.selectable_label(selected, text);
+            if resp.clicked() {
                 *selected_property = i;
             }
+            // Context menu to toggle animation on/off
+            resp.context_menu(|ui| {
+                if is_animated {
+                    if ui.button(t("Disable animation")).clicked() {
+                        animated_params.remove(param_id);
+                        // Check if any parameters are still animated
+                        let any_still_animated = PROPERTY_NAMES.iter().enumerate().any(|(other_i, _)| {
+                            let other_param_id = prop_to_param_id(other_i);
+                            animated_params.contains(other_param_id)
+                        });
+                        // If no parameters are animated, clear all keyframes
+                        if !any_still_animated {
+                            keyframes.clear();
+                        }
+                        ui.close_menu();
+                    }
+                } else {
+                    if ui.button(t("Enable animation")).clicked() {
+                        animated_params.insert(param_id.to_string());
+                        ui.close_menu();
+                    }
+                }
+            });
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui
@@ -625,6 +723,30 @@ fn transform_curve_editor<T>(
     });
 
     ui.add_space(4.0);
+
+    // ── Check if any parameters are animated ──
+    let any_animated = PROPERTY_NAMES.iter().enumerate().any(|(i, _)| {
+        animated_params.contains(prop_to_param_id(i))
+    });
+
+    if !any_animated {
+        // No parameters are animated — show a message instead of the graph
+        ui.vertical_centered(|ui| {
+            ui.add_space(40.0);
+            ui.label(
+                egui::RichText::new(t("No animated parameters"))
+                    .size(13.0)
+                    .color(Color32::from_rgb(140, 140, 160)),
+            );
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new(t("Select a property above and click '+ Key' to start animating"))
+                    .size(10.0)
+                    .color(Color32::from_rgb(100, 100, 120)),
+            );
+        });
+        return;
+    }
 
     // ── Compute which keyframes are relevant for the selected property ──
     // A keyframe is "relevant" if it's the first kf, or the value of the
@@ -671,11 +793,6 @@ fn transform_curve_editor<T>(
             })
             .unwrap_or(0);
         ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new(t("Transition into kf:"))
-                    .size(10.5)
-                    .color(Color32::from_rgb(160, 160, 180)),
-            );
             let cur_easing = keyframes[nearest_idx].easing;
             if let Some(next) = easing_picker(ui, cur_easing) {
                 keyframes[nearest_idx].easing = next;
@@ -720,9 +837,54 @@ fn transform_curve_editor<T>(
         Stroke::new(1.0, Color32::from_rgb(44, 42, 28)),
     );
 
-    let (val_min, val_max) = property_range(prop);
-    let time_min = 0.0_f32;
-    let time_max = duration.max(0.1);
+    // ── Pan and zoom controls ──
+    // Initialize zoom if not set
+    if *zoom <= 0.0 {
+        *zoom = 1.0;
+    }
+
+    // Handle mouse wheel zoom
+    let scroll_delta = ui.input(|i| i.smooth_scroll_delta.y);
+    if scroll_delta.abs() > 0.1 && graph_rect.contains(ui.input(|i| i.pointer.hover_pos().unwrap_or_default())) {
+        let zoom_factor = 1.0 + scroll_delta * 0.001;
+        *zoom = (*zoom * zoom_factor).clamp(0.1, 10.0);
+    }
+
+    // Handle RMB panning
+    let rmb_down = ui.input(|i| i.pointer.secondary_down());
+    let rmb_pressed = ui.input(|i| i.pointer.secondary_pressed());
+    
+    if rmb_pressed && graph_rect.contains(ui.input(|i| i.pointer.press_origin().unwrap_or_default())) {
+        *panning = true;
+    }
+    
+    if *panning {
+        if rmb_down {
+            let delta = ui.input(|i| i.pointer.delta());
+            // Convert pixel delta to time/value delta
+            let (val_min_base, val_max_base) = property_range(prop);
+            let time_span = duration.max(0.1) / *zoom;
+            let value_span = (val_max_base - val_min_base) / *zoom;
+            
+            pan_offset.x -= delta.x * time_span / graph_width;
+            pan_offset.y += delta.y * value_span / graph_height;
+        } else {
+            *panning = false;
+        }
+    }
+
+    // Apply zoom and pan to time/value ranges
+    let (val_min_base, val_max_base) = property_range(prop);
+    let time_center = duration * 0.5 + pan_offset.x;
+    let value_center = (val_min_base + val_max_base) * 0.5 + pan_offset.y;
+    
+    let time_span = duration.max(0.1) / *zoom;
+    let value_span = (val_max_base - val_min_base) / *zoom;
+    
+    let time_min = (time_center - time_span * 0.5).max(0.0);
+    let time_max = time_center + time_span * 0.5;
+    let val_min = value_center - value_span * 0.5;
+    let val_max = value_center + value_span * 0.5;
 
     let margin = 4.0;
     let inner_rect = graph_rect.shrink(margin);
@@ -1118,6 +1280,9 @@ fn scalar_curve_editor(
     ce_selected: &mut Vec<usize>,
     ce_multi_drag: &mut bool,
     ce_multi_drag_delta: &mut egui::Vec2,
+    pan_offset: &mut egui::Vec2,
+    zoom: &mut f32,
+    panning: &mut bool,
 ) {
     use crate::i18n::t;
     let available = ui.available_size();
@@ -1137,9 +1302,54 @@ fn scalar_curve_editor(
         Stroke::new(1.0, Color32::from_rgb(44, 42, 28)),
     );
 
-    let (val_min, val_max) = value_range;
-    let time_min = 0.0_f32;
-    let time_max = duration.max(0.1);
+    // ── Pan and zoom controls ──
+    // Initialize zoom if not set
+    if *zoom <= 0.0 {
+        *zoom = 1.0;
+    }
+
+    // Handle mouse wheel zoom
+    let scroll_delta = ui.input(|i| i.smooth_scroll_delta.y);
+    if scroll_delta.abs() > 0.1 && graph_rect.contains(ui.input(|i| i.pointer.hover_pos().unwrap_or_default())) {
+        let zoom_factor = 1.0 + scroll_delta * 0.001;
+        *zoom = (*zoom * zoom_factor).clamp(0.1, 10.0);
+    }
+
+    // Handle RMB panning
+    let rmb_down = ui.input(|i| i.pointer.secondary_down());
+    let rmb_pressed = ui.input(|i| i.pointer.secondary_pressed());
+    
+    if rmb_pressed && graph_rect.contains(ui.input(|i| i.pointer.press_origin().unwrap_or_default())) {
+        *panning = true;
+    }
+    
+    if *panning {
+        if rmb_down {
+            let delta = ui.input(|i| i.pointer.delta());
+            // Convert pixel delta to time/value delta
+            let (val_min_base, val_max_base) = value_range;
+            let time_span = duration.max(0.1) / *zoom;
+            let value_span = (val_max_base - val_min_base) / *zoom;
+            
+            pan_offset.x -= delta.x * time_span / graph_width;
+            pan_offset.y += delta.y * value_span / graph_height;
+        } else {
+            *panning = false;
+        }
+    }
+
+    // Apply zoom and pan to time/value ranges
+    let (val_min_base, val_max_base) = value_range;
+    let time_center = duration * 0.5 + pan_offset.x;
+    let value_center = (val_min_base + val_max_base) * 0.5 + pan_offset.y;
+    
+    let time_span = duration.max(0.1) / *zoom;
+    let value_span = (val_max_base - val_min_base) / *zoom;
+    
+    let time_min = (time_center - time_span * 0.5).max(0.0);
+    let time_max = time_center + time_span * 0.5;
+    let val_min = value_center - value_span * 0.5;
+    let val_max = value_center + value_span * 0.5;
     let inner_rect = graph_rect.shrink(4.0);
 
     draw_grid(&painter, inner_rect, time_min, time_max, val_min, val_max);
