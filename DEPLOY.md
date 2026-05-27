@@ -30,9 +30,11 @@ The project uses **conditional compilation** to optimize build times:
    - `RUST_LOG` = `info,memstroy_assets_server=info`
    - `ASSETS_ROOT` = `/data/assets` (already in railway.toml as default)
 4. Railway will build via the `nixpacks.toml` config (in repo root):
-   - Build: `cargo build --release --bin memstroy-assets-server`
+   - Build: `cargo build --release -p memstroy-assets-server --bin memstroy-assets-server`
    - Start: `./target/release/memstroy-assets-server --root /data/assets`
-   - **Note**: Only the server binary is built on Railway, not the entire workspace
+   - **Note**: Only the server binary is built on Railway, not the entire workspace.
+     The `-p memstroy-assets-server` flag is required because the workspace's
+     `default-members` excludes the server package to speed up local client builds.
    - **Auto-cleanup**: Server automatically deletes all old clips on startup to free disk space
 5. **Configure a public domain** (Settings → Networking → Generate domain)
    so the editor clients can reach the server.
@@ -99,7 +101,7 @@ The server is mostly disk-bound:
 ## Local testing of the deploy build
 
 ```bash
-cargo build --release --bin memstroy-assets-server
+cargo build --release -p memstroy-assets-server --bin memstroy-assets-server
 PORT=8080 ASSETS_ROOT=./assets ./target/release/memstroy-assets-server
 curl http://localhost:8080/api/health
 ```
