@@ -1398,7 +1398,10 @@ impl EditorState {
                 let a = &self.scene.actors[ai];
                 let t_in = a.t_in.unwrap_or(0.0);
                 let t_out = a.t_out.unwrap_or(scene_dur);
-                if t >= t_in && t <= t_out {
+                // Half-open occupancy window: [t_in, t_out). A clip ending
+                // exactly at `t` does not block the lane for a new clip
+                // starting at the same instant.
+                if t >= t_in && t < t_out {
                     busy = true;
                     break;
                 }
@@ -1421,7 +1424,9 @@ impl EditorState {
                     memstroy_core::Overlay::Image(o) => (o.t_in, o.t_out),
                     memstroy_core::Overlay::Video(o) => (o.t_in, o.t_out),
                 };
-                if t >= t_in && t <= t_out {
+                // Half-open occupancy window: [t_in, t_out). Keeps
+                // back-to-back placements on the same lane legal.
+                if t >= t_in && t < t_out {
                     busy = true;
                     break;
                 }

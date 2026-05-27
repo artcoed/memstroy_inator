@@ -7187,6 +7187,12 @@ fn broadcast_lane_change_to_peers(state: &mut EditorState, primary: Selection, t
         state.timeline_drag.group_anchor = anchors;
     }
 
+    let video_tracks = state.video_track_indices();
+    if video_tracks.is_empty() {
+        return;
+    }
+    let video_pos_of = |track: usize| video_tracks.iter().position(|&t| t == track);
+
     // ── Resolve "starting lane" of every peer ──
     let primary_start_track: usize = state.timeline_drag.group_anchor
         .iter()
@@ -7208,12 +7214,17 @@ fn broadcast_lane_change_to_peers(state: &mut EditorState, primary: Selection, t
             _ => target_track,
         });
 
-    let delta = target_track as i64 - primary_start_track as i64;
+    // Work in VIDEO-lane coordinates (0..video_tracks.len()) rather than
+    // raw global track indices. This keeps multi-selection lane offsets
+    // stable even when audio lanes are interleaved in the global index space.
+    let primary_start_pos = video_pos_of(primary_start_track)
+        .unwrap_or_else(|| video_pos_of(target_track).unwrap_or(0));
+    let target_pos = video_pos_of(target_track).unwrap_or(primary_start_pos);
+    let delta = target_pos as i64 - primary_start_pos as i64;
     if delta == 0 {
         return;
     }
 
-    let num_tracks = state.tracks.len();
     let anchors_clone: Vec<crate::state::GroupMoveAnchor> =
         state.timeline_drag.group_anchor.clone();
     let peers: Vec<Selection> = state.canvas_selection.clone();
@@ -7239,7 +7250,11 @@ fn broadcast_lane_change_to_peers(state: &mut EditorState, primary: Selection, t
                                     .unwrap_or(0)
                             })
                     });
-                    let new_track = (cur as i64 + delta).clamp(0, num_tracks.saturating_sub(1) as i64) as usize;
+                    let cur_pos = video_pos_of(cur).unwrap_or(primary_start_pos);
+                    let new_pos = (cur_pos as i64 + delta)
+                        .clamp(0, video_tracks.len().saturating_sub(1) as i64)
+                        as usize;
+                    let new_track = video_tracks[new_pos];
                     state.actor_track_assignments.insert(ai, new_track);
                 }
             }
@@ -7249,7 +7264,11 @@ fn broadcast_lane_change_to_peers(state: &mut EditorState, primary: Selection, t
                         state.overlay_track_assignments.get(&oi).copied()
                             .unwrap_or_else(|| default_overlay_lane(state))
                     });
-                    let new_track = (cur as i64 + delta).clamp(0, num_tracks.saturating_sub(1) as i64) as usize;
+                    let cur_pos = video_pos_of(cur).unwrap_or(primary_start_pos);
+                    let new_pos = (cur_pos as i64 + delta)
+                        .clamp(0, video_tracks.len().saturating_sub(1) as i64)
+                        as usize;
+                    let new_track = video_tracks[new_pos];
                     state.overlay_track_assignments.insert(oi, new_track);
                 }
             }
@@ -11913,7 +11932,10 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             if assigned != *i { continue; }
                             let t_in = a.t_in.unwrap_or(0.0);
                             let t_out = a.t_out.unwrap_or(duration);
-                            if drop_time >= t_in && drop_time <= t_out {
+                            // Half-open occupancy window: [t_in, t_out).
+                            // A clip ending exactly at `drop_time` does not
+                            // make the lane busy for the new drop.
+                            if drop_time >= t_in && drop_time < t_out {
                                 occupied = true;
                                 break;
                             }
@@ -11935,7 +11957,8 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                 memstroy_core::Overlay::Image(o) => (o.t_in, o.t_out),
                                 memstroy_core::Overlay::Video(o) => (o.t_in, o.t_out),
                             };
-                            if drop_time >= t_in && drop_time <= t_out {
+                            // Half-open occupancy window: [t_in, t_out).
+                            if drop_time >= t_in && drop_time < t_out {
                                 occupied = true;
                                 break;
                             }

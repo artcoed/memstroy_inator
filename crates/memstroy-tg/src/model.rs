@@ -36,62 +36,84 @@ impl TgPost {
     }
 
     /// Extract the "useful" part of the post text: everything before
-    /// the first blank line (which separates the content description
-    /// from the subscriber-facing boilerplate like voting links).
+    /// the footer boilerplate (voting markers, chat links, boost links).
+    /// 
+    /// The typical structure is:
+    /// ```
+    /// [emoji]—Main description text
+    /// [emoji]—Имба/Топчик/Хрень
+    /// Наш чатик— https://t.me/...
+    /// Голосовать для продвижения канала—https://t.me/...?boost
+    /// ```
+    /// 
+    /// We want to extract only the main description text.
     pub fn clean_description(&self) -> String {
         let text = &self.text;
 
-        // Take only the first line/paragraph (before first newline or "—Имба"/"—Топ" marker)
-        let raw = if let Some(pos) = text.find("\n\n") {
-            &text[..pos]
-        } else if let Some(pos) = text.find('\n') {
-            &text[..pos]
-        } else {
-            text.as_str()
-        };
-
-        // Remove boilerplate patterns: "—Имба", "—Топчик", "—Топ", "—Хрень", "—Херня"
-        // and emoji voting markers like "❤️‍🔥", "👍", "👎", "🔥", "□", "♡"
-        let mut result = raw.to_string();
-
-        // Remove common tail patterns (voting markers)
-        let cut_markers = [
-            "\u{2764}\u{FE0F}\u{200D}\u{1F525}", // ❤️‍🔥
-            "\u{1F44D}", // 👍
-            "\u{1F44E}", // 👎
-            "\u{1F525}", // 🔥
-            "❤️‍🔥",
-            "—Имба",
-            "—Топчик",
-            "—Топ",
-            "—Хрень",
-            "—Херня",
-            "—Такое себе",
-            "□",
-            "♡",
+        // Footer markers that indicate the start of boilerplate
+        let footer_markers = [
+            "Наш чатик",
+            "Голосовать для продвижения",
+            "https://t.me/+",
+            "?boost",
         ];
 
-        // Find the earliest occurrence of any marker and cut there
-        let mut cut_pos = result.len();
-        for marker in cut_markers {
-            if let Some(pos) = result.find(marker) {
-                cut_pos = cut_pos.min(pos);
+        // Find the earliest footer marker
+        let mut footer_start = text.len();
+        for marker in &footer_markers {
+            if let Some(pos) = text.find(marker) {
+                footer_start = footer_start.min(pos);
             }
         }
-        result.truncate(cut_pos);
 
-        // Also try to cut at a standalone em-dash followed by a known word
-        // Pattern: " ❤" or "❤" at end
-        let result = result.trim_end_matches(|c: char| {
-            c == '—' || c == ' ' || c == '\u{00A0}' || !c.is_alphanumeric() && c != '(' && c != ')' && c != '!' && c != '?' && c != '.'
-        });
+        // Take text before footer
+        let before_footer = &text[..footer_start];
 
-        let cleaned = result.trim().to_string();
+        // Split by em-dash lines (format: "—Text")
+        let lines: Vec<&str> = before_footer
+            .split('—')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        // Voting markers that should be excluded
+        let voting_markers = [
+            "Имба",
+            "Топчик", 
+            "Топ",
+            "Хрень",
+            "Херня",
+            "Такое себе",
+            "Танцует с бутылкой в руках",
+        ];
+
+        // Find the main description line (first non-voting line)
+        let main_line = lines
+            .iter()
+            .find(|line| {
+                // Skip lines that are just voting markers
+                !voting_markers.iter().any(|marker| line.starts_with(marker))
+            })
+            .copied()
+            .unwrap_or("");
+
+        // Clean up emojis and special characters from the beginning
+        let cleaned = main_line
+            .trim_start_matches(|c: char| {
+                // Remove leading emojis, custom emoji placeholders, and whitespace
+                !c.is_alphanumeric() && c != '(' && c != ')' && c != '"' && c != '\''
+            })
+            .trim();
+
         if cleaned.is_empty() {
-            // Fallback: return first 40 chars of raw text
-            raw.chars().take(40).collect::<String>().trim().to_string()
+            // Fallback: return first 60 chars of original text
+            text.chars()
+                .take(60)
+                .collect::<String>()
+                .trim()
+                .to_string()
         } else {
-            cleaned
+            cleaned.to_string()
         }
     }
 }
