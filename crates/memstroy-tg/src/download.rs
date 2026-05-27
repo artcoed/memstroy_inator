@@ -220,7 +220,7 @@ pub async fn incremental_refresh(
     Ok((state, stats))
 }
 
-/// Extract a thumbnail frame from a video at t=1s using ffmpeg.
+/// Extract a thumbnail frame from a video at the first frame (t=0).
 pub async fn generate_thumbnail(video: &Path, output: &Path) -> Result<()> {
     let status = tokio::process::Command::new("ffmpeg")
         .args([
@@ -229,7 +229,7 @@ pub async fn generate_thumbnail(video: &Path, output: &Path) -> Result<()> {
         ])
         .arg(video.as_os_str())
         .args([
-            "-ss", "1.0",
+            "-ss", "0.0",
             "-vframes", "1",
             "-vf", "scale=160:-1",
             "-q:v", "5",

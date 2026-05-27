@@ -1489,6 +1489,10 @@ impl EditorState {
             return None;
         }
         for &lane in audio_lanes.iter() {
+            // Never auto-place onto a locked lane.
+            if self.tracks.get(lane).map(|t| t.locked).unwrap_or(false) {
+                continue;
+            }
             let mut busy = false;
             for (aui, au) in self.scene.audio.iter().enumerate() {
                 if au.deleted { continue; }
@@ -1496,6 +1500,7 @@ impl EditorState {
                     .audio_track_assignments
                     .get(&aui)
                     .copied()
+                    .filter(|t| audio_lanes.contains(t))
                     .unwrap_or_else(|| audio_lanes[aui % audio_lanes.len()]);
                 if assigned != lane { continue; }
                 let other_in = au.t_in;

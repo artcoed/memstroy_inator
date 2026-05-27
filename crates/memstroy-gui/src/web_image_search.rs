@@ -185,20 +185,7 @@ pub fn show_window(
 ) {
     let mut open = state.web_image_search_open;
     let window_id = egui::Id::new("web_image_search_window");
-    
-    // Capture the current window size BEFORE showing it, so we can
-    // lock it to prevent auto-expansion from child widgets.
-    let current_size = ctx.memory(|m| {
-        m.area_rect(window_id).map(|r| r.size())
-    });
-    
-    // Update saved size only if it's a valid user-resized dimension
-    if let Some(sz) = current_size {
-        if sz.x >= 300.0 && sz.y >= 280.0 {
-            state.web_image_search.panel_size = Some(sz);
-        }
-    }
-    
+
     let window_size = state
         .web_image_search
         .panel_size
