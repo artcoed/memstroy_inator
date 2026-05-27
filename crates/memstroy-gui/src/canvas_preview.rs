@@ -2771,13 +2771,13 @@ enum DisplayMode {
 /// from the parent chain. Used to transform child elements relative to
 /// their parent.
 #[derive(Clone, Copy, Debug)]
-struct ParentTransform {
+pub struct ParentTransform {
     /// Parent's world position (centre).
-    pos: WorldPos,
+    pub pos: WorldPos,
     /// Parent's accumulated rotation in degrees.
-    rotation_deg: f32,
+    pub rotation_deg: f32,
     /// Parent's accumulated uniform scale.
-    scale: f32,
+    pub scale: f32,
 }
 
 impl Default for ParentTransform {
@@ -2794,7 +2794,7 @@ impl Default for ParentTransform {
 /// `parent_id`. Walks up the parent hierarchy (with cycle detection) and
 /// accumulates position, rotation, and scale. Returns `None` when the
 /// element has no parent or the parent can't be resolved.
-fn resolve_parent_transform(
+pub fn resolve_parent_transform(
     state: &EditorState,
     parent_id: &str,
     t: f32,
