@@ -286,6 +286,7 @@ impl MontageOutput {
                 animated_params: Default::default(),
                 z_order: 0,
                 parent_id: None,
+                mute_audio: false,
             };
             scene.actors.push(actor);
         }
