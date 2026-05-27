@@ -2396,6 +2396,11 @@ fn mux_audio(scene: &Scene, assets_root: &Path, output_path: &Path) -> Result<()
     let mut jobs: Vec<AudioJob> = Vec::new();
     let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     for tr in &scene.audio {
+        // Skip deleted audio tracks (marked as deleted instead of
+        // removed from the array to prevent index shifts in the UI).
+        if tr.deleted {
+            continue;
+        }
         let path = if tr.source.is_absolute() {
             tr.source.clone()
         } else {

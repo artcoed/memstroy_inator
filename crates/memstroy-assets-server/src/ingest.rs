@@ -115,36 +115,36 @@ async fn run_ingest(store: AssetStore, channel: String, limit: u32) {
         let stem = post.id.to_string();
         let description = post.clean_description();
         
-        // Create txt file with description
-        if !description.is_empty() {
-            let txt_path = clips_dir.join(format!("{}.txt", stem));
-            if let Err(e) = tokio::fs::write(&txt_path, description.as_bytes()).await {
-                warn!(
-                    error = %e,
-                    path = %txt_path.display(),
-                    "failed to write description sidecar"
-                );
-            } else {
-                info!(id = post.id, "created txt metadata");
-            }
+        // Create txt file with description (always, even if empty)
+        let txt_path = clips_dir.join(format!("{}.txt", stem));
+        if let Err(e) = tokio::fs::write(&txt_path, description.as_bytes()).await {
+            warn!(
+                error = %e,
+                path = %txt_path.display(),
+                "failed to write description sidecar"
+            );
+        } else {
+            info!(id = post.id, desc_len = description.len(), "created txt metadata");
         }
         
-        // Create label file
-        let label_path = clips_dir.join(format!("{}.label", stem));
-        if !label_path.exists() {
-            let short_label: String = description
-                .chars()
-                .take(60)
-                .collect::<String>()
-                .trim()
-                .to_string();
-            if !short_label.is_empty() {
-                if let Err(e) = tokio::fs::write(&label_path, short_label.as_bytes()).await {
-                    warn!(
-                        error = %e,
-                        path = %label_path.display(),
-                        "failed to write label sidecar"
-                    );
+        // Create label file (only if description is not empty)
+        if !description.is_empty() {
+            let label_path = clips_dir.join(format!("{}.label", stem));
+            if !label_path.exists() {
+                let short_label: String = description
+                    .chars()
+                    .take(60)
+                    .collect::<String>()
+                    .trim()
+                    .to_string();
+                if !short_label.is_empty() {
+                    if let Err(e) = tokio::fs::write(&label_path, short_label.as_bytes()).await {
+                        warn!(
+                            error = %e,
+                            path = %label_path.display(),
+                            "failed to write label sidecar"
+                        );
+                    }
                 }
             }
         }
