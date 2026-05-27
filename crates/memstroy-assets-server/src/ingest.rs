@@ -27,7 +27,8 @@ pub fn spawn_tg_ingest(store: AssetStore, channel: String, limit: u32) {
         // Set a timeout for the entire ingest operation to prevent hangs
         // when there's no internet connection or the server is shutting down
         // Increased to 5 minutes to allow downloading multiple clips
-        let timeout_duration = Duration::from_secs(300); // 5 minutes
+        let timeout_secs = if limit >= 10 { 600 } else { 300 };
+        let timeout_duration = Duration::from_secs(timeout_secs);
         
         match tokio::time::timeout(timeout_duration, run_ingest(store, channel, limit)).await {
             Ok(_) => {
@@ -56,9 +57,11 @@ async fn run_ingest(store: AssetStore, channel: String, limit: u32) {
         return;
     }
 
-    // Translate post-count into Telegram preview pages. ~16 posts
-    // per page; round up and add a little padding.
-    let max_pages = ((limit as usize / 16) + 2).max(2);
+    // Translate desired video-count into Telegram preview pages.
+    // Some posts on the list page don't expose a direct `<video src=...>`
+    // (albums/grouped). We compensate by scanning more pages and then
+    // enriching missing video URLs via `?single`.
+    let max_pages = ((limit as usize / 6) + 10).max(8);
     info!(
         channel = %channel,
         limit,
@@ -81,11 +84,11 @@ async fn run_ingest(store: AssetStore, channel: String, limit: u32) {
         }
     };
 
-    // Newest-first, then keep only `limit` posts.
+    // Newest-first. We will enrich missing video URLs and then keep the
+    // newest `limit` posts that actually have a downloadable video URL.
     let mut posts = posts;
     posts.sort_by(|a, b| b.id.cmp(&a.id));
-    posts.truncate(limit as usize);
-    info!("After sorting and truncating: {} posts", posts.len());
+    info!("After sorting: {} posts (pre-enrich)", posts.len());
 
     // Create thumbs directory upfront
     let thumbs_dir = clips_dir.join("thumbs");
@@ -100,6 +103,52 @@ async fn run_ingest(store: AssetStore, channel: String, limit: u32) {
             None
         }
     };
+
+    // Walk newest posts: enrich missing CDN URLs via `?single` until we have
+    // `limit` posts with a plain HTTP(S) video link (not stream/blob embed).
+    let target = limit as usize;
+    let enrich_scan = target.saturating_mul(25).min(posts.len());
+    let mut selected: Vec<memstroy_tg::TgPost> = Vec::with_capacity(target);
+
+    if let Some(ref http_client) = client {
+        for post in posts.iter_mut().take(enrich_scan) {
+            if selected.len() >= target {
+                break;
+            }
+            if post.downloadable_video().is_none() {
+                if let Err(e) = memstroy_tg::enrich_post_videos(http_client, post).await {
+                    warn!(id = post.id, error = %e, "enrich_post_videos failed");
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            if post.downloadable_video().is_some() {
+                selected.push(post.clone());
+            }
+        }
+    } else {
+        selected = posts
+            .iter()
+            .filter(|p| p.downloadable_video().is_some())
+            .take(target)
+            .cloned()
+            .collect();
+    }
+
+    if selected.len() < target {
+        warn!(
+            found = selected.len(),
+            wanted = target,
+            scanned = enrich_scan,
+            "fewer posts with downloadable video than limit"
+        );
+    }
+
+    posts = selected;
+    info!(
+        "After enrich+filter: {} posts with downloadable video (limit={})",
+        posts.len(),
+        limit
+    );
 
     // Download videos and create metadata sequentially (one by one)
     // This ensures atomic operations: if disk fills up, we have complete clips with metadata
@@ -117,7 +166,7 @@ async fn run_ingest(store: AssetStore, channel: String, limit: u32) {
         info!("Processing clip {}/{}: id={}", idx + 1, posts.len(), post.id);
         
         // Step 1: Download video if it has a URL and doesn't exist
-        let video_downloaded = if let Some(_video_url) = post.primary_video() {
+        let video_downloaded = if let Some(_video_url) = post.downloadable_video() {
             if video_path.exists() {
                 info!("Video already exists for {}, skipping download", stem);
                 skipped += 1;
