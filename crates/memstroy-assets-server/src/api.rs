@@ -37,6 +37,7 @@ pub fn router(store: AssetStore) -> Router {
     Router::new()
         .route("/api/health", get(health))
         .route("/api/test-metadata", post(test_metadata))
+        .route("/api/cleanup", post(cleanup_old_files))
         .route("/api/assets", get(list_assets))
         .route("/api/assets/:id", get(get_asset))
         .route("/api/assets/:id/preview", get(get_preview))
@@ -340,6 +341,73 @@ async fn test_metadata(State(store): State<AssetStore>) -> Result<Json<serde_jso
         })))
     }
 }
+
+// Manual cleanup endpoint to delete all clips and free disk space
+async fn cleanup_old_files(State(store): State<AssetStore>) -> Result<Json<serde_json::Value>, ApiError> {
+    let root = store.root();
+    let clips_dir = root.join("clips");
+    let thumbs_dir = clips_dir.join("thumbs");
+    
+    let mut deleted_files = 0u64;
+    let mut freed_bytes = 0u64;
+    
+    // Delete all files in clips/ directory
+    if clips_dir.exists() {
+        let mut entries = tokio::fs::read_dir(&clips_dir).await.map_err(|e| {
+            ApiError::BadRequest(format!("Failed to read clips directory: {}", e).into())
+        })?;
+        
+        while let Some(entry) = entries.next_entry().await.map_err(|e| {
+            ApiError::BadRequest(format!("Failed to read directory entry: {}", e).into())
+        })? {
+            let path = entry.path();
+            if path.is_file() {
+                if let Ok(metadata) = tokio::fs::metadata(&path).await {
+                    freed_bytes += metadata.len();
+                }
+                if let Err(e) = tokio::fs::remove_file(&path).await {
+                    warn!(path = %path.display(), error = %e, "failed to delete file");
+                } else {
+                    deleted_files += 1;
+                }
+            }
+        }
+    }
+    
+    // Delete all thumbnails
+    if thumbs_dir.exists() {
+        let mut entries = tokio::fs::read_dir(&thumbs_dir).await.map_err(|e| {
+            ApiError::BadRequest(format!("Failed to read thumbs directory: {}", e).into())
+        })?;
+        
+        while let Some(entry) = entries.next_entry().await.map_err(|e| {
+            ApiError::BadRequest(format!("Failed to read directory entry: {}", e).into())
+        })? {
+            let path = entry.path();
+            if path.is_file() {
+                if let Ok(metadata) = tokio::fs::metadata(&path).await {
+                    freed_bytes += metadata.len();
+                }
+                if let Err(e) = tokio::fs::remove_file(&path).await {
+                    warn!(path = %path.display(), error = %e, "failed to delete thumbnail");
+                } else {
+                    deleted_files += 1;
+                }
+            }
+        }
+    }
+    
+    // Reindex after cleanup
+    let _ = store.index_dir(&root);
+    
+    Ok(Json(json!({
+        "success": true,
+        "deleted_files": deleted_files,
+        "freed_bytes": freed_bytes,
+        "freed_mb": freed_bytes / 1024 / 1024,
+    })))
+}
+
 
 // ---------------------------------------------------------------------------
 // Errors

@@ -14,10 +14,18 @@ description = "egui/eframe editor for Memstroy-inator scenes"
 build = "build.rs"
 
 [features]
-# Default features intentionally empty: client and dev builds share
-# the same default surface. The `obfuscate-server-url` feature is an
-# explicit opt-in (see below).
-default = []
+# Default: enable local-server for development. Client builds (via
+# `scripts/package-client.ps1`) explicitly pass `--no-default-features`
+# to exclude the heavy `memstroy-assets-server` dependency tree.
+default = ["local-server"]
+
+# Enable local assets-server bootstrap for development. Client builds
+# (via `scripts/package-client.ps1`) do NOT enable this feature, so
+# the heavy `memstroy-assets-server` dependency (and its transitive
+# deps like `axum`, `tower-http`, `scraper` via `memstroy-tg`) are
+# excluded from the client binary entirely. This cuts build time and
+# binary size for shipped artefacts.
+local-server = ["dep:memstroy-assets-server"]
 
 # Wrap the compile-time-baked assets-server URL through `obfstr` so
 # its bytes are XOR-encoded in the .rdata segment instead of sitting
@@ -50,7 +58,7 @@ image = { workspace = true }
 chrono = { workspace = true }
 memstroy-core = { workspace = true }
 memstroy-render = { workspace = true }
-memstroy-assets-server = { workspace = true }
+memstroy-assets-server = { workspace = true, optional = true }
 wgpu = { workspace = true }
 rodio = { workspace = true }
 # HTTP client for the shared asset server. Keep the same TLS backend
