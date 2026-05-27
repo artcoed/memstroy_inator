@@ -9,7 +9,7 @@
 
 [build]
 builder = "nixpacks"
-buildCommand = "cargo build --release --bin memstroy-assets-server"
+buildCommand = "cargo build --release -p memstroy-assets-server"
 
 [deploy]
 startCommand = "./target/release/memstroy-assets-server --root /data/assets"
