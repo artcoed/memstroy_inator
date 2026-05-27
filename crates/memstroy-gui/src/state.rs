@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use memstroy_core::Scene;
+use tracing::info;
 
 use crate::undo::UndoStack;
 
@@ -1113,7 +1114,9 @@ impl EditorState {
     }
 
     pub fn clips_dir(&self) -> PathBuf {
-        self.assets_root.join("assets").join("mellstroy")
+        // Match server's expected structure: <root>/clips
+        // Server expects clips in <root>/clips, not <root>/assets/mellstroy
+        self.assets_root.join("clips")
     }
 
     /// Path to a sidecar state file for the clips directory. Reserved
@@ -1880,82 +1883,20 @@ impl EditorState {
             let _ = std::fs::create_dir_all(&dir);
         }
 
-        // Local clip pool — we no longer carry a Telegram-side
-        // `DownloadState` sidecar in the GUI (TG is the server's job).
-        // Just enumerate `*.mp4` files in the clips dir and pair them
-        // with thumbnails, when present, in the `thumbs/` subfolder.
+        // Load clips based on metadata presence (txt or thumbnail),
+        // not on mp4 presence. This allows server-only clips to appear
+        // in the library immediately after metadata is downloaded.
         let clips_dir = self.clips_dir();
         let thumbs_dir = clips_dir.join("thumbs");
+        info!("reload_library: clips_dir = {}", clips_dir.display());
+        info!("reload_library: thumbs_dir = {}", thumbs_dir.display());
+        info!("reload_library: clips_dir exists = {}", clips_dir.exists());
+        info!("reload_library: thumbs_dir exists = {}", thumbs_dir.exists());
+        
         let mut clips: Vec<LibraryClip> = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(&clips_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if !path.is_file() { continue; }
-                let ext = path
-                    .extension()
-                    .and_then(|s| s.to_str())
-                    .map(str::to_ascii_lowercase)
-                    .unwrap_or_default();
-                if ext != "mp4" { continue; }
-                let stem = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("clip")
-                    .to_string();
-                // Preserve the existing `id: u64` shape so the rest of
-                // the GUI keeps treating clips as numeric ids; non-numeric
-                // filenames hash to a derived id so the row still
-                // displays.
-                let id: u64 = stem
-                    .parse::<u64>()
-                    .unwrap_or_else(|_| {
-                        use std::collections::hash_map::DefaultHasher;
-                        use std::hash::{Hash, Hasher};
-                        let mut h = DefaultHasher::new();
-                        stem.hash(&mut h);
-                        h.finish()
-                    });
-                let thumb_jpg = thumbs_dir.join(format!("{}.jpg", stem));
-                let thumb_png = thumbs_dir.join(format!("{}.png", stem));
-                let thumbnail = if thumb_jpg.exists() {
-                    Some(thumb_jpg)
-                } else if thumb_png.exists() {
-                    Some(thumb_png)
-                } else {
-                    None
-                };
-                // Pick up the description sidecar (`<stem>.txt`) if it
-                // exists. It's written by the assets-server during TG
-                // ingest and mirrored locally by `jobs::spawn_refresh`,
-                // so each clip card can show the original Telegram
-                // caption rather than the bare numeric id.
-                let txt_path = clips_dir.join(format!("{}.txt", stem));
-                let description = match std::fs::read_to_string(&txt_path) {
-                    Ok(s) => s.trim().to_string(),
-                    Err(_) => String::new(),
-                };
-                clips.push(LibraryClip {
-                    id,
-                    path: path.clone(),
-                    description,
-                    downloaded: true,
-                    thumbnail,
-                    // Local clip — server_id is the file stem so the
-                    // GUI can match server listings to local entries
-                    // for de-duplication during refresh.
-                    server_id: Some(stem.clone()),
-                });
-            }
-        }
-
-        // ── Server-only clips (lazy download) ──
-        //
-        // Find `.txt` sidecars in clips_dir that don't have a
-        // corresponding `.mp4` — these are server-side clips whose
-        // metadata + thumbnail are mirrored locally but the body
-        // hasn't been downloaded yet. They render as "stubs" in the
-        // library; dragging one onto canvas/timeline triggers a
-        // background download via the lazy-download path.
+        let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        
+        // First pass: scan for txt files (metadata)
         if let Ok(entries) = std::fs::read_dir(&clips_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -1966,18 +1907,19 @@ impl EditorState {
                     .map(str::to_ascii_lowercase)
                     .unwrap_or_default();
                 if ext != "txt" { continue; }
+                
                 let stem = path
                     .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("")
                     .to_string();
                 if stem.is_empty() { continue; }
-                let mp4_path = clips_dir.join(format!("{}.mp4", stem));
-                if mp4_path.exists() { continue; } // already a downloaded clip
-                // Skip if we already added this clip via the mp4 pass
-                if clips.iter().any(|c| c.server_id.as_deref() == Some(stem.as_str())) {
+                
+                // Skip if already processed
+                if !seen_ids.insert(stem.clone()) {
                     continue;
                 }
+                
                 let id: u64 = stem.parse::<u64>().unwrap_or_else(|_| {
                     use std::collections::hash_map::DefaultHasher;
                     use std::hash::{Hash, Hasher};
@@ -1985,9 +1927,14 @@ impl EditorState {
                     stem.hash(&mut h);
                     h.finish()
                 });
+                
+                let mp4_path = clips_dir.join(format!("{}.mp4", stem));
+                let downloaded = mp4_path.exists();
+                
                 let description = std::fs::read_to_string(&path)
                     .map(|s| s.trim().to_string())
                     .unwrap_or_default();
+                
                 let thumb_jpg = thumbs_dir.join(format!("{}.jpg", stem));
                 let thumb_png = thumbs_dir.join(format!("{}.png", stem));
                 let thumbnail = if thumb_jpg.exists() {
@@ -1997,16 +1944,141 @@ impl EditorState {
                 } else {
                     None
                 };
+                
+                info!(
+                    "Loaded clip from txt: id={}, stem={}, downloaded={}, has_thumb={}, desc_len={}",
+                    id, stem, downloaded, thumbnail.is_some(), description.len()
+                );
+                
                 clips.push(LibraryClip {
                     id,
-                    path: mp4_path,  // path where the .mp4 will be written on download
+                    path: mp4_path,
                     description,
-                    downloaded: false,
+                    downloaded,
                     thumbnail,
                     server_id: Some(stem),
                 });
             }
         }
+        
+        // Second pass: scan for thumbnails without txt files
+        if let Ok(entries) = std::fs::read_dir(&thumbs_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_file() { continue; }
+                let ext = path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .map(str::to_ascii_lowercase)
+                    .unwrap_or_default();
+                if ext != "jpg" && ext != "png" { continue; }
+                
+                let stem = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                if stem.is_empty() { continue; }
+                
+                // Skip if already processed from txt
+                if !seen_ids.insert(stem.clone()) {
+                    continue;
+                }
+                
+                let id: u64 = stem.parse::<u64>().unwrap_or_else(|_| {
+                    use std::collections::hash_map::DefaultHasher;
+                    use std::hash::{Hash, Hasher};
+                    let mut h = DefaultHasher::new();
+                    stem.hash(&mut h);
+                    h.finish()
+                });
+                
+                let mp4_path = clips_dir.join(format!("{}.mp4", stem));
+                let downloaded = mp4_path.exists();
+                
+                let txt_path = clips_dir.join(format!("{}.txt", stem));
+                let description = std::fs::read_to_string(&txt_path)
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_default();
+                
+                info!(
+                    "Loaded clip from thumbnail: id={}, stem={}, downloaded={}, desc_len={}",
+                    id, stem, downloaded, description.len()
+                );
+                
+                clips.push(LibraryClip {
+                    id,
+                    path: mp4_path,
+                    description,
+                    downloaded,
+                    thumbnail: Some(path),
+                    server_id: Some(stem),
+                });
+            }
+        }
+        
+        // Third pass: scan for mp4 files without metadata (legacy clips)
+        if let Ok(entries) = std::fs::read_dir(&clips_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_file() { continue; }
+                let ext = path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .map(str::to_ascii_lowercase)
+                    .unwrap_or_default();
+                if ext != "mp4" { continue; }
+                
+                let stem = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("clip")
+                    .to_string();
+                
+                // Skip if already processed
+                if !seen_ids.insert(stem.clone()) {
+                    continue;
+                }
+                
+                let id: u64 = stem.parse::<u64>().unwrap_or_else(|_| {
+                    use std::collections::hash_map::DefaultHasher;
+                    use std::hash::{Hash, Hasher};
+                    let mut h = DefaultHasher::new();
+                    stem.hash(&mut h);
+                    h.finish()
+                });
+                
+                let thumb_jpg = thumbs_dir.join(format!("{}.jpg", stem));
+                let thumb_png = thumbs_dir.join(format!("{}.png", stem));
+                let thumbnail = if thumb_jpg.exists() {
+                    Some(thumb_jpg)
+                } else if thumb_png.exists() {
+                    Some(thumb_png)
+                } else {
+                    None
+                };
+                
+                let txt_path = clips_dir.join(format!("{}.txt", stem));
+                let description = std::fs::read_to_string(&txt_path)
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_default();
+                
+                info!(
+                    "Loaded legacy clip from mp4: id={}, stem={}, has_thumb={}, desc_len={}",
+                    id, stem, thumbnail.is_some(), description.len()
+                );
+                
+                clips.push(LibraryClip {
+                    id,
+                    path: path.clone(),
+                    description,
+                    downloaded: true,
+                    thumbnail,
+                    server_id: Some(stem),
+                });
+            }
+        }
+
         clips.sort_by_key(|c| c.id);
         
         // Log clip counts for debugging

@@ -81,7 +81,17 @@ async fn main() -> Result<()> {
     );
 
     let handle = start(addr, store);
-    handle.await.context("server task crashed")?;
+    
+    // Wait for Ctrl+C signal
+    tokio::select! {
+        result = handle => {
+            result.context("server task crashed")?;
+        }
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("Received shutdown signal, exiting...");
+        }
+    }
+    
     Ok(())
 }
 

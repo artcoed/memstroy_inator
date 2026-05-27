@@ -609,6 +609,13 @@ pub struct Actor {
     /// absolute scene coordinates (the default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
+    /// **Mute embedded audio**: when true, the actor's embedded audio
+    /// stream (if any) is NOT automatically mixed into the output.
+    /// Defaults to `false` (audio plays). Set to `true` when the user
+    /// explicitly removes the auto-generated audio track or wants to
+    /// silence this actor's soundtrack without deleting the video.
+    #[serde(default)]
+    pub mute_audio: bool,
 }
 
 fn default_true() -> bool { true }
@@ -1315,6 +1322,11 @@ pub struct AudioTrack {
     /// Mute the track without removing it. Survives save/load.
     #[serde(default)]
     pub mute: bool,
+    /// Mark the track as deleted (hidden from UI but kept in the array
+    /// to prevent index shifts). When true, the track is skipped in
+    /// rendering and hidden from the timeline/inspector.
+    #[serde(default)]
+    pub deleted: bool,
     /// Reverb mix (0..1). Implemented as a small comb-filter feedback
     /// echo in the engine — gives a quick "room" feel without the cost
     /// of a real convolution reverb.
@@ -1383,6 +1395,7 @@ impl Default for AudioTrack {
             fade_in: 0.0,
             fade_out: 0.0,
             mute: false,
+            deleted: false,
             reverb: 0.0,
             parent_actor: None,
             volume_kfs: Vec::new(),

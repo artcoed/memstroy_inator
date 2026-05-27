@@ -198,6 +198,7 @@ fn execute_line(line: &str, scene: &mut Scene, messages: &mut Vec<String>) -> Re
                 animated_params: Default::default(),
                 z_order: 0,
                 parent_id: None,
+                mute_audio: false,
             };
             scene.actors.push(actor);
         }
