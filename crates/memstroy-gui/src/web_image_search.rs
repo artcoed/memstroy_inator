@@ -185,21 +185,29 @@ pub fn show_window(
 ) {
     let mut open = state.web_image_search_open;
     let window_id = egui::Id::new("web_image_search_window");
-    if let Some(rect) = ctx.memory(|m| m.area_rect(window_id)) {
-        let sz = rect.size();
+    
+    // Capture the current window size BEFORE showing it, so we can
+    // lock it to prevent auto-expansion from child widgets.
+    let current_size = ctx.memory(|m| {
+        m.area_rect(window_id).map(|r| r.size())
+    });
+    
+    // Update saved size only if it's a valid user-resized dimension
+    if let Some(sz) = current_size {
         if sz.x >= 300.0 && sz.y >= 280.0 {
             state.web_image_search.panel_size = Some(sz);
         }
     }
-    let default_sz = state
+    
+    let window_size = state
         .web_image_search
         .panel_size
         .unwrap_or(egui::vec2(560.0, 640.0));
 
-    egui::Window::new(format!("\u{1F310} {}", crate::i18n::t("Web Image Search")))
+    let mut window = egui::Window::new(format!("\u{1F310} {}", crate::i18n::t("Web Image Search")))
         .id(window_id)
         .open(&mut open)
-        .default_size(default_sz)
+        .default_size(window_size)
         .min_width(300.0)
         .max_width(1200.0)
         .min_height(280.0)
@@ -207,16 +215,26 @@ pub fn show_window(
         .resizable([true, true])
         .collapsible(true)
         .scroll(false)
-        .show(ctx, |ui| {
+        .auto_sized(); // Prevent auto-sizing based on content
+    
+    // Preserve window position if it exists
+    if let Some(pos) = ctx.memory(|m| m.area_rect(window_id).map(|r| r.left_top())) {
+        window = window.current_pos(pos);
+    }
+    
+    window.show(ctx, |ui| {
             // Get the actual window content width from the clip rect,
             // which reflects the real allocated space for this window.
             // This prevents the content from expanding beyond the window
             // boundaries during text input or layout changes.
             let body_w = ui.clip_rect().width() - ui.spacing().window_margin.sum().x;
             
-            // Hard-clamp the content width to prevent expansion
+            // Hard-clamp the content width to prevent expansion.
+            // We use a fixed-size container that clips overflow to prevent
+            // any child widget (especially TextEdit) from pushing the window wider.
             ui.set_max_width(body_w);
             ui.set_width(body_w);
+            ui.set_clip_rect(ui.clip_rect()); // Enforce clipping
 
             // Claim the full window body for pointer hits so clicks on
             // padding / gaps between widgets don't fall through to the
@@ -243,10 +261,16 @@ fn window_body(
 
     // ── Search bar ─────────────────────────────────────────────────
     ui.horizontal(|ui| {
+        // Clamp the horizontal layout to prevent expansion
+        ui.set_max_width(body_w);
+        ui.set_width(body_w);
+        
+        let text_width = (body_w - 110.0).max(80.0).min(body_w - 110.0);
         let resp = ui.add(
             egui::TextEdit::singleline(&mut state.web_image_search.query)
                 .hint_text(t("Search images..."))
-                .desired_width((body_w - 110.0).max(80.0)),
+                .desired_width(text_width)
+                .clip_text(true), // Clip text that overflows
         );
         let enter = resp.lost_focus()
             && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -274,6 +298,8 @@ fn window_body(
         // Error state — show prominently with a retry button
         ui.add_space(4.0);
         ui.horizontal(|ui| {
+            ui.set_max_width(body_w);
+            ui.set_width(body_w);
             ui.label(
                 RichText::new(status.as_str())
                     .size(12.0)
@@ -283,6 +309,8 @@ fn window_body(
         });
         ui.add_space(4.0);
         ui.horizontal(|ui| {
+            ui.set_max_width(body_w);
+            ui.set_width(body_w);
             if ui.button(format!("\u{1F504} {}", t("Retry"))).clicked() {
                 kick_search(state, tx, /*append=*/ false);
             }

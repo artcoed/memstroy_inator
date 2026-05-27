@@ -9,6 +9,17 @@ members = [
     "crates/memstroy-gui",
     "crates/memstroy-assets-server",
 ]
+# По умолчанию собираем всё кроме сервера (сервер только на Railway).
+# GUI собирается с feature "local-server" для dev-режима, но клиентские
+# сборки (scripts/package-client.ps1) явно отключают эту фичу.
+default-members = [
+    "crates/memstroy-core",
+    "crates/memstroy-tg",
+    "crates/memstroy-vision",
+    "crates/memstroy-render",
+    "crates/memstroy-cli",
+    "crates/memstroy-gui",
+]
 
 [workspace.package]
 version = "0.1.0"
