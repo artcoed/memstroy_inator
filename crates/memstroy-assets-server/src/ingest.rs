@@ -192,7 +192,11 @@ async fn run_ingest(store: AssetStore, channel: String, limit: u32) {
         Err(e) => warn!(error = %e, "download_videos failed"),
     }
 
+    // Reindex after video downloads complete so clips appear with metadata
+    info!("Reindexing store after ingest...");
     if let Err(e) = store.index_dir(&root) {
         warn!(error = %e, "post-ingest reindex failed");
+    } else {
+        info!("Store reindexed successfully");
     }
 }

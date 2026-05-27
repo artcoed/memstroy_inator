@@ -80,6 +80,7 @@ pub fn parse_posts(html: &str) -> Vec<TgPost> {
         for v in node.select(&video_sel) {
             if let Some(src) = v.value().attr("src") {
                 videos.push(src.to_string());
+                eprintln!("Found video src: {}", src);
             }
         }
         
@@ -87,15 +88,19 @@ pub fn parse_posts(html: &str) -> Vec<TgPost> {
         // Telegram sometimes embeds video URLs in data attributes or as background thumbnails
         let video_player_sel = Selector::parse(".tgme_widget_message_video_player").unwrap();
         for player in node.select(&video_player_sel) {
+            eprintln!("Found video player element for post {}", id);
             // The href points to the post, not the video
             // But we can extract video from nested video tags
             let nested_video_sel = Selector::parse("video").unwrap();
             for v in player.select(&nested_video_sel) {
                 if let Some(src) = v.value().attr("src") {
                     videos.push(src.to_string());
+                    eprintln!("Found nested video src: {}", src);
                 }
             }
         }
+        
+        eprintln!("Post {} has {} videos", id, videos.len());
         
         // De-duplicate while preserving order.
         let mut seen = std::collections::HashSet::new();
