@@ -1,6 +1,8 @@
 [phases.setup]
 # Ensure ffmpeg is available in Railway/Nixpacks runtime.
-nixPkgs = ["ffmpeg"]
+# Defining a custom setup phase disables some auto-detection, so we
+# explicitly include the Rust toolchain too.
+nixPkgs = ["cargo", "rustc", "ffmpeg"]
 
 [phases.build]
 cmds = ["cargo build --release -p memstroy-assets-server"]
