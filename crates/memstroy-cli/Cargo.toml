@@ -11,6 +11,16 @@ description = "CLI for Memstroy-inator"
 name = "memstroy"
 path = "src/main.rs"
 
+[features]
+# Default: include Telegram scraping functionality for full CLI experience.
+# Client builds can disable this with --no-default-features to exclude
+# heavy dependencies (scraper, reqwest with rustls, etc.).
+default = ["telegram"]
+
+# Enable Telegram channel scraping via the `download` subcommand.
+# Pulls in memstroy-tg and its heavy dependency tree (scraper, reqwest).
+telegram = ["dep:memstroy-tg"]
+
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
@@ -21,6 +31,6 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 chrono = { workspace = true }
 memstroy-core = { workspace = true }
-memstroy-tg = { workspace = true }
+memstroy-tg = { workspace = true, optional = true }
 memstroy-render = { workspace = true }
 memstroy-vision = { workspace = true }
