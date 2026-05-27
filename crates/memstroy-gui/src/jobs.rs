@@ -362,12 +362,12 @@ pub fn spawn_refresh(
             }
 
             let safe_id = sanitise_id(&item.id);
-            let mp4_path = clips_dir.join(format!("{}.mp4", safe_id));
             let txt_path = clips_dir.join(format!("{}.txt", safe_id));
             let thumb_jpg = thumbs_dir.join(format!("{}.jpg", safe_id));
 
-            // Skip if already downloaded locally (both metadata and video)
-            if mp4_path.exists() && txt_path.exists() {
+            // Skip if metadata already downloaded locally
+            // We only download metadata (txt + thumbnail), not the video itself
+            if txt_path.exists() && thumb_jpg.exists() {
                 downloaded_ids.insert(item.id.clone());
                 new_count += 1;
                 continue;
@@ -382,7 +382,10 @@ pub fn spawn_refresh(
 
             // Download description sidecar (always, even if video exists)
             if !item.description.is_empty() && !txt_path.exists() {
-                let _ = tokio::fs::write(&txt_path, item.description.as_bytes()).await;
+                match tokio::fs::write(&txt_path, item.description.as_bytes()).await {
+                    Ok(_) => info!("Wrote description for {}", safe_id),
+                    Err(e) => warn!("Failed to write description for {}: {}", safe_id, e),
+                }
             }
 
             // Download thumbnail (always, even if video exists)
@@ -391,7 +394,10 @@ pub fn spawn_refresh(
                     "{}/api/assets/{}/preview",
                     server, item.id
                 );
-                let _ = download_file(&client, &thumb_url, &thumb_jpg).await;
+                match download_file(&client, &thumb_url, &thumb_jpg).await {
+                    Ok(_) => info!("Downloaded thumbnail for {}", safe_id),
+                    Err(e) => warn!("Failed to download thumbnail for {}: {}", safe_id, e),
+                }
             }
 
             // Mark as "known" but not downloaded (video will be downloaded on first use)
