@@ -1857,6 +1857,68 @@ impl App {
         }
     }
 
+    /// Resolve the most likely actor owner for an audio row.
+    ///
+    /// Primary key is `parent_actor` when present. For unlinked rows we try:
+    /// 1) id convention `<actor_id>_audio`, then
+    /// 2) same source file + overlapping time window (best score).
+    fn infer_actor_for_audio_track(&self, audio_idx: usize) -> Option<usize> {
+        let Some(audio) = self.state.scene.audio.get(audio_idx) else { return None; };
+        if let Some(parent_id) = audio.parent_actor.as_deref() {
+            if let Some(ai) = self.state.scene.actors.iter().position(|a| a.id == parent_id) {
+                return Some(ai);
+            }
+        }
+
+        if let Some(actor_id) = audio.id.strip_suffix("_audio") {
+            if let Some(ai) = self
+                .state
+                .scene
+                .actors
+                .iter()
+                .position(|a| a.id == actor_id && a.source == audio.source)
+            {
+                return Some(ai);
+            }
+        }
+
+        let scene_end = self.state.scene.output.duration.max(audio.t_in);
+        let au_in = audio.t_in;
+        let au_out = audio.t_out.unwrap_or(scene_end);
+        let mut best: Option<(usize, f32)> = None;
+        for (ai, actor) in self.state.scene.actors.iter().enumerate() {
+            if actor.source != audio.source {
+                continue;
+            }
+            let a_in = actor.t_in.unwrap_or(0.0);
+            let a_out = actor.t_out.unwrap_or(scene_end);
+            if !(au_in < a_out && a_in < au_out) {
+                continue;
+            }
+            let score = (a_in - au_in).abs() + (actor.source_start - audio.source_start).abs();
+            match best {
+                Some((_, best_score)) if score >= best_score => {}
+                _ => best = Some((ai, score)),
+            }
+        }
+        best.map(|(ai, _)| ai)
+    }
+
+    /// Mark audio row as deleted and mute the corresponding actor's
+    /// embedded fallback audio (if we can resolve one).
+    fn mark_audio_track_deleted(&mut self, audio_idx: usize) {
+        if audio_idx >= self.state.scene.audio.len() || self.state.scene.audio[audio_idx].deleted {
+            return;
+        }
+        let actor_idx = self.infer_actor_for_audio_track(audio_idx);
+        self.state.scene.audio[audio_idx].deleted = true;
+        if let Some(ai) = actor_idx {
+            if let Some(actor) = self.state.scene.actors.get_mut(ai) {
+                actor.mute_audio = true;
+            }
+        }
+    }
+
     fn delete_selected(&mut self) {
         // ── Multi-select delete ──
         //
@@ -1986,14 +2048,7 @@ impl App {
                 if i >= self.state.scene.audio.len() {
                     continue;
                 }
-                // Mark as deleted instead of removing to prevent index shifts
-                self.state.scene.audio[i].deleted = true;
-                // Mark actor's embedded audio as muted if this track is bound to an actor
-                if let Some(parent_id) = &self.state.scene.audio[i].parent_actor {
-                    if let Some(actor) = self.state.scene.actors.iter_mut().find(|a| &a.id == parent_id) {
-                        actor.mute_audio = true;
-                    }
-                }
+                self.mark_audio_track_deleted(i);
             }
             for i in bg_idxs.into_iter().rev() {
                 if i >= self.state.scene.backgrounds.len() {
@@ -2094,15 +2149,9 @@ impl App {
                 }
                 // Mark as deleted instead of removing from array to prevent
                 // index shifts that cause other audio tracks to "jump" layers.
-                self.state.scene.audio[i].deleted = true;
-                // When removing an audio track that's bound to an actor,
-                // mark the actor's embedded audio as muted so the renderer
-                // doesn't auto-mix it back in.
-                if let Some(parent_id) = &self.state.scene.audio[i].parent_actor {
-                    if let Some(actor) = self.state.scene.actors.iter_mut().find(|a| &a.id == parent_id) {
-                        actor.mute_audio = true;
-                    }
-                }
+                // For unlinked rows we still try to infer the originating
+                // actor and mute its embedded fallback audio.
+                self.mark_audio_track_deleted(i);
                 // No need to remove from side-tables since we're not
                 // removing from the array — the track is just marked
                 // as deleted and will be hidden in the UI.
