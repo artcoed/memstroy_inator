@@ -111,7 +111,13 @@ impl App {
                 "client build: skipping in-process assets-server, using remote"
             );
         } else {
+            #[cfg(feature = "local-server")]
             Self::spawn_local_assets_server(rt.handle(), &state);
+            
+            #[cfg(not(feature = "local-server"))]
+            tracing::info!(
+                "local-server feature disabled: skipping in-process assets-server"
+            );
         }
 
         // Construct the audio engine and immediately apply the master
@@ -152,6 +158,11 @@ impl App {
     /// through to whatever (if anything) is already listening on that
     /// port, which keeps developer workflows where the server is run
     /// separately working unchanged.
+    ///
+    /// Only available when the `local-server` feature is enabled. Client
+    /// builds (via `scripts/package-client.ps1`) disable this feature to
+    /// avoid pulling in the heavy `memstroy-assets-server` dependency tree.
+    #[cfg(feature = "local-server")]
     fn spawn_local_assets_server(
         handle: &tokio::runtime::Handle,
         state: &EditorState,

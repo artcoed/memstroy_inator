@@ -1,12 +1,5 @@
-# Nixpacks build configuration for the memstroy-assets-server only.
-# We avoid building the GUI (massive native deps) and target only the
-# server binary so Railway builds stay fast.
-
-[phases.setup]
-nixPkgs = ["gcc", "rustup", "ffmpeg"]
-
 [phases.build]
 cmds = ["cargo build --release --bin memstroy-assets-server"]
 
 [start]
-cmd = "./target/release/memstroy-assets-server --root /data/assets"
+cmd = "./target/release/memstroy-assets-server --root ${ASSETS_ROOT:-/data/assets}"

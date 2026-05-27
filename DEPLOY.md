@@ -4,6 +4,21 @@ The shared assets server is a small axum-based HTTP service that serves
 clips / images / sounds / particles to any number of Memstroy editors.
 It's designed to run on a single host and stream assets on demand.
 
+## Build configuration
+
+The project uses **conditional compilation** to optimize build times:
+
+- **Local development** (`cargo build --release`): Builds GUI with embedded
+  local assets-server for convenience. This includes the full dependency tree.
+  
+- **Client distribution** (`scripts/package-client.ps1`): Builds GUI **without**
+  the assets-server dependency using `--no-default-features`. This excludes
+  heavy dependencies like `axum`, `tower-http`, and `scraper`, cutting build
+  time roughly in half and reducing binary size.
+  
+- **Railway deployment**: Only builds `memstroy-assets-server` binary via
+  `nixpacks.toml`, not the entire workspace.
+
 ## Quick start (Railway)
 
 1. **Create a new Railway project** linked to this repository.
@@ -14,11 +29,41 @@ It's designed to run on a single host and stream assets on demand.
 3. **Set environment variables** (Settings → Variables):
    - `RUST_LOG` = `info,memstroy_assets_server=info`
    - `ASSETS_ROOT` = `/data/assets` (already in railway.toml as default)
-4. Railway will build via the `nixpacks.toml` config:
-   - `cargo build --release --bin memstroy-assets-server`
+4. Railway will build via the `nixpacks.toml` config (in repo root):
+   - Build: `cargo build --release --bin memstroy-assets-server`
    - Start: `./target/release/memstroy-assets-server --root /data/assets`
+   - **Note**: Only the server binary is built on Railway, not the entire workspace
+   - **Auto-cleanup**: Server automatically deletes all old clips on startup to free disk space
 5. **Configure a public domain** (Settings → Networking → Generate domain)
    so the editor clients can reach the server.
+
+## Automatic cleanup on startup
+
+**IMPORTANT**: The server now automatically deletes all clips and thumbnails on every startup
+to free disk space. This is critical for Railway's 500MB disk limit.
+
+- On startup, all files in `/data/assets/clips/` and `/data/assets/clips/thumbs/` are deleted
+- This frees space for fresh ingests from Telegram
+- After cleanup, run a fresh ingest to populate with new clips
+
+## Manual cleanup endpoint
+
+If you need to free space without restarting:
+
+```bash
+curl -X POST https://your-app.up.railway.app/api/cleanup
+```
+
+Response:
+```json
+{
+  "success": true,
+  "deleted_files": 150,
+  "freed_bytes": 450000000,
+  "freed_mb": 429
+}
+```
+
 
 ## Endpoint summary
 

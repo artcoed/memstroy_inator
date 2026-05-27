@@ -64,6 +64,12 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("creating asset root {}", root.display()))?;
 
+    // Auto-cleanup on startup to free disk space (critical for 500MB Railway volume)
+    tracing::info!("Running startup cleanup to free disk space...");
+    if let Err(e) = cleanup_old_clips(&root).await {
+        tracing::warn!(error = %e, "startup cleanup failed, continuing anyway");
+    }
+
     let store = AssetStore::new();
     store.index_dir(&root)?;
 
@@ -102,4 +108,58 @@ fn init_tracing() {
         .with_env_filter(filter)
         .with_target(false)
         .try_init();
+}
+
+/// Delete all clips and their metadata to free disk space.
+/// This runs automatically on server startup to ensure we have space for new ingests.
+async fn cleanup_old_clips(root: &PathBuf) -> Result<()> {
+    let clips_dir = root.join("clips");
+    let thumbs_dir = clips_dir.join("thumbs");
+    
+    let mut deleted_files = 0u64;
+    let mut freed_bytes = 0u64;
+    
+    // Delete all files in clips/ directory
+    if clips_dir.exists() {
+        let mut entries = tokio::fs::read_dir(&clips_dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.is_file() {
+                if let Ok(metadata) = tokio::fs::metadata(&path).await {
+                    freed_bytes += metadata.len();
+                }
+                if let Err(e) = tokio::fs::remove_file(&path).await {
+                    tracing::warn!(path = %path.display(), error = %e, "failed to delete file");
+                } else {
+                    deleted_files += 1;
+                }
+            }
+        }
+    }
+    
+    // Delete all thumbnails
+    if thumbs_dir.exists() {
+        let mut entries = tokio::fs::read_dir(&thumbs_dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.is_file() {
+                if let Ok(metadata) = tokio::fs::metadata(&path).await {
+                    freed_bytes += metadata.len();
+                }
+                if let Err(e) = tokio::fs::remove_file(&path).await {
+                    tracing::warn!(path = %path.display(), error = %e, "failed to delete thumbnail");
+                } else {
+                    deleted_files += 1;
+                }
+            }
+        }
+    }
+    
+    tracing::info!(
+        deleted_files,
+        freed_mb = freed_bytes / 1024 / 1024,
+        "Startup cleanup complete"
+    );
+    
+    Ok(())
 }
