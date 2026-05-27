@@ -2008,6 +2008,17 @@ impl EditorState {
             }
         }
         clips.sort_by_key(|c| c.id);
+        
+        // Log clip counts for debugging
+        let downloaded_count = clips.iter().filter(|c| c.downloaded).count();
+        let server_only_count = clips.iter().filter(|c| !c.downloaded).count();
+        tracing::info!(
+            "Loaded {} clips ({} downloaded, {} server-only)",
+            clips.len(),
+            downloaded_count,
+            server_only_count
+        );
+        
         self.library.mellstroy_clips = clips;
 
         // Also rescan the user's sound / image / particle bundles so the
