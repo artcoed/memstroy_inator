@@ -232,13 +232,23 @@ pub fn show_window(
             window_body(ui, state, tx, body_w);
         });
     
-    // Only update saved size when user is actively resizing (dragging edges)
+    // Update saved size ONLY when the size actually changed.
+    // Window moves (dragging the title bar) also report as `dragged()`,
+    // so we must not treat every drag as a resize.
     if let Some(inner_response) = response {
         if inner_response.response.dragged() || inner_response.response.drag_stopped() {
             if let Some(new_rect) = ctx.memory(|m| m.area_rect(window_id)) {
                 let new_size = new_rect.size();
                 if new_size.x >= 300.0 && new_size.y >= 280.0 && new_size.x <= 1200.0 && new_size.y <= 1200.0 {
-                    state.web_image_search.panel_size = Some(new_size);
+                    let prev = state
+                        .web_image_search
+                        .panel_size
+                        .unwrap_or(egui::vec2(560.0, 640.0));
+                    let eps = 0.5_f32;
+                    let changed = (new_size.x - prev.x).abs() > eps || (new_size.y - prev.y).abs() > eps;
+                    if changed {
+                        state.web_image_search.panel_size = Some(new_size);
+                    }
                 }
             }
         }
