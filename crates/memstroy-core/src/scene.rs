@@ -259,6 +259,41 @@ fn migrate_overlay_layout_pos<F, G>(
     }
 }
 
+
+impl Scene {
+    pub fn element_parent_id(&self, element_id: &str) -> Option<&str> {
+        if let Some(actor) = self.actors.iter().find(|a| a.id == element_id) {
+            return actor.parent_id.as_deref();
+        }
+        self.overlays.iter().find_map(|ov| match ov {
+            Overlay::Text(o) if o.id == element_id => o.parent_id.as_deref(),
+            Overlay::Image(o) if o.id == element_id => o.parent_id.as_deref(),
+            Overlay::Video(o) if o.id == element_id => o.parent_id.as_deref(),
+            _ => None,
+        })
+    }
+
+    pub fn set_element_parent_id(&mut self, element_id: &str, parent_id: Option<String>) -> bool {
+        if let Some(actor) = self.actors.iter_mut().find(|a| a.id == element_id) {
+            actor.parent_id = parent_id;
+            return true;
+        }
+        if let Some(overlay) = self.overlays.iter_mut().find(|ov| match ov {
+            Overlay::Text(o) => o.id == element_id,
+            Overlay::Image(o) => o.id == element_id,
+            Overlay::Video(o) => o.id == element_id,
+        }) {
+            match overlay {
+                Overlay::Text(o) => o.parent_id = parent_id,
+                Overlay::Image(o) => o.parent_id = parent_id,
+                Overlay::Video(o) => o.parent_id = parent_id,
+            }
+            return true;
+        }
+        false
+    }
+}
+
 impl Scene {
     /// Inspect every actor / overlay layout and back-fill its
     /// `animated_params` set so that any parameter that actually varies
