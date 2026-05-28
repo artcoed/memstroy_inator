@@ -515,15 +515,67 @@ pub async fn download_file(
         .await
         .map_err(|e| format!("network error: {e}"))?;
     if !resp.status().is_success() {
-        return Err(format!("HTTP {}", resp.status()));
+        let status = resp.status();
+        let ct = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("unknown")
+            .to_string();
+        let body = resp.text().await.unwrap_or_default();
+        let snippet: String = body.chars().take(200).collect();
+        return Err(format!("HTTP {status} (content-type={ct}): {snippet}"));
     }
+    let ct = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown")
+        .to_string();
+    let content_len = resp
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
+    if ct.starts_with("text/") {
+        let body = resp.text().await.unwrap_or_default();
+        let snippet: String = body.chars().take(200).collect();
+        return Err(format!("unexpected content-type={ct}: {snippet}"));
+    }
+
     let bytes = resp
         .bytes()
         .await
         .map_err(|e| format!("read error: {e}"))?;
-    tokio::fs::write(target, &bytes)
+    if let Some(cl) = content_len {
+        if cl != bytes.len() as u64 {
+            return Err(format!(
+                "incomplete download: content-length={cl} got={}",
+                bytes.len()
+            ));
+        }
+    }
+    if bytes.len() <= 4096 {
+        // Guard against HTML/error pages or truncated bodies saved as `.mp4`.
+        // The GUI's `is_usable_local_video` uses the same 4KB threshold.
+        return Err(format!(
+            "download too small: {} bytes (content-type={ct})",
+            bytes.len()
+        ));
+    }
+
+    // Atomic write: write to a temp file then rename. Prevents the GUI from
+    // seeing a partially-written file as the final target.
+    let tmp = target.with_extension("partial");
+    if let Some(parent) = tmp.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
+    tokio::fs::write(&tmp, &bytes)
         .await
-        .map_err(|e| format!("write error: {e}"))
+        .map_err(|e| format!("write error: {e}"))?;
+    tokio::fs::rename(&tmp, target)
+        .await
+        .map_err(|e| format!("rename error: {e}"))
 }
 
 /// Strip characters that aren't safe in filenames (defence-in-depth —

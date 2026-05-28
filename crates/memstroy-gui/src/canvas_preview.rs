@@ -3077,6 +3077,11 @@ fn get_element_world_pos(
                 x: actor_state.pos[0] * world_w,
                 y: actor_state.pos[1] * world_h,
             }
+        } else if let Some(ov_state) = overlay_state_at_scene_time(state, element_id, sample_t) {
+            WorldPos {
+                x: ov_state.pos[0] * world_w,
+                y: ov_state.pos[1] * world_h,
+            }
         } else {
             WorldPos {
                 x: world_w * 0.5,
@@ -3108,6 +3113,38 @@ fn get_element_world_pos(
     }
 
     base_pos
+}
+
+
+/// Sample an overlay's layout at scene time `t` (clip-local keyframes).
+fn overlay_state_at_scene_time(
+    state: &EditorState,
+    element_id: &str,
+    scene_t: f32,
+) -> Option<OverlayState> {
+    state.scene.overlays.iter().find_map(|ov| {
+        let (t_in, t_out, layout) = match ov {
+            Overlay::Text(txt) => (txt.t_in, txt.t_out, &txt.layout),
+            Overlay::Image(img) => (img.t_in, img.t_out, &img.layout),
+            Overlay::Video(vid) => (vid.t_in, vid.t_out, &vid.layout),
+        };
+        let id = match ov {
+            Overlay::Text(txt) => &txt.id,
+            Overlay::Image(img) => &img.id,
+            Overlay::Video(vid) => &vid.id,
+        };
+        if id != element_id {
+            return None;
+        }
+        let local_t = if scene_t >= t_in && scene_t <= t_out {
+            scene_t - t_in
+        } else if scene_t < t_in {
+            0.0
+        } else {
+            t_out - t_in
+        };
+        Some(keyframe::sample(layout, local_t).unwrap_or_default())
+    })
 }
 
 /// While an animated param is dragged on canvas, layout sampling is frozen
@@ -4235,24 +4272,13 @@ fn current_selection_world_center(state: &EditorState) -> Option<[f32; 2]> {
             Some([wp.x, wp.y])
         }
         Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
-            let local_t = overlay_clip_local_time(state, idx);
-            let ov = &state.scene.overlays[idx];
-            let layout: &Vec<Keyframe<OverlayState>> = match ov {
-                Overlay::Text(t) => &t.layout,
-                Overlay::Image(im) => &im.layout,
-                Overlay::Video(v) => &v.layout,
+            let ov_id = match &state.scene.overlays[idx] {
+                Overlay::Text(t) => t.id.as_str(),
+                Overlay::Image(im) => im.id.as_str(),
+                Overlay::Video(v) => v.id.as_str(),
             };
-            let ov_state = keyframe::sample(layout, local_t).unwrap_or_default();
-            // Decoupled-from-rf world position (see comments on the
-            // matching maths in `draw_canvas_overlays` and
-            // `get_element_world_pos`).
-            let [rw, rh] = state.scene.render_frame.resolution;
-            let world_w = rw as f32;
-            let world_h = rh as f32;
-            Some([
-                ov_state.pos[0] * world_w,
-                ov_state.pos[1] * world_h,
-            ])
+            let wp = get_element_world_pos(state, ov_id, &[], t);
+            Some([wp.x, wp.y])
         }
         Selection::RenderFrame => {
             let rf_state = sample_render_frame(&state.scene.render_frame, t);
