@@ -2735,6 +2735,7 @@ impl App {
         crop_right(&mut right.pan_kfs, local_split);
         crop_right(&mut right.low_pass_kfs, local_split);
         crop_right(&mut right.high_pass_kfs, local_split);
+        crop_right(&mut right.reverb_kfs, local_split);
         // Resolve the audio's CURRENT lane. If no explicit assignment
         // exists (round-robin fallback was being used), compute what
         // lane the timeline draws this audio on RIGHT NOW so both
@@ -2763,6 +2764,7 @@ impl App {
             crop(&mut s.audio[i].pan_kfs, local_split_left);
             crop(&mut s.audio[i].low_pass_kfs, local_split_left);
             crop(&mut s.audio[i].high_pass_kfs, local_split_left);
+            crop(&mut s.audio[i].reverb_kfs, local_split_left);
             s.audio.insert(i + 1, right);
         });
         let pivot = i + 1;
