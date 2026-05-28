@@ -798,6 +798,10 @@ pub struct EditorState {
     /// while the path is listed here.
     pub pending_clip_downloads: std::collections::HashSet<std::path::PathBuf>,
 
+    /// Drops that arrived for a finished download but whose .mp4 isn't
+    /// yet readable (server-side processing, OneDrive sync, etc.).
+    pub deferred_clip_placements: Vec<(PathBuf, crate::jobs::ClipDropTarget, String, std::time::Instant)>,
+
     /// Debounced `reload_library` — set by background jobs, drained on
     /// the next UI frame so metadata sync does not freeze the editor.
     pub library_reload_pending: bool,
