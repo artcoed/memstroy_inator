@@ -507,41 +507,36 @@ impl App {
             Ok(path) => {
                 self.state.pending_clip_downloads.remove(&path);
                 self.schedule_library_reload();
-                if !EditorState::wait_usable_local_video(&path, 25) {
-                    let detail = if path.is_file() {
-                        std::fs::metadata(&path)
-                            .map(|m| format!("{} bytes", m.len()))
-                            .unwrap_or_else(|_| "size unknown".into())
-                    } else {
-                        "file missing".into()
-                    };
+
+                // Fast path: the file is already readable, place the
+                // actor immediately.
+                if EditorState::is_usable_local_video(&path) {
+                    self.place_drop_target(&path, drop_target);
+                    self.invalidate_preview_for_path(&path);
                     self.state.status = format!(
-                        "{} {} ({}): {}",
-                        crate::i18n::t("\u{274C} Clip download incomplete:"),
-                        server_id,
-                        detail,
-                        path.display()
+                        "{} {}",
+                        crate::i18n::t("\u{2B07} Clip downloaded:"),
+                        server_id
                     );
                     return;
                 }
-                use crate::jobs::ClipDropTarget;
-                match drop_target {
-                    ClipDropTarget::CanvasAt { world_x, world_y } => {
-                        crate::panels::add_actor_from_clip_at_canvas(
-                            &mut self.state,
-                            &path,
-                            [world_x, world_y],
-                        );
-                    }
-                    ClipDropTarget::TimelineAt { t } => {
-                        crate::panels::add_actor_from_clip_at_time(&mut self.state, &path, t);
-                    }
-                    ClipDropTarget::None => {}
-                }
-                self.invalidate_preview_for_path(&path);
+
+                // Slow path: the file exists but isn't yet usable.
+                // Don't block the UI thread — queue the drop for the
+                // next frame(s) to retry. flush_deferred_clip_placements
+                // will pick it up once is_usable_local_video flips to
+                // true (or drop it after the 10-second deadline).
+                let deadline = std::time::Instant::now()
+                    + std::time::Duration::from_secs(10);
+                self.state.deferred_clip_placements.push((
+                    path.clone(),
+                    drop_target,
+                    server_id.clone(),
+                    deadline,
+                ));
                 self.state.status = format!(
                     "{} {}",
-                    crate::i18n::t("\u{2B07} Clip downloaded:"),
+                    crate::i18n::t("\u{23F3} Waiting for clip to finalize:"),
                     server_id
                 );
             }
@@ -561,6 +556,76 @@ impl App {
                 );
             }
         }
+    }
+
+    /// Place a finished clip download according to its original drop
+    /// target. Shared between the immediate path and the deferred queue
+    /// retry.
+    fn place_drop_target(
+        &mut self,
+        path: &std::path::Path,
+        drop_target: crate::jobs::ClipDropTarget,
+    ) {
+        use crate::jobs::ClipDropTarget;
+        let pb = path.to_path_buf();
+        match drop_target {
+            ClipDropTarget::CanvasAt { world_x, world_y } => {
+                crate::panels::add_actor_from_clip_at_canvas(
+                    &mut self.state,
+                    &pb,
+                    [world_x, world_y],
+                );
+            }
+            ClipDropTarget::TimelineAt { t } => {
+                crate::panels::add_actor_from_clip_at_time(
+                    &mut self.state,
+                    &pb,
+                    t,
+                );
+            }
+            ClipDropTarget::None => {}
+        }
+    }
+
+    /// Retry any clip drops whose download finished but whose .mp4
+    /// wasn't readable yet on the frame the event arrived. Called once
+    /// per UI frame from `update()`.
+    fn flush_deferred_clip_placements(&mut self) {
+        if self.state.deferred_clip_placements.is_empty() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let pending = std::mem::take(&mut self.state.deferred_clip_placements);
+        let mut keep = Vec::with_capacity(pending.len());
+        for (path, drop_target, server_id, deadline) in pending {
+            if EditorState::is_usable_local_video(&path) {
+                self.place_drop_target(&path, drop_target);
+                self.invalidate_preview_for_path(&path);
+                self.state.status = format!(
+                    "{} {}",
+                    crate::i18n::t("\u{2B07} Clip downloaded:"),
+                    server_id
+                );
+            } else if now >= deadline {
+                let detail = if path.is_file() {
+                    std::fs::metadata(&path)
+                        .map(|m| format!("{} bytes", m.len()))
+                        .unwrap_or_else(|_| "size unknown".into())
+                } else {
+                    "file missing".into()
+                };
+                self.state.status = format!(
+                    "{} {} ({}): {}",
+                    crate::i18n::t("\u{274C} Clip download incomplete:"),
+                    server_id,
+                    detail,
+                    path.display()
+                );
+            } else {
+                keep.push((path, drop_target, server_id, deadline));
+            }
+        }
+        self.state.deferred_clip_placements = keep;
     }
 
     /// Reset preview caches for any layer using `path` and queue ffmpeg warmup.
@@ -3795,6 +3860,7 @@ impl eframe::App for App {
         }
 
         self.pump_events(ctx);
+        self.flush_deferred_clip_placements();
         self.flush_pending_library_reload();
         self.maybe_request_library_reload_repaint(ctx);
         self.poll_frame_extraction();
