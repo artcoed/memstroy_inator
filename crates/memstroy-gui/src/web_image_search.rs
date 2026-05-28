@@ -271,7 +271,9 @@ fn window_body(
         egui::vec2(body_w, 30.0),
         egui::Layout::left_to_right(egui::Align::Center),
         |ui| {
-            ui.set_max_width(body_w);
+            // Do NOT set_max_width(body_w) here — let the layout naturally constraint. 
+            // set_max_width in left_to_right layout with Align::Center can stretch the outer frame 
+            // when children change (like text edit focus outline or spinner appearing).
             
             let text_width = (body_w - 110.0).max(80.0);
             let resp = ui.add(
@@ -288,14 +290,6 @@ fn window_body(
                 // Refocus the box so the user can immediately edit the
                 // query without clicking back into it.
                 resp.request_focus();
-            }
-            if state.web_image_search.searching {
-                ui.spinner();
-                ui.label(
-                    RichText::new(t("searching..."))
-                        .size(10.0)
-                        .color(Color32::from_rgb(255, 200, 80)),
-                );
             }
         },
     );
