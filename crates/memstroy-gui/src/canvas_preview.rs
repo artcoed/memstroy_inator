@@ -480,8 +480,8 @@ fn actor_world_aabb(state: &EditorState, idx: usize) -> Option<([f32; 2], [f32; 
     if let Some(ref pid) = actor.parent_id {
         let mut visited = vec![actor.id.clone()];
         if let Some(pxf) = resolve_parent_transform(state, pid, t, &mut visited) {
-            effective_scale *= pxf.scale;
-            effective_scale_y *= pxf.scale;
+            effective_scale *= pxf.scale_x;
+            effective_scale_y *= safe_div(pxf.scale_y, pxf.scale_x);
         }
     }
     let elem_w = src_w * effective_scale;
@@ -536,7 +536,8 @@ fn overlay_world_aabb(state: &EditorState, idx: usize) -> Option<([f32; 2], [f32
             );
             center_x = world_pos.x;
             center_y = world_pos.y;
-            ov_state.scale *= pxf.scale;
+            ov_state.scale *= pxf.scale_x;
+            ov_state.scale_y *= safe_div(pxf.scale_y, pxf.scale_x);
         }
     }
 
@@ -1323,7 +1324,8 @@ fn draw_single_actor(
         let mut visited = vec![actor.id.clone()];
         if let Some(parent_xform) = resolve_parent_transform(state, pid, t, &mut visited) {
             actor_rotation += parent_xform.rotation_deg;
-            scale_eff *= parent_xform.scale;
+            scale_eff *= parent_xform.scale_x;
+            actor_scale_y *= safe_div(parent_xform.scale_y, parent_xform.scale_x);
         }
     }
 
@@ -1771,7 +1773,8 @@ fn draw_canvas_overlays_impl(
         });
         if let Some(ref pxf) = parent_xform_resolved {
             ov_state.rotation_deg += pxf.rotation_deg;
-            ov_state.scale *= pxf.scale;
+            ov_state.scale *= pxf.scale_x;
+            ov_state.scale_y *= safe_div(pxf.scale_y, pxf.scale_x);
         }
 
         let rf = &state.scene.render_frame;
@@ -2821,8 +2824,10 @@ pub struct ParentTransform {
     pub pos: WorldPos,
     /// Parent's accumulated rotation in degrees.
     pub rotation_deg: f32,
-    /// Parent's accumulated uniform scale.
-    pub scale: f32,
+    /// Parent's accumulated X scale.
+    pub scale_x: f32,
+    /// Parent's accumulated Y scale.
+    pub scale_y: f32,
 }
 
 impl Default for ParentTransform {
@@ -2830,9 +2835,14 @@ impl Default for ParentTransform {
         Self {
             pos: WorldPos { x: 0.0, y: 0.0 },
             rotation_deg: 0.0,
-            scale: 1.0,
+            scale_x: 1.0,
+            scale_y: 1.0,
         }
     }
+}
+
+fn safe_div(num: f32, den: f32) -> f32 {
+    if den.abs() > 1.0e-6 { num / den } else { 1.0 }
 }
 
 /// Resolve the full parent transform chain for an element identified by
@@ -2864,7 +2874,8 @@ pub fn resolve_parent_transform(
             rotation_deg: rf_state.rotation_deg + mod_delta.d_rotation_deg,
             // Render frame zoom is inverse scale (zoom > 1 = zoomed in = smaller world area)
             // For parenting purposes, we treat it as scale = 1 (the rf doesn't scale children)
-            scale: 1.0,
+            scale_x: 1.0,
+            scale_y: 1.0,
         });
     }
 
@@ -2873,38 +2884,39 @@ pub fn resolve_parent_transform(
         let actor_t_in = actor.t_in.unwrap_or(0.0);
         let actor_state = keyframe::sample(&actor.layout, t).unwrap_or_default();
         let mod_delta = keyframe::evaluate_modifiers(&actor.modifiers, (t - actor_t_in).max(0.0));
+        let canvas_transform = state.scene.canvas_layouts.iter()
+            .find(|cl| cl.element_id == actor.id)
+            .and_then(|cl| keyframe::sample(&cl.keyframes, t));
 
         let rf = &state.scene.render_frame;
         let [rw, rh] = rf.resolution;
         let world_w = rw as f32;
         let world_h = rh as f32;
 
-        let mut pos = WorldPos {
-            x: actor_state.pos[0] * world_w + mod_delta.dx,
-            y: actor_state.pos[1] * world_h + mod_delta.dy,
+        let mut pos = if let Some(transform) = canvas_transform {
+            WorldPos { x: transform.pos.x + mod_delta.dx, y: transform.pos.y + mod_delta.dy }
+        } else {
+            WorldPos {
+                x: actor_state.pos[0] * world_w + mod_delta.dx,
+                y: actor_state.pos[1] * world_h + mod_delta.dy,
+            }
         };
-        let mut rotation = actor_state.rotation_deg + mod_delta.d_rotation_deg;
-        let mut scale = (actor_state.scale + mod_delta.d_scale).max(0.001);
+        let mut rotation = canvas_transform.map(|transform| transform.rotation_deg).unwrap_or(actor_state.rotation_deg) + mod_delta.d_rotation_deg;
+        let mut scale_x = (canvas_transform.map(|transform| transform.scale).unwrap_or(actor_state.scale) + mod_delta.d_scale).max(0.001);
+        let mut scale_y = scale_x * actor_state.scale_y;
 
         // Recursively resolve this element's own parent
         if let Some(ref grandparent_id) = actor.parent_id {
             if let Some(gp) = resolve_parent_transform(state, grandparent_id, t, visited) {
-                // Apply grandparent transform to this parent's local transform
-                let rad = gp.rotation_deg.to_radians();
-                let cos_r = rad.cos();
-                let sin_r = rad.sin();
-                let local_x = (pos.x - gp.pos.x) * gp.scale;
-                let local_y = (pos.y - gp.pos.y) * gp.scale;
-                pos = WorldPos {
-                    x: gp.pos.x + local_x * cos_r - local_y * sin_r,
-                    y: gp.pos.y + local_x * sin_r + local_y * cos_r,
-                };
+                // Apply grandparent transform to this parent's local transform.
+                pos = apply_parent_transform(pos, &gp);
                 rotation += gp.rotation_deg;
-                scale *= gp.scale;
+                scale_x *= gp.scale_x;
+                scale_y *= gp.scale_y;
             }
         }
 
-        return Some(ParentTransform { pos, rotation_deg: rotation, scale });
+        return Some(ParentTransform { pos, rotation_deg: rotation, scale_x, scale_y });
     }
 
     // Try to find the parent as an overlay
@@ -2929,31 +2941,38 @@ pub fn resolve_parent_transform(
         let world_w = rw as f32;
         let world_h = rh as f32;
 
-        let mut pos = WorldPos {
-            x: ov_state.pos[0] * world_w + mod_delta.dx,
-            y: ov_state.pos[1] * world_h + mod_delta.dy,
+        let overlay_id = match ov {
+            Overlay::Text(o) => &o.id,
+            Overlay::Image(o) => &o.id,
+            Overlay::Video(o) => &o.id,
         };
-        let mut rotation = ov_state.rotation_deg + mod_delta.d_rotation_deg;
-        let mut scale = (ov_state.scale + mod_delta.d_scale).max(0.001);
+        let canvas_transform = state.scene.canvas_layouts.iter()
+            .find(|cl| cl.element_id == *overlay_id)
+            .and_then(|cl| keyframe::sample(&cl.keyframes, t));
+
+        let mut pos = if let Some(transform) = canvas_transform {
+            WorldPos { x: transform.pos.x + mod_delta.dx, y: transform.pos.y + mod_delta.dy }
+        } else {
+            WorldPos {
+                x: ov_state.pos[0] * world_w + mod_delta.dx,
+                y: ov_state.pos[1] * world_h + mod_delta.dy,
+            }
+        };
+        let mut rotation = canvas_transform.map(|transform| transform.rotation_deg).unwrap_or(ov_state.rotation_deg) + mod_delta.d_rotation_deg;
+        let mut scale_x = (canvas_transform.map(|transform| transform.scale).unwrap_or(ov_state.scale) + mod_delta.d_scale).max(0.001);
+        let mut scale_y = scale_x * ov_state.scale_y;
 
         // Recursively resolve this overlay's own parent
         if let Some(grandparent_id) = parent_pid {
             if let Some(gp) = resolve_parent_transform(state, grandparent_id, t, visited) {
-                let rad = gp.rotation_deg.to_radians();
-                let cos_r = rad.cos();
-                let sin_r = rad.sin();
-                let local_x = (pos.x - gp.pos.x) * gp.scale;
-                let local_y = (pos.y - gp.pos.y) * gp.scale;
-                pos = WorldPos {
-                    x: gp.pos.x + local_x * cos_r - local_y * sin_r,
-                    y: gp.pos.y + local_x * sin_r + local_y * cos_r,
-                };
+                pos = apply_parent_transform(pos, &gp);
                 rotation += gp.rotation_deg;
-                scale *= gp.scale;
+                scale_x *= gp.scale_x;
+                scale_y *= gp.scale_y;
             }
         }
 
-        return Some(ParentTransform { pos, rotation_deg: rotation, scale });
+        return Some(ParentTransform { pos, rotation_deg: rotation, scale_x, scale_y });
     }
 
     None
@@ -2966,10 +2985,8 @@ fn apply_parent_transform(child_pos: WorldPos, parent: &ParentTransform) -> Worl
     let rad = parent.rotation_deg.to_radians();
     let cos_r = rad.cos();
     let sin_r = rad.sin();
-    // Child's position is relative to the world origin; compute offset
-    // from parent centre, scale it, rotate it, then translate back.
-    let dx = (child_pos.x - parent.pos.x) * parent.scale;
-    let dy = (child_pos.y - parent.pos.y) * parent.scale;
+    let dx = child_pos.x * parent.scale_x;
+    let dy = child_pos.y * parent.scale_y;
     WorldPos {
         x: parent.pos.x + dx * cos_r - dy * sin_r,
         y: parent.pos.y + dx * sin_r + dy * cos_r,
@@ -2979,17 +2996,14 @@ fn apply_parent_transform(child_pos: WorldPos, parent: &ParentTransform) -> Worl
 /// Inverse of [`apply_parent_transform`]: map a world centre back to the
 /// stored pre-parent layout value used in `canvas_layouts` / legacy tracks.
 fn inverse_parent_transform(world: WorldPos, parent: &ParentTransform) -> WorldPos {
-    let scale = parent.scale.max(1e-6);
-    let rad = (-parent.rotation_deg).to_radians();
+    let rad = parent.rotation_deg.to_radians();
     let cos_r = rad.cos();
     let sin_r = rad.sin();
     let dx = world.x - parent.pos.x;
     let dy = world.y - parent.pos.y;
-    let sx = dx * cos_r - dy * sin_r;
-    let sy = dx * sin_r + dy * cos_r;
     WorldPos {
-        x: parent.pos.x + sx / scale,
-        y: parent.pos.y + sy / scale,
+        x: safe_div(dx * cos_r + dy * sin_r, parent.scale_x),
+        y: safe_div(-dx * sin_r + dy * cos_r, parent.scale_y),
     }
 }
 
@@ -3048,7 +3062,7 @@ fn get_element_world_pos(
     };
 
     // Check canvas_layouts for this element (scene-time keyframes).
-    let mut base_pos = if let Some(cl) = state.scene.canvas_layouts.iter().find(|cl| cl.element_id == element_id) {
+    let base_pos = if let Some(cl) = state.scene.canvas_layouts.iter().find(|cl| cl.element_id == element_id) {
         keyframe::sample(&cl.keyframes, sample_t)
             .map(|transform| transform.pos)
     } else {
@@ -4630,6 +4644,46 @@ fn write_selection_world_center(
     }
 }
 
+
+
+pub fn set_element_parent_preserve_world(
+    state: &mut EditorState,
+    element_id: &str,
+    new_parent_id: Option<String>,
+) -> bool {
+    let t = state.playhead;
+    let sel = if let Some(idx) = state.scene.actors.iter().position(|a| a.id == element_id) {
+        Selection::Actor(idx)
+    } else if let Some(idx) = state.scene.overlays.iter().position(|ov| match ov {
+        Overlay::Text(o) => o.id == element_id,
+        Overlay::Image(o) => o.id == element_id,
+        Overlay::Video(o) => o.id == element_id,
+    }) {
+        Selection::Overlay(idx)
+    } else {
+        return false;
+    };
+    let current_world = match sel {
+        Selection::Actor(idx) => get_element_world_pos(state, element_id, &state.scene.actors[idx].layout, t),
+        Selection::Overlay(idx) => {
+            let dummy: &[Keyframe<ActorState>] = &[];
+            let sample_t = overlay_clip_local_time_at(state, idx, t);
+            get_element_world_pos(state, element_id, dummy, sample_t)
+        }
+        _ => return false,
+    };
+    let token = canvas_drag_token(CANVAS_TOKEN_POS, sel);
+    if state.last_drag_group != Some(token) {
+        state.undo.push(&state.scene);
+        state.last_drag_group = Some(token);
+    }
+    if !state.scene.set_element_parent_id(element_id, new_parent_id) {
+        return false;
+    }
+    write_selection_world_center(state, sel, [current_world.x, current_world.y], token, false);
+    true
+}
+
 // `mark_actor_canvas_animated` / `mark_overlay_canvas_animated` were
 // removed (and replaced by the gating inside `kf_anim::write_*_param`).
 // Canvas drags no longer auto-mark a parameter as animated — the user
@@ -5049,8 +5103,8 @@ fn sniff_hit(state: &EditorState, pos: WorldPos) -> Option<Selection> {
     //
     // (sniff_hit doesn't test backgrounds, so the camera-relative
     // dims aren't needed here.)
-    let world_w = rw as f32;
-    let world_h = rh as f32;
+    let _world_w = rw as f32;
+    let _world_h = rh as f32;
 
     // Overlays first (top of z-order). Sort by track index ascending — the
     // topmost row on the timeline panel hits first. Overlays drawn BEHIND
@@ -5096,7 +5150,8 @@ fn sniff_hit(state: &EditorState, pos: WorldPos) -> Option<Selection> {
             &mut ov_scale,
             &mut ov_scale_y,
         );
-        let mut parent_scale = 1.0_f32;
+        let mut parent_scale_x = 1.0_f32;
+        let mut parent_scale_y = 1.0_f32;
         let parent_id = match overlay {
             Overlay::Text(o) => o.parent_id.as_ref(),
             Overlay::Image(o) => o.parent_id.as_ref(),
@@ -5106,11 +5161,12 @@ fn sniff_hit(state: &EditorState, pos: WorldPos) -> Option<Selection> {
             let mut visited = vec![ov_id.to_string()];
             if let Some(pxf) = resolve_parent_transform(state, pid, t, &mut visited) {
                 rotation_deg += pxf.rotation_deg;
-                parent_scale *= pxf.scale;
+                parent_scale_x *= pxf.scale_x;
+                parent_scale_y *= pxf.scale_y;
             }
         }
-        let half_w = ew * parent_scale * 0.5;
-        let half_h = eh * parent_scale * 0.5;
+        let half_w = ew * parent_scale_x * 0.5;
+        let half_h = eh * parent_scale_y * 0.5;
         if world_point_in_oriented_rect(pos, ov_world, half_w, half_h, rotation_deg) {
             return Some(Selection::Overlay(idx));
         }
@@ -5121,13 +5177,14 @@ fn sniff_hit(state: &EditorState, pos: WorldPos) -> Option<Selection> {
         let world_pos = get_element_world_pos(state, &actor.id, &actor.layout, t);
         let actor_st = keyframe::sample(&actor.layout, t).unwrap_or_default();
         let mut actor_scale = actor_st.scale;
-        let actor_scale_y = actor_st.scale_y;
+        let mut actor_scale_y = actor_st.scale_y;
         let mut rotation_deg = actor_st.rotation_deg;
         if let Some(ref pid) = actor.parent_id {
             let mut visited = vec![actor.id.clone()];
             if let Some(pxf) = resolve_parent_transform(state, pid, t, &mut visited) {
                 rotation_deg += pxf.rotation_deg;
-                actor_scale *= pxf.scale;
+                actor_scale *= pxf.scale_x;
+                actor_scale_y *= safe_div(pxf.scale_y, pxf.scale_x);
             }
         }
         let (base_w, base_h) = if let Some(fc) = state.frame_caches.get(idx) {
@@ -5178,7 +5235,8 @@ fn selected_element_gizmo(
                 let mut visited = vec![actor.id.clone()];
                 if let Some(pxf) = resolve_parent_transform(state, pid, sample_t, &mut visited) {
                     rotation_deg += pxf.rotation_deg;
-                    actor_scale *= pxf.scale;
+                    actor_scale *= pxf.scale_x;
+                actor_scale_y *= safe_div(pxf.scale_y, pxf.scale_x);
                 }
             }
             let (base_w, base_h) = if let Some(fc) = state.frame_caches.get(idx) {
@@ -5241,12 +5299,14 @@ fn selected_element_gizmo(
                 &mut ov_scale,
                 &mut ov_scale_y,
             );
-            let mut parent_scale = 1.0_f32;
+            let mut parent_scale_x = 1.0_f32;
+            let mut parent_scale_y = 1.0_f32;
             if let Some(pid) = parent_id {
                 let mut visited = vec![ov_id.to_string()];
                 if let Some(pxf) = resolve_parent_transform(state, pid, t, &mut visited) {
                     rotation_deg += pxf.rotation_deg;
-                    parent_scale *= pxf.scale;
+                    parent_scale_x *= pxf.scale_x;
+                    parent_scale_y *= pxf.scale_y;
                 }
             }
             let center_screen = state.canvas_viewport.world_to_screen(world_pos, viewport_size);
@@ -5256,8 +5316,8 @@ fn selected_element_gizmo(
                     full_rect.min.x + center_screen[0],
                     full_rect.min.y + center_screen[1],
                 ),
-                half_w: elem_w * parent_scale * 0.5 * zoom,
-                half_h: elem_h * parent_scale * 0.5 * zoom,
+                half_w: elem_w * parent_scale_x * 0.5 * zoom,
+                half_h: elem_h * parent_scale_y * 0.5 * zoom,
                 rotation_deg,
             })
         }
@@ -8098,4 +8158,85 @@ fn handle_canvas_skeleton_input(
     }
 
     false
+}
+
+#[cfg(test)]
+mod transform_hierarchy_tests {
+    use super::*;
+
+    fn actor(id: &str, parent_id: Option<&str>) -> Actor {
+        Actor {
+            id: id.to_string(),
+            source: std::path::PathBuf::new(),
+            anchors: None,
+            chroma_key: ChromaKeyParams::default(),
+            layout: vec![Keyframe::new(0.0, ActorState::default())],
+            t_in: None,
+            t_out: None,
+            visible: true,
+            z_order: 0,
+            source_start: 0.0,
+            loop_source: false,
+            flip_horizontal: false,
+            attachments: Vec::new(),
+            skeleton_attachments: Vec::new(),
+            modifiers: Vec::new(),
+            effects: Vec::new(),
+            parent_id: parent_id.map(str::to_string),
+            color_correction: ColorCorrection::default(),
+            transition_in: Transition::default(),
+            transition_out: Transition::default(),
+            transition_duration: 0.35,
+            speed: 1.0,
+            animated_params: std::collections::BTreeSet::new(),
+            mute_audio: false,
+        }
+    }
+
+    fn canvas_layout(id: &str, pos: WorldPos, scale: f32, rotation_deg: f32) -> CanvasLayout {
+        CanvasLayout {
+            element_id: id.to_string(),
+            keyframes: vec![Keyframe::new(0.0, CanvasTransform { pos, width: 500.0, scale, rotation_deg, opacity: 1.0 })],
+        }
+    }
+
+    fn assert_close(actual: f32, expected: f32) {
+        assert!((actual - expected).abs() < 1.0e-3, "actual={actual}, expected={expected}");
+    }
+
+    #[test]
+    fn child_position_follows_parent_position_rotation_and_non_uniform_scale() {
+        let mut state = EditorState::new();
+        state.scene.actors = vec![actor("parent", None), actor("child", Some("parent"))];
+        state.scene.canvas_layouts = vec![
+            canvas_layout("parent", WorldPos { x: 100.0, y: 100.0 }, 2.0, 90.0),
+            canvas_layout("child", WorldPos { x: 10.0, y: 20.0 }, 1.0, 0.0),
+        ];
+
+        let pos = get_element_world_pos(&state, "child", &state.scene.actors[1].layout, 0.0);
+        assert_close(pos.x, 60.0);
+        assert_close(pos.y, 120.0);
+
+        let mut visited = vec!["child".to_string()];
+        let parent = resolve_parent_transform(&state, "parent", 0.0, &mut visited).unwrap();
+        assert_close(parent.scale_x, 2.0);
+        assert_close(parent.scale_y, 2.0);
+    }
+
+    #[test]
+    fn inverse_parent_transform_preserves_world_when_reparenting() {
+        let parent = ParentTransform {
+            pos: WorldPos { x: 100.0, y: 100.0 },
+            rotation_deg: 90.0,
+            scale_x: 2.0,
+            scale_y: 2.0,
+        };
+        let world = WorldPos { x: 60.0, y: 120.0 };
+        let local = inverse_parent_transform(world, &parent);
+        assert_close(local.x, 10.0);
+        assert_close(local.y, 20.0);
+        let roundtrip = apply_parent_transform(local, &parent);
+        assert_close(roundtrip.x, world.x);
+        assert_close(roundtrip.y, world.y);
+    }
 }
