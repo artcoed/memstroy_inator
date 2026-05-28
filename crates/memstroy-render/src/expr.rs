@@ -21,7 +21,7 @@ use memstroy_core::keyframe::{ModifierKind, TrackModifier};
 use memstroy_core::skeleton::{SkeletonAttachment, SkeletonTemplate};
 use memstroy_core::{
     Actor, ActorState, CanvasTransform, ColorCorrection, Easing, Effect, EffectKind, Keyframe,
-    OverlayState, RenderFrameState, Scene,
+    Overlay, OverlayState, RenderFrameState, Scene,
 };
 
 // ─── PIECEWISE EXPRESSIONS ──────────────────────────────────────────
@@ -404,6 +404,128 @@ pub(crate) struct ElementTransform {
     pub vflip: bool,
 }
 
+
+struct ParentTransformExpr {
+    x: String,
+    y: String,
+    rot_deg: String,
+    scale_x: String,
+    scale_y: String,
+}
+
+fn expr_add(a: String, b: String) -> String {
+    if b == "0" { a } else if a == "0" { b } else { format!("(({})+({}))", a, b) }
+}
+
+fn expr_mul(a: String, b: String) -> String {
+    if a == "1" { b } else if b == "1" { a } else { format!("(({})*({}))", a, b) }
+}
+
+fn expr_scale_add(base: String, delta: String) -> String {
+    if delta == "0" { base } else { format!("(({})+({}))", base, delta) }
+}
+
+fn canvas_transform_expr(scene: &Scene, element_id: &str) -> Option<(String, String, String, String)> {
+    scene.canvas_layouts.iter().find(|cl| cl.element_id == element_id).map(|cl| {
+        (
+            piecewise(&cl.keyframes, |t: &CanvasTransform| t.pos.x),
+            piecewise(&cl.keyframes, |t: &CanvasTransform| t.pos.y),
+            piecewise(&cl.keyframes, |t: &CanvasTransform| t.rotation_deg),
+            piecewise(&cl.keyframes, |t: &CanvasTransform| t.scale),
+        )
+    })
+}
+
+fn apply_parent_expr(x: String, y: String, parent: &ParentTransformExpr) -> (String, String) {
+    let sx = expr_mul(x, parent.scale_x.clone());
+    let sy = expr_mul(y, parent.scale_y.clone());
+    let theta = format!("(({})*PI/180)", parent.rot_deg);
+    let cos_t = format!("cos({})", theta);
+    let sin_t = format!("sin({})", theta);
+    let wx = format!("(({})+(({})*({})-({})*({})))", parent.x, sx, cos_t, sy, sin_t);
+    let wy = format!("(({})+(({})*({})+({})*({})))", parent.y, sx, sin_t, sy, cos_t);
+    (wx, wy)
+}
+
+fn parent_transform_expr(scene: &Scene, parent_id: &str, visited: &mut Vec<String>) -> Option<ParentTransformExpr> {
+    if visited.iter().any(|id| id == parent_id) {
+        return None;
+    }
+    visited.push(parent_id.to_string());
+
+    if parent_id == "__render_frame__" {
+        let rf = &scene.render_frame;
+        let mods = build_modifier_expr(&rf.modifiers, 0.0);
+        let x = expr_add(piecewise(&rf.layout, |s: &RenderFrameState| s.pos.x), mods.dx);
+        let y = expr_add(piecewise(&rf.layout, |s: &RenderFrameState| s.pos.y), mods.dy);
+        let rot_deg = expr_add(piecewise(&rf.layout, |s: &RenderFrameState| s.rotation_deg), mods.drot_deg);
+        return Some(ParentTransformExpr { x, y, rot_deg, scale_x: "1".into(), scale_y: "1".into() });
+    }
+
+    let [out_w, out_h] = scene.output.resolution;
+    let mut out = if let Some(actor) = scene.actors.iter().find(|a| a.id == parent_id) {
+        let mods = build_modifier_expr(&actor.modifiers, actor.t_in.unwrap_or(0.0));
+        let (x, y, rot_deg, scale_x) = if let Some((cx, cy, crot, cscale)) = canvas_transform_expr(scene, &actor.id) {
+            (cx, cy, crot, cscale)
+        } else {
+            (
+                format!("(({px})*{w:.4})", px = piecewise(&actor.layout, |s: &ActorState| s.pos[0]), w = out_w as f32),
+                format!("(({py})*{h:.4})", py = piecewise(&actor.layout, |s: &ActorState| s.pos[1]), h = out_h as f32),
+                piecewise(&actor.layout, |s: &ActorState| s.rotation_deg),
+                piecewise(&actor.layout, |s: &ActorState| s.scale),
+            )
+        };
+        let x = expr_add(x, mods.dx);
+        let y = expr_add(y, mods.dy);
+        let rot_deg = expr_add(rot_deg, mods.drot_deg);
+        let scale_x = expr_scale_add(scale_x, mods.dscale);
+        let scale_y = expr_mul(scale_x.clone(), piecewise(&actor.layout, |s: &ActorState| s.scale_y));
+        ParentTransformExpr { x, y, rot_deg, scale_x, scale_y }
+    } else if let Some(ov) = scene.overlays.iter().find(|ov| match ov {
+        Overlay::Text(o) => o.id == parent_id,
+        Overlay::Image(o) => o.id == parent_id,
+        Overlay::Video(o) => o.id == parent_id,
+    }) {
+        let (id, t_in, layout, modifiers) = match ov {
+            Overlay::Text(o) => (&o.id, o.t_in, &o.layout, &o.modifiers),
+            Overlay::Image(o) => (&o.id, o.t_in, &o.layout, &o.modifiers),
+            Overlay::Video(o) => (&o.id, o.t_in, &o.layout, &o.modifiers),
+        };
+        let base = LayoutTimeBase::ClipLocal { t_in };
+        let mods = build_modifier_expr(modifiers, t_in);
+        let (x, y, rot_deg, scale_x) = if let Some((cx, cy, crot, cscale)) = canvas_transform_expr(scene, id) {
+            (cx, cy, crot, cscale)
+        } else {
+            (
+                format!("(({px})*{w:.4})", px = piecewise_layout(layout, |s: &OverlayState| s.pos[0], base), w = out_w as f32),
+                format!("(({py})*{h:.4})", py = piecewise_layout(layout, |s: &OverlayState| s.pos[1], base), h = out_h as f32),
+                piecewise_layout(layout, |s: &OverlayState| s.rotation_deg, base),
+                piecewise_layout(layout, |s: &OverlayState| s.scale, base),
+            )
+        };
+        let x = expr_add(x, mods.dx);
+        let y = expr_add(y, mods.dy);
+        let rot_deg = expr_add(rot_deg, mods.drot_deg);
+        let scale_x = expr_scale_add(scale_x, mods.dscale);
+        let scale_y = expr_mul(scale_x.clone(), piecewise_layout(layout, |s: &OverlayState| s.scale_y, base));
+        ParentTransformExpr { x, y, rot_deg, scale_x, scale_y }
+    } else {
+        return None;
+    };
+
+    if let Some(grandparent_id) = scene.element_parent_id(parent_id) {
+        if let Some(parent) = parent_transform_expr(scene, grandparent_id, visited) {
+            let (x, y) = apply_parent_expr(out.x, out.y, &parent);
+            out.x = x;
+            out.y = y;
+            out.rot_deg = expr_add(out.rot_deg, parent.rot_deg);
+            out.scale_x = expr_mul(out.scale_x, parent.scale_x);
+            out.scale_y = expr_mul(out.scale_y, parent.scale_y);
+        }
+    }
+    Some(out)
+}
+
 /// Build the full overlay-time transform for an element identified by
 /// `element_id`. This is the renderer's equivalent of
 /// `canvas_preview::get_element_world_pos` + the legacy keyframe
@@ -431,12 +553,9 @@ pub(crate) struct ElementTransform {
 /// rendered out-of-sync with the canvas preview (the preview samples
 /// at `t - t_in`, the renderer at `t`).
 ///
-/// TODO: parent_id transform propagation. When an element has a
-/// `parent_id` set, its position/rotation/scale should be relative to
-/// the parent's transform. The canvas preview already handles this
-/// (see `resolve_parent_transform` in canvas_preview.rs), but the
-/// ffmpeg expression builder doesn't yet — exported video won't
-/// reflect parent-child relationships until this is implemented here.
+/// Parent hierarchy is resolved recursively, matching Unity-style
+/// local-to-world composition: child position is stored in parent-local
+/// space, then parent position/rotation/non-uniform scale are applied.
 pub(crate) fn build_element_transform<S>(
     scene: &Scene,
     element_id: &str,
@@ -594,6 +713,14 @@ where
         format!("(({})+({}))", world_y, mods.dy)
     };
 
+    let parent_expr = scene.element_parent_id(element_id)
+        .and_then(|parent_id| parent_transform_expr(scene, parent_id, &mut vec![element_id.to_string()]));
+    let (world_x, world_y) = if let Some(parent) = parent_expr.as_ref() {
+        apply_parent_expr(world_x, world_y, parent)
+    } else {
+        (world_x, world_y)
+    };
+
     // ── World → output canvas: full render-frame camera transform ───
     //
     // Mirrors `frame_snapshot::world_to_output` exactly so the export
@@ -678,6 +805,16 @@ where
     } else {
         format!("(({})+({}))*({})", scale_base, mods.dscale, scale_y_factor)
     };
+    let sx_base = if let Some(parent) = parent_expr.as_ref() {
+        expr_mul(sx_base, parent.scale_x.clone())
+    } else {
+        sx_base
+    };
+    let sy_base = if let Some(parent) = parent_expr.as_ref() {
+        expr_mul(sy_base, parent.scale_y.clone())
+    } else {
+        sy_base
+    };
     let sx_expr = if rf_zoom_is_one {
         sx_base
     } else {
@@ -698,11 +835,17 @@ where
     let layout_has_rot = legacy_layout
         .iter()
         .any(|kf| kf.value.rotation_deg().abs() > 0.05);
-    let rot_expr = if layout_has_rot || !mods.drot_is_zero() || !rf_rot_is_zero {
+    let parent_has_rot = parent_expr.as_ref().map(|p| p.rot_deg != "0").unwrap_or(false);
+    let rot_expr = if layout_has_rot || !mods.drot_is_zero() || parent_has_rot || !rf_rot_is_zero {
         let elem_rot_deg = if mods.drot_is_zero() {
             rot_deg_layout
         } else {
             format!("(({})+({}))", rot_deg_layout, mods.drot_deg)
+        };
+        let elem_rot_deg = if let Some(parent) = parent_expr.as_ref() {
+            expr_add(elem_rot_deg, parent.rot_deg.clone())
+        } else {
+            elem_rot_deg
         };
         let total_deg = if rf_rot_is_zero {
             elem_rot_deg
