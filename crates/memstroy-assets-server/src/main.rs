@@ -34,6 +34,23 @@ struct Cli {
     /// `--root /data/assets`).
     #[arg(long)]
     root: Option<PathBuf>,
+
+    /// Telegram channel to scrape automatically on startup, right
+    /// after the cleanup + initial index. Pairs with the startup
+    /// cleanup: cleanup wipes the old library, auto-ingest immediately
+    /// repopulates it with fresh clips. If omitted (and
+    /// `MEMSTROY_INGEST_CHANNEL` is also unset), auto-ingest is
+    /// skipped and the server boots with whatever survived cleanup —
+    /// the `POST /api/ingest/tg` endpoint still works for manual
+    /// invocations.
+    #[arg(long)]
+    ingest_channel: Option<String>,
+
+    /// How many recent clips the auto-ingest job should fetch.
+    /// Matches the default used by `POST /api/ingest/tg`. The env
+    /// fallback is `MEMSTROY_INGEST_LIMIT`.
+    #[arg(long)]
+    ingest_limit: Option<u32>,
 }
 
 #[tokio::main(worker_threads = 2)]
@@ -75,6 +92,50 @@ async fn main() -> Result<()> {
 
     for (kind, count) in store.count_by_kind() {
         tracing::info!(kind = ?kind, count, "indexed");
+    }
+
+    // Kick off the Telegram ingest job on startup if a channel is
+    // configured. Pairs with the startup cleanup above: cleanup
+    // intentionally wipes the old library on every boot, and this
+    // immediately starts pulling fresh clips so the server is useful
+    // again as quickly as possible. The ingest task runs in the
+    // background — it does not block the HTTP server from coming up,
+    // and the store is re-indexed by the task itself when downloads
+    // finish.
+    let ingest_channel = cli
+        .ingest_channel
+        .or_else(|| std::env::var("MEMSTROY_INGEST_CHANNEL").ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let ingest_limit = cli
+        .ingest_limit
+        .or_else(|| {
+            std::env::var("MEMSTROY_INGEST_LIMIT")
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok())
+        })
+        .unwrap_or(10);
+
+    match ingest_channel {
+        Some(channel) => {
+            tracing::info!(
+                channel = %channel,
+                limit = ingest_limit,
+                "auto-ingest: scheduling Telegram scrape on startup",
+            );
+            memstroy_assets_server::ingest::spawn_tg_ingest(
+                store.clone(),
+                channel,
+                ingest_limit,
+            );
+        }
+        None => {
+            tracing::info!(
+                "auto-ingest: no channel configured \
+                 (set --ingest-channel or MEMSTROY_INGEST_CHANNEL to enable); \
+                 manual POST /api/ingest/tg still works",
+            );
+        }
     }
 
     tracing::info!(
