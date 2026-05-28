@@ -47,6 +47,8 @@ pub struct FrameCache {
     pub ready: bool,
     /// Whether extraction is currently running.
     pub extracting: bool,
+    /// Set when ffmpeg/ffprobe could not build a preview (bad file, missing ffmpeg, …).
+    pub failed: bool,
     /// Source frame dimensions (width, height) — read from first extracted frame.
     pub source_width: u32,
     pub source_height: u32,
@@ -94,6 +96,7 @@ impl FrameCache {
             duration: 0.0,
             ready: false,
             extracting: false,
+            failed: false,
             source_width: 480,
             source_height: 270,
             texture: None,
@@ -118,7 +121,7 @@ impl FrameCache {
     pub fn start_extraction(
         source: PathBuf,
         rt: &Handle,
-        on_done: impl FnOnce(f32, usize, PathBuf) + Send + 'static,
+        on_done: impl FnOnce(Result<(f32, usize, PathBuf), ()>) + Send + 'static,
     ) {
         rt.spawn(async move {
             extract_frames_blocking(source, on_done);
@@ -135,7 +138,7 @@ impl FrameCache {
     #[allow(dead_code)]
     pub fn start_extraction_thread(
         source: PathBuf,
-        on_done: impl FnOnce(f32, usize, PathBuf) + Send + 'static,
+        on_done: impl FnOnce(Result<(f32, usize, PathBuf), ()>) + Send + 'static,
     ) {
         thread::spawn(move || {
             extract_frames_blocking(source, on_done);
@@ -149,6 +152,7 @@ impl FrameCache {
         self.cache_dir = cache_dir;
         self.ready = true;
         self.extracting = false;
+        self.failed = false;
 
         // Detect source dimensions from the first extracted frame
         let first_frame_path = self.cache_dir.join("000001.jpg");
@@ -1513,11 +1517,10 @@ fn glitch(img: &ColorImage, strength: f32) -> ColorImage {
 
 /// Synchronously extract frames for a clip via `ffmpeg` and `ffprobe`.
 /// Invoked from background workers (tokio task or std::thread). Calls
-/// `on_done` with the resulting (duration_secs, frame_count, cache_dir)
-/// only on success; errors are logged and the callback is skipped.
+/// `on_done` with extraction results (or `Err` when ffmpeg/ffprobe fails).
 fn extract_frames_blocking(
     source: PathBuf,
-    on_done: impl FnOnce(f32, usize, PathBuf) + Send + 'static,
+    on_done: impl FnOnce(Result<(f32, usize, PathBuf), ()>) + Send + 'static,
 ) {
     extract_frames_blocking_with_scale(source, 480, on_done);
 }
@@ -1528,7 +1531,7 @@ fn extract_frames_blocking(
 pub fn extract_frames_blocking_with_scale(
     source: PathBuf,
     max_width: u32,
-    on_done: impl FnOnce(f32, usize, PathBuf) + Send + 'static,
+    on_done: impl FnOnce(Result<(f32, usize, PathBuf), ()>) + Send + 'static,
 ) {
     let ffmpeg = memstroy_render::ffmpeg_binary();
     let ffprobe = {
@@ -1550,6 +1553,7 @@ pub fn extract_frames_blocking_with_scale(
     ));
     if let Err(e) = std::fs::create_dir_all(&cache_dir) {
         tracing::error!("Failed to create frame cache dir: {e}");
+        on_done(Err(()));
         return;
     }
 
@@ -1599,18 +1603,28 @@ pub fn extract_frames_blocking_with_scale(
                 })
                 .unwrap_or(0);
 
+            if frame_count == 0 {
+                tracing::warn!(
+                    path = %source.display(),
+                    "Frame extraction produced zero frames"
+                );
+                on_done(Err(()));
+                return;
+            }
             tracing::info!(
                 "Frame extraction complete: {} frames, {:.1}s duration",
                 frame_count,
                 duration
             );
-            on_done(duration, frame_count, cache_dir);
+            on_done(Ok((duration, frame_count, cache_dir)));
         }
         Ok(s) => {
             tracing::error!("ffmpeg frame extraction exited with: {}", s);
+            on_done(Err(()));
         }
         Err(e) => {
             tracing::error!("ffmpeg frame extraction failed: {e}");
+            on_done(Err(()));
         }
     }
 }

@@ -793,6 +793,19 @@ pub struct EditorState {
     /// and never expire within a session.
     pub video_duration_cache: std::collections::HashMap<std::path::PathBuf, f32>,
 
+    /// `.mp4` paths currently downloading from the assets-server. Drop
+    /// handlers must not spawn actors against a partial/missing file
+    /// while the path is listed here.
+    pub pending_clip_downloads: std::collections::HashSet<std::path::PathBuf>,
+
+    /// Debounced `reload_library` — set by background jobs, drained on
+    /// the next UI frame so metadata sync does not freeze the editor.
+    pub library_reload_pending: bool,
+
+    /// Set when a clip lands on the timeline/canvas so the App starts
+    /// ffmpeg preview extraction on the next frame.
+    pub request_media_preview: bool,
+
     /// Tokio runtime handle injected by the App on startup so panels
     /// that talk to network services (the asset server, Telegram
     /// ingest, etc.) can spawn async tasks without rebuilding their
@@ -973,6 +986,16 @@ pub struct LibraryClip {
     pub server_id: Option<String>,
 }
 
+/// Result of scanning asset folders on a background thread.
+#[derive(Debug, Clone)]
+pub struct LibraryScanSnapshot {
+    pub mellstroy_clips: Vec<LibraryClip>,
+    pub sounds: Vec<LibraryAsset>,
+    pub images: Vec<LibraryAsset>,
+    pub particles: Vec<LibraryAsset>,
+    pub videos: Vec<LibraryAsset>,
+}
+
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum Selection {
@@ -1119,6 +1142,39 @@ impl EditorState {
         self.assets_root.join("clips")
     }
 
+    /// Quick header sniff so JPEG/PNG previews saved with a `.mp4` name
+    /// are not treated as playable video.
+    fn video_file_has_valid_header(path: &std::path::Path) -> bool {
+        use std::io::Read;
+        let mut buf = [0u8; 12];
+        let Ok(mut file) = std::fs::File::open(path) else {
+            return false;
+        };
+        if file.read_exact(&mut buf).is_err() {
+            return false;
+        }
+        // JPEG / PNG thumbnails mis-labelled as video
+        if buf[0] == 0xFF && buf[1] == 0xD8 {
+            return false;
+        }
+        if buf[..8] == [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A] {
+            return false;
+        }
+        // ISO BMFF (mp4/m4v/mov)
+        if buf[4..8] == *b"ftyp" {
+            return true;
+        }
+        // WebM / Matroska
+        if buf[..4] == [0x1A, 0x45, 0xDF, 0xA3] {
+            return true;
+        }
+        // AVI RIFF
+        if &buf[..4] == b"RIFF" && buf[8..12] == *b"AVI " {
+            return true;
+        }
+        false
+    }
+
     /// True when `path` points at a non-trivial video file on disk (not a
     /// thumbnail or empty stub accidentally named `.mp4`).
     pub fn is_usable_local_video(path: &std::path::Path) -> bool {
@@ -1134,9 +1190,13 @@ impl EditorState {
         if !ext_ok {
             return false;
         }
-        std::fs::metadata(path)
+        let size_ok = std::fs::metadata(path)
             .map(|m| m.len() > 4096)
-            .unwrap_or(false)
+            .unwrap_or(false);
+        if !size_ok {
+            return false;
+        }
+        Self::video_file_has_valid_header(path)
     }
 
     /// Path to a sidecar state file for the clips directory. Reserved
@@ -1892,37 +1952,9 @@ impl EditorState {
         Ok(scene)
     }
 
-    pub fn reload_library(&mut self) {
-        // Make sure the asset subdirectories exist BEFORE we walk
-        // them. On a fresh install (or in a client build whose
-        // `assets_root` is `~/.memstroy/cache/`) none of these
-        // directories ship with the binary — and `scan_asset_dir`
-        // returns an empty Vec when the path is missing. Without this
-        // upfront `create_dir_all` the editor would show an empty
-        // Images / Sounds / Videos / Particles tab on first run, then
-        // suddenly populate the moment the user dropped or pasted the
-        // first file (which created the directory as a side-effect).
-        // The user reported exactly that: "картинки подгружаются из
-        // локального кеша в проект только после добавления первой
-        // картинки". Creating the dirs eagerly + the periodic
-        // mtime-fingerprint poll in `auto_rescan_local_library_if_due`
-        // means existing files become visible right away, and any
-        // file dropped in by an external tool is picked up within a
-        // couple of seconds without a manual refresh.
-        for dir in self.library_dirs() {
-            let _ = std::fs::create_dir_all(&dir);
-        }
-
-        // Load clips based on metadata presence (txt or thumbnail),
-        // not on mp4 presence. This allows server-only clips to appear
-        // in the library immediately after metadata is downloaded.
-        let clips_dir = self.clips_dir();
+    /// Walk `clips_dir` for Mellstroy clip metadata (safe on a worker thread).
+    pub fn scan_mellstroy_clips(clips_dir: &std::path::Path) -> Vec<LibraryClip> {
         let thumbs_dir = clips_dir.join("thumbs");
-        info!("reload_library: clips_dir = {}", clips_dir.display());
-        info!("reload_library: thumbs_dir = {}", thumbs_dir.display());
-        info!("reload_library: clips_dir exists = {}", clips_dir.exists());
-        info!("reload_library: thumbs_dir exists = {}", thumbs_dir.exists());
-        
         let mut clips: Vec<LibraryClip> = Vec::new();
         let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         
@@ -2110,35 +2142,57 @@ impl EditorState {
         }
 
         clips.sort_by_key(|c| c.id);
-        
-        // Log clip counts for debugging
-        let downloaded_count = clips.iter().filter(|c| c.downloaded).count();
-        let server_only_count = clips.iter().filter(|c| !c.downloaded).count();
+        clips
+    }
+
+    /// Full library scan (filesystem only). Safe to run on a worker thread.
+    pub fn scan_library_snapshot(assets_root: std::path::PathBuf) -> LibraryScanSnapshot {
+        let clips_dir = assets_root.join("clips");
+        let dirs = [
+            clips_dir.clone(),
+            assets_root.join("assets").join("sounds"),
+            assets_root.join("assets").join("images"),
+            assets_root.join("assets").join("particles"),
+            assets_root.join("assets").join("videos"),
+        ];
+        for dir in &dirs {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        LibraryScanSnapshot {
+            mellstroy_clips: Self::scan_mellstroy_clips(&clips_dir),
+            sounds: scan_asset_dir(&dirs[1], AssetCategory::Sound),
+            images: scan_asset_dir(&dirs[2], AssetCategory::Image),
+            particles: scan_asset_dir(&dirs[3], AssetCategory::Particle),
+            videos: scan_asset_dir(&dirs[4], AssetCategory::Video),
+        }
+    }
+
+    /// Apply a background scan result on the UI thread.
+    pub fn apply_library_snapshot(&mut self, snap: LibraryScanSnapshot) {
+        let downloaded_count = snap.mellstroy_clips.iter().filter(|c| c.downloaded).count();
+        let server_only_count = snap.mellstroy_clips.iter().filter(|c| !c.downloaded).count();
         tracing::info!(
             "Loaded {} clips ({} downloaded, {} server-only)",
-            clips.len(),
+            snap.mellstroy_clips.len(),
             downloaded_count,
             server_only_count
         );
-        
-        self.library.mellstroy_clips = clips;
-
-        // Also rescan the user's sound / image / particle bundles so the
-        // sub-libraries pick up any new files dropped into their dirs.
-        self.library.sounds = scan_asset_dir(&self.sounds_dir(), AssetCategory::Sound);
-        self.library.images = scan_asset_dir(&self.images_dir(), AssetCategory::Image);
-        self.library.particles = scan_asset_dir(&self.particles_dir(), AssetCategory::Particle);
-
-        // Fetch server clip metadata after local filesystem scan completes
-        // This allows server-only clips to appear in the library immediately
-        self.fetch_server_clips_metadata();
-        self.library.videos = scan_asset_dir(&self.videos_dir(), AssetCategory::Video);
-
-        // Refresh the directory fingerprint so the next
-        // `auto_rescan_local_library_if_due` only triggers an actual
-        // reload when the on-disk state really did change.
+        self.library.mellstroy_clips = snap.mellstroy_clips;
+        self.library.sounds = snap.sounds;
+        self.library.images = snap.images;
+        self.library.particles = snap.particles;
+        self.library.videos = snap.videos;
         self.library_dir_fingerprint = self.compute_library_dir_fingerprint();
         self.last_library_rescan = Some(std::time::Instant::now());
+    }
+
+    pub fn reload_library(&mut self) {
+        for dir in self.library_dirs() {
+            let _ = std::fs::create_dir_all(&dir);
+        }
+        let snap = Self::scan_library_snapshot(self.assets_root.clone());
+        self.apply_library_snapshot(snap);
+        self.fetch_server_clips_metadata();
     }
 
     /// Fetch clip metadata from the server and merge with local clips.
@@ -2149,7 +2203,7 @@ impl EditorState {
     /// 3. Sends a `JobEvent::RefreshLibraryReloaded` to trigger UI refresh
     ///
     /// Gracefully degrades if server is unreachable (logs warning, continues with local-only clips).
-    fn fetch_server_clips_metadata(&self) {
+    pub(crate) fn fetch_server_clips_metadata(&self) {
         // Check if server_url is configured
         if self.server_url.trim().is_empty() {
             tracing::debug!("server_url not configured, skipping server metadata fetch");
@@ -2375,11 +2429,9 @@ impl EditorState {
 
         let now = self.compute_library_dir_fingerprint();
         if now != self.library_dir_fingerprint {
-            // On-disk state changed (file added / removed / replaced
-            // / renamed externally). Run the heavy rebuild — it
-            // re-stamps `library_dir_fingerprint` and bumps
-            // `last_library_rescan` itself.
-            self.reload_library();
+            // On-disk state changed — schedule a debounced background
+            // rescan so the UI thread never blocks on `read_dir`.
+            self.library_reload_pending = true;
         } else {
             // Nothing to do; just bump the timer so we don't busy-poll.
             self.last_library_rescan = Some(std::time::Instant::now());
@@ -3139,6 +3191,14 @@ pub struct CanvasDrag {
     /// resume on release — currently we leave it paused so the user
     /// can review the keyframe they just authored).
     pub was_playing_at_drag_start: bool,
+    /// Element id whose transform is being edited on-canvas without
+    /// touching keyframes yet (animated params only).
+    pub preview_element_id: Option<String>,
+    /// Live world-pixel centre while dragging an animated position.
+    pub preview_world_center: Option<[f32; 2]>,
+    pub preview_rotation_deg: Option<f32>,
+    pub preview_scale: Option<f32>,
+    pub preview_scale_y: Option<f32>,
 }
 
 /// One active snap guideline.
