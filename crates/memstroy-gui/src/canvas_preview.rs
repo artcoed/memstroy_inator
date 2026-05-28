@@ -1303,14 +1303,16 @@ fn draw_single_actor(
         (1080.0_f32, 1920.0)
     };
     let actor_state = keyframe::sample(&actor.layout, t).unwrap_or_default();
-    let actor_scale = actor_state.scale;
-    let actor_scale_y = actor_state.scale_y;
+    let mut actor_scale = actor_state.scale;
+    let mut actor_scale_y = actor_state.scale_y;
+    let mut actor_rotation = actor_state.rotation_deg;
+    apply_canvas_transform_preview(state, &actor.id, &mut actor_rotation, &mut actor_scale, &mut actor_scale_y);
     let mod_delta = if matches!(display_mode, DisplayMode::Active) {
         keyframe::evaluate_modifiers(&actor.modifiers, t - t_in)
     } else {
         keyframe::ModifierDelta::default()
     };
-    let mut actor_rotation = actor_state.rotation_deg + mod_delta.d_rotation_deg;
+    actor_rotation += mod_delta.d_rotation_deg;
     let actor_opacity = actor_state.opacity;
     let actor_flip_x = actor_state.flip_x_anim;
     let actor_flip_y = actor_state.flip_y_anim;
@@ -1359,7 +1361,7 @@ fn draw_single_actor(
 
     let mut frame_shown = false;
     if let Some(fc) = state.frame_caches.get_mut(idx) {
-        if fc.is_ready() {
+        if fc.is_ready() && fc.frame_count > 0 {
             let actor_ck = &state.scene.actors[idx].chroma_key;
             let actor_t_in = state.scene.actors[idx].t_in.unwrap_or(0.0);
             let local_for_anim = (state.playhead - actor_t_in).max(0.0);
@@ -1421,16 +1423,52 @@ fn draw_single_actor(
     }
 
     if !frame_shown {
-        let fill = match display_mode {
-            DisplayMode::Active => Color32::from_rgb(44, 42, 28),
-            _ => Color32::from_rgb(32, 30, 20),
-        };
-        painter.rect_filled(elem_rect, Rounding::same(3.0), fill);
-        painter.text(
-            elem_rect.center(), egui::Align2::CENTER_CENTER,
-            &state.scene.actors[idx].id, egui::FontId::proportional(10.0),
-            Color32::from_rgb(140, 140, 160),
-        );
+        let (extracting, preview_failed, cache_ready) = state
+            .frame_caches
+            .get(idx)
+            .map(|fc| (fc.extracting, fc.failed, fc.is_ready()))
+            .unwrap_or((false, false, false));
+        let preview_pending =
+            !preview_failed && (extracting || !cache_ready);
+
+        // While ffmpeg extracts preview frames, show the library
+        // thumbnail so the user sees the clip land on canvas; once
+        // extraction finishes `frame_shown` flips to the live video.
+        if preview_pending {
+            if let Some(thumb) =
+                crate::panels::clip_thumbnail_for_source(state, &state.scene.actors[idx].source)
+            {
+                let uri = format!("file://{}", thumb.display());
+                let img = egui::Image::from_uri(uri)
+                    .fit_to_exact_size(elem_rect.size())
+                    .maintain_aspect_ratio(true)
+                    .rounding(Rounding::same(3.0));
+                img.paint_at(ui, elem_rect);
+                frame_shown = true;
+            }
+        }
+
+        if !frame_shown {
+            let fill = match display_mode {
+                DisplayMode::Active => Color32::from_rgb(44, 42, 28),
+                _ => Color32::from_rgb(32, 30, 20),
+            };
+            painter.rect_filled(elem_rect, Rounding::same(3.0), fill);
+            let label = if preview_failed {
+                crate::i18n::t("Video preview failed")
+            } else if extracting {
+                crate::i18n::t("Loading video...")
+            } else {
+                state.scene.actors[idx].id.as_str()
+            };
+            painter.text(
+                elem_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                label,
+                egui::FontId::proportional(10.0),
+                Color32::from_rgb(140, 140, 160),
+            );
+        }
     }
 
     let multi_selected = state.canvas_selection.iter().any(|s| *s == Selection::Actor(idx));
@@ -1694,6 +1732,18 @@ fn draw_canvas_overlays_impl(
             DisplayMode::AfterEnd => t_out - t_in,
         };
         let mut ov_state = keyframe::sample(layout, sample_t).unwrap_or_default();
+        let overlay_id: &str = match overlay {
+            Overlay::Text(txt) => &txt.id,
+            Overlay::Image(img) => &img.id,
+            Overlay::Video(vid) => &vid.id,
+        };
+        apply_canvas_transform_preview(
+            state,
+            overlay_id,
+            &mut ov_state.rotation_deg,
+            &mut ov_state.scale,
+            &mut ov_state.scale_y,
+        );
 
         // Apply animation modifiers (additive on top of eased keyframe).
         let modifiers: &[TrackModifier] = match overlay {
@@ -1714,11 +1764,6 @@ fn draw_canvas_overlays_impl(
             Overlay::Text(txt) => txt.parent_id.as_ref(),
             Overlay::Image(img) => img.parent_id.as_ref(),
             Overlay::Video(vid) => vid.parent_id.as_ref(),
-        };
-        let overlay_id: &str = match overlay {
-            Overlay::Text(txt) => &txt.id,
-            Overlay::Image(img) => &img.id,
-            Overlay::Video(vid) => &vid.id,
         };
         let parent_xform_resolved = overlay_parent_id.and_then(|pid| {
             let mut visited = vec![overlay_id.to_string()];
@@ -2931,6 +2976,23 @@ fn apply_parent_transform(child_pos: WorldPos, parent: &ParentTransform) -> Worl
     }
 }
 
+/// Inverse of [`apply_parent_transform`]: map a world centre back to the
+/// stored pre-parent layout value used in `canvas_layouts` / legacy tracks.
+fn inverse_parent_transform(world: WorldPos, parent: &ParentTransform) -> WorldPos {
+    let scale = parent.scale.max(1e-6);
+    let rad = (-parent.rotation_deg).to_radians();
+    let cos_r = rad.cos();
+    let sin_r = rad.sin();
+    let dx = world.x - parent.pos.x;
+    let dy = world.y - parent.pos.y;
+    let sx = dx * cos_r - dy * sin_r;
+    let sy = dx * sin_r + dy * cos_r;
+    WorldPos {
+        x: parent.pos.x + sx / scale,
+        y: parent.pos.y + sy / scale,
+    }
+}
+
 /// world coords relative to the render frame.
 fn get_element_world_pos(
     state: &EditorState,
@@ -2971,12 +3033,27 @@ fn get_element_world_pos(
         }
     }
 
-    // Check canvas_layouts for this element
-    if let Some(cl) = state.scene.canvas_layouts.iter().find(|cl| cl.element_id == element_id) {
-        if let Some(transform) = keyframe::sample(&cl.keyframes, t) {
-            return transform.pos;
+    if state.canvas_drag.preview_element_id.as_deref() == Some(element_id) {
+        if let Some(c) = state.canvas_drag.preview_world_center {
+            // Preview stores the element's world centre while dragging;
+            // parent propagation is applied only when sampling stored data.
+            return WorldPos { x: c[0], y: c[1] };
         }
     }
+
+    let sample_t = if state.canvas_drag.preview_element_id.as_deref() == Some(element_id) {
+        state.canvas_drag.drag_start_playhead.unwrap_or(t)
+    } else {
+        t
+    };
+
+    // Check canvas_layouts for this element (scene-time keyframes).
+    let mut base_pos = if let Some(cl) = state.scene.canvas_layouts.iter().find(|cl| cl.element_id == element_id) {
+        keyframe::sample(&cl.keyframes, sample_t)
+            .map(|transform| transform.pos)
+    } else {
+        None
+    };
 
     // Fallback: convert legacy normalised coords to world pixels.
     //
@@ -2994,18 +3071,19 @@ fn get_element_world_pos(
     let world_w = rw as f32;
     let world_h = rh as f32;
 
-    let base_pos = if let Some(actor_state) = keyframe::sample(legacy_layout, t) {
-        WorldPos {
-            x: actor_state.pos[0] * world_w,
-            y: actor_state.pos[1] * world_h,
+    let base_pos = base_pos.unwrap_or_else(|| {
+        if let Some(actor_state) = keyframe::sample(legacy_layout, sample_t) {
+            WorldPos {
+                x: actor_state.pos[0] * world_w,
+                y: actor_state.pos[1] * world_h,
+            }
+        } else {
+            WorldPos {
+                x: world_w * 0.5,
+                y: world_h * 0.5,
+            }
         }
-    } else {
-        // Default world centre = centre of the reference rectangle.
-        WorldPos {
-            x: world_w * 0.5,
-            y: world_h * 0.5,
-        }
-    };
+    });
 
     // ── Parent transform propagation ──
     // If this element has a parent, apply the parent's accumulated
@@ -3024,12 +3102,146 @@ fn get_element_world_pos(
 
     if let Some(pid) = parent_id {
         let mut visited = vec![element_id.to_string()];
-        if let Some(parent_xform) = resolve_parent_transform(state, &pid, t, &mut visited) {
+        if let Some(parent_xform) = resolve_parent_transform(state, &pid, sample_t, &mut visited) {
             return apply_parent_transform(base_pos, &parent_xform);
         }
     }
 
     base_pos
+}
+
+/// While an animated param is dragged on canvas, layout sampling is frozen
+/// but rotation / scale can still be previewed from `canvas_drag`.
+fn apply_canvas_transform_preview(
+    state: &EditorState,
+    element_id: &str,
+    rotation_deg: &mut f32,
+    scale: &mut f32,
+    scale_y: &mut f32,
+) {
+    if state.canvas_drag.preview_element_id.as_deref() != Some(element_id) {
+        return;
+    }
+    if let Some(r) = state.canvas_drag.preview_rotation_deg {
+        *rotation_deg = r;
+    }
+    if let Some(s) = state.canvas_drag.preview_scale {
+        *scale = s;
+    }
+    if let Some(sy) = state.canvas_drag.preview_scale_y {
+        *scale_y = sy;
+    }
+}
+
+fn selection_element_id(state: &EditorState, sel: Selection) -> Option<String> {
+    match sel {
+        Selection::Actor(i) => state.scene.actors.get(i).map(|a| a.id.clone()),
+        Selection::Overlay(i) => state.scene.overlays.get(i).and_then(|ov| match ov {
+            Overlay::Text(t) => Some(t.id.clone()),
+            Overlay::Image(im) => Some(im.id.clone()),
+            Overlay::Video(v) => Some(v.id.clone()),
+        }),
+        _ => None,
+    }
+}
+
+fn selection_position_animated(state: &EditorState, sel: Selection) -> bool {
+    match sel {
+        Selection::Actor(i) => state.scene.actors.get(i).map(|a| {
+            a.animated_params.contains(memstroy_core::param_ids::POS_X)
+                || a.animated_params.contains(memstroy_core::param_ids::POS_Y)
+        }).unwrap_or(false),
+        Selection::Overlay(i) => state.scene.overlays.get(i).map(|ov| {
+            let ap = match ov {
+                Overlay::Text(t) => &t.animated_params,
+                Overlay::Image(im) => &im.animated_params,
+                Overlay::Video(v) => &v.animated_params,
+            };
+            ap.contains(memstroy_core::param_ids::POS_X)
+                || ap.contains(memstroy_core::param_ids::POS_Y)
+        }).unwrap_or(false),
+        _ => false,
+    }
+}
+
+fn selection_rotation_animated(state: &EditorState, sel: Selection) -> bool {
+    match sel {
+        Selection::Actor(i) => state
+            .scene
+            .actors
+            .get(i)
+            .map(|a| a.animated_params.contains(memstroy_core::param_ids::ROTATION))
+            .unwrap_or(false),
+        Selection::Overlay(i) => state.scene.overlays.get(i).map(|ov| {
+            let ap = match ov {
+                Overlay::Text(t) => &t.animated_params,
+                Overlay::Image(im) => &im.animated_params,
+                Overlay::Video(v) => &v.animated_params,
+            };
+            ap.contains(memstroy_core::param_ids::ROTATION)
+        }).unwrap_or(false),
+        _ => false,
+    }
+}
+
+fn selection_scale_animated(state: &EditorState, sel: Selection) -> bool {
+    match sel {
+        Selection::Actor(i) => state.scene.actors.get(i).map(|a| {
+            a.animated_params.contains(memstroy_core::param_ids::SCALE)
+                || a.animated_params.contains(memstroy_core::param_ids::SCALE_Y)
+        }).unwrap_or(false),
+        Selection::Overlay(i) => state.scene.overlays.get(i).map(|ov| {
+            let ap = match ov {
+                Overlay::Text(t) => &t.animated_params,
+                Overlay::Image(im) => &im.animated_params,
+                Overlay::Video(v) => &v.animated_params,
+            };
+            ap.contains(memstroy_core::param_ids::SCALE)
+                || ap.contains(memstroy_core::param_ids::SCALE_Y)
+        }).unwrap_or(false),
+        _ => false,
+    }
+}
+
+fn clear_canvas_drag_preview(state: &mut EditorState) {
+    state.canvas_drag.preview_element_id = None;
+    state.canvas_drag.preview_world_center = None;
+    state.canvas_drag.preview_rotation_deg = None;
+    state.canvas_drag.preview_scale = None;
+    state.canvas_drag.preview_scale_y = None;
+}
+
+fn commit_canvas_drag_preview(state: &mut EditorState) {
+    let sel = state.selection;
+    if sel == Selection::None {
+        clear_canvas_drag_preview(state);
+        return;
+    }
+    if state.canvas_drag.preview_world_center.is_none()
+        && state.canvas_drag.preview_rotation_deg.is_none()
+        && state.canvas_drag.preview_scale.is_none()
+        && state.canvas_drag.preview_scale_y.is_none()
+    {
+        return;
+    }
+    state.canvas_drag.drag_start_playhead = None;
+    if let Some(center) = state.canvas_drag.preview_world_center.take() {
+        let token = canvas_drag_token(CANVAS_TOKEN_POS, sel);
+        write_selection_world_center(state, sel, center, token, false);
+    }
+    if let Some(rot) = state.canvas_drag.preview_rotation_deg.take() {
+        let token = canvas_drag_token(CANVAS_TOKEN_ROTATION, sel);
+        write_selection_rotation(state, sel, rot, token, false);
+    }
+    if let Some(scale) = state.canvas_drag.preview_scale.take() {
+        let token = canvas_drag_token(CANVAS_TOKEN_SCALE, sel);
+        write_selection_scale(state, sel, scale, token, false);
+    }
+    if let Some(scale_y) = state.canvas_drag.preview_scale_y.take() {
+        let token = canvas_drag_token(CANVAS_TOKEN_SCALE_Y, sel);
+        write_selection_scale_y(state, sel, scale_y, token, false);
+    }
+    state.canvas_drag.preview_element_id = None;
 }
 
 
@@ -3042,6 +3254,37 @@ fn get_element_world_pos(
 const ELEM_HANDLE_SIZE: f32 = 7.0;
 const RF_HANDLE_SIZE: f32 = 8.0;
 const RF_CENTER_RADIUS: f32 = 8.0;
+
+/// Screen-space gizmo for the selected actor / overlay (rotation-aware).
+struct ElementGizmo {
+    center: Pos2,
+    half_w: f32,
+    half_h: f32,
+    rotation_deg: f32,
+}
+
+impl ElementGizmo {
+    fn local_to_screen(&self, lx: f32, ly: f32) -> Pos2 {
+        let theta = self.rotation_deg.to_radians();
+        let (s, c) = (theta.sin(), theta.cos());
+        let rx = lx * c - ly * s;
+        let ry = lx * s + ly * c;
+        Pos2::new(self.center.x + rx, self.center.y + ry)
+    }
+
+    fn screen_to_local(&self, p: Pos2) -> (f32, f32) {
+        let theta = (-self.rotation_deg).to_radians();
+        let (s, c) = (theta.sin(), theta.cos());
+        let dx = p.x - self.center.x;
+        let dy = p.y - self.center.y;
+        (dx * c - dy * s, dx * s + dy * c)
+    }
+
+    fn contains_screen(&self, p: Pos2) -> bool {
+        let (lx, ly) = self.screen_to_local(p);
+        lx.abs() <= self.half_w && ly.abs() <= self.half_h
+    }
+}
 
 fn draw_selection_gizmo(
     ui: &mut egui::Ui,
@@ -3162,6 +3405,9 @@ fn draw_selection_gizmo(
             }
         }
     } else if response.drag_stopped() || !response.dragged() {
+        if response.drag_stopped() {
+            commit_canvas_drag_preview(state);
+        }
         if !response.dragged() && state.canvas_drag.mode != crate::state::CanvasDragMode::None {
             // ── Marquee commit ──
             // The drag is ending (or the response says the pointer is
@@ -3186,6 +3432,7 @@ fn draw_selection_gizmo(
             // edits go back to using the live playhead.
             state.canvas_drag.drag_start_playhead = None;
             state.canvas_drag.was_playing_at_drag_start = false;
+            clear_canvas_drag_preview(state);
         }
     }
 
@@ -3288,13 +3535,10 @@ fn decide_drag_mode(
 
     // 0. Rotation handle takes priority over corner/edge handles when the
     //    user clicks the small circle floating above the bbox.
-    if let Some(elem_rect) = selected_element_screen_rect(state, full_rect, viewport_size) {
-        let handle_pos = rotation_handle_screen_pos(elem_rect);
-        // Same 3.0× hit-radius rationale as for the resize handles —
-        // press should always succeed where hover advertised the
-        // gesture, accounting for egui's drag-start drift.
+    if let Some(gizmo) = selected_element_gizmo(state, full_rect, viewport_size) {
+        let handle_pos = rotation_handle_screen_pos_gizmo(&gizmo);
         if (start - handle_pos).length() < ROTATION_HANDLE_RADIUS * 3.0 {
-            let center = elem_rect.center();
+            let center = gizmo.center;
             let initial_rot_deg = current_selection_rotation(state).unwrap_or(0.0);
             let dx = start.x - center.x;
             let dy = start.y - center.y;
@@ -3308,42 +3552,35 @@ fn decide_drag_mode(
 
     // 1. If a selected element is present and the click is on one of its
     //    8 resize handles → ResizeSelection.
-    if let Some(elem_rect) = selected_element_screen_rect(state, full_rect, viewport_size) {
-        // Convert screen rect to world rect for anchor computation.
+    if let Some(gizmo) = selected_element_gizmo(state, full_rect, viewport_size) {
         let zoom = state.canvas_viewport.zoom.max(0.0001);
-        let world_min_x = state.canvas_viewport.center.x
-            + (elem_rect.min.x - full_rect.min.x - viewport_size[0] * 0.5) / zoom;
-        let world_min_y = state.canvas_viewport.center.y
-            + (elem_rect.min.y - full_rect.min.y - viewport_size[1] * 0.5) / zoom;
-        let world_max_x = state.canvas_viewport.center.x
-            + (elem_rect.max.x - full_rect.min.x - viewport_size[0] * 0.5) / zoom;
-        let world_max_y = state.canvas_viewport.center.y
-            + (elem_rect.max.y - full_rect.min.y - viewport_size[1] * 0.5) / zoom;
-        let world_cx = (world_min_x + world_max_x) * 0.5;
-        let world_cy = (world_min_y + world_max_y) * 0.5;
+        let screen_to_world_xy = |p: Pos2| -> [f32; 2] {
+            let w = state.canvas_viewport.screen_to_world(
+                [p.x - full_rect.min.x, p.y - full_rect.min.y],
+                viewport_size,
+            );
+            [w.x, w.y]
+        };
+        let hw = gizmo.half_w;
+        let hh = gizmo.half_h;
+        let tl = screen_to_world_xy(gizmo.local_to_screen(-hw, -hh));
+        let tr = screen_to_world_xy(gizmo.local_to_screen(hw, -hh));
+        let br = screen_to_world_xy(gizmo.local_to_screen(hw, hh));
+        let bl = screen_to_world_xy(gizmo.local_to_screen(-hw, hh));
+        let world_cx = screen_to_world_xy(gizmo.center)[0];
+        let world_cy = screen_to_world_xy(gizmo.center)[1];
 
-        // Handle screen positions paired with handle ID and opposite-anchor
-        // world positions:
-        //   0..3 = corners (TL, TR, BR, BL)
-        //   4..7 = edge midpoints (Top, Right, Bottom, Left)
         let handle_specs: [(Pos2, u8, [f32; 2]); 8] = [
-            // Corner: TL → anchor BR
-            (elem_rect.left_top(),         0, [world_max_x, world_max_y]),
-            // Corner: TR → anchor BL
-            (elem_rect.right_top(),        1, [world_min_x, world_max_y]),
-            // Corner: BR → anchor TL
-            (elem_rect.right_bottom(),     2, [world_min_x, world_min_y]),
-            // Corner: BL → anchor TR
-            (elem_rect.left_bottom(),      3, [world_max_x, world_min_y]),
-            // Edge top → anchor bottom-mid
-            (Pos2::new(elem_rect.center().x, elem_rect.min.y), 4, [world_cx, world_max_y]),
-            // Edge right → anchor left-mid
-            (Pos2::new(elem_rect.max.x, elem_rect.center().y), 5, [world_min_x, world_cy]),
-            // Edge bottom → anchor top-mid
-            (Pos2::new(elem_rect.center().x, elem_rect.max.y), 6, [world_cx, world_min_y]),
-            // Edge left → anchor right-mid
-            (Pos2::new(elem_rect.min.x, elem_rect.center().y), 7, [world_max_x, world_cy]),
+            (gizmo.local_to_screen(-hw, -hh), 0, br),
+            (gizmo.local_to_screen(hw, -hh), 1, bl),
+            (gizmo.local_to_screen(hw, hh), 2, tl),
+            (gizmo.local_to_screen(-hw, hh), 3, tr),
+            (gizmo.local_to_screen(0.0, -hh), 4, screen_to_world_xy(gizmo.local_to_screen(0.0, hh))),
+            (gizmo.local_to_screen(hw, 0.0), 5, screen_to_world_xy(gizmo.local_to_screen(-hw, 0.0))),
+            (gizmo.local_to_screen(0.0, hh), 6, screen_to_world_xy(gizmo.local_to_screen(0.0, -hh))),
+            (gizmo.local_to_screen(-hw, 0.0), 7, screen_to_world_xy(gizmo.local_to_screen(hw, 0.0))),
         ];
+        let _ = (zoom, world_cx, world_cy, tl, tr);
 
         for (handle_pos, handle_id, anchor_world) in handle_specs.iter() {
             // Hit radius is intentionally a touch larger than the
@@ -3373,7 +3610,7 @@ fn decide_drag_mode(
             }
         }
         // 2. Click inside the selected element body → MoveSelection.
-        if elem_rect.contains(start) {
+        if gizmo.contains_screen(start) {
             return move_selection_mode(state);
         }
     }
@@ -3929,6 +4166,10 @@ fn rotation_handle_screen_pos(elem_rect: Rect) -> Pos2 {
     Pos2::new(elem_rect.center().x, elem_rect.min.y - ROTATION_HANDLE_OFFSET)
 }
 
+fn rotation_handle_screen_pos_gizmo(g: &ElementGizmo) -> Pos2 {
+    g.local_to_screen(0.0, -g.half_h - ROTATION_HANDLE_OFFSET)
+}
+
 fn current_selection_scale_y(state: &EditorState) -> Option<f32> {
     let t = state.playhead;
     match state.selection {
@@ -4067,7 +4308,8 @@ fn canvas_drag_token(category: &'static str, sel: Selection) -> u64 {
 fn set_selection_world_center(state: &mut EditorState, center: [f32; 2]) {
     let token = canvas_drag_token(CANVAS_TOKEN_POS, state.selection);
     let sel = state.selection;
-    write_selection_world_center(state, sel, center, token);
+    let defer = state.canvas_drag.drag_start_playhead.is_some();
+    write_selection_world_center(state, sel, center, token, defer);
 }
 
 // ─── MULTI-DRAG BROADCAST HELPERS ────────────────────────────────────
@@ -4165,7 +4407,7 @@ fn broadcast_multi_translation(state: &mut EditorState, total_dx: f32, total_dy:
             entry.initial_pos[0] + total_dx,
             entry.initial_pos[1] + total_dy,
         ];
-        write_selection_world_center(state, entry.selection, new_center, token);
+        write_selection_world_center(state, entry.selection, new_center, token, true);
     }
 }
 
@@ -4184,8 +4426,8 @@ fn broadcast_multi_scale(state: &mut EditorState, scale_factor: f32, scale_y_fac
         if entry.selection == primary { continue; }
         let new_scale = (entry.initial_scale * scale_factor).clamp(0.05, 100.0);
         let new_scale_y = (entry.initial_scale_y * scale_y_factor).clamp(0.05, 100.0);
-        write_selection_scale(state, entry.selection, new_scale, token_x);
-        write_selection_scale_y(state, entry.selection, new_scale_y, token_y);
+        write_selection_scale(state, entry.selection, new_scale, token_x, true);
+        write_selection_scale_y(state, entry.selection, new_scale_y, token_y, true);
     }
 }
 
@@ -4203,7 +4445,7 @@ fn broadcast_multi_rotation(state: &mut EditorState, delta_deg: f32) {
     for entry in snapshot {
         if entry.selection == primary { continue; }
         let new_rot = (entry.initial_rotation + delta_deg).clamp(-3600.0, 3600.0);
-        write_selection_rotation(state, entry.selection, new_rot, token);
+        write_selection_rotation(state, entry.selection, new_rot, token, true);
     }
 }
 
@@ -4217,7 +4459,16 @@ fn write_selection_world_center(
     sel: Selection,
     center: [f32; 2],
     token: u64,
+    defer_animated: bool,
 ) {
+    if defer_animated
+        && state.canvas_drag.drag_start_playhead.is_some()
+        && selection_position_animated(state, sel)
+    {
+        state.canvas_drag.preview_element_id = selection_element_id(state, sel);
+        state.canvas_drag.preview_world_center = Some(center);
+        return;
+    }
     // Re-anchor every keyframe write to the playhead captured at drag
     // start (frozen for the duration of the gesture). Outside an active
     // drag the live playhead is used so single inspector edits still
@@ -4240,9 +4491,19 @@ fn write_selection_world_center(
             // even when the inspector clearly showed the param as
             // static.
             let animated_clone = state.scene.actors[idx].animated_params.clone();
+            let parent_id = state.scene.actors[idx].parent_id.clone();
+            let mut stored_center = WorldPos { x: center[0], y: center[1] };
+            if let Some(pid) = parent_id {
+                let mut visited = vec![actor_id.clone()];
+                if let Some(pxf) = resolve_parent_transform(state, &pid, t, &mut visited) {
+                    stored_center = inverse_parent_transform(stored_center, &pxf);
+                }
+            }
             if let Some(cl) = state.scene.canvas_layouts.iter_mut()
                 .find(|cl| cl.element_id == actor_id)
             {
+                let sx = stored_center.x;
+                let sy = stored_center.y;
                 crate::kf_anim::write_canvas_param(
                     &mut cl.keyframes,
                     &animated_clone,
@@ -4252,8 +4513,8 @@ fn write_selection_world_center(
                     ],
                     t,
                     |v| {
-                        v.pos.x = center[0];
-                        v.pos.y = center[1];
+                        v.pos.x = sx;
+                        v.pos.y = sy;
                     },
                 );
                 return;
@@ -4267,7 +4528,7 @@ fn write_selection_world_center(
             let world_w = rw as f32;
             let world_h = rh as f32;
             if world_w <= 0.0 || world_h <= 0.0 { return; }
-            let new_norm = [center[0] / world_w, center[1] / world_h];
+            let new_norm = [stored_center.x / world_w, stored_center.y / world_h];
             let actor = &mut state.scene.actors[idx];
             crate::kf_anim::write_actor_param(
                 &mut actor.layout, &mut actor.animated_params, t,
@@ -4282,13 +4543,30 @@ fn write_selection_world_center(
         }
         Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
             let local_t = overlay_clip_local_time_at(state, idx, t);
+            let ov_id = match &state.scene.overlays[idx] {
+                Overlay::Text(t) => t.id.clone(),
+                Overlay::Image(im) => im.id.clone(),
+                Overlay::Video(v) => v.id.clone(),
+            };
+            let parent_id = match &state.scene.overlays[idx] {
+                Overlay::Text(t) => t.parent_id.clone(),
+                Overlay::Image(im) => im.parent_id.clone(),
+                Overlay::Video(v) => v.parent_id.clone(),
+            };
+            let mut stored_center = WorldPos { x: center[0], y: center[1] };
+            if let Some(pid) = parent_id {
+                let mut visited = vec![ov_id];
+                if let Some(pxf) = resolve_parent_transform(state, &pid, t, &mut visited) {
+                    stored_center = inverse_parent_transform(stored_center, &pxf);
+                }
+            }
             // Same decoupled-from-rf world→norm conversion as the
             // actor branch above.
             let [rw, rh] = state.scene.render_frame.resolution;
             let world_w = rw as f32;
             let world_h = rh as f32;
             if world_w <= 0.0 || world_h <= 0.0 { return; }
-            let new_norm = [center[0] / world_w, center[1] / world_h];
+            let new_norm = [stored_center.x / world_w, stored_center.y / world_h];
             let (layout, animated_params) =
                 overlay_layout_and_animated_mut(&mut state.scene.overlays[idx]);
             crate::kf_anim::write_overlay_param(
@@ -4334,7 +4612,8 @@ fn write_selection_world_center(
 fn set_selection_scale_y(state: &mut EditorState, new_scale_y: f32) {
     let token = canvas_drag_token(CANVAS_TOKEN_SCALE_Y, state.selection);
     let sel = state.selection;
-    write_selection_scale_y(state, sel, new_scale_y, token);
+    let defer = state.canvas_drag.drag_start_playhead.is_some();
+    write_selection_scale_y(state, sel, new_scale_y, token, defer);
 }
 
 fn write_selection_scale_y(
@@ -4342,8 +4621,17 @@ fn write_selection_scale_y(
     sel: Selection,
     new_scale_y: f32,
     token: u64,
+    defer_animated: bool,
 ) {
     let s = new_scale_y.clamp(0.05, 100.0);
+    if defer_animated
+        && state.canvas_drag.drag_start_playhead.is_some()
+        && selection_scale_animated(state, sel)
+    {
+        state.canvas_drag.preview_element_id = selection_element_id(state, sel);
+        state.canvas_drag.preview_scale_y = Some(s);
+        return;
+    }
     let t = state.canvas_drag.drag_start_playhead.unwrap_or(state.playhead);
     if state.last_drag_group != Some(token) {
         state.undo.push(&state.scene);
@@ -4377,7 +4665,8 @@ fn write_selection_scale_y(
 fn set_selection_scale(state: &mut EditorState, new_scale: f32) {
     let token = canvas_drag_token(CANVAS_TOKEN_SCALE, state.selection);
     let sel = state.selection;
-    write_selection_scale(state, sel, new_scale, token);
+    let defer = state.canvas_drag.drag_start_playhead.is_some();
+    write_selection_scale(state, sel, new_scale, token, defer);
 }
 
 fn write_selection_scale(
@@ -4385,8 +4674,17 @@ fn write_selection_scale(
     sel: Selection,
     new_scale: f32,
     token: u64,
+    defer_animated: bool,
 ) {
     let s = new_scale.clamp(0.05, 100.0);
+    if defer_animated
+        && state.canvas_drag.drag_start_playhead.is_some()
+        && selection_scale_animated(state, sel)
+    {
+        state.canvas_drag.preview_element_id = selection_element_id(state, sel);
+        state.canvas_drag.preview_scale = Some(s);
+        return;
+    }
     let t = state.canvas_drag.drag_start_playhead.unwrap_or(state.playhead);
     if state.last_drag_group != Some(token) {
         state.undo.push(&state.scene);
@@ -4441,7 +4739,8 @@ fn apply_scale_delta(state: &mut EditorState, delta: f32) {
 fn set_selection_rotation(state: &mut EditorState, new_rot_deg: f32) {
     let token = canvas_drag_token(CANVAS_TOKEN_ROTATION, state.selection);
     let sel = state.selection;
-    write_selection_rotation(state, sel, new_rot_deg, token);
+    let defer = state.canvas_drag.drag_start_playhead.is_some();
+    write_selection_rotation(state, sel, new_rot_deg, token, defer);
 }
 
 fn write_selection_rotation(
@@ -4449,7 +4748,16 @@ fn write_selection_rotation(
     sel: Selection,
     new_rot_deg: f32,
     token: u64,
+    defer_animated: bool,
 ) {
+    if defer_animated
+        && state.canvas_drag.drag_start_playhead.is_some()
+        && selection_rotation_animated(state, sel)
+    {
+        state.canvas_drag.preview_element_id = selection_element_id(state, sel);
+        state.canvas_drag.preview_rotation_deg = Some(new_rot_deg);
+        return;
+    }
     let t = state.canvas_drag.drag_start_playhead.unwrap_or(state.playhead);
     if state.last_drag_group != Some(token) {
         state.undo.push(&state.scene);
@@ -4680,6 +4988,24 @@ fn overlay_clip_local_time_at(state: &EditorState, ov_idx: usize, scene_t: f32) 
     (scene_t - t_in).max(0.0)
 }
 
+/// Axis-aligned hit test in an oriented rectangle (world space).
+fn world_point_in_oriented_rect(
+    pos: WorldPos,
+    center: WorldPos,
+    half_w: f32,
+    half_h: f32,
+    rotation_deg: f32,
+) -> bool {
+    let rad = (-rotation_deg).to_radians();
+    let cos_r = rad.cos();
+    let sin_r = rad.sin();
+    let dx = pos.x - center.x;
+    let dy = pos.y - center.y;
+    let lx = dx * cos_r - dy * sin_r;
+    let ly = dx * sin_r + dy * cos_r;
+    lx.abs() <= half_w && ly.abs() <= half_h
+}
+
 /// Lightweight hit sniffer (read-only) — returns what would be selected at a
 /// given world position without mutating the editor state.
 fn sniff_hit(state: &EditorState, pos: WorldPos) -> Option<Selection> {
@@ -4727,14 +5053,39 @@ fn sniff_hit(state: &EditorState, pos: WorldPos) -> Option<Selection> {
         let sample_t = if t >= t_in && t <= t_out { t - t_in }
             else if t < t_in { 0.0 } else { t_out - t_in };
         let ov_state = keyframe::sample(layout, sample_t).unwrap_or_default();
-        let ov_world = WorldPos {
-            x: ov_state.pos[0] * world_w,
-            y: ov_state.pos[1] * world_h,
+        let ov_id = match overlay {
+            Overlay::Text(o) => o.id.as_str(),
+            Overlay::Image(o) => o.id.as_str(),
+            Overlay::Video(o) => o.id.as_str(),
         };
+        let ov_world = get_element_world_pos(state, ov_id, &[], t);
         let (ew, eh) = overlay_bbox_with_state(overlay, &ov_state, state);
-        if pos.x >= ov_world.x - ew * 0.5 && pos.x <= ov_world.x + ew * 0.5
-            && pos.y >= ov_world.y - eh * 0.5 && pos.y <= ov_world.y + eh * 0.5
-        {
+        let mut rotation_deg = ov_state.rotation_deg;
+        let mut ov_scale = ov_state.scale;
+        let mut ov_scale_y = ov_state.scale_y;
+        apply_canvas_transform_preview(
+            state,
+            ov_id,
+            &mut rotation_deg,
+            &mut ov_scale,
+            &mut ov_scale_y,
+        );
+        let mut parent_scale = 1.0_f32;
+        let parent_id = match overlay {
+            Overlay::Text(o) => o.parent_id.as_ref(),
+            Overlay::Image(o) => o.parent_id.as_ref(),
+            Overlay::Video(o) => o.parent_id.as_ref(),
+        };
+        if let Some(pid) = parent_id {
+            let mut visited = vec![ov_id.to_string()];
+            if let Some(pxf) = resolve_parent_transform(state, pid, t, &mut visited) {
+                rotation_deg += pxf.rotation_deg;
+                parent_scale *= pxf.scale;
+            }
+        }
+        let half_w = ew * parent_scale * 0.5;
+        let half_h = eh * parent_scale * 0.5;
+        if world_point_in_oriented_rect(pos, ov_world, half_w, half_h, rotation_deg) {
             return Some(Selection::Overlay(idx));
         }
     }
@@ -4743,8 +5094,16 @@ fn sniff_hit(state: &EditorState, pos: WorldPos) -> Option<Selection> {
         if !actor.visible { continue; }
         let world_pos = get_element_world_pos(state, &actor.id, &actor.layout, t);
         let actor_st = keyframe::sample(&actor.layout, t).unwrap_or_default();
-        let actor_scale = actor_st.scale;
+        let mut actor_scale = actor_st.scale;
         let actor_scale_y = actor_st.scale_y;
+        let mut rotation_deg = actor_st.rotation_deg;
+        if let Some(ref pid) = actor.parent_id {
+            let mut visited = vec![actor.id.clone()];
+            if let Some(pxf) = resolve_parent_transform(state, pid, t, &mut visited) {
+                rotation_deg += pxf.rotation_deg;
+                actor_scale *= pxf.scale;
+            }
+        }
         let (base_w, base_h) = if let Some(fc) = state.frame_caches.get(idx) {
             if fc.is_ready() && fc.frame_count > 0 {
                 (fc.source_width as f32, fc.source_height as f32)
@@ -4752,94 +5111,152 @@ fn sniff_hit(state: &EditorState, pos: WorldPos) -> Option<Selection> {
         } else { (1080.0, 1920.0) };
         let half_w = base_w * actor_scale * 0.5;
         let half_h = base_h * actor_scale * actor_scale_y * 0.5;
-        if pos.x >= world_pos.x - half_w && pos.x <= world_pos.x + half_w
-            && pos.y >= world_pos.y - half_h && pos.y <= world_pos.y + half_h
-        {
+        if world_point_in_oriented_rect(pos, world_pos, half_w, half_h, rotation_deg) {
             return Some(Selection::Actor(idx));
         }
     }
     None
 }
 
-/// Compute the screen-space rectangle of the selected element (actor/overlay).
+/// Rotation-aware screen gizmo for the current selection.
+fn selected_element_gizmo(
+    state: &EditorState,
+    full_rect: Rect,
+    viewport_size: [f32; 2],
+) -> Option<ElementGizmo> {
+    let t = state.playhead;
+    match state.selection {
+        Selection::Actor(idx) if idx < state.scene.actors.len() => {
+            let actor = &state.scene.actors[idx];
+            if !actor.visible {
+                return None;
+            }
+            let sample_t = state
+                .canvas_drag
+                .drag_start_playhead
+                .filter(|_| state.canvas_drag.preview_element_id.as_deref() == Some(actor.id.as_str()))
+                .unwrap_or(t);
+            let world_pos = get_element_world_pos(state, &actor.id, &actor.layout, t);
+            let actor_st = keyframe::sample(&actor.layout, sample_t).unwrap_or_default();
+            let mut actor_scale = actor_st.scale;
+            let mut actor_scale_y = actor_st.scale_y;
+            let mut rotation_deg = actor_st.rotation_deg;
+            apply_canvas_transform_preview(
+                state,
+                &actor.id,
+                &mut rotation_deg,
+                &mut actor_scale,
+                &mut actor_scale_y,
+            );
+            if let Some(ref pid) = actor.parent_id {
+                let mut visited = vec![actor.id.clone()];
+                if let Some(pxf) = resolve_parent_transform(state, pid, sample_t, &mut visited) {
+                    rotation_deg += pxf.rotation_deg;
+                    actor_scale *= pxf.scale;
+                }
+            }
+            let (base_w, base_h) = if let Some(fc) = state.frame_caches.get(idx) {
+                if fc.is_ready() && fc.frame_count > 0 {
+                    (fc.source_width as f32, fc.source_height as f32)
+                } else {
+                    (1080.0, 1920.0)
+                }
+            } else {
+                (1080.0, 1920.0)
+            };
+            let center_screen = state.canvas_viewport.world_to_screen(world_pos, viewport_size);
+            let zoom = state.canvas_viewport.zoom;
+            Some(ElementGizmo {
+                center: Pos2::new(
+                    full_rect.min.x + center_screen[0],
+                    full_rect.min.y + center_screen[1],
+                ),
+                half_w: base_w * actor_scale * 0.5 * zoom,
+                half_h: base_h * actor_scale * actor_scale_y * 0.5 * zoom,
+                rotation_deg,
+            })
+        }
+        Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
+            let overlay = &state.scene.overlays[idx];
+            let (ov_id, t_in, t_out, layout, parent_id) = match overlay {
+                Overlay::Text(txt) => (
+                    txt.id.as_str(),
+                    txt.t_in,
+                    txt.t_out,
+                    &txt.layout,
+                    txt.parent_id.as_ref(),
+                ),
+                Overlay::Image(img) => (
+                    img.id.as_str(),
+                    img.t_in,
+                    img.t_out,
+                    &img.layout,
+                    img.parent_id.as_ref(),
+                ),
+                Overlay::Video(vid) => (
+                    vid.id.as_str(),
+                    vid.t_in,
+                    vid.t_out,
+                    &vid.layout,
+                    vid.parent_id.as_ref(),
+                ),
+            };
+            let sample_t = if t >= t_in && t <= t_out { t - t_in } else { 0.0 };
+            let ov_state = keyframe::sample(layout, sample_t).unwrap_or_default();
+            let world_pos = get_element_world_pos(state, ov_id, &[], t);
+            let (elem_w, elem_h) = overlay_bbox_with_state(overlay, &ov_state, state);
+            let mut rotation_deg = ov_state.rotation_deg;
+            let mut ov_scale = ov_state.scale;
+            let mut ov_scale_y = ov_state.scale_y;
+            apply_canvas_transform_preview(
+                state,
+                ov_id,
+                &mut rotation_deg,
+                &mut ov_scale,
+                &mut ov_scale_y,
+            );
+            let mut parent_scale = 1.0_f32;
+            if let Some(pid) = parent_id {
+                let mut visited = vec![ov_id.to_string()];
+                if let Some(pxf) = resolve_parent_transform(state, pid, t, &mut visited) {
+                    rotation_deg += pxf.rotation_deg;
+                    parent_scale *= pxf.scale;
+                }
+            }
+            let center_screen = state.canvas_viewport.world_to_screen(world_pos, viewport_size);
+            let zoom = state.canvas_viewport.zoom;
+            Some(ElementGizmo {
+                center: Pos2::new(
+                    full_rect.min.x + center_screen[0],
+                    full_rect.min.y + center_screen[1],
+                ),
+                half_w: elem_w * parent_scale * 0.5 * zoom,
+                half_h: elem_h * parent_scale * 0.5 * zoom,
+                rotation_deg,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Axis-aligned bounding rect of the selected element (for legacy callers).
 fn selected_element_screen_rect(
     state: &EditorState,
     full_rect: Rect,
     viewport_size: [f32; 2],
 ) -> Option<Rect> {
-    let t = state.playhead;
-    match state.selection {
-        Selection::Actor(idx) if idx < state.scene.actors.len() => {
-            let actor = &state.scene.actors[idx];
-            if !actor.visible { return None; }
-            let world_pos = get_element_world_pos(state, &actor.id, &actor.layout, t);
-            let actor_st = keyframe::sample(&actor.layout, t).unwrap_or_default();
-            let actor_scale = actor_st.scale;
-            let actor_scale_y = actor_st.scale_y;
-            let (base_w, base_h) = if let Some(fc) = state.frame_caches.get(idx) {
-                if fc.is_ready() && fc.frame_count > 0 {
-                    (fc.source_width as f32, fc.source_height as f32)
-                } else { (1080.0, 1920.0) }
-            } else { (1080.0, 1920.0) };
-            let elem_width = base_w * actor_scale;
-            let elem_height = base_h * actor_scale * actor_scale_y;
-            let center_screen = state.canvas_viewport.world_to_screen(world_pos, viewport_size);
-            let half_w = elem_width * 0.5 * state.canvas_viewport.zoom;
-            let half_h = elem_height * 0.5 * state.canvas_viewport.zoom;
-            Some(Rect::from_center_size(
-                Pos2::new(full_rect.min.x + center_screen[0], full_rect.min.y + center_screen[1]),
-                Vec2::new(half_w * 2.0, half_h * 2.0),
-            ))
-        }
-        Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
-            let overlay = &state.scene.overlays[idx];
-            let (t_in, t_out, layout) = match overlay {
-                Overlay::Text(txt) => (txt.t_in, txt.t_out, &txt.layout),
-                Overlay::Image(img) => (img.t_in, img.t_out, &img.layout),
-                Overlay::Video(vid) => (vid.t_in, vid.t_out, &vid.layout),
-            };
-            let sample_t = if t >= t_in && t <= t_out { t - t_in } else { 0.0 };
-            let ov_state = keyframe::sample(layout, sample_t).unwrap_or_default();
-            // World-fixed dims — `pos` is interpreted against the
-            // resolution rectangle anchored at world (0, 0).
-            // Mirrors `draw_canvas_overlays`: the render frame is a
-            // pure camera, its pos / zoom never drag world-space
-            // elements, so the gizmo / hit-test must NOT shift with
-            // rf either.
-            let rf = &state.scene.render_frame;
-            let [rw, rh] = rf.resolution;
-            let world_w = rw as f32;
-            let world_h = rh as f32;
-            let world_pos = WorldPos {
-                x: ov_state.pos[0] * world_w,
-                y: ov_state.pos[1] * world_h,
-            };
-            // Use the texture-aware bbox so resize handles snap to the
-            // image's real dimensions instead of the legacy 200×200
-            // placeholder square that used to bunch them in the centre.
-            let (elem_w, elem_h) = overlay_bbox_with_state(overlay, &ov_state, state);
-            let center_screen = state.canvas_viewport.world_to_screen(world_pos, viewport_size);
-            let half_w = elem_w * 0.5 * state.canvas_viewport.zoom;
-            let half_h = elem_h * 0.5 * state.canvas_viewport.zoom;
-            Some(Rect::from_center_size(
-                Pos2::new(full_rect.min.x + center_screen[0], full_rect.min.y + center_screen[1]),
-                Vec2::new(half_w * 2.0, half_h * 2.0),
-            ))
-        }
-        Selection::RenderFrame => {
-            // The render frame is selectable like any other element so the
-            // user can rotate/resize/reposition it from the canvas. We
-            // intentionally return `None` here so the generic AABB
-            // handles drawn by `draw_selection_handles` don't appear on
-            // top of the rotated handles drawn by `draw_render_frame`.
-            // The resize / move drag modes for the render frame are
-            // detected separately in `decide_drag_mode` using rotated
-            // corner positions, and the rotated body hit-test uses the
-            // OBB so a click inside the visible frame still selects it.
-            None
-        }
-        _ => None,
+    let g = selected_element_gizmo(state, full_rect, viewport_size)?;
+    let corners = [
+        g.local_to_screen(-g.half_w, -g.half_h),
+        g.local_to_screen(g.half_w, -g.half_h),
+        g.local_to_screen(g.half_w, g.half_h),
+        g.local_to_screen(-g.half_w, g.half_h),
+    ];
+    let mut rect = Rect::NOTHING;
+    for c in corners {
+        rect = rect.union(Rect::from_center_size(c, Vec2::ZERO));
     }
+    Some(rect)
 }
 
 #[allow(dead_code)]
@@ -4867,40 +5284,31 @@ fn update_hover_cursor(
     viewport_size: [f32; 2],
     hover: Pos2,
 ) {
-    if let Some(rect) = selected_element_screen_rect(state, full_rect, viewport_size) {
-        // Rotation handle gets priority over the corners/edges so its
-        // hit-box is checked first (it's drawn outside the bbox).
-        let rot_pos = rotation_handle_screen_pos(rect);
+    if let Some(gizmo) = selected_element_gizmo(state, full_rect, viewport_size) {
+        let rot_pos = rotation_handle_screen_pos_gizmo(&gizmo);
         if (hover - rot_pos).length() < ROTATION_HANDLE_RADIUS * 2.0 {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
             return;
         }
-        let corners = [
-            (rect.left_top(), egui::CursorIcon::ResizeNwSe),
-            (rect.right_top(), egui::CursorIcon::ResizeNeSw),
-            (rect.left_bottom(), egui::CursorIcon::ResizeNeSw),
-            (rect.right_bottom(), egui::CursorIcon::ResizeNwSe),
+        let hw = gizmo.half_w;
+        let hh = gizmo.half_h;
+        let handle_specs: [(Pos2, egui::CursorIcon); 8] = [
+            (gizmo.local_to_screen(-hw, -hh), egui::CursorIcon::ResizeNwSe),
+            (gizmo.local_to_screen(hw, -hh), egui::CursorIcon::ResizeNeSw),
+            (gizmo.local_to_screen(hw, hh), egui::CursorIcon::ResizeNwSe),
+            (gizmo.local_to_screen(-hw, hh), egui::CursorIcon::ResizeNeSw),
+            (gizmo.local_to_screen(0.0, -hh), egui::CursorIcon::ResizeVertical),
+            (gizmo.local_to_screen(hw, 0.0), egui::CursorIcon::ResizeHorizontal),
+            (gizmo.local_to_screen(0.0, hh), egui::CursorIcon::ResizeVertical),
+            (gizmo.local_to_screen(-hw, 0.0), egui::CursorIcon::ResizeHorizontal),
         ];
-        for (corner, cursor) in &corners {
-            if (hover - *corner).length() < ELEM_HANDLE_SIZE * 2.0 {
-                ui.ctx().set_cursor_icon(*cursor);
+        for (handle_pos, cursor) in handle_specs {
+            if (hover - handle_pos).length() < ELEM_HANDLE_SIZE * 2.0 {
+                ui.ctx().set_cursor_icon(cursor);
                 return;
             }
         }
-        // Edge midpoint handles
-        let edges = [
-            (Pos2::new(rect.center().x, rect.min.y), egui::CursorIcon::ResizeVertical),
-            (Pos2::new(rect.max.x, rect.center().y), egui::CursorIcon::ResizeHorizontal),
-            (Pos2::new(rect.center().x, rect.max.y), egui::CursorIcon::ResizeVertical),
-            (Pos2::new(rect.min.x, rect.center().y), egui::CursorIcon::ResizeHorizontal),
-        ];
-        for (mp, cursor) in &edges {
-            if (hover - *mp).length() < ELEM_HANDLE_SIZE * 2.0 {
-                ui.ctx().set_cursor_icon(*cursor);
-                return;
-            }
-        }
-        if rect.contains(hover) {
+        if gizmo.contains_screen(hover) {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
             return;
         }
@@ -5053,12 +5461,14 @@ fn draw_selection_handles(
     state: &EditorState,
     viewport_size: [f32; 2],
 ) {
-    // Selected element handles
-    if let Some(rect) = selected_element_screen_rect(state, full_rect, viewport_size) {
+    // Selected element handles (rotation-aware OBB)
+    if let Some(gizmo) = selected_element_gizmo(state, full_rect, viewport_size) {
         let handle_color = COL_SELECTED_BORDER;
         let corners = [
-            rect.left_top(), rect.right_top(),
-            rect.left_bottom(), rect.right_bottom(),
+            gizmo.local_to_screen(-gizmo.half_w, -gizmo.half_h),
+            gizmo.local_to_screen(gizmo.half_w, -gizmo.half_h),
+            gizmo.local_to_screen(gizmo.half_w, gizmo.half_h),
+            gizmo.local_to_screen(-gizmo.half_w, gizmo.half_h),
         ];
         for corner in &corners {
             let hr = Rect::from_center_size(*corner, Vec2::splat(ELEM_HANDLE_SIZE));
@@ -5066,24 +5476,24 @@ fn draw_selection_handles(
             painter.rect_stroke(hr, Rounding::same(2.0), Stroke::new(1.0, Color32::from_rgb(40, 40, 40)));
         }
         let midpoints = [
-            Pos2::new(rect.center().x, rect.min.y),
-            Pos2::new(rect.center().x, rect.max.y),
-            Pos2::new(rect.min.x, rect.center().y),
-            Pos2::new(rect.max.x, rect.center().y),
+            gizmo.local_to_screen(0.0, -gizmo.half_h),
+            gizmo.local_to_screen(0.0, gizmo.half_h),
+            gizmo.local_to_screen(-gizmo.half_w, 0.0),
+            gizmo.local_to_screen(gizmo.half_w, 0.0),
         ];
         for mp in &midpoints {
             let hr = Rect::from_center_size(*mp, Vec2::new(ELEM_HANDLE_SIZE * 1.4, ELEM_HANDLE_SIZE * 0.7));
             painter.rect_filled(hr, Rounding::same(2.0), handle_color);
         }
-        painter.rect_stroke(rect, Rounding::same(2.0), Stroke::new(1.5, handle_color));
+        for i in 0..4 {
+            painter.line_segment(
+                [corners[i], corners[(i + 1) % 4]],
+                Stroke::new(1.5, handle_color),
+            );
+        }
 
-        // ── Rotation handle ───────────────────────────────────────
-        // Floats above the top-mid handle on a short stem so it never
-        // overlaps the resize affordances. Cyan colour distinguishes
-        // it from yellow scale handles. Drag this handle to rotate the
-        // element around its centre; hold Shift to snap to 15° steps.
-        let rot_pos = rotation_handle_screen_pos(rect);
-        let top_mid = Pos2::new(rect.center().x, rect.min.y);
+        let rot_pos = rotation_handle_screen_pos_gizmo(&gizmo);
+        let top_mid = gizmo.local_to_screen(0.0, -gizmo.half_h);
         painter.line_segment(
             [top_mid, rot_pos],
             Stroke::new(1.5, Color32::from_rgb(80, 160, 200)),
@@ -6032,29 +6442,14 @@ fn screen_to_element_uv(
     viewport_size: [f32; 2],
     pointer: Pos2,
 ) -> Option<([f32; 2], Selection, Rect)> {
-    let elem_rect = selected_element_screen_rect(state, full_rect, viewport_size)?;
-    if elem_rect.width() <= 0.5 || elem_rect.height() <= 0.5 {
+    let gizmo = selected_element_gizmo(state, full_rect, viewport_size)?;
+    if gizmo.half_w <= 0.5 || gizmo.half_h <= 0.5 {
         return None;
     }
-    let rotation_deg = selected_element_rotation_deg(state);
-
-    let center = elem_rect.center();
-    // Inverse-rotate the pointer around the element centre. Because
-    // the element rect is the AABB of the *unrotated* image (the
-    // renderer rotates the picture around the same centre), the
-    // local axis-aligned dims here are the right denominators for
-    // image-local UV. The inverse rotation lines up "image-local
-    // X/Y" with the click before normalising into UV.
-    let theta = (-rotation_deg).to_radians();
-    let (s, c) = (theta.sin(), theta.cos());
-    let dx = pointer.x - center.x;
-    let dy = pointer.y - center.y;
-    let local_x = dx * c - dy * s;
-    let local_y = dx * s + dy * c;
-    let half_w = elem_rect.width() * 0.5;
-    let half_h = elem_rect.height() * 0.5;
-    let u = (local_x / (half_w * 2.0)) + 0.5;
-    let v = (local_y / (half_h * 2.0)) + 0.5;
+    let (lx, ly) = gizmo.screen_to_local(pointer);
+    let u = (lx / (gizmo.half_w * 2.0)) + 0.5;
+    let v = (ly / (gizmo.half_h * 2.0)) + 0.5;
+    let elem_rect = selected_element_screen_rect(state, full_rect, viewport_size)?;
     Some(([u.clamp(-0.5, 1.5), v.clamp(-0.5, 1.5)], state.selection, elem_rect))
 }
 

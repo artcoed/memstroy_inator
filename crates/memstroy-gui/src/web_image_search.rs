@@ -209,15 +209,8 @@ pub fn show_window(
     }
     
     let response = window.show(ctx, |ui| {
-            // Use the saved window size to calculate body width instead of clip_rect,
-            // which can fluctuate and cause unwanted expansion.
-            let window_size = state.web_image_search.panel_size.unwrap_or(egui::vec2(560.0, 640.0));
-            let margins = ui.spacing().window_margin.sum().x;
-            let body_w = (window_size.x - margins).max(280.0);
-            
-            // Hard-clamp the content width to prevent expansion.
-            ui.set_max_width(body_w);
-            ui.set_width(body_w);
+            let body_w = ui.available_width().max(280.0);
+            ui.set_min_width(280.0);
 
             // Claim the full window body for pointer hits so clicks on
             // padding / gaps between widgets don't fall through to the
@@ -232,21 +225,24 @@ pub fn show_window(
             window_body(ui, state, tx, body_w);
         });
     
-    // Update saved size ONLY when the size actually changed.
-    // Window moves (dragging the title bar) also report as `dragged()`,
-    // so we must not treat every drag as a resize.
+    // Persist size only when the user resizes — not when moving the window.
     if let Some(inner_response) = response {
-        if inner_response.response.dragged() || inner_response.response.drag_stopped() {
+        if inner_response.response.drag_stopped() {
             if let Some(new_rect) = ctx.memory(|m| m.area_rect(window_id)) {
                 let new_size = new_rect.size();
-                if new_size.x >= 300.0 && new_size.y >= 280.0 && new_size.x <= 1200.0 && new_size.y <= 1200.0 {
+                if new_size.x >= 300.0
+                    && new_size.y >= 280.0
+                    && new_size.x <= 1200.0
+                    && new_size.y <= 1200.0
+                {
                     let prev = state
                         .web_image_search
                         .panel_size
-                        .unwrap_or(egui::vec2(560.0, 640.0));
+                        .unwrap_or(window_size);
                     let eps = 0.5_f32;
-                    let changed = (new_size.x - prev.x).abs() > eps || (new_size.y - prev.y).abs() > eps;
-                    if changed {
+                    if (new_size.x - prev.x).abs() > eps
+                        || (new_size.y - prev.y).abs() > eps
+                    {
                         state.web_image_search.panel_size = Some(new_size);
                     }
                 }

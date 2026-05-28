@@ -18,9 +18,13 @@ pub struct App {
     tx: Sender<JobEvent>,
     rx: Receiver<JobEvent>,
     /// Per-actor extraction results. Key = actor index.
-    frame_extract_results: Vec<Arc<Mutex<Option<(f32, usize, std::path::PathBuf)>>>>,
-    /// Per-audio-track waveform extraction results.
-    waveform_extract_results: Vec<Arc<Mutex<Option<(Vec<f32>, f32)>>>>,
+    frame_extract_results: Vec<Arc<Mutex<Option<Result<(f32, usize, std::path::PathBuf), ()>>>>>,
+    /// Per-audio-track waveform extraction results (`None` in slot = pending).
+    waveform_extract_results: Vec<Arc<Mutex<Option<Option<(Vec<f32>, f32)>>>>>,
+    /// Debounce rapid `reload_library` calls from background jobs.
+    library_reload_debounce_until: Option<std::time::Instant>,
+    /// True while a background library scan is running.
+    library_reload_in_progress: bool,
     /// Audio playback engine
     audio_engine: AudioEngine,
     /// Previous playing state (for detecting transitions)
@@ -139,6 +143,8 @@ impl App {
             rx,
             frame_extract_results: Vec::new(),
             waveform_extract_results: Vec::new(),
+            library_reload_debounce_until: None,
+            library_reload_in_progress: false,
             audio_engine,
             was_playing: false,
             prev_playhead: 0.0,
@@ -294,20 +300,18 @@ impl App {
                     self.state.status = format!("\u{1F504} {}", msg);
                 }
                 JobEvent::RefreshLibraryReloaded(msg) => {
-                    // Mid-refresh partial reload: the worker has
-                    // mirrored a fresh batch of clips to disk, so
-                    // re-scan the local library now instead of
-                    // waiting for the whole refresh to finish. This
-                    // is what restores the live "watch the catalogue
-                    // grow" feel during a 400+ clip ingest — without
-                    // it, the panel would stay frozen for the entire
-                    // multi-minute download.
+                    // Debounce rescans so metadata batches don't stall
+                    // the UI thread on every single clip.
                     self.state.status = format!("\u{1F504} {}", msg);
-                    self.state.reload_library();
+                    self.state.library_reload_pending = true;
+                    self.library_reload_debounce_until =
+                        Some(std::time::Instant::now() + std::time::Duration::from_millis(350));
                 }
                 JobEvent::RefreshFinished(Ok(summary)) => {
                     self.state.refreshing = false;
-                    self.state.reload_library();
+                    self.state.library_reload_pending = true;
+                    self.library_reload_debounce_until =
+                        Some(std::time::Instant::now() + std::time::Duration::from_millis(350));
                     self.state.status = format!(
                         "{} {} {}, {} {}",
                         crate::i18n::t("\u{1F389} Refresh done!"),
@@ -470,6 +474,21 @@ impl App {
                 JobEvent::ClipDownloaded { server_id, result, drop_target } => {
                     self.handle_clip_downloaded(server_id, result, drop_target);
                 }
+                JobEvent::VideoDurationProbed {
+                    actor_id,
+                    path,
+                    duration,
+                } => {
+                    self.handle_video_duration_probed(actor_id, path, duration);
+                }
+                JobEvent::LibraryScanned(snap) => {
+                    self.library_reload_in_progress = false;
+                    self.state.apply_library_snapshot(snap);
+                    self.state.fetch_server_clips_metadata();
+                }
+                JobEvent::LibraryReloadAborted => {
+                    self.library_reload_in_progress = false;
+                }
             }
         }
     }
@@ -486,23 +505,32 @@ impl App {
     ) {
         match result {
             Ok(path) => {
-                // Reload library so the new file replaces its stub
-                self.state.reload_library();
-                // Spawn the actor at the requested drop target
+                self.state.pending_clip_downloads.remove(&path);
+                self.schedule_library_reload();
+                if !EditorState::is_usable_local_video(&path) {
+                    self.state.status = format!(
+                        "{} {}: {}",
+                        crate::i18n::t("\u{274C} Clip download incomplete:"),
+                        server_id,
+                        path.display()
+                    );
+                    return;
+                }
                 use crate::jobs::ClipDropTarget;
                 match drop_target {
                     ClipDropTarget::CanvasAt { world_x, world_y } => {
                         crate::panels::add_actor_from_clip_at_canvas(
-                            &mut self.state, &path, [world_x, world_y]
+                            &mut self.state,
+                            &path,
+                            [world_x, world_y],
                         );
                     }
                     ClipDropTarget::TimelineAt { t } => {
-                        crate::panels::add_actor_from_clip_at_time(
-                            &mut self.state, &path, t
-                        );
+                        crate::panels::add_actor_from_clip_at_time(&mut self.state, &path, t);
                     }
                     ClipDropTarget::None => {}
                 }
+                self.invalidate_preview_for_path(&path);
                 self.state.status = format!(
                     "{} {}",
                     crate::i18n::t("\u{2B07} Clip downloaded:"),
@@ -510,12 +538,126 @@ impl App {
                 );
             }
             Err(e) => {
+                let safe = crate::jobs::sanitise_id(&server_id);
+                self.state.pending_clip_downloads.retain(|p| {
+                    p.file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(|stem| stem != safe)
+                        .unwrap_or(true)
+                });
                 self.state.status = format!(
                     "{} {}: {}",
                     crate::i18n::t("\u{274C} Clip download failed:"),
-                    server_id, e
+                    server_id,
+                    e
                 );
             }
+        }
+    }
+
+    /// Reset preview caches for any layer using `path` and queue ffmpeg warmup.
+    fn invalidate_preview_for_path(&mut self, path: &std::path::Path) {
+        for (idx, actor) in self.state.scene.actors.iter().enumerate() {
+            if actor.source != path {
+                continue;
+            }
+            if idx < self.state.frame_caches.len() {
+                let source = actor.source.clone();
+                self.state.frame_caches[idx] =
+                    crate::video_cache::FrameCache::new(source, idx);
+            }
+            if idx < self.frame_extract_results.len() {
+                if let Ok(mut slot) = self.frame_extract_results[idx].lock() {
+                    *slot = None;
+                }
+            }
+        }
+        for (idx, track) in self.state.scene.audio.iter().enumerate() {
+            if track.source == path && idx < self.state.audio_waveforms.len() {
+                self.state.audio_waveforms[idx] = crate::state::AudioWaveform::default();
+                if idx < self.waveform_extract_results.len() {
+                    if let Ok(mut slot) = self.waveform_extract_results[idx].lock() {
+                        *slot = None;
+                    }
+                }
+            }
+        }
+        self.state.request_media_preview = true;
+    }
+
+    fn handle_video_duration_probed(
+        &mut self,
+        actor_id: String,
+        path: std::path::PathBuf,
+        duration: Option<f32>,
+    ) {
+        let Some(duration) = duration.filter(|d| *d > 0.01) else {
+            return;
+        };
+        self.state
+            .video_duration_cache
+            .insert(path.clone(), duration);
+        let Some(idx) = self
+            .state
+            .scene
+            .actors
+            .iter()
+            .position(|a| a.id == actor_id && a.source == path)
+        else {
+            return;
+        };
+        let t_in = self.state.scene.actors[idx].t_in.unwrap_or(0.0);
+        let t_out = t_in + duration.max(0.1);
+        self.state.scene.actors[idx].t_out = Some(t_out);
+        crate::panels::sync_audio_to_actor(&mut self.state, idx);
+    }
+
+    /// Coalesce rapid `reload_library` requests from background workers
+    /// so metadata sync does not stall the UI thread every few clips.
+    fn schedule_library_reload(&mut self) {
+        self.state.library_reload_pending = true;
+        const DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(350);
+        self.library_reload_debounce_until =
+            Some(std::time::Instant::now() + DEBOUNCE);
+    }
+
+    fn flush_pending_library_reload(&mut self) {
+        if !self.state.library_reload_pending || self.library_reload_in_progress {
+            return;
+        }
+        let due = self
+            .library_reload_debounce_until
+            .map(|t| std::time::Instant::now() >= t)
+            .unwrap_or(true);
+        if !due {
+            return;
+        }
+        self.state.library_reload_pending = false;
+        self.library_reload_debounce_until = None;
+        self.library_reload_in_progress = true;
+        let assets_root = self.state.assets_root.clone();
+        let tx = self.tx.clone();
+        self.rt.as_ref().unwrap().spawn(async move {
+            let snap = tokio::task::spawn_blocking(move || {
+                EditorState::scan_library_snapshot(assets_root)
+            })
+            .await
+            .ok();
+            if let Some(snap) = snap {
+                let _ = tx.send(JobEvent::LibraryScanned(snap));
+            } else {
+                let _ = tx.send(JobEvent::LibraryReloadAborted);
+            }
+        });
+    }
+
+    fn maybe_request_library_reload_repaint(&self, ctx: &egui::Context) {
+        if self.state.library_reload_pending
+            && self
+                .library_reload_debounce_until
+                .is_some_and(|t| std::time::Instant::now() < t)
+        {
+            ctx.request_repaint();
         }
     }
 
@@ -2200,8 +2342,8 @@ impl App {
 
     /// Split the selected element at the current playhead position.
     /// Creates two adjacent elements: [original_start..playhead] and [playhead..original_end].
-    fn split_at_playhead(&mut self) {
-        let t = self.state.playhead;
+    fn split_at_playhead(&mut self, cut_t: Option<f32>) {
+        let t = cut_t.unwrap_or(self.state.playhead);
         match self.state.selection {
             Selection::Background(i) if i < self.state.scene.backgrounds.len() => {
                 self.split_background_at(i, t);
@@ -2302,32 +2444,12 @@ impl App {
         right.t_in = Some(t);
         right.t_out = Some(end);
         right.source_start = a.source_start + (t - start);
-        // Right half: keep kfs whose scene-time is at or after the
-        // cut. Their `t` stays in scene-time so the renderer / canvas
-        // sample them at the right absolute moment.
-        right.layout.retain(|kf| kf.t >= t - 1.0e-3);
-        if right.layout.is_empty() {
-            let last_state = a.layout.last().map(|k| k.value).unwrap_or_default();
-            // Anchor the seed kf at the right half's t_in so static
-            // sampling falls back to the last authored state.
-            right.layout.push(memstroy_core::Keyframe::new(t, last_state));
-        }
         let original_lane = self.state.actor_track_assignments.get(&i).copied();
         self.state.mutate(move |s| {
             s.actors[i].t_out = Some(t);
-            // Left half: drop kfs whose scene-time runs past the
-            // cut point. Anything authored AFTER the new t_out is
-            // outside the visible window.
-            s.actors[i].layout.retain(|kf| kf.t <= t + 1.0e-3);
-            if s.actors[i].layout.is_empty() {
-                let seed_t = s.actors[i].t_in.unwrap_or(0.0);
-                s.actors[i].layout.push(memstroy_core::Keyframe::new(
-                    seed_t,
-                    memstroy_core::ActorState::default(),
-                ));
-            }
             s.actors.insert(i + 1, right);
         });
+        crate::split_crop::finish_actor_split(&mut self.state.scene, i, i + 1, t, t);
         let pivot = i + 1;
         let mut shifted: std::collections::HashMap<usize, usize> =
             std::collections::HashMap::with_capacity(
@@ -2360,33 +2482,6 @@ impl App {
         }
         if pivot <= self.frame_extract_results.len() {
             self.frame_extract_results.insert(pivot, std::sync::Arc::new(std::sync::Mutex::new(None)));
-        }
-
-        // Duplicate the canvas_layouts entry for the right half so it
-        // inherits the same world-pixel position track as the original.
-        // Without this, the right half falls back to the legacy normalised
-        // layout and renders at a different position — the user sees two
-        // overlapping clips instead of a clean cut.
-        let original_id = self.state.scene.actors[i].id.clone();
-        if let Some(cl_idx) = self.state.scene.canvas_layouts.iter().position(|cl| cl.element_id == original_id) {
-            let mut right_cl = self.state.scene.canvas_layouts[cl_idx].clone();
-            right_cl.element_id = right_id.clone();
-            // Trim the right half's keyframes to only those at or after
-            // the cut point (same logic as the actor layout kfs).
-            right_cl.keyframes.retain(|kf| kf.t >= t - 1.0e-3);
-            if right_cl.keyframes.is_empty() {
-                // Seed with the sampled position at the cut point so the
-                // right half starts where the left half ended.
-                if let Some(sampled) = memstroy_core::keyframe::sample(
-                    &self.state.scene.canvas_layouts[cl_idx].keyframes, t,
-                ) {
-                    right_cl.keyframes.push(memstroy_core::Keyframe::new(t, sampled));
-                }
-            }
-            // Also trim the LEFT half's canvas_layouts to kfs at or before
-            // the cut point so it doesn't carry stale future keyframes.
-            self.state.scene.canvas_layouts[cl_idx].keyframes.retain(|kf| kf.t <= t + 1.0e-3);
-            self.state.scene.canvas_layouts.push(right_cl);
         }
 
         Some((pivot, right_id))
@@ -2466,86 +2561,37 @@ impl App {
             return false;
         }
         let mut right = ov.clone();
-        let local_split = t - start;
         match &mut right {
             memstroy_core::Overlay::Text(txt) => {
                 txt.id = crate::panels::unique_overlay_id_in_scene(
                     &self.state.scene.overlays,
                     &txt.id,
                 );
-                txt.t_in = t;
-                txt.layout.retain(|kf| kf.t >= local_split - 1.0e-3);
-                for kf in txt.layout.iter_mut() {
-                    kf.t = (kf.t - local_split).max(0.0);
-                }
-                if txt.layout.is_empty() {
-                    txt.layout.push(memstroy_core::Keyframe::new(0.0, memstroy_core::OverlayState::default()));
-                }
             }
             memstroy_core::Overlay::Image(im) => {
                 im.id = crate::panels::unique_overlay_id_in_scene(
                     &self.state.scene.overlays,
                     &im.id,
                 );
-                im.t_in = t;
-                im.layout.retain(|kf| kf.t >= local_split - 1.0e-3);
-                for kf in im.layout.iter_mut() {
-                    kf.t = (kf.t - local_split).max(0.0);
-                }
-                if im.layout.is_empty() {
-                    im.layout.push(memstroy_core::Keyframe::new(0.0, memstroy_core::OverlayState::default()));
-                }
             }
             memstroy_core::Overlay::Video(v) => {
                 v.id = crate::panels::unique_overlay_id_in_scene(
                     &self.state.scene.overlays,
                     &v.id,
                 );
-                v.t_in = t;
-                // Advance `source_start` so the right half plays
-                // from the correct point in the underlying file.
-                // Without this, the right half restarts from
-                // source_start = 0 and the user sees the first
-                // frame again.
-                v.source_start = v.source_start + local_split.max(0.0);
-                v.layout.retain(|kf| kf.t >= local_split - 1.0e-3);
-                for kf in v.layout.iter_mut() {
-                    kf.t = (kf.t - local_split).max(0.0);
-                }
-                if v.layout.is_empty() {
-                    v.layout.push(memstroy_core::Keyframe::new(0.0, memstroy_core::OverlayState::default()));
-                }
             }
         }
-        let local_split_left = local_split;
         let original_overlay_lane =
             self.state.overlay_track_assignments.get(&i).copied();
         self.state.mutate(move |s| {
             match &mut s.overlays[i] {
-                memstroy_core::Overlay::Text(txt) => {
-                    txt.t_out = t;
-                    txt.layout.retain(|kf| kf.t <= local_split_left + 1.0e-3);
-                    if txt.layout.is_empty() {
-                        txt.layout.push(memstroy_core::Keyframe::new(0.0, memstroy_core::OverlayState::default()));
-                    }
-                }
-                memstroy_core::Overlay::Image(im) => {
-                    im.t_out = t;
-                    im.layout.retain(|kf| kf.t <= local_split_left + 1.0e-3);
-                    if im.layout.is_empty() {
-                        im.layout.push(memstroy_core::Keyframe::new(0.0, memstroy_core::OverlayState::default()));
-                    }
-                }
-                memstroy_core::Overlay::Video(v) => {
-                    v.t_out = t;
-                    v.layout.retain(|kf| kf.t <= local_split_left + 1.0e-3);
-                    if v.layout.is_empty() {
-                        v.layout.push(memstroy_core::Keyframe::new(0.0, memstroy_core::OverlayState::default()));
-                    }
-                }
+                memstroy_core::Overlay::Text(txt) => txt.t_out = t,
+                memstroy_core::Overlay::Image(im) => im.t_out = t,
+                memstroy_core::Overlay::Video(v) => v.t_out = t,
             }
             s.overlays.insert(i + 1, right);
         });
+        crate::split_crop::finish_overlay_split(&mut self.state.scene, i, i + 1, t, t);
         let pivot = i + 1;
         let mut shifted: std::collections::HashMap<usize, usize> =
             std::collections::HashMap::with_capacity(
@@ -2559,36 +2605,6 @@ impl App {
             shifted.insert(pivot, lane);
         }
         self.state.overlay_track_assignments = shifted;
-
-        // Duplicate canvas_layouts for the right half overlay (same
-        // logic as the actor split — prevents the right half from
-        // falling back to legacy positioning and overlapping the left).
-        let original_ov_id = match &self.state.scene.overlays[i] {
-            memstroy_core::Overlay::Text(txt) => txt.id.clone(),
-            memstroy_core::Overlay::Image(im) => im.id.clone(),
-            memstroy_core::Overlay::Video(v) => v.id.clone(),
-        };
-        let right_ov_id = match &self.state.scene.overlays[pivot] {
-            memstroy_core::Overlay::Text(txt) => txt.id.clone(),
-            memstroy_core::Overlay::Image(im) => im.id.clone(),
-            memstroy_core::Overlay::Video(v) => v.id.clone(),
-        };
-        if let Some(cl_idx) = self.state.scene.canvas_layouts.iter().position(|cl| cl.element_id == original_ov_id) {
-            let mut right_cl = self.state.scene.canvas_layouts[cl_idx].clone();
-            right_cl.element_id = right_ov_id;
-            // Overlay canvas_layouts keyframes are in scene-time.
-            // Trim to kfs at or after the cut point for the right half.
-            right_cl.keyframes.retain(|kf| kf.t >= t - 1.0e-3);
-            if right_cl.keyframes.is_empty() {
-                if let Some(sampled) = memstroy_core::keyframe::sample(
-                    &self.state.scene.canvas_layouts[cl_idx].keyframes, t,
-                ) {
-                    right_cl.keyframes.push(memstroy_core::Keyframe::new(t, sampled));
-                }
-            }
-            self.state.scene.canvas_layouts[cl_idx].keyframes.retain(|kf| kf.t <= t + 1.0e-3);
-            self.state.scene.canvas_layouts.push(right_cl);
-        }
 
         self.state.status = crate::i18n::t("\u{2702} Overlay split at playhead.").into();
         true
@@ -2861,13 +2877,20 @@ impl App {
 
             let source_clone = source.clone();
             // Use a shared slot to communicate results back
-            let result_slot: Arc<Mutex<Option<(Vec<f32>, f32)>>> = Arc::new(Mutex::new(None));
+            let result_slot: Arc<Mutex<Option<Option<(Vec<f32>, f32)>>>> =
+                Arc::new(Mutex::new(None));
             let slot_clone = result_slot.clone();
 
             self.rt.as_ref().unwrap().spawn(async move {
-                let peaks = crate::state::AudioWaveform::extract_peaks(&source_clone, 512);
+                let peaks =
+                    tokio::task::spawn_blocking(move || {
+                        crate::state::AudioWaveform::extract_peaks(&source_clone, 512)
+                    })
+                    .await
+                    .ok()
+                    .flatten();
                 if let Ok(mut slot) = slot_clone.lock() {
-                    *slot = peaks;
+                    *slot = Some(peaks);
                 }
             });
 
@@ -2895,17 +2918,20 @@ impl App {
             if self.state.audio_waveforms[audio_idx].ready { continue; }
 
             if let Ok(mut slot) = self.waveform_extract_results[audio_idx].lock() {
-                if let Some((peaks, duration)) = slot.take() {
-                    self.state.audio_waveforms[audio_idx].peaks = peaks;
-                    self.state.audio_waveforms[audio_idx].duration = duration;
-                    self.state.audio_waveforms[audio_idx].ready = true;
+                if let Some(result) = slot.take() {
                     self.state.audio_waveforms[audio_idx].extracting = false;
-                    self.state.status = format!(
-                        "{} ({} {}): {:.1}s",
-                        crate::i18n::t("\u{2705} Waveform ready"),
-                        crate::i18n::t("audio"),
-                        audio_idx, duration
-                    );
+                    if let Some((peaks, duration)) = result {
+                        self.state.audio_waveforms[audio_idx].ready = true;
+                        self.state.audio_waveforms[audio_idx].peaks = peaks;
+                        self.state.audio_waveforms[audio_idx].duration = duration;
+                        self.state.status = format!(
+                            "{} ({} {}): {:.1}s",
+                            crate::i18n::t("\u{2705} Waveform ready"),
+                            crate::i18n::t("audio"),
+                            audio_idx,
+                            duration
+                        );
+                    }
                 }
             }
         }
@@ -2944,7 +2970,7 @@ impl App {
         for actor_idx in 0..num_actors {
             let source = self.state.scene.actors[actor_idx].source.clone();
 
-            if !source.exists() {
+            if !EditorState::is_usable_local_video(&source) {
                 continue;
             }
 
@@ -2958,6 +2984,7 @@ impl App {
             // Initialize or re-initialize the cache for this actor
             let mut cache = crate::video_cache::FrameCache::new(source.clone(), actor_idx);
             cache.extracting = true;
+            cache.failed = false;
             self.state.frame_caches[actor_idx] = cache;
 
             let result_slot = self.frame_extract_results[actor_idx].clone();
@@ -2969,15 +2996,18 @@ impl App {
             let width = extract_width;
             let rt_handle = self.rt.as_ref().unwrap().handle().clone();
             rt_handle.spawn(async move {
-                crate::video_cache::extract_frames_blocking_with_scale(
-                    source,
-                    width,
-                    move |duration, frame_count, cache_dir| {
-                        if let Ok(mut slot) = result_slot.lock() {
-                            *slot = Some((duration, frame_count, cache_dir));
-                        }
-                    },
-                );
+                tokio::task::spawn_blocking(move || {
+                    crate::video_cache::extract_frames_blocking_with_scale(
+                        source,
+                        width,
+                        move |outcome| {
+                            if let Ok(mut slot) = result_slot.lock() {
+                                *slot = Some(outcome);
+                            }
+                        },
+                    );
+                })
+                .await;
             });
         }
 
@@ -2988,15 +3018,33 @@ impl App {
     fn poll_frame_extraction(&mut self) {
         for actor_idx in 0..self.frame_extract_results.len() {
             if let Ok(mut slot) = self.frame_extract_results[actor_idx].lock() {
-                if let Some((duration, frame_count, cache_dir)) = slot.take() {
+                if let Some(outcome) = slot.take() {
                     if let Some(fc) = self.state.frame_caches.get_mut(actor_idx) {
-                        fc.set_ready(duration, frame_count, cache_dir);
-                        self.state.status = format!(
-                            "{} ({} {}): {} {} ({:.1}s)",
-                            crate::i18n::t("\u{2705} Preview ready"),
-                            crate::i18n::t("actor"),
-                            actor_idx, frame_count, crate::i18n::t("frames"), duration
-                        );
+                        match outcome {
+                            Ok((duration, frame_count, cache_dir)) => {
+                                fc.set_ready(duration, frame_count, cache_dir);
+                                self.state.status = format!(
+                                    "{} ({} {}): {} {} ({:.1}s)",
+                                    crate::i18n::t("\u{2705} Preview ready"),
+                                    crate::i18n::t("actor"),
+                                    actor_idx,
+                                    frame_count,
+                                    crate::i18n::t("frames"),
+                                    duration
+                                );
+                            }
+                            Err(()) => {
+                                fc.extracting = false;
+                                fc.ready = false;
+                                fc.failed = true;
+                                self.state.status = format!(
+                                    "{} {} {}",
+                                    crate::i18n::t("\u{274C} Preview frames failed:"),
+                                    crate::i18n::t("actor"),
+                                    actor_idx
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -3739,6 +3787,8 @@ impl eframe::App for App {
         }
 
         self.pump_events(ctx);
+        self.flush_pending_library_reload();
+        self.maybe_request_library_reload_repaint(ctx);
         self.poll_frame_extraction();
         self.poll_waveform_extraction();
         // Pick up sinks built on the background audio-load thread (see
@@ -3749,8 +3799,13 @@ impl eframe::App for App {
         // Auto-start frame extraction for actors that have source files
         if !self.state.scene.actors.is_empty() {
             let needs_extraction = self.state.scene.actors.iter().enumerate().any(|(i, actor)| {
-                actor.source.exists()
-                    && self.state.frame_caches.get(i).map(|fc| !fc.is_ready() && !fc.extracting).unwrap_or(true)
+                EditorState::is_usable_local_video(&actor.source)
+                    && self
+                        .state
+                        .frame_caches
+                        .get(i)
+                        .map(|fc| fc.failed || (!fc.is_ready() && !fc.extracting))
+                        .unwrap_or(true)
             });
             if needs_extraction {
                 self.start_frame_extraction();
@@ -3771,6 +3826,13 @@ impl eframe::App for App {
             if needs_wf {
                 self.start_waveform_extraction();
             }
+        }
+
+        if self.state.request_media_preview {
+            self.state.request_media_preview = false;
+            self.start_frame_extraction();
+            self.start_waveform_extraction();
+            ctx.request_repaint();
         }
 
         // The skeleton-editor floating window with its own keyboard
@@ -3929,11 +3991,8 @@ impl eframe::App for App {
         // timeline has painted so the cut uses the click position and the
         // exact clicked element (not whatever was previously selected).
         if let Some((sel, cut_t)) = self.state.pending_timeline_split.take() {
-            // Mirror the old split behavior: move playhead to the cut and
-            // focus the clicked element, then perform a split at that time.
-            self.state.playhead = cut_t;
             self.state.selection = sel;
-            self.split_at_playhead();
+            self.split_at_playhead(Some(cut_t));
         }
 
         // Check if refresh was requested via flag
@@ -3951,7 +4010,7 @@ impl eframe::App for App {
         }
         if self.state.status == "__SPLIT_AT_PLAYHEAD__" {
             self.state.status = String::new();
-            self.split_at_playhead();
+            self.split_at_playhead(None);
         }
         if self.state.status == "__MERGE_NEXT__" {
             self.state.status = String::new();

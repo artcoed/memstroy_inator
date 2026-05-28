@@ -31,6 +31,7 @@ mod kf_anim;
 mod panels;
 mod settings;
 mod skeleton_editor;
+mod split_crop;
 mod state;
 mod system_fonts;
 mod title_templates;

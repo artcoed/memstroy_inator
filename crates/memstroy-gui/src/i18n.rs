@@ -1074,6 +1074,11 @@ fn ru_lookup(key: &str) -> Option<&'static str> {
         "Deleted" => "Удалено",
         "keyframe(s)" => "кейфрейм(ов)",
         "Loading..." => "Загрузка…",
+        "Loading video..." => "Загрузка видео…",
+        "Video preview failed" => "Не удалось загрузить превью видео",
+        "Video file is not ready yet — wait for download" => {
+            "Видеофайл ещё не готов — дождитесь загрузки"
+        }
         "New layer" => "Новый слой",
         "Audio lane" => "Аудио-дорожка",
         "Drop here" => "Бросьте сюда",
