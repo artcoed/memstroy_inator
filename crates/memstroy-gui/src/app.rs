@@ -507,11 +507,19 @@ impl App {
             Ok(path) => {
                 self.state.pending_clip_downloads.remove(&path);
                 self.schedule_library_reload();
-                if !EditorState::is_usable_local_video(&path) {
+                if !EditorState::wait_usable_local_video(&path, 25) {
+                    let detail = if path.is_file() {
+                        std::fs::metadata(&path)
+                            .map(|m| format!("{} bytes", m.len()))
+                            .unwrap_or_else(|_| "size unknown".into())
+                    } else {
+                        "file missing".into()
+                    };
                     self.state.status = format!(
-                        "{} {}: {}",
+                        "{} {} ({}): {}",
                         crate::i18n::t("\u{274C} Clip download incomplete:"),
                         server_id,
+                        detail,
                         path.display()
                     );
                     return;
