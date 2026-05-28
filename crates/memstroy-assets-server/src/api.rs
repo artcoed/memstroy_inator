@@ -25,6 +25,101 @@ use crate::ingest;
 use crate::model::{AssetKind, AssetSummary};
 use crate::store::AssetStore;
 
+// ---------------------------------------------------------------------------
+// Embedded placeholder assets
+// ---------------------------------------------------------------------------
+//
+// The asset volume on production deployments can be empty (fresh redeploy,
+// volume reset, lost data) while editor clients still hold references to
+// asset ids from previous sessions. To keep drag-and-drop usable in that
+// situation we ship a tiny set of placeholder files inside the binary and
+// serve them whenever the real asset is missing. This is intentionally
+// permissive — the server is "trust the network" and prefers a working
+// download over a strict 404.
+
+/// 1-second 640x360 H.264 MP4 placeholder used for missing clips/videos.
+const FALLBACK_VIDEO: &[u8] = include_bytes!("../assets/fallback.mp4");
+
+/// JPEG thumbnail used for missing previews.
+const FALLBACK_IMAGE: &[u8] = include_bytes!("../assets/fallback.jpg");
+
+/// 1-second silent WAV used for missing sound assets.
+const FALLBACK_SOUND: &[u8] = include_bytes!("../assets/fallback.wav");
+
+fn fallback_entry(id: &str, kind: AssetKind) -> crate::model::AssetEntry {
+    use std::path::PathBuf;
+    let (ext, size) = match kind {
+        AssetKind::Sound => ("wav", FALLBACK_SOUND.len() as u64),
+        AssetKind::Image => ("jpg", FALLBACK_IMAGE.len() as u64),
+        AssetKind::Particle => ("json", 0),
+        AssetKind::Text => ("txt", 0),
+        AssetKind::Clip | AssetKind::Video => ("mp4", FALLBACK_VIDEO.len() as u64),
+    };
+    crate::model::AssetEntry {
+        id: id.to_string(),
+        kind,
+        label: id.to_string(),
+        description: String::new(),
+        path: PathBuf::from(format!("placeholder/{}.{}", id, ext)),
+        thumbnail: None,
+        size_bytes: size,
+        tags: Vec::new(),
+    }
+}
+
+fn fallback_download_response(id: &str, kind: AssetKind) -> Response {
+    let (bytes, mime, ext): (&'static [u8], &'static str, &'static str) = match kind {
+        AssetKind::Sound => (FALLBACK_SOUND, "audio/wav", "wav"),
+        AssetKind::Image => (FALLBACK_IMAGE, "image/jpeg", "jpg"),
+        AssetKind::Particle => (b"{}", "application/json", "json"),
+        AssetKind::Text => (b"", "text/plain; charset=utf-8", "txt"),
+        AssetKind::Clip | AssetKind::Video => (FALLBACK_VIDEO, "video/mp4", "mp4"),
+    };
+    let disposition = format!("attachment; filename=\"{}.{}\"", sanitize_filename(id), ext);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, mime)
+        .header(header::CONTENT_DISPOSITION, disposition)
+        .header(header::CONTENT_LENGTH, bytes.len().to_string())
+        .header(
+            "x-memstroy-placeholder",
+            HeaderValue::from_static("missing-asset"),
+        )
+        .body(Body::from(bytes))
+        .expect("valid response")
+}
+
+fn fallback_preview_response() -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "image/jpeg")
+        .header(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=60"),
+        )
+        .header(
+            "x-memstroy-placeholder",
+            HeaderValue::from_static("missing-asset"),
+        )
+        .body(Body::from(FALLBACK_IMAGE))
+        .expect("valid response")
+}
+
+fn fallback_text_response() -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; charset=utf-8"),
+        )
+        .header(
+            "x-memstroy-placeholder",
+            HeaderValue::from_static("missing-asset"),
+        )
+        .body(Body::empty())
+        .expect("valid response")
+}
+
 /// Build the public router. Exposed via `crate::router` so tests can
 /// drive it through `tower::ServiceExt::oneshot` without binding a
 /// real socket.
@@ -132,10 +227,11 @@ async fn get_asset(
     State(store): State<AssetStore>,
     Path(id): Path<String>,
 ) -> Result<Json<crate::model::AssetEntry>, ApiError> {
-    store
-        .get(&id)
-        .map(Json)
-        .ok_or(ApiError::NotFound)
+    Ok(Json(
+        store
+            .get(&id)
+            .unwrap_or_else(|| fallback_entry(&id, AssetKind::Clip)),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -146,21 +242,26 @@ async fn get_preview(
     State(store): State<AssetStore>,
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
-    let entry = store.get(&id).ok_or(ApiError::NotFound)?;
-    let thumb = entry.thumbnail.ok_or(ApiError::NotFound)?;
-    
+    let Some(entry) = store.get(&id) else {
+        return Ok(fallback_preview_response());
+    };
+    let Some(thumb) = entry.thumbnail else {
+        return Ok(fallback_preview_response());
+    };
+
     // Stream thumbnails to avoid loading large images into memory
-    let file = tokio::fs::File::open(&thumb)
-        .await
-        .map_err(|e| {
-            warn!(path = %thumb.display(), error = %e, "thumbnail open failed");
-            ApiError::NotFound
-        })?;
-    
+    let file = match tokio::fs::File::open(&thumb).await {
+        Ok(f) => f,
+        Err(e) => {
+            warn!(path = %thumb.display(), error = %e, "thumbnail open failed; serving placeholder");
+            return Ok(fallback_preview_response());
+        }
+    };
+
     let mime = mime_guess::from_path(&thumb).first_or_octet_stream();
     let stream = tokio_util::io::ReaderStream::new(file);
     let body = Body::from_stream(stream);
-    
+
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, mime.as_ref())
@@ -177,14 +278,19 @@ async fn get_download(
     State(store): State<AssetStore>,
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
-    let entry = store.get(&id).ok_or(ApiError::NotFound)?;
-    
+    let Some(entry) = store.get(&id) else {
+        return Ok(fallback_download_response(&id, AssetKind::Clip));
+    };
+
     // Check file size and stream large files instead of loading into memory
-    let metadata = tokio::fs::metadata(&entry.path).await.map_err(|e| {
-        warn!(path = %entry.path.display(), error = %e, "metadata read failed");
-        ApiError::NotFound
-    })?;
-    
+    let metadata = match tokio::fs::metadata(&entry.path).await {
+        Ok(m) => m,
+        Err(e) => {
+            warn!(path = %entry.path.display(), error = %e, "metadata read failed; serving placeholder");
+            return Ok(fallback_download_response(&entry.id, entry.kind));
+        }
+    };
+
     let mime = mime_guess::from_path(&entry.path).first_or_octet_stream();
     let filename = entry
         .path
@@ -193,26 +299,32 @@ async fn get_download(
         .map(sanitize_filename)
         .unwrap_or_else(|| entry.id.clone());
     let disposition = format!("attachment; filename=\"{}\"", filename);
-    
+
     let file_size = metadata.len();
-    
+
     // For small files, load into memory for better performance
     // For large files, stream to avoid OOM
     let body = if file_size <= MAX_IN_MEMORY_SIZE {
-        let bytes = tokio::fs::read(&entry.path).await.map_err(|e| {
-            warn!(path = %entry.path.display(), error = %e, "asset read failed");
-            ApiError::NotFound
-        })?;
-        Body::from(bytes)
+        match tokio::fs::read(&entry.path).await {
+            Ok(bytes) => Body::from(bytes),
+            Err(e) => {
+                warn!(path = %entry.path.display(), error = %e, "asset read failed; serving placeholder");
+                return Ok(fallback_download_response(&entry.id, entry.kind));
+            }
+        }
     } else {
-        let file = tokio::fs::File::open(&entry.path).await.map_err(|e| {
-            warn!(path = %entry.path.display(), error = %e, "asset open failed");
-            ApiError::NotFound
-        })?;
-        let stream = tokio_util::io::ReaderStream::new(file);
-        Body::from_stream(stream)
+        match tokio::fs::File::open(&entry.path).await {
+            Ok(file) => {
+                let stream = tokio_util::io::ReaderStream::new(file);
+                Body::from_stream(stream)
+            }
+            Err(e) => {
+                warn!(path = %entry.path.display(), error = %e, "asset open failed; serving placeholder");
+                return Ok(fallback_download_response(&entry.id, entry.kind));
+            }
+        }
     };
-    
+
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, mime.as_ref())
@@ -239,17 +351,22 @@ async fn get_text(
     State(store): State<AssetStore>,
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
-    let entry = store.get(&id).ok_or(ApiError::NotFound)?;
+    let Some(entry) = store.get(&id) else {
+        return Ok(fallback_text_response());
+    };
     if entry.kind != AssetKind::Text {
         return Err(ApiError::NotFound);
     }
-    
+
     // Check file size before loading
-    let metadata = tokio::fs::metadata(&entry.path).await.map_err(|e| {
-        warn!(path = %entry.path.display(), error = %e, "metadata read failed");
-        ApiError::NotFound
-    })?;
-    
+    let metadata = match tokio::fs::metadata(&entry.path).await {
+        Ok(m) => m,
+        Err(e) => {
+            warn!(path = %entry.path.display(), error = %e, "metadata read failed; serving placeholder");
+            return Ok(fallback_text_response());
+        }
+    };
+
     // Limit text file size to prevent OOM (10MB max for text files)
     const MAX_TEXT_SIZE: u64 = 10 * 1024 * 1024;
     if metadata.len() > MAX_TEXT_SIZE {
@@ -257,13 +374,14 @@ async fn get_text(
             format!("Text file too large: {} bytes (max {})", metadata.len(), MAX_TEXT_SIZE).into()
         ));
     }
-    
-    let body = tokio::fs::read_to_string(&entry.path)
-        .await
-        .map_err(|e| {
-            warn!(path = %entry.path.display(), error = %e, "text read failed");
-            ApiError::NotFound
-        })?;
+
+    let body = match tokio::fs::read_to_string(&entry.path).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(path = %entry.path.display(), error = %e, "text read failed; serving placeholder");
+            return Ok(fallback_text_response());
+        }
+    };
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(
