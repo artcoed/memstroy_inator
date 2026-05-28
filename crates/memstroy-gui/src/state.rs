@@ -1145,32 +1145,48 @@ impl EditorState {
     /// Quick header sniff so JPEG/PNG previews saved with a `.mp4` name
     /// are not treated as playable video.
     fn video_file_has_valid_header(path: &std::path::Path) -> bool {
-        use std::io::Read;
-        let mut buf = [0u8; 12];
-        let Ok(mut file) = std::fs::File::open(path) else {
+        let Ok(data) = std::fs::read(path) else {
             return false;
         };
-        if file.read_exact(&mut buf).is_err() {
+        if data.len() < 12 {
             return false;
         }
         // JPEG / PNG thumbnails mis-labelled as video
-        if buf[0] == 0xFF && buf[1] == 0xD8 {
+        if data[0] == 0xFF && data[1] == 0xD8 {
             return false;
         }
-        if buf[..8] == [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A] {
+        if data.len() >= 8
+            && data[..8] == [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]
+        {
             return false;
         }
-        // ISO BMFF (mp4/m4v/mov)
-        if buf[4..8] == *b"ftyp" {
-            return true;
+        // ISO BMFF (mp4/m4v/mov) — `ftyp` may not sit at byte 4
+        let scan = data.len().min(512);
+        for i in 0..scan.saturating_sub(3) {
+            if &data[i..i + 4] == b"ftyp" {
+                return true;
+            }
         }
         // WebM / Matroska
-        if buf[..4] == [0x1A, 0x45, 0xDF, 0xA3] {
+        if data[..4] == [0x1A, 0x45, 0xDF, 0xA3] {
             return true;
         }
         // AVI RIFF
-        if &buf[..4] == b"RIFF" && buf[8..12] == *b"AVI " {
+        if data.len() >= 12 && &data[..4] == b"RIFF" && &data[8..12] == b"AVI " {
             return true;
+        }
+        false
+    }
+
+    /// Poll until a freshly downloaded clip is readable (OneDrive / AV).
+    pub fn wait_usable_local_video(path: &std::path::Path, attempts: u32) -> bool {
+        for i in 0..attempts {
+            if Self::is_usable_local_video(path) {
+                return true;
+            }
+            if i + 1 < attempts {
+                std::thread::sleep(std::time::Duration::from_millis(80));
+            }
         }
         false
     }

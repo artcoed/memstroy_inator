@@ -208,9 +208,14 @@ pub fn show_window(
         window = window.current_pos(pos);
     }
     
+    // Cap content width to the saved panel size (see comment in show_window).
+    let margin_x = ctx.style().spacing.window_margin.left
+        + ctx.style().spacing.window_margin.right;
+    let body_max_w = (window_size.x - margin_x).max(280.0).min(1200.0);
+
     let response = window.show(ctx, |ui| {
-            let body_w = ui.available_width().max(280.0);
-            ui.set_min_width(280.0);
+            ui.set_max_width(body_max_w);
+            ui.set_min_width(body_max_w.min(280.0));
 
             // Claim the full window body for pointer hits so clicks on
             // padding / gaps between widgets don't fall through to the
@@ -222,7 +227,7 @@ pub fn show_window(
                 Sense::click(),
             );
 
-            window_body(ui, state, tx, body_w);
+            window_body(ui, state, tx, body_max_w);
         });
     
     // Persist size only when the user resizes — not when moving the window.
@@ -394,7 +399,7 @@ fn window_body(
                 return;
             }
 
-            results_grid(ui, state, tx);
+            results_grid(ui, state, tx, body_w);
 
             // ── Pagination control ──────────────────────────────
             let has_more = state.web_image_search.next_offset.is_some()
@@ -403,7 +408,7 @@ fn window_body(
             if has_more {
                 ui.add_space(8.0);
                 ui.allocate_ui_with_layout(
-                    egui::vec2(ui.available_width(), 40.0),
+                    egui::vec2(body_w, 40.0),
                     egui::Layout::top_down(egui::Align::Center),
                     |ui| {
                         let next_pg = state.web_image_search.page_count + 1;
@@ -429,7 +434,7 @@ fn window_body(
             {
                 ui.add_space(8.0);
                 ui.allocate_ui_with_layout(
-                    egui::vec2(ui.available_width(), 40.0),
+                    egui::vec2(body_w, 40.0),
                     egui::Layout::top_down(egui::Align::Center),
                     |ui| {
                         ui.spinner();
@@ -446,7 +451,7 @@ fn window_body(
             {
                 ui.add_space(6.0);
                 ui.allocate_ui_with_layout(
-                    egui::vec2(ui.available_width(), 30.0),
+                    egui::vec2(body_w, 30.0),
                     egui::Layout::top_down(egui::Align::Center),
                     |ui| {
                         ui.label(
@@ -462,7 +467,12 @@ fn window_body(
         });
 }
 
-fn results_grid(ui: &mut egui::Ui, state: &mut EditorState, tx: &Sender<JobEvent>) {
+fn results_grid(
+    ui: &mut egui::Ui,
+    state: &mut EditorState,
+    tx: &Sender<JobEvent>,
+    body_max_w: f32,
+) {
     // Subtract a safety margin equal to the vertical scrollbar width
     // BEFORE we compute how many cards fit per row. The first paint
     // (no scrollbar yet) and subsequent paints (scrollbar present)
@@ -471,7 +481,8 @@ fn results_grid(ui: &mut egui::Ui, state: &mut EditorState, tx: &Sender<JobEvent
     // the user reported.
     const VBAR_WIDTH: f32 = 16.0;
     const HORIZONTAL_MARGIN: f32 = 8.0;
-    let avail_w = (ui.available_width() - VBAR_WIDTH - HORIZONTAL_MARGIN).max(140.0);
+    let avail_w = (body_max_w.min(ui.available_width()) - VBAR_WIDTH - HORIZONTAL_MARGIN)
+        .max(140.0);
     let card_w = 150.0_f32;
     let card_h = 180.0_f32;
     let gap = 6.0_f32;
@@ -517,7 +528,6 @@ fn results_grid(ui: &mut egui::Ui, state: &mut EditorState, tx: &Sender<JobEvent
             egui::Layout::left_to_right(egui::Align::TOP),
             |ui| {
                 ui.set_max_width(row_max_w);
-                ui.set_width(row_max_w);
                 for col in 0..cols {
                     let idx = i + col;
                     if idx >= n {
