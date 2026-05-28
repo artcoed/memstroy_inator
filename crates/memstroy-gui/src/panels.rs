@@ -1932,56 +1932,18 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
                 .show_ui(ui, |ui| {
                     // "None" option to clear parent
                     if ui.selectable_label(current_parent.is_none(), t("None (absolute)")).clicked() {
-                        state.scene.actors[i].parent_id = None;
+                        let _ = crate::canvas_preview::set_element_parent_preserve_world(state, &actor_id, None);
                     }
                     for (cid, clabel) in &candidates {
                         let selected = current_parent.as_deref() == Some(cid.as_str());
                         if ui.selectable_label(selected, clabel).clicked() {
-                            // Convert actor position to be relative to the new parent
-                            let t = state.playhead;
-                            let actor_id = actor_id.clone();
-                            
-                            // Get current world position of the actor
-                            let current_world_pos = {
-                                let actor_state = memstroy_core::keyframe::sample(&state.scene.actors[i].layout, t)
-                                    .unwrap_or_default();
-                                let rf = &state.scene.render_frame;
-                                let [rw, rh] = rf.resolution;
-                                memstroy_core::WorldPos {
-                                    x: actor_state.pos[0] * rw as f32,
-                                    y: actor_state.pos[1] * rh as f32,
-                                }
-                            };
-                            
-                            // Get world position of the new parent
-                            let parent_world_pos = {
-                                let mut visited = vec![actor_id.clone()];
-                                crate::canvas_preview::resolve_parent_transform(state, cid, t, &mut visited)
-                                    .map(|pxf| pxf.pos)
-                                    .unwrap_or(memstroy_core::WorldPos { x: 0.0, y: 0.0 })
-                            };
-                            
-                            // Calculate offset from parent
-                            let offset_x = current_world_pos.x - parent_world_pos.x;
-                            let offset_y = current_world_pos.y - parent_world_pos.y;
-                            
-                            // Convert offset back to normalized coordinates
-                            let rf = &state.scene.render_frame;
-                            let [rw, rh] = rf.resolution;
-                            let new_norm_x = 0.5 + (offset_x / rw as f32);
-                            let new_norm_y = 0.5 + (offset_y / rh as f32);
-                            
-                            state.scene.actors[i].parent_id = Some(cid.clone());
-                            // Update all keyframes to use the new relative position
-                            for kf in &mut state.scene.actors[i].layout {
-                                kf.value.pos = [new_norm_x, new_norm_y];
-                            }
+                            let _ = crate::canvas_preview::set_element_parent_preserve_world(state, &actor_id, Some(cid.clone()));
                         }
                     }
                 });
             if current_parent.is_some() {
                 if ui.small_button("\u{2715}").on_hover_text(t("Clear parent")).clicked() {
-                    state.scene.actors[i].parent_id = None;
+                    let _ = crate::canvas_preview::set_element_parent_preserve_world(state, &actor_id, None);
                 }
             }
         });
@@ -4480,64 +4442,18 @@ fn inspector_overlay(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
                     .width(180.0)
                     .show_ui(ui, |ui| {
                         if ui.selectable_label(current_parent.is_none(), t("None (absolute)")).clicked() {
-                            if let Some(Overlay::Text(t2)) = state.scene.overlays.get_mut(i) {
-                                t2.parent_id = None;
-                            }
+                            let _ = crate::canvas_preview::set_element_parent_preserve_world(state, &text_id, None);
                         }
                         for (cid, clabel) in &candidates {
                             let selected = current_parent.as_deref() == Some(cid.as_str());
                             if ui.selectable_label(selected, clabel).clicked() {
-                                // Convert text position to be relative to the new parent
-                                let t = state.playhead;
-                                let text_id = text_id.clone();
-                                
-                                // Get current world position of the text
-                                let current_world_pos = if let Some(Overlay::Text(txt)) = state.scene.overlays.get(i) {
-                                    let ov_state = memstroy_core::keyframe::sample(&txt.layout, (t - txt.t_in).max(0.0))
-                                        .unwrap_or_default();
-                                    let rf = &state.scene.render_frame;
-                                    let [rw, rh] = rf.resolution;
-                                    memstroy_core::WorldPos {
-                                        x: ov_state.pos[0] * rw as f32,
-                                        y: ov_state.pos[1] * rh as f32,
-                                    }
-                                } else {
-                                    continue;
-                                };
-                                
-                                // Get world position of the new parent
-                                let parent_world_pos = {
-                                    let mut visited = vec![text_id.clone()];
-                                    crate::canvas_preview::resolve_parent_transform(state, cid, t, &mut visited)
-                                        .map(|pxf| pxf.pos)
-                                        .unwrap_or(memstroy_core::WorldPos { x: 0.0, y: 0.0 })
-                                };
-                                
-                                // Calculate offset from parent
-                                let offset_x = current_world_pos.x - parent_world_pos.x;
-                                let offset_y = current_world_pos.y - parent_world_pos.y;
-                                
-                                // Convert offset back to normalized coordinates
-                                let rf = &state.scene.render_frame;
-                                let [rw, rh] = rf.resolution;
-                                let new_norm_x = 0.5 + (offset_x / rw as f32);
-                                let new_norm_y = 0.5 + (offset_y / rh as f32);
-                                
-                                if let Some(Overlay::Text(t2)) = state.scene.overlays.get_mut(i) {
-                                    t2.parent_id = Some(cid.clone());
-                                    // Update all keyframes to use the new relative position
-                                    for kf in &mut t2.layout {
-                                        kf.value.pos = [new_norm_x, new_norm_y];
-                                    }
-                                }
+                                let _ = crate::canvas_preview::set_element_parent_preserve_world(state, &text_id, Some(cid.clone()));
                             }
                         }
                     });
                 if current_parent.is_some() {
                     if ui.small_button("\u{2715}").on_hover_text(t("Clear parent")).clicked() {
-                        if let Some(Overlay::Text(t2)) = state.scene.overlays.get_mut(i) {
-                            t2.parent_id = None;
-                        }
+                        let _ = crate::canvas_preview::set_element_parent_preserve_world(state, &text_id, None);
                     }
                 }
             });
@@ -4590,64 +4506,18 @@ fn inspector_overlay(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
                         .width(180.0)
                         .show_ui(ui, |ui| {
                             if ui.selectable_label(current_parent.is_none(), t("None (absolute)")).clicked() {
-                                if let Some(Overlay::Image(im2)) = state.scene.overlays.get_mut(i) {
-                                    im2.parent_id = None;
-                                }
+                                let _ = crate::canvas_preview::set_element_parent_preserve_world(state, &img_id, None);
                             }
                             for (cid, clabel) in &candidates {
                                 let selected = current_parent.as_deref() == Some(cid.as_str());
                                 if ui.selectable_label(selected, clabel).clicked() {
-                                    // Convert image position to be relative to the new parent
-                                    let t = state.playhead;
-                                    let img_id = img_id.clone();
-                                    
-                                    // Get current world position of the image
-                                    let current_world_pos = if let Some(Overlay::Image(img)) = state.scene.overlays.get(i) {
-                                        let ov_state = memstroy_core::keyframe::sample(&img.layout, (t - img.t_in).max(0.0))
-                                            .unwrap_or_default();
-                                        let rf = &state.scene.render_frame;
-                                        let [rw, rh] = rf.resolution;
-                                        memstroy_core::WorldPos {
-                                            x: ov_state.pos[0] * rw as f32,
-                                            y: ov_state.pos[1] * rh as f32,
-                                        }
-                                    } else {
-                                        continue;
-                                    };
-                                    
-                                    // Get world position of the new parent
-                                    let parent_world_pos = {
-                                        let mut visited = vec![img_id.clone()];
-                                        crate::canvas_preview::resolve_parent_transform(state, cid, t, &mut visited)
-                                            .map(|pxf| pxf.pos)
-                                            .unwrap_or(memstroy_core::WorldPos { x: 0.0, y: 0.0 })
-                                    };
-                                    
-                                    // Calculate offset from parent
-                                    let offset_x = current_world_pos.x - parent_world_pos.x;
-                                    let offset_y = current_world_pos.y - parent_world_pos.y;
-                                    
-                                    // Convert offset back to normalized coordinates
-                                    let rf = &state.scene.render_frame;
-                                    let [rw, rh] = rf.resolution;
-                                    let new_norm_x = 0.5 + (offset_x / rw as f32);
-                                    let new_norm_y = 0.5 + (offset_y / rh as f32);
-                                    
-                                    if let Some(Overlay::Image(im2)) = state.scene.overlays.get_mut(i) {
-                                        im2.parent_id = Some(cid.clone());
-                                        // Update all keyframes to use the new relative position
-                                        for kf in &mut im2.layout {
-                                            kf.value.pos = [new_norm_x, new_norm_y];
-                                        }
-                                    }
+                                    let _ = crate::canvas_preview::set_element_parent_preserve_world(state, &img_id, Some(cid.clone()));
                                 }
                             }
                         });
                     if current_parent.is_some() {
                         if ui.small_button("\u{2715}").on_hover_text(t("Clear parent")).clicked() {
-                            if let Some(Overlay::Image(im2)) = state.scene.overlays.get_mut(i) {
-                                im2.parent_id = None;
-                            }
+                            let _ = crate::canvas_preview::set_element_parent_preserve_world(state, &img_id, None);
                         }
                     }
                 });
@@ -4742,64 +4612,18 @@ fn inspector_overlay(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
                         .width(180.0)
                         .show_ui(ui, |ui| {
                             if ui.selectable_label(current_parent.is_none(), t("None (absolute)")).clicked() {
-                                if let Some(Overlay::Video(v2)) = state.scene.overlays.get_mut(i) {
-                                    v2.parent_id = None;
-                                }
+                                let _ = crate::canvas_preview::set_element_parent_preserve_world(state, &vid_id, None);
                             }
                             for (cid, clabel) in &candidates {
                                 let selected = current_parent.as_deref() == Some(cid.as_str());
                                 if ui.selectable_label(selected, clabel).clicked() {
-                                    // Convert video position to be relative to the new parent
-                                    let t = state.playhead;
-                                    let vid_id = vid_id.clone();
-                                    
-                                    // Get current world position of the video
-                                    let current_world_pos = if let Some(Overlay::Video(vid)) = state.scene.overlays.get(i) {
-                                        let ov_state = memstroy_core::keyframe::sample(&vid.layout, (t - vid.t_in).max(0.0))
-                                            .unwrap_or_default();
-                                        let rf = &state.scene.render_frame;
-                                        let [rw, rh] = rf.resolution;
-                                        memstroy_core::WorldPos {
-                                            x: ov_state.pos[0] * rw as f32,
-                                            y: ov_state.pos[1] * rh as f32,
-                                        }
-                                    } else {
-                                        continue;
-                                    };
-                                    
-                                    // Get world position of the new parent
-                                    let parent_world_pos = {
-                                        let mut visited = vec![vid_id.clone()];
-                                        crate::canvas_preview::resolve_parent_transform(state, cid, t, &mut visited)
-                                            .map(|pxf| pxf.pos)
-                                            .unwrap_or(memstroy_core::WorldPos { x: 0.0, y: 0.0 })
-                                    };
-                                    
-                                    // Calculate offset from parent
-                                    let offset_x = current_world_pos.x - parent_world_pos.x;
-                                    let offset_y = current_world_pos.y - parent_world_pos.y;
-                                    
-                                    // Convert offset back to normalized coordinates
-                                    let rf = &state.scene.render_frame;
-                                    let [rw, rh] = rf.resolution;
-                                    let new_norm_x = 0.5 + (offset_x / rw as f32);
-                                    let new_norm_y = 0.5 + (offset_y / rh as f32);
-                                    
-                                    if let Some(Overlay::Video(v2)) = state.scene.overlays.get_mut(i) {
-                                        v2.parent_id = Some(cid.clone());
-                                        // Update all keyframes to use the new relative position
-                                        for kf in &mut v2.layout {
-                                            kf.value.pos = [new_norm_x, new_norm_y];
-                                        }
-                                    }
+                                    let _ = crate::canvas_preview::set_element_parent_preserve_world(state, &vid_id, Some(cid.clone()));
                                 }
                             }
                         });
                     if current_parent.is_some() {
                         if ui.small_button("\u{2715}").on_hover_text(t("Clear parent")).clicked() {
-                            if let Some(Overlay::Video(v2)) = state.scene.overlays.get_mut(i) {
-                                v2.parent_id = None;
-                            }
+                            let _ = crate::canvas_preview::set_element_parent_preserve_world(state, &vid_id, None);
                         }
                     }
                 });
