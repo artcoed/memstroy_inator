@@ -96,6 +96,16 @@ pub enum JobEvent {
         result: Result<PathBuf, String>,
         drop_target: ClipDropTarget,
     },
+    /// Background ffprobe finished for a clip placed on the timeline.
+    VideoDurationProbed {
+        actor_id: String,
+        path: PathBuf,
+        duration: Option<f32>,
+    },
+    /// Background filesystem scan finished — apply on the UI thread.
+    LibraryScanned(crate::state::LibraryScanSnapshot),
+    /// Background library scan failed (worker thread panic / join error).
+    LibraryReloadAborted,
 }
 
 /// Where to drop a freshly-downloaded clip when the lazy-download
@@ -458,12 +468,6 @@ pub fn spawn_refresh(
             // Mark as "known" but not downloaded (video will be downloaded on first use)
             downloaded_ids.insert(item.id.clone());
             new_count += 1;
-
-            // Notify UI to reload library after each metadata download
-            let _ = tx.send(JobEvent::RefreshLibraryReloaded(format!(
-                "Downloaded metadata {} / {} clips",
-                new_count, total_clips
-            )));
 
             // Small delay to avoid overwhelming the server
             tokio::time::sleep(Duration::from_millis(10)).await;

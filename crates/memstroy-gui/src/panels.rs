@@ -8870,30 +8870,11 @@ fn apply_split(
             right.t_in = Some(m_out);
             right.t_out = Some(original_t_out);
             right.source_start = original.source_start + (m_out - original_t_in).max(0.0);
-            right.layout.retain(|kf| kf.t >= m_out - 1.0e-3);
-            if right.layout.is_empty() {
-                let last = original.layout.last().map(|k| k.value).unwrap_or_default();
-                right.layout.push(memstroy_core::Keyframe::new(m_out, last));
-            }
-            // Bound audio (if any) belongs to the left half — wipe the
-            // parent_actor binding on the right half so the timing
-            // sync doesn't try to follow it.
-            // (The audio row stays attached to the original actor on
-            // the left.)
             state.mutate_drag(token, |s| {
-                // Trim left half.
-                let a = &mut s.actors[i];
-                a.t_out = Some(m_in);
-                a.layout.retain(|kf| kf.t <= m_in + 1.0e-3);
-                if a.layout.is_empty() {
-                    a.layout.push(memstroy_core::Keyframe::new(
-                        m_in,
-                        memstroy_core::ActorState::default(),
-                    ));
-                }
-                // Insert right half at i+1.
+                s.actors[i].t_out = Some(m_in);
                 s.actors.insert(i + 1, right);
             });
+            crate::split_crop::finish_actor_split(&mut state.scene, i, i + 1, m_in, m_out);
             // Side-table bookkeeping.
             shift_assignments_for_insert(&mut state.actor_track_assignments, i + 1);
             // The right half inherits the original's lane.
@@ -8931,87 +8912,26 @@ fn apply_split(
                 Overlay::Image(im) => (im.t_in, im.t_out),
                 Overlay::Video(v) => (v.t_in, v.t_out),
             };
-            let local_split = m_out - original_t_in;
-            // Right-half kfs filtered + re-anchored.
             match &mut right {
                 Overlay::Text(t) => {
                     t.id = unique_overlay_id_in_scene(&state.scene.overlays, &t.id);
-                    t.t_in = m_out;
-                    t.t_out = original_t_out;
-                    t.layout.retain(|kf| kf.t >= local_split - 1.0e-3);
-                    for kf in t.layout.iter_mut() { kf.t -= local_split; kf.t = kf.t.max(0.0); }
-                    if t.layout.is_empty() {
-                        t.layout.push(memstroy_core::Keyframe::new(
-                            0.0,
-                            memstroy_core::OverlayState::default(),
-                        ));
-                    }
                 }
                 Overlay::Image(im) => {
                     im.id = unique_overlay_id_in_scene(&state.scene.overlays, &im.id);
-                    im.t_in = m_out;
-                    im.t_out = original_t_out;
-                    im.layout.retain(|kf| kf.t >= local_split - 1.0e-3);
-                    for kf in im.layout.iter_mut() { kf.t -= local_split; kf.t = kf.t.max(0.0); }
-                    if im.layout.is_empty() {
-                        im.layout.push(memstroy_core::Keyframe::new(
-                            0.0,
-                            memstroy_core::OverlayState::default(),
-                        ));
-                    }
                 }
                 Overlay::Video(v) => {
                     v.id = unique_overlay_id_in_scene(&state.scene.overlays, &v.id);
-                    v.t_in = m_out;
-                    v.t_out = original_t_out;
-                    v.source_start = v.source_start + local_split.max(0.0);
-                    v.layout.retain(|kf| kf.t >= local_split - 1.0e-3);
-                    for kf in v.layout.iter_mut() { kf.t -= local_split; kf.t = kf.t.max(0.0); }
-                    if v.layout.is_empty() {
-                        v.layout.push(memstroy_core::Keyframe::new(
-                            0.0,
-                            memstroy_core::OverlayState::default(),
-                        ));
-                    }
                 }
             }
-            let local_split_left = m_in - original_t_in;
             state.mutate_drag(token, |s| {
-                // Trim left half.
                 match &mut s.overlays[i] {
-                    Overlay::Text(t) => {
-                        t.t_out = m_in;
-                        t.layout.retain(|kf| kf.t <= local_split_left + 1.0e-3);
-                        if t.layout.is_empty() {
-                            t.layout.push(memstroy_core::Keyframe::new(
-                                0.0,
-                                memstroy_core::OverlayState::default(),
-                            ));
-                        }
-                    }
-                    Overlay::Image(im) => {
-                        im.t_out = m_in;
-                        im.layout.retain(|kf| kf.t <= local_split_left + 1.0e-3);
-                        if im.layout.is_empty() {
-                            im.layout.push(memstroy_core::Keyframe::new(
-                                0.0,
-                                memstroy_core::OverlayState::default(),
-                            ));
-                        }
-                    }
-                    Overlay::Video(v) => {
-                        v.t_out = m_in;
-                        v.layout.retain(|kf| kf.t <= local_split_left + 1.0e-3);
-                        if v.layout.is_empty() {
-                            v.layout.push(memstroy_core::Keyframe::new(
-                                0.0,
-                                memstroy_core::OverlayState::default(),
-                            ));
-                        }
-                    }
+                    Overlay::Text(t) => t.t_out = m_in,
+                    Overlay::Image(im) => im.t_out = m_in,
+                    Overlay::Video(v) => v.t_out = m_in,
                 }
                 s.overlays.insert(i + 1, right);
             });
+            crate::split_crop::finish_overlay_split(&mut state.scene, i, i + 1, m_in, m_out);
             shift_assignments_for_insert(&mut state.overlay_track_assignments, i + 1);
             let original_lane = state.overlay_track_assignments.get(&i).copied();
             if let Some(lane) = original_lane {
@@ -15025,8 +14945,11 @@ pub(crate) fn clip_video_needs_download(clip: &crate::state::LibraryClip) -> boo
 }
 
 pub(crate) fn dragged_clip_needs_download(state: &EditorState, path: &std::path::Path) -> bool {
+    if state.pending_clip_downloads.contains(path) {
+        return true;
+    }
     if let Some(clip) = find_library_clip_by_path(state, path) {
-        clip_video_needs_download(clip)
+        !clip.downloaded || !is_usable_local_video(&clip.path)
     } else {
         !is_usable_local_video(path)
     }
@@ -15062,16 +14985,60 @@ pub(crate) fn try_spawn_lazy_clip_download(
             crate::i18n::t("Cannot download clip: background worker not ready").into();
         return true;
     };
+    let local_path = clip_path.to_path_buf();
+    state.pending_clip_downloads.insert(local_path.clone());
     crate::jobs::spawn_clip_download(
         &handle,
         tx,
         state.server_url.clone(),
         server_id,
-        clip_path.to_path_buf(),
+        local_path,
         drop_target,
     );
     state.status = crate::i18n::t("\u{2B07} Downloading clip from server...").into();
     true
+}
+
+/// Library thumbnail for a clip source path (used while preview frames extract).
+pub(crate) fn clip_thumbnail_for_source(
+    state: &EditorState,
+    source: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    if let Some(clip) = find_library_clip_by_path(state, source) {
+        return clip.thumbnail.clone();
+    }
+    let stem = source.file_stem()?.to_str()?;
+    state
+        .library
+        .mellstroy_clips
+        .iter()
+        .find(|c| c.server_id.as_deref() == Some(stem) || c.path == source)
+        .and_then(|c| c.thumbnail.clone())
+}
+
+/// Non-blocking duration: use cache, else default and probe on a worker.
+fn clip_duration_for_placement(state: &mut EditorState, path: &PathBuf, actor_id: &str) -> f32 {
+    if let Some(&d) = state.video_duration_cache.get(path) {
+        return d;
+    }
+    const FALLBACK: f32 = 5.0;
+    if let (Some(handle), Some(tx)) = (state.tokio_handle.clone(), state.image_fx_tx.clone()) {
+        let path2 = path.clone();
+        let actor_id = actor_id.to_string();
+        handle.spawn(async move {
+            let path_probe = path2.clone();
+            let duration =
+                tokio::task::spawn_blocking(move || probe_video_duration(&path_probe))
+                    .await
+                    .ok();
+            let _ = tx.send(crate::jobs::JobEvent::VideoDurationProbed {
+                actor_id,
+                path: path2,
+                duration,
+            });
+        });
+    }
+    FALLBACK
 }
 
 pub fn add_actor_from_clip(state: &mut EditorState, path: &PathBuf) {
@@ -15251,22 +15218,19 @@ pub fn add_text_overlay(state: &mut EditorState) -> usize {
 
 /// Add an actor from a clip at a specific time (used by drag-to-track).
 pub(crate) fn add_actor_from_clip_at_time(state: &mut EditorState, path: &PathBuf, t: f32) {
+    if !is_usable_local_video(path) {
+        state.status = crate::i18n::t("Video file is not ready yet — wait for download").into();
+        return;
+    }
+
     let counter = state.scene.actors.len() + 1;
     let id = path.file_stem().and_then(|s| s.to_str())
         .map(|s| format!("{}_{}", s, counter))
         .unwrap_or_else(|| format!("actor_{}", counter));
 
-    // Probe the clip duration with a session cache so repeated drops
-    // of the same clip don't block the UI thread on ffprobe each time.
-    // First-time probe is still synchronous (50-500ms) but the
-    // subsequent drops complete instantly.
-    let clip_duration = if let Some(&d) = state.video_duration_cache.get(path) {
-        d
-    } else {
-        let d = probe_video_duration(path);
-        state.video_duration_cache.insert(path.clone(), d);
-        d
-    };
+    // Never block the UI thread on ffprobe — use cache, a short default,
+    // then refine timing when the background probe finishes.
+    let clip_duration = clip_duration_for_placement(state, path, &id);
     let t_in = t.max(0.0);
     let t_out = t_in + clip_duration.max(0.1);
 
@@ -15312,6 +15276,7 @@ pub(crate) fn add_actor_from_clip_at_time(state: &mut EditorState, path: &PathBu
     push_audio_track_for_actor(state, &id, path, t_in, Some(t_out), 0.0);
 
     state.selection = Selection::Actor(new_actor_idx);
+    state.request_media_preview = true;
     state.status = format!("{} {}", crate::i18n::t("Dropped actor:"), id);
 }
 
