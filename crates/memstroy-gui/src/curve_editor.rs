@@ -397,6 +397,33 @@ pub fn curve_editor_panel(
             static_value,
             t_local,
         } => {
+            // Empty-state path: when the parameter is not flagged as
+            // animated, the panel collapses to the bare title plus a
+            // single helper line. No param label in the header, no
+            // Animated/Static toggle, no "+ Key" button — the user
+            // enables animation from the inspector on the element
+            // itself.
+            if !animated_params.contains(param_id) {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(t("Curve Editor"))
+                            .size(13.0)
+                            .strong()
+                            .color(Color32::WHITE),
+                    );
+                });
+                ui.add_space(4.0);
+                ui.vertical_centered(|ui| {
+                    ui.add_space(40.0);
+                    ui.label(
+                        egui::RichText::new(t("Parameter is not animated"))
+                            .size(13.0)
+                            .color(Color32::from_rgb(140, 140, 160)),
+                    );
+                });
+                return;
+            }
+
             // Header for audio param.
             ui.horizontal(|ui| {
                 ui.label(
@@ -451,41 +478,29 @@ pub fn curve_editor_panel(
 
             // Check if parameter is animated
             if !animated_params.contains(param_id) {
-                // Parameter is not animated — show a message instead of the graph
-                ui.vertical_centered(|ui| {
-                    ui.add_space(40.0);
-                    ui.label(
-                        egui::RichText::new(t("Parameter is not animated"))
-                            .size(13.0)
-                            .color(Color32::from_rgb(140, 140, 160)),
-                    );
-                    ui.add_space(8.0);
-                    ui.label(
-                        egui::RichText::new(t("Toggle 'Animated' above or click '+ Key' to start animating"))
-                            .size(10.0)
-                            .color(Color32::from_rgb(100, 100, 120)),
-                    );
-                });
-            } else {
-                scalar_curve_editor(
-                    ui,
-                    kfs,
-                    animated_params,
-                    param_id,
-                    param_color,
-                    duration,
-                    value_range,
-                    static_value,
-                    t_local,
-                    marquee,
-                    ce_selected,
-                    ce_multi_drag,
-                    ce_multi_drag_delta,
-                    pan_offset,
-                    zoom,
-                    panning,
-                );
+                // Defensive: the early-return above already covers
+                // this path. Keep the guard so the scalar editor
+                // below can assume animation is enabled.
+                return;
             }
+            scalar_curve_editor(
+                ui,
+                kfs,
+                animated_params,
+                param_id,
+                param_color,
+                duration,
+                value_range,
+                static_value,
+                t_local,
+                marquee,
+                ce_selected,
+                ce_multi_drag,
+                ce_multi_drag_delta,
+                pan_offset,
+                zoom,
+                panning,
+            );
         }
         CurveEditorTarget::EffectParam {
             kfs,
@@ -497,6 +512,30 @@ pub fn curve_editor_panel(
             static_value,
             t_local,
         } => {
+            // Empty-state path: see the Audio arm above for the
+            // rationale — collapsed header + single helper line, no
+            // toggle and no "+ Key" until the parameter is animated.
+            if !animated_params.contains(param_id) {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(t("Curve Editor"))
+                            .size(13.0)
+                            .strong()
+                            .color(Color32::WHITE),
+                    );
+                });
+                ui.add_space(4.0);
+                ui.vertical_centered(|ui| {
+                    ui.add_space(40.0);
+                    ui.label(
+                        egui::RichText::new(t("Parameter is not animated"))
+                            .size(13.0)
+                            .color(Color32::from_rgb(140, 140, 160)),
+                    );
+                });
+                return;
+            }
+
             // Header for effect param — mirrors the Audio variant but
             // with an "Effect" badge and the effect-specific label.
             ui.horizontal(|ui| {
@@ -558,41 +597,28 @@ pub fn curve_editor_panel(
 
             // Check if parameter is animated
             if !animated_params.contains(param_id) {
-                // Parameter is not animated — show a message instead of the graph
-                ui.vertical_centered(|ui| {
-                    ui.add_space(40.0);
-                    ui.label(
-                        egui::RichText::new(t("Parameter is not animated"))
-                            .size(13.0)
-                            .color(Color32::from_rgb(140, 140, 160)),
-                    );
-                    ui.add_space(8.0);
-                    ui.label(
-                        egui::RichText::new(t("Toggle 'Animated' above or click '+ Key' to start animating"))
-                            .size(10.0)
-                            .color(Color32::from_rgb(100, 100, 120)),
-                    );
-                });
-            } else {
-                scalar_curve_editor(
-                    ui,
-                    kfs,
-                    animated_params,
-                    param_id,
-                    param_color,
-                    duration,
-                    value_range,
-                    static_value,
-                    t_local,
-                    marquee,
-                    ce_selected,
-                    ce_multi_drag,
-                    ce_multi_drag_delta,
-                    pan_offset,
-                    zoom,
-                    panning,
-                );
+                // Defensive: the early-return above already covers
+                // this path.
+                return;
             }
+            scalar_curve_editor(
+                ui,
+                kfs,
+                animated_params,
+                param_id,
+                param_color,
+                duration,
+                value_range,
+                static_value,
+                t_local,
+                marquee,
+                ce_selected,
+                ce_multi_drag,
+                ce_multi_drag_delta,
+                pan_offset,
+                zoom,
+                panning,
+            );
         }
     }
 }
@@ -630,6 +656,39 @@ fn transform_curve_editor<T>(
     T: Clone,
 {
     use crate::i18n::t;
+
+    // Decide up-front whether ANY parameter is currently flagged as
+    // animated. When nothing is animated the panel becomes a thin
+    // empty state — no property selector, no "+ Key", no easing
+    // picker. The user enables animation from the inspector / context
+    // menu on the element itself; the curve editor only surfaces
+    // those affordances once it actually has something to edit.
+    let any_animated = PROPERTY_NAMES
+        .iter()
+        .enumerate()
+        .any(|(i, _)| animated_params.contains(prop_to_param_id(i)));
+
+    if !any_animated {
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(t("Curve Editor"))
+                    .size(13.0)
+                    .strong()
+                    .color(Color32::WHITE),
+            );
+        });
+        ui.add_space(4.0);
+        ui.vertical_centered(|ui| {
+            ui.add_space(40.0);
+            ui.label(
+                egui::RichText::new(t("No animated parameters"))
+                    .size(13.0)
+                    .color(Color32::from_rgb(140, 140, 160)),
+            );
+        });
+        return;
+    }
+
     // ── Property selector toolbar ──
     ui.horizontal(|ui| {
         ui.label(
@@ -730,21 +789,9 @@ fn transform_curve_editor<T>(
     });
 
     if !any_animated {
-        // No parameters are animated — show a message instead of the graph
-        ui.vertical_centered(|ui| {
-            ui.add_space(40.0);
-            ui.label(
-                egui::RichText::new(t("No animated parameters"))
-                    .size(13.0)
-                    .color(Color32::from_rgb(140, 140, 160)),
-            );
-            ui.add_space(8.0);
-            ui.label(
-                egui::RichText::new(t("Select a property above and click '+ Key' to start animating"))
-                    .size(10.0)
-                    .color(Color32::from_rgb(100, 100, 120)),
-            );
-        });
+        // Defensive: the early-return above already covers this path,
+        // but keep the guard so the rest of the body can assume there
+        // is at least one animated property to render.
         return;
     }
 
