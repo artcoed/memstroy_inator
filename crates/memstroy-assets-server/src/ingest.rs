@@ -11,6 +11,11 @@ use tracing::{info, warn};
 
 use crate::store::AssetStore;
 
+/// JPEG bytes used as a last-resort thumbnail when both ffmpeg-from-video
+/// and the Telegram poster fallback fail. Same image as the
+/// missing-asset placeholder served by `api.rs`.
+const PLACEHOLDER_THUMB: &[u8] = include_bytes!("../assets/fallback.jpg");
+
 /// Spawn a Telegram channel ingest job. The new clips are saved into
 /// `<asset-root>/clips/` and the store is re-indexed when the
 /// downloads finish.
@@ -232,21 +237,25 @@ async fn run_ingest(store: AssetStore, channel: String, limit: u32) {
                 }
             }
             
-            // Download thumbnail
-            if let Some(ref http_client) = client {
-                let thumb_path = thumbs_dir.join(format!("{}.jpg", stem));
-                if !thumb_path.exists() {
-                    // Generate thumbnail from first frame of video instead of downloading from Telegram
-                    info!("Generating thumbnail from video for {}", stem);
-                    match memstroy_tg::generate_thumbnail(&video_path, &thumb_path).await {
-                        Ok(_) => {
-                            info!("✓ Generated thumbnail from video for {}", stem);
-                        }
-                        Err(e) => {
-                            warn!(error = %e, id = post.id, "thumbnail generation from video failed");
-                            // Fallback: try to download thumbnail from Telegram
-                            if !post.images.is_empty() {
-                                if let Some(thumb_url) = post.images.first() {
+            // ── Thumbnail ──────────────────────────────────────────────
+            // Try in this order, stopping on the first that succeeds:
+            //   1. ffmpeg: extract first frame of the local video.
+            //   2. HTTP:   download Telegram's poster image (`post.images[0]`).
+            //   3.
+            let thumb_path = thumbs_dir.join(format!("{}.jpg", stem));
+            if !thumb_path.exists() {
+                // Generate thumbnail from first frame of video instead of downloading from Telegram
+                info!("Generating thumbnail from video for {}", stem);
+                match memstroy_tg::generate_thumbnail(&video_path, &thumb_path).await {
+                    Ok(_) => {
+                        info!("✓ Generated thumbnail from video for {}", stem);
+                    }
+                    Err(e) => {
+                        warn!(error = %e, id = post.id, "thumbnail generation from video failed");
+                        // Fallback: try to download thumbnail from Telegram
+                        if !post.images.is_empty() {
+                            if let Some(thumb_url) = post.images.first() {
+                                if let Some(ref http_client) = client {
                                     match http_client.get(thumb_url).send().await {
                                         Ok(resp) if resp.status().is_success() => {
                                             match resp.bytes().await {
@@ -266,6 +275,28 @@ async fn run_ingest(store: AssetStore, channel: String, limit: u32) {
                                 }
                             }
                         }
+                    }
+                }
+
+                // Final fallback: if neither ffmpeg nor the Telegram
+                // poster managed to produce a thumb, write the embedded
+                // placeholder JPEG so every clip has a thumbnail file.
+                // This keeps the GUI's clip grid visually consistent and
+                // means `find_thumbnail` in the store always finds a
+                // sidecar for clips.
+                if !thumb_path.exists() {
+                    match tokio::fs::write(&thumb_path, PLACEHOLDER_THUMB).await {
+                        Ok(_) => warn!(
+                            id = post.id,
+                            path = %thumb_path.display(),
+                            "wrote placeholder thumbnail after primary methods failed"
+                        ),
+                        Err(e) => warn!(
+                            id = post.id,
+                            error = %e,
+                            path = %thumb_path.display(),
+                            "failed to write placeholder thumbnail"
+                        ),
                     }
                 }
             }
