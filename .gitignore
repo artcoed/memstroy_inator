@@ -20,3 +20,5 @@ Cargo.lock.bak
 .vscode/
 *.swp
 .DS_Store
+# Build outputs
+/dist/
