@@ -115,20 +115,25 @@ async fn run_ingest(store: AssetStore, channel: String, limit: u32) {
             if selected.len() >= target {
                 break;
             }
-            if post.downloadable_video().is_none() {
+            // Only skip enrich if we already have a *confident* video
+            // URL (one with an explicit `.mp4`/`.mov`/... extension).
+            // A weakly-downloadable URL is almost always a thumbnail
+            // blob in disguise — `?single` may still surface the real
+            // clip.
+            if post.confidently_downloadable_video().is_none() {
                 if let Err(e) = memstroy_tg::enrich_post_videos(http_client, post).await {
                     warn!(id = post.id, error = %e, "enrich_post_videos failed");
                 }
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
-            if post.downloadable_video().is_some() {
+            if post.confidently_downloadable_video().is_some() {
                 selected.push(post.clone());
             }
         }
     } else {
         selected = posts
             .iter()
-            .filter(|p| p.downloadable_video().is_some())
+            .filter(|p| p.confidently_downloadable_video().is_some())
             .take(target)
             .cloned()
             .collect();
