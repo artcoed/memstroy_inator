@@ -145,6 +145,19 @@ pub struct WebImageSearchState {
     /// Last outer size of the floating window (remembered so opening /
     /// searching does not reset the user's layout).
     pub panel_size: Option<egui::Vec2>,
+    /// Last outer position of the floating window. Stored separately
+    /// because the panel owns its size instead of relying on egui's
+    /// content-driven resize state.
+    pub panel_pos: Option<egui::Pos2>,
+    /// True while the user is dragging one of this panel's explicit
+    /// resize handles.
+    pub panel_resizing: bool,
+    /// Pointer position at the start of an explicit resize drag.
+    pub panel_resize_start_pointer: Option<egui::Pos2>,
+    /// Window size at the start of an explicit resize drag.
+    pub panel_resize_start_size: Option<egui::Vec2>,
+    /// Window position at the start of a left-edge resize drag.
+    pub panel_resize_start_pos: Option<egui::Pos2>,
 }
 
 /// Mark the matching hit as "no longer downloading" and update its
@@ -183,39 +196,38 @@ pub fn show_window(
     state: &mut EditorState,
     tx: &Sender<JobEvent>,
 ) {
+    const MIN_PANEL_SIZE: Vec2 = Vec2::new(300.0, 280.0);
+    const MAX_PANEL_SIZE: Vec2 = Vec2::new(1200.0, 1200.0);
+
     let mut open = state.web_image_search_open;
     let window_id = egui::Id::new("web_image_search_window");
 
     let window_size = state
         .web_image_search
         .panel_size
-        .unwrap_or(egui::vec2(560.0, 640.0));
+        .unwrap_or(egui::vec2(560.0, 640.0))
+        .max(MIN_PANEL_SIZE)
+        .min(MAX_PANEL_SIZE);
 
     let mut window = egui::Window::new(format!("\u{1F310} {}", crate::i18n::t("Web Image Search")))
         .id(window_id)
         .open(&mut open)
-        .default_size(window_size)
-        .min_width(300.0)
-        .max_width(1200.0)
-        .min_height(280.0)
-        .max_height(1200.0)
-        .resizable([true, true])
+        .fixed_size(window_size)
         .collapsible(true)
         .scroll(false);
     
-    // Preserve window position if it exists
-    if let Some(pos) = ctx.memory(|m| m.area_rect(window_id).map(|r| r.left_top())) {
+    if let Some(pos) = state.web_image_search.panel_pos {
+        window = window.current_pos(pos);
+    } else if let Some(pos) = ctx.memory(|m| m.area_rect(window_id).map(|r| r.left_top())) {
         window = window.current_pos(pos);
     }
     
-    // Cap content width to the saved panel size (see comment in show_window).
     let margin_x = ctx.style().spacing.window_margin.left
         + ctx.style().spacing.window_margin.right;
-    let body_max_w = (window_size.x - margin_x).max(280.0).min(1200.0);
+    let body_max_w = (window_size.x - margin_x).max(280.0);
 
     let response = window.show(ctx, |ui| {
-            ui.set_max_width(body_max_w);
-            ui.set_min_width(body_max_w.min(280.0));
+            ui.set_width(body_max_w);
 
             // Claim the full window body for pointer hits so clicks on
             // padding / gaps between widgets don't fall through to the
@@ -228,34 +240,98 @@ pub fn show_window(
             );
 
             window_body(ui, state, tx, body_max_w);
+
+            let rect = ui.max_rect();
+            let side_radius = ui.style().interaction.resize_grab_radius_side + 6.0;
+            let edge_id = ui.id().with("web_image_search_manual_resize");
+            let left_rect = egui::Rect::from_min_max(rect.left_top(), rect.left_bottom()).expand(side_radius);
+            let right_rect = egui::Rect::from_min_max(rect.right_top(), rect.right_bottom()).expand(side_radius);
+            let left = ui.interact(left_rect, edge_id.with("left"), Sense::drag());
+            let right = ui.interact(right_rect, edge_id.with("right"), Sense::drag());
+            (left, right)
         });
     
-    // Persist size only when the user resizes — not when moving the window.
     if let Some(inner_response) = response {
-        if inner_response.response.drag_stopped() {
-            if let Some(new_rect) = ctx.memory(|m| m.area_rect(window_id)) {
-                let new_size = new_rect.size();
-                if new_size.x >= 300.0
-                    && new_size.y >= 280.0
-                    && new_size.x <= 1200.0
-                    && new_size.y <= 1200.0
-                {
-                    let prev = state
-                        .web_image_search
-                        .panel_size
-                        .unwrap_or(window_size);
-                    let eps = 0.5_f32;
-                    if (new_size.x - prev.x).abs() > eps
-                        || (new_size.y - prev.y).abs() > eps
-                    {
-                        state.web_image_search.panel_size = Some(new_size);
-                    }
-                }
-            }
+        if let Some((left, right)) = inner_response.inner {
+            handle_panel_width_resize(
+                ctx,
+                state,
+                &left,
+                &right,
+                window_size,
+                inner_response.response.rect.left_top(),
+                MIN_PANEL_SIZE,
+                MAX_PANEL_SIZE,
+            );
         }
+        if !state.web_image_search.panel_resizing {
+            state.web_image_search.panel_pos = Some(inner_response.response.rect.left_top());
+        }
+    } else {
+        state.web_image_search.panel_resizing = false;
+        state.web_image_search.panel_resize_start_pointer = None;
+        state.web_image_search.panel_resize_start_size = None;
+        state.web_image_search.panel_resize_start_pos = None;
     }
     
     state.web_image_search_open = open;
+}
+
+fn handle_panel_width_resize(
+    ctx: &egui::Context,
+    state: &mut EditorState,
+    left: &egui::Response,
+    right: &egui::Response,
+    current_size: egui::Vec2,
+    current_pos: egui::Pos2,
+    min_size: egui::Vec2,
+    max_size: egui::Vec2,
+) {
+    let left_active = left.dragged() || left.hovered();
+    let right_active = right.dragged() || right.hovered();
+    if left_active || right_active {
+        ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+    }
+
+    let dragging_left = left.dragged();
+    let dragging_right = right.dragged();
+    let any_dragging = dragging_left || dragging_right;
+
+    if any_dragging && !state.web_image_search.panel_resizing {
+        state.web_image_search.panel_resizing = true;
+        state.web_image_search.panel_resize_start_pointer = ctx.input(|i| i.pointer.press_origin());
+        state.web_image_search.panel_resize_start_size = Some(current_size);
+        state.web_image_search.panel_resize_start_pos = Some(current_pos);
+    }
+
+    if state.web_image_search.panel_resizing && any_dragging {
+        if let (Some(start_pointer), Some(start_size), Some(start_pos), Some(pointer_pos)) = (
+            state.web_image_search.panel_resize_start_pointer,
+            state.web_image_search.panel_resize_start_size,
+            state.web_image_search.panel_resize_start_pos,
+            ctx.input(|i| i.pointer.interact_pos()),
+        ) {
+            let delta_x = pointer_pos.x - start_pointer.x;
+            let mut next_size = start_size;
+            let mut next_pos = start_pos;
+            if dragging_left {
+                next_size.x = (start_size.x - delta_x).clamp(min_size.x, max_size.x);
+                next_pos.x = start_pos.x + (start_size.x - next_size.x);
+            } else if dragging_right {
+                next_size.x = (start_size.x + delta_x).clamp(min_size.x, max_size.x);
+            }
+            state.web_image_search.panel_size = Some(next_size);
+            state.web_image_search.panel_pos = Some(next_pos);
+            ctx.request_repaint();
+        }
+    }
+
+    if state.web_image_search.panel_resizing && !ctx.input(|i| i.pointer.primary_down()) {
+        state.web_image_search.panel_resizing = false;
+        state.web_image_search.panel_resize_start_pointer = None;
+        state.web_image_search.panel_resize_start_size = None;
+        state.web_image_search.panel_resize_start_pos = None;
+    }
 }
 
 fn window_body(
