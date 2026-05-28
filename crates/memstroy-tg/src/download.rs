@@ -220,7 +220,18 @@ pub async fn incremental_refresh(
     Ok((state, stats))
 }
 
-/// Extract a thumbnail frame from a video at the first frame (t=0).
+/// Extract a thumbnail frame from a video at the first decodable frame.
+///
+/// Strategy:
+///   1. First attempt: read from the natural start of the file (no
+///      `-ss` seek) and grab `-frames:v 1`. This is the most reliable
+///      path on short clips, on clips whose first kf isn't a keyframe,
+///      and on the tiny Telegram preview snippets we sometimes
+///      download.
+///   2. If that fails, retry with `-ss 0.1` to skip past a possibly
+///      malformed initial header.
+///
+/// We also capture stderr so the warn log in
 pub async fn generate_thumbnail(video: &Path, output: &Path) -> Result<()> {
     let ffmpeg = {
         let mut p = memstroy_render::ffmpeg_binary();
@@ -234,8 +245,7 @@ pub async fn generate_thumbnail(video: &Path, output: &Path) -> Result<()> {
         ])
         .arg(video.as_os_str())
         .args([
-            "-ss", "0.0",
-            "-vframes", "1",
+            "-frames:v", "1",
             "-vf", "scale=160:-1",
             "-q:v", "5",
         ])
