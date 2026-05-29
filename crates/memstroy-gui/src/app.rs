@@ -2222,21 +2222,49 @@ impl App {
 
             // Walk descending so removing higher indices keeps
             // lower ones valid.
-            for i in actor_idxs.into_iter().rev() {
+            let mut family_actor_idxs: Vec<usize> = Vec::new();
+            let mut family_overlay_idxs: Vec<usize> = Vec::new();
+            for i in actor_idxs.iter().copied() {
+                if i >= self.state.scene.actors.len() {
+                    continue;
+                }
+                let subtree =
+                    self.state.scene.collect_element_subtree_ids(&self.state.scene.actors[i].id);
+                for id in subtree {
+                    if let Some(ai) = self
+                        .state
+                        .scene
+                        .actors
+                        .iter()
+                        .position(|a| a.id == id)
+                    {
+                        family_actor_idxs.push(ai);
+                    }
+                    if let Some(oi) = self.state.scene.overlays.iter().position(|ov| {
+                        match ov {
+                            memstroy_core::Overlay::Text(o) => o.id == *id,
+                            memstroy_core::Overlay::Image(o) => o.id == *id,
+                            memstroy_core::Overlay::Video(o) => o.id == *id,
+                        }
+                    }) {
+                        family_overlay_idxs.push(oi);
+                    }
+                }
+            }
+            family_actor_idxs.sort_unstable();
+            family_actor_idxs.dedup();
+            family_overlay_idxs.sort_unstable();
+            family_overlay_idxs.dedup();
+
+            for i in family_actor_idxs.iter().rev().copied() {
                 if i >= self.state.scene.actors.len() {
                     continue;
                 }
                 let actor_id = self.state.scene.actors[i].id.clone();
-                // Mark bound audio as deleted (not removed) to prevent
-                // index shifts that cause other audio tracks to jump.
                 let _removed_audio = crate::panels::remove_audio_bound_to_actor(
                     &mut self.state,
                     &actor_id,
                 );
-                // No need to remove from waveform_extract_results since
-                // audio tracks are just marked as deleted.
-                // Use raw vec mutation here (not `mutate()`) because
-                // we already pushed the batch undo snapshot above.
                 self.state.scene.actors.remove(i);
                 if i < self.state.frame_caches.len() {
                     self.state.frame_caches.remove(i);
@@ -2249,7 +2277,7 @@ impl App {
                     i,
                 );
             }
-            for i in overlay_idxs.into_iter().rev() {
+            for i in family_overlay_idxs.iter().rev().copied() {
                 if i >= self.state.scene.overlays.len() {
                     continue;
                 }
@@ -2283,38 +2311,147 @@ impl App {
         match self.state.selection {
             Selection::Actor(i) if i < self.state.scene.actors.len() => {
                 let actor_id = self.state.scene.actors[i].id.clone();
-                // Bound audio (the AudioTrack created when the clip was
-                // dropped) is marked as deleted (not removed from array)
-                // so we never leak orphaned audio rows and other audio
-                // tracks don't shift indices.
-                let _removed_audio = crate::panels::remove_audio_bound_to_actor(
-                    &mut self.state, &actor_id);
-                // No need to remove from waveform_extract_results since
-                // audio tracks are just marked as deleted, not removed.
-                self.state.mutate(|s| { s.actors.remove(i); });
-                // Keep every side-table that mirrors the actors Vec in
-                // lock-step with the new index space. Without the
-                // assignments shift, the actor that used to sit at
-                // `i+1` keeps its old assignments[i+1] entry which now
-                // belongs to a different actor — that's the "layers
-                // jump" the user reported when deleting.
-                if i < self.state.frame_caches.len() {
-                    self.state.frame_caches.remove(i);
+                let subtree = self.state.scene.collect_element_subtree_ids(&actor_id);
+                let mut actor_idxs: Vec<usize> = subtree
+                    .iter()
+                    .filter_map(|id| {
+                        self.state
+                            .scene
+                            .actors
+                            .iter()
+                            .position(|a| &a.id == id)
+                    })
+                    .collect();
+                let mut overlay_idxs: Vec<usize> = subtree
+                    .iter()
+                    .filter_map(|id| {
+                        self.state.scene.overlays.iter().position(|ov| {
+                            match ov {
+                                memstroy_core::Overlay::Text(o) => &o.id == id,
+                                memstroy_core::Overlay::Image(o) => &o.id == id,
+                                memstroy_core::Overlay::Video(o) => &o.id == id,
+                            }
+                        })
+                    })
+                    .collect();
+                actor_idxs.sort_unstable();
+                actor_idxs.dedup();
+                overlay_idxs.sort_unstable();
+                overlay_idxs.dedup();
+
+                for idx in actor_idxs.iter().rev().copied() {
+                    let aid = self.state.scene.actors[idx].id.clone();
+                    let _removed_audio =
+                        crate::panels::remove_audio_bound_to_actor(&mut self.state, &aid);
                 }
-                if i < self.frame_extract_results.len() {
-                    self.frame_extract_results.remove(i);
+                self.state.mutate(|s| {
+                    s.canvas_layouts
+                        .retain(|cl| !subtree.contains(&cl.element_id));
+                    for idx in overlay_idxs.iter().rev().copied() {
+                        if idx < s.overlays.len() {
+                            s.overlays.remove(idx);
+                        }
+                    }
+                    for idx in actor_idxs.iter().rev().copied() {
+                        if idx < s.actors.len() {
+                            s.actors.remove(idx);
+                        }
+                    }
+                });
+                for idx in actor_idxs.iter().rev().copied() {
+                    if idx < self.state.frame_caches.len() {
+                        self.state.frame_caches.remove(idx);
+                    }
+                    if idx < self.frame_extract_results.len() {
+                        self.frame_extract_results.remove(idx);
+                    }
+                    crate::panels::shift_assignments_after_remove(
+                        &mut self.state.actor_track_assignments,
+                        idx,
+                    );
                 }
-                crate::panels::shift_assignments_after_remove(
-                    &mut self.state.actor_track_assignments, i);
+                for idx in overlay_idxs.iter().rev().copied() {
+                    crate::panels::shift_assignments_after_remove(
+                        &mut self.state.overlay_track_assignments,
+                        idx,
+                    );
+                }
                 self.state.selection = Selection::None;
                 self.state.canvas_selection.clear();
                 self.state.multi_select.clear();
                 self.state.status = crate::i18n::t("\u{1F5D1} Actor deleted.").into();
             }
             Selection::Overlay(i) if i < self.state.scene.overlays.len() => {
-                self.state.mutate(|s| { s.overlays.remove(i); });
-                crate::panels::shift_assignments_after_remove(
-                    &mut self.state.overlay_track_assignments, i);
+                let root_id = match &self.state.scene.overlays[i] {
+                    memstroy_core::Overlay::Text(o) => o.id.clone(),
+                    memstroy_core::Overlay::Image(o) => o.id.clone(),
+                    memstroy_core::Overlay::Video(o) => o.id.clone(),
+                };
+                let subtree = self.state.scene.collect_element_subtree_ids(&root_id);
+                let mut overlay_idxs: Vec<usize> = subtree
+                    .iter()
+                    .filter_map(|id| {
+                        self.state.scene.overlays.iter().position(|ov| {
+                            match ov {
+                                memstroy_core::Overlay::Text(o) => &o.id == id,
+                                memstroy_core::Overlay::Image(o) => &o.id == id,
+                                memstroy_core::Overlay::Video(o) => &o.id == id,
+                            }
+                        })
+                    })
+                    .collect();
+                let mut actor_idxs: Vec<usize> = subtree
+                    .iter()
+                    .filter_map(|id| {
+                        self.state
+                            .scene
+                            .actors
+                            .iter()
+                            .position(|a| &a.id == id)
+                    })
+                    .collect();
+                overlay_idxs.sort_unstable();
+                overlay_idxs.dedup();
+                actor_idxs.sort_unstable();
+                actor_idxs.dedup();
+
+                for idx in actor_idxs.iter().rev().copied() {
+                    let aid = self.state.scene.actors[idx].id.clone();
+                    let _removed_audio =
+                        crate::panels::remove_audio_bound_to_actor(&mut self.state, &aid);
+                }
+                self.state.mutate(|s| {
+                    s.canvas_layouts
+                        .retain(|cl| !subtree.contains(&cl.element_id));
+                    for idx in overlay_idxs.iter().rev().copied() {
+                        if idx < s.overlays.len() {
+                            s.overlays.remove(idx);
+                        }
+                    }
+                    for idx in actor_idxs.iter().rev().copied() {
+                        if idx < s.actors.len() {
+                            s.actors.remove(idx);
+                        }
+                    }
+                });
+                for idx in actor_idxs.iter().rev().copied() {
+                    if idx < self.state.frame_caches.len() {
+                        self.state.frame_caches.remove(idx);
+                    }
+                    if idx < self.frame_extract_results.len() {
+                        self.frame_extract_results.remove(idx);
+                    }
+                    crate::panels::shift_assignments_after_remove(
+                        &mut self.state.actor_track_assignments,
+                        idx,
+                    );
+                }
+                for idx in overlay_idxs.iter().rev().copied() {
+                    crate::panels::shift_assignments_after_remove(
+                        &mut self.state.overlay_track_assignments,
+                        idx,
+                    );
+                }
                 self.state.selection = Selection::None;
                 self.state.canvas_selection.clear();
                 self.state.multi_select.clear();
@@ -4262,30 +4399,48 @@ impl eframe::App for App {
                         self.state.actor_track_assignments.insert(new_idx, lane);
                     }
                 } else if is_image {
-                    let id = dest.file_stem().and_then(|s| s.to_str())
-                        .map(|s| format!("img_{}", s))
+                    let t_in = self.state.playhead;
+                    let t_out = (t_in + 3.0).min(self.state.scene.output.duration).max(t_in + 0.1);
+                    let id_base = dest
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(|s| format!("img_{s}"))
                         .unwrap_or_else(|| format!("img_{}", self.state.scene.overlays.len() + 1));
-                    let overlay = memstroy_core::Overlay::Image(memstroy_core::ImageOverlay {
-                        id: id.clone(),
-                        source: dest.clone(),
-                        t_in: self.state.playhead,
-                        t_out: (self.state.playhead + 3.0).min(self.state.scene.output.duration),
-                        layout: vec![memstroy_core::Keyframe::new(0.0, memstroy_core::OverlayState::default())],
-                        modifiers: Vec::new(),
-                        skeleton_attachment: None,
-                        effects: Vec::new(),
-                        animated_params: Default::default(),
-                        chroma_key: None,
-                        z_order: 0,
-                        parent_id: None,
+                    let source = dest.clone();
+                    let mut placed_id = id_base.clone();
+                    self.state.mutate_state(|s| {
+                        placed_id =
+                            crate::state::unique_overlay_id(&s.scene.overlays, &id_base);
+                        let lane = s.pick_or_create_empty_video_lane_for_range(t_in, t_out);
+                        let new_idx = s.scene.overlays.len();
+                        s.scene.overlays.push(memstroy_core::Overlay::Image(
+                            memstroy_core::ImageOverlay {
+                                id: placed_id.clone(),
+                                source: source.clone(),
+                                t_in,
+                                t_out,
+                                layout: vec![memstroy_core::Keyframe::new(
+                                    0.0,
+                                    memstroy_core::OverlayState::default(),
+                                )],
+                                modifiers: Vec::new(),
+                                skeleton_attachment: None,
+                                effects: Vec::new(),
+                                animated_params: Default::default(),
+                                chroma_key: None,
+                                z_order: 0,
+                                parent_id: None,
+                            },
+                        ));
+                        s.overlay_track_assignments.insert(new_idx, lane);
+                        s.selection = Selection::Overlay(new_idx);
                     });
-                    self.state.scene.overlays.push(overlay);
-                    let new_idx = self.state.scene.overlays.len() - 1;
-                    let t = self.state.playhead;
-                    let lane = self.state.pick_or_create_empty_video_lane_at(t);
-                    self.state.overlay_track_assignments.insert(new_idx, lane);
-                    self.state.selection = Selection::Overlay(new_idx);
-                    self.state.status = format!("{} {} ({})", crate::i18n::t("Dropped image:"), id, crate::i18n::t("saved to library"));
+                    self.state.status = format!(
+                        "{} {} ({})",
+                        crate::i18n::t("Dropped image:"),
+                        placed_id,
+                        crate::i18n::t("saved to library")
+                    );
                 } else if is_audio {
                     let id = dest.file_stem().and_then(|s| s.to_str())
                         .map(|s| s.to_string())

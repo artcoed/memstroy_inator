@@ -943,29 +943,32 @@ pub(crate) fn add_library_asset_at_playhead(
             state.status = format!("{} {}", crate::i18n::t("Added sound:"), asset.id);
         }
         AssetDragKind::Image => {
-            let overlay = Overlay::Image(ImageOverlay {
-                id: asset.id.clone(),
-                source: asset.path.clone(),
-                t_in: t,
-                t_out: (t + 3.0).min(dur),
-                layout: vec![Keyframe::new(0.0, OverlayState::default())],
-                modifiers: Vec::new(),
-                skeleton_attachment: None,
-                effects: Vec::new(),
-                animated_params: Default::default(),
-                chroma_key: None,
-                z_order: 0,
-                parent_id: None,
+            let t_in = t;
+            let t_out = (t + 3.0).min(dur);
+            let asset_id = asset.id.clone();
+            let asset_path = asset.path.clone();
+            state.mutate_state(|s| {
+                let lane = s.pick_or_create_empty_video_lane_for_range(t_in, t_out);
+                let overlay = Overlay::Image(ImageOverlay {
+                    id: crate::state::unique_overlay_id(&s.scene.overlays, &asset_id),
+                    source: asset_path.clone(),
+                    t_in,
+                    t_out,
+                    layout: vec![Keyframe::new(0.0, OverlayState::default())],
+                    modifiers: Vec::new(),
+                    skeleton_attachment: None,
+                    effects: Vec::new(),
+                    animated_params: Default::default(),
+                    chroma_key: None,
+                    z_order: 0,
+                    parent_id: None,
+                });
+                s.scene.overlays.push(overlay);
+                let new_idx = s.scene.overlays.len() - 1;
+                s.overlay_track_assignments.insert(new_idx, lane);
+                s.selection = Selection::Overlay(new_idx);
+                s.status = format!("{} {}", crate::i18n::t("Added image:"), asset_id);
             });
-            state.scene.overlays.push(overlay);
-            let new_idx = state.scene.overlays.len() - 1;
-            // Always land the new image overlay on its own lane so a
-            // drop never silently replaces an image already on the
-            // default overlay row.
-            let lane = state.pick_or_create_empty_video_lane_at(t);
-            state.overlay_track_assignments.insert(new_idx, lane);
-            state.selection = Selection::Overlay(new_idx);
-            state.status = format!("{} {}", crate::i18n::t("Added image:"), asset.id);
         }
         AssetDragKind::Particle => {
             // Particle = image overlay with a spin + pulse + wobble preset
@@ -992,28 +995,35 @@ pub(crate) fn add_library_asset_at_playhead(
                     freq_hz: 1.0, amp_x: 12.0, amp_y: 12.0, amp_rot_deg: 0.0, phase: 0.0,
                 },
             });
-            let overlay = Overlay::Image(ImageOverlay {
-                id: format!("particle_{}", asset.id),
-                source: asset.path.clone(),
-                t_in: t,
-                t_out: (t + 4.0).min(dur),
-                layout: vec![Keyframe::new(0.0, OverlayState::default())],
-                modifiers,
-                skeleton_attachment: None,
-                effects: Vec::new(),
-                animated_params: Default::default(),
-                chroma_key: None,
-                z_order: 0,
-                parent_id: None,
+            let t_in = t;
+            let t_out = (t + 4.0).min(dur);
+            let asset_id = asset.id.clone();
+            let asset_path = asset.path.clone();
+            state.mutate_state(|s| {
+                let lane = s.pick_or_create_empty_video_lane_for_range(t_in, t_out);
+                let overlay = Overlay::Image(ImageOverlay {
+                    id: crate::state::unique_overlay_id(
+                        &s.scene.overlays,
+                        &format!("particle_{asset_id}"),
+                    ),
+                    source: asset_path.clone(),
+                    t_in,
+                    t_out,
+                    layout: vec![Keyframe::new(0.0, OverlayState::default())],
+                    modifiers,
+                    skeleton_attachment: None,
+                    effects: Vec::new(),
+                    animated_params: Default::default(),
+                    chroma_key: None,
+                    z_order: 0,
+                    parent_id: None,
+                });
+                s.scene.overlays.push(overlay);
+                let new_idx = s.scene.overlays.len() - 1;
+                s.overlay_track_assignments.insert(new_idx, lane);
+                s.selection = Selection::Overlay(new_idx);
+                s.status = format!("{} {}", crate::i18n::t("Added particle:"), asset_id);
             });
-            state.scene.overlays.push(overlay);
-            let new_idx = state.scene.overlays.len() - 1;
-            // Same rule as plain images — a particle drop must never
-            // clobber an existing layer.
-            let lane = state.pick_or_create_empty_video_lane_at(t);
-            state.overlay_track_assignments.insert(new_idx, lane);
-            state.selection = Selection::Overlay(new_idx);
-            state.status = format!("{} {}", crate::i18n::t("Added particle:"), asset.id);
         }
         AssetDragKind::Video => {
             // Treat a Video drop the same way as a Clip from the
@@ -2232,14 +2242,12 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
     ui.add_space(8.0);
     inspector_modifiers(ui, &mut a.modifiers, ("actor_mods", i));
 
-    // Auto-seed a keyframe at the playhead for any param that was just
-    // toggled to animated (wasn't animated before this frame, now is).
-    for pid in a.animated_params.iter() {
-        if !animated_before.contains(pid) {
-            kf_anim::seed_actor_kf_on_toggle(&mut a.layout, playhead);
-            break; // one seed pass is enough — it inserts the whole state
-        }
-    }
+    kf_anim::seed_actor_params_on_toggle(
+        &mut a.layout,
+        &mut a.animated_params,
+        &animated_before,
+        playhead,
+    );
 }
 
 /// Color a param label gold when its kf was just clicked from the timeline.
@@ -3382,16 +3390,35 @@ fn inspector_masks_section(
             // is pushed by `commit_mask_draft` when the user finishes
             // drawing on the canvas. No placeholder is created here to
             // avoid the "two masks" bug.
-            if ui.button(crate::i18n::t("\u{25AD} Rectangle / Crop")).clicked() {
+            if ui.button(crate::i18n::t("\u{25AD} Rectangle mask")).clicked() {
                 *mask_tool = MaskTool::RectMask;
             }
+            if ui.button(crate::i18n::t("\u{2702} Crop")).clicked() {
+                *mask_tool = MaskTool::CropRect;
+            }
+            ui.end_row();
             if ui.button(crate::i18n::t("\u{2B2D} Ellipse")).clicked() {
                 *mask_tool = MaskTool::EllipseMask;
             }
-            ui.end_row();
             if ui.button(crate::i18n::t("\u{270D} Freehand")).clicked() {
                 *mask_tool = MaskTool::FreehandMask;
             }
+            ui.end_row();
+            if ui
+                .button(crate::i18n::t("\u{1F58C} Draw"))
+                .on_hover_text(crate::i18n::t("Freehand brush — keep pixels inside the stroke"))
+                .clicked()
+            {
+                *mask_tool = MaskTool::BrushDraw;
+            }
+            if ui
+                .button(crate::i18n::t("\u{1F9F9} Eraser"))
+                .on_hover_text(crate::i18n::t("Freehand eraser — erase pixels inside the stroke"))
+                .clicked()
+            {
+                *mask_tool = MaskTool::Eraser;
+            }
+            ui.end_row();
             if ui
                 .button(crate::i18n::t("\u{2B20} Segment selection"))
                 .on_hover_text(crate::i18n::t(
@@ -4808,6 +4835,59 @@ fn inspector_image_tools_section(ui: &mut egui::Ui, state: &mut EditorState, ove
         );
         ui.add_space(4.0);
 
+        ui.label(
+            RichText::new(crate::i18n::t("Canvas editing — drag on the preview to apply"))
+                .size(9.5)
+                .strong()
+                .color(Color32::from_rgb(255, 200, 120)),
+        );
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+            use crate::state::{MaskTool, Selection};
+
+            if ui
+                .button(RichText::new("\u{2702} Crop").size(11.0))
+                .on_hover_text(crate::i18n::t("Drag a rectangle to permanently crop pixels"))
+                .clicked()
+            {
+                state.selection = Selection::Overlay(overlay_idx);
+                state.mask_tool = MaskTool::CropRect;
+            }
+            if ui
+                .button(RichText::new("\u{25AD} Collider").size(11.0))
+                .on_hover_text(crate::i18n::t("Rect mask — hide everything outside the box"))
+                .clicked()
+            {
+                state.selection = Selection::Overlay(overlay_idx);
+                state.mask_tool = MaskTool::RectMask;
+            }
+            if ui
+                .button(RichText::new("\u{270D} Draw").size(11.0))
+                .on_hover_text(crate::i18n::t("Freehand brush — keep pixels inside the stroke"))
+                .clicked()
+            {
+                state.selection = Selection::Overlay(overlay_idx);
+                state.mask_tool = MaskTool::BrushDraw;
+            }
+            if ui
+                .button(RichText::new("\u{1F9F9} Eraser").size(11.0))
+                .on_hover_text(crate::i18n::t("Freehand eraser — erase pixels inside the stroke"))
+                .clicked()
+            {
+                state.selection = Selection::Overlay(overlay_idx);
+                state.mask_tool = MaskTool::Eraser;
+            }
+        });
+
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new(crate::i18n::t("Effects — click to add, tweak in Effects section"))
+                .size(9.5)
+                .strong()
+                .color(Color32::from_rgb(180, 220, 255)),
+        );
+        ui.add_space(2.0);
+
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
 
@@ -5336,6 +5416,7 @@ fn inspector_overlay_state_widgets(
     use crate::kf_anim;
     use memstroy_core::param_ids;
 
+    let animated_before = animated_params.clone();
     let cur = kf_anim::sample_overlay(layout, playhead);
 
     let mut new_x = cur.pos[0];
@@ -5519,6 +5600,13 @@ fn inspector_overlay_state_widgets(
     inspector_overlay_param_strip(
         ui, layout, flip_y_anim, playhead,
         |s| s.flip_y_anim, (salt_kind, "strip_fy", salt_idx),
+    );
+
+    kf_anim::seed_overlay_params_on_toggle(
+        layout,
+        animated_params,
+        &animated_before,
+        playhead,
     );
 }
 
@@ -11373,7 +11461,8 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     // layer's storage was untouched. Here we fold every release into a
     // SINGLE undo snapshot before applying the new times.
     if !param_row_drag_releases.is_empty() {
-        state.undo.push(&state.scene);
+        state.last_drag_group = None;
+        state.undo.push_full(state.build_undo_snapshot());
         let mut moved = 0usize;
         // Track the new times so we can update `state.selected_keyframes`
         // — without this, every selected entry (which carries the OLD

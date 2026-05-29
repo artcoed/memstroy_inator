@@ -461,9 +461,12 @@ const COL_MULTI_SELECT_BORDER: Color32 = Color32::from_rgb(255, 180, 60);
 /// World-space AABB of an actor at the current playhead. Mirrors the
 /// math in `actor_screen_rect` but stays in world pixels (no canvas
 /// zoom multiplier, no full_rect offset). Returns `(min, max)` corners.
-fn actor_world_aabb(state: &EditorState, idx: usize) -> Option<([f32; 2], [f32; 2])> {
+pub(crate) fn actor_world_aabb(
+    state: &EditorState,
+    idx: usize,
+    t: f32,
+) -> Option<([f32; 2], [f32; 2])> {
     let actor = state.scene.actors.get(idx)?;
-    let t = state.playhead;
 
     let world_pos = get_element_world_pos(state, &actor.id, &actor.layout, t);
     let (src_w, src_h) = if let Some(fc) = state.frame_caches.get(idx) {
@@ -497,9 +500,12 @@ fn actor_world_aabb(state: &EditorState, idx: usize) -> Option<([f32; 2], [f32; 
 
 /// World-space AABB of an overlay at the current playhead. Mirrors the
 /// math in `draw_canvas_overlays`. Returns `(min, max)` corners.
-fn overlay_world_aabb(state: &EditorState, idx: usize) -> Option<([f32; 2], [f32; 2])> {
+pub(crate) fn overlay_world_aabb(
+    state: &EditorState,
+    idx: usize,
+    t: f32,
+) -> Option<([f32; 2], [f32; 2])> {
     let overlay = state.scene.overlays.get(idx)?;
-    let t = state.playhead;
     let (t_in, t_out, layout) = match overlay {
         Overlay::Text(txt) => (txt.t_in, txt.t_out, &txt.layout),
         Overlay::Image(img) => (img.t_in, img.t_out, &img.layout),
@@ -509,37 +515,50 @@ fn overlay_world_aabb(state: &EditorState, idx: usize) -> Option<([f32; 2], [f32
         else if t < t_in { 0.0 } else { (t_out - t_in).max(0.0) };
     let mut ov_state = keyframe::sample(layout, sample_t).unwrap_or_default();
 
-    let [out_w, out_h] = state.scene.render_frame.resolution;
-    let world_w = out_w as f32;
-    let world_h = out_h as f32;
-    let mut center_x = ov_state.pos[0] * world_w;
-    let mut center_y = ov_state.pos[1] * world_h;
-
-    // Apply parent transform (position + scale) so marquee-select and
-    // hit-testing match what the user actually sees on canvas.
-    let parent_id = match overlay {
-        Overlay::Text(o) => o.parent_id.clone(),
-        Overlay::Image(o) => o.parent_id.clone(),
-        Overlay::Video(o) => o.parent_id.clone(),
-    };
     let element_id = match overlay {
-        Overlay::Text(o) => o.id.clone(),
-        Overlay::Image(o) => o.id.clone(),
-        Overlay::Video(o) => o.id.clone(),
+        Overlay::Text(o) => o.id.as_str(),
+        Overlay::Image(o) => o.id.as_str(),
+        Overlay::Video(o) => o.id.as_str(),
+    };
+    apply_canvas_transform_preview(
+        state,
+        element_id,
+        &mut ov_state.rotation_deg,
+        &mut ov_state.scale,
+        &mut ov_state.scale_y,
+    );
+    let modifiers: &[memstroy_core::TrackModifier] = match overlay {
+        Overlay::Text(txt) => &txt.modifiers,
+        Overlay::Image(img) => &img.modifiers,
+        Overlay::Video(vid) => &vid.modifiers,
+    };
+    let mod_delta = if t >= t_in && t <= t_out {
+        keyframe::evaluate_modifiers(modifiers, sample_t)
+    } else {
+        keyframe::ModifierDelta::default()
+    };
+    ov_state.scale = (ov_state.scale + mod_delta.d_scale).max(0.001);
+    ov_state.rotation_deg += mod_delta.d_rotation_deg;
+
+    let parent_id = match overlay {
+        Overlay::Text(o) => o.parent_id.as_ref(),
+        Overlay::Image(o) => o.parent_id.as_ref(),
+        Overlay::Video(o) => o.parent_id.as_ref(),
     };
     if let Some(pid) = parent_id {
-        let mut visited = vec![element_id];
-        if let Some(pxf) = resolve_parent_transform(state, &pid, t, &mut visited) {
-            // Apply parent translation + scale to the local position
-            let world_pos = apply_parent_transform(
-                WorldPos { x: center_x, y: center_y }, &pxf,
-            );
-            center_x = world_pos.x;
-            center_y = world_pos.y;
+        let mut visited = vec![element_id.to_string()];
+        if let Some(pxf) = resolve_parent_transform(state, pid, t, &mut visited) {
+            ov_state.rotation_deg += pxf.rotation_deg;
             ov_state.scale *= pxf.scale_x;
             ov_state.scale_y *= safe_div(pxf.scale_y, pxf.scale_x);
         }
     }
+
+    // Match `frame_snapshot` / gizmo code — honour canvas_layouts,
+    // drag preview, skeleton attachments and parent position.
+    let wp = get_element_world_pos(state, element_id, &[], t);
+    let center_x = wp.x + mod_delta.dx;
+    let center_y = wp.y + mod_delta.dy;
 
     // Use the texture-aware bbox so image overlays use real PNG
     // dimensions (not the legacy 200×200 placeholder), keeping the
@@ -652,14 +671,14 @@ fn commit_marquee_selection(state: &mut EditorState, extend: bool) {
     let mut hits: Vec<Selection> = Vec::new();
     for idx in 0..state.scene.actors.len() {
         if !state.scene.actors[idx].visible { continue; }
-        if let Some(aabb) = actor_world_aabb(state, idx) {
+        if let Some(aabb) = actor_world_aabb(state, idx, state.playhead) {
             if aabbs_overlap(aabb, marquee_box) {
                 hits.push(Selection::Actor(idx));
             }
         }
     }
     for idx in 0..state.scene.overlays.len() {
-        if let Some(aabb) = overlay_world_aabb(state, idx) {
+        if let Some(aabb) = overlay_world_aabb(state, idx, state.playhead) {
             if aabbs_overlap(aabb, marquee_box) {
                 hits.push(Selection::Overlay(idx));
             }
@@ -733,8 +752,8 @@ fn draw_multi_selection_borders(
         // Skip the primary — its handles/border are drawn elsewhere.
         if *sel == state.selection { continue; }
         let aabb = match *sel {
-            Selection::Actor(i) => actor_world_aabb(state, i),
-            Selection::Overlay(i) => overlay_world_aabb(state, i),
+            Selection::Actor(i) => actor_world_aabb(state, i, state.playhead),
+            Selection::Overlay(i) => overlay_world_aabb(state, i, state.playhead),
             _ => None,
         };
         let Some((mn, mx)) = aabb else { continue; };
@@ -1147,13 +1166,25 @@ fn pick_actors_for_canvas(state: &EditorState, t: f32) -> HashSet<usize> {
 fn pick_overlays_for_canvas(state: &EditorState, t: f32) -> HashSet<usize> {
     use std::collections::HashMap;
     let mut by_track: HashMap<usize, Vec<usize>> = HashMap::new();
-    for oi in 0..state.scene.overlays.len() {
-        // Skip text overlays — they may overlap freely on a lane.
-        if matches!(state.scene.overlays[oi], Overlay::Text(_)) { continue; }
-        let lane = overlay_track_index(state, oi);
-        by_track.entry(lane).or_default().push(oi);
-    }
     let mut keep = HashSet::new();
+    for oi in 0..state.scene.overlays.len() {
+        match &state.scene.overlays[oi] {
+            // Text overlays may overlap freely on a lane.
+            Overlay::Text(_) => continue,
+            // Every image active at the playhead is drawn (each sits on
+            // its own timeline row, like clips).
+            Overlay::Image(im) => {
+                if t >= im.t_in && t <= im.t_out {
+                    keep.insert(oi);
+                }
+                continue;
+            }
+            Overlay::Video(_) => {
+                let lane = overlay_track_index(state, oi);
+                by_track.entry(lane).or_default().push(oi);
+            }
+        }
+    }
     for (_lane, indices) in by_track {
         let active = indices.iter().copied().find(|&oi| {
             let (t_in, t_out) = match &state.scene.overlays[oi] {
@@ -3007,8 +3038,8 @@ fn inverse_parent_transform(world: WorldPos, parent: &ParentTransform) -> WorldP
     }
 }
 
-/// world coords relative to the render frame.
-fn get_element_world_pos(
+/// World coords relative to the render frame.
+pub(crate) fn get_element_world_pos(
     state: &EditorState,
     element_id: &str,
     legacy_layout: &[Keyframe<ActorState>],
@@ -3275,23 +3306,31 @@ fn commit_canvas_drag_preview(state: &mut EditorState) {
     {
         return;
     }
-    state.canvas_drag.drag_start_playhead = None;
+    // Keep the playhead frozen until keyframes are written — clearing
+    // `drag_start_playhead` before the write made animated drags land
+    // at the live playhead (often mid-playback) instead of drag start.
+    let frozen_t = state.canvas_drag.drag_start_playhead;
     if let Some(center) = state.canvas_drag.preview_world_center.take() {
         let token = canvas_drag_token(CANVAS_TOKEN_POS, sel);
+        state.canvas_drag.drag_start_playhead = frozen_t;
         write_selection_world_center(state, sel, center, token, false);
     }
     if let Some(rot) = state.canvas_drag.preview_rotation_deg.take() {
         let token = canvas_drag_token(CANVAS_TOKEN_ROTATION, sel);
+        state.canvas_drag.drag_start_playhead = frozen_t;
         write_selection_rotation(state, sel, rot, token, false);
     }
     if let Some(scale) = state.canvas_drag.preview_scale.take() {
         let token = canvas_drag_token(CANVAS_TOKEN_SCALE, sel);
+        state.canvas_drag.drag_start_playhead = frozen_t;
         write_selection_scale(state, sel, scale, token, false);
     }
     if let Some(scale_y) = state.canvas_drag.preview_scale_y.take() {
         let token = canvas_drag_token(CANVAS_TOKEN_SCALE_Y, sel);
+        state.canvas_drag.drag_start_playhead = frozen_t;
         write_selection_scale_y(state, sel, scale_y, token, false);
     }
+    state.canvas_drag.drag_start_playhead = None;
     state.canvas_drag.preview_element_id = None;
 }
 
@@ -4374,12 +4413,12 @@ fn snapshot_multi_drag(state: &EditorState) -> Vec<crate::state::MultiDragEntry>
     for sel in &state.canvas_selection {
         let pos = match *sel {
             Selection::Actor(i) => {
-                actor_world_aabb(state, i).map(|(mn, mx)| {
+                actor_world_aabb(state, i, state.playhead).map(|(mn, mx)| {
                     [(mn[0] + mx[0]) * 0.5, (mn[1] + mx[1]) * 0.5]
                 })
             }
             Selection::Overlay(i) => {
-                overlay_world_aabb(state, i).map(|(mn, mx)| {
+                overlay_world_aabb(state, i, state.playhead).map(|(mn, mx)| {
                     [(mn[0] + mx[0]) * 0.5, (mn[1] + mx[1]) * 0.5]
                 })
             }
@@ -4515,10 +4554,7 @@ fn write_selection_world_center(
     // land at the visible time.
     let t = state.canvas_drag.drag_start_playhead.unwrap_or(state.playhead);
     // ── Undo grouping: one snapshot per drag gesture. ──
-    if state.last_drag_group != Some(token) {
-        state.undo.push(&state.scene);
-        state.last_drag_group = Some(token);
-    }
+    state.push_drag_undo_if_needed(token);
     match sel {
         Selection::Actor(idx) if idx < state.scene.actors.len() => {
             let actor_id = state.scene.actors[idx].id.clone();
@@ -4557,6 +4593,31 @@ fn write_selection_world_center(
                         v.pos.y = sy;
                     },
                 );
+                // Keep the normalised layout track in sync so the
+                // inspector, timeline strips, and canvas use one pose.
+                let [rw, rh] = state.scene.render_frame.resolution;
+                let world_w = rw as f32;
+                let world_h = rh as f32;
+                if world_w > 0.0 && world_h > 0.0 {
+                    let new_norm = [stored_center.x / world_w, stored_center.y / world_h];
+                    let actor = &mut state.scene.actors[idx];
+                    crate::kf_anim::write_actor_param(
+                        &mut actor.layout,
+                        &mut actor.animated_params,
+                        t,
+                        memstroy_core::param_ids::POS_X,
+                        false,
+                        |v| v.pos[0] = new_norm[0],
+                    );
+                    crate::kf_anim::write_actor_param(
+                        &mut actor.layout,
+                        &mut actor.animated_params,
+                        t,
+                        memstroy_core::param_ids::POS_Y,
+                        false,
+                        |v| v.pos[1] = new_norm[1],
+                    );
+                }
                 return;
             }
             // Legacy normalised: convert world centre to a normalised
@@ -4673,10 +4734,7 @@ pub fn set_element_parent_preserve_world(
         _ => return false,
     };
     let token = canvas_drag_token(CANVAS_TOKEN_POS, sel);
-    if state.last_drag_group != Some(token) {
-        state.undo.push(&state.scene);
-        state.last_drag_group = Some(token);
-    }
+    state.push_drag_undo_if_needed(token);
     if !state.scene.set_element_parent_id(element_id, new_parent_id) {
         return false;
     }
@@ -4713,10 +4771,7 @@ fn write_selection_scale_y(
         return;
     }
     let t = state.canvas_drag.drag_start_playhead.unwrap_or(state.playhead);
-    if state.last_drag_group != Some(token) {
-        state.undo.push(&state.scene);
-        state.last_drag_group = Some(token);
-    }
+    state.push_drag_undo_if_needed(token);
     match sel {
         Selection::Actor(idx) if idx < state.scene.actors.len() => {
             let actor = &mut state.scene.actors[idx];
@@ -4766,10 +4821,7 @@ fn write_selection_scale(
         return;
     }
     let t = state.canvas_drag.drag_start_playhead.unwrap_or(state.playhead);
-    if state.last_drag_group != Some(token) {
-        state.undo.push(&state.scene);
-        state.last_drag_group = Some(token);
-    }
+    state.push_drag_undo_if_needed(token);
     match sel {
         Selection::Actor(idx) if idx < state.scene.actors.len() => {
             let actor = &mut state.scene.actors[idx];
@@ -4839,10 +4891,7 @@ fn write_selection_rotation(
         return;
     }
     let t = state.canvas_drag.drag_start_playhead.unwrap_or(state.playhead);
-    if state.last_drag_group != Some(token) {
-        state.undo.push(&state.scene);
-        state.last_drag_group = Some(token);
-    }
+    state.push_drag_undo_if_needed(token);
     match sel {
         Selection::Actor(idx) if idx < state.scene.actors.len() => {
             let actor = &mut state.scene.actors[idx];
@@ -5990,12 +6039,11 @@ fn ensure_image_loaded(
                 [w as usize, h as usize],
                 &pixels,
             );
-            let name = format!(
-                "img_overlay_{}",
-                path.file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("anon")
-            );
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            path.hash(&mut hasher);
+            let name = format!("img_overlay_{:016x}", hasher.finish());
             let handle = ctx.load_texture(name, color_image, egui::TextureOptions::LINEAR);
             (Some(handle), Some([w, h]))
         }
@@ -6646,7 +6694,10 @@ pub(crate) fn handle_mask_draw_input(
             if let Some((uv, _, _)) =
                 screen_to_element_uv(state, full_rect, viewport_size, p)
             {
-                if matches!(tool, MaskTool::FreehandMask) {
+                if matches!(
+                    tool,
+                    MaskTool::FreehandMask | MaskTool::Eraser | MaskTool::BrushDraw
+                ) {
                     // Decimate so the path doesn't accumulate thousands
                     // of duplicate points when the cursor barely moves.
                     let push = match state.mask_draft_points.last() {
@@ -6881,6 +6932,8 @@ fn commit_mask_draft(
         && (by - ty).abs() < 0.005
         && tool != MaskTool::FreehandMask
         && tool != MaskTool::SegmentMask
+        && tool != MaskTool::Eraser
+        && tool != MaskTool::BrushDraw
     {
         // Treat tiny gestures as a misclick — don't commit anything.
         // Polygon-style tools (freehand and segment) skip this guard
@@ -6957,6 +7010,32 @@ fn commit_mask_draft(
                 ))
             }
         }
+        MaskTool::CropRect => Some(memstroy_core::Effect::new(
+            memstroy_core::EffectKind::Crop {
+                left: lx,
+                top: ty,
+                right: (1.0 - rx).clamp(0.0, 0.49),
+                bottom: (1.0 - by).clamp(0.0, 0.49),
+            },
+        )),
+        MaskTool::Eraser | MaskTool::BrushDraw => {
+            if pts.len() < 3 {
+                None
+            } else {
+                let clamped: Vec<[f32; 2]> = pts
+                    .into_iter()
+                    .map(|p| [p[0].clamp(0.0, 1.0), p[1].clamp(0.0, 1.0)])
+                    .collect();
+                let invert = matches!(tool, MaskTool::Eraser);
+                Some(memstroy_core::Effect::new(
+                    memstroy_core::EffectKind::Mask {
+                        shape: memstroy_core::MaskShape::Polygon { points: clamped },
+                        feather: if matches!(tool, MaskTool::BrushDraw) { 0.01 } else { 0.0 },
+                        invert,
+                    },
+                ))
+            }
+        }
         MaskTool::Eyedropper => {
             // Eyedropper commits via a separate single-click handler
             // (`handle_eyedropper_mask_click`) that knows how to read
@@ -6971,13 +7050,19 @@ fn commit_mask_draft(
     };
 
     let Some(effect) = new_effect else { return; };
+    let replace_crop = matches!(effect.kind, memstroy_core::EffectKind::Crop { .. });
 
     // Fold the new effect into the target element's stack inside a
     // single `mutate` call so it lands as one undo step.
     state.mutate(|scene| {
         match target {
             Selection::Actor(i) if i < scene.actors.len() => {
-                scene.actors[i].effects.push(effect);
+                if replace_crop {
+                    scene.actors[i]
+                        .effects
+                        .retain(|e| !matches!(e.kind, memstroy_core::EffectKind::Crop { .. }));
+                }
+                scene.actors[i].effects.push(effect.clone());
             }
             Selection::Overlay(i) if i < scene.overlays.len() => {
                 let effects = match &mut scene.overlays[i] {
@@ -6985,7 +7070,10 @@ fn commit_mask_draft(
                     memstroy_core::Overlay::Image(im) => &mut im.effects,
                     memstroy_core::Overlay::Video(v) => &mut v.effects,
                 };
-                effects.push(effect);
+                if replace_crop {
+                    effects.retain(|e| !matches!(e.kind, memstroy_core::EffectKind::Crop { .. }));
+                }
+                effects.push(effect.clone());
             }
             _ => {}
         }
@@ -7196,7 +7284,7 @@ fn draw_mask_draft(
         .last()
         .unwrap_or(&start_uv);
     match tool {
-        MaskTool::RectMask => {
+        MaskTool::RectMask | MaskTool::CropRect => {
             // Draw the rectangle as a closed polyline in element-local
             // UV so it rotates with the image. `Rect::from_two_pos`
             // would axis-align it on screen; we want the four corners
@@ -7234,12 +7322,19 @@ fn draw_mask_draft(
                 prev = cur;
             }
         }
-        MaskTool::FreehandMask => {
+        MaskTool::FreehandMask | MaskTool::Eraser | MaskTool::BrushDraw => {
+            let stroke = if matches!(tool, MaskTool::Eraser) {
+                Stroke::new(1.5, Color32::from_rgb(255, 120, 120))
+            } else if matches!(tool, MaskTool::BrushDraw) {
+                Stroke::new(2.0, Color32::from_rgb(120, 220, 255))
+            } else {
+                stroke_main
+            };
             if state.mask_draft_points.len() >= 2 {
                 let mut prev = to_screen(state.mask_draft_points[0]);
                 for &uv in state.mask_draft_points.iter().skip(1) {
                     let cur = to_screen(uv);
-                    painter.line_segment([prev, cur], stroke_main);
+                    painter.line_segment([prev, cur], stroke);
                     prev = cur;
                 }
                 // Ghost line back to the start so the user knows the
@@ -7877,7 +7972,7 @@ fn skeleton_host_screen_rect(
         Selection::Actor(i) => actor_screen_rect(state, full_rect, viewport_size, i),
         Selection::Overlay(i) => {
             // Reuse the overlay AABB and convert it to screen.
-            let (mn, mx) = overlay_world_aabb(state, i)?;
+            let (mn, mx) = overlay_world_aabb(state, i, state.playhead)?;
             let center = [(mn[0] + mx[0]) * 0.5, (mn[1] + mx[1]) * 0.5];
             let center_screen = state
                 .canvas_viewport

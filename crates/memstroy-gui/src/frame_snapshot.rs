@@ -14,12 +14,12 @@
 //! Two modes:
 //!
 //! - **Full frame** (default — no canvas selection, no primary
-//!   selection): every visible layer at `t` is composited and the
-//!   output is filled with `scene.output.background_color`.
+//!   selection): every visible layer at `t` is composited onto a
+//!   transparent canvas (no scene background fill).
 //! - **Subset** (when `state.canvas_selection` is non-empty, or when
 //!   `state.selection` points at a single element): only the listed
-//!   layers are composited and the canvas starts transparent so the
-//!   user gets a "copy these layers as if isolated" snapshot.
+//!   layers are composited and the canvas is sized to their world
+//!   bounding box, also transparent.
 //!
 //! In both modes the resulting RGBA is saved as
 //! `assets/images/frame_<unix-millis>.png` and a fresh
@@ -149,14 +149,10 @@ pub fn extract_frame_to_image_layer(state: &mut EditorState) -> Result<usize, St
 /// (no render-frame clipping).
 fn compute_subset_world_bbox(
     state: &EditorState,
-    scene: &Scene,
+    _scene: &Scene,
     subset: &[Selection],
     t: f32,
 ) -> Option<([f32; 2], [f32; 2])> {
-    use memstroy_core::keyframe;
-    let [rw, rh] = scene.render_frame.resolution;
-    let world_w = rw as f32;
-    let world_h = rh as f32;
     let mut min_x = f32::INFINITY;
     let mut min_y = f32::INFINITY;
     let mut max_x = f32::NEG_INFINITY;
@@ -164,65 +160,8 @@ fn compute_subset_world_bbox(
     let mut any = false;
     for sel in subset {
         let bbox = match *sel {
-            Selection::Actor(ai) => {
-                let actor = scene.actors.get(ai)?;
-                if !actor.visible { continue; }
-                let t_in = actor.t_in.unwrap_or(0.0);
-                let t_out = actor.t_out.unwrap_or(scene.output.duration);
-                if t < t_in || t > t_out { continue; }
-                let astate = keyframe::sample(&actor.layout, t).unwrap_or_default();
-                let world_pos = element_world_pos(scene, &actor.id, t)
-                    .unwrap_or_else(|| WorldPos {
-                        x: astate.pos[0] * world_w,
-                        y: astate.pos[1] * world_h,
-                    });
-                let (sw, sh) = state.frame_caches.get(ai)
-                    .filter(|fc| fc.is_ready() && fc.frame_count > 0)
-                    .map(|fc| (fc.source_width as f32, fc.source_height as f32))
-                    .unwrap_or((1080.0, 1920.0));
-                let elem_w = sw * astate.scale;
-                let elem_h = sh * astate.scale * astate.scale_y;
-                Some((
-                    [world_pos.x - elem_w * 0.5, world_pos.y - elem_h * 0.5],
-                    [world_pos.x + elem_w * 0.5, world_pos.y + elem_h * 0.5],
-                ))
-            }
-            Selection::Overlay(oi) => {
-                let ov = scene.overlays.get(oi)?;
-                let (t_in, t_out) = match ov {
-                    Overlay::Text(o) => (o.t_in, o.t_out),
-                    Overlay::Image(o) => (o.t_in, o.t_out),
-                    Overlay::Video(o) => (o.t_in, o.t_out),
-                };
-                if t < t_in || t > t_out { continue; }
-                let local_t = (t - t_in).max(0.0);
-                let layout = match ov {
-                    Overlay::Text(o) => &o.layout,
-                    Overlay::Image(o) => &o.layout,
-                    Overlay::Video(o) => &o.layout,
-                };
-                let ostate = keyframe::sample(layout, local_t).unwrap_or_default();
-                let center_x = ostate.pos[0] * world_w;
-                let center_y = ostate.pos[1] * world_h;
-                // Use texture size when available, else 200x200 default
-                let (sw, sh) = match ov {
-                    Overlay::Image(im) => state.image_textures.lock().ok()
-                        .and_then(|m| match m.get(&im.source) {
-                            Some(crate::state::ImageTextureSlot::Loaded { size, .. }) => {
-                                Some((size[0] as f32, size[1] as f32))
-                            }
-                            _ => None,
-                        })
-                        .unwrap_or((200.0, 200.0)),
-                    _ => (200.0, 200.0),
-                };
-                let elem_w = sw * ostate.scale;
-                let elem_h = sh * ostate.scale * ostate.scale_y;
-                Some((
-                    [center_x - elem_w * 0.5, center_y - elem_h * 0.5],
-                    [center_x + elem_w * 0.5, center_y + elem_h * 0.5],
-                ))
-            }
+            Selection::Actor(ai) => crate::canvas_preview::actor_world_aabb(state, ai, t),
+            Selection::Overlay(oi) => crate::canvas_preview::overlay_world_aabb(state, oi, t),
             _ => None,
         };
         if let Some((mn, mx)) = bbox {
@@ -261,79 +200,36 @@ fn compose_frame(
     let rh_full = rh_full.max(1);
     let rf_state = sample_render_frame_eased(rf, t);
 
-    // ── Determine output canvas size and projection ──
-    //
-    // Full-frame: canvas = render-frame resolution, project via
-    // `world_to_output` honouring rf rotation/zoom (current export
-    // behaviour).
-    //
-    // Subset: canvas = world-space bounding box of selected elements
-    // (no render-frame clipping). Project via `world_to_subset` which
-    // is a simple translate (world.x - bbox.min.x, world.y - bbox.min.y).
-    let (rw, rh, subset_bbox_min) = if full_frame {
-        (rw_full, rh_full, None)
+    // Always composite at full render-frame resolution with the real
+    // camera transform, then crop to the selection bbox in output
+    // space. The old "synthetic camera centred on the bbox" path
+    // mis-aligned subset extracts when elements used canvas_layouts
+    // or parent transforms — the saved region looked like a random
+    // crop of the frame instead of the selected layer.
+    let subset_crop_bbox = if full_frame {
+        None
     } else {
-        // Compute world AABB of every selected element
-        let bbox = compute_subset_world_bbox(state, &scene_clone, subset, t);
-        match bbox {
-            Some((mn, mx)) => {
-                // Add a small padding so element edges aren't clipped
-                let pad = 4.0_f32;
-                let bw = ((mx[0] - mn[0]) + pad * 2.0).max(8.0).round() as u32;
-                let bh = ((mx[1] - mn[1]) + pad * 2.0).max(8.0).round() as u32;
-                (bw.max(8), bh.max(8), Some([mn[0] - pad, mn[1] - pad]))
-            }
-            None => (rw_full, rh_full, None), // fallback if no bbox computable
-        }
+        compute_subset_world_bbox(state, &scene_clone, subset, t)
     };
 
-    // Override rf_state in subset mode so `world_to_output` projects
-    // world coords directly into the bbox-sized canvas with no
-    // rotation/zoom (identity). Centre the synthetic rf at the bbox
-    // centre so `world_to_output`'s `(rw/2 + (world - rf.pos))`
-    // formula maps `bbox_min` → `(0, 0)` and `bbox_max` → `(rw, rh)`.
-    let rf_state = if let Some(bmin) = subset_bbox_min {
-        RenderFrameState {
-            pos: WorldPos {
-                x: bmin[0] + (rw as f32) * 0.5,
-                y: bmin[1] + (rh as f32) * 0.5,
-            },
-            zoom: 1.0,
-            rotation_deg: 0.0,
-        }
-    } else {
-        rf_state
-    };
-
-    // Output canvas. Full-frame mode: pre-fill with scene background
-    // colour at full alpha. Subset mode: stay transparent so the
-    // copied layers can later be overlaid on something else.
-    let mut canvas = if full_frame {
-        let [r, g, b] = scene_clone.output.background_color;
-        RgbaImage::from_pixel(rw, rh, Rgba([r, g, b, 255]))
-    } else {
-        RgbaImage::new(rw, rh)
-    };
+    // Transparent output — extracted images are meant to be composited
+    // elsewhere, not pasted with an opaque scene background.
+    let mut canvas = RgbaImage::new(rw_full, rh_full);
 
     let mut summary = CompositeSummary::default();
 
     // ── Pass 1: backgrounds ──────────────────────────────────────
     //
-    // Only paint backgrounds in full-frame mode, OR when the user has
-    // explicitly added a Background to the subset. In both cases we
-    // render the same way the canvas does (solid colour fill across
-    // the render frame; image/video bg skipped for v1).
-    let bg_iter: Vec<usize> = if full_frame {
-        (0..scene_clone.backgrounds.len()).collect()
-    } else {
-        subset
-            .iter()
-            .filter_map(|s| match s {
-                Selection::Background(i) => Some(*i),
-                _ => None,
-            })
-            .collect()
-    };
+    // Only paint a background when the user explicitly selected it.
+    // Full-frame extract stays transparent so "Extract as image"
+    // produces a PNG with alpha, not the scene's solid backdrop.
+    let bg_iter: Vec<usize> = subset
+        .iter()
+        .filter_map(|s| match s {
+            Selection::Background(i) => Some(*i),
+            _ => None,
+        })
+        .collect();
     for i in bg_iter {
         let bg = match scene_clone.backgrounds.get(i) {
             Some(b) => b,
@@ -344,17 +240,17 @@ fn compose_frame(
         }
         match &bg.source {
             MediaSource::SolidColor { color } => {
-                paint_solid_background(&mut canvas, *color, &rf_state, rw, rh);
+                paint_solid_background(&mut canvas, *color, &rf_state, rw_full, rh_full);
             }
             MediaSource::Image { path } => {
-                if !paint_image_background(&mut canvas, path, bg.fit, rw, rh) {
+                if !paint_image_background(&mut canvas, path, bg.fit, rw_full, rh_full) {
                     summary.skipped_image_bg += 1;
                 }
             }
             MediaSource::Video { path, r#loop, start_at } => {
                 let local = (t - bg.start).max(0.0) + *start_at;
                 if !paint_video_background(
-                    &mut canvas, path, local, *r#loop, bg.fit, rw, rh,
+                    &mut canvas, path, local, *r#loop, bg.fit, rw_full, rh_full,
                 ) {
                     summary.skipped_image_bg += 1;
                 }
@@ -455,23 +351,24 @@ fn compose_frame(
                 match overlay_owned {
                     Overlay::Image(img_ov) => {
                         paint_image_overlay(
+                            state,
                             &mut canvas,
                             &img_ov,
                             &rf_state,
-                            rw,
-                            rh,
+                            rw_full,
+                            rh_full,
                             t,
                         );
                     }
                     Overlay::Text(txt) => {
-                        if !paint_text_overlay(&mut canvas, &txt, &rf_state, rw, rh, t)
+                        if !paint_text_overlay(state, &mut canvas, &txt, &rf_state, rw_full, rh_full, t)
                         {
                             summary.skipped_text += 1;
                         }
                     }
                     Overlay::Video(vid) => {
                         if !paint_video_overlay(
-                            &mut canvas, &vid, &rf_state, rw, rh, t,
+                            state, &mut canvas, &vid, &rf_state, rw_full, rh_full, t,
                         ) {
                             summary.skipped_video += 1;
                         }
@@ -479,7 +376,7 @@ fn compose_frame(
                 }
             }
             PaintOp::Actor(ai) => {
-                paint_actor(state, &scene_clone, ai, &rf_state, rw, rh, t, &mut canvas);
+                paint_actor(state, &scene_clone, ai, &rf_state, rw_full, rh_full, t, &mut canvas);
             }
         }
     }
@@ -489,11 +386,67 @@ fn compose_frame(
     // Effect layers operate on the already-composited canvas within
     // their bounding box. Applied after all content layers.
     if !scene_clone.effect_layers.is_empty() {
-        apply_snapshot_effect_layers(&scene_clone, &rf_state, rw, rh, t, &mut canvas);
+        apply_snapshot_effect_layers(state, &scene_clone, &rf_state, rw_full, rh_full, t, &mut canvas);
     }
 
-    summary.image = canvas;
+    summary.image = if let Some((mn, mx)) = subset_crop_bbox {
+        crop_canvas_to_world_bbox(&canvas, mn, mx, &rf_state, rw_full, rh_full)
+    } else {
+        canvas
+    };
     summary
+}
+
+/// Crop a full-frame composite to the output-pixel bounds of a
+/// world-space rectangle (with a little padding).
+fn crop_canvas_to_world_bbox(
+    canvas: &RgbaImage,
+    world_min: [f32; 2],
+    world_max: [f32; 2],
+    rf_state: &RenderFrameState,
+    rw: u32,
+    rh: u32,
+) -> RgbaImage {
+    let pad_world = 8.0_f32;
+    let corners = [
+        [world_min[0] - pad_world, world_min[1] - pad_world],
+        [world_max[0] + pad_world, world_min[1] - pad_world],
+        [world_max[0] + pad_world, world_max[1] + pad_world],
+        [world_min[0] - pad_world, world_max[1] + pad_world],
+    ];
+    let mut min_x = f32::INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for c in corners {
+        let (ox, oy) = world_to_output(
+            WorldPos { x: c[0], y: c[1] },
+            rf_state,
+            rw,
+            rh,
+        );
+        min_x = min_x.min(ox);
+        min_y = min_y.min(oy);
+        max_x = max_x.max(ox);
+        max_y = max_y.max(oy);
+    }
+    if !min_x.is_finite() || !min_y.is_finite() {
+        return canvas.clone();
+    }
+    let x0 = (min_x.floor() as i32).max(0).min(rw as i32 - 1) as u32;
+    let y0 = (min_y.floor() as i32).max(0).min(rh as i32 - 1) as u32;
+    let x1 = (max_x.ceil() as i32).max(x0 as i32 + 1).min(rw as i32) as u32;
+    let y1 = (max_y.ceil() as i32).max(y0 as i32 + 1).min(rh as i32) as u32;
+    let cw = (x1 - x0).max(1);
+    let ch = (y1 - y0).max(1);
+    let mut out = RgbaImage::new(cw, ch);
+    for y in 0..ch {
+        for x in 0..cw {
+            let p = *canvas.get_pixel(x0 + x, y0 + y);
+            out.put_pixel(x, y, p);
+        }
+    }
+    out
 }
 
 // ─── BACKGROUND ────────────────────────────────────────────────────
@@ -522,6 +475,7 @@ fn paint_solid_background(
 // ─── IMAGE OVERLAY ─────────────────────────────────────────────────
 
 fn paint_image_overlay(
+    state: &EditorState,
     canvas: &mut RgbaImage,
     img_ov: &ImageOverlay,
     rf_state: &RenderFrameState,
@@ -595,22 +549,16 @@ fn paint_image_overlay(
         sub
     };
 
-    // Compute the layer's centre and effective output size.
-    //
-    // ── World position is decoupled from the live render frame ──
-    //
-    // `pos` is interpreted against a FIXED reference rectangle of size
-    // `render_frame.resolution` anchored at world (0, 0). The render
-    // frame's own pos / zoom / rotation feed into `world_to_output`
-    // below as the camera transform; they never shift the overlay's
-    // world position. This mirrors `canvas_preview` and the FFmpeg
-    // export, so the snapshot, the canvas, and the rendered MP4 all
-    // place this image at the same spot.
-    let world_w = rw as f32;
-    let world_h = rh as f32;
+    // World position matches `canvas_preview::get_element_world_pos`.
+    let world_pos = crate::canvas_preview::get_element_world_pos(
+        state,
+        &img_ov.id,
+        &[],
+        t,
+    );
     let world_pos = WorldPos {
-        x: ov_state.pos[0] * world_w + mod_delta.dx,
-        y: ov_state.pos[1] * world_h + mod_delta.dy,
+        x: world_pos.x + mod_delta.dx,
+        y: world_pos.y + mod_delta.dy,
     };
     let (cx, cy) = world_to_output(world_pos, rf_state, rw, rh);
 
@@ -728,25 +676,12 @@ fn paint_actor(
         None => return,
     };
 
-    // World position from canvas_layouts (free canvas v2) or legacy
-    // normalised layout. We mirror `canvas_preview::get_element_world_pos`
-    // here, but skip the skeleton-attachment path — actors with
-    // attachments are an advanced editor feature and the snapshot
-    // can fall back to the keyframed centre.
-    let world_pos = element_world_pos(scene, &actor.id, t).unwrap_or_else(|| {
-        // Decoupled-from-rf legacy fallback: `pos` is a `[0..1]`
-        // vector against a FIXED reference rectangle of size
-        // `render_frame.resolution`. See
-        // `canvas_preview::get_element_world_pos` and
-        // `Scene::migrate_decouple_render_frame` for the v2 contract.
-        let world_w = rw as f32;
-        let world_h = rh as f32;
-        let layout_state = keyframe::sample(&actor.layout, t).unwrap_or_default();
-        WorldPos {
-            x: layout_state.pos[0] * world_w,
-            y: layout_state.pos[1] * world_h,
-        }
-    });
+    let world_pos = crate::canvas_preview::get_element_world_pos(
+        state,
+        &actor.id,
+        &actor.layout,
+        t,
+    );
     let world_pos_with_mod = WorldPos {
         x: world_pos.x + mod_delta.dx,
         y: world_pos.y + mod_delta.dy,
@@ -783,19 +718,6 @@ fn paint_actor(
         flip_y,
         actor_state.opacity,
     );
-}
-
-/// Look up an actor's world position from `canvas_layouts` (free canvas
-/// v2). Returns `None` when no entry exists — caller falls back to the
-/// legacy normalised `layout`. Mirrors the relevant branch of
-/// `canvas_preview::get_element_world_pos` minus the skeleton path.
-fn element_world_pos(scene: &Scene, element_id: &str, t: f32) -> Option<WorldPos> {
-    let cl = scene
-        .canvas_layouts
-        .iter()
-        .find(|cl| cl.element_id == element_id)?;
-    let transform = keyframe::sample(&cl.keyframes, t)?;
-    Some(transform.pos)
 }
 
 /// Load the RGBA frame for an actor at clip-local time `local_t`.
@@ -892,6 +814,7 @@ fn apply_actor_processing(
 /// Apply all active effect layers to the snapshot canvas. Mirrors the
 /// CPU compositor's `apply_effect_layers` logic.
 fn apply_snapshot_effect_layers(
+    state: &EditorState,
     scene: &Scene,
     rf_state: &RenderFrameState,
     rw: u32,
@@ -925,10 +848,11 @@ fn apply_snapshot_effect_layers(
         let world_w = base_size * ov_state.scale;
         let world_h = base_size * ov_state.scale * ov_state.scale_y;
 
-        let world_pos = element_world_pos(scene, &fx_ov.id, t).unwrap_or_else(|| WorldPos {
-            x: ov_state.pos[0] * rw as f32 + mod_delta.dx,
-            y: ov_state.pos[1] * rh as f32 + mod_delta.dy,
-        });
+        let world_pos = crate::canvas_preview::get_element_world_pos(state, &fx_ov.id, &[], t);
+        let world_pos = WorldPos {
+            x: world_pos.x + mod_delta.dx,
+            y: world_pos.y + mod_delta.dy,
+        };
         let (cx, cy) = world_to_output(world_pos, rf_state, rw, rh);
 
         let half_w = world_w * rf_state.zoom * 0.5;
@@ -1231,6 +1155,7 @@ fn paint_video_background(
 /// `box_extra_left/right` plate doesn't shift the visible text away
 /// from the user's authored position.
 fn paint_text_overlay(
+    state: &EditorState,
     canvas: &mut RgbaImage,
     txt: &TextOverlay,
     rf_state: &RenderFrameState,
@@ -1268,14 +1193,15 @@ fn paint_text_overlay(
         return true;
     }
 
-    // Anchor the text-block centre at the user-space pos.
-    //
-    // Decoupled-from-rf world position (see `Scene::migrate_decouple_render_frame`).
-    let world_w = rw as f32;
-    let world_h = rh as f32;
+    let world_pos = crate::canvas_preview::get_element_world_pos(
+        state,
+        &txt.id,
+        &[],
+        t,
+    );
     let world_pos = WorldPos {
-        x: ov_state.pos[0] * world_w + mod_delta.dx,
-        y: ov_state.pos[1] * world_h + mod_delta.dy,
+        x: world_pos.x + mod_delta.dx,
+        y: world_pos.y + mod_delta.dy,
     };
     let (cx, cy) = world_to_output(world_pos, rf_state, rw, rh);
 
@@ -1333,6 +1259,7 @@ fn paint_text_overlay(
 /// effect stack, then composite under the layer's keyframed
 /// transform. Returns `false` when ffmpeg can't deliver a frame.
 fn paint_video_overlay(
+    state: &EditorState,
     canvas: &mut RgbaImage,
     vid: &VideoOverlay,
     rf_state: &RenderFrameState,
@@ -1388,15 +1315,15 @@ fn paint_video_overlay(
         None => return false,
     };
 
-    // Decoupled-from-rf world position. The render frame is a pure
-    // camera viewport — its pos / zoom / rotation drive
-    // `world_to_output` below as the camera transform but never shift
-    // this overlay's authored world coordinate.
-    let world_w = rw as f32;
-    let world_h = rh as f32;
+    let world_pos = crate::canvas_preview::get_element_world_pos(
+        state,
+        &vid.id,
+        &[],
+        t,
+    );
     let world_pos = WorldPos {
-        x: ov_state.pos[0] * world_w + mod_delta.dx,
-        y: ov_state.pos[1] * world_h + mod_delta.dy,
+        x: world_pos.x + mod_delta.dx,
+        y: world_pos.y + mod_delta.dy,
     };
     let (cx, cy) = world_to_output(world_pos, rf_state, rw, rh);
 
