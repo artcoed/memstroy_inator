@@ -54,14 +54,22 @@ fn upsert_index<T: Clone + keyframe::Lerp>(
 
 // ─── Sampled "current value" reads ───────────────────────────────────
 
-/// Sample an actor layout at time `t`, returning a default if the layout
-/// is empty. Reading is read-only — never mutates the layout.
-pub fn sample_actor(layout: &[Keyframe<ActorState>], t: f32) -> ActorState {
-    keyframe::sample(layout, t).unwrap_or_default()
+/// Sample an actor layout at time `t` with per-parameter tracks decoupled
+/// (opacity keyframes do not affect scale timing, etc.).
+pub fn sample_actor(
+    layout: &[Keyframe<ActorState>],
+    animated_params: &BTreeSet<String>,
+    t: f32,
+) -> ActorState {
+    memstroy_core::sample_actor_layout(layout, animated_params, t)
 }
 
-pub fn sample_overlay(layout: &[Keyframe<OverlayState>], t: f32) -> OverlayState {
-    keyframe::sample(layout, t).unwrap_or_default()
+pub fn sample_overlay(
+    layout: &[Keyframe<OverlayState>],
+    animated_params: &BTreeSet<String>,
+    t: f32,
+) -> OverlayState {
+    memstroy_core::sample_overlay_layout(layout, animated_params, t)
 }
 
 // ─── Writers (called from inspector / canvas after user edit) ────────
@@ -84,9 +92,9 @@ pub fn write_actor_param<F>(
 ) where
     F: Fn(&mut ActorState),
 {
-    // Seed with at least one kf so the rest of the system has a value to read.
+    // First keyframe lands at the playhead when the track was empty.
     if layout.is_empty() {
-        layout.push(Keyframe::new(0.0, ActorState::default()));
+        layout.push(Keyframe::new(t, ActorState::default()));
     }
 
     // Canvas drags optionally auto-mark a param as animated when the
@@ -98,7 +106,7 @@ pub fn write_actor_param<F>(
 
     let is_animated = animated_params.contains(param_id);
     if is_animated {
-        let seed = sample_actor(layout, t);
+        let seed = sample_actor(layout, animated_params, t);
         let idx = upsert_index(layout, t, seed);
         if let Some(kf) = layout.get_mut(idx) {
             f(&mut kf.value);
@@ -121,7 +129,7 @@ pub fn write_overlay_param<F>(
     F: Fn(&mut OverlayState),
 {
     if layout.is_empty() {
-        layout.push(Keyframe::new(0.0, OverlayState::default()));
+        layout.push(Keyframe::new(t, OverlayState::default()));
     }
     if auto_animate_on_canvas_drag && t > 1.0e-3 {
         animated_params.insert(param_id.to_string());
@@ -129,7 +137,7 @@ pub fn write_overlay_param<F>(
 
     let is_animated = animated_params.contains(param_id);
     if is_animated {
-        let seed = sample_overlay(layout, t);
+        let seed = sample_overlay(layout, animated_params, t);
         let idx = upsert_index(layout, t, seed);
         if let Some(kf) = layout.get_mut(idx) {
             f(&mut kf.value);
@@ -164,15 +172,18 @@ pub fn write_render_frame_param<F>(
     F: Fn(&mut memstroy_core::RenderFrameState),
 {
     if layout.is_empty() {
-        layout.push(Keyframe::new(0.0, memstroy_core::RenderFrameState::default()));
+        layout.push(Keyframe::new(
+            t,
+            memstroy_core::RenderFrameState::default(),
+        ));
     }
     if auto_animate_on_canvas_drag && t > 1.0e-3 {
         animated_params.insert(param_id.to_string());
     }
     let is_animated = animated_params.contains(param_id);
     if is_animated {
-        let seed = keyframe::sample(layout, t)
-            .unwrap_or(memstroy_core::RenderFrameState::default());
+        let seed =
+            memstroy_core::sample_render_frame_layout(layout, animated_params, t);
         let idx = upsert_index(layout, t, seed);
         if let Some(kf) = layout.get_mut(idx) {
             f(&mut kf.value);
@@ -204,7 +215,7 @@ pub fn write_canvas_param<F>(
     F: Fn(&mut CanvasTransform),
 {
     if layout.is_empty() {
-        layout.push(Keyframe::new(0.0, CanvasTransform::default()));
+        layout.push(Keyframe::new(t, CanvasTransform::default()));
     }
     let any_animated = relevant_param_ids
         .iter()
@@ -298,63 +309,550 @@ pub fn animated_toggle(
     false
 }
 
-/// When the user toggles a param to "animated", upsert a keyframe at
-/// `t` that carries **only** that param's current value.
-pub fn seed_actor_params_on_toggle(
+/// After inspector diamond toggles: remove keyframes for disabled
+/// params and seed the first keyframe at the playhead for newly
+/// enabled params.
+pub fn reconcile_actor_animated_params(
     layout: &mut Vec<Keyframe<ActorState>>,
-    animated_params: &mut BTreeSet<String>,
+    animated_params: &BTreeSet<String>,
     animated_before: &BTreeSet<String>,
-    t: f32,
+    scene_t: f32,
+    clip_start: f32,
+    clip_end: f32,
 ) {
-    let cur = sample_actor(layout, t);
-    let newly_animated: Vec<String> = animated_params
+    memstroy_core::reconcile_actor_animated_params(
+        layout,
+        animated_params,
+        animated_before,
+        scene_t,
+        clip_start,
+        clip_end,
+    );
+}
+
+pub fn reconcile_overlay_animated_params(
+    layout: &mut Vec<Keyframe<OverlayState>>,
+    animated_params: &BTreeSet<String>,
+    animated_before: &BTreeSet<String>,
+    local_t: f32,
+    clip_duration: f32,
+) {
+    memstroy_core::reconcile_overlay_animated_params(
+        layout,
+        animated_params,
+        animated_before,
+        local_t,
+        clip_duration,
+    );
+}
+
+pub fn reconcile_render_frame_animated_params(
+    layout: &mut Vec<Keyframe<memstroy_core::RenderFrameState>>,
+    animated_params: &BTreeSet<String>,
+    animated_before: &BTreeSet<String>,
+    scene_t: f32,
+    scene_duration: f32,
+) {
+    memstroy_core::reconcile_render_frame_animated_params(
+        layout,
+        animated_params,
+        animated_before,
+        scene_t,
+        scene_duration,
+    );
+}
+
+#[allow(dead_code)]
+pub fn clear_actor_param_animation(
+    layout: &mut Vec<Keyframe<ActorState>>,
+    animated_params: &BTreeSet<String>,
+    param_id: &str,
+    reference_t: f32,
+) {
+    memstroy_core::clear_actor_param_animation(layout, animated_params, param_id, reference_t);
+}
+
+#[allow(dead_code)]
+pub fn clear_overlay_param_animation(
+    layout: &mut Vec<Keyframe<OverlayState>>,
+    animated_params: &BTreeSet<String>,
+    param_id: &str,
+    reference_t: f32,
+) {
+    memstroy_core::clear_overlay_param_animation(layout, animated_params, param_id, reference_t);
+}
+
+#[allow(dead_code)]
+pub fn enable_actor_param_animation(
+    layout: &mut Vec<Keyframe<ActorState>>,
+    animated_params: &BTreeSet<String>,
+    param_id: &str,
+    seed_t: f32,
+) {
+    memstroy_core::enable_actor_param_animation(layout, animated_params, param_id, seed_t);
+}
+
+#[allow(dead_code)]
+pub fn enable_overlay_param_animation(
+    layout: &mut Vec<Keyframe<OverlayState>>,
+    animated_params: &BTreeSet<String>,
+    param_id: &str,
+    seed_t: f32,
+) {
+    memstroy_core::enable_overlay_param_animation(layout, animated_params, param_id, seed_t);
+}
+
+// ─── Per-param change times (timeline + curve editor parity) ─────────
+
+pub const KF_TIME_EPS: f32 = 1.0e-3;
+
+/// Merge two sorted time lists, deduplicating within [`KF_TIME_EPS`].
+pub fn merge_param_times(mut a: Vec<f32>, b: Vec<f32>) -> Vec<f32> {
+    a.extend(b);
+    a.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+    a.dedup_by(|x, y| (*x - *y).abs() < KF_TIME_EPS);
+    a
+}
+
+/// Nearest layout keyframe index for a param-change time.
+pub fn layout_index_at_time<T>(layout: &[Keyframe<T>], t: f32) -> usize {
+    layout
         .iter()
-        .filter(|pid| !animated_before.contains(*pid))
-        .cloned()
+        .position(|kf| (kf.t - t).abs() < KF_TIME_EPS)
+        .unwrap_or_else(|| {
+            layout
+                .iter()
+                .enumerate()
+                .min_by(|(_, a), (_, b)| {
+                    (a.t - t)
+                        .abs()
+                        .partial_cmp(&(b.t - t).abs())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|(i, _)| i)
+                .unwrap_or(0)
+        })
+}
+
+/// Layout indices that correspond to per-param change times.
+pub fn layout_indices_for_param_times<T>(layout: &[Keyframe<T>], times: &[f32]) -> Vec<usize> {
+    let mut indices: Vec<usize> = times
+        .iter()
+        .map(|&t| layout_index_at_time(layout, t))
         .collect();
-    for pid in newly_animated {
-        let pid = pid.as_str();
-        write_actor_param(layout, animated_params, t, pid, false, |s| match pid {
-            memstroy_core::param_ids::POS_X => s.pos[0] = cur.pos[0],
-            memstroy_core::param_ids::POS_Y => s.pos[1] = cur.pos[1],
-            memstroy_core::param_ids::SCALE => s.scale = cur.scale,
-            memstroy_core::param_ids::SCALE_Y => s.scale_y = cur.scale_y,
-            memstroy_core::param_ids::ROTATION => s.rotation_deg = cur.rotation_deg,
-            memstroy_core::param_ids::OPACITY => s.opacity = cur.opacity,
-            memstroy_core::param_ids::FLIP_X => s.flip_x_anim = cur.flip_x_anim,
-            memstroy_core::param_ids::FLIP_Y => s.flip_y_anim = cur.flip_y_anim,
-            _ => {}
-        });
+    indices.sort_unstable();
+    indices.dedup();
+    indices
+}
+
+pub fn actor_layout_param_times(
+    layout: &[Keyframe<ActorState>],
+    animated_params: &BTreeSet<String>,
+    param_id: &str,
+) -> Vec<f32> {
+    memstroy_core::actor_param_timeline_times(layout, animated_params, param_id)
+}
+
+pub fn overlay_layout_param_times(
+    layout: &[Keyframe<OverlayState>],
+    animated_params: &BTreeSet<String>,
+    param_id: &str,
+) -> Vec<f32> {
+    memstroy_core::overlay_param_timeline_times(layout, animated_params, param_id)
+}
+
+/// Per-param breakpoint times on a canvas layout track (world-pixel motion).
+pub fn canvas_param_timeline_times(
+    canvas: &[Keyframe<CanvasTransform>],
+    param_id: &str,
+) -> Vec<f32> {
+    memstroy_core::param_timeline_times(
+        canvas,
+        |v| canvas_scalar_get(v, param_id),
+        |i| canvas_other_fields_changed_at(canvas, param_id, i),
+    )
+}
+
+/// Per-param change times for an actor layout, merged with any matching
+/// `canvas_layouts` track (canvas drags write world-pixel motion there).
+pub fn actor_param_change_times(
+    layout: &[Keyframe<ActorState>],
+    animated_params: &BTreeSet<String>,
+    canvas: Option<&[Keyframe<CanvasTransform>]>,
+    param_id: &str,
+) -> Vec<f32> {
+    let layout_times = actor_layout_param_times(layout, animated_params, param_id);
+    match canvas {
+        Some(cl) => merge_param_times(layout_times, canvas_param_timeline_times(cl, param_id)),
+        None => layout_times,
     }
 }
 
-/// Overlay variant of [`seed_actor_params_on_toggle`].
-pub fn seed_overlay_params_on_toggle(
-    layout: &mut Vec<Keyframe<OverlayState>>,
-    animated_params: &mut BTreeSet<String>,
-    animated_before: &BTreeSet<String>,
-    t: f32,
-) {
-    let cur = sample_overlay(layout, t);
-    let newly_animated: Vec<String> = animated_params
-        .iter()
-        .filter(|pid| !animated_before.contains(*pid))
-        .cloned()
-        .collect();
-    for pid in newly_animated {
-        let pid = pid.as_str();
-        write_overlay_param(layout, animated_params, t, pid, false, |s| match pid {
-            memstroy_core::param_ids::POS_X => s.pos[0] = cur.pos[0],
-            memstroy_core::param_ids::POS_Y => s.pos[1] = cur.pos[1],
-            memstroy_core::param_ids::SCALE => s.scale = cur.scale,
-            memstroy_core::param_ids::SCALE_Y => s.scale_y = cur.scale_y,
-            memstroy_core::param_ids::ROTATION => s.rotation_deg = cur.rotation_deg,
-            memstroy_core::param_ids::OPACITY => s.opacity = cur.opacity,
-            memstroy_core::param_ids::FLIP_X => s.flip_x_anim = cur.flip_x_anim,
-            memstroy_core::param_ids::FLIP_Y => s.flip_y_anim = cur.flip_y_anim,
-            _ => {}
-        });
+/// Per-param change times for an overlay layout, merged with canvas track.
+pub fn overlay_param_change_times(
+    layout: &[Keyframe<OverlayState>],
+    animated_params: &BTreeSet<String>,
+    canvas: Option<&[Keyframe<CanvasTransform>]>,
+    param_id: &str,
+) -> Vec<f32> {
+    let layout_times = overlay_layout_param_times(layout, animated_params, param_id);
+    match canvas {
+        Some(cl) => merge_param_times(layout_times, canvas_param_timeline_times(cl, param_id)),
+        None => layout_times,
     }
+}
+
+pub fn render_frame_param_change_times(
+    layout: &[Keyframe<memstroy_core::RenderFrameState>],
+    animated_params: &BTreeSet<String>,
+    param_id: &str,
+) -> Vec<f32> {
+    memstroy_core::render_frame_param_timeline_times(layout, animated_params, param_id)
+}
+
+fn canvas_param_value_at(
+    canvas: &[Keyframe<CanvasTransform>],
+    param_id: &str,
+    t: f32,
+) -> Option<f32> {
+    use memstroy_core::param_ids as p;
+    let times = canvas_param_timeline_times(canvas, param_id);
+    if times.is_empty() {
+        return None;
+    }
+    let sample_track = |get: fn(&CanvasTransform) -> f32| -> Option<f32> {
+        let track: Vec<Keyframe<f32>> = times
+            .iter()
+            .map(|&tm| {
+                let idx = layout_index_at_time(canvas, tm);
+                Keyframe {
+                    t: tm,
+                    value: get(&canvas[idx].value),
+                    easing: canvas[idx].easing,
+                }
+            })
+            .collect();
+        memstroy_core::keyframe::sample(&track, t)
+    };
+    match param_id {
+        p::POS_X => sample_track(|v| v.pos.x),
+        p::POS_Y => sample_track(|v| v.pos.y),
+        p::SCALE => sample_track(|v| v.scale),
+        p::ROTATION => sample_track(|v| v.rotation_deg),
+        p::OPACITY => sample_track(|v| v.opacity),
+        _ => None,
+    }
+}
+
+/// Value of one transform parameter at `t` for curve-editor display.
+/// Prefers `canvas_layouts` when that track has keyframes (world pixels).
+pub fn actor_param_value_at(
+    layout: &[Keyframe<ActorState>],
+    canvas: Option<&[Keyframe<CanvasTransform>]>,
+    animated_params: &BTreeSet<String>,
+    param_id: &str,
+    t: f32,
+) -> f32 {
+    if let Some(cl) = canvas {
+        if !canvas_param_timeline_times(cl, param_id).is_empty() {
+            if let Some(v) = canvas_param_value_at(cl, param_id, t) {
+                return v;
+            }
+        }
+    }
+    memstroy_core::sample_actor_param_at(layout, animated_params, param_id, t)
+}
+
+pub fn overlay_param_value_at(
+    layout: &[Keyframe<OverlayState>],
+    canvas: Option<&[Keyframe<CanvasTransform>]>,
+    animated_params: &BTreeSet<String>,
+    param_id: &str,
+    t: f32,
+) -> f32 {
+    if let Some(cl) = canvas {
+        if !canvas_param_timeline_times(cl, param_id).is_empty() {
+            if let Some(v) = canvas_param_value_at(cl, param_id, t) {
+                return v;
+            }
+        }
+    }
+    memstroy_core::sample_overlay_param_at(layout, animated_params, param_id, t)
+}
+
+pub fn render_frame_param_value_at(
+    layout: &[Keyframe<memstroy_core::RenderFrameState>],
+    animated_params: &BTreeSet<String>,
+    param_id: &str,
+    t: f32,
+) -> f32 {
+    memstroy_core::sample_render_frame_param_at(layout, animated_params, param_id, t)
+}
+
+// ─── Canvas scalar tracks (curve editor + canvas drags) ──────────────
+
+/// True when this element's canvas layout already authors motion for `param_id`.
+pub fn canvas_param_track_active(canvas: &[Keyframe<CanvasTransform>], param_id: &str) -> bool {
+    !canvas_param_timeline_times(canvas, param_id).is_empty()
+}
+
+fn canvas_scalar_get(v: &CanvasTransform, param_id: &str) -> f32 {
+    use memstroy_core::param_ids as p;
+    match param_id {
+        p::POS_X => v.pos.x,
+        p::POS_Y => v.pos.y,
+        p::SCALE => v.scale,
+        p::ROTATION => v.rotation_deg,
+        p::OPACITY => v.opacity,
+        _ => 0.0,
+    }
+}
+
+fn canvas_scalar_set(v: &mut CanvasTransform, param_id: &str, value: f32) {
+    use memstroy_core::param_ids as p;
+    match param_id {
+        p::POS_X => v.pos.x = value,
+        p::POS_Y => v.pos.y = value,
+        p::SCALE => v.scale = value,
+        p::ROTATION => v.rotation_deg = value,
+        p::OPACITY => v.opacity = value,
+        _ => {}
+    }
+}
+
+fn canvas_other_fields_changed_at(
+    canvas: &[Keyframe<CanvasTransform>],
+    param_id: &str,
+    i: usize,
+) -> bool {
+    const EPS: f32 = 1.0e-4;
+    if i == 0 {
+        return false;
+    }
+    let prev = &canvas[i - 1].value;
+    let cur = &canvas[i].value;
+    let d = |a: f32, b: f32| (a - b).abs() > EPS;
+    use memstroy_core::param_ids as p;
+    match param_id {
+        p::POS_X => {
+            d(prev.pos.y, cur.pos.y)
+                || d(prev.scale, cur.scale)
+                || d(prev.rotation_deg, cur.rotation_deg)
+                || d(prev.opacity, cur.opacity)
+        }
+        p::POS_Y => {
+            d(prev.pos.x, cur.pos.x)
+                || d(prev.scale, cur.scale)
+                || d(prev.rotation_deg, cur.rotation_deg)
+                || d(prev.opacity, cur.opacity)
+        }
+        p::SCALE => {
+            d(prev.pos.x, cur.pos.x)
+                || d(prev.pos.y, cur.pos.y)
+                || d(prev.rotation_deg, cur.rotation_deg)
+                || d(prev.opacity, cur.opacity)
+        }
+        p::ROTATION => {
+            d(prev.pos.x, cur.pos.x)
+                || d(prev.pos.y, cur.pos.y)
+                || d(prev.scale, cur.scale)
+                || d(prev.opacity, cur.opacity)
+        }
+        p::OPACITY => {
+            d(prev.pos.x, cur.pos.x)
+                || d(prev.pos.y, cur.pos.y)
+                || d(prev.scale, cur.scale)
+                || d(prev.rotation_deg, cur.rotation_deg)
+        }
+        _ => false,
+    }
+}
+
+/// Upsert one scalar field on the canvas layout track.
+pub fn author_canvas_param_keyframe(
+    canvas: &mut Vec<Keyframe<CanvasTransform>>,
+    animated_params: &BTreeSet<String>,
+    param_id: &str,
+    t: f32,
+    value: f32,
+) {
+    write_canvas_param(canvas, animated_params, &[param_id], t, |v| {
+        canvas_scalar_set(v, param_id, value);
+    });
+}
+
+pub fn delete_canvas_param_keyframe_at(
+    canvas: &mut Vec<Keyframe<CanvasTransform>>,
+    param_id: &str,
+    at_t: f32,
+) {
+    let Some(i) = canvas.iter().position(|k| (k.t - at_t).abs() < KF_TIME_EPS) else {
+        return;
+    };
+    if canvas_other_fields_changed_at(canvas, param_id, i) {
+        if i > 0 {
+            let prev = canvas_scalar_get(&canvas[i - 1].value, param_id);
+            canvas_scalar_set(&mut canvas[i].value, param_id, prev);
+        }
+        return;
+    }
+    canvas.remove(i);
+    if canvas.is_empty() {
+        canvas.push(Keyframe::new(at_t, CanvasTransform::default()));
+    }
+}
+
+pub fn rekey_canvas_param_keyframe(
+    canvas: &mut Vec<Keyframe<CanvasTransform>>,
+    animated_params: &BTreeSet<String>,
+    param_id: &str,
+    old_t: f32,
+    new_t: f32,
+    value: f32,
+) {
+    let old_easing = canvas
+        .iter()
+        .find(|k| (k.t - old_t).abs() < KF_TIME_EPS)
+        .map(|k| k.easing)
+        .unwrap_or(Easing::Linear);
+    if (old_t - new_t).abs() > KF_TIME_EPS {
+        delete_canvas_param_keyframe_at(canvas, param_id, old_t);
+    }
+    author_canvas_param_keyframe(canvas, animated_params, param_id, new_t, value);
+    if let Some(kf) = canvas.iter_mut().find(|k| (k.t - new_t).abs() < KF_TIME_EPS) {
+        kf.easing = old_easing;
+    }
+}
+
+pub fn curve_author_actor_param(
+    layout: &mut Vec<Keyframe<ActorState>>,
+    canvas: Option<&mut Vec<Keyframe<CanvasTransform>>>,
+    animated_params: &BTreeSet<String>,
+    param_id: &str,
+    t: f32,
+    value: f32,
+) {
+    if let Some(cl) = canvas {
+        if canvas_param_track_active(cl, param_id) {
+            author_canvas_param_keyframe(cl, animated_params, param_id, t, value);
+            return;
+        }
+    }
+    memstroy_core::author_actor_param_keyframe(layout, animated_params, param_id, t, value);
+}
+
+pub fn curve_delete_actor_param(
+    layout: &mut Vec<Keyframe<ActorState>>,
+    canvas: Option<&mut Vec<Keyframe<CanvasTransform>>>,
+    animated_params: &BTreeSet<String>,
+    param_id: &str,
+    at_t: f32,
+) {
+    if let Some(cl) = canvas {
+        if canvas_param_track_active(cl, param_id) {
+            delete_canvas_param_keyframe_at(cl, param_id, at_t);
+            return;
+        }
+    }
+    memstroy_core::delete_actor_param_keyframe_at(layout, animated_params, param_id, at_t);
+}
+
+pub fn curve_rekey_actor_param(
+    layout: &mut Vec<Keyframe<ActorState>>,
+    canvas: Option<&mut Vec<Keyframe<CanvasTransform>>>,
+    animated_params: &BTreeSet<String>,
+    param_id: &str,
+    old_t: f32,
+    new_t: f32,
+    value: f32,
+) {
+    if let Some(cl) = canvas {
+        if canvas_param_track_active(cl, param_id) {
+            rekey_canvas_param_keyframe(cl, animated_params, param_id, old_t, new_t, value);
+            return;
+        }
+    }
+    memstroy_core::rekey_actor_param_keyframe(
+        layout, animated_params, param_id, old_t, new_t, value,
+    );
+}
+
+pub fn curve_author_overlay_param(
+    layout: &mut Vec<Keyframe<OverlayState>>,
+    canvas: Option<&mut Vec<Keyframe<CanvasTransform>>>,
+    animated_params: &BTreeSet<String>,
+    param_id: &str,
+    t: f32,
+    value: f32,
+) {
+    if let Some(cl) = canvas {
+        if canvas_param_track_active(cl, param_id) {
+            author_canvas_param_keyframe(cl, animated_params, param_id, t, value);
+            return;
+        }
+    }
+    memstroy_core::author_overlay_param_keyframe(layout, animated_params, param_id, t, value);
+}
+
+pub fn curve_delete_overlay_param(
+    layout: &mut Vec<Keyframe<OverlayState>>,
+    canvas: Option<&mut Vec<Keyframe<CanvasTransform>>>,
+    animated_params: &BTreeSet<String>,
+    param_id: &str,
+    at_t: f32,
+) {
+    if let Some(cl) = canvas {
+        if canvas_param_track_active(cl, param_id) {
+            delete_canvas_param_keyframe_at(cl, param_id, at_t);
+            return;
+        }
+    }
+    memstroy_core::delete_overlay_param_keyframe_at(layout, animated_params, param_id, at_t);
+}
+
+pub fn curve_rekey_overlay_param(
+    layout: &mut Vec<Keyframe<OverlayState>>,
+    canvas: Option<&mut Vec<Keyframe<CanvasTransform>>>,
+    animated_params: &BTreeSet<String>,
+    param_id: &str,
+    old_t: f32,
+    new_t: f32,
+    value: f32,
+) {
+    if let Some(cl) = canvas {
+        if canvas_param_track_active(cl, param_id) {
+            rekey_canvas_param_keyframe(cl, animated_params, param_id, old_t, new_t, value);
+            return;
+        }
+    }
+    memstroy_core::rekey_overlay_param_keyframe(
+        layout, animated_params, param_id, old_t, new_t, value,
+    );
+}
+
+/// Resolve which backing keyframe owns easing for a param breakpoint time.
+pub fn param_keyframe_source_at<T>(
+    layout: &[Keyframe<T>],
+    canvas: Option<&[Keyframe<CanvasTransform>]>,
+    param_id: &str,
+    t: f32,
+) -> ParamKeyframeSource {
+    if let Some(cl) = canvas {
+        let canvas_times = canvas_param_timeline_times(cl, param_id);
+        if canvas_times.iter().any(|&ct| (ct - t).abs() < KF_TIME_EPS) {
+            if let Some(ci) = cl.iter().position(|kf| (kf.t - t).abs() < KF_TIME_EPS) {
+                return ParamKeyframeSource::Canvas(ci);
+            }
+            return ParamKeyframeSource::Canvas(layout_index_at_time(cl, t));
+        }
+    }
+    ParamKeyframeSource::Layout(layout_index_at_time(layout, t))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParamKeyframeSource {
+    Layout(usize),
+    Canvas(usize),
 }
 
 // ─── Keyframe selection in the timeline ──────────────────────────────

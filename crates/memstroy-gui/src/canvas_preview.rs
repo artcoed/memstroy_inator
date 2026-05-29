@@ -344,9 +344,8 @@ fn handle_eyedropper_click_overlay(
     let rotation_deg = match &state.scene.overlays[idx] {
         Overlay::Image(im) => {
             let local_t = (state.playhead - im.t_in).max(0.0);
-            keyframe::sample(&im.layout, local_t)
-                .map(|s| s.rotation_deg)
-                .unwrap_or(0.0)
+            memstroy_core::sample_overlay_layout(&im.layout, &im.animated_params, local_t)
+                .rotation_deg
         }
         _ => 0.0,
     };
@@ -425,7 +424,8 @@ fn actor_screen_rect(
         } else { (1080.0_f32, 1920.0) }
     } else { (1080.0_f32, 1920.0) };
 
-    let actor_state = keyframe::sample(&actor.layout, t).unwrap_or_default();
+    let actor_state =
+        memstroy_core::sample_actor_layout(&actor.layout, &actor.animated_params, t);
     let elem_w = src_w * actor_state.scale;
     let elem_h = src_h * actor_state.scale * actor_state.scale_y;
 
@@ -475,7 +475,8 @@ pub(crate) fn actor_world_aabb(
         } else { (1080.0_f32, 1920.0) }
     } else { (1080.0_f32, 1920.0) };
 
-    let actor_state = keyframe::sample(&actor.layout, t).unwrap_or_default();
+    let actor_state =
+        memstroy_core::sample_actor_layout(&actor.layout, &actor.animated_params, t);
     let mut effective_scale = actor_state.scale;
     let mut effective_scale_y = actor_state.scale_y;
     // Apply parent's scale if this actor has a parent (mirrors the
@@ -483,8 +484,8 @@ pub(crate) fn actor_world_aabb(
     if let Some(ref pid) = actor.parent_id {
         let mut visited = vec![actor.id.clone()];
         if let Some(pxf) = resolve_parent_transform(state, pid, t, &mut visited) {
-            effective_scale *= pxf.scale_x;
-            effective_scale_y *= safe_div(pxf.scale_y, pxf.scale_x);
+            let mut rot = 0.0_f32;
+            apply_parent_inheritance_actor(&mut rot, &mut effective_scale, &mut effective_scale_y, &pxf);
         }
     }
     let elem_w = src_w * effective_scale;
@@ -513,13 +514,30 @@ pub(crate) fn overlay_world_aabb(
     };
     let sample_t = if t >= t_in && t <= t_out { t - t_in }
         else if t < t_in { 0.0 } else { (t_out - t_in).max(0.0) };
-    let mut ov_state = keyframe::sample(layout, sample_t).unwrap_or_default();
-
     let element_id = match overlay {
         Overlay::Text(o) => o.id.as_str(),
         Overlay::Image(o) => o.id.as_str(),
         Overlay::Video(o) => o.id.as_str(),
     };
+    let parent_id = match overlay {
+        Overlay::Text(o) => o.parent_id.as_ref(),
+        Overlay::Image(o) => o.parent_id.as_ref(),
+        Overlay::Video(o) => o.parent_id.as_ref(),
+    };
+    let modifiers: &[memstroy_core::TrackModifier] = match overlay {
+        Overlay::Text(txt) => &txt.modifiers,
+        Overlay::Image(img) => &img.modifiers,
+        Overlay::Video(vid) => &vid.modifiers,
+    };
+    let mut ov_state = overlay_visual_state(
+        &state.scene,
+        overlay,
+        element_id,
+        parent_id,
+        t,
+        sample_t,
+        modifiers,
+    );
     apply_canvas_transform_preview(
         state,
         element_id,
@@ -527,32 +545,11 @@ pub(crate) fn overlay_world_aabb(
         &mut ov_state.scale,
         &mut ov_state.scale_y,
     );
-    let modifiers: &[memstroy_core::TrackModifier] = match overlay {
-        Overlay::Text(txt) => &txt.modifiers,
-        Overlay::Image(img) => &img.modifiers,
-        Overlay::Video(vid) => &vid.modifiers,
-    };
     let mod_delta = if t >= t_in && t <= t_out {
         keyframe::evaluate_modifiers(modifiers, sample_t)
     } else {
         keyframe::ModifierDelta::default()
     };
-    ov_state.scale = (ov_state.scale + mod_delta.d_scale).max(0.001);
-    ov_state.rotation_deg += mod_delta.d_rotation_deg;
-
-    let parent_id = match overlay {
-        Overlay::Text(o) => o.parent_id.as_ref(),
-        Overlay::Image(o) => o.parent_id.as_ref(),
-        Overlay::Video(o) => o.parent_id.as_ref(),
-    };
-    if let Some(pid) = parent_id {
-        let mut visited = vec![element_id.to_string()];
-        if let Some(pxf) = resolve_parent_transform(state, pid, t, &mut visited) {
-            ov_state.rotation_deg += pxf.rotation_deg;
-            ov_state.scale *= pxf.scale_x;
-            ov_state.scale_y *= safe_div(pxf.scale_y, pxf.scale_x);
-        }
-    }
 
     // Match `frame_snapshot` / gizmo code — honour canvas_layouts,
     // drag preview, skeleton attachments and parent position.
@@ -1018,7 +1015,7 @@ fn render_frame_corners_screen(
 
 /// Sample the RenderFrame state at time t.
 fn sample_render_frame(rf: &RenderFrame, t: f32) -> RenderFrameState {
-    keyframe::sample(&rf.layout, t).unwrap_or_default()
+    memstroy_core::sample_render_frame_layout(&rf.layout, &rf.animated_params, t)
 }
 
 /// Sample the RenderFrame state with its animation modifiers layered on
@@ -1070,7 +1067,11 @@ fn resolve_overlay_attachment_world(
 
     // Host actor's world center + dimensions at `t`.
     let host_world = get_element_world_pos(state, &host_actor.id, &host_actor.layout, t);
-    let host_state = keyframe::sample(&host_actor.layout, t).unwrap_or_default();
+    let host_state = memstroy_core::sample_actor_layout(
+        &host_actor.layout,
+        &host_actor.animated_params,
+        t,
+    );
     let (src_w, src_h) = if let Some(fc) = state.frame_caches.get(host_idx) {
         if fc.is_ready() && fc.frame_count > 0 {
             (fc.source_width as f32, fc.source_height as f32)
@@ -1334,7 +1335,8 @@ fn draw_single_actor(
     } else {
         (1080.0_f32, 1920.0)
     };
-    let actor_state = keyframe::sample(&actor.layout, t).unwrap_or_default();
+    let actor_state =
+        memstroy_core::sample_actor_layout(&actor.layout, &actor.animated_params, t);
     let mut actor_scale = actor_state.scale;
     let mut actor_scale_y = actor_state.scale_y;
     let mut actor_rotation = actor_state.rotation_deg;
@@ -1354,9 +1356,12 @@ fn draw_single_actor(
     if let Some(ref pid) = actor.parent_id {
         let mut visited = vec![actor.id.clone()];
         if let Some(parent_xform) = resolve_parent_transform(state, pid, t, &mut visited) {
-            actor_rotation += parent_xform.rotation_deg;
-            scale_eff *= parent_xform.scale_x;
-            actor_scale_y *= safe_div(parent_xform.scale_y, parent_xform.scale_x);
+            apply_parent_inheritance_actor(
+                &mut actor_rotation,
+                &mut scale_eff,
+                &mut actor_scale_y,
+                &parent_xform,
+            );
         }
     }
 
@@ -1764,12 +1769,30 @@ fn draw_canvas_overlays_impl(
             DisplayMode::BeforeStart => 0.0,
             DisplayMode::AfterEnd => t_out - t_in,
         };
-        let mut ov_state = keyframe::sample(layout, sample_t).unwrap_or_default();
         let overlay_id: &str = match overlay {
             Overlay::Text(txt) => &txt.id,
             Overlay::Image(img) => &img.id,
             Overlay::Video(vid) => &vid.id,
         };
+        let overlay_parent_id: Option<&String> = match overlay {
+            Overlay::Text(txt) => txt.parent_id.as_ref(),
+            Overlay::Image(img) => img.parent_id.as_ref(),
+            Overlay::Video(vid) => vid.parent_id.as_ref(),
+        };
+        let modifiers: &[TrackModifier] = match overlay {
+            Overlay::Text(txt) => &txt.modifiers,
+            Overlay::Image(img) => &img.modifiers,
+            Overlay::Video(vid) => &vid.modifiers,
+        };
+        let mut ov_state = overlay_visual_state(
+            &state.scene,
+            overlay,
+            overlay_id,
+            overlay_parent_id,
+            t,
+            sample_t,
+            modifiers,
+        );
         apply_canvas_transform_preview(
             state,
             overlay_id,
@@ -1777,59 +1800,15 @@ fn draw_canvas_overlays_impl(
             &mut ov_state.scale,
             &mut ov_state.scale_y,
         );
-
-        // Apply animation modifiers (additive on top of eased keyframe).
-        let modifiers: &[TrackModifier] = match overlay {
-            Overlay::Text(txt) => &txt.modifiers,
-            Overlay::Image(img) => &img.modifiers,
-            Overlay::Video(vid) => &vid.modifiers,
-        };
         let mod_delta = if matches!(display_mode, DisplayMode::Active) {
             keyframe::evaluate_modifiers(modifiers, sample_t)
         } else {
             keyframe::ModifierDelta::default()
         };
-        ov_state.scale = (ov_state.scale + mod_delta.d_scale).max(0.001);
-        ov_state.rotation_deg += mod_delta.d_rotation_deg;
-
-        // ── Parent transform inheritance (rotation + scale + position) ──
-        let overlay_parent_id: Option<&String> = match overlay {
-            Overlay::Text(txt) => txt.parent_id.as_ref(),
-            Overlay::Image(img) => img.parent_id.as_ref(),
-            Overlay::Video(vid) => vid.parent_id.as_ref(),
-        };
-        let parent_xform_resolved = overlay_parent_id.and_then(|pid| {
-            let mut visited = vec![overlay_id.to_string()];
-            resolve_parent_transform(state, pid, t, &mut visited)
-        });
-        if let Some(ref pxf) = parent_xform_resolved {
-            ov_state.rotation_deg += pxf.rotation_deg;
-            ov_state.scale *= pxf.scale_x;
-            ov_state.scale_y *= safe_div(pxf.scale_y, pxf.scale_x);
-        }
-
-        let rf = &state.scene.render_frame;
-        // World-space size of the FIXED reference rectangle that the
-        // legacy normalised `pos` is interpreted against. Decoupled
-        // from the live render frame: editing rf.pos / rf.zoom no
-        // longer drags this overlay along on the canvas. The rf is a
-        // pure camera viewport — its parameters change WHAT gets
-        // captured to the output, not WHERE world-space layers sit.
-        let [rw, rh] = rf.resolution;
-        let world_w = rw as f32;
-        let world_h = rh as f32;
-
-        // Default world position from layout. Modifier offsets and any
-        // skeleton attachment can override / shift it.
-        let mut world_pos = WorldPos {
-            x: ov_state.pos[0] * world_w + mod_delta.dx,
-            y: ov_state.pos[1] * world_h + mod_delta.dy,
-        };
-
-        // ── Apply parent position transform ──
-        if let Some(ref pxf) = parent_xform_resolved {
-            world_pos = apply_parent_transform(world_pos, pxf);
-        }
+        // World centre — same path as actors, export compositor and extract.
+        let mut world_pos = get_element_world_pos(state, overlay_id, &[], t);
+        world_pos.x += mod_delta.dx;
+        world_pos.y += mod_delta.dy;
 
         // Skeleton attachment: if this overlay is bound to a host actor's
         // skeleton point, compute the point's world position from the
@@ -2844,198 +2823,25 @@ enum DisplayMode {
 
 // ─── ELEMENT POSITION RESOLUTION ─────────────────────────────────────
 
-/// Get the world-pixel position of an element, checking canvas_layouts
-/// first, then falling back to legacy normalised layout converted to
-/// Resolved parent transform: position, rotation, and scale accumulated
-/// from the parent chain. Used to transform child elements relative to
-/// their parent.
-#[derive(Clone, Copy, Debug)]
-pub struct ParentTransform {
-    /// Parent's world position (centre).
-    pub pos: WorldPos,
-    /// Parent's accumulated rotation in degrees.
-    pub rotation_deg: f32,
-    /// Parent's accumulated X scale.
-    pub scale_x: f32,
-    /// Parent's accumulated Y scale.
-    pub scale_y: f32,
-}
-
-impl Default for ParentTransform {
-    fn default() -> Self {
-        Self {
-            pos: WorldPos { x: 0.0, y: 0.0 },
-            rotation_deg: 0.0,
-            scale_x: 1.0,
-            scale_y: 1.0,
-        }
-    }
-}
-
-fn safe_div(num: f32, den: f32) -> f32 {
-    if den.abs() > 1.0e-6 { num / den } else { 1.0 }
-}
+pub use memstroy_core::{
+    apply_parent_inheritance_actor, apply_parent_inheritance_overlay, apply_parent_transform,
+    inverse_parent_transform, overlay_visual_state, ParentTransform,
+};
 
 /// Resolve the full parent transform chain for an element identified by
 /// `parent_id`. Walks up the parent hierarchy (with cycle detection) and
-/// accumulates position, rotation, and scale. Returns `None` when the
-/// element has no parent or the parent can't be resolved.
+/// accumulates position, rotation, and scale.
 pub fn resolve_parent_transform(
     state: &EditorState,
     parent_id: &str,
     t: f32,
     visited: &mut Vec<String>,
 ) -> Option<ParentTransform> {
-    // Cycle detection: if we've already visited this id, bail out.
-    if visited.contains(&parent_id.to_string()) {
-        return None;
-    }
-    visited.push(parent_id.to_string());
-
-    // Special case: render frame as parent
-    if parent_id == "__render_frame__" {
-        let rf = &state.scene.render_frame;
-        let rf_state = keyframe::sample(&rf.layout, t).unwrap_or_default();
-        let mod_delta = keyframe::evaluate_modifiers(&rf.modifiers, t);
-        return Some(ParentTransform {
-            pos: WorldPos {
-                x: rf_state.pos.x + mod_delta.dx,
-                y: rf_state.pos.y + mod_delta.dy,
-            },
-            rotation_deg: rf_state.rotation_deg + mod_delta.d_rotation_deg,
-            // Render frame zoom is inverse scale (zoom > 1 = zoomed in = smaller world area)
-            // For parenting purposes, we treat it as scale = 1 (the rf doesn't scale children)
-            scale_x: 1.0,
-            scale_y: 1.0,
-        });
-    }
-
-    // Try to find the parent as an actor
-    if let Some(actor) = state.scene.actors.iter().find(|a| a.id == parent_id) {
-        let actor_t_in = actor.t_in.unwrap_or(0.0);
-        let actor_state = keyframe::sample(&actor.layout, t).unwrap_or_default();
-        let mod_delta = keyframe::evaluate_modifiers(&actor.modifiers, (t - actor_t_in).max(0.0));
-        let canvas_transform = state.scene.canvas_layouts.iter()
-            .find(|cl| cl.element_id == actor.id)
-            .and_then(|cl| keyframe::sample(&cl.keyframes, t));
-
-        let rf = &state.scene.render_frame;
-        let [rw, rh] = rf.resolution;
-        let world_w = rw as f32;
-        let world_h = rh as f32;
-
-        let mut pos = if let Some(transform) = canvas_transform {
-            WorldPos { x: transform.pos.x + mod_delta.dx, y: transform.pos.y + mod_delta.dy }
-        } else {
-            WorldPos {
-                x: actor_state.pos[0] * world_w + mod_delta.dx,
-                y: actor_state.pos[1] * world_h + mod_delta.dy,
-            }
-        };
-        let mut rotation = canvas_transform.map(|transform| transform.rotation_deg).unwrap_or(actor_state.rotation_deg) + mod_delta.d_rotation_deg;
-        let mut scale_x = (canvas_transform.map(|transform| transform.scale).unwrap_or(actor_state.scale) + mod_delta.d_scale).max(0.001);
-        let mut scale_y = scale_x * actor_state.scale_y;
-
-        // Recursively resolve this element's own parent
-        if let Some(ref grandparent_id) = actor.parent_id {
-            if let Some(gp) = resolve_parent_transform(state, grandparent_id, t, visited) {
-                // Apply grandparent transform to this parent's local transform.
-                pos = apply_parent_transform(pos, &gp);
-                rotation += gp.rotation_deg;
-                scale_x *= gp.scale_x;
-                scale_y *= gp.scale_y;
-            }
-        }
-
-        return Some(ParentTransform { pos, rotation_deg: rotation, scale_x, scale_y });
-    }
-
-    // Try to find the parent as an overlay
-    if let Some(ov) = state.scene.overlays.iter().find(|ov| {
-        match ov {
-            Overlay::Text(o) => o.id == parent_id,
-            Overlay::Image(o) => o.id == parent_id,
-            Overlay::Video(o) => o.id == parent_id,
-        }
-    }) {
-        let (t_in, layout, parent_pid, modifiers): (f32, &[Keyframe<OverlayState>], Option<&String>, &[keyframe::TrackModifier]) = match ov {
-            Overlay::Text(o) => (o.t_in, &o.layout, o.parent_id.as_ref(), &o.modifiers),
-            Overlay::Image(o) => (o.t_in, &o.layout, o.parent_id.as_ref(), &o.modifiers),
-            Overlay::Video(o) => (o.t_in, &o.layout, o.parent_id.as_ref(), &o.modifiers),
-        };
-        let local_t = (t - t_in).max(0.0);
-        let ov_state = keyframe::sample(layout, local_t).unwrap_or_default();
-        let mod_delta = keyframe::evaluate_modifiers(modifiers, local_t);
-
-        let rf = &state.scene.render_frame;
-        let [rw, rh] = rf.resolution;
-        let world_w = rw as f32;
-        let world_h = rh as f32;
-
-        let overlay_id = match ov {
-            Overlay::Text(o) => &o.id,
-            Overlay::Image(o) => &o.id,
-            Overlay::Video(o) => &o.id,
-        };
-        let canvas_transform = state.scene.canvas_layouts.iter()
-            .find(|cl| cl.element_id == *overlay_id)
-            .and_then(|cl| keyframe::sample(&cl.keyframes, t));
-
-        let mut pos = if let Some(transform) = canvas_transform {
-            WorldPos { x: transform.pos.x + mod_delta.dx, y: transform.pos.y + mod_delta.dy }
-        } else {
-            WorldPos {
-                x: ov_state.pos[0] * world_w + mod_delta.dx,
-                y: ov_state.pos[1] * world_h + mod_delta.dy,
-            }
-        };
-        let mut rotation = canvas_transform.map(|transform| transform.rotation_deg).unwrap_or(ov_state.rotation_deg) + mod_delta.d_rotation_deg;
-        let mut scale_x = (canvas_transform.map(|transform| transform.scale).unwrap_or(ov_state.scale) + mod_delta.d_scale).max(0.001);
-        let mut scale_y = scale_x * ov_state.scale_y;
-
-        // Recursively resolve this overlay's own parent
-        if let Some(grandparent_id) = parent_pid {
-            if let Some(gp) = resolve_parent_transform(state, grandparent_id, t, visited) {
-                pos = apply_parent_transform(pos, &gp);
-                rotation += gp.rotation_deg;
-                scale_x *= gp.scale_x;
-                scale_y *= gp.scale_y;
-            }
-        }
-
-        return Some(ParentTransform { pos, rotation_deg: rotation, scale_x, scale_y });
-    }
-
-    None
+    memstroy_core::resolve_parent_transform(&state.scene, parent_id, t, visited)
 }
 
-/// Apply a parent transform to a child's local world position. The child's
-/// position is treated as an offset from the parent's centre, rotated by
-/// the parent's rotation and scaled by the parent's scale.
-fn apply_parent_transform(child_pos: WorldPos, parent: &ParentTransform) -> WorldPos {
-    let rad = parent.rotation_deg.to_radians();
-    let cos_r = rad.cos();
-    let sin_r = rad.sin();
-    let dx = child_pos.x * parent.scale_x;
-    let dy = child_pos.y * parent.scale_y;
-    WorldPos {
-        x: parent.pos.x + dx * cos_r - dy * sin_r,
-        y: parent.pos.y + dx * sin_r + dy * cos_r,
-    }
-}
-
-/// Inverse of [`apply_parent_transform`]: map a world centre back to the
-/// stored pre-parent layout value used in `canvas_layouts` / legacy tracks.
-fn inverse_parent_transform(world: WorldPos, parent: &ParentTransform) -> WorldPos {
-    let rad = parent.rotation_deg.to_radians();
-    let cos_r = rad.cos();
-    let sin_r = rad.sin();
-    let dx = world.x - parent.pos.x;
-    let dy = world.y - parent.pos.y;
-    WorldPos {
-        x: safe_div(dx * cos_r + dy * sin_r, parent.scale_x),
-        y: safe_div(-dx * sin_r + dy * cos_r, parent.scale_y),
-    }
+fn safe_div(num: f32, den: f32) -> f32 {
+    if den.abs() > 1.0e-6 { num / den } else { 1.0 }
 }
 
 /// World coords relative to the render frame.
@@ -3152,14 +2958,42 @@ pub(crate) fn get_element_world_pos(
 
     if let Some(pid) = parent_id {
         let mut visited = vec![element_id.to_string()];
-        if let Some(parent_xform) = resolve_parent_transform(state, &pid, sample_t, &mut visited) {
-            return apply_parent_transform(base_pos, &parent_xform);
+        if let Some(parent_xform) =
+            memstroy_core::resolve_parent_transform(&state.scene, &pid, sample_t, &mut visited)
+        {
+            return memstroy_core::apply_parent_transform(base_pos, &parent_xform);
         }
     }
 
     base_pos
 }
 
+
+/// Sample an actor's transform at scene time `t` (per-param tracks).
+fn sample_actor_transform(actor: &memstroy_core::Actor, t: f32) -> ActorState {
+    memstroy_core::sample_actor_layout(&actor.layout, &actor.animated_params, t)
+}
+
+/// Sample an overlay's transform at clip-local time `t` (per-param tracks).
+fn sample_overlay_transform(overlay: &Overlay, local_t: f32) -> OverlayState {
+    match overlay {
+        Overlay::Text(t) => memstroy_core::sample_overlay_layout(
+            &t.layout,
+            &t.animated_params,
+            local_t,
+        ),
+        Overlay::Image(im) => memstroy_core::sample_overlay_layout(
+            &im.layout,
+            &im.animated_params,
+            local_t,
+        ),
+        Overlay::Video(v) => memstroy_core::sample_overlay_layout(
+            &v.layout,
+            &v.animated_params,
+            local_t,
+        ),
+    }
+}
 
 /// Sample an overlay's layout at scene time `t` (clip-local keyframes).
 fn overlay_state_at_scene_time(
@@ -3188,7 +3022,7 @@ fn overlay_state_at_scene_time(
         } else {
             t_out - t_in
         };
-        Some(keyframe::sample(layout, local_t).unwrap_or_default())
+        Some(sample_overlay_transform(ov, local_t))
     })
 }
 
@@ -3840,68 +3674,40 @@ fn apply_drag(
 
         CanvasDragMode::MoveActorLegacy { actor_idx, initial_pos } => {
             if actor_idx < state.scene.actors.len() {
-                // World-fixed dims — `pos` is interpreted against the
-                // resolution rectangle anchored at world (0, 0). The
-                // render frame is a pure CAMERA: editing rf.pos /
-                // rf.zoom never drags world-space elements (per
-                // `draw_canvas_overlays` / `get_element_world_pos`),
-                // so the drag math must match. Without this, dragging
-                // an element after moving the rf produced a snap-back
-                // jump because the inverse formula assumed a different
-                // anchor than the renderer.
-                let rf = &state.scene.render_frame;
-                let [rw, rh] = rf.resolution;
-                let world_w = rw as f32;
-                let world_h = rh as f32;
-
-                let proposed_norm_x = initial_pos[0] + world_dx / world_w;
-                let proposed_norm_y = initial_pos[1] + world_dy / world_h;
-                let world_x = proposed_norm_x * world_w;
-                let world_y = proposed_norm_y * world_h;
-                let (snapped_world_x, snapped_world_y, guides) = snap_world_center(
+                // `initial_pos` is the world centre at drag start (see
+                // `move_selection_mode`). Apply the screen delta in
+                // world space, then let `write_selection_world_center`
+                // map back through the parent chain when needed.
+                let proposed_x = initial_pos[0] + world_dx;
+                let proposed_y = initial_pos[1] + world_dy;
+                let (snapped_x, snapped_y, guides) = snap_world_center(
                     state,
-                    world_x,
-                    world_y,
+                    proposed_x,
+                    proposed_y,
                     Some(SnapExclude::Actor(actor_idx)),
                 );
                 state.canvas_drag.snap_guides = guides;
-                set_selection_world_center(state, [snapped_world_x, snapped_world_y]);
-                // Broadcast snapped delta in world coords so non-primary
-                // elements track the primary's actual on-screen motion.
-                let prim_initial_world_x = initial_pos[0] * world_w;
-                let prim_initial_world_y = initial_pos[1] * world_h;
-                let total_dx = snapped_world_x - prim_initial_world_x;
-                let total_dy = snapped_world_y - prim_initial_world_y;
+                set_selection_world_center(state, [snapped_x, snapped_y]);
+                let total_dx = snapped_x - initial_pos[0];
+                let total_dy = snapped_y - initial_pos[1];
                 broadcast_multi_translation(state, total_dx, total_dy);
             }
         }
 
         CanvasDragMode::MoveOverlay { overlay_idx, initial_pos } => {
             if overlay_idx < state.scene.overlays.len() {
-                // World-fixed dims — see `MoveActorLegacy` above.
-                let rf = &state.scene.render_frame;
-                let [rw, rh] = rf.resolution;
-                let world_w = rw as f32;
-                let world_h = rh as f32;
-                let dx_norm = world_dx / world_w;
-                let dy_norm = world_dy / world_h;
-                let proposed_norm_x = initial_pos[0] + dx_norm;
-                let proposed_norm_y = initial_pos[1] + dy_norm;
-                let world_x = proposed_norm_x * world_w;
-                let world_y = proposed_norm_y * world_h;
-                let (snapped_world_x, snapped_world_y, guides) = snap_world_center(
+                let proposed_x = initial_pos[0] + world_dx;
+                let proposed_y = initial_pos[1] + world_dy;
+                let (snapped_x, snapped_y, guides) = snap_world_center(
                     state,
-                    world_x,
-                    world_y,
+                    proposed_x,
+                    proposed_y,
                     Some(SnapExclude::Overlay(overlay_idx)),
                 );
                 state.canvas_drag.snap_guides = guides;
-                set_selection_world_center(state, [snapped_world_x, snapped_world_y]);
-                // Broadcast snapped world delta to other selected items.
-                let prim_initial_world_x = initial_pos[0] * world_w;
-                let prim_initial_world_y = initial_pos[1] * world_h;
-                let total_dx = snapped_world_x - prim_initial_world_x;
-                let total_dy = snapped_world_y - prim_initial_world_y;
+                set_selection_world_center(state, [snapped_x, snapped_y]);
+                let total_dx = snapped_x - initial_pos[0];
+                let total_dy = snapped_y - initial_pos[1];
                 broadcast_multi_translation(state, total_dx, total_dy);
             }
         }
@@ -4140,45 +3946,38 @@ fn apply_drag(
 
 fn move_selection_mode(state: &EditorState) -> crate::state::CanvasDragMode {
     use crate::state::CanvasDragMode;
-    let t = state.playhead;
+    let t = state.canvas_drag.drag_start_playhead.unwrap_or(state.playhead);
     match state.selection {
         Selection::Actor(idx) if idx < state.scene.actors.len() => {
-            let actor_id = state.scene.actors[idx].id.clone();
-            // Prefer the canvas-layout (world-pixel) track when the actor
-            // has one. Sample at the *playhead* — using `.first()` here
-            // caused the actor to snap to the first keyframe's position
-            // on the very first frame of the drag whenever the playhead
-            // sat between keyframes.
+            let actor = &state.scene.actors[idx];
+            let actor_id = actor.id.clone();
+            // Anchor the drag to the on-screen world centre (includes
+            // parent transforms). Adding screen deltas to stored local /
+            // normalised coords made parented children "run away" from
+            // the pointer.
+            let wp = get_element_world_pos(state, &actor_id, &actor.layout, t);
+            let initial_world = [wp.x, wp.y];
             if let Some(cl) = state.scene.canvas_layouts.iter().find(|cl| cl.element_id == actor_id) {
                 if !cl.keyframes.is_empty() {
-                    let sampled = keyframe::sample(&cl.keyframes, t).unwrap_or_default();
                     return CanvasDragMode::MoveActorWorld {
                         actor_idx: idx,
-                        initial_pos: [sampled.pos.x, sampled.pos.y],
+                        initial_pos: initial_world,
                     };
                 }
             }
-            // Legacy normalised layout — sample at the playhead, same fix.
-            let initial_pos = keyframe::sample(&state.scene.actors[idx].layout, t)
-                .map(|s| s.pos)
-                .unwrap_or_else(|| state.scene.actors[idx].layout.first()
-                    .map(|kf| kf.value.pos).unwrap_or([0.5, 0.5]));
-            CanvasDragMode::MoveActorLegacy { actor_idx: idx, initial_pos }
+            CanvasDragMode::MoveActorLegacy { actor_idx: idx, initial_pos: initial_world }
         }
         Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
-            // Overlays are sampled in CLIP-LOCAL time (`t - t_in`); the
-            // drag origin must use the same time base so we read the
-            // visible position the user is grabbing.
-            let local_t = overlay_clip_local_time(state, idx);
-            let layout: &Vec<Keyframe<OverlayState>> = match &state.scene.overlays[idx] {
-                Overlay::Text(t) => &t.layout,
-                Overlay::Image(im) => &im.layout,
-                Overlay::Video(v) => &v.layout,
+            let ov_id = match &state.scene.overlays[idx] {
+                Overlay::Text(o) => o.id.as_str(),
+                Overlay::Image(im) => im.id.as_str(),
+                Overlay::Video(v) => v.id.as_str(),
             };
-            let initial_pos = keyframe::sample(layout, local_t)
-                .map(|s| s.pos)
-                .unwrap_or_else(|| layout.first().map(|k| k.value.pos).unwrap_or([0.5, 0.5]));
-            CanvasDragMode::MoveOverlay { overlay_idx: idx, initial_pos }
+            let wp = get_element_world_pos(state, ov_id, &[], t);
+            CanvasDragMode::MoveOverlay {
+                overlay_idx: idx,
+                initial_pos: [wp.x, wp.y],
+            }
         }
         Selection::RenderFrame => {
             let rf_state = sample_render_frame(&state.scene.render_frame, t);
@@ -4194,19 +3993,11 @@ fn current_selection_scale(state: &EditorState) -> Option<f32> {
     let t = state.playhead;
     match state.selection {
         Selection::Actor(idx) if idx < state.scene.actors.len() => {
-            keyframe::sample(&state.scene.actors[idx].layout, t)
-                .map(|s| s.scale)
-                .or_else(|| state.scene.actors[idx].layout.first().map(|k| k.value.scale))
+            Some(sample_actor_transform(&state.scene.actors[idx], t).scale)
         }
         Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
             let local_t = overlay_clip_local_time(state, idx);
-            let layout: &Vec<Keyframe<OverlayState>> = match &state.scene.overlays[idx] {
-                Overlay::Text(t) => &t.layout,
-                Overlay::Image(im) => &im.layout,
-                Overlay::Video(v) => &v.layout,
-            };
-            keyframe::sample(layout, local_t).map(|s| s.scale)
-                .or_else(|| layout.first().map(|k| k.value.scale))
+            Some(sample_overlay_transform(&state.scene.overlays[idx], local_t).scale)
         }
         Selection::RenderFrame => {
             // Render frame uses inverse zoom as its "scale" — bigger value
@@ -4226,20 +4017,13 @@ fn current_selection_rotation(state: &EditorState) -> Option<f32> {
     let t = state.playhead;
     match state.selection {
         Selection::Actor(idx) if idx < state.scene.actors.len() => {
-            keyframe::sample(&state.scene.actors[idx].layout, t)
-                .map(|s| s.rotation_deg)
-                .or_else(|| state.scene.actors[idx].layout.first().map(|k| k.value.rotation_deg))
+            Some(sample_actor_transform(&state.scene.actors[idx], t).rotation_deg)
         }
         Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
             let local_t = overlay_clip_local_time(state, idx);
-            let layout: &Vec<Keyframe<OverlayState>> = match &state.scene.overlays[idx] {
-                Overlay::Text(t) => &t.layout,
-                Overlay::Image(im) => &im.layout,
-                Overlay::Video(v) => &v.layout,
-            };
-            keyframe::sample(layout, local_t)
-                .map(|s| s.rotation_deg)
-                .or_else(|| layout.first().map(|k| k.value.rotation_deg))
+            Some(
+                sample_overlay_transform(&state.scene.overlays[idx], local_t).rotation_deg,
+            )
         }
         Selection::RenderFrame => {
             let rf_state = sample_render_frame(&state.scene.render_frame, t);
@@ -4264,19 +4048,13 @@ fn current_selection_scale_y(state: &EditorState) -> Option<f32> {
     let t = state.playhead;
     match state.selection {
         Selection::Actor(idx) if idx < state.scene.actors.len() => {
-            keyframe::sample(&state.scene.actors[idx].layout, t)
-                .map(|s| s.scale_y)
-                .or_else(|| state.scene.actors[idx].layout.first().map(|k| k.value.scale_y))
+            Some(sample_actor_transform(&state.scene.actors[idx], t).scale_y)
         }
         Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
             let local_t = overlay_clip_local_time(state, idx);
-            let layout: &Vec<Keyframe<OverlayState>> = match &state.scene.overlays[idx] {
-                Overlay::Text(t) => &t.layout,
-                Overlay::Image(im) => &im.layout,
-                Overlay::Video(v) => &v.layout,
-            };
-            keyframe::sample(layout, local_t).map(|s| s.scale_y)
-                .or_else(|| layout.first().map(|k| k.value.scale_y))
+            Some(
+                sample_overlay_transform(&state.scene.overlays[idx], local_t).scale_y,
+            )
         }
         // Render frame is locked to its output aspect ratio.
         Selection::RenderFrame => Some(1.0),
@@ -4445,17 +4223,12 @@ fn sample_selection_transform(state: &EditorState, sel: Selection) -> (f32, f32,
     let t = state.playhead;
     match sel {
         Selection::Actor(idx) if idx < state.scene.actors.len() => {
-            let st = keyframe::sample(&state.scene.actors[idx].layout, t).unwrap_or_default();
+            let st = sample_actor_transform(&state.scene.actors[idx], t);
             (st.scale, st.scale_y, st.rotation_deg)
         }
         Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
             let local_t = overlay_clip_local_time(state, idx);
-            let layout: &Vec<Keyframe<OverlayState>> = match &state.scene.overlays[idx] {
-                Overlay::Text(t) => &t.layout,
-                Overlay::Image(im) => &im.layout,
-                Overlay::Video(v) => &v.layout,
-            };
-            let st = keyframe::sample(layout, local_t).unwrap_or_default();
+            let st = sample_overlay_transform(&state.scene.overlays[idx], local_t);
             (st.scale, st.scale_y, st.rotation_deg)
         }
         Selection::RenderFrame => {
@@ -5181,42 +4954,42 @@ fn sniff_hit(state: &EditorState, pos: WorldPos) -> Option<Selection> {
         };
         let sample_t = if t >= t_in && t <= t_out { t - t_in }
             else if t < t_in { 0.0 } else { t_out - t_in };
-        let ov_state = keyframe::sample(layout, sample_t).unwrap_or_default();
         let ov_id = match overlay {
             Overlay::Text(o) => o.id.as_str(),
             Overlay::Image(o) => o.id.as_str(),
             Overlay::Video(o) => o.id.as_str(),
         };
-        let ov_world = get_element_world_pos(state, ov_id, &[], t);
-        let (ew, eh) = overlay_bbox_with_state(overlay, &ov_state, state);
-        let mut rotation_deg = ov_state.rotation_deg;
-        let mut ov_scale = ov_state.scale;
-        let mut ov_scale_y = ov_state.scale_y;
-        apply_canvas_transform_preview(
-            state,
-            ov_id,
-            &mut rotation_deg,
-            &mut ov_scale,
-            &mut ov_scale_y,
-        );
-        let mut parent_scale_x = 1.0_f32;
-        let mut parent_scale_y = 1.0_f32;
         let parent_id = match overlay {
             Overlay::Text(o) => o.parent_id.as_ref(),
             Overlay::Image(o) => o.parent_id.as_ref(),
             Overlay::Video(o) => o.parent_id.as_ref(),
         };
-        if let Some(pid) = parent_id {
-            let mut visited = vec![ov_id.to_string()];
-            if let Some(pxf) = resolve_parent_transform(state, pid, t, &mut visited) {
-                rotation_deg += pxf.rotation_deg;
-                parent_scale_x *= pxf.scale_x;
-                parent_scale_y *= pxf.scale_y;
-            }
-        }
-        let half_w = ew * parent_scale_x * 0.5;
-        let half_h = eh * parent_scale_y * 0.5;
-        if world_point_in_oriented_rect(pos, ov_world, half_w, half_h, rotation_deg) {
+        let modifiers: &[TrackModifier] = match overlay {
+            Overlay::Text(txt) => &txt.modifiers,
+            Overlay::Image(img) => &img.modifiers,
+            Overlay::Video(vid) => &vid.modifiers,
+        };
+        let mut ov_state = overlay_visual_state(
+            &state.scene,
+            overlay,
+            ov_id,
+            parent_id,
+            t,
+            sample_t,
+            modifiers,
+        );
+        apply_canvas_transform_preview(
+            state,
+            ov_id,
+            &mut ov_state.rotation_deg,
+            &mut ov_state.scale,
+            &mut ov_state.scale_y,
+        );
+        let ov_world = get_element_world_pos(state, ov_id, &[], t);
+        let (ew, eh) = overlay_bbox_with_state(overlay, &ov_state, state);
+        let half_w = ew * 0.5;
+        let half_h = eh * 0.5;
+        if world_point_in_oriented_rect(pos, ov_world, half_w, half_h, ov_state.rotation_deg) {
             return Some(Selection::Overlay(idx));
         }
     }
@@ -5224,16 +4997,19 @@ fn sniff_hit(state: &EditorState, pos: WorldPos) -> Option<Selection> {
     for (idx, actor) in state.scene.actors.iter().enumerate().rev() {
         if !actor.visible { continue; }
         let world_pos = get_element_world_pos(state, &actor.id, &actor.layout, t);
-        let actor_st = keyframe::sample(&actor.layout, t).unwrap_or_default();
+        let actor_st = sample_actor_transform(actor, t);
         let mut actor_scale = actor_st.scale;
         let mut actor_scale_y = actor_st.scale_y;
         let mut rotation_deg = actor_st.rotation_deg;
         if let Some(ref pid) = actor.parent_id {
             let mut visited = vec![actor.id.clone()];
             if let Some(pxf) = resolve_parent_transform(state, pid, t, &mut visited) {
-                rotation_deg += pxf.rotation_deg;
-                actor_scale *= pxf.scale_x;
-                actor_scale_y *= safe_div(pxf.scale_y, pxf.scale_x);
+                apply_parent_inheritance_actor(
+                    &mut rotation_deg,
+                    &mut actor_scale,
+                    &mut actor_scale_y,
+                    &pxf,
+                );
             }
         }
         let (base_w, base_h) = if let Some(fc) = state.frame_caches.get(idx) {
@@ -5269,7 +5045,7 @@ fn selected_element_gizmo(
                 .filter(|_| state.canvas_drag.preview_element_id.as_deref() == Some(actor.id.as_str()))
                 .unwrap_or(t);
             let world_pos = get_element_world_pos(state, &actor.id, &actor.layout, t);
-            let actor_st = keyframe::sample(&actor.layout, sample_t).unwrap_or_default();
+            let actor_st = sample_actor_transform(actor, sample_t);
             let mut actor_scale = actor_st.scale;
             let mut actor_scale_y = actor_st.scale_y;
             let mut rotation_deg = actor_st.rotation_deg;
@@ -5283,9 +5059,12 @@ fn selected_element_gizmo(
             if let Some(ref pid) = actor.parent_id {
                 let mut visited = vec![actor.id.clone()];
                 if let Some(pxf) = resolve_parent_transform(state, pid, sample_t, &mut visited) {
-                    rotation_deg += pxf.rotation_deg;
-                    actor_scale *= pxf.scale_x;
-                actor_scale_y *= safe_div(pxf.scale_y, pxf.scale_x);
+                    apply_parent_inheritance_actor(
+                        &mut rotation_deg,
+                        &mut actor_scale,
+                        &mut actor_scale_y,
+                        &pxf,
+                    );
                 }
             }
             let (base_w, base_h) = if let Some(fc) = state.frame_caches.get(idx) {
@@ -5335,29 +5114,29 @@ fn selected_element_gizmo(
                 ),
             };
             let sample_t = if t >= t_in && t <= t_out { t - t_in } else { 0.0 };
-            let ov_state = keyframe::sample(layout, sample_t).unwrap_or_default();
-            let world_pos = get_element_world_pos(state, ov_id, &[], t);
-            let (elem_w, elem_h) = overlay_bbox_with_state(overlay, &ov_state, state);
-            let mut rotation_deg = ov_state.rotation_deg;
-            let mut ov_scale = ov_state.scale;
-            let mut ov_scale_y = ov_state.scale_y;
+            let modifiers: &[TrackModifier] = match overlay {
+                Overlay::Text(txt) => &txt.modifiers,
+                Overlay::Image(img) => &img.modifiers,
+                Overlay::Video(vid) => &vid.modifiers,
+            };
+            let mut ov_state = overlay_visual_state(
+                &state.scene,
+                overlay,
+                ov_id,
+                parent_id,
+                t,
+                sample_t,
+                modifiers,
+            );
             apply_canvas_transform_preview(
                 state,
                 ov_id,
-                &mut rotation_deg,
-                &mut ov_scale,
-                &mut ov_scale_y,
+                &mut ov_state.rotation_deg,
+                &mut ov_state.scale,
+                &mut ov_state.scale_y,
             );
-            let mut parent_scale_x = 1.0_f32;
-            let mut parent_scale_y = 1.0_f32;
-            if let Some(pid) = parent_id {
-                let mut visited = vec![ov_id.to_string()];
-                if let Some(pxf) = resolve_parent_transform(state, pid, t, &mut visited) {
-                    rotation_deg += pxf.rotation_deg;
-                    parent_scale_x *= pxf.scale_x;
-                    parent_scale_y *= pxf.scale_y;
-                }
-            }
+            let world_pos = get_element_world_pos(state, ov_id, &[], t);
+            let (elem_w, elem_h) = overlay_bbox_with_state(overlay, &ov_state, state);
             let center_screen = state.canvas_viewport.world_to_screen(world_pos, viewport_size);
             let zoom = state.canvas_viewport.zoom;
             Some(ElementGizmo {
@@ -5365,9 +5144,9 @@ fn selected_element_gizmo(
                     full_rect.min.x + center_screen[0],
                     full_rect.min.y + center_screen[1],
                 ),
-                half_w: elem_w * parent_scale_x * 0.5 * zoom,
-                half_h: elem_h * parent_scale_y * 0.5 * zoom,
-                rotation_deg,
+                half_w: elem_w * 0.5 * zoom,
+                half_h: elem_h * 0.5 * zoom,
+                rotation_deg: ov_state.rotation_deg,
             })
         }
         _ => None,
@@ -5676,8 +5455,7 @@ fn draw_element_resize_handles(
             let actor = &state.scene.actors[idx];
             if !actor.visible { return; }
             let world_pos = get_element_world_pos(state, &actor.id, &actor.layout, t);
-            let actor_scale = keyframe::sample(&actor.layout, t)
-                .map(|s| s.scale).unwrap_or(1.0);
+            let actor_scale = sample_actor_transform(actor, t).scale;
             // Use real source dimensions from frame cache
             let (base_w, base_h) = if let Some(fc) = state.frame_caches.get(idx) {
                 if fc.is_ready() && fc.frame_count > 0 {
@@ -5702,7 +5480,7 @@ fn draw_element_resize_handles(
                 Overlay::Video(vid) => (vid.t_in, vid.t_out, &vid.layout),
             };
             let sample_t = if t >= t_in && t <= t_out { t - t_in } else { 0.0 };
-            let ov_state = keyframe::sample(layout, sample_t).unwrap_or_default();
+            let ov_state = sample_overlay_transform(overlay, sample_t);
             // World-fixed dims — see the matching block above.
             let rf = &state.scene.render_frame;
             let [rw, rh] = rf.resolution;
@@ -6252,7 +6030,7 @@ fn try_select_at(state: &mut EditorState, pos: WorldPos) {
                 };
                 let sample_t = if t >= t_in && t <= t_out { t - t_in }
                     else if t < t_in { 0.0 } else { t_out - t_in };
-                let ov_state = keyframe::sample(layout, sample_t).unwrap_or_default();
+                let ov_state = sample_overlay_transform(overlay, sample_t);
 
                 let ov_world = WorldPos {
                     x: ov_state.pos[0] * world_w,
@@ -6269,8 +6047,7 @@ fn try_select_at(state: &mut EditorState, pos: WorldPos) {
             HitCand::Actor(idx) => {
                 let actor = &state.scene.actors[idx];
                 let world_pos = get_element_world_pos(state, &actor.id, &actor.layout, t);
-                let actor_scale = keyframe::sample(&actor.layout, t)
-                    .map(|s| s.scale).unwrap_or(1.0);
+                let actor_scale = sample_actor_transform(actor, t).scale;
                 let (base_w, base_h) = if let Some(fc) = state.frame_caches.get(idx) {
                     if fc.is_ready() && fc.frame_count > 0 {
                         (fc.source_width as f32, fc.source_height as f32)
@@ -6335,8 +6112,7 @@ fn is_point_on_selection(state: &EditorState, pos: WorldPos) -> bool {
             let actor = &state.scene.actors[idx];
             if !actor.visible { return false; }
             let world_pos = get_element_world_pos(state, &actor.id, &actor.layout, t);
-            let actor_scale = keyframe::sample(&actor.layout, t)
-                .map(|s| s.scale).unwrap_or(1.0);
+            let actor_scale = sample_actor_transform(actor, t).scale;
             let (base_w, base_h) = if let Some(fc) = state.frame_caches.get(idx) {
                 if fc.is_ready() && fc.frame_count > 0 {
                     (fc.source_width as f32, fc.source_height as f32)
@@ -6362,7 +6138,7 @@ fn is_point_on_selection(state: &EditorState, pos: WorldPos) -> bool {
                 Overlay::Video(vid) => (vid.t_in, vid.t_out, &vid.layout),
             };
             let sample_t = if t >= t_in && t <= t_out { t - t_in } else { 0.0 };
-            let ov_state = keyframe::sample(layout, sample_t).unwrap_or_default();
+            let ov_state = sample_overlay_transform(overlay, sample_t);
             let ov_world = WorldPos {
                 x: ov_state.pos[0] * world_w,
                 y: ov_state.pos[1] * world_h,
@@ -6595,25 +6371,11 @@ fn screen_to_element_uv(
 fn selected_element_rotation_deg(state: &EditorState) -> f32 {
     match state.selection {
         Selection::Actor(idx) if idx < state.scene.actors.len() => {
-            let layout = &state.scene.actors[idx].layout;
-            keyframe::sample(layout, state.playhead)
-                .map(|s| s.rotation_deg)
-                .unwrap_or(0.0)
+            sample_actor_transform(&state.scene.actors[idx], state.playhead).rotation_deg
         }
         Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
-            let (t_in, t_out, layout) = match &state.scene.overlays[idx] {
-                Overlay::Text(t) => (t.t_in, t.t_out, &t.layout),
-                Overlay::Image(im) => (im.t_in, im.t_out, &im.layout),
-                Overlay::Video(v) => (v.t_in, v.t_out, &v.layout),
-            };
-            let local_t = if state.playhead >= t_in && state.playhead <= t_out {
-                state.playhead - t_in
-            } else {
-                0.0
-            };
-            keyframe::sample(layout, local_t)
-                .map(|s| s.rotation_deg)
-                .unwrap_or(0.0)
+            let local_t = overlay_clip_local_time(state, idx);
+            sample_overlay_transform(&state.scene.overlays[idx], local_t).rotation_deg
         }
         _ => 0.0,
     }

@@ -2,6 +2,7 @@
 
 pub mod undo;
 pub mod video_cache;
+pub mod split_crop;
 pub mod skeleton_editor;
 pub mod kf_anim;
 pub mod settings;

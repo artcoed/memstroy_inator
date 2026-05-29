@@ -18,8 +18,12 @@ pub mod canvas;
 pub mod skeleton;
 pub mod scripting;
 pub mod effects;
+pub mod layout_sample;
+pub mod parent_transform;
 
 pub use scene::*;
+pub use layout_sample::*;
+pub use parent_transform::*;
 pub use easing::*;
 pub use keyframe::*;
 pub use anchor::*;

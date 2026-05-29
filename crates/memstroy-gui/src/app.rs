@@ -9,7 +9,7 @@ use tokio::runtime::Runtime;
 
 use crate::jobs::{spawn_refresh, spawn_render, JobEvent};
 use crate::panels;
-use crate::state::{EditorState, Selection};
+use crate::state::{EditorState, SceneExitAction, Selection};
 use crate::audio_engine::AudioEngine;
 
 pub struct App {
@@ -76,6 +76,13 @@ pub struct App {
     /// clipboard image takes priority. `None` = no internal copy in
     /// this session, so OS clipboard always wins.
     last_internal_copy_at: Option<std::time::Instant>,
+
+    /// Deferred tab switch / close / open / quit while the unsaved
+    /// changes dialog is shown.
+    pending_scene_exit: Option<SceneExitAction>,
+    /// Set when the user chose "Don't save" on quit — next close
+    /// request is allowed through without prompting again.
+    force_app_close: bool,
 }
 
 impl App {
@@ -154,6 +161,99 @@ impl App {
             pending_v_release_skips: 0,
             ctrl_held_grace_frames: 0,
             last_internal_copy_at: None,
+            pending_scene_exit: None,
+            force_app_close: false,
+        }
+    }
+
+    /// If the active tab has edits, queue `action` and return false.
+    fn request_scene_exit(&mut self, action: SceneExitAction) -> bool {
+        if self.pending_scene_exit.is_some() {
+            return false;
+        }
+        if self.state.active_tab_is_dirty() {
+            self.pending_scene_exit = Some(action);
+            false
+        } else {
+            self.commit_scene_exit(action);
+            true
+        }
+    }
+
+    fn commit_scene_exit(&mut self, action: SceneExitAction) {
+        let needs_close = matches!(action, SceneExitAction::Quit);
+        self.state.apply_scene_exit_action(action);
+        if needs_close {
+            self.force_app_close = true;
+        }
+    }
+
+    /// Try to save the active tab for an exit flow. Returns true when
+    /// the scene has no remaining unsaved edits.
+    fn save_active_tab_for_exit(&mut self) -> bool {
+        self.save_scene();
+        !self.state.active_tab_is_dirty()
+    }
+
+    fn show_unsaved_changes_dialog(&mut self, ctx: &egui::Context) {
+        let Some(action) = self.pending_scene_exit.clone() else {
+            return;
+        };
+
+        let mut dismiss = false;
+        let mut save_and_proceed = false;
+        let mut discard_and_proceed = false;
+
+        egui::Window::new(crate::i18n::t("Unsaved changes"))
+            .id(egui::Id::new("unsaved_changes_dialog"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_width(420.0)
+            .show(ctx, |ui| {
+                ui.label(crate::i18n::t(
+                    "This scene has changes that have not been saved. Save before leaving?",
+                ));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(crate::i18n::t("Save"))
+                        .clicked()
+                    {
+                        save_and_proceed = true;
+                    }
+                    if ui
+                        .button(crate::i18n::t("Don't save"))
+                        .clicked()
+                    {
+                        discard_and_proceed = true;
+                    }
+                    if ui.button(crate::i18n::t("Cancel")).clicked() {
+                        dismiss = true;
+                    }
+                });
+            });
+
+        if dismiss {
+            self.pending_scene_exit = None;
+            return;
+        }
+        if save_and_proceed {
+            if self.save_active_tab_for_exit() {
+                let action = self.pending_scene_exit.take().unwrap_or(action);
+                self.commit_scene_exit(action);
+                if self.force_app_close {
+                    ctx.send_viewport_cmd(ViewportCommand::Close);
+                }
+            }
+            return;
+        }
+        if discard_and_proceed {
+            let action = self.pending_scene_exit.take().unwrap_or(action);
+            self.commit_scene_exit(action);
+            if self.force_app_close {
+                ctx.send_viewport_cmd(ViewportCommand::Close);
+            }
         }
     }
 
@@ -807,13 +907,7 @@ impl App {
                         let is_active = i == active;
                         let is_editing = editing == Some(i);
                         let tab_name = self.state.scene_tabs[i].name.clone();
-                        // "Dirty" = tab has content but no save path yet.
-                        let dirty = self
-                            .state
-                            .scene_tabs
-                            .get(i)
-                            .map(|t| t.path.is_none() && !t.scene.actors.is_empty())
-                            .unwrap_or(false);
+                        let dirty = self.state.tab_is_dirty(i);
 
                         let (fill, stroke_col, text_col, accent) = if is_active {
                             (
@@ -890,6 +984,7 @@ impl App {
                                     );
                                     if resp.clicked() && !is_active {
                                         switch_to = Some(i);
+                                        close_tab = None;
                                     }
                                     if resp.double_clicked() {
                                         start_rename = Some((i, tab_name.clone()));
@@ -950,7 +1045,7 @@ impl App {
             .stroke(Stroke::new(1.0, Color32::from_rgb(120, 100, 40)))
             .min_size(Vec2::new(26.0, 22.0));
             if ui.add(plus_btn).on_hover_text(crate::i18n::t("New scene tab")).clicked() {
-                self.state.new_tab();
+                self.request_scene_exit(SceneExitAction::NewTab);
             }
         });
 
@@ -969,10 +1064,10 @@ impl App {
             self.state.editing_tab_buf.clear();
         }
         if let Some(idx) = switch_to {
-            self.state.switch_tab(idx);
+            self.request_scene_exit(SceneExitAction::SwitchTab(idx));
         }
         if let Some(idx) = close_tab {
-            self.state.close_tab(idx);
+            self.request_scene_exit(SceneExitAction::CloseTab(idx));
         }
     }
 
@@ -981,9 +1076,7 @@ impl App {
         egui::menu::bar(ui, |ui| {
             ui.menu_button(RichText::new(t("\u{1F4C1} File")).strong(), |ui| {
                 if ui.button(t("\u{2728} New scene")).clicked() {
-                    self.state.scene = Scene::default();
-                    self.state.scene_path = None;
-                    self.state.status = t("\u{2728} New scene created.").into();
+                    self.request_scene_exit(SceneExitAction::NewScene);
                     ui.close_menu();
                 }
                 if ui.button(t("\u{1F4C2} Open scene...")).clicked() {
@@ -997,32 +1090,10 @@ impl App {
                             .and_then(|e| e.to_str())
                             .map(|s| s.eq_ignore_ascii_case("memstroy"))
                             .unwrap_or(false);
-                        let load_res: Result<Scene, String> = if is_memstroy {
-                            self.state.load_memstroy(&path)
-                        } else {
-                            Scene::load(&path).map_err(|e| e.to_string())
-                        };
-                        match load_res {
-                            Ok(s) => {
-                                self.state.scene = s;
-                                self.state.scene_path = Some(path.clone());
-                                self.state.status = t("\u{2705} Scene loaded.").into();
-                                // Sidecar layout for non-bundle formats.
-                                if !is_memstroy {
-                                    let layout_path = path.with_extension("layout.json");
-                                    self.state.load_layout(&layout_path);
-                                }
-                                // Update tab name
-                                let name = path.file_stem().and_then(|s| s.to_str())
-                                    .unwrap_or(t("Scene")).to_string();
-                                if self.state.active_tab < self.state.scene_tabs.len() {
-                                    self.state.scene_tabs[self.state.active_tab].name = name;
-                                    self.state.scene_tabs[self.state.active_tab].path = Some(path.clone());
-                                    self.state.scene_tabs[self.state.active_tab].scene = self.state.scene.clone();
-                                }
-                            }
-                            Err(e) => self.state.status = format!("{} {e}", t("\u{274C} Open failed:")),
-                        }
+                        self.request_scene_exit(SceneExitAction::OpenScene {
+                            path,
+                            is_memstroy,
+                        });
                     }
                     ui.close_menu();
                 }
@@ -1165,7 +1236,10 @@ impl App {
                 }
                 ui.separator();
                 if ui.button(t("\u{1F6AA} Exit")).clicked() {
-                    ctx.send_viewport_cmd(ViewportCommand::Close);
+                    if self.request_scene_exit(SceneExitAction::Quit) {
+                        ctx.send_viewport_cmd(ViewportCommand::Close);
+                    }
+                    ui.close_menu();
                 }
             });
 
@@ -1661,10 +1735,10 @@ impl App {
         true
     }
 
-    /// Render the body of the curve-editor floating window. Resolves
-    /// the active curve target (Actor / Overlay / Audio) and shows a
-    /// dropdown picker when the user has multiple compatible elements
-    /// multi-selected so they can choose which one's curve to edit.
+    /// Render the body of the curve-editor floating window. Binds to
+    /// exactly one selected element (actor / overlay / audio / render
+    /// frame). When nothing is selected or multiple elements are
+    /// selected, the panel clears and asks the user to pick one.
     fn draw_curve_editor_body(&mut self, ui: &mut egui::Ui) {
         use crate::curve_editor::{
             curve_editor_panel, CurveEditorTarget, PROP_OPACITY, PROP_POS_X,
@@ -1672,139 +1746,118 @@ impl App {
         };
         use crate::i18n::t;
 
-        // Build the list of candidate targets the curve editor can bind
-        // to right now. Each entry has a short label, the resolved
-        // selection it points at, and a kind tag the renderer uses to
-        // route into the right CurveEditorTarget variant.
+        fn curve_editor_single_selection(state: &crate::state::EditorState) -> Option<Selection> {
+            if state.canvas_selection.len() > 1 || state.multi_select.len() > 1 {
+                return None;
+            }
+            if state.canvas_selection.len() == 1 {
+                let s = state.canvas_selection[0];
+                if matches!(
+                    s,
+                    Selection::Actor(_)
+                        | Selection::Overlay(_)
+                        | Selection::Audio(_)
+                        | Selection::RenderFrame
+                ) {
+                    return Some(s);
+                }
+            }
+            match state.selection {
+                Selection::Actor(_)
+                | Selection::Overlay(_)
+                | Selection::Audio(_)
+                | Selection::RenderFrame => Some(state.selection),
+                _ => None,
+            }
+        }
+
+        fn clear_curve_editor_state(state: &mut crate::state::EditorState) {
+            state.curve_editor_property = PROP_SCALE;
+            state.curve_editor_selected.clear();
+            state.curve_editor_marquee = None;
+            state.curve_editor_multi_drag = false;
+            state.curve_editor_multi_drag_delta = egui::Vec2::ZERO;
+        }
+
+        let Some(sel) = curve_editor_single_selection(&self.state) else {
+            clear_curve_editor_state(&mut self.state);
+            ui.label(
+                egui::RichText::new(t("Select a single element to edit its properties."))
+                    .italics()
+                    .color(Color32::from_rgb(140, 140, 160)),
+            );
+            return;
+        };
+
         #[derive(Clone, Copy, PartialEq, Eq)]
-        enum CandidateKind {
+        enum TargetKind {
             Actor,
             Overlay,
             Audio,
             RenderFrame,
         }
-        let mut candidates: Vec<(String, Selection, CandidateKind)> = Vec::new();
-        // Single primary selection always comes first so it stays the
-        // default when the popup opens.
-        match self.state.selection {
-            Selection::Actor(i) if i < self.state.scene.actors.len() => {
-                let id = self.state.scene.actors[i].id.clone();
-                candidates.push((
-                    format!("{} {}", t("Actor"), id),
-                    Selection::Actor(i),
-                    CandidateKind::Actor,
-                ));
-            }
-            Selection::Overlay(i) if i < self.state.scene.overlays.len() => {
-                let id = match &self.state.scene.overlays[i] {
-                    memstroy_core::Overlay::Text(o) => o.id.clone(),
-                    memstroy_core::Overlay::Image(o) => o.id.clone(),
-                    memstroy_core::Overlay::Video(o) => o.id.clone(),
-                };
-                candidates.push((
-                    format!("{} {}", t("Overlay"), id),
-                    Selection::Overlay(i),
-                    CandidateKind::Overlay,
-                ));
-            }
-            Selection::Audio(i) if i < self.state.scene.audio.len() => {
-                let id = self.state.scene.audio[i].id.clone();
-                candidates.push((
-                    format!("{} {}", t("Audio"), id),
-                    Selection::Audio(i),
-                    CandidateKind::Audio,
-                ));
-            }
-            Selection::RenderFrame => {
-                candidates.push((
-                    t("Render Frame").into(),
-                    Selection::RenderFrame,
-                    CandidateKind::RenderFrame,
-                ));
-            }
-            _ => {}
-        }
-        // Multi-selected actors (Ctrl+click) extend the candidate set so
-        // the user can flick between them without leaving the editor.
-        for &mi in &self.state.multi_select {
-            if mi >= self.state.scene.actors.len() {
-                continue;
-            }
-            let already_in_list = candidates
-                .iter()
-                .any(|(_, sel, _)| matches!(*sel, Selection::Actor(j) if j == mi));
-            if already_in_list {
-                continue;
-            }
-            let id = self.state.scene.actors[mi].id.clone();
-            candidates.push((
-                format!("{} {}", t("Actor"), id),
-                Selection::Actor(mi),
-                CandidateKind::Actor,
-            ));
-        }
-        // Render Frame is always available as a candidate even when
-        // it isn't the primary selection — it's a global element so
-        // the user can always edit its curves without leaving the
-        // current selection. Match the way the canvas handles it.
-        if !candidates
-            .iter()
-            .any(|(_, sel, _)| matches!(*sel, Selection::RenderFrame))
-        {
-            candidates.push((
-                t("Render Frame").into(),
-                Selection::RenderFrame,
-                CandidateKind::RenderFrame,
-            ));
-        }
 
-        if candidates.is_empty() {
-            ui.label(
-                egui::RichText::new(t(
-                    "Select an actor, overlay or audio layer to edit its curves.",
-                ))
-                .italics()
-                .color(Color32::from_rgb(140, 140, 160)),
-            );
-            return;
-        }
+        let kind = match sel {
+            Selection::Actor(i) if i < self.state.scene.actors.len() => TargetKind::Actor,
+            Selection::Overlay(i) if i < self.state.scene.overlays.len() => TargetKind::Overlay,
+            Selection::Audio(i) if i < self.state.scene.audio.len() => TargetKind::Audio,
+            Selection::RenderFrame => TargetKind::RenderFrame,
+            _ => {
+                clear_curve_editor_state(&mut self.state);
+                ui.label(
+                    egui::RichText::new(t(
+                        "Select an actor, overlay or audio layer to edit its curves.",
+                    ))
+                    .italics()
+                    .color(Color32::from_rgb(140, 140, 160)),
+                );
+                return;
+            }
+        };
 
-        // The curve editor is always bound to the primary selection.
-        // The previous "element picker" made it too easy to edit curves
-        // on a different element than the one currently selected on the
-        // canvas/timeline.
-        let chosen_idx = 0usize;
-        let (_label, sel, kind) = candidates[chosen_idx].clone();
         let duration = self.state.scene.output.duration;
         let playhead = self.state.playhead;
 
         match kind {
-            CandidateKind::Actor => {
+            TargetKind::Actor => {
                 if let Selection::Actor(i) = sel {
-                    if let Some(a) = self.state.scene.actors.get_mut(i) {
-                        let target = CurveEditorTarget::Actor {
-                            layout: &mut a.layout,
-                            animated_params: &mut a.animated_params,
-                        };
-                        curve_editor_panel(
-                            ui,
-                            target,
-                            duration,
-                            &mut self.state.curve_editor_property,
-                            playhead,
-                            &mut self.state.curve_editor_marquee,
-                            &mut self.state.curve_editor_selected,
-                            &mut self.state.curve_editor_multi_drag,
-                            &mut self.state.curve_editor_multi_drag_delta,
-                            &mut self.state.curve_editor_pan_offset,
-                            &mut self.state.curve_editor_zoom,
-                            &mut self.state.curve_editor_panning,
-                        );
-                        // Effect animated params — show a scalar curve
-                        // editor for each animated effect parameter.
-                        let actor_t_in = a.t_in.unwrap_or(0.0);
-                        let t_local = (playhead - actor_t_in).max(0.0);
-                        for (fx_idx, eff) in a.effects.iter_mut().enumerate() {
+                    let scene = &mut self.state.scene;
+                    let actor_id = scene.actors[i].id.clone();
+                    let canvas_idx = scene
+                        .canvas_layouts
+                        .iter()
+                        .position(|cl| cl.element_id == actor_id);
+                    let clip_start = scene.actors[i].t_in.unwrap_or(0.0);
+                    let clip_end = scene.actors[i].t_out.unwrap_or(duration);
+                    let canvas_layout = canvas_idx
+                        .map(|idx| &mut scene.canvas_layouts[idx].keyframes);
+                    let a = &mut scene.actors[i];
+                    let target = CurveEditorTarget::Actor {
+                        layout: &mut a.layout,
+                        animated_params: &mut a.animated_params,
+                        clip_start,
+                        clip_end,
+                        canvas_layout,
+                    };
+                    curve_editor_panel(
+                        ui,
+                        target,
+                        duration,
+                        &mut self.state.curve_editor_property,
+                        playhead,
+                        &mut self.state.curve_editor_marquee,
+                        &mut self.state.curve_editor_selected,
+                        &mut self.state.curve_editor_multi_drag,
+                        &mut self.state.curve_editor_multi_drag_delta,
+                        &mut self.state.curve_editor_pan_offset,
+                        &mut self.state.curve_editor_zoom,
+                        &mut self.state.curve_editor_panning,
+                    );
+                    // Effect animated params — show a scalar curve
+                    // editor for each animated effect parameter.
+                    let actor_t_in = a.t_in.unwrap_or(0.0);
+                    let t_local = (playhead - actor_t_in).max(0.0);
+                    for (fx_idx, eff) in a.effects.iter_mut().enumerate() {
                             let kind_label = eff.kind.label().to_string();
                             let animated_keys: Vec<String> =
                                 eff.animated_params.iter().cloned().collect();
@@ -1854,33 +1907,51 @@ impl App {
                                 );
                             }
                         }
-                    }
                 }
             }
-            CandidateKind::Overlay => {
+            TargetKind::Overlay => {
                 if let Selection::Overlay(i) = sel {
-                    if let Some(ov) = self.state.scene.overlays.get_mut(i) {
-                        let (layout, animated, t_in) = match ov {
+                    let scene = &mut self.state.scene;
+                    let ov_id = match scene.overlays.get(i) {
+                        Some(memstroy_core::Overlay::Text(o)) => o.id.clone(),
+                        Some(memstroy_core::Overlay::Image(o)) => o.id.clone(),
+                        Some(memstroy_core::Overlay::Video(o)) => o.id.clone(),
+                        None => return,
+                    };
+                    let canvas_idx = scene
+                        .canvas_layouts
+                        .iter()
+                        .position(|cl| cl.element_id == ov_id);
+                    let canvas_layout = canvas_idx
+                        .map(|idx| &mut scene.canvas_layouts[idx].keyframes);
+                    let ov = &mut scene.overlays[i];
+                    let (layout, animated, t_in, t_out) = match ov {
                             memstroy_core::Overlay::Text(o) => (
                                 &mut o.layout,
                                 &mut o.animated_params,
                                 o.t_in,
+                                o.t_out,
                             ),
                             memstroy_core::Overlay::Image(o) => (
                                 &mut o.layout,
                                 &mut o.animated_params,
                                 o.t_in,
+                                o.t_out,
                             ),
                             memstroy_core::Overlay::Video(o) => (
                                 &mut o.layout,
                                 &mut o.animated_params,
                                 o.t_in,
+                                o.t_out,
                             ),
                         };
+                        let clip_duration = (t_out - t_in).max(0.0);
                         let target = CurveEditorTarget::Overlay {
                             layout,
                             animated_params: animated,
                             t_in,
+                            clip_duration,
+                            canvas_layout,
                         };
                         curve_editor_panel(
                             ui,
@@ -1954,10 +2025,9 @@ impl App {
                                 );
                             }
                         }
-                    }
                 }
             }
-            CandidateKind::Audio => {
+            TargetKind::Audio => {
                 if let Selection::Audio(i) = sel {
                     if let Some(audio) = self.state.scene.audio.get_mut(i) {
                         // Audio has 3 keyframable scalar params:
@@ -2048,7 +2118,7 @@ impl App {
                     }
                 }
             }
-            CandidateKind::RenderFrame => {
+            TargetKind::RenderFrame => {
                 let rf = &mut self.state.scene.render_frame;
                 let target = CurveEditorTarget::RenderFrame {
                     layout: &mut rf.layout,
@@ -3336,7 +3406,9 @@ impl App {
                         self.state.scene_tabs[self.state.active_tab].name = name;
                         self.state.scene_tabs[self.state.active_tab].path =
                             Some(path.clone());
+                        self.state.sync_scene_to_tab();
                     }
+                    self.state.mark_active_tab_saved();
                 }
                 Err(e) => self.state.status = format!("{} {e}", crate::i18n::t("\u{274C} Save failed:")),
             }
@@ -3999,6 +4071,14 @@ impl eframe::App for App {
         }
 
         self.pump_events(ctx);
+
+        if ctx.input(|i| i.viewport().close_requested()) && !self.force_app_close {
+            if self.pending_scene_exit.is_none() && self.state.active_tab_is_dirty() {
+                self.pending_scene_exit = Some(SceneExitAction::Quit);
+                ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+            }
+        }
+
         self.flush_deferred_clip_placements();
         self.flush_pending_library_reload();
         self.maybe_request_library_reload_repaint(ctx);
@@ -4662,6 +4742,7 @@ impl eframe::App for App {
 
         // Auto-save tick + recovery modal
         self.tick_autosave();
+        self.show_unsaved_changes_dialog(ctx);
         self.show_recovery_dialog(ctx);
 
         // Settings dialog (File > Settings...). Always called; the

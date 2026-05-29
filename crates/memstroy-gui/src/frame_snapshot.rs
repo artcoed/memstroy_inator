@@ -80,20 +80,15 @@ pub fn extract_frame_to_image_layer(state: &mut EditorState) -> Result<usize, St
 
     // ── Decide which layers to capture ───────────────────────────
     //
-    // 1. Multi-selection on the canvas wins (Ctrl+click / marquee).
-    // 2. Otherwise the primary selection (single element) is the
-    //    subset — handy for "copy this one layer as a flat image".
-    // 3. Otherwise the WHOLE frame is captured (background + every
-    //    active layer at the playhead).
-    let subset: Vec<Selection> = if !state.canvas_selection.is_empty() {
-        state.canvas_selection.clone()
-    } else {
-        match state.selection {
-            Selection::None | Selection::RenderFrame => Vec::new(),
-            other => vec![other],
-        }
-    };
-    let full_frame = subset.is_empty();
+    // 1. Multi-selection on the canvas wins (Ctrl+click / marquee),
+    //    merged with the primary timeline selection when it is a
+    //    paintable layer (so clip + image both export even if only
+    //    the image was added to canvas_selection).
+    // 2. Otherwise the primary selection alone.
+    // 3. Otherwise the WHOLE frame.
+    // Audio / camera / render-frame never paint pixels — skip them.
+    // Audio-only falls back to the linked actor or full frame.
+    let (subset, full_frame) = resolve_extract_subset(state);
 
     // ── Compose ──────────────────────────────────────────────────
     let summary = compose_frame(state, &subset, full_frame, t);
@@ -138,6 +133,51 @@ pub fn extract_frame_to_image_layer(state: &mut EditorState) -> Result<usize, St
     }
     state.status = status;
     Ok(idx)
+}
+
+/// Layers that produce visible pixels in [`compose_frame`].
+fn selection_is_paintable(sel: Selection) -> bool {
+    matches!(
+        sel,
+        Selection::Actor(_) | Selection::Overlay(_) | Selection::Background(_)
+    )
+}
+
+/// Build the extract subset and whether to capture the full frame.
+fn resolve_extract_subset(state: &EditorState) -> (Vec<Selection>, bool) {
+    let mut subset: Vec<Selection> = if !state.canvas_selection.is_empty() {
+        state
+            .canvas_selection
+            .iter()
+            .copied()
+            .filter(|s| selection_is_paintable(*s))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    if selection_is_paintable(state.selection) && !subset.contains(&state.selection) {
+        subset.push(state.selection);
+    }
+
+    if subset.is_empty() {
+        if let Selection::Audio(ai) = state.selection {
+            if let Some(parent_id) = state
+                .scene
+                .audio
+                .get(ai)
+                .and_then(|a| a.parent_actor.clone())
+            {
+                if let Some(actor_idx) = state.scene.actors.iter().position(|a| a.id == parent_id)
+                {
+                    return (vec![Selection::Actor(actor_idx)], false);
+                }
+            }
+        }
+        return (Vec::new(), true);
+    }
+
+    (subset, false)
 }
 
 // ─── COMPOSITOR ────────────────────────────────────────────────────
@@ -491,7 +531,11 @@ fn paint_image_overlay(
         return;
     }
     let sample_t = t - img_ov.t_in;
-    let mut ov_state = keyframe::sample(&img_ov.layout, sample_t).unwrap_or_default();
+    let mut ov_state = memstroy_core::sample_overlay_layout(
+        &img_ov.layout,
+        &img_ov.animated_params,
+        sample_t,
+    );
 
     // Animation modifiers (wobble / shake / pulse / spin) — additive
     // on top of the eased keyframe sample, exactly like the canvas.
@@ -636,7 +680,8 @@ fn paint_actor(
 
     // Sample the layout state and animation modifiers — same recipe
     // as canvas_preview's actor pass.
-    let mut actor_state = keyframe::sample(&actor.layout, t).unwrap_or_default();
+    let mut actor_state =
+        memstroy_core::sample_actor_layout(&actor.layout, &actor.animated_params, t);
     let mod_delta = keyframe::evaluate_modifiers(&actor.modifiers, t - t_in);
     actor_state.scale = (actor_state.scale + mod_delta.d_scale).max(0.001);
     actor_state.rotation_deg += mod_delta.d_rotation_deg;
@@ -687,6 +732,20 @@ fn paint_actor(
         y: world_pos.y + mod_delta.dy,
     };
     let (cx, cy) = world_to_output(world_pos_with_mod, rf_state, rw, rh);
+
+    if let Some(pid) = actor.parent_id.as_ref() {
+        let mut visited = vec![actor.id.clone()];
+        if let Some(pxf) =
+            memstroy_core::resolve_parent_transform(scene, pid, t, &mut visited)
+        {
+            memstroy_core::apply_parent_inheritance_actor(
+                &mut actor_state.rotation_deg,
+                &mut actor_state.scale,
+                &mut actor_state.scale_y,
+                &pxf,
+            );
+        }
+    }
 
     // Static + animated flips combined the same way the canvas does.
     let combined_x = if actor.flip_horizontal {
@@ -839,7 +898,11 @@ fn apply_snapshot_effect_layers(
             continue;
         }
         let sample_t = t - fx_ov.t_in;
-        let mut ov_state = keyframe::sample(&fx_ov.layout, sample_t).unwrap_or_default();
+        let mut ov_state = memstroy_core::sample_overlay_layout(
+            &fx_ov.layout,
+            &fx_ov.animated_params,
+            sample_t,
+        );
         let mod_delta = keyframe::evaluate_modifiers(&fx_ov.modifiers, sample_t);
         ov_state.scale = (ov_state.scale + mod_delta.d_scale).max(0.001);
         ov_state.rotation_deg += mod_delta.d_rotation_deg;
@@ -904,7 +967,7 @@ fn apply_snapshot_effect_layers(
 /// Sample the render-frame state with animation modifiers layered on
 /// top — direct port of `canvas_preview::sample_render_frame_eased`.
 fn sample_render_frame_eased(rf: &RenderFrame, t: f32) -> RenderFrameState {
-    let mut s = keyframe::sample(&rf.layout, t).unwrap_or_default();
+    let mut s = memstroy_core::sample_render_frame_layout(&rf.layout, &rf.animated_params, t);
     if rf.modifiers.is_empty() {
         return s;
     }
@@ -1167,10 +1230,17 @@ fn paint_text_overlay(
         return true;
     }
     let sample_t = t - txt.t_in;
-    let mut ov_state = keyframe::sample(&txt.layout, sample_t).unwrap_or_default();
+    let ov_ref = memstroy_core::Overlay::Text(txt.clone());
+    let mut ov_state = memstroy_core::overlay_visual_state(
+        &state.scene,
+        &ov_ref,
+        &txt.id,
+        txt.parent_id.as_ref(),
+        t,
+        sample_t,
+        &txt.modifiers,
+    );
     let mod_delta = keyframe::evaluate_modifiers(&txt.modifiers, sample_t);
-    ov_state.scale = (ov_state.scale + mod_delta.d_scale).max(0.001);
-    ov_state.rotation_deg += mod_delta.d_rotation_deg;
 
     // Route through the same rasteriser the MP4 export uses so the
     // snapshot matches the rendered video glyph-for-glyph.
@@ -1193,12 +1263,7 @@ fn paint_text_overlay(
         return true;
     }
 
-    let world_pos = crate::canvas_preview::get_element_world_pos(
-        state,
-        &txt.id,
-        &[],
-        t,
-    );
+    let world_pos = memstroy_core::element_world_pos(&state.scene, &txt.id, t);
     let world_pos = WorldPos {
         x: world_pos.x + mod_delta.dx,
         y: world_pos.y + mod_delta.dy,
@@ -1271,7 +1336,11 @@ fn paint_video_overlay(
         return true;
     }
     let sample_t = t - vid.t_in;
-    let mut ov_state = keyframe::sample(&vid.layout, sample_t).unwrap_or_default();
+    let mut ov_state = memstroy_core::sample_overlay_layout(
+        &vid.layout,
+        &vid.animated_params,
+        sample_t,
+    );
     let mod_delta = keyframe::evaluate_modifiers(&vid.modifiers, sample_t);
     ov_state.scale = (ov_state.scale + mod_delta.d_scale).max(0.001);
     ov_state.rotation_deg += mod_delta.d_rotation_deg;
