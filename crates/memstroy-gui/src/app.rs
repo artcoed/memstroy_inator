@@ -783,6 +783,7 @@ impl App {
         let t_out = t_in + duration.max(0.1);
         self.state.scene.actors[idx].t_out = Some(t_out);
         crate::panels::sync_audio_to_actor(&mut self.state, idx);
+        self.state.request_media_preview = true;
     }
 
     /// Coalesce rapid `reload_library` requests from background workers
@@ -3299,35 +3300,76 @@ impl App {
     /// Poll for frame extraction completion across all actors.
     fn poll_frame_extraction(&mut self) {
         for actor_idx in 0..self.frame_extract_results.len() {
-            if let Ok(mut slot) = self.frame_extract_results[actor_idx].lock() {
-                if let Some(outcome) = slot.take() {
-                    if let Some(fc) = self.state.frame_caches.get_mut(actor_idx) {
-                        match outcome {
-                            Ok((duration, frame_count, cache_dir)) => {
-                                fc.set_ready(duration, frame_count, cache_dir);
-                                self.state.status = format!(
-                                    "{} ({} {}): {} {} ({:.1}s)",
-                                    crate::i18n::t("\u{2705} Preview ready"),
-                                    crate::i18n::t("actor"),
-                                    actor_idx,
-                                    frame_count,
-                                    crate::i18n::t("frames"),
-                                    duration
-                                );
-                            }
-                            Err(()) => {
-                                fc.extracting = false;
-                                fc.ready = false;
-                                fc.failed = true;
-                                self.state.status = format!(
-                                    "{} {} {}",
-                                    crate::i18n::t("\u{274C} Preview frames failed:"),
-                                    crate::i18n::t("actor"),
-                                    actor_idx
-                                );
-                            }
-                        }
+            let outcome = if let Ok(mut slot) = self.frame_extract_results[actor_idx].lock() {
+                slot.take()
+            } else {
+                None
+            };
+            let Some(outcome) = outcome else {
+                continue;
+            };
+            if actor_idx >= self.state.scene.actors.len() {
+                continue;
+            }
+
+            match outcome {
+                Ok((duration, frame_count, cache_dir)) => {
+                    let actor_t_in = self.state.scene.actors[actor_idx]
+                        .t_in
+                        .unwrap_or(0.0);
+                    let local_for_anim =
+                        (self.state.playhead - actor_t_in).max(0.0);
+                    let path = self.state.scene.actors[actor_idx].source.clone();
+                    let cur_out = self.state.scene.actors[actor_idx].t_out;
+                    let ck = self.state.scene.actors[actor_idx].chroma_key.clone();
+                    let cc = self.state.scene.actors[actor_idx]
+                        .color_correction
+                        .sampled_at(local_for_anim);
+                    let effects: Vec<memstroy_core::Effect> = self.state.scene.actors
+                        [actor_idx]
+                        .effects
+                        .iter()
+                        .map(|e| e.sampled_at(local_for_anim))
+                        .collect();
+
+                    self.state
+                        .video_duration_cache
+                        .insert(path, duration);
+                    let want_out = actor_t_in + duration.max(0.1);
+                    if cur_out
+                        .map(|o| (o - want_out).abs() > 0.05)
+                        .unwrap_or(true)
+                    {
+                        self.state.scene.actors[actor_idx].t_out = Some(want_out);
+                        crate::panels::sync_audio_to_actor(&mut self.state, actor_idx);
                     }
+
+                    if let Some(fc) = self.state.frame_caches.get_mut(actor_idx) {
+                        fc.set_ready(duration, frame_count, cache_dir);
+                        fc.ensure_processed_preload(0.0, &ck, &cc, &effects);
+                    }
+                    self.state.status = format!(
+                        "{} ({} {}): {} {} ({:.1}s)",
+                        crate::i18n::t("\u{2705} Preview ready"),
+                        crate::i18n::t("actor"),
+                        actor_idx,
+                        frame_count,
+                        crate::i18n::t("frames"),
+                        duration
+                    );
+                }
+                Err(()) => {
+                    if let Some(fc) = self.state.frame_caches.get_mut(actor_idx) {
+                        fc.extracting = false;
+                        fc.ready = false;
+                        fc.failed = true;
+                    }
+                    self.state.status = format!(
+                        "{} {} {}",
+                        crate::i18n::t("\u{274C} Preview frames failed:"),
+                        crate::i18n::t("actor"),
+                        actor_idx
+                    );
                 }
             }
         }

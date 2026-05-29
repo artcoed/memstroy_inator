@@ -1391,11 +1391,19 @@ fn draw_single_actor(
     let tint = Color32::from_rgba_unmultiplied(base_tint.r(), base_tint.g(), base_tint.b(), (alpha * 255.0) as u8);
 
     let speed = actor.speed.max(0.0001);
-    let local_t = match display_mode {
+    let mut local_t = match display_mode {
         DisplayMode::Active => (t - t_in) * speed + actor.source_start,
         DisplayMode::BeforeStart => actor.source_start,
         DisplayMode::AfterEnd => actor.source_start + (t_out - t_in) * speed,
     };
+    if let Some(fc) = state.frame_caches.get(idx) {
+        if fc.is_ready() && fc.duration > 0.01 {
+            let source_end = actor.source_start + fc.duration;
+            if local_t > source_end {
+                local_t = source_end;
+            }
+        }
+    }
 
     let mut frame_shown = false;
     if let Some(fc) = state.frame_caches.get_mut(idx) {
@@ -1418,7 +1426,12 @@ fn draw_single_actor(
                 || any_fx_active;
 
             let texture = if has_effects {
-                fc.processed_frame_at_time(local_t, actor_ck, actor_cc, actor_fx, ui.ctx())
+                fc.ensure_processed_preload(local_t, actor_ck, actor_cc, actor_fx);
+                if fc.processed_frame_warm() {
+                    fc.processed_frame_at_time(local_t, actor_ck, actor_cc, actor_fx, ui.ctx())
+                } else {
+                    None
+                }
             } else {
                 fc.frame_at_time(local_t, ui.ctx())
             };
@@ -1466,8 +1479,28 @@ fn draw_single_actor(
             .get(idx)
             .map(|fc| (fc.extracting, fc.failed, fc.is_ready()))
             .unwrap_or((false, false, false));
-        let preview_pending =
-            !preview_failed && (extracting || !cache_ready);
+        let actor_ck = &state.scene.actors[idx].chroma_key;
+        let actor_t_in = state.scene.actors[idx].t_in.unwrap_or(0.0);
+        let local_for_anim = (state.playhead - actor_t_in).max(0.0);
+        let actor_cc_warm = state.scene.actors[idx]
+            .color_correction
+            .sampled_at(local_for_anim);
+        let any_fx_warm = state.scene.actors[idx]
+            .effects
+            .iter()
+            .map(|e| e.sampled_at(local_for_anim))
+            .any(|e| e.enabled && e.intensity > 0.001);
+        let needs_processed_warmup = cache_ready
+            && (actor_ck.similarity > 0.01
+                || !actor_cc_warm.is_identity()
+                || any_fx_warm)
+            && state
+                .frame_caches
+                .get(idx)
+                .map(|fc| !fc.processed_frame_warm())
+                .unwrap_or(false);
+        let preview_pending = !preview_failed
+            && (extracting || !cache_ready || needs_processed_warmup);
 
         // While ffmpeg extracts preview frames, show the library
         // thumbnail so the user sees the clip land on canvas; once
