@@ -185,24 +185,55 @@ impl FrameCache {
         self.extracting = false;
         self.failed = false;
 
-        // Detect source dimensions from the first extracted frame
-        let first_frame_path = self.cache_dir.join("000001.jpg");
-        if let Ok(img) = image::open(&first_frame_path) {
-            self.source_width = img.width();
-            self.source_height = img.height();
-        }
-
-        // Initialize ring buffer
-        self.buffer = vec![None; self.buffer_size];
+        // Initialize ring buffers. Decode only frame 0 on the UI thread —
+        // loading all 90 slots here was freezing the app for 1–2s when
+        // extraction finished and the canvas switched thumbnail → video.
         self.buffer_start = 0;
-
-        // Initialize processed ring buffer (empty until background thread fills it)
+        self.buffer = vec![None; self.buffer_size];
         self.processed_buffer = vec![None; self.buffer_size];
         self.processed_buffer_start = 0;
         self.processed_params_hash = 0;
 
-        // Synchronously pre-load initial frames
-        self.load_buffer_range(0);
+        if self.frame_count > 0 {
+            if let Some(first) = self.load_frame_from_disk(0) {
+                self.source_width = first.size[0] as u32;
+                self.source_height = first.size[1] as u32;
+                self.buffer[0] = Some(first);
+            }
+        }
+        self.trigger_preload(0);
+    }
+
+    /// Whether the background chroma/effects pipeline has produced at least
+    /// one frame. While false, callers should keep showing the library
+    /// thumbnail instead of blocking on a synchronous chroma pass.
+    pub fn processed_frame_warm(&self) -> bool {
+        self.processed_buffer.iter().any(|slot| slot.is_some())
+    }
+
+    /// Kick off (without waiting for) a processed preload window covering `t`.
+    pub fn ensure_processed_preload(
+        &mut self,
+        t: f32,
+        ck: &memstroy_core::ChromaKeyParams,
+        cc: &memstroy_core::ColorCorrection,
+        effects: &[memstroy_core::Effect],
+    ) {
+        if !self.ready || self.frame_count == 0 {
+            return;
+        }
+        self.poll_processed_preload();
+        let frame_index = ((t * self.fps).floor() as usize)
+            .clamp(0, self.frame_count.saturating_sub(1));
+        let params_hash = hash_effect_params(ck, cc, effects);
+        if self.processed_params_hash != params_hash {
+            self.processed_buffer.clear();
+            self.processed_buffer_start = 0;
+            self.processed_params_hash = params_hash;
+        }
+        if !self.processed_preloading {
+            self.trigger_processed_preload(frame_index, ck, cc, effects);
+        }
     }
 
     /// Whether the cache has extracted frames and is ready for use.
@@ -321,10 +352,74 @@ impl FrameCache {
         }
         self.last_displayed_frame = frame_index;
         let buffer_end = self.buffer_start + self.buffer_size;
-        let frames_remaining = buffer_end.saturating_sub(frame_index);
+        let frames_remaining = buffer_end.saturating_sub(frame_index + 1);
         if frames_remaining < self.buffer_size / 2 && !self.preloading {
             self.trigger_preload(frame_index);
         }
+    }
+
+    /// Preview downscale dimension — smaller when many caches are preloading.
+    fn preview_dim_for_preload() -> usize {
+        let active_caches = PRELOAD_SEMAPHORE.load(std::sync::atomic::Ordering::Relaxed);
+        if active_caches >= 4 {
+            180
+        } else if active_caches >= 2 {
+            240
+        } else {
+            360
+        }
+    }
+
+    /// Run chroma-key + colour-correction + effects on one decoded frame.
+    fn process_raw_frame(
+        raw: &ColorImage,
+        ck: &memstroy_core::ChromaKeyParams,
+        cc: &memstroy_core::ColorCorrection,
+        effects: &[memstroy_core::Effect],
+        preview_dim: usize,
+    ) -> ColorImage {
+        let scaled = downscale_for_preview(raw, preview_dim);
+
+        let chroma_active = ck.similarity.is_finite() && ck.similarity >= 1.0e-5;
+        let cc_active = (cc.brightness.abs() > 1e-4)
+            || (cc.contrast.abs() > 1e-4)
+            || (cc.saturation.abs() > 1e-4)
+            || (cc.temperature.abs() > 1e-4)
+            || cc.lift.iter().any(|v| v.abs() > 1e-4)
+            || cc.gamma.iter().any(|v| (v - 1.0).abs() > 1e-4)
+            || cc.gain.iter().any(|v| (v - 1.0).abs() > 1e-4)
+            || !cc.curves.is_identity();
+        let effects_active = effects.iter().any(|e| e.enabled && e.intensity > 0.001);
+
+        if !chroma_active && !cc_active && !effects_active {
+            scaled
+        } else {
+            let mut p = apply_effects_cpu(&scaled, ck, cc);
+            if effects_active {
+                p = apply_effect_stack_cpu(&p, effects);
+            }
+            p
+        }
+    }
+
+    /// Synchronously decode + process a single frame when the processed ring
+    /// buffer hasn't caught up yet. Keeps playback moving past the 90-frame
+    /// window instead of freezing on the last cached texture.
+    fn sync_process_frame(
+        &mut self,
+        frame_index: usize,
+        ck: &memstroy_core::ChromaKeyParams,
+        cc: &memstroy_core::ColorCorrection,
+        effects: &[memstroy_core::Effect],
+    ) -> Option<ColorImage> {
+        let raw = self.resolve_frame_image(frame_index)?;
+        Some(Self::process_raw_frame(
+            &raw,
+            ck,
+            cc,
+            effects,
+            Self::preview_dim_for_preload(),
+        ))
     }
 
     fn preload_covers_frame(&self, start: usize, len: usize, frame_index: usize) -> bool {
@@ -363,6 +458,9 @@ impl FrameCache {
         let params_hash = hash_effect_params(ck, cc, effects);
         let new_key = (frame_index, params_hash);
 
+        self.poll_processed_preload();
+        self.note_frame_displayed(frame_index);
+
         // ── Tier 1: single-frame texture cache (fastest) ──
         if let (Some(prev_key), Some(_)) = (self.fx_key, self.fx_texture.as_ref()) {
             if prev_key == new_key {
@@ -371,16 +469,11 @@ impl FrameCache {
         }
 
         // ── Tier 2: processed ring buffer (background worker) ──
-        // If params changed since the buffer was built, invalidate it.
         if self.processed_params_hash != params_hash {
             self.processed_buffer.clear();
             self.processed_buffer_start = 0;
             self.processed_params_hash = params_hash;
-            // processed_preloading may still hold stale params — the
-            // poll path checks params_hash and discards mismatches.
         }
-
-        self.poll_processed_preload();
 
         if self.is_in_processed_buffer(frame_index) {
             let buf_idx = frame_index - self.processed_buffer_start;
@@ -398,34 +491,44 @@ impl FrameCache {
                     }
                 }
                 self.fx_key = Some(new_key);
+
+                let proc_end = self.processed_buffer_start + self.processed_buffer.len();
+                let proc_remaining = proc_end.saturating_sub(frame_index + 1);
+                if proc_remaining < self.buffer_size / 2 {
+                    self.trigger_processed_preload(frame_index, ck, cc, effects);
+                }
+
                 return self.fx_texture.as_ref();
             }
         }
 
-        // Processed slot missing — keep the last keyed frame visible while the
-        // background worker catches up (same hold policy as raw frames).
-        if self.fx_texture.is_some() && self.fx_key.is_some() {
-            if !self.processed_preloading {
-                self.trigger_processed_preload(frame_index, ck, cc, effects);
-            }
-            return self.fx_texture.as_ref();
-        }
-
-        // ── Tier 3: raw fallback (no chroma-key CPU cost on UI thread) ──
-        // Kick off background processed preload FIRST (before we borrow self
-        // for frame_at_time, whose returned &TextureHandle extends the borrow).
+        // ── Tier 2b: sync process when the playhead outran the buffer ──
         if !self.processed_preloading {
             self.trigger_processed_preload(frame_index, ck, cc, effects);
         }
+        // Skip synchronous chroma on a cold processed buffer (typical right
+        // after extraction) — the canvas keeps the library thumbnail visible
+        // until the background worker delivers the first processed frame.
+        if self.processed_frame_warm() {
+            if let Some(processed) = self.sync_process_frame(frame_index, ck, cc, effects) {
+                let options = TextureOptions::LINEAR;
+                match self.fx_texture.as_mut() {
+                    Some(tex) => tex.set(processed, options),
+                    None => {
+                        let tex = ctx.load_texture(
+                            format!("frame_fx_{}", self.actor_index),
+                            processed,
+                            options,
+                        );
+                        self.fx_texture = Some(tex);
+                    }
+                }
+                self.fx_key = Some(new_key);
+                return self.fx_texture.as_ref();
+            }
+        }
 
-        // Return the unprocessed frame immediately so playback stays at 60fps.
-        // The background processed preload will fill the processed_buffer soon.
-        let raw_tex = self.frame_at_time(t, ctx)?;
-
-        // Return the raw texture handle. The caller (canvas_preview) uses it
-        // as-is; the user sees the un-keyed frame for 1-2 frames which is
-        // acceptable during motion and far better than a UI stall.
-        Some(raw_tex)
+        None
     }
 
     /// Load a single frame from disk as a ColorImage.
@@ -460,7 +563,18 @@ impl FrameCache {
     /// Trigger a background thread to pre-load frames starting at `start_frame`.
     fn trigger_preload(&mut self, start_frame: usize) {
         if self.preloading {
-            return;
+            // Playhead jumped ahead of the in-flight window — cancel the stale
+            // preload so we can start one centred on the current frame.
+            if self.last_displayed_frame != usize::MAX
+                && !self.is_in_buffer(self.last_displayed_frame)
+            {
+                self.preloading = false;
+                if let Ok(mut guard) = self.preload_slot.lock() {
+                    *guard = None;
+                }
+            } else {
+                return;
+            }
         }
         // Check the global preload semaphore — if too many caches are
         // already preloading, skip this request. The next frame's
@@ -565,12 +679,20 @@ impl FrameCache {
         effects: &[memstroy_core::Effect],
     ) {
         if self.processed_preloading {
-            return;
+            if self.last_displayed_frame != usize::MAX
+                && !self.is_in_processed_buffer(self.last_displayed_frame)
+            {
+                self.processed_preloading = false;
+                if let Ok(mut guard) = self.processed_preload_slot.lock() {
+                    *guard = None;
+                }
+            } else {
+                return;
+            }
         }
 
         let params_hash = hash_effect_params(ck, cc, effects);
-        let active_caches = PRELOAD_SEMAPHORE.load(std::sync::atomic::Ordering::Relaxed);
-        let preview_dim = if active_caches >= 4 { 180 } else if active_caches >= 2 { 240 } else { 360 };
+        let preview_dim = Self::preview_dim_for_preload();
 
         // Clone params for the closure.
         let ck = ck.clone();
@@ -607,33 +729,9 @@ impl FrameCache {
                         Err(_) => None,
                     };
 
-                    // Apply chroma-key + colour-correction + effects.
-                    let processed = if let Some(raw) = img {
-                        let scaled = downscale_for_preview(&raw, preview_dim);
-
-                        let chroma_active = ck.similarity.is_finite() && ck.similarity >= 1.0e-5;
-                        let cc_active = (cc.brightness.abs() > 1e-4)
-                            || (cc.contrast.abs() > 1e-4)
-                            || (cc.saturation.abs() > 1e-4)
-                            || (cc.temperature.abs() > 1e-4)
-                            || cc.lift.iter().any(|v| v.abs() > 1e-4)
-                            || cc.gamma.iter().any(|v| (v - 1.0).abs() > 1e-4)
-                            || cc.gain.iter().any(|v| (v - 1.0).abs() > 1e-4)
-                            || !cc.curves.is_identity();
-                        let effects_active = effects.iter().any(|e| e.enabled && e.intensity > 0.001);
-
-                        if !chroma_active && !cc_active && !effects_active {
-                            Some(scaled)
-                        } else {
-                            let mut p = apply_effects_cpu(&scaled, &ck, &cc);
-                            if effects_active {
-                                p = apply_effect_stack_cpu(&p, &effects);
-                            }
-                            Some(p)
-                        }
-                    } else {
-                        None
-                    };
+                    let processed = img.map(|raw| {
+                        FrameCache::process_raw_frame(&raw, &ck, &cc, &effects, preview_dim)
+                    });
 
                     frames.push(processed);
                 }
@@ -679,9 +777,11 @@ impl FrameCache {
                 if covers {
                     self.processed_buffer_start = result.start;
                     self.processed_buffer = result.frames;
+                } else if display != usize::MAX && !self.is_in_processed_buffer(display) {
+                    // Stale preload completed behind the playhead — discard it.
+                    // `processed_frame_at_time` sync-processes the current frame
+                    // and will re-trigger preload centred on the playhead.
                 }
-                // If stale, keep the previous processed buffer (if any) and let
-                // `processed_frame_at_time` re-trigger preload on the next call.
             }
             self.processed_preloading = false;
         }
