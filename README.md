@@ -1,5 +1,7 @@
 # Memstroy-inator
 
+ОСНОВНОЙ ТГК: https://t.me/memstroy_inator
+
 Десктоп-редактор для сборки коротких вертикальных мемов в стиле
 Mellstroy (Shorts / Reels / TikTok). Workspace и имена крейтов
 (`memstroy-core`, `memstroy-gui` и т. д.) сохранены как
