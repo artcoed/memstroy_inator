@@ -48,6 +48,29 @@ const MOVE_DRAG_BIAS: f32 = 1.0;
 
 const COL_BG_TRACK: Color32 = Color32::from_rgb(28, 26, 16);
 const COL_BG_TRACK_ALT: Color32 = Color32::from_rgb(32, 30, 20);
+
+/// Empty band below the bottom-most layer row — lets the vertical
+/// scrollbar park the last lane comfortably inside the viewport.
+const TIMELINE_BOTTOM_GUTTER: f32 = 280.0;
+/// Empty band past the scene end (converted to seconds via zoom) so
+/// horizontal pan has slack to the right of the last clip.
+const TIMELINE_RIGHT_GUTTER_PX: f32 = 220.0;
+
+#[inline]
+fn timeline_right_gutter_secs(pps: f32) -> f32 {
+    TIMELINE_RIGHT_GUTTER_PX / pps.max(1.0)
+}
+
+#[inline]
+fn timeline_scrollable_duration(scene_duration: f32, pps: f32) -> f32 {
+    scene_duration + timeline_right_gutter_secs(pps)
+}
+
+#[inline]
+fn timeline_max_h_scroll(scene_duration: f32, pps: f32, track_area_width: f32) -> f32 {
+    let visible_secs = track_area_width / pps.max(1.0);
+    (timeline_scrollable_duration(scene_duration, pps) - visible_secs).max(0.0)
+}
 const COL_RULER: Color32 = Color32::from_rgb(36, 34, 24);
 const COL_PLAYHEAD: Color32 = Color32::from_rgb(255, 60, 60);
 const COL_TEXT_DIM: Color32 = Color32::from_rgb(140, 140, 160);
@@ -1620,12 +1643,12 @@ fn multi_apply_pos_delta(state: &mut EditorState, dx: f32, dy: f32, playhead: f3
             Selection::Actor(ai) => {
                 if let Some(a) = state.scene.actors.get_mut(ai) {
                     if dx.abs() > 1.0e-7 {
-                        kf_anim::write_actor_param(&mut a.layout, &mut a.animated_params,
+                        crate::kf_anim::write_actor_param(&mut a.layout, &mut a.animated_params,
                             playhead, param_ids::POS_X, false,
                             |s| s.pos[0] += dx);
                     }
                     if dy.abs() > 1.0e-7 {
-                        kf_anim::write_actor_param(&mut a.layout, &mut a.animated_params,
+                        crate::kf_anim::write_actor_param(&mut a.layout, &mut a.animated_params,
                             playhead, param_ids::POS_Y, false,
                             |s| s.pos[1] += dy);
                     }
@@ -1635,12 +1658,12 @@ fn multi_apply_pos_delta(state: &mut EditorState, dx: f32, dy: f32, playhead: f3
                 if let Some(ov) = state.scene.overlays.get_mut(oi) {
                     let (layout, animated) = overlay_layout_and_params(ov);
                     if dx.abs() > 1.0e-7 {
-                        kf_anim::write_overlay_param(layout, animated,
+                        crate::kf_anim::write_overlay_param(layout, animated,
                             playhead, param_ids::POS_X, false,
                             |s| s.pos[0] += dx);
                     }
                     if dy.abs() > 1.0e-7 {
-                        kf_anim::write_overlay_param(layout, animated,
+                        crate::kf_anim::write_overlay_param(layout, animated,
                             playhead, param_ids::POS_Y, false,
                             |s| s.pos[1] += dy);
                     }
@@ -1660,7 +1683,7 @@ fn multi_apply_scale_factor(state: &mut EditorState, factor: f32, playhead: f32)
         match sel {
             Selection::Actor(ai) => {
                 if let Some(a) = state.scene.actors.get_mut(ai) {
-                    kf_anim::write_actor_param(&mut a.layout, &mut a.animated_params,
+                    crate::kf_anim::write_actor_param(&mut a.layout, &mut a.animated_params,
                         playhead, param_ids::SCALE, false,
                         |s| s.scale = (s.scale * factor).clamp(0.01, 50.0));
                 }
@@ -1668,7 +1691,7 @@ fn multi_apply_scale_factor(state: &mut EditorState, factor: f32, playhead: f32)
             Selection::Overlay(oi) => {
                 if let Some(ov) = state.scene.overlays.get_mut(oi) {
                     let (layout, animated) = overlay_layout_and_params(ov);
-                    kf_anim::write_overlay_param(layout, animated,
+                    crate::kf_anim::write_overlay_param(layout, animated,
                         playhead, param_ids::SCALE, false,
                         |s| s.scale = (s.scale * factor).clamp(0.01, 50.0));
                 }
@@ -1687,7 +1710,7 @@ fn multi_apply_rotation_delta(state: &mut EditorState, ddeg: f32, playhead: f32)
         match sel {
             Selection::Actor(ai) => {
                 if let Some(a) = state.scene.actors.get_mut(ai) {
-                    kf_anim::write_actor_param(&mut a.layout, &mut a.animated_params,
+                    crate::kf_anim::write_actor_param(&mut a.layout, &mut a.animated_params,
                         playhead, param_ids::ROTATION, false,
                         |s| s.rotation_deg += ddeg);
                 }
@@ -1695,7 +1718,7 @@ fn multi_apply_rotation_delta(state: &mut EditorState, ddeg: f32, playhead: f32)
             Selection::Overlay(oi) => {
                 if let Some(ov) = state.scene.overlays.get_mut(oi) {
                     let (layout, animated) = overlay_layout_and_params(ov);
-                    kf_anim::write_overlay_param(layout, animated,
+                    crate::kf_anim::write_overlay_param(layout, animated,
                         playhead, param_ids::ROTATION, false,
                         |s| s.rotation_deg += ddeg);
                 }
@@ -1714,7 +1737,7 @@ fn multi_apply_opacity_delta(state: &mut EditorState, dop: f32, playhead: f32) {
         match sel {
             Selection::Actor(ai) => {
                 if let Some(a) = state.scene.actors.get_mut(ai) {
-                    kf_anim::write_actor_param(&mut a.layout, &mut a.animated_params,
+                    crate::kf_anim::write_actor_param(&mut a.layout, &mut a.animated_params,
                         playhead, param_ids::OPACITY, false,
                         |s| s.opacity = (s.opacity + dop).clamp(0.0, 1.0));
                 }
@@ -1722,7 +1745,7 @@ fn multi_apply_opacity_delta(state: &mut EditorState, dop: f32, playhead: f32) {
             Selection::Overlay(oi) => {
                 if let Some(ov) = state.scene.overlays.get_mut(oi) {
                     let (layout, animated) = overlay_layout_and_params(ov);
-                    kf_anim::write_overlay_param(layout, animated,
+                    crate::kf_anim::write_overlay_param(layout, animated,
                         playhead, param_ids::OPACITY, false,
                         |s| s.opacity = (s.opacity + dop).clamp(0.0, 1.0));
                 }
@@ -1741,7 +1764,7 @@ fn multi_toggle_flip_x(state: &mut EditorState, playhead: f32) {
         match sel {
             Selection::Actor(ai) => {
                 if let Some(a) = state.scene.actors.get_mut(ai) {
-                    kf_anim::write_actor_param(&mut a.layout, &mut a.animated_params,
+                    crate::kf_anim::write_actor_param(&mut a.layout, &mut a.animated_params,
                         playhead, param_ids::FLIP_X, false,
                         |s| s.flip_x_anim = -s.flip_x_anim);
                 }
@@ -1749,7 +1772,7 @@ fn multi_toggle_flip_x(state: &mut EditorState, playhead: f32) {
             Selection::Overlay(oi) => {
                 if let Some(ov) = state.scene.overlays.get_mut(oi) {
                     let (layout, animated) = overlay_layout_and_params(ov);
-                    kf_anim::write_overlay_param(layout, animated,
+                    crate::kf_anim::write_overlay_param(layout, animated,
                         playhead, param_ids::FLIP_X, false,
                         |s| s.flip_x_anim = -s.flip_x_anim);
                 }
@@ -1768,7 +1791,7 @@ fn multi_toggle_flip_y(state: &mut EditorState, playhead: f32) {
         match sel {
             Selection::Actor(ai) => {
                 if let Some(a) = state.scene.actors.get_mut(ai) {
-                    kf_anim::write_actor_param(&mut a.layout, &mut a.animated_params,
+                    crate::kf_anim::write_actor_param(&mut a.layout, &mut a.animated_params,
                         playhead, param_ids::FLIP_Y, false,
                         |s| s.flip_y_anim = -s.flip_y_anim);
                 }
@@ -1776,7 +1799,7 @@ fn multi_toggle_flip_y(state: &mut EditorState, playhead: f32) {
             Selection::Overlay(oi) => {
                 if let Some(ov) = state.scene.overlays.get_mut(oi) {
                     let (layout, animated) = overlay_layout_and_params(ov);
-                    kf_anim::write_overlay_param(layout, animated,
+                    crate::kf_anim::write_overlay_param(layout, animated,
                         playhead, param_ids::FLIP_Y, false,
                         |s| s.flip_y_anim = -s.flip_y_anim);
                 }
@@ -1875,7 +1898,7 @@ fn inspector_actor_skeleton(ui: &mut egui::Ui, state: &mut EditorState, i: usize
 // level once the body is empty.
 //
 // Rationale: parameter-less keyframe authoring during canvas drags
-// has been fixed at the source (see `kf_anim::write_render_frame_param`
+// has been fixed at the source (see `crate::kf_anim::write_render_frame_param`
 // gating in `canvas_preview.rs`), and the user explicitly asked for
 // keyframes to *not* appear in the inspector — only in the per-param
 // rows under each element on the timeline, where multi-select,
@@ -1982,7 +2005,7 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
     // Sample the eased current value at the playhead — this is read-only
     // and never mutates `layout`. The widget below is bound to a temp
     // copy, and only `.changed()` triggers a write through `kf_anim`.
-    let cur = kf_anim::sample_actor(&a.layout, playhead);
+    let cur = crate::kf_anim::sample_actor(&a.layout, &a.animated_params, playhead);
 
     let kf_count = a.layout.len();
     if kf_count <= 1 {
@@ -2010,20 +2033,20 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
     let mut new_x = cur.pos[0];
     let mut new_y = cur.pos[1];
     ui.horizontal(|ui| {
-        kf_anim::animated_toggle(ui, &mut a.animated_params, param_ids::POS_X, ("act_pos_x", i));
+        crate::kf_anim::animated_toggle(ui, &mut a.animated_params, param_ids::POS_X, ("act_pos_x", i));
         ui.label(param_label(highlight.is_active(param_ids::POS_X), t("X:")));
         let r = ui.add(egui::DragValue::new(&mut new_x).range(-2.0..=3.0).speed(0.005));
         if r.changed() {
-            kf_anim::write_actor_param(
+            crate::kf_anim::write_actor_param(
                 &mut a.layout, &mut a.animated_params, playhead,
                 param_ids::POS_X, false,
                 |s| s.pos[0] = new_x);
         }
-        kf_anim::animated_toggle(ui, &mut a.animated_params, param_ids::POS_Y, ("act_pos_y", i));
+        crate::kf_anim::animated_toggle(ui, &mut a.animated_params, param_ids::POS_Y, ("act_pos_y", i));
         ui.label(param_label(highlight.is_active(param_ids::POS_Y), t("Y:")));
         let r = ui.add(egui::DragValue::new(&mut new_y).range(-2.0..=3.0).speed(0.005));
         if r.changed() {
-            kf_anim::write_actor_param(
+            crate::kf_anim::write_actor_param(
                 &mut a.layout, &mut a.animated_params, playhead,
                 param_ids::POS_Y, false,
                 |s| s.pos[1] = new_y);
@@ -2050,17 +2073,17 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
     let mut linked: bool = ui.data(|d| d.get_temp(lock_id).unwrap_or(true));
 
     ui.horizontal(|ui| {
-        kf_anim::animated_toggle(ui, &mut a.animated_params, param_ids::SCALE, ("act_scale", i));
+        crate::kf_anim::animated_toggle(ui, &mut a.animated_params, param_ids::SCALE, ("act_scale", i));
         ui.label(param_label(highlight.is_active(param_ids::SCALE), "Scale X:"));
         let r = ui.add(egui::Slider::new(&mut new_scale, 0.05..=5.0).logarithmic(true));
         if r.changed() {
-            kf_anim::write_actor_param(
+            crate::kf_anim::write_actor_param(
                 &mut a.layout, &mut a.animated_params, playhead,
                 param_ids::SCALE, false,
                 |s| s.scale = new_scale);
             if linked {
                 new_scale_y = 1.0;
-                kf_anim::write_actor_param(
+                crate::kf_anim::write_actor_param(
                     &mut a.layout, &mut a.animated_params, playhead,
                     param_ids::SCALE_Y, false,
                     |s| s.scale_y = 1.0);
@@ -2079,7 +2102,7 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
             ui.data_mut(|d| d.insert_temp(lock_id, linked));
             if linked {
                 new_scale_y = 1.0;
-                kf_anim::write_actor_param(
+                crate::kf_anim::write_actor_param(
                     &mut a.layout, &mut a.animated_params, playhead,
                     param_ids::SCALE_Y, false,
                     |s| s.scale_y = 1.0);
@@ -2090,7 +2113,7 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
     });
 
     ui.horizontal(|ui| {
-        kf_anim::animated_toggle(ui, &mut a.animated_params, param_ids::SCALE_Y, ("act_sy", i));
+        crate::kf_anim::animated_toggle(ui, &mut a.animated_params, param_ids::SCALE_Y, ("act_sy", i));
         ui.label(param_label(highlight.is_active(param_ids::SCALE_Y), "Scale Y:"))
             .on_hover_text(crate::i18n::t("Independent Y-axis scale. Linked to Scale X by default."));
         if linked {
@@ -2111,11 +2134,11 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
             let mut linked_scale = cur.scale;
             let r = ui.add(egui::Slider::new(&mut linked_scale, 0.05..=5.0).logarithmic(true));
             if r.changed() && linked_scale.is_finite() && linked_scale > 0.0 {
-                kf_anim::write_actor_param(
+                crate::kf_anim::write_actor_param(
                     &mut a.layout, &mut a.animated_params, playhead,
                     param_ids::SCALE, false,
                     |s| s.scale = linked_scale);
-                kf_anim::write_actor_param(
+                crate::kf_anim::write_actor_param(
                     &mut a.layout, &mut a.animated_params, playhead,
                     param_ids::SCALE_Y, false,
                     |s| s.scale_y = 1.0);
@@ -2123,7 +2146,7 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
         } else {
             let r = ui.add(egui::Slider::new(&mut new_scale_y, 0.1..=5.0).logarithmic(true));
             if r.changed() {
-                kf_anim::write_actor_param(
+                crate::kf_anim::write_actor_param(
                     &mut a.layout, &mut a.animated_params, playhead,
                     param_ids::SCALE_Y, false,
                     |s| s.scale_y = new_scale_y);
@@ -2145,7 +2168,7 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
     let mut new_rot = cur.rotation_deg;
     ui.add_space(4.0);
     ui.horizontal(|ui| {
-        kf_anim::animated_toggle(ui, &mut a.animated_params, param_ids::ROTATION, ("act_rot", i));
+        crate::kf_anim::animated_toggle(ui, &mut a.animated_params, param_ids::ROTATION, ("act_rot", i));
         ui.label(param_label(highlight.is_active(param_ids::ROTATION), "Rotation"));
         let prev_rot = new_rot;
         circular_rotation_widget(ui, ("actor_rot", i), &mut new_rot, 90.0);
@@ -2165,7 +2188,7 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
             }
         });
         if dial_changed {
-            kf_anim::write_actor_param(
+            crate::kf_anim::write_actor_param(
                 &mut a.layout, &mut a.animated_params, playhead,
                 param_ids::ROTATION, false,
                 |s| s.rotation_deg = new_rot);
@@ -2181,11 +2204,11 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
     let mut new_op = cur.opacity;
     ui.add_space(4.0);
     ui.horizontal(|ui| {
-        kf_anim::animated_toggle(ui, &mut a.animated_params, param_ids::OPACITY, ("act_op", i));
+        crate::kf_anim::animated_toggle(ui, &mut a.animated_params, param_ids::OPACITY, ("act_op", i));
         ui.label(param_label(highlight.is_active(param_ids::OPACITY), "Opacity:"));
         let r = ui.add(egui::Slider::new(&mut new_op, 0.0..=1.0));
         if r.changed() {
-            kf_anim::write_actor_param(
+            crate::kf_anim::write_actor_param(
                 &mut a.layout, &mut a.animated_params, playhead,
                 param_ids::OPACITY, false,
                 |s| s.opacity = new_op);
@@ -2202,11 +2225,11 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
     let mut new_fy = cur.flip_y_anim;
     ui.add_space(4.0);
     ui.horizontal(|ui| {
-        kf_anim::animated_toggle(ui, &mut a.animated_params, param_ids::FLIP_X, ("act_fx", i));
+        crate::kf_anim::animated_toggle(ui, &mut a.animated_params, param_ids::FLIP_X, ("act_fx", i));
         ui.label(param_label(highlight.is_active(param_ids::FLIP_X), "Flip X:"));
         let r = ui.add(egui::Slider::new(&mut new_fx, -1.0..=1.0));
         if r.changed() {
-            kf_anim::write_actor_param(
+            crate::kf_anim::write_actor_param(
                 &mut a.layout, &mut a.animated_params, playhead,
                 param_ids::FLIP_X, false,
                 |s| s.flip_x_anim = new_fx);
@@ -2219,11 +2242,11 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
         |s| s.flip_x_anim, ("act_strip_flip_x", i),
     );
     ui.horizontal(|ui| {
-        kf_anim::animated_toggle(ui, &mut a.animated_params, param_ids::FLIP_Y, ("act_fy", i));
+        crate::kf_anim::animated_toggle(ui, &mut a.animated_params, param_ids::FLIP_Y, ("act_fy", i));
         ui.label(param_label(highlight.is_active(param_ids::FLIP_Y), "Flip Y:"));
         let r = ui.add(egui::Slider::new(&mut new_fy, -1.0..=1.0));
         if r.changed() {
-            kf_anim::write_actor_param(
+            crate::kf_anim::write_actor_param(
                 &mut a.layout, &mut a.animated_params, playhead,
                 param_ids::FLIP_Y, false,
                 |s| s.flip_y_anim = new_fy);
@@ -2242,11 +2265,15 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
     ui.add_space(8.0);
     inspector_modifiers(ui, &mut a.modifiers, ("actor_mods", i));
 
-    kf_anim::seed_actor_params_on_toggle(
+    let clip_start = a.t_in.unwrap_or(0.0);
+    let clip_end = a.t_out.unwrap_or(state.scene.output.duration);
+    crate::kf_anim::reconcile_actor_animated_params(
         &mut a.layout,
-        &mut a.animated_params,
+        &a.animated_params,
         &animated_before,
         playhead,
+        clip_start,
+        clip_end,
     );
 }
 
@@ -4571,8 +4598,10 @@ fn inspector_overlay(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
             // Trying to maintain two sources of truth (drag handles +
             // numeric fields) was the source of multiple "image keeps
             // jumping back to old t_in" bugs.
+            let clip_dur = (im.t_out - im.t_in).max(0.0);
+            let local_t = (playhead - im.t_in).clamp(0.0, clip_dur);
             inspector_overlay_state_widgets(
-                ui, &mut im.layout, &mut im.animated_params, playhead, i, "img",
+                ui, &mut im.layout, &mut im.animated_params, local_t, clip_dur, i, "img",
                 state.kf_highlight.clone());
             ui.add_space(8.0);
             inspector_modifiers(ui, &mut im.modifiers, ("img_mods", i));
@@ -4731,8 +4760,10 @@ fn inspector_overlay(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
                 .color(COL_TEXT_DIM),
             );
 
+            let clip_dur = (v.t_out - v.t_in).max(0.0);
+            let local_t = (playhead - v.t_in).clamp(0.0, clip_dur);
             inspector_overlay_state_widgets(
-                ui, &mut v.layout, &mut v.animated_params, playhead, i, "vid",
+                ui, &mut v.layout, &mut v.animated_params, local_t, clip_dur, i, "vid",
                 state.kf_highlight.clone());
             ui.add_space(8.0);
             inspector_modifiers(ui, &mut v.modifiers, ("vid_mods", i));
@@ -5400,7 +5431,7 @@ fn image_preset_button(
 
 /// Shared "transform" widget block for the three overlay flavours
 /// (Image / Video / Text). Reads sampled values from `layout` and only
-/// writes through `kf_anim::write_overlay_param` when the user actually
+/// writes through `crate::kf_anim::write_overlay_param` when the user actually
 /// edits a control — this is the per-overlay equivalent of the actor's
 /// new inspector flow and the fix for the "infinite keyframes during
 /// playback / timeline scrub" bug.
@@ -5408,7 +5439,8 @@ fn inspector_overlay_state_widgets(
     ui: &mut egui::Ui,
     layout: &mut Vec<Keyframe<OverlayState>>,
     animated_params: &mut std::collections::BTreeSet<String>,
-    playhead: f32,
+    local_playhead: f32,
+    clip_duration: f32,
     salt_idx: usize,
     salt_kind: &'static str,
     highlight: crate::kf_anim::KfHighlight,
@@ -5417,35 +5449,35 @@ fn inspector_overlay_state_widgets(
     use memstroy_core::param_ids;
 
     let animated_before = animated_params.clone();
-    let cur = kf_anim::sample_overlay(layout, playhead);
+    let cur = crate::kf_anim::sample_overlay(layout, animated_params, local_playhead);
 
     let mut new_x = cur.pos[0];
     let mut new_y = cur.pos[1];
     ui.add_space(4.0);
     ui.horizontal(|ui| {
-        kf_anim::animated_toggle(ui, animated_params, param_ids::POS_X, (salt_kind, "px", salt_idx));
+        crate::kf_anim::animated_toggle(ui, animated_params, param_ids::POS_X, (salt_kind, "px", salt_idx));
         ui.label(param_label(highlight.is_active(param_ids::POS_X), "X:"));
         let r = ui.add(egui::DragValue::new(&mut new_x).speed(0.005));
         if r.changed() {
-            kf_anim::write_overlay_param(layout, animated_params, playhead,
+            crate::kf_anim::write_overlay_param(layout, animated_params, local_playhead,
                 param_ids::POS_X, false, |s| s.pos[0] = new_x);
         }
-        kf_anim::animated_toggle(ui, animated_params, param_ids::POS_Y, (salt_kind, "py", salt_idx));
+        crate::kf_anim::animated_toggle(ui, animated_params, param_ids::POS_Y, (salt_kind, "py", salt_idx));
         ui.label(param_label(highlight.is_active(param_ids::POS_Y), "Y:"));
         let r = ui.add(egui::DragValue::new(&mut new_y).speed(0.005));
         if r.changed() {
-            kf_anim::write_overlay_param(layout, animated_params, playhead,
+            crate::kf_anim::write_overlay_param(layout, animated_params, local_playhead,
                 param_ids::POS_Y, false, |s| s.pos[1] = new_y);
         }
     });
     let pos_x_anim = animated_params.contains(param_ids::POS_X);
     let pos_y_anim = animated_params.contains(param_ids::POS_Y);
     inspector_overlay_param_strip(
-        ui, layout, pos_x_anim, playhead,
+        ui, layout, pos_x_anim, local_playhead,
         |s| s.pos[0], (salt_kind, "strip_px", salt_idx),
     );
     inspector_overlay_param_strip(
-        ui, layout, pos_y_anim, playhead,
+        ui, layout, pos_y_anim, local_playhead,
         |s| s.pos[1], (salt_kind, "strip_py", salt_idx),
     );
 
@@ -5460,11 +5492,11 @@ fn inspector_overlay_state_widgets(
     let mut linked: bool = ui.data(|d| d.get_temp(lock_id).unwrap_or(true));
 
     ui.horizontal(|ui| {
-        kf_anim::animated_toggle(ui, animated_params, param_ids::SCALE, (salt_kind, "sc", salt_idx));
+        crate::kf_anim::animated_toggle(ui, animated_params, param_ids::SCALE, (salt_kind, "sc", salt_idx));
         ui.label(param_label(highlight.is_active(param_ids::SCALE), "Scale X:"));
         let r = ui.add(egui::Slider::new(&mut new_scale, 0.05..=5.0).logarithmic(true));
         if r.changed() {
-            kf_anim::write_overlay_param(layout, animated_params, playhead,
+            crate::kf_anim::write_overlay_param(layout, animated_params, local_playhead,
                 param_ids::SCALE, false, |s| s.scale = new_scale);
             if linked {
                 // Mirror the X edit onto Y. Note: scale_y is a Y-stretch
@@ -5473,7 +5505,7 @@ fn inspector_overlay_state_widgets(
                 // simply hold scale_y at 1.0 (uniform) — that's the
                 // intent of "synced X and Y scale".
                 new_sy = 1.0;
-                kf_anim::write_overlay_param(layout, animated_params, playhead,
+                crate::kf_anim::write_overlay_param(layout, animated_params, local_playhead,
                     param_ids::SCALE_Y, false, |s| s.scale_y = 1.0);
             }
         }
@@ -5492,7 +5524,7 @@ fn inspector_overlay_state_widgets(
             if linked {
                 // Re-syncing forces Y to follow X (uniform).
                 new_sy = 1.0;
-                kf_anim::write_overlay_param(layout, animated_params, playhead,
+                crate::kf_anim::write_overlay_param(layout, animated_params, local_playhead,
                     param_ids::SCALE_Y, false, |s| s.scale_y = 1.0);
             }
         } else {
@@ -5501,7 +5533,7 @@ fn inspector_overlay_state_widgets(
     });
 
     ui.horizontal(|ui| {
-        kf_anim::animated_toggle(ui, animated_params, param_ids::SCALE_Y, (salt_kind, "sy", salt_idx));
+        crate::kf_anim::animated_toggle(ui, animated_params, param_ids::SCALE_Y, (salt_kind, "sy", salt_idx));
         ui.label(param_label(highlight.is_active(param_ids::SCALE_Y), "Scale Y:"));
         if linked {
             // Linked mode: the Y slider edits the *uniform* scale.
@@ -5510,15 +5542,15 @@ fn inspector_overlay_state_widgets(
             let mut linked_scale = cur.scale;
             let r = ui.add(egui::Slider::new(&mut linked_scale, 0.05..=5.0).logarithmic(true));
             if r.changed() && linked_scale.is_finite() && linked_scale > 0.0 {
-                kf_anim::write_overlay_param(layout, animated_params, playhead,
+                crate::kf_anim::write_overlay_param(layout, animated_params, local_playhead,
                     param_ids::SCALE, false, |s| s.scale = linked_scale);
-                kf_anim::write_overlay_param(layout, animated_params, playhead,
+                crate::kf_anim::write_overlay_param(layout, animated_params, local_playhead,
                     param_ids::SCALE_Y, false, |s| s.scale_y = 1.0);
             }
         } else {
             let r = ui.add(egui::Slider::new(&mut new_sy, 0.1..=5.0).logarithmic(true));
             if r.changed() {
-                kf_anim::write_overlay_param(layout, animated_params, playhead,
+                crate::kf_anim::write_overlay_param(layout, animated_params, local_playhead,
                     param_ids::SCALE_Y, false, |s| s.scale_y = new_sy);
             }
         }
@@ -5526,17 +5558,17 @@ fn inspector_overlay_state_widgets(
     let scale_anim = animated_params.contains(param_ids::SCALE);
     let scale_y_anim = animated_params.contains(param_ids::SCALE_Y);
     inspector_overlay_param_strip(
-        ui, layout, scale_anim, playhead,
+        ui, layout, scale_anim, local_playhead,
         |s| s.scale, (salt_kind, "strip_sc", salt_idx),
     );
     inspector_overlay_param_strip(
-        ui, layout, scale_y_anim, playhead,
+        ui, layout, scale_y_anim, local_playhead,
         |s| s.scale_y, (salt_kind, "strip_sy", salt_idx),
     );
 
     let mut new_rot = cur.rotation_deg;
     ui.horizontal(|ui| {
-        kf_anim::animated_toggle(ui, animated_params, param_ids::ROTATION, (salt_kind, "rot", salt_idx));
+        crate::kf_anim::animated_toggle(ui, animated_params, param_ids::ROTATION, (salt_kind, "rot", salt_idx));
         ui.label(param_label(highlight.is_active(param_ids::ROTATION), "Rotation"));
         let prev_rot = new_rot;
         circular_rotation_widget(ui, (salt_kind, "rot_w", salt_idx), &mut new_rot, 80.0);
@@ -5545,68 +5577,69 @@ fn inspector_overlay_state_widgets(
             .range(-3600.0..=3600.0).speed(0.5).suffix("\u{00B0}").fixed_decimals(1));
         if r.changed() { dial_changed = true; }
         if dial_changed {
-            kf_anim::write_overlay_param(layout, animated_params, playhead,
+            crate::kf_anim::write_overlay_param(layout, animated_params, local_playhead,
                 param_ids::ROTATION, false, |s| s.rotation_deg = new_rot);
         }
     });
     let rot_anim = animated_params.contains(param_ids::ROTATION);
     inspector_overlay_param_strip(
-        ui, layout, rot_anim, playhead,
+        ui, layout, rot_anim, local_playhead,
         |s| s.rotation_deg, (salt_kind, "strip_rot", salt_idx),
     );
 
     let mut new_op = cur.opacity;
     ui.horizontal(|ui| {
-        kf_anim::animated_toggle(ui, animated_params, param_ids::OPACITY, (salt_kind, "op", salt_idx));
+        crate::kf_anim::animated_toggle(ui, animated_params, param_ids::OPACITY, (salt_kind, "op", salt_idx));
         ui.label(param_label(highlight.is_active(param_ids::OPACITY), "Opacity:"));
         let r = ui.add(egui::Slider::new(&mut new_op, 0.0..=1.0));
         if r.changed() {
-            kf_anim::write_overlay_param(layout, animated_params, playhead,
+            crate::kf_anim::write_overlay_param(layout, animated_params, local_playhead,
                 param_ids::OPACITY, false, |s| s.opacity = new_op);
         }
     });
     let op_anim = animated_params.contains(param_ids::OPACITY);
     inspector_overlay_param_strip(
-        ui, layout, op_anim, playhead,
+        ui, layout, op_anim, local_playhead,
         |s| s.opacity, (salt_kind, "strip_op", salt_idx),
     );
 
     let mut new_fx = cur.flip_x_anim;
     let mut new_fy = cur.flip_y_anim;
     ui.horizontal(|ui| {
-        kf_anim::animated_toggle(ui, animated_params, param_ids::FLIP_X, (salt_kind, "fx", salt_idx));
+        crate::kf_anim::animated_toggle(ui, animated_params, param_ids::FLIP_X, (salt_kind, "fx", salt_idx));
         ui.label(param_label(highlight.is_active(param_ids::FLIP_X), "Flip X:"));
         let r = ui.add(egui::Slider::new(&mut new_fx, -1.0..=1.0));
         if r.changed() {
-            kf_anim::write_overlay_param(layout, animated_params, playhead,
+            crate::kf_anim::write_overlay_param(layout, animated_params, local_playhead,
                 param_ids::FLIP_X, false, |s| s.flip_x_anim = new_fx);
         }
     });
     let flip_x_anim = animated_params.contains(param_ids::FLIP_X);
     inspector_overlay_param_strip(
-        ui, layout, flip_x_anim, playhead,
+        ui, layout, flip_x_anim, local_playhead,
         |s| s.flip_x_anim, (salt_kind, "strip_fx", salt_idx),
     );
     ui.horizontal(|ui| {
-        kf_anim::animated_toggle(ui, animated_params, param_ids::FLIP_Y, (salt_kind, "fy", salt_idx));
+        crate::kf_anim::animated_toggle(ui, animated_params, param_ids::FLIP_Y, (salt_kind, "fy", salt_idx));
         ui.label(param_label(highlight.is_active(param_ids::FLIP_Y), "Flip Y:"));
         let r = ui.add(egui::Slider::new(&mut new_fy, -1.0..=1.0));
         if r.changed() {
-            kf_anim::write_overlay_param(layout, animated_params, playhead,
+            crate::kf_anim::write_overlay_param(layout, animated_params, local_playhead,
                 param_ids::FLIP_Y, false, |s| s.flip_y_anim = new_fy);
         }
     });
     let flip_y_anim = animated_params.contains(param_ids::FLIP_Y);
     inspector_overlay_param_strip(
-        ui, layout, flip_y_anim, playhead,
+        ui, layout, flip_y_anim, local_playhead,
         |s| s.flip_y_anim, (salt_kind, "strip_fy", salt_idx),
     );
 
-    kf_anim::seed_overlay_params_on_toggle(
+    crate::kf_anim::reconcile_overlay_animated_params(
         layout,
         animated_params,
         &animated_before,
-        playhead,
+        local_playhead,
+        clip_duration,
     );
 }
 
@@ -5658,11 +5691,13 @@ fn inspector_text_overlay(
 
     // ─── Position / rotation / opacity (size is driven by font_size) ───
     // Inspector reads the eased current value at the playhead and only
-    // writes through `kf_anim::write_overlay_param` on actual edits, so
+    // writes through `crate::kf_anim::write_overlay_param` on actual edits, so
     // simply drawing the inspector during playback / scrubbing no
     // longer auto-inserts keyframes.
+    let clip_dur = (t.t_out - t.t_in).max(0.0);
+    let local_t = (playhead - t.t_in).clamp(0.0, clip_dur);
     inspector_overlay_state_widgets(
-        ui, &mut t.layout, &mut t.animated_params, playhead, idx, "text",
+        ui, &mut t.layout, &mut t.animated_params, local_t, clip_dur, idx, "text",
         crate::kf_anim::KfHighlight::default());
     ui.add_space(8.0);
 
@@ -5922,6 +5957,8 @@ fn inspector_render_frame(ui: &mut egui::Ui, state: &mut EditorState) {
     use crate::kf_anim;
     use memstroy_core::param_ids;
     let rf_t_local = state.playhead;
+    let scene_duration = state.scene.output.duration.max(0.0);
+    let animated_before = state.scene.render_frame.animated_params.clone();
     let rf = &mut state.scene.render_frame;
     // Output resolution is fixed at 1080x1920 — every export goes through
     // `app.rs` which overrides the scene's resolution to that value, and
@@ -5956,8 +5993,11 @@ fn inspector_render_frame(ui: &mut egui::Ui, state: &mut EditorState) {
     // inspector does for actor / overlay layouts. Without this the
     // widgets always showed the first kf's value, even when later
     // kfs animated the frame off-screen.
-    let cur_state = memstroy_core::keyframe::sample(&rf.layout, rf_t_local)
-        .unwrap_or_default();
+    let cur_state = memstroy_core::sample_render_frame_layout(
+        &rf.layout,
+        &rf.animated_params,
+        rf_t_local,
+    );
     let mut new_pos_x = cur_state.pos.x;
     let mut new_pos_y = cur_state.pos.y;
     let mut new_rot = cur_state.rotation_deg;
@@ -5967,7 +6007,7 @@ fn inspector_render_frame(ui: &mut egui::Ui, state: &mut EditorState) {
 
     // ─── Position ─────────────────────────────────────────────
     ui.horizontal(|ui| {
-        kf_anim::animated_toggle(
+        crate::kf_anim::animated_toggle(
             ui,
             &mut rf.animated_params,
             param_ids::POS_X,
@@ -5975,7 +6015,7 @@ fn inspector_render_frame(ui: &mut egui::Ui, state: &mut EditorState) {
         );
         ui.label(t("X:"));
         let r_x = ui.add(egui::DragValue::new(&mut new_pos_x).speed(0.5));
-        kf_anim::animated_toggle(
+        crate::kf_anim::animated_toggle(
             ui,
             &mut rf.animated_params,
             param_ids::POS_Y,
@@ -5984,7 +6024,7 @@ fn inspector_render_frame(ui: &mut egui::Ui, state: &mut EditorState) {
         ui.label(t("Y:"));
         let r_y = ui.add(egui::DragValue::new(&mut new_pos_y).speed(0.5));
         if r_x.changed() {
-            kf_anim::write_render_frame_param(
+            crate::kf_anim::write_render_frame_param(
                 &mut rf.layout,
                 &mut rf.animated_params,
                 rf_t_local,
@@ -5994,7 +6034,7 @@ fn inspector_render_frame(ui: &mut egui::Ui, state: &mut EditorState) {
             );
         }
         if r_y.changed() {
-            kf_anim::write_render_frame_param(
+            crate::kf_anim::write_render_frame_param(
                 &mut rf.layout,
                 &mut rf.animated_params,
                 rf_t_local,
@@ -6008,7 +6048,7 @@ fn inspector_render_frame(ui: &mut egui::Ui, state: &mut EditorState) {
 
     // ─── Rotation ─────────────────────────────────────────────
     ui.horizontal(|ui| {
-        kf_anim::animated_toggle(
+        crate::kf_anim::animated_toggle(
             ui,
             &mut rf.animated_params,
             param_ids::ROTATION,
@@ -6033,7 +6073,7 @@ fn inspector_render_frame(ui: &mut egui::Ui, state: &mut EditorState) {
             }
         });
         if dial_changed {
-            kf_anim::write_render_frame_param(
+            crate::kf_anim::write_render_frame_param(
                 &mut rf.layout,
                 &mut rf.animated_params,
                 rf_t_local,
@@ -6053,7 +6093,7 @@ fn inspector_render_frame(ui: &mut egui::Ui, state: &mut EditorState) {
     // "scale" reads more intuitively for an animatable element than
     // "zoom" did.
     ui.horizontal(|ui| {
-        kf_anim::animated_toggle(
+        crate::kf_anim::animated_toggle(
             ui,
             &mut rf.animated_params,
             param_ids::SCALE,
@@ -6066,7 +6106,7 @@ fn inspector_render_frame(ui: &mut egui::Ui, state: &mut EditorState) {
         );
         if r.changed() {
             let new_zoom = (1.0 / new_scale.max(1e-4)).clamp(0.001, 1000.0);
-            kf_anim::write_render_frame_param(
+            crate::kf_anim::write_render_frame_param(
                 &mut rf.layout,
                 &mut rf.animated_params,
                 rf_t_local,
@@ -6105,6 +6145,14 @@ fn inspector_render_frame(ui: &mut egui::Ui, state: &mut EditorState) {
     ui.add_space(8.0);
     // Render frame is scene-time anchored — effect kfs use scene-time.
     inspector_effect_stack(ui, &mut rf.effects, "rf_fx", rf_t_local);
+
+    crate::kf_anim::reconcile_render_frame_animated_params(
+        &mut state.scene.render_frame.layout,
+        &state.scene.render_frame.animated_params,
+        &animated_before,
+        rf_t_local,
+        scene_duration,
+    );
 }
 
 fn inspector_background(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
@@ -6194,7 +6242,7 @@ fn inspector_audio(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
         // window via `t_out` (using the cached "1× length") and
         // cascades onto the linked actor below. The widget therefore
         // stays inline but uses the SAME shared primitives every other
-        // inspector relies on — `kf_anim::animated_toggle` for the
+        // inspector relies on — `crate::kf_anim::animated_toggle` for the
         // painted diamond and `param_label_str` for the gold-highlight
         // label.
         let old_speed = audio.speed.max(0.0001);
@@ -6584,7 +6632,7 @@ fn inspector_audio_param(
 /// Visually this row is built out of the SAME primitives as the actor /
 /// overlay / render-frame inspectors:
 ///
-///   - [`kf_anim::animated_toggle`] for the per-param "is animated"
+///   - [`crate::kf_anim::animated_toggle`] for the per-param "is animated"
 ///     diamond (painted directly because egui's default font doesn't
 ///     render the Unicode diamond glyphs — the previous Unicode-glyph
 ///     toggle showed up as an empty square on most installs).
@@ -6628,7 +6676,7 @@ fn inspector_audio_param_ex(
         // other inspector. Replaces the hand-rolled Unicode-glyph
         // toggle that rendered as an empty square on default fonts.
         let was_on = animated.contains(param_id);
-        let _toggled = kf_anim::animated_toggle(
+        let _toggled = crate::kf_anim::animated_toggle(
             ui,
             animated,
             param_id,
@@ -9006,6 +9054,78 @@ fn timeline_input_locked(ui: &egui::Ui) -> bool {
     })
 }
 
+/// Floating easing picker for param-row keyframes. Anchored at a fixed
+/// screen position so it stays stable during playback repaints.
+fn draw_kf_easing_popup(ctx: &egui::Context, state: &mut EditorState) {
+    let Some(popup) = state.kf_easing_popup.clone() else {
+        return;
+    };
+
+    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        state.kf_easing_popup = None;
+        return;
+    }
+
+    let popup_id = egui::Id::new("kf_easing_popup");
+    let mut chosen: Option<memstroy_core::Easing> = None;
+
+    let area = egui::Area::new(popup_id)
+        .fixed_pos(popup.screen_pos)
+        .order(egui::Order::Foreground)
+        .interactable(true)
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.set_min_width(148.0);
+                ui.label(
+                    egui::RichText::new(crate::i18n::t("Transition into kf"))
+                        .size(10.0)
+                        .strong(),
+                );
+                ui.separator();
+                let easings: [(memstroy_core::Easing, &str); 6] = [
+                    (memstroy_core::Easing::Linear, "Linear"),
+                    (memstroy_core::Easing::Step, "Step (instant)"),
+                    (memstroy_core::Easing::EaseIn, "Ease in"),
+                    (memstroy_core::Easing::EaseOut, "Ease out"),
+                    (memstroy_core::Easing::EaseInOut, "Ease in/out"),
+                    (memstroy_core::Easing::Cubic, "Cubic"),
+                ];
+                for (easing, label) in easings {
+                    if ui.button(crate::i18n::t(label)).clicked() {
+                        chosen = Some(easing);
+                    }
+                }
+            });
+        });
+
+    if ctx.input(|i| {
+        i.pointer.primary_pressed()
+            && i.pointer
+                .interact_pos()
+                .is_some_and(|p| !area.response.rect.contains(p))
+    }) {
+        state.kf_easing_popup = None;
+        return;
+    }
+
+    if let Some(easing) = chosen {
+        let selected_kfs = state.selected_keyframes.clone();
+        let layer_label = popup.layer.clone();
+        let mut targets: Vec<(crate::kf_anim::SelectedLayer, String, f32)> = Vec::new();
+        if popup.apply_to_selection && !selected_kfs.is_empty() {
+            for sk in &selected_kfs {
+                targets.push((sk.layer.clone(), sk.param_id.clone(), sk.t));
+            }
+        } else {
+            targets.push((layer_label, popup.param_id, popup.t));
+        }
+        for (layer, param_id, t) in targets {
+            apply_easing_to_layer_kf(state, &layer, &param_id, t, easing);
+        }
+        state.kf_easing_popup = None;
+    }
+}
+
 pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     // ── Prevent the panel from auto-growing ──
     // The TopBottomPanel grows when its content's min-size exceeds the
@@ -9386,6 +9506,10 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
         state.timeline_scroll =
             (state.timeline_scroll - scroll_delta.x / pps.max(1.0)).max(0.0);
     }
+
+    let scene_duration = state.scene.output.duration.max(0.0);
+    let max_h_scroll = timeline_max_h_scroll(scene_duration, pps, track_area_width);
+    state.timeline_scroll = state.timeline_scroll.clamp(0.0, max_h_scroll);
 
     // ── Ruler ──
     let ruler_resp = ui.interact(
@@ -9805,7 +9929,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     // including any per-param keyframe-row expansion on the selected layer.
     // The dedicated Render Frame row is added once at the top.
     //
-    // We pad the total with `BOTTOM_GUTTER` so the user can ALWAYS scroll
+    // We pad the total with `TIMELINE_BOTTOM_GUTTER` so the user can ALWAYS scroll
     // the bottom-most lane fully into the visible area, with a generous
     // empty band beneath it. Without enough gutter the last row's
     // bottom edge sits exactly at the viewport bottom — combined with
@@ -9817,7 +9941,6 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     // px) so even on a short timeline panel the bottom-most audio lane
     // is fully reachable instead of getting clipped by the scrollbar's
     // last-pixel round-down.
-    const BOTTOM_GUTTER: f32 = 160.0;
     let total_tracks_h: f32 = rf_row_h
         + render_frame_expansion(state, v_zoom)
         + (0..num_tracks)
@@ -9837,7 +9960,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                     + selected_layer_expansion(state, i, v_zoom)
             })
             .sum::<f32>()
-        + BOTTOM_GUTTER;
+        + TIMELINE_BOTTOM_GUTTER;
     let max_v_scroll = (total_tracks_h - viewport_h).max(0.0);
     state.timeline_v_scroll = state.timeline_v_scroll.max(0.0).min(max_v_scroll);
     let v_scroll = state.timeline_v_scroll;
@@ -9996,6 +10119,9 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                     }
                     for ec in outcome.easing_changes {
                         param_row_easing_changes.push((layer_label.clone(), ec));
+                    }
+                    if let Some(popup) = outcome.easing_popup_open {
+                        state.kf_easing_popup = Some(popup);
                     }
                     for dr in outcome.drag_releases {
                         param_row_drag_releases.push((layer_label.clone(), dr));
@@ -11292,6 +11418,9 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                 for ec in outcome.easing_changes {
                     param_row_easing_changes.push((layer_label.clone(), ec));
                 }
+                if let Some(popup) = outcome.easing_popup_open {
+                    state.kf_easing_popup = Some(popup);
+                }
                 for dr in outcome.drag_releases {
                     param_row_drag_releases.push((layer_label.clone(), dr));
                 }
@@ -11562,7 +11691,8 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     // local zoom (timeline_zoom in pixels-per-second). The thumb edges can be
     // dragged to resize the visible window.
     let visible_secs_h = (track_area_width / pps.max(1.0)).max(0.0);
-    let total_h = duration.max(visible_secs_h.max(0.5));
+    let total_h = timeline_scrollable_duration(duration, pps).max(visible_secs_h.max(0.5));
+    state.timeline_scroll = state.timeline_scroll.clamp(0.0, timeline_max_h_scroll(duration, pps, track_area_width));
     let view_a_h = (state.timeline_scroll / total_h).clamp(0.0, 1.0);
     let view_b_h = ((state.timeline_scroll + visible_secs_h) / total_h).clamp(view_a_h, 1.0);
     let (new_a_h, new_b_h) = stretchable_scrollbar(
@@ -11615,17 +11745,17 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     //
     // total_tracks_h is essentially linear in v_zoom (every row, the
     // RF row, and every expansion contribute `* v_zoom` terms; the
-    // only v_zoom-independent components are `BOTTOM_GUTTER` plus a
-    // few small `+ 4.0` paddings inside the expansion helpers — those
-    // are tiny enough to fold into the linear approximation without
-    // affecting one-pixel UI feel). So:
+    // only v_zoom-independent components are `TIMELINE_BOTTOM_GUTTER`
+    // plus a few small `+ 4.0` paddings inside the expansion helpers —
+    // those are tiny enough to fold into the linear approximation
+    // without affecting one-pixel UI feel). So:
     //   total(v') ≈ (total(v_zoom) - C) * (v' / v_zoom) + C
     // where C is the v_zoom-independent residual we model as
-    // BOTTOM_GUTTER. Solving total(v_zoom_min) = viewport_h:
+    // TIMELINE_BOTTOM_GUTTER. Solving total(v_zoom_min) = viewport_h:
     //   v_zoom_min = (viewport_h - C) * v_zoom / (total - C)
     const V_ZOOM_HARD_MIN: f32 = 0.05;
     const V_ZOOM_MAX: f32 = 8.0;
-    let zoom_invariant_h = BOTTOM_GUTTER;
+    let zoom_invariant_h = TIMELINE_BOTTOM_GUTTER;
     let zoom_scaled_h = (total_tracks_h - zoom_invariant_h).max(1.0e-4);
     // Target a viewport that's ever-so-slightly larger than the
     // content so the user gets a true 100%-thumb when fully zoomed
@@ -11664,7 +11794,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
         // ratio: smaller thumb ↔ more total content ↔ larger v_zoom.
         // We solve `viewport_h / new_total = new_thumb_size` for
         // `new_v_zoom`, treating total_tracks_h as roughly linear in
-        // v_zoom (the constant `BOTTOM_GUTTER` and small per-row
+        // v_zoom (the constant `TIMELINE_BOTTOM_GUTTER` and small per-row
         // padding terms are absorbed into the residual — close enough
         // for a UI control where one pixel of slop is invisible).
         let zoom_changed = (new_thumb_size - thumb_size_frac).abs() > 1.0e-4;
@@ -11692,7 +11822,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                         + selected_layer_expansion(state, i, new_v_zoom)
                 })
                 .sum::<f32>()
-            + BOTTOM_GUTTER;
+            + TIMELINE_BOTTOM_GUTTER;
         let new_max_v_scroll = (new_total_tracks_h - viewport_h).max(0.0);
         let denom = (1.0 - new_thumb_size).max(1.0e-4);
         let new_pan_frac = (new_a_v / denom).clamp(0.0, 1.0);
@@ -12087,6 +12217,8 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
         track_left,
         track_right,
     );
+
+    draw_kf_easing_popup(ui.ctx(), state);
 }
 
 
@@ -13438,41 +13570,6 @@ fn compute_param_change_points(
     use memstroy_core::param_ids as p;
     let mut out: std::collections::BTreeMap<String, Vec<(f32, f32)>> =
         std::collections::BTreeMap::new();
-    const EPS: f32 = 1.0e-4;
-
-    fn changed_actor<F>(layout: &[Keyframe<ActorState>], get: F) -> Vec<f32>
-    where
-        F: Fn(&ActorState) -> f32,
-    {
-        if layout.len() < 2 { return Vec::new(); }
-        let mut times: Vec<f32> = Vec::new();
-        // Always include the first kf — that's the initial value for
-        // the parameter and the user wants to see/click it.
-        times.push(layout[0].t);
-        for win in layout.windows(2) {
-            let (prev, cur) = (&win[0].value, &win[1].value);
-            if (get(cur) - get(prev)).abs() > EPS {
-                times.push(win[1].t);
-            }
-        }
-        times
-    }
-
-    fn changed_overlay<F>(layout: &[Keyframe<OverlayState>], get: F) -> Vec<f32>
-    where
-        F: Fn(&OverlayState) -> f32,
-    {
-        if layout.len() < 2 { return Vec::new(); }
-        let mut times: Vec<f32> = Vec::new();
-        times.push(layout[0].t);
-        for win in layout.windows(2) {
-            let (prev, cur) = (&win[0].value, &win[1].value);
-            if (get(cur) - get(prev)).abs() > EPS {
-                times.push(win[1].t);
-            }
-        }
-        times
-    }
 
     let pairs = |times: Vec<f32>, sel: Selection| -> Vec<(f32, f32)> {
         times
@@ -13484,22 +13581,105 @@ fn compute_param_change_points(
     match sel {
         Selection::Actor(ai) => {
             if let Some(a) = state.scene.actors.get(ai) {
-                out.insert(p::POS_X.to_string(),
-                    pairs(changed_actor(&a.layout, |s| s.pos[0]), sel));
-                out.insert(p::POS_Y.to_string(),
-                    pairs(changed_actor(&a.layout, |s| s.pos[1]), sel));
-                out.insert(p::SCALE.to_string(),
-                    pairs(changed_actor(&a.layout, |s| s.scale), sel));
-                out.insert(p::SCALE_Y.to_string(),
-                    pairs(changed_actor(&a.layout, |s| s.scale_y), sel));
-                out.insert(p::ROTATION.to_string(),
-                    pairs(changed_actor(&a.layout, |s| s.rotation_deg), sel));
-                out.insert(p::OPACITY.to_string(),
-                    pairs(changed_actor(&a.layout, |s| s.opacity), sel));
-                out.insert(p::FLIP_X.to_string(),
-                    pairs(changed_actor(&a.layout, |s| s.flip_x_anim), sel));
-                out.insert(p::FLIP_Y.to_string(),
-                    pairs(changed_actor(&a.layout, |s| s.flip_y_anim), sel));
+                let canvas = state
+                    .scene
+                    .canvas_layouts
+                    .iter()
+                    .find(|cl| cl.element_id == a.id)
+                    .map(|cl| cl.keyframes.as_slice());
+                out.insert(
+                    p::POS_X.to_string(),
+                    pairs(
+                        crate::kf_anim::actor_param_change_times(
+                            &a.layout,
+                            &a.animated_params,
+                            canvas,
+                            p::POS_X,
+                        ),
+                        sel,
+                    ),
+                );
+                out.insert(
+                    p::POS_Y.to_string(),
+                    pairs(
+                        crate::kf_anim::actor_param_change_times(
+                            &a.layout,
+                            &a.animated_params,
+                            canvas,
+                            p::POS_Y,
+                        ),
+                        sel,
+                    ),
+                );
+                out.insert(
+                    p::SCALE.to_string(),
+                    pairs(
+                        crate::kf_anim::actor_param_change_times(
+                            &a.layout,
+                            &a.animated_params,
+                            canvas,
+                            p::SCALE,
+                        ),
+                        sel,
+                    ),
+                );
+                out.insert(
+                    p::SCALE_Y.to_string(),
+                    pairs(
+                        crate::kf_anim::actor_layout_param_times(
+                            &a.layout,
+                            &a.animated_params,
+                            p::SCALE_Y,
+                        ),
+                        sel,
+                    ),
+                );
+                out.insert(
+                    p::ROTATION.to_string(),
+                    pairs(
+                        crate::kf_anim::actor_param_change_times(
+                            &a.layout,
+                            &a.animated_params,
+                            canvas,
+                            p::ROTATION,
+                        ),
+                        sel,
+                    ),
+                );
+                out.insert(
+                    p::OPACITY.to_string(),
+                    pairs(
+                        crate::kf_anim::actor_param_change_times(
+                            &a.layout,
+                            &a.animated_params,
+                            canvas,
+                            p::OPACITY,
+                        ),
+                        sel,
+                    ),
+                );
+                out.insert(
+                    p::FLIP_X.to_string(),
+                    pairs(
+                        crate::kf_anim::actor_layout_param_times(
+                            &a.layout,
+                            &a.animated_params,
+                            p::FLIP_X,
+                        ),
+                        sel,
+                    ),
+                );
+                out.insert(
+                    p::FLIP_Y.to_string(),
+                    pairs(
+                        crate::kf_anim::actor_layout_param_times(
+                            &a.layout,
+                            &a.animated_params,
+                            p::FLIP_Y,
+                        ),
+                        sel,
+                    ),
+                );
                 // Effect animated params — each kf in param_kfs is a
                 // real change-point the user authored.
                 for (fx_idx, eff) in a.effects.iter().enumerate() {
@@ -13520,22 +13700,115 @@ fn compute_param_change_points(
                     Overlay::Image(im) => &im.layout,
                     Overlay::Video(v) => &v.layout,
                 };
-                out.insert(p::POS_X.to_string(),
-                    pairs(changed_overlay(layout, |s| s.pos[0]), sel));
-                out.insert(p::POS_Y.to_string(),
-                    pairs(changed_overlay(layout, |s| s.pos[1]), sel));
-                out.insert(p::SCALE.to_string(),
-                    pairs(changed_overlay(layout, |s| s.scale), sel));
-                out.insert(p::SCALE_Y.to_string(),
-                    pairs(changed_overlay(layout, |s| s.scale_y), sel));
-                out.insert(p::ROTATION.to_string(),
-                    pairs(changed_overlay(layout, |s| s.rotation_deg), sel));
-                out.insert(p::OPACITY.to_string(),
-                    pairs(changed_overlay(layout, |s| s.opacity), sel));
-                out.insert(p::FLIP_X.to_string(),
-                    pairs(changed_overlay(layout, |s| s.flip_x_anim), sel));
-                out.insert(p::FLIP_Y.to_string(),
-                    pairs(changed_overlay(layout, |s| s.flip_y_anim), sel));
+                let ov_id = match ov {
+                    Overlay::Text(t) => &t.id,
+                    Overlay::Image(im) => &im.id,
+                    Overlay::Video(v) => &v.id,
+                };
+                let canvas = state
+                    .scene
+                    .canvas_layouts
+                    .iter()
+                    .find(|cl| cl.element_id == *ov_id)
+                    .map(|cl| cl.keyframes.as_slice());
+                let animated_params = match ov {
+                    Overlay::Text(t) => &t.animated_params,
+                    Overlay::Image(im) => &im.animated_params,
+                    Overlay::Video(v) => &v.animated_params,
+                };
+                out.insert(
+                    p::POS_X.to_string(),
+                    pairs(
+                        crate::kf_anim::overlay_param_change_times(
+                            layout,
+                            animated_params,
+                            canvas,
+                            p::POS_X,
+                        ),
+                        sel,
+                    ),
+                );
+                out.insert(
+                    p::POS_Y.to_string(),
+                    pairs(
+                        crate::kf_anim::overlay_param_change_times(
+                            layout,
+                            animated_params,
+                            canvas,
+                            p::POS_Y,
+                        ),
+                        sel,
+                    ),
+                );
+                out.insert(
+                    p::SCALE.to_string(),
+                    pairs(
+                        crate::kf_anim::overlay_param_change_times(
+                            layout,
+                            animated_params,
+                            canvas,
+                            p::SCALE,
+                        ),
+                        sel,
+                    ),
+                );
+                out.insert(
+                    p::SCALE_Y.to_string(),
+                    pairs(
+                        crate::kf_anim::overlay_layout_param_times(
+                            layout,
+                            animated_params,
+                            p::SCALE_Y,
+                        ),
+                        sel,
+                    ),
+                );
+                out.insert(
+                    p::ROTATION.to_string(),
+                    pairs(
+                        crate::kf_anim::overlay_param_change_times(
+                            layout,
+                            animated_params,
+                            canvas,
+                            p::ROTATION,
+                        ),
+                        sel,
+                    ),
+                );
+                out.insert(
+                    p::OPACITY.to_string(),
+                    pairs(
+                        crate::kf_anim::overlay_param_change_times(
+                            layout,
+                            animated_params,
+                            canvas,
+                            p::OPACITY,
+                        ),
+                        sel,
+                    ),
+                );
+                out.insert(
+                    p::FLIP_X.to_string(),
+                    pairs(
+                        crate::kf_anim::overlay_layout_param_times(
+                            layout,
+                            animated_params,
+                            p::FLIP_X,
+                        ),
+                        sel,
+                    ),
+                );
+                out.insert(
+                    p::FLIP_Y.to_string(),
+                    pairs(
+                        crate::kf_anim::overlay_layout_param_times(
+                            layout,
+                            animated_params,
+                            p::FLIP_Y,
+                        ),
+                        sel,
+                    ),
+                );
                 // Effect animated params.
                 let effects: &[memstroy_core::Effect] = match ov {
                     Overlay::Text(t) => &t.effects,
@@ -13567,34 +13840,51 @@ fn compute_param_change_points(
         let rf = &state.scene.render_frame;
         let layout: &[Keyframe<RenderFrameState>] = &rf.layout;
 
-        fn changed_rf<F>(layout: &[Keyframe<RenderFrameState>], get: F) -> Vec<f32>
-        where
-            F: Fn(&RenderFrameState) -> f32,
-        {
-            const EPS: f32 = 1.0e-4;
-            if layout.len() < 2 { return Vec::new(); }
-            let mut times: Vec<f32> = Vec::new();
-            times.push(layout[0].t);
-            for win in layout.windows(2) {
-                let (prev, cur) = (&win[0].value, &win[1].value);
-                if (get(cur) - get(prev)).abs() > EPS {
-                    times.push(win[1].t);
-                }
-            }
-            times
-        }
-
-        out.insert(p::POS_X.to_string(),
-            pairs(changed_rf(layout, |s| s.pos.x), sel));
-        out.insert(p::POS_Y.to_string(),
-            pairs(changed_rf(layout, |s| s.pos.y), sel));
-        // The render frame uses `zoom` instead of `scale` internally;
-        // expose it under the SCALE param id so existing inspector /
-        // timeline pipes treat it like the actor / overlay scale row.
-        out.insert(p::SCALE.to_string(),
-            pairs(changed_rf(layout, |s| s.zoom), sel));
-        out.insert(p::ROTATION.to_string(),
-            pairs(changed_rf(layout, |s| s.rotation_deg), sel));
+        out.insert(
+            p::POS_X.to_string(),
+            pairs(
+                memstroy_core::render_frame_param_timeline_times(
+                    layout,
+                    &rf.animated_params,
+                    p::POS_X,
+                ),
+                sel,
+            ),
+        );
+        out.insert(
+            p::POS_Y.to_string(),
+            pairs(
+                memstroy_core::render_frame_param_timeline_times(
+                    layout,
+                    &rf.animated_params,
+                    p::POS_Y,
+                ),
+                sel,
+            ),
+        );
+        // Stored as `zoom`; timeline uses the same scalar field as sampling.
+        out.insert(
+            p::SCALE.to_string(),
+            pairs(
+                memstroy_core::render_frame_param_timeline_times(
+                    layout,
+                    &rf.animated_params,
+                    p::SCALE,
+                ),
+                sel,
+            ),
+        );
+        out.insert(
+            p::ROTATION.to_string(),
+            pairs(
+                memstroy_core::render_frame_param_timeline_times(
+                    layout,
+                    &rf.animated_params,
+                    p::ROTATION,
+                ),
+                sel,
+            ),
+        );
     }
 
     // Audio per-param tracks: each animatable scalar lives in its own
@@ -14321,43 +14611,20 @@ fn draw_param_kf_rows(
             if r.hovered() && !r.dragged() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
-            // Right-click context menu — pick the interpolation curve
-            // ("transition") used to ease INTO this keyframe. When the
-            // user has multiple keyframes already selected (Ctrl+click
-            // before right-click) the choice applies to every selected
-            // kf so they can re-flag a whole batch of "make these
-            // step-holds" or "linearise these" in one shot.
-            let kf_in_selection = is_selected;
-            r.context_menu(|ui| {
-                ui.label(
-                    egui::RichText::new(crate::i18n::t("Transition into kf"))
-                        .size(10.0)
-                        .strong(),
-                );
-                ui.separator();
-                let easings: [(memstroy_core::Easing, &str); 6] = [
-                    (memstroy_core::Easing::Linear, "Linear"),
-                    (memstroy_core::Easing::Step, "Step (instant)"),
-                    (memstroy_core::Easing::EaseIn, "Ease in"),
-                    (memstroy_core::Easing::EaseOut, "Ease out"),
-                    (memstroy_core::Easing::EaseInOut, "Ease in/out"),
-                    (memstroy_core::Easing::Cubic, "Cubic"),
-                ];
-                for (e, label) in easings {
-                    if ui
-                        .selectable_label(false, crate::i18n::t(label))
-                        .clicked()
-                    {
-                        outcome.easing_changes.push(ParamRowEasingChange {
-                            param_id: param_id.clone(),
-                            t: local_t,
-                            easing: e,
-                            apply_to_selection: kf_in_selection,
-                        });
-                        ui.close_menu();
-                    }
+            // Right-click → open a screen-anchored easing picker. Using
+            // `Response::context_menu` on painter-drawn diamonds flickered
+            // during playback because the anchor is recreated every frame.
+            if r.secondary_clicked() {
+                if let Some(pos) = r.interact_pointer_pos() {
+                    outcome.easing_popup_open = Some(crate::state::KfEasingPopup {
+                        layer: sel_layer_label.clone(),
+                        param_id: param_id.clone(),
+                        t: local_t,
+                        apply_to_selection: is_selected,
+                        screen_pos: pos,
+                    });
                 }
-            });
+            }
         }
     }
 
@@ -14391,6 +14658,8 @@ struct ParamRowOutcome {
     multi_drag_delta_this_frame: f32,
     /// Set to true when the multi-drag gesture ends (pointer released).
     multi_drag_released: bool,
+    /// Request to open the screen-anchored easing picker (right-click).
+    easing_popup_open: Option<crate::state::KfEasingPopup>,
     /// Keyframes whose screen positions fall inside the marquee rect
     /// this frame. The caller uses this to update `selected_keyframes`.
     #[allow(dead_code)]

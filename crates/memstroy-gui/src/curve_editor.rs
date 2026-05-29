@@ -36,18 +36,25 @@ const NUM_TRANSFORM_PROPS: usize = 5;
 /// the playhead and clip duration; the panel takes care of mapping
 /// `selected_property` to the right backing field.
 pub enum CurveEditorTarget<'a> {
-    /// Transform layout of an actor.
+    /// Transform layout of an actor (layout times are scene-time).
     Actor {
         layout: &'a mut Vec<Keyframe<ActorState>>,
         animated_params: &'a mut BTreeSet<String>,
+        clip_start: f32,
+        clip_end: f32,
+        /// Optional canvas-layout track for the same element (world-pixel
+        /// motion authored on the canvas). Merged with `layout` when
+        /// deciding which keyframes belong to each parameter.
+        canvas_layout: Option<&'a mut Vec<Keyframe<memstroy_core::CanvasTransform>>>,
     },
-    /// Transform layout of a text / image / video overlay. `t_in`
-    /// shifts the keyframe time-axis so the editor speaks scene-time
-    /// (matching the actor track's frame-of-reference).
+    /// Transform layout of a text / image / video overlay. Layout
+    /// times are clip-local; `t_in` maps the playhead for display.
     Overlay {
         layout: &'a mut Vec<Keyframe<OverlayState>>,
         animated_params: &'a mut BTreeSet<String>,
         t_in: f32,
+        clip_duration: f32,
+        canvas_layout: Option<&'a mut Vec<Keyframe<memstroy_core::CanvasTransform>>>,
     },
     /// Audio layer: per-parameter scalar tracks for Volume / Speed /
     /// Pan. Only one parameter is shown at a time; the property
@@ -314,7 +321,15 @@ pub fn curve_editor_panel(
     use crate::i18n::t;
 
     match target {
-        CurveEditorTarget::Actor { layout, animated_params } => {
+        CurveEditorTarget::Actor {
+            layout,
+            animated_params,
+            clip_start,
+            clip_end,
+            canvas_layout,
+        } => {
+            let seed_t = playhead.clamp(clip_start, clip_end.max(clip_start));
+            let mut canvas_slot = canvas_layout;
             transform_curve_editor::<ActorState>(
                 ui,
                 layout,
@@ -323,9 +338,18 @@ pub fn curve_editor_panel(
                 selected_property,
                 playhead,
                 /* time_offset */ 0.0,
+                seed_t,
+                &mut canvas_slot,
+                memstroy_core::clear_actor_param_animation,
+                memstroy_core::enable_actor_param_animation,
                 get_actor_property,
                 set_actor_property,
                 ActorState::default,
+                actor_curve_param_times,
+                actor_curve_author,
+                actor_curve_delete,
+                actor_curve_rekey,
+                actor_curve_sample,
                 marquee,
                 ce_selected,
                 ce_multi_drag,
@@ -334,15 +358,16 @@ pub fn curve_editor_panel(
                 zoom,
                 panning,
             );
-            // Effect animated params — show a scalar curve
-            // editor for each animated effect parameter.
-            let actor_t_in = layout.first().map(|kf| kf.t).unwrap_or(0.0);
-            // Note: we can't access actor.t_in here, so we approximate
-            // from the first keyframe. For proper t_local calculation,
-            // the caller (app.rs) should pass it in.
-            let _t_local = (playhead - actor_t_in).max(0.0);
         }
-        CurveEditorTarget::Overlay { layout, animated_params, t_in } => {
+        CurveEditorTarget::Overlay {
+            layout,
+            animated_params,
+            t_in,
+            clip_duration,
+            canvas_layout,
+        } => {
+            let seed_t = (playhead - t_in).clamp(0.0, clip_duration.max(0.0));
+            let mut canvas_slot = canvas_layout;
             transform_curve_editor::<OverlayState>(
                 ui,
                 layout,
@@ -351,9 +376,18 @@ pub fn curve_editor_panel(
                 selected_property,
                 playhead,
                 /* time_offset */ t_in,
+                seed_t,
+                &mut canvas_slot,
+                memstroy_core::clear_overlay_param_animation,
+                memstroy_core::enable_overlay_param_animation,
                 get_overlay_property,
                 set_overlay_property,
                 OverlayState::default,
+                overlay_curve_param_times,
+                overlay_curve_author,
+                overlay_curve_delete,
+                overlay_curve_rekey,
+                overlay_curve_sample,
                 marquee,
                 ce_selected,
                 ce_multi_drag,
@@ -364,9 +398,8 @@ pub fn curve_editor_panel(
             );
         }
         CurveEditorTarget::RenderFrame { layout, animated_params } => {
-            // Render-frame kfs are stored in scene time, same as
-            // actors — pass `time_offset = 0.0` so the editor's
-            // X-axis is direct scene-time.
+            let seed_t = playhead.clamp(0.0, duration);
+            let mut no_canvas: Option<&mut Vec<Keyframe<memstroy_core::CanvasTransform>>> = None;
             transform_curve_editor::<RenderFrameState>(
                 ui,
                 layout,
@@ -375,9 +408,18 @@ pub fn curve_editor_panel(
                 selected_property,
                 playhead,
                 /* time_offset */ 0.0,
+                seed_t,
+                &mut no_canvas,
+                memstroy_core::clear_render_frame_param_animation,
+                memstroy_core::enable_render_frame_param_animation,
                 get_render_frame_property,
                 set_render_frame_property,
                 RenderFrameState::default,
+                render_frame_curve_param_times,
+                render_frame_curve_author,
+                render_frame_curve_delete,
+                render_frame_curve_rekey,
+                render_frame_curve_sample,
                 marquee,
                 ce_selected,
                 ce_multi_drag,
@@ -629,6 +671,182 @@ fn sample_f32_kfs(kfs: &[Keyframe<f32>], t: f32, default: f32) -> f32 {
     memstroy_core::keyframe::sample(kfs, t).unwrap_or(default)
 }
 
+fn actor_curve_param_times(
+    layout: &[Keyframe<ActorState>],
+    animated_params: &BTreeSet<String>,
+    canvas: Option<&[Keyframe<memstroy_core::CanvasTransform>]>,
+    param_id: &str,
+) -> Vec<f32> {
+    crate::kf_anim::actor_param_change_times(layout, animated_params, canvas, param_id)
+}
+
+fn overlay_curve_param_times(
+    layout: &[Keyframe<OverlayState>],
+    animated_params: &BTreeSet<String>,
+    canvas: Option<&[Keyframe<memstroy_core::CanvasTransform>]>,
+    param_id: &str,
+) -> Vec<f32> {
+    crate::kf_anim::overlay_param_change_times(layout, animated_params, canvas, param_id)
+}
+
+fn render_frame_curve_param_times(
+    layout: &[Keyframe<RenderFrameState>],
+    animated_params: &BTreeSet<String>,
+    _canvas: Option<&[Keyframe<memstroy_core::CanvasTransform>]>,
+    param_id: &str,
+) -> Vec<f32> {
+    crate::kf_anim::render_frame_param_change_times(layout, animated_params, param_id)
+}
+
+fn actor_curve_sample(
+    layout: &[Keyframe<ActorState>],
+    canvas: Option<&[Keyframe<memstroy_core::CanvasTransform>]>,
+    animated_params: &BTreeSet<String>,
+    param_id: &str,
+    t: f32,
+) -> f32 {
+    crate::kf_anim::actor_param_value_at(layout, canvas, animated_params, param_id, t)
+}
+
+fn overlay_curve_sample(
+    layout: &[Keyframe<OverlayState>],
+    canvas: Option<&[Keyframe<memstroy_core::CanvasTransform>]>,
+    animated_params: &BTreeSet<String>,
+    param_id: &str,
+    t: f32,
+) -> f32 {
+    crate::kf_anim::overlay_param_value_at(layout, canvas, animated_params, param_id, t)
+}
+
+fn render_frame_curve_sample(
+    layout: &[Keyframe<RenderFrameState>],
+    _canvas: Option<&[Keyframe<memstroy_core::CanvasTransform>]>,
+    animated_params: &BTreeSet<String>,
+    param_id: &str,
+    t: f32,
+) -> f32 {
+    crate::kf_anim::render_frame_param_value_at(layout, animated_params, param_id, t)
+}
+
+fn actor_curve_author(
+    layout: &mut Vec<Keyframe<ActorState>>,
+    canvas_slot: &mut Option<&mut Vec<Keyframe<memstroy_core::CanvasTransform>>>,
+    animated_params: &BTreeSet<String>,
+    param_id: &str,
+    t: f32,
+    value: f32,
+) {
+    let canvas = canvas_slot.as_mut().map(|cl| &mut **cl);
+    crate::kf_anim::curve_author_actor_param(layout, canvas, animated_params, param_id, t, value);
+}
+
+fn actor_curve_delete(
+    layout: &mut Vec<Keyframe<ActorState>>,
+    canvas_slot: &mut Option<&mut Vec<Keyframe<memstroy_core::CanvasTransform>>>,
+    animated_params: &BTreeSet<String>,
+    param_id: &str,
+    at_t: f32,
+) {
+    let canvas = canvas_slot.as_mut().map(|cl| &mut **cl);
+    crate::kf_anim::curve_delete_actor_param(layout, canvas, animated_params, param_id, at_t);
+}
+
+fn actor_curve_rekey(
+    layout: &mut Vec<Keyframe<ActorState>>,
+    canvas_slot: &mut Option<&mut Vec<Keyframe<memstroy_core::CanvasTransform>>>,
+    animated_params: &BTreeSet<String>,
+    param_id: &str,
+    old_t: f32,
+    new_t: f32,
+    value: f32,
+) {
+    let canvas = canvas_slot.as_mut().map(|cl| &mut **cl);
+    crate::kf_anim::curve_rekey_actor_param(
+        layout, canvas, animated_params, param_id, old_t, new_t, value,
+    );
+}
+
+fn overlay_curve_author(
+    layout: &mut Vec<Keyframe<OverlayState>>,
+    canvas_slot: &mut Option<&mut Vec<Keyframe<memstroy_core::CanvasTransform>>>,
+    animated_params: &BTreeSet<String>,
+    param_id: &str,
+    t: f32,
+    value: f32,
+) {
+    let canvas = canvas_slot.as_mut().map(|cl| &mut **cl);
+    crate::kf_anim::curve_author_overlay_param(layout, canvas, animated_params, param_id, t, value);
+}
+
+fn overlay_curve_delete(
+    layout: &mut Vec<Keyframe<OverlayState>>,
+    canvas_slot: &mut Option<&mut Vec<Keyframe<memstroy_core::CanvasTransform>>>,
+    animated_params: &BTreeSet<String>,
+    param_id: &str,
+    at_t: f32,
+) {
+    let canvas = canvas_slot.as_mut().map(|cl| &mut **cl);
+    crate::kf_anim::curve_delete_overlay_param(layout, canvas, animated_params, param_id, at_t);
+}
+
+fn overlay_curve_rekey(
+    layout: &mut Vec<Keyframe<OverlayState>>,
+    canvas_slot: &mut Option<&mut Vec<Keyframe<memstroy_core::CanvasTransform>>>,
+    animated_params: &BTreeSet<String>,
+    param_id: &str,
+    old_t: f32,
+    new_t: f32,
+    value: f32,
+) {
+    let canvas = canvas_slot.as_mut().map(|cl| &mut **cl);
+    crate::kf_anim::curve_rekey_overlay_param(
+        layout, canvas, animated_params, param_id, old_t, new_t, value,
+    );
+}
+
+fn render_frame_curve_author(
+    layout: &mut Vec<Keyframe<RenderFrameState>>,
+    _canvas_slot: &mut Option<&mut Vec<Keyframe<memstroy_core::CanvasTransform>>>,
+    animated_params: &BTreeSet<String>,
+    param_id: &str,
+    t: f32,
+    value: f32,
+) {
+    memstroy_core::author_render_frame_param_keyframe(layout, animated_params, param_id, t, value);
+}
+
+fn render_frame_curve_delete(
+    layout: &mut Vec<Keyframe<RenderFrameState>>,
+    _canvas_slot: &mut Option<&mut Vec<Keyframe<memstroy_core::CanvasTransform>>>,
+    animated_params: &BTreeSet<String>,
+    param_id: &str,
+    at_t: f32,
+) {
+    memstroy_core::delete_render_frame_param_keyframe_at(layout, animated_params, param_id, at_t);
+}
+
+fn render_frame_curve_rekey(
+    layout: &mut Vec<Keyframe<RenderFrameState>>,
+    _canvas_slot: &mut Option<&mut Vec<Keyframe<memstroy_core::CanvasTransform>>>,
+    animated_params: &BTreeSet<String>,
+    param_id: &str,
+    old_t: f32,
+    new_t: f32,
+    value: f32,
+) {
+    memstroy_core::rekey_render_frame_param_keyframe(
+        layout, animated_params, param_id, old_t, new_t, value,
+    );
+}
+
+/// One curve-editor control point for the active parameter only.
+struct ParamCurvePoint {
+    t: f32,
+    value: f32,
+    source: crate::kf_anim::ParamKeyframeSource,
+    easing: Easing,
+}
+
 /// Generic transform-curve editor used by both Actor and Overlay
 /// targets. Templated over the keyframe value type `T`. The caller
 /// supplies the property accessor / mutator and a default-state
@@ -642,9 +860,50 @@ fn transform_curve_editor<T>(
     selected_property: &mut usize,
     playhead: f32,
     time_offset: f32,
+    seed_t: f32,
+    canvas_slot: &mut Option<&mut Vec<Keyframe<memstroy_core::CanvasTransform>>>,
+    clear_param: fn(&mut Vec<Keyframe<T>>, &BTreeSet<String>, &str, f32),
+    enable_param: fn(&mut Vec<Keyframe<T>>, &BTreeSet<String>, &str, f32),
     get_property: fn(&T, usize) -> f32,
     set_property: fn(&mut T, usize, f32),
     default_value: fn() -> T,
+    param_change_times: fn(
+        &[Keyframe<T>],
+        &BTreeSet<String>,
+        Option<&[Keyframe<memstroy_core::CanvasTransform>]>,
+        &str,
+    ) -> Vec<f32>,
+    author_param: fn(
+        &mut Vec<Keyframe<T>>,
+        &mut Option<&mut Vec<Keyframe<memstroy_core::CanvasTransform>>>,
+        &BTreeSet<String>,
+        &str,
+        f32,
+        f32,
+    ),
+    delete_param_at: fn(
+        &mut Vec<Keyframe<T>>,
+        &mut Option<&mut Vec<Keyframe<memstroy_core::CanvasTransform>>>,
+        &BTreeSet<String>,
+        &str,
+        f32,
+    ),
+    rekey_param: fn(
+        &mut Vec<Keyframe<T>>,
+        &mut Option<&mut Vec<Keyframe<memstroy_core::CanvasTransform>>>,
+        &BTreeSet<String>,
+        &str,
+        f32,
+        f32,
+        f32,
+    ),
+    sample_param: fn(
+        &[Keyframe<T>],
+        Option<&[Keyframe<memstroy_core::CanvasTransform>]>,
+        &BTreeSet<String>,
+        &str,
+        f32,
+    ) -> f32,
     marquee: &mut Option<crate::state::CurveEditorMarquee>,
     ce_selected: &mut Vec<usize>,
     ce_multi_drag: &mut bool,
@@ -656,6 +915,7 @@ fn transform_curve_editor<T>(
     T: Clone,
 {
     use crate::i18n::t;
+    use crate::kf_anim::ParamKeyframeSource;
 
     // Decide up-front whether ANY parameter is currently flagged as
     // animated. When nothing is animated the panel becomes a thin
@@ -688,6 +948,10 @@ fn transform_curve_editor<T>(
         });
         return;
     }
+
+    let active_param_id = prop_to_param_id(*selected_property);
+    let mut pending_add_key: Option<(f32, f32)> = None;
+    let prev_property = *selected_property;
 
     // ── Property selector toolbar ──
     ui.horizontal(|ui| {
@@ -724,6 +988,9 @@ fn transform_curve_editor<T>(
             });
             let resp = ui.selectable_label(selected, text);
             if resp.clicked() {
+                if *selected_property != i {
+                    ce_selected.clear();
+                }
                 *selected_property = i;
             }
             // Context menu to toggle animation on/off
@@ -731,55 +998,40 @@ fn transform_curve_editor<T>(
                 if is_animated {
                     if ui.button(t("Disable animation")).clicked() {
                         animated_params.remove(param_id);
-                        // Check if any parameters are still animated
-                        let any_still_animated = PROPERTY_NAMES.iter().enumerate().any(|(other_i, _)| {
-                            let other_param_id = prop_to_param_id(other_i);
-                            animated_params.contains(other_param_id)
-                        });
-                        // If no parameters are animated, clear all keyframes
-                        if !any_still_animated {
-                            keyframes.clear();
-                        }
+                        clear_param(keyframes, animated_params, param_id, seed_t);
                         ui.close_menu();
                     }
-                } else {
-                    if ui.button(t("Enable animation")).clicked() {
-                        animated_params.insert(param_id.to_string());
-                        ui.close_menu();
-                    }
+                } else if ui.button(t("Enable animation")).clicked() {
+                    animated_params.insert(param_id.to_string());
+                    enable_param(keyframes, animated_params, param_id, seed_t);
+                    ui.close_menu();
                 }
             });
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui
-                .small_button(t("+ Key"))
-                .on_hover_text(t("Add keyframe at playhead"))
-                .clicked()
-            {
-                // The keyframe time stored on the layout is "scene
-                // time minus t_in" so it always matches the local
-                // frame the rest of the editor uses for that flavour
-                // of element.
-                let local_t = (playhead - time_offset).max(0.0);
-                let value = interpolate_at::<T>(
-                    keyframes,
-                    local_t,
-                    *selected_property,
-                    get_property,
-                );
-                let mut new_state = keyframes
-                    .last()
-                    .map(|kf| kf.value.clone())
-                    .unwrap_or_else(default_value);
-                set_property(&mut new_state, *selected_property, value);
-                keyframes.push(Keyframe::new(local_t, new_state));
-                keyframes.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap());
-                // Mark the parameter as animated — adding a kf is a
-                // strong signal of intent.
-                animated_params.insert(prop_to_param_id(*selected_property).to_string());
+            if animated_params.contains(active_param_id) {
+                if ui
+                    .small_button(t("+ Key"))
+                    .on_hover_text(t("Add keyframe at playhead for the selected parameter"))
+                    .clicked()
+                {
+                    let local_t = (playhead - time_offset).max(0.0);
+                    let canvas_slice = canvas_slot.as_ref().map(|cl| cl.as_slice());
+                    let value = sample_param(
+                        keyframes,
+                        canvas_slice,
+                        animated_params,
+                        active_param_id,
+                        local_t,
+                    );
+                    pending_add_key = Some((local_t, value));
+                }
             }
         });
     });
+    if prev_property != *selected_property {
+        ce_selected.clear();
+    }
 
     ui.add_space(4.0);
 
@@ -796,72 +1048,108 @@ fn transform_curve_editor<T>(
     }
 
     // ── Compute which keyframes are relevant for the selected property ──
-    // A keyframe is "relevant" if it's the first kf, or the value of the
-    // selected property differs from the previous kf. This prevents
-    // position-only keyframes from cluttering the Scale view (the core
-    // bug report: "position kfs showing in scale menu").
+    // Uses the same per-param change-point logic as the timeline param
+    // rows (`compute_param_change_points`) so canvas / inspector edits
+    // show identical diamonds here and under the layer strip.
     let prop = *selected_property;
-    let relevant_indices: Vec<usize> = {
-        let mut indices = Vec::new();
-        const EPS: f32 = 1.0e-4;
-        let mut last_kept: Option<f32> = None;
-        for (ki, kf) in keyframes.iter().enumerate() {
-            let cur_val = get_property(&kf.value, prop);
-            if ki == 0 {
-                // Always include the first kf — it establishes the
-                // initial value for the property.
-                indices.push(ki);
-                last_kept = Some(cur_val);
-            } else if last_kept.is_none() || (cur_val - last_kept.unwrap()).abs() > EPS {
-                // Compare against the previous *relevant* keyframe's value,
-                // not the immediate predecessor. This yields per-parameter
-                // keyframe points even when other properties insert extra
-                // keyframes at times when this property is unchanged.
-                indices.push(ki);
-                last_kept = Some(cur_val);
-            }
-        }
-        indices
+    let param_id = prop_to_param_id(prop);
+    let param_points: Vec<ParamCurvePoint> = {
+        let canvas_slice = canvas_slot.as_ref().map(|cl| cl.as_slice());
+        let change_times =
+            param_change_times(keyframes, animated_params, canvas_slice, param_id);
+        change_times
+            .iter()
+            .map(|&t| {
+                let source =
+                    crate::kf_anim::param_keyframe_source_at(keyframes, canvas_slice, param_id, t);
+                let (value, easing) = match source {
+                    crate::kf_anim::ParamKeyframeSource::Layout(i) => {
+                        let kf = &keyframes[i];
+                        (get_property(&kf.value, prop), kf.easing)
+                    }
+                    crate::kf_anim::ParamKeyframeSource::Canvas(i) => {
+                        if let Some(kf) = canvas_slice.and_then(|cl| cl.get(i)) {
+                            let v = match param_id {
+                                memstroy_core::param_ids::POS_X => kf.value.pos.x,
+                                memstroy_core::param_ids::POS_Y => kf.value.pos.y,
+                                memstroy_core::param_ids::SCALE => kf.value.scale,
+                                memstroy_core::param_ids::ROTATION => kf.value.rotation_deg,
+                                memstroy_core::param_ids::OPACITY => kf.value.opacity,
+                                _ => 0.0,
+                            };
+                            (v, kf.easing)
+                        } else {
+                            (
+                                sample_param(
+                                    keyframes,
+                                    canvas_slice,
+                                    animated_params,
+                                    param_id,
+                                    t,
+                                ),
+                                Easing::Linear,
+                            )
+                        }
+                    }
+                };
+                ParamCurvePoint {
+                    t,
+                    value,
+                    source,
+                    easing,
+                }
+            })
+            .collect()
     };
 
     // ── Easing picker for the selected kf at the playhead ──
-    // Only considers keyframes that are relevant to the selected property
-    // so the user isn't editing easing on a position-only kf while viewing
-    // the Scale curve.
-    if !relevant_indices.is_empty() {
+    if !param_points.is_empty() {
         let local_t = (playhead - time_offset).max(0.0);
-        let nearest_idx = relevant_indices
+        let nearest_pi = param_points
             .iter()
-            .copied()
-            .min_by(|&a, &b| {
-                let da = (keyframes[a].t - local_t).abs();
-                let db = (keyframes[b].t - local_t).abs();
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                let da = (a.t - local_t).abs();
+                let db = (b.t - local_t).abs();
                 da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
             })
+            .map(|(pi, _)| pi)
             .unwrap_or(0);
+        let nearest = &param_points[nearest_pi];
+        let nearest_source = nearest.source;
+        let nearest_t = nearest.t;
+        let mut headline_easing: Option<(ParamKeyframeSource, Easing)> = None;
         ui.horizontal(|ui| {
-            let cur_easing = keyframes[nearest_idx].easing;
+            let cur_easing = nearest.easing;
             if let Some(next) = easing_picker(ui, cur_easing) {
-                keyframes[nearest_idx].easing = next;
+                headline_easing = Some((nearest_source, next));
             }
-            // Show the kf number relative to relevant-only count so
-            // the user reads "kf #2 of 3" (only property-relevant kfs)
-            // instead of "kf #5 of 12" (all kfs including other props).
-            let display_num = relevant_indices
-                .iter()
-                .position(|&i| i == nearest_idx)
-                .map(|p| p + 1)
-                .unwrap_or(1);
             ui.label(
                 egui::RichText::new(format!(
                     "kf #{} @ {:.2}s",
-                    display_num,
-                    keyframes[nearest_idx].t,
+                    nearest_pi + 1,
+                    nearest_t,
                 ))
                 .size(10.0)
                 .color(Color32::from_rgb(120, 120, 140)),
             );
         });
+        if let Some((source, next)) = headline_easing {
+            match source {
+                ParamKeyframeSource::Layout(i) => {
+                    if let Some(kf) = keyframes.get_mut(i) {
+                        kf.easing = next;
+                    }
+                }
+                ParamKeyframeSource::Canvas(i) => {
+                if let Some(cl) = canvas_slot.as_mut().map(|v| &mut **v) {
+                    if let Some(kf) = cl.get_mut(i) {
+                        kf.easing = next;
+                    }
+                }
+                }
+            }
+        }
         ui.add_space(2.0);
     }
 
@@ -920,14 +1208,27 @@ fn transform_curve_editor<T>(
         }
     }
 
-    // Apply zoom and pan to time/value ranges
-    let (val_min_base, val_max_base) = property_range(prop);
+    // Value range follows the active parameter's samples so Pos X / canvas
+    // world coords are always visible (not clamped to 0..1 defaults).
+    let (val_min_base, val_max_base) = if param_points.is_empty() {
+        property_range(prop)
+    } else {
+        let mut vmin = f32::INFINITY;
+        let mut vmax = f32::NEG_INFINITY;
+        for p in &param_points {
+            vmin = vmin.min(p.value);
+            vmax = vmax.max(p.value);
+        }
+        let pad = (vmax - vmin).max(0.05) * 0.2;
+        (vmin - pad, vmax + pad)
+    };
+
     let time_center = duration * 0.5 + pan_offset.x;
     let value_center = (val_min_base + val_max_base) * 0.5 + pan_offset.y;
-    
+
     let time_span = duration.max(0.1) / *zoom;
-    let value_span = (val_max_base - val_min_base) / *zoom;
-    
+    let value_span = (val_max_base - val_min_base).max(0.1) / *zoom;
+
     let time_min = (time_center - time_span * 0.5).max(0.0);
     let time_max = time_center + time_span * 0.5;
     let val_min = value_center - value_span * 0.5;
@@ -954,22 +1255,22 @@ fn transform_curve_editor<T>(
 
     let curve_color = property_color(prop);
 
-    // Draw the curve segments.
-    if keyframes.len() >= 2 {
-        for pair in keyframes.windows(2) {
-            let (kf_a, kf_b) = (&pair[0], &pair[1]);
-            let va = get_property(&kf_a.value, prop);
-            let vb = get_property(&kf_b.value, prop);
-            let xa = time_to_graph_x(kf_a.t, time_min, time_max, inner_rect);
-            let ya = value_to_graph_y(va, val_min, val_max, inner_rect);
-            let xb = time_to_graph_x(kf_b.t, time_min, time_max, inner_rect);
-            let yb = value_to_graph_y(vb, val_min, val_max, inner_rect);
+    // Draw curve segments between consecutive breakpoints for this param only.
+    if param_points.len() >= 2 {
+        for pair in param_points.windows(2) {
+            let a = &pair[0];
+            let b = &pair[1];
+            let easing = b.easing;
+            let xa = time_to_graph_x(a.t, time_min, time_max, inner_rect);
+            let ya = value_to_graph_y(a.value, val_min, val_max, inner_rect);
+            let xb = time_to_graph_x(b.t, time_min, time_max, inner_rect);
+            let yb = value_to_graph_y(b.value, val_min, val_max, inner_rect);
 
             let num_samples = 24;
             let mut prev_point = Pos2::new(xa, ya);
             for i in 1..=num_samples {
                 let frac = i as f32 / num_samples as f32;
-                let eased = kf_b.easing.apply(frac);
+                let eased = easing.apply(frac);
                 let px = xa + frac * (xb - xa);
                 let py = ya + eased * (yb - ya);
                 let cur_point = Pos2::new(px, py);
@@ -980,6 +1281,15 @@ fn transform_curve_editor<T>(
                 prev_point = cur_point;
             }
         }
+    } else if let Some(p) = param_points.first() {
+        let y = value_to_graph_y(p.value, val_min, val_max, inner_rect);
+        painter.line_segment(
+            [
+                Pos2::new(inner_rect.min.x, y),
+                Pos2::new(inner_rect.max.x, y),
+            ],
+            Stroke::new(1.5, curve_color),
+        );
     }
 
     // Draw keyframe diamonds (draggable).
@@ -990,37 +1300,21 @@ fn transform_curve_editor<T>(
     // actual property changes — this fixes the "position kfs showing
     // in scale menu" bug.
     let diamond_size = 6.0;
-    let mut drag_idx: Option<usize> = None;
+    let mut drag_from_t: Option<f32> = None;
     let mut click_idx: Option<usize> = None;
-    let mut delete_idx: Option<usize> = None;
-    let mut easing_change: Option<(usize, Easing)> = None;
+    let mut delete_at_t: Option<f32> = None;
+    let mut easing_change: Option<(crate::kf_anim::ParamKeyframeSource, Easing)> = None;
     let ctrl_held = ui.input(|i| i.modifiers.ctrl || i.modifiers.mac_cmd);
     let shift_held = ui.input(|i| i.modifiers.shift);
 
-    for (ki, kf) in keyframes.iter().enumerate() {
-        let v = get_property(&kf.value, prop);
-        let cx = time_to_graph_x(kf.t, time_min, time_max, inner_rect);
-        let cy = value_to_graph_y(v, val_min, val_max, inner_rect);
+    for (pi, pt) in param_points.iter().enumerate() {
+        let kf_easing = pt.easing;
+        let cx = time_to_graph_x(pt.t, time_min, time_max, inner_rect);
+        let cy = value_to_graph_y(pt.value, val_min, val_max, inner_rect);
         let center = Pos2::new(cx, cy);
 
-        let is_relevant = relevant_indices.contains(&ki);
+        let is_ce_selected = ce_selected.contains(&pi);
 
-        if !is_relevant {
-            // Irrelevant kf: draw a tiny dimmed circle as a hint, no
-            // interaction. This prevents the user from accidentally
-            // dragging/editing a kf that belongs to another property.
-            let ghost_r = 2.5;
-            painter.circle_filled(
-                center,
-                ghost_r,
-                Color32::from_rgba_premultiplied(140, 140, 160, 60),
-            );
-            continue;
-        }
-
-        let is_ce_selected = ce_selected.contains(&ki);
-
-        // Apply multi-drag offset for display.
         let display_center = if is_ce_selected && *ce_multi_drag {
             Pos2::new(center.x + ce_multi_drag_delta.x, center.y + ce_multi_drag_delta.y)
         } else {
@@ -1038,7 +1332,7 @@ fn transform_curve_editor<T>(
             Color32::WHITE
         };
 
-        if kf.easing == Easing::Step {
+        if kf_easing == Easing::Step {
             // Instant transition: draw a square to distinguish step-hold keyframes.
             let r = Rect::from_center_size(display_center, Vec2::splat(diamond_size * 2.0));
             painter.rect_filled(r, Rounding::ZERO, fill);
@@ -1057,8 +1351,8 @@ fn transform_curve_editor<T>(
             ));
         }
 
-        if keyframes.len() > 1 && ki > 0 {
-            let easing_l = match kf.easing {
+        if param_points.len() > 1 {
+            let easing_l = match kf_easing {
                 Easing::Step => "Step",
                 Easing::Linear => "",
                 Easing::EaseIn => "In",
@@ -1078,12 +1372,12 @@ fn transform_curve_editor<T>(
         }
 
         let diamond_rect = Rect::from_center_size(display_center, Vec2::splat(diamond_size * 2.5));
-        let id = ui.make_persistent_id(("curve_kf", ki));
+        let id = ui.make_persistent_id(("curve_kf", param_id, pi));
         let kf_resp = ui.interact(diamond_rect, id, Sense::click_and_drag());
 
         if kf_resp.drag_started() {
+            drag_from_t = Some(pt.t);
             if is_ce_selected && ce_selected.len() > 1 {
-                // Start multi-drag.
                 *ce_multi_drag = true;
                 *ce_multi_drag_delta = egui::Vec2::ZERO;
             }
@@ -1091,18 +1385,31 @@ fn transform_curve_editor<T>(
         if kf_resp.dragged() {
             if is_ce_selected && *ce_multi_drag {
                 *ce_multi_drag_delta += kf_resp.drag_delta();
-            } else {
-                drag_idx = Some(ki);
+            } else if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
+                let old_t = drag_from_t.unwrap_or(pt.t);
+                let new_t =
+                    graph_x_to_time(pos.x, time_min, time_max, inner_rect).clamp(0.0, time_max);
+                let new_v =
+                    graph_y_to_value(pos.y, val_min, val_max, inner_rect).clamp(val_min, val_max);
+                rekey_param(
+                    keyframes,
+                    canvas_slot,
+                    animated_params,
+                    param_id,
+                    old_t,
+                    new_t,
+                    new_v,
+                );
+                drag_from_t = Some(new_t);
             }
         }
         if kf_resp.drag_stopped() && is_ce_selected && *ce_multi_drag {
-            // Defer commit to after the loop (can't mutate keyframes
-            // while iterating).
-            drag_idx = None; // suppress single-drag path
+            drag_from_t = None;
         }
         if kf_resp.clicked() {
-            click_idx = Some(ki);
+            click_idx = Some(pi);
         }
+        let pt_source = pt.source;
         kf_resp.context_menu(|ui| {
             ui.label(egui::RichText::new(t("Interpolation")).size(10.0).strong());
             ui.separator();
@@ -1114,15 +1421,15 @@ fn transform_curve_editor<T>(
                 ("Step (hold)", Easing::Step),
                 ("Cubic", Easing::Cubic),
             ] {
-                let selected = kf.easing == value;
+                let selected = kf_easing == value;
                 if ui.selectable_label(selected, t(label)).clicked() {
-                    easing_change = Some((ki, value));
+                    easing_change = Some((pt_source, value));
                     ui.close_menu();
                 }
             }
             ui.separator();
             if ui.selectable_label(false, t("Delete keyframe")).clicked() {
-                delete_idx = Some(ki);
+                delete_at_t = Some(pt.t);
                 ui.close_menu();
             }
         });
@@ -1138,19 +1445,25 @@ fn transform_curve_editor<T>(
         let mut sorted_sel: Vec<usize> = ce_selected.clone();
         sorted_sel.sort();
         for &si in &sorted_sel {
-            if si < keyframes.len() {
-                let old_v = get_property(&keyframes[si].value, prop);
-                let old_cx = time_to_graph_x(keyframes[si].t, time_min, time_max, inner_rect);
-                let old_cy = value_to_graph_y(old_v, val_min, val_max, inner_rect);
-                let new_t = graph_x_to_time(old_cx + dx, time_min, time_max, inner_rect)
-                    .clamp(0.0, time_max);
-                let new_v = graph_y_to_value(old_cy + dy, val_min, val_max, inner_rect)
-                    .clamp(val_min, val_max);
-                keyframes[si].t = new_t;
-                set_property(&mut keyframes[si].value, prop, new_v);
-            }
+            let Some(pt) = param_points.get(si) else {
+                continue;
+            };
+            let old_cx = time_to_graph_x(pt.t, time_min, time_max, inner_rect);
+            let old_cy = value_to_graph_y(pt.value, val_min, val_max, inner_rect);
+            let new_t =
+                graph_x_to_time(old_cx + dx, time_min, time_max, inner_rect).clamp(0.0, time_max);
+            let new_v =
+                graph_y_to_value(old_cy + dy, val_min, val_max, inner_rect).clamp(val_min, val_max);
+            rekey_param(
+                keyframes,
+                canvas_slot,
+                animated_params,
+                param_id,
+                pt.t,
+                new_t,
+                new_v,
+            );
         }
-        keyframes.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap());
         ce_selected.clear();
         *ce_multi_drag = false;
         *ce_multi_drag_delta = egui::Vec2::ZERO;
@@ -1172,34 +1485,25 @@ fn transform_curve_editor<T>(
         }
     }
 
-    if let Some((ki, e)) = easing_change {
-        if let Some(kf) = keyframes.get_mut(ki) {
-            kf.easing = e;
-        }
-    }
-    if let Some(ki) = delete_idx {
-        if ki < keyframes.len() {
-            keyframes.remove(ki);
-            // Remove from selection.
-            ce_selected.retain(|&x| x != ki);
-            // Adjust indices > ki.
-            for idx in ce_selected.iter_mut() {
-                if *idx > ki {
-                    *idx -= 1;
+    if let Some((source, e)) = easing_change {
+        match source {
+            ParamKeyframeSource::Layout(i) => {
+                if let Some(kf) = keyframes.get_mut(i) {
+                    kf.easing = e;
+                }
+            }
+            ParamKeyframeSource::Canvas(i) => {
+                if let Some(cl) = canvas_slot.as_mut().map(|v| &mut **v) {
+                    if let Some(kf) = cl.get_mut(i) {
+                        kf.easing = e;
+                    }
                 }
             }
         }
     }
-
-    if let Some(ki) = drag_idx {
-        if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
-            let new_t = graph_x_to_time(pos.x, time_min, time_max, inner_rect)
-                .clamp(0.0, time_max);
-            let new_v = graph_y_to_value(pos.y, val_min, val_max, inner_rect)
-                .clamp(val_min, val_max);
-            keyframes[ki].t = new_t;
-            set_property(&mut keyframes[ki].value, prop, new_v);
-        }
+    if let Some(at_t) = delete_at_t {
+        delete_param_at(keyframes, canvas_slot, animated_params, param_id, at_t);
+        ce_selected.clear();
     }
 
     if response.double_clicked() {
@@ -1208,14 +1512,15 @@ fn transform_curve_editor<T>(
                 .clamp(0.0, time_max);
             let new_v = graph_y_to_value(pos.y, val_min, val_max, inner_rect)
                 .clamp(val_min, val_max);
-            let mut new_state = keyframes
-                .last()
-                .map(|kf| kf.value.clone())
-                .unwrap_or_else(default_value);
-            set_property(&mut new_state, prop, new_v);
-            keyframes.push(Keyframe::new(new_t, new_state));
-            keyframes.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap());
-            animated_params.insert(prop_to_param_id(prop).to_string());
+            animated_params.insert(param_id.to_string());
+            author_param(
+                keyframes,
+                canvas_slot,
+                animated_params,
+                param_id,
+                new_t,
+                new_v,
+            );
         }
     }
 
@@ -1223,7 +1528,7 @@ fn transform_curve_editor<T>(
     // Starts when the user drags from empty space inside the graph
     // (no diamond hit). On release, selects all relevant diamonds
     // whose centers fall inside the rectangle.
-    if drag_idx.is_none() && !*ce_multi_drag {
+    if !*ce_multi_drag {
         let primary_pressed = ui.input(|i| i.pointer.primary_pressed());
         let press_origin = ui.input(|i| i.pointer.press_origin());
         let any_down = ui.input(|i| i.pointer.any_down());
@@ -1232,24 +1537,15 @@ fn transform_curve_editor<T>(
         if marquee.is_none() && primary_pressed {
             if let Some(p) = press_origin {
                 if inner_rect.contains(p) {
-                    // Check no diamond is under the press.
-                    let mut on_diamond = false;
-                    for (ki, kf) in keyframes.iter().enumerate() {
-                        if !relevant_indices.contains(&ki) {
-                            continue;
-                        }
-                        let v = get_property(&kf.value, prop);
-                        let cx = time_to_graph_x(kf.t, time_min, time_max, inner_rect);
-                        let cy_kf = value_to_graph_y(v, val_min, val_max, inner_rect);
-                        let dr = Rect::from_center_size(
+                    let on_diamond = param_points.iter().any(|pt| {
+                        let cx = time_to_graph_x(pt.t, time_min, time_max, inner_rect);
+                        let cy_kf = value_to_graph_y(pt.value, val_min, val_max, inner_rect);
+                        Rect::from_center_size(
                             Pos2::new(cx, cy_kf),
                             Vec2::splat(diamond_size * 2.5),
-                        );
-                        if dr.contains(p) {
-                            on_diamond = true;
-                            break;
-                        }
-                    }
+                        )
+                        .contains(p)
+                    });
                     if !on_diamond {
                         *marquee = Some(crate::state::CurveEditorMarquee {
                             start: p,
@@ -1287,22 +1583,27 @@ fn transform_curve_editor<T>(
                     if !extend {
                         ce_selected.clear();
                     }
-                    for (ki, kf) in keyframes.iter().enumerate() {
-                        if !relevant_indices.contains(&ki) {
-                            continue;
-                        }
-                        let v = get_property(&kf.value, prop);
-                        let cx = time_to_graph_x(kf.t, time_min, time_max, inner_rect);
-                        let cy_kf = value_to_graph_y(v, val_min, val_max, inner_rect);
-                        if rect.contains(Pos2::new(cx, cy_kf)) {
-                            if !ce_selected.contains(&ki) {
-                                ce_selected.push(ki);
-                            }
+                    for (pi, pt) in param_points.iter().enumerate() {
+                        let cx = time_to_graph_x(pt.t, time_min, time_max, inner_rect);
+                        let cy_kf = value_to_graph_y(pt.value, val_min, val_max, inner_rect);
+                        if rect.contains(Pos2::new(cx, cy_kf)) && !ce_selected.contains(&pi) {
+                            ce_selected.push(pi);
                         }
                     }
                 }
             }
         }
+    }
+
+    if let Some((local_t, value)) = pending_add_key {
+        author_param(
+            keyframes,
+            canvas_slot,
+            animated_params,
+            active_param_id,
+            local_t,
+            value,
+        );
     }
 
     let _ = NUM_TRANSFORM_PROPS;

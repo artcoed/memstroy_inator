@@ -107,6 +107,9 @@ ttf-parser = "0.25"
 # ab_glyph did not. Already present transitively via memstroy-render
 # / egui, so this is just an explicit re-export with no extra cost.
 ab_glyph = "0.2"
+# Portable SIMD (AVX2 / SSE / NEON) for the chroma-key + colour-correction
+# pipeline. Auto-detects the best instruction set at runtime via `wide`.
+wide = "0.7"
 
 # ── Windows-only build dependency: PE VersionInfo resource ──────────
 # `winresource` programmatically generates and links a Win32
