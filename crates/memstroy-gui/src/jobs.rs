@@ -405,7 +405,7 @@ pub fn spawn_refresh(
 
             // Skip if metadata already downloaded locally
             // We only download metadata (txt + thumbnail), not the video itself
-            if txt_path.exists() && thumb_jpg.exists() {
+            if txt_path.exists() && find_local_thumbnail(&clips_dir, &safe_id).is_some() {
                 info!("Clip {} already has metadata, skipping", safe_id);
                 downloaded_ids.insert(item.id.clone());
                 new_count += 1;
@@ -439,13 +439,13 @@ pub fn spawn_refresh(
             }
 
             // Download thumbnail (always, even if video exists)
-            if !thumb_jpg.exists() {
+            if find_local_thumbnail(&clips_dir, &safe_id).is_none() {
                 let thumb_url = format!(
                     "{}/api/assets/{}/preview",
                     server, item.id
                 );
                 info!("Downloading thumbnail from: {}", thumb_url);
-                match download_file(&client, &thumb_url, &thumb_jpg).await {
+                match download_thumbnail(&client, &thumb_url, &thumb_jpg).await {
                     Ok(_) => {
                         info!("✓ Downloaded thumbnail for {}", safe_id);
                         // Verify file was created
@@ -472,6 +472,8 @@ pub fn spawn_refresh(
             // Small delay to avoid overwhelming the server
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+
+        generate_thumbnails(&clips_dir, &thumbs_dir).await;
 
         let _ = tx.send(JobEvent::RefreshFinished(Ok(RefreshSummary {
             new_clips: new_count,
@@ -501,13 +503,56 @@ pub struct ListResponse {
     pub items: Vec<ServerAssetSummary>,
 }
 
-/// HTTP GET → file. Buffers the whole body in memory because the
-/// per-clip files are small enough (TG preview pages cap clip duration
-/// to ~60 s).
-pub async fn download_file(
+/// Locate a local thumbnail for a clip stem, mirroring server-side
+/// `find_thumbnail` resolution order.
+pub fn find_local_thumbnail(clips_dir: &std::path::Path, stem: &str) -> Option<PathBuf> {
+    let mp4_path = clips_dir.join(format!("{stem}.mp4"));
+
+    for ext in ["png", "jpg", "jpeg", "webp"] {
+        let cand = clips_dir.join(format!("{stem}.thumb.{ext}"));
+        if cand.exists() {
+            return Some(cand);
+        }
+    }
+
+    let thumbs_dir = clips_dir.join("thumbs");
+    if thumbs_dir.is_dir() {
+        for ext in ["jpg", "jpeg", "png", "webp"] {
+            let cand = thumbs_dir.join(format!("{stem}.{ext}"));
+            if cand.exists() {
+                return Some(cand);
+            }
+        }
+    }
+
+    for ext in ["png", "jpg", "jpeg", "webp"] {
+        let cand = clips_dir.join(format!("{stem}.{ext}"));
+        if cand.exists() && cand != mp4_path {
+            return Some(cand);
+        }
+    }
+
+    None
+}
+
+fn is_valid_image_bytes(bytes: &[u8]) -> bool {
+    if bytes.len() >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF {
+        return true;
+    }
+    if bytes.len() >= 8
+        && bytes[0..8] == [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
+    {
+        return true;
+    }
+    bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP"
+}
+
+async fn download_response_to_file(
     client: &reqwest::Client,
     url: &str,
     target: &std::path::Path,
+    min_bytes: usize,
+    require_image: bool,
 ) -> Result<(), String> {
     let resp = client
         .get(url)
@@ -555,17 +600,19 @@ pub async fn download_file(
             ));
         }
     }
-    if bytes.len() <= 4096 {
-        // Guard against HTML/error pages or truncated bodies saved as `.mp4`.
-        // The GUI's `is_usable_local_video` uses the same 4KB threshold.
+    if bytes.len() < min_bytes {
         return Err(format!(
             "download too small: {} bytes (content-type={ct})",
             bytes.len()
         ));
     }
+    if require_image && !is_valid_image_bytes(&bytes) {
+        return Err(format!(
+            "not a valid image: {} bytes (content-type={ct})",
+            bytes.len()
+        ));
+    }
 
-    // Atomic write: write to a temp file then rename. Prevents the GUI from
-    // seeing a partially-written file as the final target.
     let tmp = target.with_extension("partial");
     if let Some(parent) = tmp.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
@@ -576,6 +623,30 @@ pub async fn download_file(
     tokio::fs::rename(&tmp, target)
         .await
         .map_err(|e| format!("rename error: {e}"))
+}
+
+/// HTTP GET → file. Buffers the whole body in memory because the
+/// per-clip files are small enough (TG preview pages cap clip duration
+/// to ~60 s).
+pub async fn download_file(
+    client: &reqwest::Client,
+    url: &str,
+    target: &std::path::Path,
+) -> Result<(), String> {
+    // Guard against HTML/error pages or truncated bodies saved as `.mp4`.
+    // The GUI's `is_usable_local_video` uses the same 4KB threshold.
+    download_response_to_file(client, url, target, 4097, false).await
+}
+
+/// Download a preview JPEG/PNG/WebP from the assets server. Thumbnails
+/// are often well under 4KB (ffmpeg uses `scale=160:-1`), so they
+/// must not go through the video size guard in [`download_file`].
+pub async fn download_thumbnail(
+    client: &reqwest::Client,
+    url: &str,
+    target: &std::path::Path,
+) -> Result<(), String> {
+    download_response_to_file(client, url, target, 64, true).await
 }
 
 /// Strip characters that aren't safe in filenames (defence-in-depth —
@@ -624,6 +695,12 @@ pub fn spawn_clip_download(
         }
         let result = download_file(&client, &url, &local_path).await
             .map(|_| local_path.clone());
+        if result.is_ok() {
+            if let Some(clips_dir) = local_path.parent() {
+                let thumbs_dir = clips_dir.join("thumbs");
+                generate_thumbnails(clips_dir, &thumbs_dir).await;
+            }
+        }
         let _ = tx.send(JobEvent::ClipDownloaded {
             server_id,
             result,
@@ -634,8 +711,7 @@ pub fn spawn_clip_download(
 
 /// For every `*.mp4` file in `clips_dir` without a matching
 /// `thumbs/<stem>.jpg`, run a quick ffmpeg pass to extract a frame.
-#[allow(dead_code)]
-async fn generate_thumbnails(clips_dir: &std::path::Path, thumbs_dir: &std::path::Path) {
+pub(crate) async fn generate_thumbnails(clips_dir: &std::path::Path, thumbs_dir: &std::path::Path) -> usize {
     let bin = ffmpeg_binary();
     let ffmpeg_ok = {
         let mut cmd = std::process::Command::new(&bin);
@@ -646,13 +722,15 @@ async fn generate_thumbnails(clips_dir: &std::path::Path, thumbs_dir: &std::path
     };
     if !ffmpeg_ok {
         warn!("ffmpeg not found — skipping thumbnail generation");
-        return;
+        return 0;
     }
 
+    let _ = std::fs::create_dir_all(thumbs_dir);
     let entries = match std::fs::read_dir(clips_dir) {
         Ok(e) => e,
-        Err(_) => return,
+        Err(_) => return 0,
     };
+    let mut generated = 0usize;
     for entry in entries.flatten() {
         let p = entry.path();
         if !p.is_file() { continue; }
@@ -666,8 +744,10 @@ async fn generate_thumbnails(clips_dir: &std::path::Path, thumbs_dir: &std::path
             Some(s) => s.to_string(),
             None => continue,
         };
+        if find_local_thumbnail(clips_dir, &stem).is_some() {
+            continue;
+        }
         let thumb = thumbs_dir.join(format!("{}.jpg", stem));
-        if thumb.exists() { continue; }
 
         let result = {
             let mut cmd = tokio::process::Command::new(&bin);
@@ -687,6 +767,7 @@ async fn generate_thumbnails(clips_dir: &std::path::Path, thumbs_dir: &std::path
         match result {
             Ok(status) if status.success() => {
                 info!(id = %stem, "generated thumbnail");
+                generated += 1;
             }
             Ok(_) => {
                 // Some clips fail at ss=0.5 (very short). Retry from 0.
@@ -701,11 +782,18 @@ async fn generate_thumbnails(clips_dir: &std::path::Path, thumbs_dir: &std::path
                 .arg(&thumb)
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null());
-                let _ = memstroy_render::hide_console_tokio(&mut cmd).status().await;
+                if memstroy_render::hide_console_tokio(&mut cmd).status().await
+                    .map(|s| s.success())
+                    .unwrap_or(false)
+                {
+                    info!(id = %stem, "generated thumbnail (retry from 0)");
+                    generated += 1;
+                }
             }
             Err(e) => warn!(id = %stem, error = %e, "ffmpeg thumbnail failed"),
         }
     }
+    generated
 }
 
 

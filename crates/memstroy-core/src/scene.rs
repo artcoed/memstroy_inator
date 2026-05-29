@@ -273,6 +273,38 @@ impl Scene {
         })
     }
 
+    /// All element ids in the parenting subtree rooted at `root_id`
+    /// (includes `root_id` itself). Actors and overlays may parent each
+    /// other; order is breadth-first.
+    pub fn collect_element_subtree_ids(&self, root_id: &str) -> Vec<String> {
+        let mut ids = vec![root_id.to_string()];
+        let mut idx = 0usize;
+        while idx < ids.len() {
+            let parent = ids[idx].clone();
+            idx += 1;
+            for actor in &self.actors {
+                if actor.parent_id.as_deref() == Some(parent.as_str())
+                    && !ids.iter().any(|id| id == &actor.id)
+                {
+                    ids.push(actor.id.clone());
+                }
+            }
+            for overlay in &self.overlays {
+                let (child_id, child_parent) = match overlay {
+                    Overlay::Text(o) => (&o.id, o.parent_id.as_deref()),
+                    Overlay::Image(o) => (&o.id, o.parent_id.as_deref()),
+                    Overlay::Video(o) => (&o.id, o.parent_id.as_deref()),
+                };
+                if child_parent == Some(parent.as_str())
+                    && !ids.iter().any(|id| id == child_id)
+                {
+                    ids.push(child_id.clone());
+                }
+            }
+        }
+        ids
+    }
+
     pub fn set_element_parent_id(&mut self, element_id: &str, parent_id: Option<String>) -> bool {
         if let Some(actor) = self.actors.iter_mut().find(|a| a.id == element_id) {
             actor.parent_id = parent_id;

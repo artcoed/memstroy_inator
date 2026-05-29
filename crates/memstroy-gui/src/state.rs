@@ -1309,6 +1309,61 @@ impl EditorState {
         self.actor_track_assignments = snap.actor_track_assignments;
         self.overlay_track_assignments = snap.overlay_track_assignments;
         self.audio_track_assignments = snap.audio_track_assignments;
+        self.sanitize_track_assignments();
+    }
+
+    /// Save undo snapshot, then apply a mutation that may touch lane
+    /// assignments, selection, or other editor state outside `Scene`.
+    pub fn mutate_state(&mut self, f: impl FnOnce(&mut Self)) {
+        self.last_drag_group = None;
+        let snap = self.build_undo_snapshot();
+        self.undo.push_full(snap);
+        f(self);
+        self.sanitize_track_assignments();
+    }
+
+    /// One undo snapshot per canvas / timeline drag gesture (includes
+    /// lane assignments so Ctrl+Z does not orphan clips from the panel).
+    pub fn push_drag_undo_if_needed(&mut self, token: u64) {
+        if self.last_drag_group != Some(token) {
+            self.last_drag_group = None;
+            self.undo.push_full(self.build_undo_snapshot());
+            self.last_drag_group = Some(token);
+        }
+    }
+
+    /// Clamp lane indices after undo/redo or legacy snapshots so every
+    /// clip still maps to a valid video/audio row in the layers panel.
+    pub fn sanitize_track_assignments(&mut self) {
+        let video_lanes = self.video_track_indices();
+        let audio_lanes = self.audio_track_indices();
+        let default_actor = video_lanes.first().copied().unwrap_or(0);
+        let default_overlay = if video_lanes.len() >= 2 {
+            video_lanes[1]
+        } else {
+            default_actor
+        };
+        let default_audio = audio_lanes.first().copied().unwrap_or(0);
+
+        let clamp_video = |lane: &mut usize| {
+            if video_lanes.contains(lane) {
+                return;
+            }
+            *lane = default_overlay;
+        };
+        for lane in self.actor_track_assignments.values_mut() {
+            if !video_lanes.contains(lane) {
+                *lane = default_actor;
+            }
+        }
+        for lane in self.overlay_track_assignments.values_mut() {
+            clamp_video(lane);
+        }
+        for lane in self.audio_track_assignments.values_mut() {
+            if !audio_lanes.contains(lane) {
+                *lane = default_audio;
+            }
+        }
     }
 
     /// Save undo snapshot, then apply a mutation via the closure.
@@ -1538,12 +1593,95 @@ impl EditorState {
         None
     }
 
+    /// Like [`Self::find_empty_video_lane_at`] but treats a lane as busy
+    /// when any clip's half-open range `[t_in, t_out)` overlaps the
+    /// candidate placement range. Required for image overlays that span
+    /// several seconds at the playhead.
+    pub fn find_empty_video_lane_for_range(&self, t_in: f32, t_out: f32) -> Option<usize> {
+        let scene_dur = self.scene.output.duration.max(0.0);
+        for &lane in self.video_track_indices().iter() {
+            if self.tracks.get(lane).map(|t| t.locked).unwrap_or(false) {
+                continue;
+            }
+            let mut busy = false;
+            for (ai, _) in self.scene.actors.iter().enumerate() {
+                let assigned = self
+                    .actor_track_assignments
+                    .get(&ai)
+                    .copied()
+                    .unwrap_or_else(|| {
+                        self.video_track_indices()
+                            .first()
+                            .copied()
+                            .unwrap_or(0)
+                    });
+                if assigned != lane {
+                    continue;
+                }
+                let a = &self.scene.actors[ai];
+                let other_in = a.t_in.unwrap_or(0.0);
+                let other_out = a.t_out.unwrap_or(scene_dur);
+                if t_in < other_out && other_in < t_out {
+                    busy = true;
+                    break;
+                }
+            }
+            if busy {
+                continue;
+            }
+            let default_overlay_lane = {
+                let v = self.video_track_indices();
+                if v.len() >= 2 {
+                    v[1]
+                } else {
+                    v.first().copied().unwrap_or(0)
+                }
+            };
+            for (oi, ov) in self.scene.overlays.iter().enumerate() {
+                let assigned = self
+                    .overlay_track_assignments
+                    .get(&oi)
+                    .copied()
+                    .unwrap_or(default_overlay_lane);
+                if assigned != lane {
+                    continue;
+                }
+                let (other_in, other_out) = match ov {
+                    memstroy_core::Overlay::Text(o) => (o.t_in, o.t_out),
+                    memstroy_core::Overlay::Image(o) => (o.t_in, o.t_out),
+                    memstroy_core::Overlay::Video(o) => (o.t_in, o.t_out),
+                };
+                if t_in < other_out && other_in < t_out {
+                    busy = true;
+                    break;
+                }
+            }
+            if !busy {
+                return Some(lane);
+            }
+        }
+        None
+    }
+
     /// Pick the lane a fresh canvas-dropped clip should land on:
     /// the first empty video lane at time `t`, falling back to a
     /// freshly-inserted lane at the top of the video stack when every
     /// existing lane is busy.
     pub fn pick_or_create_empty_video_lane_at(&mut self, t: f32) -> usize {
         if let Some(lane) = self.find_empty_video_lane_at(t) {
+            lane
+        } else {
+            self.insert_video_track_at_top()
+        }
+    }
+
+    /// Range-aware lane picker for image / overlay clips.
+    pub fn pick_or_create_empty_video_lane_for_range(
+        &mut self,
+        t_in: f32,
+        t_out: f32,
+    ) -> usize {
+        if let Some(lane) = self.find_empty_video_lane_for_range(t_in, t_out) {
             lane
         } else {
             self.insert_video_track_at_top()
@@ -2017,15 +2155,7 @@ impl EditorState {
                     .map(|s| s.trim().to_string())
                     .unwrap_or_default();
                 
-                let thumb_jpg = thumbs_dir.join(format!("{}.jpg", stem));
-                let thumb_png = thumbs_dir.join(format!("{}.png", stem));
-                let thumbnail = if thumb_jpg.exists() {
-                    Some(thumb_jpg)
-                } else if thumb_png.exists() {
-                    Some(thumb_png)
-                } else {
-                    None
-                };
+                let thumbnail = crate::jobs::find_local_thumbnail(clips_dir, &stem);
                 
                 info!(
                     "Loaded clip from txt: id={}, stem={}, downloaded={}, has_thumb={}, desc_len={}",
@@ -2130,15 +2260,7 @@ impl EditorState {
                     h.finish()
                 });
                 
-                let thumb_jpg = thumbs_dir.join(format!("{}.jpg", stem));
-                let thumb_png = thumbs_dir.join(format!("{}.png", stem));
-                let thumbnail = if thumb_jpg.exists() {
-                    Some(thumb_jpg)
-                } else if thumb_png.exists() {
-                    Some(thumb_png)
-                } else {
-                    None
-                };
+                let thumbnail = crate::jobs::find_local_thumbnail(clips_dir, &stem);
                 
                 let txt_path = clips_dir.join(format!("{}.txt", stem));
                 let description = std::fs::read_to_string(&txt_path)
@@ -2314,72 +2436,89 @@ impl EditorState {
             let thumbs_dir = clips_dir.join("thumbs");
             let _ = tokio::fs::create_dir_all(&thumbs_dir).await;
 
-            let mut new_clips_count = 0;
+            let mut updated_count = 0;
 
-            // Download metadata for each server clip not in local cache
+            // Download metadata and/or missing thumbnails for server clips.
             for item in listing.items.iter() {
-                // Skip if already in local cache
-                if local_clip_ids.contains(&item.id) {
-                    continue;
-                }
-
                 let safe_id = crate::jobs::sanitise_id(&item.id);
                 let txt_path = clips_dir.join(format!("{}.txt", safe_id));
                 let thumb_jpg = thumbs_dir.join(format!("{}.jpg", safe_id));
+                let has_local_thumb =
+                    crate::jobs::find_local_thumbnail(&clips_dir, &safe_id).is_some();
+                let in_local_cache = local_clip_ids.contains(&item.id);
 
-                // Skip if metadata already exists (race condition with manual refresh)
-                if txt_path.exists() && thumb_jpg.exists() {
+                // Skip only when the clip is already known locally and has a preview.
+                if in_local_cache && has_local_thumb {
+                    continue;
+                }
+
+                // Skip if another task already wrote everything we need.
+                if txt_path.exists() && has_local_thumb {
                     tracing::debug!("Metadata already exists for clip {}, skipping", safe_id);
                     continue;
                 }
 
                 tracing::debug!("Downloading metadata for clip: {}", safe_id);
 
-                // Download description
-                if !item.description.is_empty() {
-                    match tokio::fs::write(&txt_path, item.description.as_bytes()).await {
-                        Ok(_) => {
-                            tracing::debug!("✓ Wrote description for {}", safe_id);
+                let mut updated = false;
+
+                // Download description when missing.
+                if !txt_path.exists() {
+                    if !item.description.is_empty() {
+                        match tokio::fs::write(&txt_path, item.description.as_bytes()).await {
+                            Ok(_) => {
+                                tracing::debug!("✓ Wrote description for {}", safe_id);
+                                updated = true;
+                            }
+                            Err(e) => {
+                                tracing::warn!("✗ Failed to write description for {}: {}", safe_id, e);
+                                continue;
+                            }
                         }
-                        Err(e) => {
-                            tracing::warn!("✗ Failed to write description for {}: {}", safe_id, e);
-                            continue;
-                        }
+                    } else {
+                        let _ = tokio::fs::write(&txt_path, b"").await;
+                        updated = true;
                     }
-                } else {
-                    // Create empty txt file
-                    let _ = tokio::fs::write(&txt_path, b"").await;
                 }
 
-                // Download thumbnail
-                if !thumb_jpg.exists() {
+                // Retry thumbnail download when the clip is known but preview is missing.
+                if !has_local_thumb {
                     let thumb_url = format!("{}/api/assets/{}/preview", server, item.id);
-                    match crate::jobs::download_file(&client, &thumb_url, &thumb_jpg).await {
+                    match crate::jobs::download_thumbnail(&client, &thumb_url, &thumb_jpg).await {
                         Ok(_) => {
                             tracing::debug!("✓ Downloaded thumbnail for {}", safe_id);
+                            updated = true;
                         }
                         Err(e) => {
                             tracing::warn!("✗ Failed to download thumbnail for {}: {}", safe_id, e);
-                            // Continue even if thumbnail fails - we have the description
                         }
                     }
                 }
 
-                new_clips_count += 1;
+                if updated {
+                    updated_count += 1;
+                }
 
                 // Small delay to avoid overwhelming the server
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
 
-            if new_clips_count > 0 {
-                tracing::info!("Downloaded metadata for {} new server clips", new_clips_count);
+            let generated_thumbs =
+                crate::jobs::generate_thumbnails(&clips_dir, &thumbs_dir).await;
+
+            if updated_count > 0 || generated_thumbs > 0 {
+                tracing::info!(
+                    "Updated metadata for {} server clips, generated {} local thumbnails",
+                    updated_count,
+                    generated_thumbs
+                );
                 
                 // Trigger UI refresh to reload library with new metadata
                 let _ = tx.send(crate::jobs::JobEvent::RefreshLibraryReloaded(
-                    format!("Loaded {} clips from server", new_clips_count)
+                    format!("Loaded {} clips from server", updated_count)
                 ));
             } else {
-                tracing::debug!("No new server clips to download");
+                tracing::debug!("No server clip metadata needed updating");
             }
         });
     }
@@ -2567,7 +2706,7 @@ impl EditorState {
         let playhead = self.playhead;
         // Take a single undo snapshot for the whole paste batch.
         self.last_drag_group = None;
-        self.undo.push(&self.scene);
+        self.undo.push_full(self.build_undo_snapshot());
 
         // Mapping from old actor id → new actor id, so bound audio
         // tracks copied alongside their parent actor can re-link to
@@ -2598,7 +2737,9 @@ impl EditorState {
                     // canvas-drop behaviour and matches the user's
                     // mental model of "paste shows up on whichever
                     // empty layer is closest right now".
-                    let new_track = self.pick_or_create_empty_video_lane_at(playhead);
+                    let t_out = playhead + dur;
+                    let new_track =
+                        self.pick_or_create_empty_video_lane_for_range(playhead, t_out);
                     self.actor_track_assignments.insert(new_idx, new_track);
                     new_selections.push(Selection::Actor(new_idx));
                 }
@@ -2630,7 +2771,8 @@ impl EditorState {
                     }
                     let new_idx = self.scene.overlays.len();
                     self.scene.overlays.push(o);
-                    let new_track = self.pick_or_create_empty_video_lane_at(playhead);
+                    let new_track =
+                        self.pick_or_create_empty_video_lane_for_range(playhead, new_t_out);
                     self.overlay_track_assignments.insert(new_idx, new_track);
                     new_selections.push(Selection::Overlay(new_idx));
                 }
@@ -2914,31 +3056,35 @@ impl EditorState {
         let dur = self.scene.output.duration.max(0.1);
         let t_in = t;
         let t_out = (t + 3.0).min(dur).max(t + 0.1);
-        let overlay = memstroy_core::Overlay::Image(memstroy_core::ImageOverlay {
-            id: unique_overlay_id(&self.scene.overlays, &asset.id),
-            source: asset.path.clone(),
-            t_in,
-            t_out,
-            layout: vec![memstroy_core::Keyframe::new(
-                0.0,
-                memstroy_core::OverlayState::default(),
-            )],
-            modifiers: Vec::new(),
-            skeleton_attachment: None,
-            effects: Vec::new(),
-            animated_params: Default::default(),
-            chroma_key: None,
-            z_order: 0,
-            parent_id: None,
+        let overlay_id = unique_overlay_id(&self.scene.overlays, &asset.id);
+        let source = asset.path.clone();
+        let mut new_idx = 0usize;
+        self.mutate_state(|s| {
+            let lane = s.pick_or_create_empty_video_lane_for_range(t_in, t_out);
+            new_idx = s.scene.overlays.len();
+            s.scene.overlays.push(memstroy_core::Overlay::Image(
+                memstroy_core::ImageOverlay {
+                    id: overlay_id,
+                    source,
+                    t_in,
+                    t_out,
+                    layout: vec![memstroy_core::Keyframe::new(
+                        0.0,
+                        memstroy_core::OverlayState::default(),
+                    )],
+                    modifiers: Vec::new(),
+                    skeleton_attachment: None,
+                    effects: Vec::new(),
+                    animated_params: Default::default(),
+                    chroma_key: None,
+                    z_order: 0,
+                    parent_id: None,
+                },
+            ));
+            s.overlay_track_assignments.insert(new_idx, lane);
+            s.selection = Selection::Overlay(new_idx);
+            s.canvas_selection.clear();
         });
-        self.last_drag_group = None;
-        self.undo.push(&self.scene);
-        let new_idx = self.scene.overlays.len();
-        self.scene.overlays.push(overlay);
-        let new_track = self.pick_or_create_empty_video_lane_at(t);
-        self.overlay_track_assignments.insert(new_idx, new_track);
-        self.selection = Selection::Overlay(new_idx);
-        self.canvas_selection.clear();
         new_idx
     }
 }
@@ -2954,7 +3100,7 @@ fn unique_actor_id(actors: &[memstroy_core::Actor], base: &str) -> String {
     candidate
 }
 
-fn unique_overlay_id(overlays: &[memstroy_core::Overlay], base: &str) -> String {
+pub(crate) fn unique_overlay_id(overlays: &[memstroy_core::Overlay], base: &str) -> String {
     let stem = strip_copy_suffix(base);
     let mut candidate = format!("{}_copy", stem);
     let mut n = 2;
@@ -3352,6 +3498,14 @@ pub enum MaskTool {
     /// (`apply_mask_alpha`, FFmpeg export) works unchanged — what
     /// differs is *how* the user lays the points down.
     SegmentMask,
+    /// Rectangle crop — drag on canvas commits `EffectKind::Crop` so
+    /// pixels outside the box are discarded (not just masked).
+    CropRect,
+    /// Freehand eraser — polygon mask with `invert: true` (hides inside
+    /// the stroke, revealing what was underneath).
+    Eraser,
+    /// Freehand brush / draw — polygon mask keeping the stroked region.
+    BrushDraw,
 }
 
 impl MaskTool {
@@ -3365,6 +3519,9 @@ impl MaskTool {
             MaskTool::FreehandMask => "Freehand mask",
             MaskTool::Eyedropper => "Eyedropper mask",
             MaskTool::SegmentMask => "Segment mask",
+            MaskTool::CropRect => "Crop",
+            MaskTool::Eraser => "Eraser",
+            MaskTool::BrushDraw => "Draw",
         }
     }
 }

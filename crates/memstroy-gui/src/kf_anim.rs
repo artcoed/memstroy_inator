@@ -298,51 +298,63 @@ pub fn animated_toggle(
     false
 }
 
-/// Seed the first keyframe for an actor param at the given time when
-/// the param was just toggled to animated and the layout is non-empty.
-/// If `t` is beyond the scene duration or before the clip, seeds at 0.
-/// Does nothing if the param already has a distinct keyframe at `t`.
-pub fn seed_actor_kf_on_toggle(
-    layout: &mut Vec<Keyframe<memstroy_core::ActorState>>,
+/// When the user toggles a param to "animated", upsert a keyframe at
+/// `t` that carries **only** that param's current value.
+pub fn seed_actor_params_on_toggle(
+    layout: &mut Vec<Keyframe<ActorState>>,
+    animated_params: &mut BTreeSet<String>,
+    animated_before: &BTreeSet<String>,
     t: f32,
 ) {
-    // Ensure there's at least one kf (the layout should never be empty,
-    // but guard anyway).
-    if layout.is_empty() {
-        layout.push(memstroy_core::Keyframe::new(0.0, memstroy_core::ActorState::default()));
-        return;
+    let cur = sample_actor(layout, t);
+    let newly_animated: Vec<String> = animated_params
+        .iter()
+        .filter(|pid| !animated_before.contains(*pid))
+        .cloned()
+        .collect();
+    for pid in newly_animated {
+        let pid = pid.as_str();
+        write_actor_param(layout, animated_params, t, pid, false, |s| match pid {
+            memstroy_core::param_ids::POS_X => s.pos[0] = cur.pos[0],
+            memstroy_core::param_ids::POS_Y => s.pos[1] = cur.pos[1],
+            memstroy_core::param_ids::SCALE => s.scale = cur.scale,
+            memstroy_core::param_ids::SCALE_Y => s.scale_y = cur.scale_y,
+            memstroy_core::param_ids::ROTATION => s.rotation_deg = cur.rotation_deg,
+            memstroy_core::param_ids::OPACITY => s.opacity = cur.opacity,
+            memstroy_core::param_ids::FLIP_X => s.flip_x_anim = cur.flip_x_anim,
+            memstroy_core::param_ids::FLIP_Y => s.flip_y_anim = cur.flip_y_anim,
+            _ => {}
+        });
     }
-    // If layout has only one kf (or the playhead time already has one),
-    // nothing extra to do — the one existing kf IS the initial kf.
-    let insert_t = t.max(0.0);
-    let already_exists = layout.iter().any(|kf| (kf.t - insert_t).abs() < 1.0e-3);
-    if already_exists {
-        return;
-    }
-    // Insert a kf at the current playhead with the interpolated state.
-    let seed = sample_actor(layout, insert_t);
-    layout.push(memstroy_core::Keyframe::new(insert_t, seed));
-    layout.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap());
 }
 
-/// Seed the first keyframe for an overlay param — same logic as actor.
-#[allow(dead_code)]
-pub fn seed_overlay_kf_on_toggle(
-    layout: &mut Vec<Keyframe<memstroy_core::OverlayState>>,
+/// Overlay variant of [`seed_actor_params_on_toggle`].
+pub fn seed_overlay_params_on_toggle(
+    layout: &mut Vec<Keyframe<OverlayState>>,
+    animated_params: &mut BTreeSet<String>,
+    animated_before: &BTreeSet<String>,
     t: f32,
 ) {
-    if layout.is_empty() {
-        layout.push(memstroy_core::Keyframe::new(0.0, memstroy_core::OverlayState::default()));
-        return;
+    let cur = sample_overlay(layout, t);
+    let newly_animated: Vec<String> = animated_params
+        .iter()
+        .filter(|pid| !animated_before.contains(*pid))
+        .cloned()
+        .collect();
+    for pid in newly_animated {
+        let pid = pid.as_str();
+        write_overlay_param(layout, animated_params, t, pid, false, |s| match pid {
+            memstroy_core::param_ids::POS_X => s.pos[0] = cur.pos[0],
+            memstroy_core::param_ids::POS_Y => s.pos[1] = cur.pos[1],
+            memstroy_core::param_ids::SCALE => s.scale = cur.scale,
+            memstroy_core::param_ids::SCALE_Y => s.scale_y = cur.scale_y,
+            memstroy_core::param_ids::ROTATION => s.rotation_deg = cur.rotation_deg,
+            memstroy_core::param_ids::OPACITY => s.opacity = cur.opacity,
+            memstroy_core::param_ids::FLIP_X => s.flip_x_anim = cur.flip_x_anim,
+            memstroy_core::param_ids::FLIP_Y => s.flip_y_anim = cur.flip_y_anim,
+            _ => {}
+        });
     }
-    let insert_t = t.max(0.0);
-    let already_exists = layout.iter().any(|kf| (kf.t - insert_t).abs() < 1.0e-3);
-    if already_exists {
-        return;
-    }
-    let seed = sample_overlay(layout, insert_t);
-    layout.push(memstroy_core::Keyframe::new(insert_t, seed));
-    layout.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap());
 }
 
 // ─── Keyframe selection in the timeline ──────────────────────────────
