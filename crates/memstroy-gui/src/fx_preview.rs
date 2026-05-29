@@ -157,8 +157,11 @@ pub fn collect_contributors(
         }
         // Sample the overlay's local state
         let local_t = (t - im.t_in).max(0.0);
-        let ov_state: OverlayState = keyframe::sample(&im.layout, local_t)
-            .unwrap_or_default();
+        let ov_state: OverlayState = memstroy_core::sample_overlay_layout(
+            &im.layout,
+            &im.animated_params,
+            local_t,
+        );
         // World position (legacy normalised → world pixels)
         let center_x = ov_state.pos[0] * world_w;
         let center_y = ov_state.pos[1] * world_h;

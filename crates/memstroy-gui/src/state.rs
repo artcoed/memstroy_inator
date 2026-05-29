@@ -208,6 +208,19 @@ impl KeyframeMarquee {
     }
 }
 
+/// Floating easing picker for a timeline param-row keyframe. Anchored at
+/// a fixed screen position so it stays usable during playback repaints
+/// (the old `Response::context_menu` on painter-drawn diamonds flickered
+/// because the anchor widget was recreated every frame).
+#[derive(Clone, Debug)]
+pub struct KfEasingPopup {
+    pub layer: crate::kf_anim::SelectedLayer,
+    pub param_id: String,
+    pub t: f32,
+    pub apply_to_selection: bool,
+    pub screen_pos: egui::Pos2,
+}
+
 /// Active rectangle (rubber-band) selection for keyframes in the curve
 /// editor graph. Screen-pixel coordinates.
 #[derive(Clone, Copy, Debug)]
@@ -634,6 +647,8 @@ pub struct EditorState {
     pub kf_multi_drag_active: bool,
     /// Accumulated pixel offset for the in-progress multi-keyframe drag.
     pub kf_multi_drag_dx: f32,
+    /// Open easing picker for a param-row keyframe (right-click).
+    pub kf_easing_popup: Option<KfEasingPopup>,
 
     // ─── Curve editor marquee (rubber-band multi-select) ───────────
     /// Active marquee for selecting keyframes in the curve editor.
@@ -900,6 +915,23 @@ pub struct SceneTab {
     /// session (instead of creating a fresh autosave file every
     /// interval). Saved tabs ignore this and key off `path` instead.
     pub autosave_seed: u64,
+    /// Content fingerprint at last Save / Open / tab creation. When
+    /// the tab's scene digest differs, the user has unsaved edits.
+    pub saved_digest: u64,
+}
+
+/// Action deferred until the user resolves the unsaved-changes prompt.
+#[derive(Debug, Clone)]
+pub enum SceneExitAction {
+    SwitchTab(usize),
+    CloseTab(usize),
+    NewTab,
+    NewScene,
+    OpenScene {
+        path: PathBuf,
+        is_memstroy: bool,
+    },
+    Quit,
 }
 
 impl SceneTab {
@@ -1087,10 +1119,12 @@ impl EditorState {
         s.canvas_panning = false;
 
         // Multi-tab: start with one untitled tab
+        let initial_scene = Scene::default();
         s.scene_tabs = vec![SceneTab {
             name: "Untitled".into(),
             path: None,
-            scene: Scene::default(),
+            saved_digest: EditorState::scene_content_digest(&initial_scene),
+            scene: initial_scene,
             autosave_seed: SceneTab::fresh_seed(),
         }];
         s.active_tab = 0;
@@ -1149,23 +1183,32 @@ impl EditorState {
     /// Quick header sniff so JPEG/PNG previews saved with a `.mp4` name
     /// are not treated as playable video.
     fn video_file_has_valid_header(path: &std::path::Path) -> bool {
-        let Ok(data) = std::fs::read(path) else {
-            return false;
+        // Read only the first 512 bytes — avoids loading multi-gigabyte
+        // files into RAM just to sniff the header.
+        let mut file = match std::fs::File::open(path) {
+            Ok(f) => f,
+            Err(_) => return false,
         };
-        if data.len() < 12 {
+        let mut buf = [0u8; 512];
+        let n = match std::io::Read::read(&mut file, &mut buf) {
+            Ok(n) => n,
+            Err(_) => return false,
+        };
+        if n < 12 {
             return false;
         }
+        let data = &buf[..n];
         // JPEG / PNG thumbnails mis-labelled as video
         if data[0] == 0xFF && data[1] == 0xD8 {
             return false;
         }
-        if data.len() >= 8
+        if n >= 8
             && data[..8] == [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]
         {
             return false;
         }
         // ISO BMFF (mp4/m4v/mov) — `ftyp` may not sit at byte 4
-        let scan = data.len().min(512);
+        let scan = n.min(512);
         for i in 0..scan.saturating_sub(3) {
             if &data[i..i + 4] == b"ftyp" {
                 return true;
@@ -1176,7 +1219,7 @@ impl EditorState {
             return true;
         }
         // AVI RIFF
-        if data.len() >= 12 && &data[..4] == b"RIFF" && &data[8..12] == b"AVI " {
+        if n >= 12 && &data[..4] == b"RIFF" && &data[8..12] == b"AVI " {
             return true;
         }
         false
@@ -1776,16 +1819,84 @@ impl EditorState {
 
     // ─── Tab management ──────────────────────────────────────────────
 
+    /// Stable fingerprint of scene contents for dirty tracking.
+    pub fn scene_content_digest(scene: &Scene) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let bytes = serde_json::to_vec(scene).unwrap_or_default();
+        let mut h = DefaultHasher::new();
+        bytes.hash(&mut h);
+        h.finish()
+    }
+
+    /// Whether the active tab differs from its last-saved baseline.
+    pub fn active_tab_is_dirty(&mut self) -> bool {
+        self.sync_scene_to_tab();
+        let idx = self.active_tab;
+        if idx >= self.scene_tabs.len() {
+            return false;
+        }
+        Self::scene_content_digest(&self.scene_tabs[idx].scene)
+            != self.scene_tabs[idx].saved_digest
+    }
+
+    /// Whether a (possibly inactive) tab has unsaved edits.
+    pub fn tab_is_dirty(&self, tab_idx: usize) -> bool {
+        let tab = match self.scene_tabs.get(tab_idx) {
+            Some(t) => t,
+            None => return false,
+        };
+        let scene = if tab_idx == self.active_tab {
+            &self.scene
+        } else {
+            &tab.scene
+        };
+        Self::scene_content_digest(scene) != tab.saved_digest
+    }
+
+    /// Record the current tab contents as saved (after Save / Open).
+    pub fn mark_active_tab_saved(&mut self) {
+        self.sync_scene_to_tab();
+        if self.active_tab < self.scene_tabs.len() {
+            let digest = Self::scene_content_digest(&self.scene);
+            self.scene_tabs[self.active_tab].saved_digest = digest;
+        }
+    }
+
+    /// Replace the active tab with a fresh untitled scene.
+    pub fn reset_active_tab_to_new_scene(&mut self) {
+        self.sync_scene_to_tab();
+        let seed = self.scene_tabs[self.active_tab].autosave_seed;
+        let scene = Scene::default();
+        let digest = Self::scene_content_digest(&scene);
+        self.scene_tabs[self.active_tab] = SceneTab {
+            name: crate::i18n::t("Untitled").into(),
+            path: None,
+            scene: scene.clone(),
+            autosave_seed: seed,
+            saved_digest: digest,
+        };
+        self.scene = scene;
+        self.scene_path = None;
+        self.frame_caches.clear();
+        self.selection = Selection::None;
+        self.playhead = 0.0;
+        self.undo = UndoStack::default();
+        self.status = crate::i18n::t("\u{2728} New scene created.").into();
+    }
+
     /// Create a new empty tab and switch to it.
     pub fn new_tab(&mut self) {
         // Save current scene into its tab before switching
         self.sync_scene_to_tab();
         let name = format!("Scene {}", self.scene_tabs.len() + 1);
+        let scene = Scene::default();
         self.scene_tabs.push(SceneTab {
             name,
             path: None,
-            scene: Scene::default(),
+            scene: scene.clone(),
             autosave_seed: SceneTab::fresh_seed(),
+            saved_digest: Self::scene_content_digest(&scene),
         });
         self.active_tab = self.scene_tabs.len() - 1;
         self.sync_tab_to_scene();
@@ -1815,11 +1926,13 @@ impl EditorState {
             // Last tab: reset to fresh untitled state. Clear the loaded
             // scene buffer too so the canvas/inspector pick up a blank
             // slate without requiring a tab switch.
+            let scene = Scene::default();
             self.scene_tabs[0] = SceneTab {
                 name: "Untitled".into(),
                 path: None,
-                scene: Scene::default(),
+                scene: scene.clone(),
                 autosave_seed: SceneTab::fresh_seed(),
+                saved_digest: Self::scene_content_digest(&scene),
             };
             self.active_tab = 0;
             self.scene = Scene::default();
@@ -1869,6 +1982,59 @@ impl EditorState {
             self.frame_caches.clear();
             self.selection = Selection::None;
             self.playhead = 0.0;
+            self.undo = UndoStack::default();
+        }
+    }
+
+    /// Apply a deferred navigation action (caller already confirmed save/discard).
+    pub fn apply_scene_exit_action(&mut self, action: SceneExitAction) {
+        match action {
+            SceneExitAction::SwitchTab(idx) => self.switch_tab(idx),
+            SceneExitAction::CloseTab(idx) => self.close_tab(idx),
+            SceneExitAction::NewTab => self.new_tab(),
+            SceneExitAction::NewScene => self.reset_active_tab_to_new_scene(),
+            SceneExitAction::OpenScene { path, is_memstroy } => {
+                self.load_scene_from_path(&path, is_memstroy);
+            }
+            SceneExitAction::Quit => {}
+        }
+    }
+
+    /// Load a scene file into the active tab (no unsaved prompt).
+    pub fn load_scene_from_path(&mut self, path: &std::path::Path, is_memstroy: bool) {
+        let load_res: Result<Scene, String> = if is_memstroy {
+            self.load_memstroy(path)
+        } else {
+            Scene::load(path).map_err(|e| e.to_string())
+        };
+        match load_res {
+            Ok(s) => {
+                self.scene = s;
+                self.scene_path = Some(path.to_path_buf());
+                self.status = crate::i18n::t("\u{2705} Scene loaded.").into();
+                if !is_memstroy {
+                    let layout_path = path.with_extension("layout.json");
+                    self.load_layout(&layout_path);
+                }
+                let name = path
+                    .file_stem()
+                    .and_then(|st| st.to_str())
+                    .unwrap_or(crate::i18n::t("Scene"))
+                    .to_string();
+                if self.active_tab < self.scene_tabs.len() {
+                    self.scene_tabs[self.active_tab].name = name;
+                    self.scene_tabs[self.active_tab].path = Some(path.to_path_buf());
+                    self.scene_tabs[self.active_tab].scene = self.scene.clone();
+                }
+                self.mark_active_tab_saved();
+                self.frame_caches.clear();
+                self.selection = Selection::None;
+                self.playhead = 0.0;
+                self.undo = UndoStack::default();
+            }
+            Err(e) => {
+                self.status = format!("{} {e}", crate::i18n::t("\u{274C} Open failed:"));
+            }
         }
     }
 
@@ -3551,11 +3717,13 @@ pub enum CanvasDragMode {
     #[default]
     None,
     /// Move the selected actor in canvas world-pixel space.
-    /// `initial_pos` is the actor's `canvas_layouts` position at drag start.
+    /// `initial_pos` is the actor's world-pixel centre at drag start.
     MoveActorWorld { actor_idx: usize, initial_pos: [f32; 2] },
-    /// Move the selected actor using the legacy normalised layout.
+    /// Move the selected actor using the legacy normalised layout track.
+    /// `initial_pos` is the element's world-pixel centre at drag start.
     MoveActorLegacy { actor_idx: usize, initial_pos: [f32; 2] },
-    /// Move the selected overlay (normalised relative to render frame).
+    /// Move the selected overlay. `initial_pos` is the world-pixel centre
+    /// at drag start (after parent transforms).
     MoveOverlay { overlay_idx: usize, initial_pos: [f32; 2] },
     /// Resize the selected element using a specific handle. The element is
     /// anchored at the opposite handle so it stretches in the direction of
@@ -3612,4 +3780,44 @@ pub enum CanvasDragMode {
         /// the user clicks elsewhere mid-drag.
         target: Selection,
     },
+}
+
+#[cfg(test)]
+mod video_header_tests {
+    use std::io::Write;
+    use super::EditorState;
+
+    /// `video_file_has_valid_header` must not read the whole file —
+    /// only the first 512 bytes.  We create a 1 MiB file with a valid
+    /// MP4 signature (`ftyp` at offset 4) and verify the function
+    /// returns true without blocking on the full contents.
+    #[test]
+    fn large_mp4_header_sniff_ok() {
+        let mut tmp = tempfile::Builder::new()
+            .suffix(".mp4")
+            .tempfile()
+            .unwrap();
+        let mut data = vec![0u8; 1024 * 1024]; // 1 MiB
+        data[0..8].copy_from_slice(b"\x00\x00\x00\x08ftyp");
+        std::io::Write::write_all(&mut tmp, &data).unwrap();
+        tmp.flush().unwrap();
+        let path = tmp.path();
+        let ok = EditorState::is_usable_local_video(path);
+        assert!(ok, "1 MiB MP4 stub should be recognised as valid video");
+    }
+
+    /// JPEG disguised as `.mp4` must be rejected.
+    #[test]
+    fn jpeg_masquerading_as_mp4_rejected() {
+        let mut tmp = tempfile::Builder::new()
+            .suffix(".mp4")
+            .tempfile()
+            .unwrap();
+        let data = b"\xFF\xD8\xFF\xE0\x00\x10JFIF";
+        std::io::Write::write_all(&mut tmp, data).unwrap();
+        tmp.flush().unwrap();
+        let path = tmp.path();
+        let ok = EditorState::is_usable_local_video(path);
+        assert!(!ok, "JPEG header must be rejected even with .mp4 extension");
+    }
 }

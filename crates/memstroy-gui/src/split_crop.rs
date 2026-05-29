@@ -266,6 +266,14 @@ pub fn finish_actor_split(
     // the caller, so read the pre-split `t_in` from the LEFT (which
     // is unchanged) and use it for both halves' clip-local cropping.
     let original_t_in = scene.actors[left_idx].t_in.unwrap_or(0.0);
+
+    // Snapshot layout at the cut point BEFORE we crop, so a half that
+    // ends up with zero keyframes can still inherit the transform.
+    let left_layout_sample = scene.actors.get(left_idx)
+        .and_then(|a| keyframe::sample(&a.layout, cut_left));
+    let right_layout_sample = scene.actors.get(right_idx)
+        .and_then(|a| keyframe::sample(&a.layout, cut_right));
+
     if let Some(a) = scene.actors.get_mut(left_idx) {
         crop_actor_timeline(a, cut_left, original_t_in, false);
     }
@@ -276,8 +284,15 @@ pub fn finish_actor_split(
         if let Some(a) = scene.actors.get_mut(idx) {
             if a.layout.is_empty() {
                 let seed_t = a.t_in.unwrap_or(0.0);
-                a.layout
-                    .push(Keyframe::new(seed_t, ActorState::default()));
+                let fallback = if idx == left_idx {
+                    left_layout_sample
+                } else {
+                    right_layout_sample
+                };
+                a.layout.push(Keyframe::new(
+                    seed_t,
+                    fallback.unwrap_or_else(ActorState::default),
+                ));
             }
         }
     }
@@ -315,12 +330,59 @@ pub fn finish_overlay_split(
         Overlay::Image(im) => im.t_in,
         Overlay::Video(v) => v.t_in,
     };
+
+    // Snapshot overlay layout (clip-local time) at the cut point
+    // before we crop, so a half that loses every keyframe can
+    // still inherit the transform / scale / rotation.
+    let local_left = (cut_left - original_t_in).max(0.0);
+    let local_right = (cut_right - original_t_in).max(0.0);
+    let left_layout_sample = match &scene.overlays[left_idx] {
+        Overlay::Text(t) => keyframe::sample(&t.layout, local_left),
+        Overlay::Image(im) => keyframe::sample(&im.layout, local_left),
+        Overlay::Video(v) => keyframe::sample(&v.layout, local_left),
+    };
+    let right_layout_sample = match &scene.overlays[right_idx] {
+        Overlay::Text(t) => keyframe::sample(&t.layout, local_right),
+        Overlay::Image(im) => keyframe::sample(&im.layout, local_right),
+        Overlay::Video(v) => keyframe::sample(&v.layout, local_right),
+    };
+
     if let Some(ov) = scene.overlays.get_mut(left_idx) {
         crop_overlay_timeline(ov, cut_left, original_t_in, false);
     }
     if let Some(ov) = scene.overlays.get_mut(right_idx) {
         crop_overlay_timeline(ov, cut_right, original_t_in, true);
     }
+
+    // Fallback: if the crop wiped every layout keyframe, restore
+    // the sampled state so the element keeps its position / scale.
+    if let Some(ov) = scene.overlays.get_mut(left_idx) {
+        let layout = match ov {
+            Overlay::Text(t) => &mut t.layout,
+            Overlay::Image(im) => &mut im.layout,
+            Overlay::Video(v) => &mut v.layout,
+        };
+        if layout.is_empty() {
+            layout.push(Keyframe::new(
+                0.0,
+                left_layout_sample.unwrap_or_default(),
+            ));
+        }
+    }
+    if let Some(ov) = scene.overlays.get_mut(right_idx) {
+        let layout = match ov {
+            Overlay::Text(t) => &mut t.layout,
+            Overlay::Image(im) => &mut im.layout,
+            Overlay::Video(v) => &mut v.layout,
+        };
+        if layout.is_empty() {
+            layout.push(Keyframe::new(
+                0.0,
+                right_layout_sample.unwrap_or_default(),
+            ));
+        }
+    }
+
     crop_canvas_layouts_left(scene, &left_id, cut_left);
     duplicate_canvas_layout_for_split(scene, &left_id, &right_id, cut_right);
 }
@@ -696,6 +758,110 @@ mod tests {
                 );
             }
             _ => panic!("expected Video overlay"),
+        }
+    }
+
+    // ── finish_actor_split preserves transform when single kf at t=0 ──
+
+    #[test]
+    fn finish_actor_split_preserves_transform() {
+        let mut scene = Scene::default();
+        let mut a = mk_actor(Some(0.0), Some(10.0));
+        a.id = "actor_1".to_string();
+        a.layout = vec![Keyframe::new(
+            0.0,
+            ActorState {
+                pos: [1.0, 2.0],
+                scale: 3.0,
+                scale_y: 4.0,
+                rotation_deg: 45.0,
+                opacity: 0.5,
+                flip_x_anim: 0.5,
+                ..ActorState::default()
+            },
+        )];
+        scene.actors.push(a);
+        // Simulate the split: clone the actor and insert it at index 1.
+        let right = scene.actors[0].clone();
+        scene.actors.insert(1, right);
+        scene.actors[0].t_out = Some(5.0);
+        scene.actors[1].t_in = Some(5.0);
+
+        finish_actor_split(&mut scene, 0, 1, 5.0, 5.0);
+
+        // Left half should keep the sampled transform.
+        let left = &scene.actors[0];
+        assert_eq!(left.layout.len(), 1);
+        assert!(approx(left.layout[0].t, 0.0));
+        assert!(approx(left.layout[0].value.pos[0], 1.0));
+        assert!(approx(left.layout[0].value.pos[1], 2.0));
+        assert!(approx(left.layout[0].value.scale, 3.0));
+        assert!(approx(left.layout[0].value.rotation_deg, 45.0));
+
+        // Right half should also keep the sampled transform.
+        let right = &scene.actors[1];
+        assert_eq!(right.layout.len(), 1);
+        assert!(approx(right.layout[0].t, 5.0));
+        assert!(approx(right.layout[0].value.pos[0], 1.0));
+        assert!(approx(right.layout[0].value.pos[1], 2.0));
+        assert!(approx(right.layout[0].value.scale, 3.0));
+        assert!(approx(right.layout[0].value.rotation_deg, 45.0));
+    }
+
+    #[test]
+    fn finish_overlay_split_preserves_transform() {
+        let mut scene = Scene::default();
+        let mut ov = mk_image_overlay(0.0, 10.0);
+        if let Overlay::Image(im) = &mut ov {
+            im.id = "ov_1".to_string();
+            im.layout = vec![Keyframe::new(
+                0.0,
+                OverlayState {
+                    pos: [1.0, 2.0],
+                    scale: 3.0,
+                    scale_y: 4.0,
+                    rotation_deg: 45.0,
+                    opacity: 0.5,
+                    flip_x_anim: 0.5,
+                    ..OverlayState::default()
+                },
+            )];
+        }
+        scene.overlays.push(ov);
+        let right = scene.overlays[0].clone();
+        scene.overlays.insert(1, right);
+        if let Overlay::Image(im) = &mut scene.overlays[0] {
+            im.t_out = 5.0;
+        }
+        if let Overlay::Image(im) = &mut scene.overlays[1] {
+            im.t_in = 5.0;
+        }
+
+        finish_overlay_split(&mut scene, 0, 1, 5.0, 5.0);
+
+        // Left half
+        match &scene.overlays[0] {
+            Overlay::Image(im) => {
+                assert_eq!(im.layout.len(), 1);
+                assert!(approx(im.layout[0].t, 0.0));
+                assert!(approx(im.layout[0].value.pos[0], 1.0));
+                assert!(approx(im.layout[0].value.pos[1], 2.0));
+                assert!(approx(im.layout[0].value.scale, 3.0));
+                assert!(approx(im.layout[0].value.rotation_deg, 45.0));
+            }
+            _ => panic!("expected Image"),
+        }
+        // Right half
+        match &scene.overlays[1] {
+            Overlay::Image(im) => {
+                assert_eq!(im.layout.len(), 1);
+                assert!(approx(im.layout[0].t, 0.0));
+                assert!(approx(im.layout[0].value.pos[0], 1.0));
+                assert!(approx(im.layout[0].value.pos[1], 2.0));
+                assert!(approx(im.layout[0].value.scale, 3.0));
+                assert!(approx(im.layout[0].value.rotation_deg, 45.0));
+            }
+            _ => panic!("expected Image"),
         }
     }
 }

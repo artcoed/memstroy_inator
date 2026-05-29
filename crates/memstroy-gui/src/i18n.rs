@@ -111,6 +111,10 @@ fn ru_lookup(key: &str) -> Option<&'static str> {
         "\u{2699} Settings..." => "\u{2699} Настройки…",
         "Exit" => "Выход",
         "\u{1F6AA} Exit" => "\u{1F6AA} Выход",
+        "Unsaved changes" => "Несохранённые изменения",
+        "This scene has changes that have not been saved. Save before leaving?" =>
+            "В сцене есть несохранённые изменения. Сохранить перед выходом?",
+        "Don't save" => "Не сохранять",
 
         // Render menu
         "Render" => "Рендер",

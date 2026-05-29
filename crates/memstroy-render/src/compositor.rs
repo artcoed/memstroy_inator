@@ -535,7 +535,7 @@ fn build_paint_ops(scene: &Scene) -> Vec<PaintOp> {
 // ─── HELPERS — RENDER FRAME / WORLD ─────────────────────────────────
 
 fn sample_render_frame_eased(rf: &RenderFrame, t: f32) -> RenderFrameState {
-    let mut s = keyframe::sample(&rf.layout, t).unwrap_or_default();
+    let mut s = memstroy_core::sample_render_frame_layout(&rf.layout, &rf.animated_params, t);
     if rf.modifiers.is_empty() {
         return s;
     }
@@ -563,15 +563,6 @@ fn world_to_output(world: WorldPos, rf_state: &RenderFrameState, rw: u32, rh: u3
     let ox = (rw as f32) * 0.5 + rx * zoom;
     let oy = (rh as f32) * 0.5 + ry * zoom;
     (ox, oy)
-}
-
-fn element_world_pos(scene: &Scene, element_id: &str, t: f32) -> Option<WorldPos> {
-    let cl = scene
-        .canvas_layouts
-        .iter()
-        .find(|cl| cl.element_id == element_id)?;
-    let transform = keyframe::sample(&cl.keyframes, t)?;
-    Some(transform.pos)
 }
 
 fn resolve_path(root: &Path, p: &Path) -> PathBuf {
@@ -610,7 +601,8 @@ fn paint_actor(
     }
 
     // Sample state with modifiers — same recipe as canvas_preview's actor pass.
-    let mut actor_state = keyframe::sample(&actor.layout, t).unwrap_or_default();
+    let mut actor_state =
+        memstroy_core::sample_actor_layout(&actor.layout, &actor.animated_params, t);
     let mod_delta = keyframe::evaluate_modifiers(&actor.modifiers, t - t_in);
     actor_state.scale = (actor_state.scale + mod_delta.d_scale).max(0.001);
     actor_state.rotation_deg += mod_delta.d_rotation_deg;
@@ -639,17 +631,25 @@ fn paint_actor(
         apply_effect_stack_rgba(&mut layer, &actor.effects, cc_local_t);
     }
 
-    // World position: skeleton attachment overrides → canvas_layouts → legacy.
-    // Skeleton attachments aren't supported in the CPU compositor yet.
-    let world_pos = element_world_pos(scene, &actor.id, t).unwrap_or_else(|| WorldPos {
-        x: actor_state.pos[0] * rw as f32,
-        y: actor_state.pos[1] * rh as f32,
-    });
+    // World position + parent rotation/scale — mirrors canvas_preview.
+    let world_pos = memstroy_core::element_world_pos(scene, &actor.id, t);
     let world_pos = WorldPos {
         x: world_pos.x + mod_delta.dx,
         y: world_pos.y + mod_delta.dy,
     };
     let (cx, cy) = world_to_output(world_pos, rf_state, rw, rh);
+
+    if let Some(pid) = actor.parent_id.as_ref() {
+        let mut visited = vec![actor.id.clone()];
+        if let Some(pxf) = memstroy_core::resolve_parent_transform(scene, pid, t, &mut visited) {
+            memstroy_core::apply_parent_inheritance_actor(
+                &mut actor_state.rotation_deg,
+                &mut actor_state.scale,
+                &mut actor_state.scale_y,
+                &pxf,
+            );
+        }
+    }
 
     let combined_x = if actor.flip_horizontal {
         -actor_state.flip_x_anim
@@ -701,10 +701,17 @@ fn paint_image_overlay(
         return;
     }
     let sample_t = t - img_ov.t_in;
-    let mut ov_state = keyframe::sample(&img_ov.layout, sample_t).unwrap_or_default();
+    let ov_ref = &scene.overlays[overlay_idx];
+    let mut ov_state = memstroy_core::overlay_visual_state(
+        scene,
+        ov_ref,
+        &img_ov.id,
+        img_ov.parent_id.as_ref(),
+        t,
+        sample_t,
+        &img_ov.modifiers,
+    );
     let mod_delta = keyframe::evaluate_modifiers(&img_ov.modifiers, sample_t);
-    ov_state.scale = (ov_state.scale + mod_delta.d_scale).max(0.001);
-    ov_state.rotation_deg += mod_delta.d_rotation_deg;
 
     let resolved = resolve_path(assets_root, &img_ov.source);
     let mut layer = match image::open(&resolved) {
@@ -728,10 +735,7 @@ fn paint_image_overlay(
         return;
     }
 
-    let world_pos = element_world_pos(scene, &img_ov.id, t).unwrap_or_else(|| WorldPos {
-        x: ov_state.pos[0] * rw as f32,
-        y: ov_state.pos[1] * rh as f32,
-    });
+    let world_pos = memstroy_core::element_world_pos(scene, &img_ov.id, t);
     let world_pos = WorldPos {
         x: world_pos.x + mod_delta.dx,
         y: world_pos.y + mod_delta.dy,
@@ -782,10 +786,17 @@ fn paint_video_overlay(
         return;
     }
     let sample_t = t - vid.t_in;
-    let mut ov_state = keyframe::sample(&vid.layout, sample_t).unwrap_or_default();
+    let ov_ref = &scene.overlays[overlay_idx];
+    let mut ov_state = memstroy_core::overlay_visual_state(
+        scene,
+        ov_ref,
+        &vid.id,
+        vid.parent_id.as_ref(),
+        t,
+        sample_t,
+        &vid.modifiers,
+    );
     let mod_delta = keyframe::evaluate_modifiers(&vid.modifiers, sample_t);
-    ov_state.scale = (ov_state.scale + mod_delta.d_scale).max(0.001);
-    ov_state.rotation_deg += mod_delta.d_rotation_deg;
 
     let speed = vid.speed.max(1.0e-4);
     let local_t = sample_t * speed + vid.source_start;
@@ -807,10 +818,7 @@ fn paint_video_overlay(
         return;
     }
 
-    let world_pos = element_world_pos(scene, &vid.id, t).unwrap_or_else(|| WorldPos {
-        x: ov_state.pos[0] * rw as f32,
-        y: ov_state.pos[1] * rh as f32,
-    });
+    let world_pos = memstroy_core::element_world_pos(scene, &vid.id, t);
     let world_pos = WorldPos {
         x: world_pos.x + mod_delta.dx,
         y: world_pos.y + mod_delta.dy,
@@ -858,10 +866,17 @@ fn paint_text_overlay(
         return;
     }
     let sample_t = t - txt.t_in;
-    let mut ov_state = keyframe::sample(&txt.layout, sample_t).unwrap_or_default();
+    let ov_ref = &scene.overlays[overlay_idx];
+    let mut ov_state = memstroy_core::overlay_visual_state(
+        scene,
+        ov_ref,
+        &txt.id,
+        txt.parent_id.as_ref(),
+        t,
+        sample_t,
+        &txt.modifiers,
+    );
     let mod_delta = keyframe::evaluate_modifiers(&txt.modifiers, sample_t);
-    ov_state.scale = (ov_state.scale + mod_delta.d_scale).max(0.001);
-    ov_state.rotation_deg += mod_delta.d_rotation_deg;
 
     let raster = match crate::text_rasterize::rasterize_text_overlay(txt, rw, rh) {
         Ok(Some(r)) => r,
@@ -889,11 +904,10 @@ fn paint_text_overlay(
         return;
     }
 
-    let world_w = rw as f32;
-    let world_h = rh as f32;
+    let world_pos = memstroy_core::element_world_pos(scene, &txt.id, t);
     let world_pos = WorldPos {
-        x: ov_state.pos[0] * world_w + mod_delta.dx,
-        y: ov_state.pos[1] * world_h + mod_delta.dy,
+        x: world_pos.x + mod_delta.dx,
+        y: world_pos.y + mod_delta.dy,
     };
     let (cx, cy) = world_to_output(world_pos, rf_state, rw, rh);
 
@@ -1751,7 +1765,11 @@ fn apply_effect_layers(
             continue;
         }
         let sample_t = t - fx_ov.t_in;
-        let mut ov_state = keyframe::sample(&fx_ov.layout, sample_t).unwrap_or_default();
+        let mut ov_state = memstroy_core::sample_overlay_layout(
+            &fx_ov.layout,
+            &fx_ov.animated_params,
+            sample_t,
+        );
         let mod_delta = keyframe::evaluate_modifiers(&fx_ov.modifiers, sample_t);
         ov_state.scale = (ov_state.scale + mod_delta.d_scale).max(0.001);
         ov_state.rotation_deg += mod_delta.d_rotation_deg;
@@ -1763,12 +1781,11 @@ fn apply_effect_layers(
         let world_w = base_size * ov_state.scale;
         let world_h = base_size * ov_state.scale * ov_state.scale_y;
 
-        let world_pos = element_world_pos(scene, &fx_ov.id, t).unwrap_or_else(|| {
-            memstroy_core::canvas::WorldPos {
-                x: ov_state.pos[0] * rw as f32 + mod_delta.dx,
-                y: ov_state.pos[1] * rh as f32 + mod_delta.dy,
-            }
-        });
+        let world_pos = memstroy_core::element_world_pos(scene, &fx_ov.id, t);
+        let world_pos = memstroy_core::canvas::WorldPos {
+            x: world_pos.x + mod_delta.dx,
+            y: world_pos.y + mod_delta.dy,
+        };
         let (cx, cy) = world_to_output(world_pos, rf_state, rw, rh);
 
         let half_w = world_w * rf_state.zoom * 0.5;

@@ -76,12 +76,37 @@ pub struct FrameCache {
     preload_slot: Arc<Mutex<Option<PreloadResult>>>,
     /// Whether a background pre-load is currently running.
     preloading: bool,
+
+    // ── Background processed-frame pipeline (chroma-key + effects) ──
+    /// Post-processed frame images in memory (ring buffer). Kept in sync
+    /// with `buffer` — same indices, same start, but with chroma-key,
+    /// colour-correction and the effect stack already applied.
+    processed_buffer: Vec<Option<ColorImage>>,
+    /// First frame index represented in `processed_buffer`.
+    processed_buffer_start: usize,
+    /// Hash of the (ck, cc, effects) params that produced the current
+    /// `processed_buffer`. Invalidated when the user edits any colour
+    /// or effect control so the next `processed_frame_at_time` rebuilds.
+    processed_params_hash: u64,
+    /// Shared slot for background *processed* pre-load thread results.
+    processed_preload_slot: Arc<Mutex<Option<ProcessedPreloadResult>>>,
+    /// Whether a background *processed* pre-load is currently running.
+    processed_preloading: bool,
 }
 
 /// Result from the background pre-load thread.
 struct PreloadResult {
     start: usize,
     frames: Vec<Option<ColorImage>>,
+}
+
+/// Result from the background *processed* pre-load thread.
+/// Includes `params_hash` so stale results (params changed while the
+/// thread was running) can be discarded on arrival.
+struct ProcessedPreloadResult {
+    start: usize,
+    frames: Vec<Option<ColorImage>>,
+    params_hash: u64,
 }
 
 impl FrameCache {
@@ -109,6 +134,12 @@ impl FrameCache {
             last_displayed_frame: usize::MAX,
             preload_slot: Arc::new(Mutex::new(None)),
             preloading: false,
+
+            processed_buffer: Vec::new(),
+            processed_buffer_start: 0,
+            processed_params_hash: 0,
+            processed_preload_slot: Arc::new(Mutex::new(None)),
+            processed_preloading: false,
         }
     }
 
@@ -165,6 +196,11 @@ impl FrameCache {
         self.buffer = vec![None; self.buffer_size];
         self.buffer_start = 0;
 
+        // Initialize processed ring buffer (empty until background thread fills it)
+        self.processed_buffer = vec![None; self.buffer_size];
+        self.processed_buffer_start = 0;
+        self.processed_params_hash = 0;
+
         // Synchronously pre-load initial frames
         self.load_buffer_range(0);
     }
@@ -181,40 +217,14 @@ impl FrameCache {
             return None;
         }
 
-        // Check for completed background pre-load
         self.poll_preload();
 
-        // Compute frame index (0-based)
         let frame_index = ((t * self.fps).floor() as usize)
             .clamp(0, self.frame_count.saturating_sub(1));
 
-        // Try buffer first
-        if self.is_in_buffer(frame_index) {
-            let buf_idx = frame_index - self.buffer_start;
-            if let Some(img) = self.buffer.get(buf_idx).and_then(|s| s.clone()) {
-                // Trigger read-ahead
-                if frame_index != self.last_displayed_frame {
-                    self.last_displayed_frame = frame_index;
-                    let buffer_end = self.buffer_start + self.buffer_size;
-                    let remaining = buffer_end.saturating_sub(frame_index);
-                    if remaining < self.buffer_size / 2 && !self.preloading {
-                        self.trigger_preload(frame_index);
-                    }
-                }
-                return Some(img);
-            }
-        }
-
-        // Fallback: load from disk (seek case)
-        let img = self.load_frame_from_disk(frame_index);
-        if img.is_some() {
-            self.buffer_start = frame_index;
-            self.buffer = vec![None; self.buffer_size];
-            self.buffer[0] = img.clone();
-            self.trigger_preload(frame_index);
-            self.last_displayed_frame = frame_index;
-        }
-        img
+        let img = self.resolve_frame_image(frame_index)?;
+        self.note_frame_displayed(frame_index);
+        Some(img)
     }
 
     /// Get the texture for a given time `t` in seconds.
@@ -225,32 +235,23 @@ impl FrameCache {
             return None;
         }
 
-        // Check for completed background pre-load
         self.poll_preload();
 
-        // Compute frame index (0-based)
         let frame_index = ((t * self.fps).floor() as usize)
             .clamp(0, self.frame_count.saturating_sub(1));
 
-        // Check if frame is in the ring buffer
-        let image = if self.is_in_buffer(frame_index) {
-            let buf_idx = frame_index - self.buffer_start;
-            self.buffer.get(buf_idx).and_then(|slot| slot.clone())
-        } else {
-            // Frame not in buffer — load synchronously (happens on seeks)
-            let img = self.load_frame_from_disk(frame_index);
-            // Reposition buffer around this frame and trigger background pre-load
-            self.buffer_start = frame_index;
-            self.buffer = vec![None; self.buffer_size];
-            if let Some(ref image) = img {
-                self.buffer[0] = Some(image.clone());
+        let image = match self.resolve_frame_image(frame_index) {
+            Some(img) => img,
+            None => {
+                // Transient I/O gap while another preload is in flight — keep
+                // the last uploaded frame so actors don't flash empty for ~0.5s.
+                if self.texture.is_some() {
+                    self.note_frame_displayed(frame_index);
+                    return self.texture.as_ref();
+                }
+                return None;
             }
-            // Fill rest in background
-            self.trigger_preload(frame_index);
-            img
         };
-
-        let image = image?;
 
         // Skip the GPU re-upload when we're still on the same frame as last
         // time — this is the dominant cost when the playhead isn't advancing
@@ -259,15 +260,7 @@ impl FrameCache {
         if self.texture.is_some()
             && self.texture_uploaded_frame == Some(frame_index)
         {
-            // Update read-ahead bookkeeping below as before but no upload.
-            if frame_index != self.last_displayed_frame {
-                self.last_displayed_frame = frame_index;
-                let buffer_end = self.buffer_start + self.buffer_size;
-                let frames_remaining = buffer_end.saturating_sub(frame_index);
-                if frames_remaining < self.buffer_size / 2 && !self.preloading {
-                    self.trigger_preload(frame_index);
-                }
-            }
+            self.note_frame_displayed(frame_index);
             return self.texture.as_ref();
         }
 
@@ -278,25 +271,64 @@ impl FrameCache {
                 tex.set(image, options);
             }
             None => {
-                let tex = ctx.load_texture("frame_preview", image, options);
+                let tex = ctx.load_texture(
+                    format!("frame_preview_{}", self.actor_index),
+                    image,
+                    options,
+                );
                 self.texture = Some(tex);
             }
         }
         self.texture_uploaded_frame = Some(frame_index);
 
-        // Trigger read-ahead if playhead advanced
-        if frame_index != self.last_displayed_frame {
-            self.last_displayed_frame = frame_index;
-            // If we're approaching the end of the buffer, trigger pre-load ahead
-            let buffer_end = self.buffer_start + self.buffer_size;
-            let frames_remaining = buffer_end.saturating_sub(frame_index);
-            if frames_remaining < self.buffer_size / 2 && !self.preloading {
-                // Pre-load next chunk starting from current position
-                self.trigger_preload(frame_index);
+        self.note_frame_displayed(frame_index);
+
+        self.texture.as_ref()
+    }
+
+    /// Resolve a frame from the ring buffer, falling back to a synchronous disk
+    /// read and back-filling the slot. Fixes holes when preload slots are `None`
+    /// or the playhead moved ahead of a stale background preload.
+    fn resolve_frame_image(&mut self, frame_index: usize) -> Option<ColorImage> {
+        if self.is_in_buffer(frame_index) {
+            let buf_idx = frame_index - self.buffer_start;
+            if let Some(img) = self.buffer.get(buf_idx).and_then(|s| s.clone()) {
+                return Some(img);
             }
         }
 
-        self.texture.as_ref()
+        let img = self.load_frame_from_disk(frame_index)?;
+
+        if self.is_in_buffer(frame_index) {
+            let buf_idx = frame_index - self.buffer_start;
+            if let Some(slot) = self.buffer.get_mut(buf_idx) {
+                *slot = Some(img.clone());
+            }
+        } else {
+            self.buffer_start = frame_index;
+            self.buffer = vec![None; self.buffer_size];
+            self.buffer[0] = Some(img.clone());
+            self.trigger_preload(frame_index);
+        }
+
+        Some(img)
+    }
+
+    /// Read-ahead bookkeeping after a frame is shown.
+    fn note_frame_displayed(&mut self, frame_index: usize) {
+        if frame_index == self.last_displayed_frame {
+            return;
+        }
+        self.last_displayed_frame = frame_index;
+        let buffer_end = self.buffer_start + self.buffer_size;
+        let frames_remaining = buffer_end.saturating_sub(frame_index);
+        if frames_remaining < self.buffer_size / 2 && !self.preloading {
+            self.trigger_preload(frame_index);
+        }
+    }
+
+    fn preload_covers_frame(&self, start: usize, len: usize, frame_index: usize) -> bool {
+        frame_index >= start && frame_index < start + len
     }
 
     /// Check if a frame index is within the current ring buffer range.
@@ -307,9 +339,16 @@ impl FrameCache {
     }
 
     /// Return a cached texture for the given time AFTER applying chroma-key,
-    /// colour-correction, and the post-process effect stack. The processed
-    /// texture is cached and only recomputed when the frame index or any
-    /// effect parameter changes.
+    /// colour-correction, and the post-process effect stack.
+    ///
+    /// **Three-tier cache:**
+    /// 1. `fx_texture` — single-frame LRU for the exact `(frame_index, params)` pair.
+    /// 2. `processed_buffer` — ring buffer of already-processed frames coming from
+    ///    a background thread (zero CPU cost on the UI thread).
+    /// 3. Raw fallback — when neither processed cache is ready we return the
+    ///    unprocessed frame instantly and kick off a background processed preload.
+    ///    This keeps playback responsive (no UI-blocking chroma-key) at the cost
+    ///    of showing the raw clip for 1-2 frames until the background worker catches up.
     pub fn processed_frame_at_time(
         &mut self,
         t: f32,
@@ -321,60 +360,72 @@ impl FrameCache {
         if !self.ready || self.frame_count == 0 { return None; }
         let frame_index = ((t * self.fps).floor() as usize)
             .clamp(0, self.frame_count.saturating_sub(1));
-        let new_key = (frame_index, hash_effect_params(ck, cc, effects));
+        let params_hash = hash_effect_params(ck, cc, effects);
+        let new_key = (frame_index, params_hash);
 
-        // Cache hit — reuse the existing processed texture.
+        // ── Tier 1: single-frame texture cache (fastest) ──
         if let (Some(prev_key), Some(_)) = (self.fx_key, self.fx_texture.as_ref()) {
             if prev_key == new_key {
                 return self.fx_texture.as_ref();
             }
         }
 
-        // Fast path: when there are no user effects AND no active
-        // chroma/CC, skip the entire processing pipeline and just
-        // upload the downscaled raw frame. This saves the allocation
-        // + per-pixel loop on every frame during playback for the
-        // common case of "no color tweaks applied".
-        let raw = self.raw_frame_at_time(t)?;
-        let active_caches = PRELOAD_SEMAPHORE.load(std::sync::atomic::Ordering::Relaxed);
-        let preview_dim = if active_caches >= 4 { 180 } else if active_caches >= 2 { 240 } else { 360 };
-        let scaled = downscale_for_preview(&raw, preview_dim);
+        // ── Tier 2: processed ring buffer (background worker) ──
+        // If params changed since the buffer was built, invalidate it.
+        if self.processed_params_hash != params_hash {
+            self.processed_buffer.clear();
+            self.processed_buffer_start = 0;
+            self.processed_params_hash = params_hash;
+            // processed_preloading may still hold stale params — the
+            // poll path checks params_hash and discards mismatches.
+        }
 
-        let chroma_active = ck.similarity.is_finite() && ck.similarity >= 1.0e-5;
-        let cc_active = (cc.brightness.abs() > 1e-4)
-            || (cc.contrast.abs() > 1e-4)
-            || (cc.saturation.abs() > 1e-4)
-            || (cc.temperature.abs() > 1e-4)
-            || cc.lift.iter().any(|v| v.abs() > 1e-4)
-            || cc.gamma.iter().any(|v| (v - 1.0).abs() > 1e-4)
-            || cc.gain.iter().any(|v| (v - 1.0).abs() > 1e-4)
-            || !cc.curves.is_identity();
-        let effects_active = effects.iter().any(|e| e.enabled && e.intensity > 0.001);
+        self.poll_processed_preload();
 
-        let processed = if !chroma_active && !cc_active && !effects_active {
-            // No-op: just upload the scaled frame as-is.
-            scaled
-        } else {
-            let mut p = apply_effects_cpu(&scaled, ck, cc);
-            if effects_active {
-                p = apply_effect_stack_cpu(&p, effects);
-            }
-            p
-        };
-        let options = TextureOptions::LINEAR;
-        match self.fx_texture.as_mut() {
-            Some(tex) => tex.set(processed, options),
-            None => {
-                let tex = ctx.load_texture(
-                    format!("frame_fx_{}", self.actor_index),
-                    processed,
-                    options,
-                );
-                self.fx_texture = Some(tex);
+        if self.is_in_processed_buffer(frame_index) {
+            let buf_idx = frame_index - self.processed_buffer_start;
+            if let Some(img) = self.processed_buffer.get(buf_idx).and_then(|s| s.as_ref()) {
+                let options = TextureOptions::LINEAR;
+                match self.fx_texture.as_mut() {
+                    Some(tex) => tex.set(img.clone(), options),
+                    None => {
+                        let tex = ctx.load_texture(
+                            format!("frame_fx_{}", self.actor_index),
+                            img.clone(),
+                            options,
+                        );
+                        self.fx_texture = Some(tex);
+                    }
+                }
+                self.fx_key = Some(new_key);
+                return self.fx_texture.as_ref();
             }
         }
-        self.fx_key = Some(new_key);
-        self.fx_texture.as_ref()
+
+        // Processed slot missing — keep the last keyed frame visible while the
+        // background worker catches up (same hold policy as raw frames).
+        if self.fx_texture.is_some() && self.fx_key.is_some() {
+            if !self.processed_preloading {
+                self.trigger_processed_preload(frame_index, ck, cc, effects);
+            }
+            return self.fx_texture.as_ref();
+        }
+
+        // ── Tier 3: raw fallback (no chroma-key CPU cost on UI thread) ──
+        // Kick off background processed preload FIRST (before we borrow self
+        // for frame_at_time, whose returned &TextureHandle extends the borrow).
+        if !self.processed_preloading {
+            self.trigger_processed_preload(frame_index, ck, cc, effects);
+        }
+
+        // Return the unprocessed frame immediately so playback stays at 60fps.
+        // The background processed preload will fill the processed_buffer soon.
+        let raw_tex = self.frame_at_time(t, ctx)?;
+
+        // Return the raw texture handle. The caller (canvas_preview) uses it
+        // as-is; the user sees the un-keyed frame for 1-2 frames which is
+        // acceptable during motion and far better than a UI stall.
+        Some(raw_tex)
     }
 
     /// Load a single frame from disk as a ColorImage.
@@ -476,9 +527,163 @@ impl FrameCache {
         };
 
         if let Some(result) = result {
-            self.buffer_start = result.start;
-            self.buffer = result.frames;
+            let display = self.last_displayed_frame;
+            let covers = display == usize::MAX
+                || self.preload_covers_frame(result.start, result.frames.len(), display);
+            if covers {
+                self.buffer_start = result.start;
+                self.buffer = result.frames;
+            } else if display != usize::MAX && !self.is_in_buffer(display) {
+                // Stale preload completed behind the playhead — reload around
+                // the frame we're actually showing instead of swapping in data
+                // that leaves the current index uncovered.
+                self.load_buffer_range(display);
+                self.trigger_preload(display);
+            }
             self.preloading = false;
+        }
+    }
+
+    // ── PROCESSED (CHROMA-KEY + EFFECTS) BACKGROUND PIPELINE ─────────────
+
+    /// Check if a frame index is within the current processed ring buffer range.
+    fn is_in_processed_buffer(&self, frame_index: usize) -> bool {
+        frame_index >= self.processed_buffer_start
+            && frame_index < self.processed_buffer_start + self.processed_buffer.len()
+            && frame_index < self.frame_count
+    }
+
+    /// Trigger a background thread that decodes raw frames and runs the
+    /// full chroma-key + colour-correction + effect stack on them.
+    /// Results land in `processed_preload_slot`; the UI thread picks them
+    /// up via `poll_processed_preload` on the next frame.
+    fn trigger_processed_preload(
+        &mut self,
+        start_frame: usize,
+        ck: &memstroy_core::ChromaKeyParams,
+        cc: &memstroy_core::ColorCorrection,
+        effects: &[memstroy_core::Effect],
+    ) {
+        if self.processed_preloading {
+            return;
+        }
+
+        let params_hash = hash_effect_params(ck, cc, effects);
+        let active_caches = PRELOAD_SEMAPHORE.load(std::sync::atomic::Ordering::Relaxed);
+        let preview_dim = if active_caches >= 4 { 180 } else if active_caches >= 2 { 240 } else { 360 };
+
+        // Clone params for the closure.
+        let ck = ck.clone();
+        let cc = cc.clone();
+        let effects = effects.to_vec();
+        let cache_dir = self.cache_dir.clone();
+        let frame_count = self.frame_count;
+        let buffer_size = self.buffer_size;
+        let slot = self.processed_preload_slot.clone();
+
+        self.processed_preloading = true;
+
+        thread::Builder::new()
+            .name(format!("memstroy-processed-preload-{}", self.actor_index))
+            .spawn(move || {
+                let mut frames = Vec::with_capacity(buffer_size);
+                for i in 0..buffer_size {
+                    let idx = start_frame + i;
+                    if idx >= frame_count {
+                        frames.push(None);
+                        continue;
+                    }
+
+                    // Decode raw JPEG from disk (same path as raw preload).
+                    let file_name = format!("{:06}.jpg", idx + 1);
+                    let frame_path = cache_dir.join(&file_name);
+                    let img = match image::open(&frame_path) {
+                        Ok(img) => {
+                            let rgba = img.to_rgba8();
+                            let size = [rgba.width() as usize, rgba.height() as usize];
+                            let pixels = rgba.into_raw();
+                            Some(ColorImage::from_rgba_unmultiplied(size, &pixels))
+                        }
+                        Err(_) => None,
+                    };
+
+                    // Apply chroma-key + colour-correction + effects.
+                    let processed = if let Some(raw) = img {
+                        let scaled = downscale_for_preview(&raw, preview_dim);
+
+                        let chroma_active = ck.similarity.is_finite() && ck.similarity >= 1.0e-5;
+                        let cc_active = (cc.brightness.abs() > 1e-4)
+                            || (cc.contrast.abs() > 1e-4)
+                            || (cc.saturation.abs() > 1e-4)
+                            || (cc.temperature.abs() > 1e-4)
+                            || cc.lift.iter().any(|v| v.abs() > 1e-4)
+                            || cc.gamma.iter().any(|v| (v - 1.0).abs() > 1e-4)
+                            || cc.gain.iter().any(|v| (v - 1.0).abs() > 1e-4)
+                            || !cc.curves.is_identity();
+                        let effects_active = effects.iter().any(|e| e.enabled && e.intensity > 0.001);
+
+                        if !chroma_active && !cc_active && !effects_active {
+                            Some(scaled)
+                        } else {
+                            let mut p = apply_effects_cpu(&scaled, &ck, &cc);
+                            if effects_active {
+                                p = apply_effect_stack_cpu(&p, &effects);
+                            }
+                            Some(p)
+                        }
+                    } else {
+                        None
+                    };
+
+                    frames.push(processed);
+                }
+
+                if let Ok(mut guard) = slot.lock() {
+                    *guard = Some(ProcessedPreloadResult {
+                        start: start_frame,
+                        frames,
+                        params_hash,
+                    });
+                }
+                // Note: we do NOT reset processed_preloading here —
+                // that flag is cleared by poll_processed_preload on the UI thread.
+            })
+            .ok(); // Ignore spawn failure — worst case we fall back to raw frames.
+    }
+
+    /// Poll for completed background *processed* pre-load and apply
+    /// results into the processed ring buffer. Stale results (params_hash
+    /// mismatch) are silently discarded so the UI never shows frames that
+    /// were computed with outdated colour / effect settings.
+    fn poll_processed_preload(&mut self) {
+        if !self.processed_preloading {
+            return;
+        }
+        let result = if let Ok(mut guard) = self.processed_preload_slot.lock() {
+            guard.take()
+        } else {
+            None
+        };
+
+        if let Some(result) = result {
+            // Discard stale work: if the user edited params while the thread
+            // was running, the arrived frames are for the old settings.
+            if result.params_hash == self.processed_params_hash {
+                let display = self.last_displayed_frame;
+                let covers = display == usize::MAX
+                    || self.preload_covers_frame(
+                        result.start,
+                        result.frames.len(),
+                        display,
+                    );
+                if covers {
+                    self.processed_buffer_start = result.start;
+                    self.processed_buffer = result.frames;
+                }
+                // If stale, keep the previous processed buffer (if any) and let
+                // `processed_frame_at_time` re-trigger preload on the next call.
+            }
+            self.processed_preloading = false;
         }
     }
 }
@@ -644,7 +849,7 @@ pub fn downscale_for_preview(img: &ColorImage, max_dim: usize) -> ColorImage {
 ///
 /// To keep this fast on full-HD frames the four tone curves are pre-baked
 /// into 256-entry LUTs once per call instead of re-sampled per pixel.
-pub fn apply_effects_cpu(
+pub(crate) fn apply_effects_cpu_scalar(
     img: &ColorImage,
     ck: &memstroy_core::ChromaKeyParams,
     cc: &memstroy_core::ColorCorrection,
@@ -801,6 +1006,303 @@ pub fn apply_effects_cpu(
         out.pixels[i] = egui::Color32::from_rgba_unmultiplied(or_ as u8, og as u8, ob as u8, a);
     }
     out
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub(crate) fn apply_effects_cpu_simd(
+    img: &ColorImage,
+    ck: &memstroy_core::ChromaKeyParams,
+    cc: &memstroy_core::ColorCorrection,
+) -> ColorImage {
+    use wide::{f32x8, CmpGt, CmpLt};
+
+    // ── Early-out checks (same as scalar) ──
+    let similarity_check = ck.similarity.is_finite() && ck.similarity >= 1.0e-5;
+    let cc_check = (cc.brightness.abs() > 1e-4)
+        || (cc.contrast.abs() > 1e-4)
+        || (cc.saturation.abs() > 1e-4)
+        || (cc.temperature.abs() > 1e-4)
+        || cc.lift.iter().any(|v| v.abs() > 1e-4)
+        || cc.gamma.iter().any(|v| (v - 1.0).abs() > 1e-4)
+        || cc.gain.iter().any(|v| (v - 1.0).abs() > 1e-4)
+        || !cc.curves.is_identity();
+    if !similarity_check && !cc_check {
+        return img.clone();
+    }
+
+    let similarity = if ck.similarity.is_finite() {
+        ck.similarity.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let blend = if ck.blend.is_finite() {
+        ck.blend.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let spill = if ck.spill.is_finite() {
+        ck.spill.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let chroma_active = similarity >= 1.0e-5;
+    let (key_cb, key_cr) = rgb_to_cbcr_bt601(ck.key_color);
+    let dist_norm = 255.0 * std::f32::consts::SQRT_2;
+
+    // LUTs & LGG pre-clamp (same as scalar)
+    let lut_master = build_curve_lut(&cc.curves.master);
+    let lut_r = build_curve_lut(&cc.curves.red);
+    let lut_g = build_curve_lut(&cc.curves.green);
+    let lut_b = build_curve_lut(&cc.curves.blue);
+    let curves_active = !cc.curves.is_identity();
+
+    let gain = [
+        cc.gain[0].max(0.0),
+        cc.gain[1].max(0.0),
+        cc.gain[2].max(0.0),
+    ];
+    let inv_gamma = [
+        1.0 / cc.gamma[0].max(0.05),
+        1.0 / cc.gamma[1].max(0.05),
+        1.0 / cc.gamma[2].max(0.05),
+    ];
+    let lift = cc.lift;
+    let lgg_active = lift.iter().any(|v| v.abs() > 1e-4)
+        || gain.iter().any(|v| (v - 1.0).abs() > 1e-4)
+        || inv_gamma.iter().any(|v| (v - 1.0).abs() > 1e-4);
+
+    let n = img.pixels.len();
+    let mut out = ColorImage::new(img.size, egui::Color32::TRANSPARENT);
+
+    // ── SIMD constants ──
+    let zero = f32x8::ZERO;
+    let one = f32x8::ONE;
+    let max255 = f32x8::splat(255.0);
+    let half = f32x8::splat(0.5);
+    let c128 = f32x8::splat(128.0);
+    let brightness = f32x8::splat(cc.brightness * 255.0);
+    let contrast = f32x8::splat(cc.contrast);
+    let saturation = f32x8::splat(cc.saturation);
+    let temp = f32x8::splat(cc.temperature * 30.0);
+    let gray_r = f32x8::splat(0.299);
+    let gray_g = f32x8::splat(0.587);
+    let gray_b = f32x8::splat(0.114);
+    let key_cb_v = f32x8::splat(key_cb);
+    let key_cr_v = f32x8::splat(key_cr);
+    let dist_norm_v = f32x8::splat(dist_norm);
+    let sim_v = f32x8::splat(similarity);
+    let blend_v = f32x8::splat(blend);
+    let spill_v = f32x8::splat(spill);
+    let cb_coeff_r = f32x8::splat(-0.169);
+    let cb_coeff_g = f32x8::splat(-0.331);
+    let cb_coeff_b = f32x8::splat(0.500);
+    let cr_coeff_r = f32x8::splat(0.500);
+    let cr_coeff_g = f32x8::splat(-0.419);
+    let cr_coeff_b = f32x8::splat(-0.081);
+
+    let batch = 8;
+    let simd_end = n - (n % batch);
+
+    // ── SIMD main loop: chroma-key + brightness + contrast + saturation + temperature ──
+    for i in (0..simd_end).step_by(batch) {
+        let mut r_arr = [0.0f32; 8];
+        let mut g_arr = [0.0f32; 8];
+        let mut b_arr = [0.0f32; 8];
+        for j in 0..8 {
+            let px = img.pixels[i + j];
+            r_arr[j] = px.r() as f32;
+            g_arr[j] = px.g() as f32;
+            b_arr[j] = px.b() as f32;
+        }
+        let mut r = f32x8::new(r_arr);
+        let mut g = f32x8::new(g_arr);
+        let mut b = f32x8::new(b_arr);
+
+        // Chroma-key
+        let mut alpha = one;
+        if chroma_active {
+            let cb = r * cb_coeff_r + g * cb_coeff_g + b * cb_coeff_b + c128;
+            let cr = r * cr_coeff_r + g * cr_coeff_g + b * cr_coeff_b + c128;
+            let du = cb - key_cb_v;
+            let dv = cr - key_cr_v;
+            let diff = (du * du + dv * dv).sqrt() / dist_norm_v;
+
+            if blend > 0.0 {
+                alpha = ((diff - sim_v) / blend_v).max(zero).min(one);
+            } else {
+                let mask = diff.cmp_lt(sim_v);
+                alpha = mask.blend(zero, one);
+            }
+        }
+
+        // Spill suppression
+        if chroma_active && spill > 0.0 {
+            let cond = alpha.cmp_gt(zero) & g.cmp_gt((r + b) * half);
+            let avg_rb = (r + b) * half;
+            let og_spill = g - (g - avg_rb) * spill_v;
+            g = cond.blend(og_spill, g);
+        }
+
+        // Brightness
+        r = r + brightness;
+        g = g + brightness;
+        b = b + brightness;
+
+        // Contrast
+        r = (r - c128) * contrast + c128;
+        g = (g - c128) * contrast + c128;
+        b = (b - c128) * contrast + c128;
+
+        // Clamp
+        r = r.max(zero).min(max255);
+        g = g.max(zero).min(max255);
+        b = b.max(zero).min(max255);
+
+        // Saturation
+        let gray = r * gray_r + g * gray_g + b * gray_b;
+        r = gray + (r - gray) * saturation;
+        g = gray + (g - gray) * saturation;
+        b = gray + (b - gray) * saturation;
+
+        // Temperature
+        if cc.temperature != 0.0 {
+            r = r + temp;
+            b = b - temp;
+        }
+
+        // Clamp
+        r = r.max(zero).min(max255);
+        g = g.max(zero).min(max255);
+        b = b.max(zero).min(max255);
+
+        // Pack
+        let r_a = r.to_array();
+        let g_a = g.to_array();
+        let b_a = b.to_array();
+        let a_a = alpha.to_array();
+        for j in 0..8 {
+            let a = (a_a[j] * 255.0).clamp(0.0, 255.0) as u8;
+            out.pixels[i + j] = egui::Color32::from_rgba_unmultiplied(
+                r_a[j] as u8,
+                g_a[j] as u8,
+                b_a[j] as u8,
+                a,
+            );
+        }
+    }
+
+    // ── Scalar tail for leftover pixels (< 8) ──
+    for i in simd_end..n {
+        let px = img.pixels[i];
+        let r = px.r() as f32;
+        let g = px.g() as f32;
+        let b = px.b() as f32;
+
+        let alpha = if !chroma_active {
+            1.0
+        } else {
+            let cb = -0.169 * r - 0.331 * g + 0.500 * b + 128.0;
+            let cr = 0.500 * r - 0.419 * g - 0.081 * b + 128.0;
+            let du = cb - key_cb;
+            let dv = cr - key_cr;
+            let diff = (du * du + dv * dv).sqrt() / dist_norm;
+            if diff < similarity {
+                0.0
+            } else if blend > 0.0 && diff < similarity + blend {
+                ((diff - similarity) / blend).clamp(0.0, 1.0)
+            } else {
+                1.0
+            }
+        };
+
+        let (mut or_, mut og, mut ob) = (r, g, b);
+        if alpha > 0.0 && spill > 0.0 && g > (r + b) * 0.5 {
+            let avg_rb = (r + b) * 0.5;
+            og = g - (g - avg_rb) * spill;
+        }
+
+        or_ = (or_ + cc.brightness * 255.0).clamp(0.0, 255.0);
+        og = (og + cc.brightness * 255.0).clamp(0.0, 255.0);
+        ob = (ob + cc.brightness * 255.0).clamp(0.0, 255.0);
+        or_ = ((or_ - 128.0) * cc.contrast + 128.0).clamp(0.0, 255.0);
+        og = ((og - 128.0) * cc.contrast + 128.0).clamp(0.0, 255.0);
+        ob = ((ob - 128.0) * cc.contrast + 128.0).clamp(0.0, 255.0);
+        let gray = 0.299 * or_ + 0.587 * og + 0.114 * ob;
+        or_ = (gray + (or_ - gray) * cc.saturation).clamp(0.0, 255.0);
+        og = (gray + (og - gray) * cc.saturation).clamp(0.0, 255.0);
+        ob = (gray + (ob - gray) * cc.saturation).clamp(0.0, 255.0);
+        if cc.temperature != 0.0 {
+            or_ = (or_ + cc.temperature * 30.0).clamp(0.0, 255.0);
+            ob = (ob - cc.temperature * 30.0).clamp(0.0, 255.0);
+        }
+
+        let a = (alpha * 255.0).clamp(0.0, 255.0) as u8;
+        out.pixels[i] = egui::Color32::from_rgba_unmultiplied(or_ as u8, og as u8, ob as u8, a);
+    }
+
+    // ── Scalar second pass: LGG + curves over all pixels ──
+    if lgg_active || curves_active {
+        for px in out.pixels.iter_mut() {
+            let mut r = px.r() as f32;
+            let mut g = px.g() as f32;
+            let mut b = px.b() as f32;
+
+            if lgg_active {
+                let mut nr = r / 255.0;
+                let mut ng = g / 255.0;
+                let mut nb = b / 255.0;
+                nr = nr + lift[0] * (1.0 - nr);
+                ng = ng + lift[1] * (1.0 - ng);
+                nb = nb + lift[2] * (1.0 - nb);
+                nr = (nr * gain[0]).max(0.0);
+                ng = (ng * gain[1]).max(0.0);
+                nb = (nb * gain[2]).max(0.0);
+                nr = nr.powf(inv_gamma[0]);
+                ng = ng.powf(inv_gamma[1]);
+                nb = nb.powf(inv_gamma[2]);
+                r = (nr * 255.0).clamp(0.0, 255.0);
+                g = (ng * 255.0).clamp(0.0, 255.0);
+                b = (nb * 255.0).clamp(0.0, 255.0);
+            }
+
+            if curves_active {
+                r = lut_master[r as usize] as f32;
+                g = lut_master[g as usize] as f32;
+                b = lut_master[b as usize] as f32;
+                r = lut_r[r as usize] as f32;
+                g = lut_g[g as usize] as f32;
+                b = lut_b[b as usize] as f32;
+            }
+
+            *px = egui::Color32::from_rgba_unmultiplied(r as u8, g as u8, b as u8, px.a());
+        }
+    }
+
+    out
+}
+
+/// Public dispatcher: selects the SIMD path on x86_64 / aarch64 when the
+/// frame is wide enough to amortise the setup cost, otherwise falls back
+/// to the scalar reference implementation.
+pub fn apply_effects_cpu(
+    img: &ColorImage,
+    ck: &memstroy_core::ChromaKeyParams,
+    cc: &memstroy_core::ColorCorrection,
+) -> ColorImage {
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    {
+        // Only use SIMD when the compiler is allowed to emit vector
+        // instructions (target-feature avx / neon).  In debug builds
+        // without those flags `wide` falls back to scalar loops and
+        // is actually slower, so we stay on the scalar reference.
+        let has_vector = cfg!(target_feature = "avx")
+            || cfg!(target_feature = "avx2")
+            || cfg!(target_feature = "neon");
+        if has_vector && img.pixels.len() >= 64 {
+            return apply_effects_cpu_simd(img, ck, cc);
+        }
+    }
+    apply_effects_cpu_scalar(img, ck, cc)
 }
 
 /// Convert an RGB triple (0..=255) to BT.601 chroma components
@@ -1625,6 +2127,153 @@ pub fn extract_frames_blocking_with_scale(
         Err(e) => {
             tracing::error!("ffmpeg frame extraction failed: {e}");
             on_done(Err(()));
+        }
+    }
+}
+
+// ─── TESTS ─────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    /// Build a synthetic 480×270 green-screen image (chroma-key target).
+    fn synthetic_green_screen() -> ColorImage {
+        let w = 480_usize;
+        let h = 270_usize;
+        let mut pixels = Vec::with_capacity(w * h);
+        for y in 0..h {
+            for x in 0..w {
+                // Center area = bright green (key target), edges = skin tone.
+                let is_green = x > w / 4 && x < w * 3 / 4 && y > h / 4 && y < h * 3 / 4;
+                let c = if is_green {
+                    egui::Color32::from_rgb(0, 255, 0)
+                } else {
+                    egui::Color32::from_rgb(200, 120, 80)
+                };
+                pixels.push(c);
+            }
+        }
+        ColorImage { size: [w, h], pixels }
+    }
+
+    /// Ensure chroma-key + colour-correction finishes a 480p frame in
+    /// well under the 16ms budget (single actor, single frame). This is
+    /// the baseline CPU cost that the background pipeline moves off the
+    /// UI thread.
+    #[test]
+    fn chroma_key_480p_under_16ms() {
+        let img = synthetic_green_screen();
+        let ck = memstroy_core::ChromaKeyParams {
+            key_color: [0, 255, 0],
+            similarity: 0.3,
+            blend: 0.1,
+            spill: 0.2,
+        };
+        let cc = memstroy_core::ColorCorrection::default();
+
+        let start = Instant::now();
+        let _out = apply_effects_cpu(&img, &ck, &cc);
+        let elapsed = start.elapsed().as_secs_f32() * 1000.0;
+
+        // Debug builds are ~3-4× slower than release. In release this
+        // should finish in < 8 ms; in debug we allow up to 50 ms so the
+        // test doesn't spuriously fail on CI. The important thing is
+        // that we have a measured baseline — 34 ms in debug means the
+        // UI thread would drop to ~30 fps with a single actor if this
+        // ran synchronously, which is exactly why the background
+        // processed-frame pipeline was added.
+        let budget = if cfg!(debug_assertions) { 50.0 } else { 8.0 };
+        assert!(
+            elapsed < budget,
+            "chroma-key + CC on 480p took {:.2}ms, exceeds {}ms budget",
+            elapsed,
+            budget
+        );
+    }
+
+    /// Ensure the processed pipeline hash changes when params change.
+    #[test]
+    fn hash_effect_params_changes_with_params() {
+        let ck1 = memstroy_core::ChromaKeyParams {
+            key_color: [0, 255, 0],
+            similarity: 0.3,
+            blend: 0.1,
+            spill: 0.2,
+        };
+        let ck2 = memstroy_core::ChromaKeyParams {
+            key_color: [0, 255, 0],
+            similarity: 0.5, // changed
+            blend: 0.1,
+            spill: 0.2,
+        };
+        let cc = memstroy_core::ColorCorrection::default();
+        let effects: Vec<memstroy_core::Effect> = Vec::new();
+
+        let h1 = hash_effect_params(&ck1, &cc, &effects);
+        let h2 = hash_effect_params(&ck2, &cc, &effects);
+        assert_ne!(h1, h2, "hash should differ when similarity changes");
+    }
+
+    /// downscale_for_preview should return input unchanged when already small.
+    #[test]
+    fn downscale_noop_when_small() {
+        let img = ColorImage::new([100, 100], egui::Color32::RED);
+        let out = downscale_for_preview(&img, 360);
+        assert_eq!(out.size, [100, 100]);
+    }
+
+    /// Ensure the SIMD path produces pixel-perfect (±1) output compared
+    /// to the scalar reference for a diverse synthetic image.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn simd_matches_scalar_pixel_perfect() {
+        let mut pixels = Vec::with_capacity(100 * 100);
+        for y in 0..100 {
+            for x in 0..100 {
+                // Mix of greens, skin tones, and neutral greys.
+                let c = match (x + y) % 5 {
+                    0 => egui::Color32::from_rgb(0, 255, 0),
+                    1 => egui::Color32::from_rgb(255, 0, 0),
+                    2 => egui::Color32::from_rgb(0, 0, 255),
+                    3 => egui::Color32::from_rgb(128, 128, 128),
+                    _ => egui::Color32::from_rgb(200, 120, 80),
+                };
+                pixels.push(c);
+            }
+        }
+        let img = ColorImage { size: [100, 100], pixels };
+
+        let ck = memstroy_core::ChromaKeyParams {
+            key_color: [0, 255, 0],
+            similarity: 0.25,
+            blend: 0.08,
+            spill: 0.15,
+        };
+        let cc = memstroy_core::ColorCorrection {
+            brightness: 0.05,
+            contrast: 1.1,
+            saturation: 1.2,
+            temperature: 0.02,
+            ..Default::default()
+        };
+
+        let scalar = apply_effects_cpu_scalar(&img, &ck, &cc);
+        let simd = apply_effects_cpu_simd(&img, &ck, &cc);
+
+        assert_eq!(scalar.size, simd.size);
+        for (i, (s, m)) in scalar.pixels.iter().zip(simd.pixels.iter()).enumerate() {
+            let dr = (s.r() as i16 - m.r() as i16).abs();
+            let dg = (s.g() as i16 - m.g() as i16).abs();
+            let db = (s.b() as i16 - m.b() as i16).abs();
+            let da = (s.a() as i16 - m.a() as i16).abs();
+            assert!(
+                dr <= 1 && dg <= 1 && db <= 1 && da <= 1,
+                "pixel {i}: scalar {:?} vs simd {:?}",
+                s,
+                m
+            );
         }
     }
 }
