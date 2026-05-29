@@ -938,10 +938,11 @@ pub(crate) fn add_library_asset_at_playhead(
             // audio included. Cached so repeated drops don't re-block.
             let clip_duration = if let Some(&d) = state.video_duration_cache.get(&asset.path) {
                 d
-            } else {
-                let d = probe_video_duration(&asset.path);
+            } else if let Some(d) = probe_video_duration(&asset.path) {
                 state.video_duration_cache.insert(asset.path.clone(), d);
                 d
+            } else {
+                30.0
             };
             let t_in = t.max(0.0);
             let t_out = t_in + clip_duration.max(0.1);
@@ -15227,12 +15228,15 @@ pub(crate) fn clip_thumbnail_for_source(
         .and_then(|c| c.thumbnail.clone())
 }
 
-/// Non-blocking duration: use cache, else default and probe on a worker.
+/// Non-blocking duration: use cache, else spawn ffprobe in the background.
 fn clip_duration_for_placement(state: &mut EditorState, path: &PathBuf, actor_id: &str) -> f32 {
     if let Some(&d) = state.video_duration_cache.get(path) {
         return d;
     }
-    const FALLBACK: f32 = 5.0;
+    // Never block the UI thread on ffprobe when dropping a clip — use a
+    // generous placeholder and refine timing when the async probe (or frame
+    // extraction) reports the real duration.
+    const PLACEHOLDER: f32 = 60.0;
     if let (Some(handle), Some(tx)) = (state.tokio_handle.clone(), state.image_fx_tx.clone()) {
         let path2 = path.clone();
         let actor_id = actor_id.to_string();
@@ -15241,7 +15245,8 @@ fn clip_duration_for_placement(state: &mut EditorState, path: &PathBuf, actor_id
             let duration =
                 tokio::task::spawn_blocking(move || probe_video_duration(&path_probe))
                     .await
-                    .ok();
+                    .ok()
+                    .flatten();
             let _ = tx.send(crate::jobs::JobEvent::VideoDurationProbed {
                 actor_id,
                 path: path2,
@@ -15249,7 +15254,28 @@ fn clip_duration_for_placement(state: &mut EditorState, path: &PathBuf, actor_id
             });
         });
     }
-    FALLBACK
+    PLACEHOLDER
+}
+
+/// Re-measure actor clips from the duration cache and extend `t_out` when it
+/// was left at the placeholder length. Does not shell out to ffprobe on the
+/// UI thread — callers that know the real duration (frame extraction) should
+/// update `video_duration_cache` directly.
+pub fn reconcile_actor_clip_durations(state: &mut EditorState) {
+    let actor_count = state.scene.actors.len();
+    for i in 0..actor_count {
+        let path = state.scene.actors[i].source.clone();
+        let Some(&duration) = state.video_duration_cache.get(&path) else {
+            continue;
+        };
+        let t_in = state.scene.actors[i].t_in.unwrap_or(0.0);
+        let want_out = t_in + duration.max(0.1);
+        let cur_out = state.scene.actors[i].t_out.unwrap_or(want_out);
+        if (cur_out - want_out).abs() > 0.05 {
+            state.scene.actors[i].t_out = Some(want_out);
+            sync_audio_to_actor(state, i);
+        }
+    }
 }
 
 pub fn add_actor_from_clip(state: &mut EditorState, path: &PathBuf) {
@@ -15491,20 +15517,33 @@ pub(crate) fn add_actor_from_clip_at_time(state: &mut EditorState, path: &PathBu
     state.status = format!("{} {}", crate::i18n::t("Dropped actor:"), id);
 }
 
-/// Probe a media file and return its duration in seconds (5.0s fallback
-/// when ffprobe isn't available or the file can't be opened).
-fn probe_video_duration(path: &PathBuf) -> f32 {
+/// Probe a media file and return its duration in seconds when ffprobe succeeds.
+fn probe_video_duration(path: &PathBuf) -> Option<f32> {
     let ffprobe = {
         let mut p = memstroy_render::ffmpeg_binary();
         p.set_file_name("ffprobe");
-        if !p.exists() { PathBuf::from("ffprobe") } else { p }
+        if !p.exists() {
+            PathBuf::from("ffprobe")
+        } else {
+            p
+        }
     };
     let mut cmd = std::process::Command::new(&ffprobe);
-    cmd.args(["-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1"])
-        .arg(path);
-    match memstroy_render::hide_console_std(&mut cmd).output() {
-        Ok(out) => String::from_utf8_lossy(&out.stdout).trim().parse::<f32>().unwrap_or(5.0),
-        Err(_) => 5.0,
+    cmd.args([
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+    ])
+    .arg(path);
+    let out = memstroy_render::hide_console_std(&mut cmd).output().ok()?;
+    let d: f32 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
+    if d > 0.01 && d.is_finite() {
+        Some(d)
+    } else {
+        None
     }
 }
 
