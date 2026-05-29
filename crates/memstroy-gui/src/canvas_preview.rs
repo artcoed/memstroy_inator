@@ -2002,7 +2002,11 @@ fn draw_canvas_overlays_impl(
                 // and prefer it for drawing. Crop entries also return a
                 // UV inset — applied below to shrink the visible
                 // rectangle so the picture mirrors the FFmpeg export.
-                let mut crop_inset = [0.0_f32; 4];
+                let mut crop_inset = if !img.effects.is_empty() {
+                    crate::image_effects::accumulated_crop_inset(&img.effects)
+                } else {
+                    [0.0_f32; 4]
+                };
                 let fx_tex_handle: Option<egui::TextureHandle> =
                     if !img.effects.is_empty() && tex_handle.is_some() {
                         match ensure_image_fx_loaded(state, &img.source, &img.effects, painter.ctx()) {
@@ -4989,7 +4993,30 @@ fn sniff_hit(state: &EditorState, pos: WorldPos) -> Option<Selection> {
         let (ew, eh) = overlay_bbox_with_state(overlay, &ov_state, state);
         let half_w = ew * 0.5;
         let half_h = eh * 0.5;
-        if world_point_in_oriented_rect(pos, ov_world, half_w, half_h, ov_state.rotation_deg) {
+        let hit_center = if let Overlay::Image(img) = overlay {
+            if let Some((full_w, full_h)) =
+                image_overlay_uncropped_size(img, &ov_state, state)
+            {
+                let adj = crate::image_effects::CropLayoutAdjust::from_inset(
+                    crate::image_effects::accumulated_crop_inset(&img.effects),
+                );
+                let off = image_crop_world_center_offset(
+                    full_w,
+                    full_h,
+                    adj,
+                    ov_state.rotation_deg,
+                );
+                WorldPos {
+                    x: ov_world.x + off.x,
+                    y: ov_world.y + off.y,
+                }
+            } else {
+                ov_world
+            }
+        } else {
+            ov_world
+        };
+        if world_point_in_oriented_rect(pos, hit_center, half_w, half_h, ov_state.rotation_deg) {
             return Some(Selection::Overlay(idx));
         }
     }
@@ -5136,18 +5163,39 @@ fn selected_element_gizmo(
                 &mut ov_state.scale_y,
             );
             let world_pos = get_element_world_pos(state, ov_id, &[], t);
-            let (elem_w, elem_h) = overlay_bbox_with_state(overlay, &ov_state, state);
             let center_screen = state.canvas_viewport.world_to_screen(world_pos, viewport_size);
             let zoom = state.canvas_viewport.zoom;
-            Some(ElementGizmo {
+            let mut gizmo = ElementGizmo {
                 center: Pos2::new(
                     full_rect.min.x + center_screen[0],
                     full_rect.min.y + center_screen[1],
                 ),
-                half_w: elem_w * 0.5 * zoom,
-                half_h: elem_h * 0.5 * zoom,
+                half_w: 0.0,
+                half_h: 0.0,
                 rotation_deg: ov_state.rotation_deg,
-            })
+            };
+            if let Overlay::Image(img) = overlay {
+                if let Some((full_w, full_h)) =
+                    image_overlay_uncropped_size(img, &ov_state, state)
+                {
+                    let adj = crate::image_effects::CropLayoutAdjust::from_inset(
+                        crate::image_effects::accumulated_crop_inset(&img.effects),
+                    );
+                    gizmo.half_w = full_w * 0.5 * zoom;
+                    gizmo.half_h = full_h * 0.5 * zoom;
+                    apply_crop_to_element_gizmo(&mut gizmo, full_w, full_h, adj, zoom);
+                } else {
+                    let (elem_w, elem_h) =
+                        overlay_bbox_with_state(overlay, &ov_state, state);
+                    gizmo.half_w = elem_w * 0.5 * zoom;
+                    gizmo.half_h = elem_h * 0.5 * zoom;
+                }
+            } else {
+                let (elem_w, elem_h) = overlay_bbox_with_state(overlay, &ov_state, state);
+                gizmo.half_w = elem_w * 0.5 * zoom;
+                gizmo.half_h = elem_h * 0.5 * zoom;
+            }
+            Some(gizmo)
         }
         _ => None,
     }
@@ -5737,17 +5785,69 @@ fn overlay_bbox_with_state(
             let sy = ov_state.scale * ov_state.scale_y;
             return (600.0 * sx, 400.0 * sy);
         }
-        if let Ok(map) = state.image_textures.lock() {
-            if let Some(crate::state::ImageTextureSlot::Loaded { size, .. }) =
-                map.get(&img.source)
-            {
-                let sx = ov_state.scale;
-                let sy = ov_state.scale * ov_state.scale_y;
-                return (size[0] as f32 * sx, size[1] as f32 * sy);
-            }
+        if let Some((full_w, full_h)) = image_overlay_uncropped_size(img, ov_state, state) {
+            let adj = crate::image_effects::CropLayoutAdjust::from_inset(
+                crate::image_effects::accumulated_crop_inset(&img.effects),
+            );
+            return (full_w * adj.visible_w_frac, full_h * adj.visible_h_frac);
         }
     }
     overlay_bbox(overlay, ov_state)
+}
+
+/// Uncropped world-pixel size of an image overlay (before Crop insets).
+fn image_overlay_uncropped_size(
+    img: &memstroy_core::ImageOverlay,
+    ov_state: &OverlayState,
+    state: &EditorState,
+) -> Option<(f32, f32)> {
+    if img.source.as_os_str().is_empty() {
+        let sx = ov_state.scale;
+        let sy = ov_state.scale * ov_state.scale_y;
+        return Some((600.0 * sx, 400.0 * sy));
+    }
+    let map = state.image_textures.lock().ok()?;
+    let crate::state::ImageTextureSlot::Loaded { size, .. } = map.get(&img.source)? else {
+        return None;
+    };
+    let sx = ov_state.scale;
+    let sy = ov_state.scale * ov_state.scale_y;
+    Some((size[0] as f32 * sx, size[1] as f32 * sy))
+}
+
+/// World-space offset of the cropped image centre from the layout anchor.
+fn image_crop_world_center_offset(
+    full_w: f32,
+    full_h: f32,
+    adj: crate::image_effects::CropLayoutAdjust,
+    rotation_deg: f32,
+) -> WorldPos {
+    let ox = full_w * adj.center_x_frac;
+    let oy = full_h * adj.center_y_frac;
+    let rad = rotation_deg.to_radians();
+    let (c, s) = (rad.cos(), rad.sin());
+    WorldPos {
+        x: ox * c - oy * s,
+        y: ox * s + oy * c,
+    }
+}
+
+/// Shrink / shift the yellow selection gizmo to match the visible crop.
+fn apply_crop_to_element_gizmo(
+    gizmo: &mut ElementGizmo,
+    full_w: f32,
+    full_h: f32,
+    adj: crate::image_effects::CropLayoutAdjust,
+    zoom: f32,
+) {
+    let ox = full_w * adj.center_x_frac * zoom;
+    let oy = full_h * adj.center_y_frac * zoom;
+    let rad = gizmo.rotation_deg.to_radians();
+    let (c, s) = (rad.cos(), rad.sin());
+    gizmo.center.x += ox * c - oy * s;
+    gizmo.center.y += ox * s + oy * c;
+    gizmo.half_w = full_w * 0.5 * adj.visible_w_frac * zoom;
+    gizmo.half_h = full_h * 0.5 * adj.visible_h_frac * zoom;
 }
 
 /// Lazily decode `path` into a cached `egui::TextureHandle` and report
@@ -6037,8 +6137,28 @@ fn try_select_at(state: &mut EditorState, pos: WorldPos) {
                     y: ov_state.pos[1] * world_h,
                 };
                 let (ew, eh) = overlay_bbox_with_state(overlay, &ov_state, state);
-                if pos.x >= ov_world.x - ew * 0.5 && pos.x <= ov_world.x + ew * 0.5
-                    && pos.y >= ov_world.y - eh * 0.5 && pos.y <= ov_world.y + eh * 0.5
+                let (hit_cx, hit_cy) = if let Overlay::Image(img) = overlay {
+                    if let Some((full_w, full_h)) =
+                        image_overlay_uncropped_size(img, &ov_state, state)
+                    {
+                        let adj = crate::image_effects::CropLayoutAdjust::from_inset(
+                            crate::image_effects::accumulated_crop_inset(&img.effects),
+                        );
+                        let off = image_crop_world_center_offset(
+                            full_w,
+                            full_h,
+                            adj,
+                            ov_state.rotation_deg,
+                        );
+                        (ov_world.x + off.x, ov_world.y + off.y)
+                    } else {
+                        (ov_world.x, ov_world.y)
+                    }
+                } else {
+                    (ov_world.x, ov_world.y)
+                };
+                if pos.x >= hit_cx - ew * 0.5 && pos.x <= hit_cx + ew * 0.5
+                    && pos.y >= hit_cy - eh * 0.5 && pos.y <= hit_cy + eh * 0.5
                 {
                     state.selection = Selection::Overlay(idx);
                     return;

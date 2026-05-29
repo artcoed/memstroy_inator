@@ -33,6 +33,54 @@
 
 use memstroy_core::effects::{Effect, EffectKind, MaskShape};
 
+/// Normalised UV inset `(left, top, right, bottom)` from all enabled
+/// `Crop` entries on the stack (same accumulation as [`apply_effect_stack`]).
+pub fn accumulated_crop_inset(effects: &[Effect]) -> [f32; 4] {
+    let mut crop = (0.0_f32, 0.0_f32, 0.0_f32, 0.0_f32);
+    for eff in effects {
+        if !eff.enabled {
+            continue;
+        }
+        let i = eff.intensity.clamp(0.0, 1.0);
+        if i <= 0.001 {
+            continue;
+        }
+        if let EffectKind::Crop {
+            left,
+            top,
+            right,
+            bottom,
+        } = &eff.kind
+        {
+            crop.0 = (crop.0 + left * i).min(0.49);
+            crop.1 = (crop.1 + top * i).min(0.49);
+            crop.2 = (crop.2 + right * i).min(0.49);
+            crop.3 = (crop.3 + bottom * i).min(0.49);
+        }
+    }
+    [crop.0, crop.1, crop.2, crop.3]
+}
+
+/// How a crop inset shrinks the on-canvas layout rect and shifts its centre.
+#[derive(Clone, Copy, Debug)]
+pub struct CropLayoutAdjust {
+    pub visible_w_frac: f32,
+    pub visible_h_frac: f32,
+    pub center_x_frac: f32,
+    pub center_y_frac: f32,
+}
+
+impl CropLayoutAdjust {
+    pub fn from_inset(crop: [f32; 4]) -> Self {
+        Self {
+            visible_w_frac: (1.0 - crop[0] - crop[2]).max(0.001),
+            visible_h_frac: (1.0 - crop[1] - crop[3]).max(0.001),
+            center_x_frac: (crop[0] - crop[2]) * 0.5,
+            center_y_frac: (crop[1] - crop[3]) * 0.5,
+        }
+    }
+}
+
 /// Apply the effect stack in `effects` to an RGBA8 buffer in place.
 /// `(w, h)` are the image dimensions in pixels.
 ///
