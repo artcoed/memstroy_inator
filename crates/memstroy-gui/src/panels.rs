@@ -4885,14 +4885,6 @@ fn inspector_image_tools_section(ui: &mut egui::Ui, state: &mut EditorState, ove
                 state.mask_tool = MaskTool::CropRect;
             }
             if ui
-                .button(RichText::new("\u{25AD} Collider").size(11.0))
-                .on_hover_text(crate::i18n::t("Rect mask — hide everything outside the box"))
-                .clicked()
-            {
-                state.selection = Selection::Overlay(overlay_idx);
-                state.mask_tool = MaskTool::RectMask;
-            }
-            if ui
                 .button(RichText::new("\u{270D} Draw").size(11.0))
                 .on_hover_text(crate::i18n::t("Freehand brush — keep pixels inside the stroke"))
                 .clicked()
@@ -5250,23 +5242,60 @@ fn apply_aspect_ratio_crop(
     target_w: f32,
     target_h: f32,
 ) {
-    let src_aspect = (source_w / source_h.max(1.0)).max(1e-3);
     let tgt_aspect = (target_w / target_h.max(1.0)).max(1e-3);
-    let (mut left, mut top, mut right, mut bottom) = (0.0_f32, 0.0_f32, 0.0_f32, 0.0_f32);
-    if (tgt_aspect - src_aspect).abs() < 1e-3 {
-        // Same aspect — clear any existing crop.
-    } else if tgt_aspect > src_aspect {
-        // Target is wider than source → trim top/bottom evenly.
-        let visible_v_frac = (src_aspect / tgt_aspect).clamp(0.02, 1.0);
+    let (mut left, mut top, mut right, mut bottom) =
+        effects.iter().find_map(|e| {
+            if !e.enabled {
+                return None;
+            }
+            match &e.kind {
+                EffectKind::Crop {
+                    left,
+                    top,
+                    right,
+                    bottom,
+                } => Some((*left, *top, *right, *bottom)),
+                _ => None,
+            }
+        })
+        .unwrap_or((0.0, 0.0, 0.0, 0.0));
+
+    let vw = (1.0 - left - right).clamp(0.02, 1.0);
+    let vh = (1.0 - top - bottom).clamp(0.02, 1.0);
+    let src_aspect_vis =
+        ((source_w * vw) / (source_h * vh).max(1.0)).max(1e-3);
+
+    if (tgt_aspect - src_aspect_vis).abs() < 1e-3 {
+        // Visible region already matches — clear crop.
+        left = 0.0;
+        top = 0.0;
+        right = 0.0;
+        bottom = 0.0;
+    } else if tgt_aspect > src_aspect_vis {
+        // Target is wider than the visible region → trim top/bottom.
+        let visible_v_frac = (src_aspect_vis / tgt_aspect).clamp(0.02, 1.0);
         let crop_each = ((1.0 - visible_v_frac) * 0.5).clamp(0.0, 0.49);
-        top = crop_each;
-        bottom = crop_each;
+        top = (top + crop_each * vh).min(0.49);
+        bottom = (bottom + crop_each * vh).min(0.49);
     } else {
-        // Target is taller than source → trim left/right evenly.
-        let visible_h_frac = (tgt_aspect / src_aspect).clamp(0.02, 1.0);
+        // Target is taller → trim left/right of the visible region.
+        let visible_h_frac = (tgt_aspect / src_aspect_vis).clamp(0.02, 1.0);
         let crop_each = ((1.0 - visible_h_frac) * 0.5).clamp(0.0, 0.49);
-        left = crop_each;
-        right = crop_each;
+        left = (left + crop_each * vw).min(0.49);
+        right = (right + crop_each * vw).min(0.49);
+    }
+
+    let lr = left + right;
+    if lr >= 0.98 {
+        let s = 0.97 / lr;
+        left *= s;
+        right *= s;
+    }
+    let tb = top + bottom;
+    if tb >= 0.98 {
+        let s = 0.97 / tb;
+        top *= s;
+        bottom *= s;
     }
     let no_crop = left == 0.0 && top == 0.0 && right == 0.0 && bottom == 0.0;
     let kind = EffectKind::Crop {
