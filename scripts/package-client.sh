@@ -16,13 +16,14 @@
 #     with `--server-url`.
 #
 # What the bundle ships:
-#   * `bin/memstroy-gui` (+ `bin/memstroy` CLI) — that's it.
+#   * `bin/memstroy-gui` (+ `bin/memstroy` CLI)
+#   * `models/u2netp.onnx` — AI background removal (canvas cutout tool)
 #   * `examples/`, `README.md` and a small launcher `Memstroy-inator.sh`.
 #
 # What the bundle deliberately does NOT ship:
-#   * Any `assets/` directory. Client builds load every clip / image /
-#     sound from the operator's remote `memstroy-assets-server` and
-#     cache them under `~/.memstroy/cache/` on first use.
+#   * The full in-tree `assets/` directory (clips/images/sounds are
+#     fetched from the operator's remote memstroy-assets-server and
+#     cached under `~/.memstroy/cache/` on first use).
 #   * The `memstroy-assets-server` binary itself. The server is run by
 #     the operator on their backend, not by the client. Use
 #     `scripts/start-server.sh` separately for that.
@@ -150,6 +151,16 @@ for bin in memstroy-gui memstroy; do
     fi
     cp -p "${src}" "${BUNDLE_DIR}/bin/"
 done
+
+# ─── AI background-removal model (U²-Netp) ───────────────────────────
+MODEL_SRC="${ROOT_DIR}/assets/models/u2netp.onnx"
+if [[ ! -f "${MODEL_SRC}" ]]; then
+    echo "error: missing AI model: ${MODEL_SRC} (place u2netp.onnx there before packaging)" >&2
+    exit 1
+fi
+mkdir -p "${BUNDLE_DIR}/models"
+cp -p "${MODEL_SRC}" "${BUNDLE_DIR}/models/u2netp.onnx"
+echo "    bundled   : models/u2netp.onnx"
 
 # ─── Belt-and-braces strip (Linux/macOS) ─────────────────────────────
 # `[profile.release]` already sets `strip = "symbols"`, so this is a

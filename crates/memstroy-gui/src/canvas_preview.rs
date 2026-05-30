@@ -15,7 +15,6 @@ const COL_CANVAS_BG: Color32 = Color32::from_rgb(28, 28, 24);
 const COL_GRID_MINOR: Color32 = Color32::from_rgb(58, 56, 40);
 const COL_GRID_MAJOR: Color32 = Color32::from_rgb(90, 85, 50);
 const COL_RENDER_FRAME: Color32 = Color32::from_rgb(255, 80, 80);
-const COL_ELEMENT_BORDER: Color32 = Color32::from_rgb(180, 180, 200);
 const COL_SELECTED_BORDER: Color32 = Color32::from_rgb(255, 220, 80);
 const COL_INACTIVE_TINT: Color32 = Color32::from_rgba_premultiplied(255, 255, 255, 100);
 const COL_OVERLAY_IMAGE: Color32 = Color32::from_rgb(100, 180, 255);
@@ -133,6 +132,15 @@ pub fn canvas_preview(ui: &mut egui::Ui, state: &mut EditorState) {
         return;
     }
 
+    // ── RMB drag on empty canvas → image selection frame ──
+    handle_canvas_image_search_rmb_input(
+        ui,
+        &response,
+        state,
+        full_rect,
+        viewport_size,
+    );
+
     // ── Handle pan/zoom input ──
     handle_canvas_input(ui, &response, state, viewport_size, full_rect);
 
@@ -196,6 +204,14 @@ pub fn canvas_preview(ui: &mut egui::Ui, state: &mut EditorState) {
     //    everything else so the user can see what they're lassoing.
     draw_canvas_marquee(&painter, full_rect, state, viewport_size);
 
+    // ── Canvas image-search selection frames (RMB drag) ──
+    crate::canvas_image_search::draw_selection_frames(
+        &painter,
+        full_rect,
+        state,
+        viewport_size,
+    );
+
     // ── Mask / crop drawing preview overlay (drawn last so the
     //    in-progress shape sits on top of every gizmo). Visual only;
     //    the actual masking is applied through the image-effects
@@ -204,6 +220,14 @@ pub fn canvas_preview(ui: &mut egui::Ui, state: &mut EditorState) {
 
     // ── Library drag-to-canvas: visual ghost + drop accept ──
     handle_canvas_asset_drag(ui, state, full_rect, viewport_size);
+
+    // ── Inline canvas image search UI (text field + carousel) ──
+    crate::canvas_image_search::show_canvas_search_ui(
+        ui.ctx(),
+        state,
+        full_rect,
+        viewport_size,
+    );
 }
 
 /// When the eyedropper is armed and the user clicks on the preview, sample
@@ -773,30 +797,105 @@ fn draw_multi_selection_borders(
 
 // ─── INPUT HANDLING ──────────────────────────────────────────────────
 
+/// RMB drag on canvas creates an image-search selection frame.
+fn handle_canvas_image_search_rmb_input(
+    ui: &mut egui::Ui,
+    response: &egui::Response,
+    state: &mut EditorState,
+    full_rect: Rect,
+    viewport_size: [f32; 2],
+) {
+    use crate::canvas_image_search::{
+        open_search_popup_at, open_selection_frame_session, RMB_MIN_TRAVEL_PX, MIN_FRAME_WORLD_PX,
+    };
+
+    if state.canvas_panning || state.mask_tool.is_active() {
+        return;
+    }
+
+    let secondary_pressed = ui.input(|i| i.pointer.secondary_pressed());
+    let secondary_down = ui.input(|i| i.pointer.secondary_down());
+    let secondary_released = ui.input(|i| i.pointer.secondary_released());
+    let press_origin = ui.input(|i| i.pointer.press_origin());
+    let interact_pos = ui.input(|i| i.pointer.interact_pos());
+
+    if state.canvas_image_search_draft.is_none()
+        && state.canvas_image_search_rmb_pending.is_none()
+        && secondary_pressed
+        && response.hovered()
+    {
+        if let Some(p) = press_origin {
+            let local = [p.x - full_rect.min.x, p.y - full_rect.min.y];
+            let world = state.canvas_viewport.screen_to_world(local, viewport_size);
+            state.canvas_image_search_rmb_pending = Some([world.x, world.y]);
+        }
+    }
+
+    if let Some(start_world) = state.canvas_image_search_rmb_pending {
+        if secondary_down {
+            if let (Some(p), Some(origin)) = (interact_pos, press_origin) {
+                let travel = (p - origin).length();
+                if travel >= RMB_MIN_TRAVEL_PX || state.canvas_image_search_draft.is_some() {
+                    let local = [p.x - full_rect.min.x, p.y - full_rect.min.y];
+                    let end = state.canvas_viewport.screen_to_world(local, viewport_size);
+                    state.canvas_image_search_draft = Some(crate::state::CanvasMarquee {
+                        start: start_world,
+                        end: [end.x, end.y],
+                    });
+                }
+            }
+        }
+    }
+
+    if secondary_released {
+        if let Some(draft) = state.canvas_image_search_draft.take() {
+            let (mn, mx) = draft.rect_world();
+            let w = (mx[0] - mn[0]).abs();
+            let h = (mx[1] - mn[1]).abs();
+            if w >= MIN_FRAME_WORLD_PX && h >= MIN_FRAME_WORLD_PX {
+                open_selection_frame_session(state, draft, [mx[0], mx[1]]);
+            }
+        } else if let Some(start_world) = state.canvas_image_search_rmb_pending.take() {
+            open_search_popup_at(state, start_world);
+        }
+        state.canvas_image_search_rmb_pending = None;
+    }
+}
+
 fn handle_canvas_input(
     ui: &mut egui::Ui,
     response: &egui::Response,
     state: &mut EditorState,
     viewport_size: [f32; 2],
-    _full_rect: Rect,
+    full_rect: Rect,
 ) {
     // Pan with middle mouse button OR Space+left-drag OR right-drag.
     // Left click/drag is ONLY for element interaction (select/move).
     let middle_down = ui.input(|i| i.pointer.middle_down());
     let space_held = ui.input(|i| i.key_down(egui::Key::Space));
     let right_down = ui.input(|i| i.pointer.secondary_down());
+    let rmb_frame = crate::canvas_image_search::rmb_gesture_active(state);
 
-    let should_pan = middle_down || right_down || (space_held && response.dragged());
+    let should_pan = middle_down || (right_down && !rmb_frame) || (space_held && response.dragged());
+    let pointer_in_canvas = ui
+        .input(|i| i.pointer.hover_pos())
+        .is_some_and(|p| full_rect.contains(p));
+    let use_raw_delta = middle_down || (right_down && !rmb_frame) || state.canvas_panning;
 
-    if should_pan && response.hovered() {
-        let delta = response.drag_delta();
+    if should_pan && (pointer_in_canvas || state.canvas_panning) {
+        let delta = if use_raw_delta {
+            ui.input(|i| i.pointer.delta())
+        } else {
+            response.drag_delta()
+        };
         if delta.length_sq() > 0.0 {
             state.canvas_viewport.pan([delta.x, delta.y]);
             state.canvas_panning = true;
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        } else if middle_down || (right_down && !rmb_frame) {
+            state.canvas_panning = true;
         }
-    } else if !ui.input(|i| i.pointer.primary_down()) {
-        // Only clear panning state when primary isn't held (avoid conflict)
+    } else if !middle_down && !(right_down && !rmb_frame) && !(space_held && ui.input(|i| i.pointer.primary_down())) {
         state.canvas_panning = false;
     }
 
@@ -822,7 +921,7 @@ fn handle_canvas_input(
             let dy = scroll.y.clamp(-120.0, 120.0);
             let factor = (base * dy).exp();
             if let Some(mouse) = ui.input(|i| i.pointer.hover_pos()) {
-                let local = [mouse.x - _full_rect.min.x, mouse.y - _full_rect.min.y];
+                let local = [mouse.x - full_rect.min.x, mouse.y - full_rect.min.y];
                 state.canvas_viewport.zoom_at(local, viewport_size, factor);
             }
         }
@@ -1543,21 +1642,24 @@ fn draw_single_actor(
     }
 
     let multi_selected = state.canvas_selection.iter().any(|s| *s == Selection::Actor(idx));
-    let border_col = if state.selection == Selection::Actor(idx) {
-        COL_SELECTED_BORDER
-    } else if multi_selected {
-        Color32::from_rgb(255, 180, 60)
-    } else {
-        COL_ELEMENT_BORDER
-    };
-    let border_width = if state.selection == Selection::Actor(idx) {
-        2.0
-    } else if multi_selected {
-        1.5
-    } else {
-        1.0
-    };
-    painter.rect_stroke(elem_rect, Rounding::same(3.0), Stroke::new(border_width, border_col));
+    if state.selection == Selection::Actor(idx) || multi_selected {
+        let border_col = if state.selection == Selection::Actor(idx) {
+            COL_SELECTED_BORDER
+        } else {
+            Color32::from_rgb(255, 180, 60)
+        };
+        let border_width = if state.selection == Selection::Actor(idx) { 2.0 } else { 1.5 };
+        // Axis-aligned fallback only when the clip is not rotated — the
+        // rotation-aware OBB in `draw_selection_handles` owns the
+        // selected outline otherwise (avoids the "double yellow box").
+        if actor_rotation.abs() < 0.01 {
+            painter.rect_stroke(
+                elem_rect,
+                Rounding::same(3.0),
+                Stroke::new(border_width, border_col),
+            );
+        }
+    }
 
     if display_mode != DisplayMode::Active {
         let badge = match display_mode {
@@ -2128,16 +2230,6 @@ fn draw_canvas_overlays_impl(
                     mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
                     painter.add(egui::Shape::mesh(mesh));
 
-                    // Selection / FIRST/LAST badges still useful even
-                    // when the picture is fully drawn.
-                    let is_selected = state.selection == Selection::Overlay(idx);
-                    if is_selected {
-                        painter.rect_stroke(
-                            elem_rect,
-                            Rounding::same(2.0),
-                            Stroke::new(2.0, COL_SELECTED_BORDER),
-                        );
-                    }
                     if display_mode != DisplayMode::Active {
                         let badge = match display_mode {
                             DisplayMode::BeforeStart => crate::i18n::t("FIRST"),
@@ -2205,10 +2297,6 @@ fn draw_overlay_placeholder(
         label, egui::FontId::proportional(10.0),
         Color32::from_rgb(160, 160, 180),
     );
-    let is_selected = state.selection == Selection::Overlay(idx);
-    let border_col = if is_selected { COL_SELECTED_BORDER } else { color };
-    let border_width = if is_selected { 2.0 } else { 1.0 };
-    painter.rect_stroke(elem_rect, Rounding::same(4.0), Stroke::new(border_width, border_col));
     if display_mode != DisplayMode::Active {
         let badge = match display_mode {
             DisplayMode::BeforeStart => crate::i18n::t("FIRST"),
@@ -3260,6 +3348,13 @@ fn draw_selection_gizmo(
         draw_selection_handles(painter, full_rect, state, viewport_size);
         return;
     }
+    // RMB image-search gestures must not start render-frame / element drags.
+    if ui.input(|i| i.pointer.secondary_down())
+        || crate::canvas_image_search::rmb_gesture_active(state)
+    {
+        draw_selection_handles(painter, full_rect, state, viewport_size);
+        return;
+    }
     // Mask / crop drawing tools own the pointer for the duration of
     // their gesture — render the gizmo handles for visual context but
     // skip the drag-state machine so the regular Move/Resize handlers
@@ -3457,6 +3552,8 @@ fn draw_selection_gizmo(
                 state.canvas_selection.clear();
                 if state.selection != Selection::None {
                     state.canvas_selection.push(state.selection);
+                } else {
+                    crate::canvas_image_search::cancel_canvas_image_search(state);
                 }
             }
         }

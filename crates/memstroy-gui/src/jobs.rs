@@ -59,6 +59,8 @@ pub enum JobEvent {
     /// surfacing on the panel's status line.
     WebSearchFinished {
         page_offset: u32,
+        /// Which UI initiated the search — panel grid vs canvas popup.
+        target: WebSearchTarget,
         result: Result<
             (
                 Vec<crate::web_image_search::WebImageHit>,
@@ -78,6 +80,12 @@ pub enum JobEvent {
         image_url: String,
         place_on_canvas: bool,
         result: Result<crate::state::LibraryAsset, String>,
+    },
+    /// AI background removal for a canvas image-search overlay finished.
+    AiBgRemoveFinished {
+        overlay_idx: usize,
+        path: PathBuf,
+        result: Result<(), String>,
     },
     /// A background image-effects bake completed. The RGBA buffer
     /// inside is uploaded as an `egui::TextureHandle` on the UI
@@ -111,6 +119,14 @@ pub enum JobEvent {
 /// Where to drop a freshly-downloaded clip when the lazy-download
 /// path completes. The caller picks the target at the moment of
 /// drag-end so the deferred completion knows what to do.
+/// Identifies which search UI should receive `WebSearchFinished`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WebSearchTarget {
+    #[default]
+    Panel,
+    Canvas,
+}
+
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
 pub enum ClipDropTarget {
@@ -839,16 +855,29 @@ const UA: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firef
 /// worker pool — no await on the caller's side. The function never
 /// panics; every failure is mapped to a
 /// `JobEvent::WebSearchFinished { result: Err(_), .. }`.
+/// Optional search modifiers forwarded from the canvas image-search popup.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WebImageSearchOptions {
+    /// When set, results are sorted so aspect ratios closest to this
+    /// value appear first (width / height).
+    pub aspect_ratio: Option<f32>,
+    /// Append hints so DuckDuckGo tends to return PNGs on transparent bg.
+    pub transparent_only: bool,
+}
+
 pub fn spawn_web_image_search(
     rt: &Handle,
     tx: Sender<JobEvent>,
     query: String,
     page_offset: u32,
+    target: WebSearchTarget,
+    options: WebImageSearchOptions,
 ) {
     rt.spawn(async move {
-        let result = run_web_image_search(&query, page_offset).await;
+        let result = run_web_image_search(&query, page_offset, options).await;
         let _ = tx.send(JobEvent::WebSearchFinished {
             page_offset,
+            target,
             result,
         });
     });
@@ -857,7 +886,13 @@ pub fn spawn_web_image_search(
 async fn run_web_image_search(
     query: &str,
     page_offset: u32,
+    options: WebImageSearchOptions,
 ) -> Result<(Vec<WebImageHit>, Option<u32>), String> {
+    let effective_query = if options.transparent_only {
+        format!("{query} png transparent background")
+    } else {
+        query.to_string()
+    };
     let client = reqwest::Client::builder()
         .user_agent(UA)
         .connect_timeout(Duration::from_secs(5))
@@ -870,7 +905,7 @@ async fn run_web_image_search(
     let landing = client
         .get("https://duckduckgo.com/")
         .query(&[
-            ("q", query),
+            ("q", effective_query.as_str()),
             ("iax", "images"),
             ("ia", "images"),
             ("t", "h_"),
@@ -904,7 +939,7 @@ async fn run_web_image_search(
         .query(&[
             ("l", "us-en"),
             ("o", "json"),
-            ("q", query),
+            ("q", effective_query.as_str()),
             ("vqd", vqd.as_str()),
             ("f", ",,,,,,"),
             ("p", "1"),
@@ -925,7 +960,16 @@ async fn run_web_image_search(
         .await
         .map_err(|e| format!("Couldn't parse image-search JSON: {e}"))?;
 
-    let hits = parse_ddg_results(&json);
+    let mut hits = parse_ddg_results(&json);
+    if let Some(target_ar) = options.aspect_ratio.filter(|r| r.is_finite() && *r > 0.01) {
+        hits.sort_by(|a, b| {
+            let ra = a.width as f32 / a.height.max(1) as f32;
+            let rb = b.width as f32 / b.height.max(1) as f32;
+            let da = (ra - target_ar).abs();
+            let db = (rb - target_ar).abs();
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
     let next_offset = parse_ddg_next_offset(&json);
     if hits.is_empty() && page_offset == 0 {
         return Err(format!(
@@ -1228,4 +1272,89 @@ fn sanitise_filename_stem(title: &str) -> String {
     } else {
         trimmed
     }
+}
+
+// ─── AI background removal (canvas image search) ─────────────────────
+
+/// Run U²-Netp on `path`, optionally gated by a UV-space polygon mask
+/// (brush selection). Overwrites the file with a PNG cutout.
+pub fn spawn_ai_background_remove(
+    rt: &Handle,
+    tx: Sender<JobEvent>,
+    overlay_idx: usize,
+    path: PathBuf,
+    model_path: PathBuf,
+    mask_polygon_uv: Option<Vec<[f32; 2]>>,
+) {
+    rt.spawn(async move {
+        let result = run_ai_background_remove(&path, &model_path, mask_polygon_uv.as_deref()).await;
+        let _ = tx.send(JobEvent::AiBgRemoveFinished {
+            overlay_idx,
+            path,
+            result,
+        });
+    });
+}
+
+async fn run_ai_background_remove(
+    path: &std::path::Path,
+    model_path: &std::path::Path,
+    mask_polygon_uv: Option<&[[f32; 2]]>,
+) -> Result<(), String> {
+    use memstroy_vision::bgremove::{BackgroundRemover, U2NetpBgRemover};
+
+    let remover = U2NetpBgRemover::new(model_path.to_path_buf());
+    let mut rgba = remover
+        .remove(path)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if let Some(poly) = mask_polygon_uv {
+        apply_uv_polygon_gate(&mut rgba, poly);
+    }
+
+    rgba.save(path).map_err(|e| format!("save cutout: {e}"))
+}
+
+/// Zero alpha outside the UV polygon (keep interior).
+fn apply_uv_polygon_gate(rgba: &mut image::RgbaImage, poly: &[[f32; 2]]) {
+    let (w, h) = rgba.dimensions();
+    if w == 0 || h == 0 || poly.len() < 3 {
+        return;
+    }
+    let wf = w as f32;
+    let hf = h as f32;
+    for y in 0..h {
+        for x in 0..w {
+            let u = (x as f32 + 0.5) / wf;
+            let v = (y as f32 + 0.5) / hf;
+            if !point_in_polygon(u, v, poly) {
+                rgba.put_pixel(x, y, image::Rgba([0, 0, 0, 0]));
+            } else {
+                let p = rgba.get_pixel(x, y);
+                if p[3] > 0 {
+                    rgba.put_pixel(x, y, image::Rgba([p[0], p[1], p[2], p[3]]));
+                }
+            }
+        }
+    }
+}
+
+fn point_in_polygon(x: f32, y: f32, poly: &[[f32; 2]]) -> bool {
+    let mut inside = false;
+    let n = poly.len();
+    let mut j = n - 1;
+    for i in 0..n {
+        let xi = poly[i][0];
+        let yi = poly[i][1];
+        let xj = poly[j][0];
+        let yj = poly[j][1];
+        let intersect = ((yi > y) != (yj > y))
+            && (x < (xj - xi) * (y - yi) / (yj - yi).max(1e-6) + xi);
+        if intersect {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
 }

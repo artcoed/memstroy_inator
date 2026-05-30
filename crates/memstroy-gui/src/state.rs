@@ -880,6 +880,17 @@ pub struct EditorState {
     /// in-flight flag, the last batch of results). Kept on the editor
     /// state so the user's search persists across show/hide cycles.
     pub web_image_search: crate::web_image_search::WebImageSearchState,
+
+    // ─── Canvas-anchored image search ───────────────────────────────
+    /// Active canvas image-search session (RMB selection frame or LMB
+    /// quick-add popup). `None` when no search UI is open on canvas.
+    pub canvas_image_search: Option<crate::canvas_image_search::CanvasImageSearchSession>,
+    /// Live rubber-band while the user is RMB-dragging to define a
+    /// selection frame. Promoted into `canvas_image_search` on release.
+    pub canvas_image_search_draft: Option<CanvasMarquee>,
+    /// Press origin recorded while we wait to see whether an RMB press
+    /// on empty canvas grows into a selection-frame drag.
+    pub canvas_image_search_rmb_pending: Option<[f32; 2]>,
 }
 
 /// Cached state for one image-overlay source. `Loading` is held only

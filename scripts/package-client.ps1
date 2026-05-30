@@ -6,13 +6,14 @@
 #
 # What ships:
 #   * bin\memstroy-gui.exe + bin\memstroy.exe
+#   * models\u2netp.onnx (AI background removal for the canvas cutout tool)
 #   * examples\*.yaml, README.md, Memstroy-inator.bat launcher
 #   * catost.ico / catost.png (app icon for shortcuts & branding)
 #
 # What deliberately does NOT ship:
-#   * Any assets\ directory. Client builds load every clip / image /
-#     sound from the operator's remote memstroy-assets-server and
-#     cache them under %USERPROFILE%\.memstroy\cache\ on first use.
+#   * Any other `assets/` tree (clips/images are fetched from the
+#     operator's remote memstroy-assets-server and cached under
+#     %USERPROFILE%\.memstroy\cache\ on first use).
 #     Users can also add their own assets via the editor's UI.
 #   * The memstroy-assets-server.exe binary itself. The server is run
 #     by the operator on their backend, not by the client.
@@ -122,6 +123,16 @@ foreach ($bin in $BinNames) {
     if (-not (Test-Path $src)) { throw "missing release binary: $src" }
     Copy-Item -Path $src -Destination (Join-Path $BundleDir "bin")
 }
+
+# ── AI background-removal model (U²-Netp) ─────────────────────────────
+$ModelSrc = Join-Path $RootDir "assets\models\u2netp.onnx"
+if (-not (Test-Path $ModelSrc)) {
+    throw "missing AI model: $ModelSrc — place u2netp.onnx there before packaging"
+}
+$ModelDestDir = Join-Path $BundleDir "models"
+New-Item -ItemType Directory -Force -Path $ModelDestDir | Out-Null
+Copy-Item -Path $ModelSrc -Destination (Join-Path $ModelDestDir "u2netp.onnx") -Force
+Write-Host "    bundled   : models\u2netp.onnx"
 
 # ── Examples + docs ─────────────────────────────────────────────────
 New-Item -ItemType Directory -Force -Path (Join-Path $BundleDir "examples") | Out-Null
