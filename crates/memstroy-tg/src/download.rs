@@ -273,10 +273,32 @@ async fn fetch_one(client: &reqwest::Client, url: &str, target: &Path) -> Result
     }
 }
 
+/// Maximum size of a single downloaded clip. Telegram clips are well under
+/// this; the cap stops an attacker-influenced URL (or an oversized CDN object)
+/// from streaming unbounded data to disk and filling the volume (DoS).
+const MAX_DOWNLOAD_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
+
 async fn try_fetch(client: &reqwest::Client, url: &str, target: &Path) -> Result<u64> {
+    // Refuse non-public targets. The download URLs come from attacker-
+    // controllable channel HTML (og:video / <video src> / CDN regex matches),
+    // so without this the fetch could be steered at internal addresses (SSRF).
+    if !crate::model::is_public_http_url_str(url) {
+        return Err(anyhow::anyhow!("refusing to fetch non-public URL: {}", url));
+    }
     let resp = client.get(url).send().await?;
     if !resp.status().is_success() {
         return Err(anyhow::anyhow!("HTTP {} for {}", resp.status(), url));
+    }
+    // Reject early when the server advertises an oversized body.
+    if let Some(len) = resp.content_length() {
+        if len > MAX_DOWNLOAD_BYTES {
+            return Err(anyhow::anyhow!(
+                "refusing oversized download: {} bytes (max {}) for {}",
+                len,
+                MAX_DOWNLOAD_BYTES,
+                url
+            ));
+        }
     }
     let tmp = target.with_extension("mp4.partial");
     let mut file = fs::File::create(&tmp).await?;
@@ -285,6 +307,17 @@ async fn try_fetch(client: &reqwest::Client, url: &str, target: &Path) -> Result
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
         total += chunk.len() as u64;
+        // Abort and clean up if the running total blows past the cap (handles
+        // a missing/lying Content-Length).
+        if total > MAX_DOWNLOAD_BYTES {
+            drop(file);
+            let _ = fs::remove_file(&tmp).await;
+            return Err(anyhow::anyhow!(
+                "download exceeded {} bytes; aborted for {}",
+                MAX_DOWNLOAD_BYTES,
+                url
+            ));
+        }
         file.write_all(&chunk).await?;
     }
     file.flush().await?;

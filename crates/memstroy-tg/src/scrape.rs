@@ -101,6 +101,19 @@ pub fn build_client() -> Result<reqwest::Client> {
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(30))
         .pool_idle_timeout(Duration::from_secs(60))
+        // Re-validate every redirect hop so an attacker-controlled public
+        // origin can't 30x-redirect a scrape/download onto loopback / LAN /
+        // cloud-metadata addresses (SSRF). Legitimate t.me / CDN redirects are
+        // all public and pass unchanged.
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 10 {
+                attempt.error("too many redirects")
+            } else if crate::model::is_public_http_url(attempt.url()) {
+                attempt.follow()
+            } else {
+                attempt.error("redirect to non-public host blocked")
+            }
+        }))
         .build()
         .context("building reqwest client")
 }
