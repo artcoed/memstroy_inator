@@ -36,6 +36,61 @@ pub fn is_downloadable_video_url(url: &str) -> bool {
     !(lower.contains("/stream/") || lower.contains("stream%2f"))
 }
 
+/// True when `url` is a public `http`/`https` URL — not loopback, private,
+/// link-local, unique-local, or a `localhost` name. Keeps the scraper /
+/// downloader from being coerced into fetching internal addresses (SSRF) via
+/// attacker-controlled `og:video` / `<video src>` URLs harvested from a public
+/// channel's HTML, and is re-applied to every redirect hop in `build_client`.
+pub(crate) fn is_public_http_url(url: &reqwest::Url) -> bool {
+    if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
+    let Some(host) = url.host_str() else { return false };
+    // `host_str` keeps the brackets around IPv6 literals.
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return ip_is_public(ip);
+    }
+    let h = host.to_ascii_lowercase();
+    h != "localhost" && !h.ends_with(".localhost")
+}
+
+/// Parse `url` and return true only when it is a public http(s) URL.
+pub(crate) fn is_public_http_url_str(url: &str) -> bool {
+    reqwest::Url::parse(url)
+        .map(|u| is_public_http_url(&u))
+        .unwrap_or(false)
+}
+
+/// Reject the IP ranges that should never be reachable from a remote media
+/// URL: loopback, private/RFC1918, CGNAT, link-local (incl. the cloud metadata
+/// endpoint), unspecified, broadcast, documentation, and IPv6 ULA.
+pub(crate) fn ip_is_public(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            !(v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                // CGNAT / shared address space 100.64.0.0/10
+                || (o[0] == 100 && (o[1] & 0xC0) == 64))
+        }
+        IpAddr::V6(v6) => {
+            let o = v6.octets();
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                // unique-local fc00::/7
+                || (o[0] & 0xFE) == 0xFC
+                // link-local fe80::/10
+                || (o[0] == 0xFE && (o[1] & 0xC0) == 0x80))
+        }
+    }
+}
+
 /// Score a downloadable URL by how confidently we believe it points at
 /// a real video file vs a thumbnail.
 ///
