@@ -52,6 +52,23 @@ use std::time::{Duration, Instant};
 use rodio::Source;
 use tracing::{debug, info, warn};
 
+/// Build a `Duration` from a seconds value that may originate from an
+/// untrusted scene file.
+///
+/// `Duration::from_secs_f32` PANICS when its argument is negative, NaN,
+/// infinite, or large enough to overflow `Duration` (~1.8e19 s). The audio
+/// timing fields (`source_start`, `t_in`, `t_out`, …) are unclamped `f32`s
+/// deserialized verbatim from the project file, so a crafted scene could push
+/// a poisoned value into one of the `skip`/`take`/`delay` durations and abort
+/// the whole process (the release profile uses `panic = "abort"`). Clamp to a
+/// finite, sane range first so a bad value silently degrades instead.
+fn safe_duration_secs(secs: f32) -> Duration {
+    // 24 h upper bound — longer than any real clip, far below the overflow
+    // threshold. `f32::max` ignores NaN, so NaN collapses to 0.0 here.
+    const MAX_SECS: f32 = 24.0 * 60.0 * 60.0;
+    Duration::from_secs_f32(secs.max(0.0).min(MAX_SECS))
+}
+
 mod dsp;
 
 /// Global one-shot panic-hook installer. Suppresses the stderr "thread
@@ -364,7 +381,12 @@ impl AudioEngine {
 
             // (1) Resample factor combines speed and pitch.
             let pitch_factor = 2.0_f32.powf(spec.pitch_semitones / 12.0);
-            let rate = (spec.speed * pitch_factor).max(0.05);
+            // Clamp the resample rate: `speed`/`pitch_semitones` are unclamped
+            // scene fields. An absurd value (e.g. speed = 1e6) makes rodio's
+            // Speed adapter report a multi-GHz sample rate, which downstream
+            // drives a multi-GB DSP buffer allocation (see dsp::Reverb::new).
+            // `f32::max` ignores NaN, so NaN/inf collapse into the valid range.
+            let rate = (spec.speed * pitch_factor).max(0.05).min(100.0);
             let stream = stream.speed(rate);
 
             // (2) Skip into the source. After `speed(rate)`, the stream's
@@ -376,7 +398,7 @@ impl AudioEngine {
             //   - `(live_playhead - t_in)` is already in scene/output time.
             let elapsed_scene = (live_playhead - spec.t_in).max(0.0);
             let skip_output_secs = (spec.source_start / rate + elapsed_scene).max(0.0);
-            let stream = stream.skip_duration(Duration::from_secs_f32(skip_output_secs));
+            let stream = stream.skip_duration(safe_duration_secs(skip_output_secs));
 
             // (3) Take only the visible duration. The audio engine no
             // longer loops sources — when the visible window outlasts
@@ -396,7 +418,7 @@ impl AudioEngine {
 
             let stream: Box<dyn Source<Item = f32> + Send> = match take_secs {
                 Some(td) if td > 0.0 => {
-                    Box::new(stream.take_duration(Duration::from_secs_f32(td)))
+                    Box::new(stream.take_duration(safe_duration_secs(td)))
                 }
                 _ => Box::new(stream),
             };
@@ -443,7 +465,7 @@ impl AudioEngine {
             // hasn't started yet).
             let delay_secs = (spec.t_in - live_playhead).max(0.0);
             if delay_secs > 0.0 {
-                sink.append(stream.delay(Duration::from_secs_f32(delay_secs)));
+                sink.append(stream.delay(safe_duration_secs(delay_secs)));
             } else {
                 sink.append(stream);
             }

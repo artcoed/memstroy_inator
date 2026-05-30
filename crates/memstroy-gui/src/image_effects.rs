@@ -95,6 +95,16 @@ pub fn apply_effect_stack(
     effects: &[Effect],
     _t: f32,
 ) -> (f32, f32, f32, f32) {
+    // Bound a blur/glow/bloom radius derived from an untrusted scene value.
+    // `EffectKind::{Blur,Glow,Bloom}.radius` is an unclamped f32 from the
+    // project file; an absurd value (e.g. 3e9) saturates the `as i32` cast to
+    // i32::MAX and overflows the `x + r` index math in `box_blur_rgba` (panic
+    // in debug; wrap → empty range → divide-by-zero in release = crash/DoS).
+    fn effect_radius(raw: f32, w: u32, h: u32) -> i32 {
+        const MAX_EFFECT_RADIUS: u32 = 4096;
+        let cap = w.max(h).min(MAX_EFFECT_RADIUS).max(1) as i32;
+        (raw as i32).clamp(1, cap)
+    }
     let mut crop = (0.0_f32, 0.0_f32, 0.0_f32, 0.0_f32);
     for eff in effects {
         if !eff.enabled { continue; }
@@ -102,7 +112,7 @@ pub fn apply_effect_stack(
         if i <= 0.001 { continue; }
         match &eff.kind {
             EffectKind::Blur { radius } => {
-                let r = ((radius * i) as i32).max(1);
+                let r = effect_radius(radius * i, w, h);
                 box_blur_rgba(rgba, w, h, r);
             }
             EffectKind::Sharpen { amount } => {
@@ -133,7 +143,7 @@ pub fn apply_effect_stack(
                 vignette(rgba, w, h, (strength * i).clamp(0.0, 1.0));
             }
             EffectKind::Pixelate { block_size } => {
-                let block = ((block_size * i) as u32).max(1);
+                let block = ((block_size * i) as u32).clamp(1, w.max(h).max(1));
                 pixelate(rgba, w, h, block);
             }
             EffectKind::Posterize { levels } => {
@@ -148,10 +158,10 @@ pub fn apply_effect_stack(
                 });
             }
             EffectKind::Glow { radius, intensity } => {
-                glow_or_bloom(rgba, w, h, ((radius * i) as i32).max(1), (intensity * i).clamp(0.0, 2.0));
+                glow_or_bloom(rgba, w, h, effect_radius(radius * i, w, h), (intensity * i).clamp(0.0, 2.0));
             }
             EffectKind::Bloom { radius } => {
-                glow_or_bloom(rgba, w, h, ((radius * i) as i32).max(1), 0.6 * i);
+                glow_or_bloom(rgba, w, h, effect_radius(radius * i, w, h), 0.6 * i);
             }
             EffectKind::Brightness { amount } => {
                 let factor = 1.0 + (amount * i);
@@ -476,6 +486,10 @@ fn box_blur_rgba(rgba: &mut Vec<u8>, w: u32, h: u32, r: i32) {
     if r <= 0 { return; }
     let w_i = w as i32;
     let h_i = h as i32;
+    // Defence-in-depth: a radius wider than the image is pointless and large
+    // values overflow the `x + r` / `y + r` arithmetic below. Bound it here too
+    // so the kernel is safe regardless of the caller.
+    let r = r.min(w_i.max(h_i).max(1));
     let mut tmp = vec![0u8; rgba.len()];
     // Horizontal pass.
     for y in 0..h_i {
@@ -486,8 +500,8 @@ fn box_blur_rgba(rgba: &mut Vec<u8>, w: u32, h: u32, r: i32) {
             let mut sb = 0u32;
             let mut sa = 0u32;
             let mut count = 0u32;
-            let xa = (x - r).max(0);
-            let xb = (x + r).min(w_i - 1);
+            let xa = x.saturating_sub(r).max(0);
+            let xb = x.saturating_add(r).min(w_i - 1);
             for xi in xa..=xb {
                 let idx = row_start + (xi as usize) * 4;
                 sr += rgba[idx] as u32;
@@ -497,6 +511,7 @@ fn box_blur_rgba(rgba: &mut Vec<u8>, w: u32, h: u32, r: i32) {
                 count += 1;
             }
             let didx = row_start + (x as usize) * 4;
+            let count = count.max(1); // never divide by zero
             tmp[didx] = (sr / count) as u8;
             tmp[didx + 1] = (sg / count) as u8;
             tmp[didx + 2] = (sb / count) as u8;
@@ -511,8 +526,8 @@ fn box_blur_rgba(rgba: &mut Vec<u8>, w: u32, h: u32, r: i32) {
             let mut sb = 0u32;
             let mut sa = 0u32;
             let mut count = 0u32;
-            let ya = (y - r).max(0);
-            let yb = (y + r).min(h_i - 1);
+            let ya = y.saturating_sub(r).max(0);
+            let yb = y.saturating_add(r).min(h_i - 1);
             for yi in ya..=yb {
                 let idx = ((yi * w_i + x) as usize) * 4;
                 sr += tmp[idx] as u32;
@@ -522,6 +537,7 @@ fn box_blur_rgba(rgba: &mut Vec<u8>, w: u32, h: u32, r: i32) {
                 count += 1;
             }
             let didx = ((y * w_i + x) as usize) * 4;
+            let count = count.max(1); // never divide by zero
             rgba[didx] = (sr / count) as u8;
             rgba[didx + 1] = (sg / count) as u8;
             rgba[didx + 2] = (sb / count) as u8;
