@@ -31,6 +31,7 @@ mod kf_anim;
 mod panels;
 mod settings;
 mod skeleton_editor;
+mod shell_reveal;
 mod split_crop;
 mod state;
 mod system_fonts;
@@ -38,6 +39,7 @@ mod title_templates;
 mod undo;
 mod video_cache;
 mod web_image_search;
+mod canvas_image_search;
 
 use anyhow::Result;
 use tracing_subscriber::EnvFilter;

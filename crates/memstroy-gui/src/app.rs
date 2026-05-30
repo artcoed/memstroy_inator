@@ -432,71 +432,71 @@ impl App {
                 }
                 JobEvent::WebSearchFinished {
                     page_offset,
+                    target,
                     result,
                 } => {
-                    self.state.web_image_search.searching = false;
-                    match result {
-                        Ok((mut hits, next_offset)) => {
-                            // Reject responses that come back at the
-                            // same start offset we already loaded —
-                            // happens when DDG echoes the same `s` in
-                            // its `next` field at end-of-results, and
-                            // would otherwise grow `results` forever.
-                            let n = hits.len();
-                            let is_first_page = page_offset == 0;
-                            if is_first_page {
-                                self.state.web_image_search.results = hits;
-                            } else {
-                                // Append, but keep the total bounded.
-                                let cap = crate::web_image_search::MAX_TOTAL_RESULTS;
-                                let cur = self.state.web_image_search.results.len();
-                                if cur < cap {
-                                    let take = (cap - cur).min(hits.len());
-                                    if take < hits.len() {
-                                        hits.truncate(take);
+                    match target {
+                        crate::jobs::WebSearchTarget::Panel => {
+                            self.state.web_image_search.searching = false;
+                            match result {
+                                Ok((mut hits, next_offset)) => {
+                                    let n = hits.len();
+                                    let is_first_page = page_offset == 0;
+                                    if is_first_page {
+                                        self.state.web_image_search.results = hits;
+                                    } else {
+                                        let cap = crate::web_image_search::MAX_TOTAL_RESULTS;
+                                        let cur = self.state.web_image_search.results.len();
+                                        if cur < cap {
+                                            let take = (cap - cur).min(hits.len());
+                                            if take < hits.len() {
+                                                hits.truncate(take);
+                                            }
+                                            self.state
+                                                .web_image_search
+                                                .results
+                                                .extend(hits);
+                                        }
                                     }
-                                    self.state
-                                        .web_image_search
-                                        .results
-                                        .extend(hits);
+                                    self.state.web_image_search.next_offset = next_offset
+                                        .filter(|&o| o != page_offset);
+                                    if !is_first_page {
+                                        self.state.web_image_search.page_count += 1;
+                                    }
+                                    self.state.web_image_search.status = if n == 0 {
+                                        if is_first_page {
+                                            crate::i18n::t("\u{1F50D} No results.").to_string()
+                                        } else {
+                                            crate::i18n::t("(no more results)").to_string()
+                                        }
+                                    } else if is_first_page {
+                                        format!("{} {} {}.", crate::i18n::t("\u{2705} Got"), n, crate::i18n::t("result(s)"))
+                                    } else {
+                                        format!(
+                                            "{} +{} ({} {})",
+                                            crate::i18n::t("\u{2795}"),
+                                            n,
+                                            crate::i18n::t("total"),
+                                            self.state.web_image_search.results.len()
+                                        )
+                                    };
+                                }
+                                Err(e) => {
+                                    if page_offset == 0 {
+                                        self.state.web_image_search.results.clear();
+                                    }
+                                    self.state.web_image_search.next_offset = None;
+                                    self.state.web_image_search.status =
+                                        format!("\u{274C} {}", e);
                                 }
                             }
-                            // Advance the cursor only if it differs
-                            // from the request's offset; otherwise we
-                            // treat it as "no more pages".
-                            self.state.web_image_search.next_offset = next_offset
-                                .filter(|&o| o != page_offset);
-                            if !is_first_page {
-                                self.state.web_image_search.page_count += 1;
-                            }
-                            self.state.web_image_search.status = if n == 0 {
-                                if is_first_page {
-                                    crate::i18n::t("\u{1F50D} No results.").to_string()
-                                } else {
-                                    crate::i18n::t("(no more results)").to_string()
-                                }
-                            } else if is_first_page {
-                                format!("{} {} {}.", crate::i18n::t("\u{2705} Got"), n, crate::i18n::t("result(s)"))
-                            } else {
-                                format!(
-                                    "{} +{} ({} {})",
-                                    crate::i18n::t("\u{2795}"),
-                                    n,
-                                    crate::i18n::t("total"),
-                                    self.state.web_image_search.results.len()
-                                )
-                            };
                         }
-                        Err(e) => {
-                            if page_offset == 0 {
-                                self.state.web_image_search.results.clear();
-                            }
-                            // On a paged-fetch error keep existing
-                            // results but stop offering "Load more"
-                            // for this query.
-                            self.state.web_image_search.next_offset = None;
-                            self.state.web_image_search.status =
-                                format!("\u{274C} {}", e);
+                        crate::jobs::WebSearchTarget::Canvas => {
+                            crate::canvas_image_search::ingest_canvas_search_result(
+                                &mut self.state,
+                                page_offset,
+                                result,
+                            );
                         }
                     }
                 }
@@ -515,6 +515,51 @@ impl App {
                         &image_url,
                         &result,
                     );
+                    if self.state.canvas_image_search.is_some() {
+                        let canvas_hit = self
+                            .state
+                            .canvas_image_search
+                            .as_ref()
+                            .and_then(|s| {
+                                s.results
+                                    .iter()
+                                    .any(|h| h.image_url == image_url)
+                                    .then_some(())
+                            })
+                            .is_some();
+                        if canvas_hit {
+                            if let Ok(ref asset) = result {
+                                let new_lib_asset = crate::state::LibraryAsset {
+                                    id: asset.id.clone(),
+                                    path: asset.path.clone(),
+                                    label: asset.label.clone(),
+                                    thumbnail: asset.thumbnail.clone(),
+                                };
+                                if !self
+                                    .state
+                                    .library
+                                    .images
+                                    .iter()
+                                    .any(|a| a.path == new_lib_asset.path)
+                                {
+                                    self.state.library.images.push(new_lib_asset);
+                                    self.state.library.images.sort_by(|a, b| {
+                                        a.label
+                                            .to_ascii_lowercase()
+                                            .cmp(&b.label.to_ascii_lowercase())
+                                    });
+                                }
+                                self.state.library_dir_fingerprint =
+                                    self.state.compute_library_dir_fingerprint();
+                            }
+                            crate::canvas_image_search::ingest_canvas_download_result(
+                                &mut self.state,
+                                &image_url,
+                                &result,
+                            );
+                            return;
+                        }
+                    }
                     match result {
                         Ok(asset) => {
                             // Instead of a full reload_library() which
@@ -567,6 +612,18 @@ impl App {
                                 format!("{} {}", crate::i18n::t("\u{274C} Download failed:"), e);
                         }
                     }
+                }
+                JobEvent::AiBgRemoveFinished {
+                    overlay_idx,
+                    path,
+                    result,
+                } => {
+                    crate::canvas_image_search::ingest_ai_bg_remove_result(
+                        &mut self.state,
+                        overlay_idx,
+                        &path,
+                        result,
+                    );
                 }
                 JobEvent::ImageFxReady(result) => {
                     self.handle_image_fx_ready(ctx, result);
@@ -1651,7 +1708,9 @@ impl App {
             // back to the default transform mode without hunting for
             // the toolbar button.
             if i.key_pressed(egui::Key::Escape) {
-                if !self.state.canvas_selection.is_empty() {
+                if crate::canvas_image_search::canvas_search_ui_visible(&self.state) {
+                    crate::canvas_image_search::hide_canvas_search_ui(&mut self.state);
+                } else if !self.state.canvas_selection.is_empty() {
                     self.state.canvas_selection.clear();
                 }
                 if self.state.mask_tool != crate::state::MaskTool::None {

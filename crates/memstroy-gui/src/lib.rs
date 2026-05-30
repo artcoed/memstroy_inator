@@ -10,6 +10,7 @@ pub mod image_fx_cache;
 pub mod fx_preview;
 pub mod jobs;
 pub mod web_image_search;
+pub mod canvas_image_search;
 pub mod build_info;
 pub mod i18n;
 pub mod audio_engine;

@@ -9,6 +9,7 @@
 #   ~/.local/share/Memstroy-inator/        (per-user, default)
 #       bin/memstroy-gui                   the editor
 #       bin/memstroy                       the CLI
+#       models/u2netp.onnx                 AI background removal
 #       examples/, README.md
 #       Memstroy-inator.sh                 launcher copied from the bundle
 #       uninstall.sh                       uninstaller (removes everything)

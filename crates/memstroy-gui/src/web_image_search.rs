@@ -809,7 +809,14 @@ fn kick_search(state: &mut EditorState, tx: &Sender<JobEvent>, append: bool) {
         );
     }
     state.web_image_search.searching = true;
-    spawn_web_image_search(&handle, tx.clone(), q, offset);
+    spawn_web_image_search(
+        &handle,
+        tx.clone(),
+        q,
+        offset,
+        crate::jobs::WebSearchTarget::Panel,
+        crate::jobs::WebImageSearchOptions::default(),
+    );
 }
 
 fn kick_download(
