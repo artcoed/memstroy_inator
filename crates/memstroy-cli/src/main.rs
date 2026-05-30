@@ -76,11 +76,11 @@ enum Cmd {
         /// Destination RGBA PNG.
         #[arg(short, long)]
         output: PathBuf,
-        /// Path to the U²-Netp ONNX model. Download from
-        /// `https://github.com/danielgatis/rembg/releases` and place it
-        /// at the default location to avoid passing this flag.
-        #[arg(long, default_value = "assets/models/u2netp.onnx")]
-        model: PathBuf,
+        /// Path to the U²-Netp ONNX model. When omitted, searches
+        /// `models/u2netp.onnx` next to the installed bundle and
+        /// `assets/models/u2netp.onnx` in dev trees.
+        #[arg(long)]
+        model: Option<PathBuf>,
         /// Optional saliency threshold in `[0, 1]`. When set above 0,
         /// produces a hard binary cutout instead of the soft matte.
         #[arg(long)]
@@ -122,6 +122,7 @@ async fn main() -> Result<()> {
             run_chroma(input, output, similarity, blend).await
         }
         Cmd::RemoveBg { input, output, model, threshold } => {
+            let model = model.unwrap_or_else(memstroy_vision::resolve_u2netp_model_path);
             run_remove_bg(input, output, model, threshold).await
         }
         Cmd::Render { scene, output, assets } => run_render(scene, output, assets).await,

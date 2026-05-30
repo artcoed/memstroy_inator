@@ -1,6 +1,6 @@
 //! UI panels — Premiere Pro-style timeline, modern inspector, drag&drop.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use egui::{Color32, Pos2, Rect, RichText, Rounding, Sense, Stroke, Vec2};
 use memstroy_core::*;
@@ -828,8 +828,24 @@ fn draw_asset_grid_cell(
         add_library_asset_at_playhead(state, asset, kind);
     }
 
-    // Tooltip on hover
+    library_path_context_menu(&resp, state, &asset.path);
     resp.on_hover_text(&asset.label);
+}
+
+/// Right-click menu for a library file row / grid cell.
+fn library_path_context_menu(
+    resp: &egui::Response,
+    state: &mut EditorState,
+    path: &Path,
+) {
+    resp.context_menu(|ui| {
+        if ui.button(crate::i18n::t("Show in folder")).clicked() {
+            ui.close_menu();
+            if let Err(e) = crate::shell_reveal::reveal_path_in_file_manager(path) {
+                state.status = e;
+            }
+        }
+    });
 }
 
 /// Compact card for a single sound / image / particle entry. Mirrors
@@ -1203,7 +1219,7 @@ fn clip_card_grid_item(ui: &mut egui::Ui, state: &mut EditorState, clip: &crate:
         }
     }
 
-    // Tooltip on hover
+    library_path_context_menu(&resp, state, &clip.path);
     resp.on_hover_text(&title);
 }
 
@@ -4621,6 +4637,8 @@ fn inspector_overlay(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
             // sliders, masks, color-key) already live above in the
             // shared inspector blocks.
             inspector_image_save_section(ui, state, i);
+            ui.add_space(6.0);
+            crate::canvas_image_search::inspector_web_image_tools(ui, state, i);
             ui.add_space(6.0);
             // ── Image Tools ──
             // Quick-access buttons for common image manipulation

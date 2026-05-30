@@ -62,6 +62,7 @@ image = { workspace = true }
 chrono = { workspace = true }
 memstroy-core = { workspace = true }
 memstroy-render = { workspace = true }
+memstroy-vision = { workspace = true }
 memstroy-assets-server = { workspace = true, optional = true }
 wgpu = { workspace = true }
 rodio = { workspace = true }
@@ -111,7 +112,6 @@ ab_glyph = "0.2"
 # pipeline. Auto-detects the best instruction set at runtime via `wide`.
 wide = "0.7"
 
-# ── Windows-only build dependency: PE VersionInfo resource ──────────
 # `winresource` programmatically generates and links a Win32
 # VS_VERSIONINFO resource into the produced `.exe`, populating the
 # Properties → Details tab with CompanyName / FileDescription /

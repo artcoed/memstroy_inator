@@ -695,6 +695,21 @@ fn ru_lookup(key: &str) -> Option<&'static str> {
             "Загружаем клипы с сервера…",
         "Local (your imports)" => "Локальная (ваши импорты)",
         "Global (built-in / browser)" => "Общая (встроенная / браузер)",
+        "Show in folder" => "Показать в папке",
+        "Image search" => "Поиск изображений",
+        "Could not open folder" => "Не удалось открыть папку",
+        "Path not found" => "Путь не найден",
+        "Checkerboard removal" => "Удаление шахматного фона",
+        "Color tolerance" => "Допуск цвета",
+        "Also remove light edges" => "Удалять светлые края",
+        "Edge brightness" => "Яркость края",
+        "Neutral tolerance" => "Допуск нейтрального",
+        "Re-apply strip" => "Повторить обработку",
+        "Re-run checkerboard removal on the placed image." =>
+            "Повторно удалить шахматный фон у размещённого изображения.",
+        "Checkerboard strip re-applied." => "Обработка шахматного фона повторена.",
+        "Checkerboard strip updated." => "Обработка шахматного фона обновлена.",
+        "Web image cutout" => "Вырезка веб-изображения",
         "server" => "сервер",
 
         // ── Misc / status messages ─────────────────────────────

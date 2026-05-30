@@ -6,8 +6,10 @@
 
 pub mod bgremove;
 pub mod chromakey;
+pub mod model_paths;
 pub mod pose;
 
 pub use bgremove::*;
 pub use chromakey::*;
+pub use model_paths::*;
 pub use pose::*;
