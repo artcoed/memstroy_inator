@@ -26,8 +26,11 @@
 //!   delegating to the `memstroy-tg` crate and re-indexing in the
 //!   background when the import is done.
 //!
-//! There is no authentication. The server is meant to be reachable
-//! only from the developer's own LAN (or `localhost` next to the GUI).
+//! Authentication is optional and off by default (suitable for a
+//! developer's own LAN or `localhost` next to the GUI). Set the
+//! `MEMSTROY_API_TOKEN` env var to require `Authorization: Bearer <token>`
+//! on the mutating endpoints (`/api/cleanup`, `/api/ingest/tg`) when the
+//! server is exposed publicly.
 //!
 //! ## Public surface
 //!
@@ -65,7 +68,7 @@ pub fn router(store: AssetStore) -> axum::Router {
 ///
 /// For memory-constrained environments (500MB RAM), the server is
 /// configured with:
-/// - Limited concurrent connections (10 max)
+/// - Single in-flight Telegram ingest job (extra requests get HTTP 429)
 /// - Request body size limit (10MB)
 /// - File streaming for large assets
 pub fn start(addr: SocketAddr, store: AssetStore) -> JoinHandle<()> {

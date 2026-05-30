@@ -123,7 +123,7 @@ async fn main() -> Result<()> {
                 limit = ingest_limit,
                 "auto-ingest: scheduling Telegram scrape on startup",
             );
-            memstroy_assets_server::ingest::spawn_tg_ingest(
+            let _ = memstroy_assets_server::ingest::try_spawn_tg_ingest(
                 store.clone(),
                 channel,
                 ingest_limit,
@@ -146,6 +146,18 @@ async fn main() -> Result<()> {
          - Concurrent downloads: 2\n\
          - Worker threads: 2"
     );
+
+    // Warn loudly when the mutating endpoints are left unauthenticated. Safe by
+    // default for LAN/localhost use; a public (e.g. Railway) deployment should
+    // set MEMSTROY_API_TOKEN so /api/cleanup and /api/ingest/tg require a token.
+    if memstroy_assets_server::api::configured_api_token().is_none() {
+        tracing::warn!(
+            "MEMSTROY_API_TOKEN is not set — the mutating endpoints \
+             (/api/cleanup, /api/ingest/tg) are UNAUTHENTICATED. Set \
+             MEMSTROY_API_TOKEN to require 'Authorization: Bearer <token>' on a \
+             public deployment."
+        );
+    }
 
     let handle = start(addr, store);
     

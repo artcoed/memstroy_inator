@@ -11,7 +11,7 @@ use std::sync::Arc;
 use axum::{
     body::Body,
     extract::{Path, Query, State},
-    http::{header, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Json, Response},
     routing::{get, post},
     Router,
@@ -131,7 +131,6 @@ pub fn router(store: AssetStore) -> Router {
 
     Router::new()
         .route("/api/health", get(health))
-        .route("/api/test-metadata", post(test_metadata))
         .route("/api/cleanup", post(cleanup_old_files))
         .route("/api/assets", get(list_assets))
         .route("/api/assets/:id", get(get_asset))
@@ -411,15 +410,23 @@ fn default_ingest_limit() -> u32 {
 
 async fn post_ingest_tg(
     State(store): State<AssetStore>,
+    headers: HeaderMap,
     Json(body): Json<TgIngestRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    require_auth(&headers)?;
     let channel = body.channel.trim().to_string();
     if channel.is_empty() {
         return Err(ApiError::BadRequest("channel must not be empty".into()));
     }
     // Limit to maximum 10 clips per request
     let limit = body.limit.max(1).min(10);
-    ingest::spawn_tg_ingest(store, channel.clone(), limit);
+    // Only one ingest at a time: an unauthenticated flood would otherwise spawn
+    // arbitrarily many long-lived download tasks (worker/disk exhaustion DoS).
+    if !ingest::try_spawn_tg_ingest(store, channel.clone(), limit) {
+        return Err(ApiError::Busy(
+            "an ingest job is already running; try again later".into(),
+        ));
+    }
     Ok(Json(json!({
         "started": true,
         "channel": channel,
@@ -427,41 +434,12 @@ async fn post_ingest_tg(
     })))
 }
 
-// Test endpoint to verify metadata creation works
-async fn test_metadata(State(store): State<AssetStore>) -> Result<Json<serde_json::Value>, ApiError> {
-    let root = store.root();
-    let clips_dir = root.join("clips");
-    let test_id = "test123";
-    let test_txt = clips_dir.join(format!("{}.txt", test_id));
-    let test_content = "Test metadata content";
-    
-    match tokio::fs::write(&test_txt, test_content.as_bytes()).await {
-        Ok(_) => {
-            // Verify file exists
-            let exists = test_txt.exists();
-            let content = tokio::fs::read_to_string(&test_txt).await.unwrap_or_default();
-            
-            // Reindex to pick up the test file
-            let _ = store.index_dir(&root);
-            
-            Ok(Json(json!({
-                "success": true,
-                "test_file": test_txt.display().to_string(),
-                "exists": exists,
-                "content": content,
-                "clips_dir": clips_dir.display().to_string(),
-            })))
-        }
-        Err(e) => Ok(Json(json!({
-            "success": false,
-            "error": e.to_string(),
-            "clips_dir": clips_dir.display().to_string(),
-        })))
-    }
-}
-
 // Manual cleanup endpoint to delete all clips and free disk space
-async fn cleanup_old_files(State(store): State<AssetStore>) -> Result<Json<serde_json::Value>, ApiError> {
+async fn cleanup_old_files(
+    State(store): State<AssetStore>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_auth(&headers)?;
     let root = store.root();
     let clips_dir = root.join("clips");
     let thumbs_dir = clips_dir.join("thumbs");
@@ -528,6 +506,61 @@ async fn cleanup_old_files(State(store): State<AssetStore>) -> Result<Json<serde
 
 
 // ---------------------------------------------------------------------------
+// Authentication (opt-in)
+// ---------------------------------------------------------------------------
+//
+// The mutating endpoints (`/api/cleanup`, `/api/ingest/tg`) are reachable by
+// anyone who can reach the server. On a public deployment (e.g. Railway behind
+// a generated domain) that means the whole internet, so we gate them behind an
+// optional shared bearer token. Auth is OFF by default so existing
+// LAN/localhost setups keep working unchanged; set `MEMSTROY_API_TOKEN` to
+// require `Authorization: Bearer <token>` on those routes. A loud warning is
+// logged at startup when the token is absent (see `main.rs`).
+
+/// Env var holding the shared bearer token. When set and non-empty, mutating
+/// endpoints require a matching `Authorization: Bearer <token>` header.
+const AUTH_TOKEN_ENV: &str = "MEMSTROY_API_TOKEN";
+
+/// The configured API token, or `None` when auth is disabled (env unset/empty).
+pub fn configured_api_token() -> Option<String> {
+    std::env::var(AUTH_TOKEN_ENV)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Enforce bearer-token auth on a mutating request. No-op (`Ok`) when no token
+/// is configured, so unauthenticated LAN deployments keep working.
+fn require_auth(headers: &HeaderMap) -> Result<(), ApiError> {
+    let Some(expected) = configured_api_token() else {
+        return Ok(());
+    };
+    let provided = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .unwrap_or("");
+    if constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
+        Ok(())
+    } else {
+        Err(ApiError::Unauthorized)
+    }
+}
+
+/// Length-checked, branch-free byte comparison to avoid leaking the token
+/// through response timing.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+// ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
 
@@ -535,6 +568,8 @@ async fn cleanup_old_files(State(store): State<AssetStore>) -> Result<Json<serde
 enum ApiError {
     NotFound,
     BadRequest(Arc<str>),
+    Unauthorized,
+    Busy(Arc<str>),
 }
 
 impl From<String> for ApiError {
@@ -554,6 +589,16 @@ impl IntoResponse for ApiError {
             ApiError::BadRequest(msg) => (
                 StatusCode::BAD_REQUEST,
                 Json(json!({ "error": "bad_request", "message": msg.as_ref() })),
+            )
+                .into_response(),
+            ApiError::Unauthorized => (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "unauthorized", "message": "missing or invalid bearer token" })),
+            )
+                .into_response(),
+            ApiError::Busy(msg) => (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({ "error": "busy", "message": msg.as_ref() })),
             )
                 .into_response(),
         }
