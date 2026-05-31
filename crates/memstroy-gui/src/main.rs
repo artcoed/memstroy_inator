@@ -18,6 +18,7 @@ mod autosave;
 mod build_info;
 mod canvas_preview;
 mod curve_editor;
+mod editor_limits;
 
 mod frame_snapshot;
 mod fx_preview;

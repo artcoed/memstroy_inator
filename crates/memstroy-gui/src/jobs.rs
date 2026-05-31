@@ -812,6 +812,88 @@ pub(crate) async fn generate_thumbnails(clips_dir: &std::path::Path, thumbs_dir:
     generated
 }
 
+const VIDEO_LIBRARY_EXTENSIONS: &[&str] = &["mp4", "mov", "webm", "avi", "mkv", "m4v"];
+
+fn asset_thumbnail_exists(video_path: &std::path::Path) -> bool {
+    [
+        video_path.with_extension("thumb.png"),
+        video_path.with_extension("thumb.jpg"),
+    ]
+    .iter()
+    .any(|p| p.is_file())
+}
+
+/// For each video in `videos_dir` without a sibling `.thumb.jpg`, extract
+/// the first decoded frame for the library grid.
+pub(crate) async fn generate_video_library_thumbnails(videos_dir: &std::path::Path) -> usize {
+    let bin = ffmpeg_binary();
+    let ffmpeg_ok = {
+        let mut cmd = std::process::Command::new(&bin);
+        cmd.arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        memstroy_render::hide_console_std(&mut cmd).status().is_ok()
+    };
+    if !ffmpeg_ok {
+        warn!("ffmpeg not found — skipping video library thumbnail generation");
+        return 0;
+    }
+
+    let _ = std::fs::create_dir_all(videos_dir);
+    let entries = match std::fs::read_dir(videos_dir) {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+
+    let mut generated = 0usize;
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if !p.is_file() {
+            continue;
+        }
+        let ext = p
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+        if !VIDEO_LIBRARY_EXTENSIONS.contains(&ext.as_str()) {
+            continue;
+        }
+        if asset_thumbnail_exists(&p) {
+            continue;
+        }
+        let thumb = p.with_extension("thumb.jpg");
+        let result = {
+            let mut cmd = tokio::process::Command::new(&bin);
+            cmd.args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                &p.to_string_lossy(),
+                "-frames:v",
+                "1",
+                "-vf",
+                "scale=120:-1",
+                "-q:v",
+                "6",
+            ])
+            .arg(&thumb)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+            memstroy_render::hide_console_tokio(&mut cmd).status().await
+        };
+        if result.map(|s| s.success()).unwrap_or(false) {
+            info!(path = %p.display(), "generated video library thumbnail");
+            generated += 1;
+        } else {
+            warn!(path = %p.display(), "ffmpeg video library thumbnail failed");
+        }
+    }
+    generated
+}
+
 
 
 // ─────────────────────────────────────────────────────────────────────

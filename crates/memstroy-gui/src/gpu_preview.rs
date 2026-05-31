@@ -367,7 +367,7 @@ impl PreviewCompositor {
 
             // Choose pipeline based on whether chroma key is active
             // (similarity > 0 indicates chroma key should be applied)
-            let use_chroma = actor.chroma_key.similarity > 0.01;
+            let use_chroma = actor.chroma_key.is_active();
 
             // TODO: push constants for transform
             // The actor's layout transform (position/scale/rotation) should be passed
@@ -546,7 +546,10 @@ impl PreviewCompositor {
             let actor_texture = self.create_texture_from_rgba(&pixels, img_w, img_h);
             let bind_group = self.create_tex_bind_group(&actor_texture);
 
-            let use_chroma = params.chroma_key.is_some();
+            let use_chroma = params
+                .chroma_key
+                .as_ref()
+                .is_some_and(|ck| ck.is_active());
 
             // TODO: push constants for transform
             // params.layout contains position/scale/rotation that should be

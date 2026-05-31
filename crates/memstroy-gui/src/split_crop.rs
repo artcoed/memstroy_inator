@@ -10,6 +10,47 @@ use memstroy_core::{
 
 const EPS: f32 = 1.0e-3;
 
+/// Default timeline span before ffprobe / frame extraction report a real
+/// duration (`clip_duration_for_placement` in the timeline UI).
+pub const CLIP_DURATION_PLACEHOLDER_SEC: f32 = 60.0;
+
+/// Maximum scene `t_out` reachable from `source_duration` given the actor's
+/// in-point, `source_start`, and playback speed.
+pub fn actor_source_window_cap(
+    t_in: f32,
+    source_start: f32,
+    speed: f32,
+    source_duration: f32,
+) -> f32 {
+    let speed = speed.max(0.0001);
+    t_in + ((source_duration - source_start).max(0.0) / speed).max(0.05)
+}
+
+/// After source duration becomes known, widen clips that still carry the
+/// drop placeholder length, clamp overstretched bars, and leave razor splits /
+/// manual trims untouched.
+pub fn reconcile_actor_t_out_for_source(actor: &mut Actor, source_duration: f32) {
+    let t_in = actor.t_in.unwrap_or(0.0);
+    let cap = actor_source_window_cap(
+        t_in,
+        actor.source_start,
+        actor.speed,
+        source_duration,
+    );
+    let Some(cur) = actor.t_out else {
+        actor.t_out = Some(cap);
+        return;
+    };
+    if cur > cap + 0.05 {
+        actor.t_out = Some(cap);
+        return;
+    }
+    let visible = (cur - t_in).max(0.0);
+    if visible + 0.05 >= CLIP_DURATION_PLACEHOLDER_SEC {
+        actor.t_out = Some(cap);
+    }
+}
+
 /// Crop every track in a `param_kfs`-shaped clip-local map.
 ///
 /// `local_cut` is the cut time expressed in the PRE-SPLIT clip-local
@@ -863,5 +904,31 @@ mod tests {
             }
             _ => panic!("expected Image"),
         }
+    }
+
+    // ── reconcile_actor_t_out_for_source (timeline window after probe) ──
+
+    #[test]
+    fn reconcile_actor_t_out_preserves_razor_left_half() {
+        let mut a = mk_actor(Some(0.0), Some(5.0));
+        a.source_start = 0.0;
+        super::reconcile_actor_t_out_for_source(&mut a, 100.0);
+        assert_eq!(a.t_out, Some(5.0));
+    }
+
+    #[test]
+    fn reconcile_actor_t_out_preserves_razor_right_half() {
+        let mut a = mk_actor(Some(5.0), Some(10.0));
+        a.source_start = 5.0;
+        super::reconcile_actor_t_out_for_source(&mut a, 100.0);
+        assert_eq!(a.t_out, Some(10.0));
+    }
+
+    #[test]
+    fn reconcile_actor_t_out_expands_placeholder_drop() {
+        let mut a = mk_actor(Some(0.0), Some(super::CLIP_DURATION_PLACEHOLDER_SEC));
+        a.source_start = 0.0;
+        super::reconcile_actor_t_out_for_source(&mut a, 30.0);
+        assert_eq!(a.t_out, Some(30.0));
     }
 }

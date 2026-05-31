@@ -696,6 +696,9 @@ fn ru_lookup(key: &str) -> Option<&'static str> {
         "Local (your imports)" => "Локальная (ваши импорты)",
         "Global (built-in / browser)" => "Общая (встроенная / браузер)",
         "Show in folder" => "Показать в папке",
+        "Enable chroma key" => "Включить хромакей",
+        "Off by default for new clips — turn on to key out the background colour" =>
+            "По умолчанию выключено для новых клипов — включите, чтобы убрать фон по цвету",
         "Image search" => "Поиск изображений",
         "Could not open folder" => "Не удалось открыть папку",
         "Path not found" => "Путь не найден",
@@ -1095,6 +1098,8 @@ fn ru_lookup(key: &str) -> Option<&'static str> {
         "Loading..." => "Загрузка…",
         "Loading video..." => "Загрузка видео…",
         "Video preview failed" => "Не удалось загрузить превью видео",
+        "\u{274C} Preview frames failed:" => "\u{274C} Не удалось извлечь кадры превью:",
+        "\u{274C} Waveform failed:" => "\u{274C} Не удалось извлечь звуковую волну:",
         "Video file is not ready yet — wait for download" => {
             "Видеофайл ещё не готов — дождитесь загрузки"
         }

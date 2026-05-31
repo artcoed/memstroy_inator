@@ -355,6 +355,23 @@ impl Scene {
         backfill_render_frame(&mut self.render_frame);
     }
 
+    /// Drop `canvas_layouts` rows that no longer match a live element id.
+    pub fn purge_orphan_canvas_layouts(&mut self) {
+        let mut live = std::collections::HashSet::new();
+        for a in &self.actors {
+            live.insert(a.id.clone());
+        }
+        for ov in &self.overlays {
+            let id = match ov {
+                Overlay::Text(t) => &t.id,
+                Overlay::Image(im) => &im.id,
+                Overlay::Video(v) => &v.id,
+            };
+            live.insert(id.clone());
+        }
+        self.canvas_layouts.retain(|cl| live.contains(&cl.element_id));
+    }
+
     /// Collect all element IDs in the scene (actors + overlays).
     /// Returns `(id, label)` pairs suitable for a dropdown selector.
     /// Excludes the element with `exclude_id` (to prevent self-parenting).
@@ -930,6 +947,9 @@ impl ColorCorrection {
 /// Chroma-keying parameters for actor source video.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChromaKeyParams {
+    /// When false, preview / export skip chromakey regardless of sliders.
+    #[serde(default)]
+    pub enabled: bool,
     /// Target colour in RGB. Defaults to a Telegram-channel green.
     pub key_color: [u8; 3],
     /// Hue tolerance in degrees [0, 180]. Higher = more permissive.
@@ -943,6 +963,7 @@ pub struct ChromaKeyParams {
 impl Default for ChromaKeyParams {
     fn default() -> Self {
         Self {
+            enabled: false,
             key_color: [0, 177, 64], // standard chroma green
             similarity: 0.20,
             blend: 0.10,
@@ -952,6 +973,10 @@ impl Default for ChromaKeyParams {
 }
 
 impl ChromaKeyParams {
+    /// Whether chromakey should run in preview / export pipelines.
+    pub fn is_active(&self) -> bool {
+        self.enabled && self.similarity.is_finite() && self.similarity >= 1.0e-5
+    }
     /// Path of the per-clip chroma sidecar file (`<clip>.chroma.json`).
     pub fn sidecar_path(clip_path: &std::path::Path) -> std::path::PathBuf {
         clip_path.with_extension("chroma.json")

@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 use memstroy_core::Scene;
 
-const MAX_HISTORY: usize = 50;
+const MAX_HISTORY: usize = 120;
 
 /// One snapshot in the history stack. Stores the full `Scene`
 /// alongside the editor's track-assignment maps so an undo restores

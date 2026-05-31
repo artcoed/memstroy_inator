@@ -22,7 +22,7 @@
 use std::collections::BTreeSet;
 
 use memstroy_core::{
-    keyframe, ActorState, CanvasTransform, Easing, Keyframe, OverlayState,
+    keyframe, ActorState, CanvasTransform, Easing, Keyframe, Overlay, OverlayState,
 };
 
 // ─── Generic in-vec upsert ───────────────────────────────────────────
@@ -70,6 +70,128 @@ pub fn sample_overlay(
     t: f32,
 ) -> OverlayState {
     memstroy_core::sample_overlay_layout(layout, animated_params, t)
+}
+
+/// Mirror the actor's normalised layout position into `canvas_layouts`
+/// when the element was dropped on the free canvas (which authors world-
+/// pixel keyframes). Without this, inspector edits touch `actor.layout`
+/// only and the preview keeps reading the stale canvas row.
+pub fn sync_actor_transform_to_canvas(scene: &mut memstroy_core::Scene, actor_idx: usize, scene_t: f32) {
+    use memstroy_core::param_ids;
+
+    if actor_idx >= scene.actors.len() {
+        return;
+    }
+    let actor_id = scene.actors[actor_idx].id.clone();
+    let animated = scene.actors[actor_idx].animated_params.clone();
+    if !scene
+        .canvas_layouts
+        .iter()
+        .any(|cl| cl.element_id == actor_id)
+    {
+        return;
+    }
+    let st = sample_actor(
+        &scene.actors[actor_idx].layout,
+        &animated,
+        scene_t,
+    );
+    let [rw, rh] = scene.render_frame.resolution;
+    let world_w = rw as f32;
+    let world_h = rh as f32;
+    if world_w <= 0.0 || world_h <= 0.0 {
+        return;
+    }
+    let world_x = st.pos[0] * world_w;
+    let world_y = st.pos[1] * world_h;
+    if let Some(cl) = scene
+        .canvas_layouts
+        .iter_mut()
+        .find(|cl| cl.element_id == actor_id)
+    {
+        write_canvas_param(
+            &mut cl.keyframes,
+            &animated,
+            &[param_ids::POS_X, param_ids::POS_Y],
+            scene_t,
+            |v| {
+                v.pos.x = world_x;
+                v.pos.y = world_y;
+            },
+        );
+    }
+}
+
+/// Mirror an overlay's normalised layout position into `canvas_layouts`
+/// when the element was placed on the free canvas (world-pixel keyframes).
+/// Inspector edits touch `overlay.layout` in clip-local time; the canvas
+/// preview reads the canvas row at scene time — without this sync the
+/// gizmo values change but the painted position does not.
+pub fn sync_overlay_transform_to_canvas(
+    scene: &mut memstroy_core::Scene,
+    overlay_idx: usize,
+    scene_t: f32,
+) {
+    use memstroy_core::param_ids;
+
+    let (element_id, animated, layout, t_in, t_out) = match scene.overlays.get(overlay_idx) {
+        Some(Overlay::Text(t)) => (
+            t.id.clone(),
+            t.animated_params.clone(),
+            &t.layout,
+            t.t_in,
+            t.t_out,
+        ),
+        Some(Overlay::Image(im)) => (
+            im.id.clone(),
+            im.animated_params.clone(),
+            &im.layout,
+            im.t_in,
+            im.t_out,
+        ),
+        Some(Overlay::Video(v)) => (
+            v.id.clone(),
+            v.animated_params.clone(),
+            &v.layout,
+            v.t_in,
+            v.t_out,
+        ),
+        None => return,
+    };
+    if !scene
+        .canvas_layouts
+        .iter()
+        .any(|cl| cl.element_id == element_id)
+    {
+        return;
+    }
+    let clip_dur = (t_out - t_in).max(0.0);
+    let local_t = (scene_t - t_in).clamp(0.0, clip_dur);
+    let st = sample_overlay(layout, &animated, local_t);
+    let [rw, rh] = scene.render_frame.resolution;
+    let world_w = rw as f32;
+    let world_h = rh as f32;
+    if world_w <= 0.0 || world_h <= 0.0 {
+        return;
+    }
+    let world_x = st.pos[0] * world_w;
+    let world_y = st.pos[1] * world_h;
+    if let Some(cl) = scene
+        .canvas_layouts
+        .iter_mut()
+        .find(|cl| cl.element_id == element_id)
+    {
+        write_canvas_param(
+            &mut cl.keyframes,
+            &animated,
+            &[param_ids::POS_X, param_ids::POS_Y],
+            scene_t,
+            |v| {
+                v.pos.x = world_x;
+                v.pos.y = world_y;
+            },
+        );
+    }
 }
 
 // ─── Writers (called from inspector / canvas after user edit) ────────

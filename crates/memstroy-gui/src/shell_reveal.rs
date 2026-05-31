@@ -10,7 +10,7 @@ pub fn reveal_path_in_file_manager(path: &Path) -> Result<(), String> {
 
     if path.is_file() {
         reveal_existing_file(path)
-    } else if let Ok(abs) = resolve_path(path) {
+    } else if let Ok(abs) = resolve_existing_file(path) {
         if abs.is_file() {
             reveal_existing_file(&abs)
         } else if abs.is_dir() {
@@ -41,19 +41,6 @@ fn io_err(e: std::io::Error) -> String {
     format!("{}: {e}", crate::i18n::t("Could not open folder"))
 }
 
-/// Resolve `path` to an absolute on-disk path and verify the file exists.
-fn resolve_path(path: &Path) -> Result<PathBuf, String> {
-    let abs = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map_err(io_err)?
-            .join(path)
-    };
-    let abs = std::fs::canonicalize(&abs).map_err(io_err)?;
-    Ok(strip_verbatim_prefix(&abs))
-}
-
 fn strip_verbatim_prefix(path: &Path) -> PathBuf {
     let s = path.to_string_lossy();
     if let Some(rest) = s.strip_prefix(r"\\?\") {
@@ -63,46 +50,105 @@ fn strip_verbatim_prefix(path: &Path) -> PathBuf {
     }
 }
 
+/// Resolve to an absolute path; prefer canonical paths but fall back
+/// when the OS refuses (OneDrive placeholders, long paths, …).
+fn resolve_existing_file(path: &Path) -> Result<PathBuf, String> {
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().map_err(io_err)?.join(path)
+    };
+    if !abs.exists() {
+        return Err(format!(
+            "{}: {}",
+            crate::i18n::t("Path not found"),
+            path.display()
+        ));
+    }
+    if let Ok(canon) = std::fs::canonicalize(&abs) {
+        return Ok(strip_verbatim_prefix(&canon));
+    }
+    Ok(strip_verbatim_prefix(&abs))
+}
+
 #[cfg(target_os = "windows")]
 fn reveal_existing_file(path: &Path) -> Result<(), String> {
-    let abs = resolve_path(path)?;
-    if reveal_via_shell_com(&abs).is_ok() {
+    let abs = resolve_existing_file(path)?;
+    if reveal_via_shell_api(&abs).is_ok() {
         return Ok(());
     }
     explorer_select(&abs)
 }
 
 #[cfg(target_os = "windows")]
-fn reveal_via_shell_com(path: &Path) -> Result<(), String> {
-    let path_literal = path.to_string_lossy().replace('\'', "''");
-    let script = format!(
-        "$p='{path_literal}'; \
-         if (-not (Test-Path -LiteralPath $p)) {{ exit 1 }}; \
-         $shell = New-Object -ComObject Shell.Application; \
-         $folder = Split-Path -LiteralPath $p; \
-         $file = Split-Path -LiteralPath $p -Leaf; \
-         $item = $shell.NameSpace($folder).ParseName($file); \
-         if ($null -eq $item) {{ exit 2 }}; \
-         $item.InvokeVerb('select')"
-    );
-    let status = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .status()
-        .map_err(io_err)?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(io_err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Shell select exited with {status}"),
-        )))
+fn reveal_via_shell_api(path: &Path) -> Result<(), String> {
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt;
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    // SAFETY: Win32 shell COM APIs; `wide` is null-terminated UTF-16.
+    unsafe {
+        #[link(name = "ole32")]
+        extern "system" {
+            fn CoInitializeEx(pvReserved: *const c_void, dwCoInit: u32) -> i32;
+        }
+        #[link(name = "shell32")]
+        extern "system" {
+            fn ILCreateFromPathW(pszPath: *const u16) -> *mut c_void;
+            fn ILClone(pidl: *const c_void) -> *mut c_void;
+            fn ILFindLastID(pidl: *const c_void) -> *mut c_void;
+            fn ILRemoveLastID(pidl: *mut c_void) -> i32;
+            fn ILFree(pidl: *const c_void);
+            fn SHOpenFolderAndSelectItems(
+                pidlFolder: *const c_void,
+                cidl: u32,
+                apidl: *const *const c_void,
+                dwFlags: u32,
+            ) -> i32;
+        }
+
+        let _ = CoInitializeEx(std::ptr::null(), 0x2); // COINIT_APARTMENTTHREADED
+
+        let pidl_full = ILCreateFromPathW(wide.as_ptr());
+        if pidl_full.is_null() {
+            return Err(crate::i18n::t("Could not open folder").to_string());
+        }
+
+        let pidl_item = ILFindLastID(pidl_full);
+        let pidl_folder = ILClone(pidl_full);
+        if pidl_folder.is_null() {
+            ILFree(pidl_full);
+            return Err(crate::i18n::t("Could not open folder").to_string());
+        }
+
+        let _ = ILRemoveLastID(pidl_folder);
+
+        let apidl = [pidl_item as *const c_void];
+        let hr = SHOpenFolderAndSelectItems(pidl_folder, 1, apidl.as_ptr(), 0);
+
+        ILFree(pidl_folder);
+        ILFree(pidl_full);
+
+        if hr < 0 {
+            return Err(format!(
+                "{}: Shell error 0x{:08X}",
+                crate::i18n::t("Could not open folder"),
+                hr as u32
+            ));
+        }
     }
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]
 fn explorer_select(path: &Path) -> Result<(), String> {
     let path_str = path.to_string_lossy();
-    let arg = format!("/select,{path_str}");
+    let arg = format!("/select,\"{path_str}\"");
     std::process::Command::new("explorer.exe")
         .arg(arg)
         .spawn()
@@ -112,7 +158,13 @@ fn explorer_select(path: &Path) -> Result<(), String> {
 
 #[cfg(target_os = "windows")]
 fn open_directory(path: &Path) -> Result<(), String> {
-    let abs = resolve_path(path).unwrap_or_else(|_| path.to_path_buf());
+    let abs = if path.is_dir() {
+        path.to_path_buf()
+    } else if let Ok(p) = resolve_existing_file(path) {
+        p
+    } else {
+        path.to_path_buf()
+    };
     std::process::Command::new("explorer.exe")
         .arg(abs)
         .spawn()

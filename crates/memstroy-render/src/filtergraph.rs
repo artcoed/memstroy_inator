@@ -26,7 +26,7 @@ use crate::plan::{FfmpegInput, InputKind};
 /// matching the form already used by the `EffectKind::ColorKey`
 /// emission below.
 fn chromakey_filter(ck: &ChromaKeyParams) -> Option<String> {
-    if !ck.similarity.is_finite() || ck.similarity < 1.0e-5 {
+    if !ck.is_active() {
         return None;
     }
     let sim = ck.similarity.clamp(1.0e-5, 1.0);

@@ -155,14 +155,20 @@ pub fn library(ui: &mut egui::Ui, state: &mut EditorState, _request_refresh: imp
         state.prev_library_search_tab = state.library_tab;
         // Only the Clips tab talks to the server; other tabs rescan
         // their local directories instead.
-        if state.library_tab == LibraryTab::Clips {
+        if state.library_tab == LibraryTab::Clips && !crate::state::LIBRARY_LOCAL_ONLY {
             maybe_auto_refresh(state, /*force=*/ search_committed);
         }
     }
     ui.add_space(2.0);
 
     let hint_text = match state.library_tab {
-        LibraryTab::Clips => t("Drag a clip onto the canvas or timeline. The library auto-updates from the assets-server (which periodically ingests from Telegram)."),
+        LibraryTab::Clips => {
+            if crate::state::LIBRARY_LOCAL_ONLY {
+                t("Drag a clip from assets/clips/ onto the canvas or timeline.")
+            } else {
+                t("Drag a clip onto the canvas or timeline. The library auto-updates from the assets-server (which periodically ingests from Telegram).")
+            }
+        }
         LibraryTab::Videos => t("User-imported videos. Drop a video file from your file manager into this panel to add it. Drag a row onto the canvas or timeline to spawn an actor."),
         LibraryTab::Sounds => t("Drop a sound onto the timeline to add it as an audio track. Drop audio files from your file manager here to import."),
         LibraryTab::Images => t("Drag a sticker onto the canvas to add it as an image overlay. Drop image files from your file manager here to import."),
@@ -188,6 +194,9 @@ pub fn library(ui: &mut egui::Ui, state: &mut EditorState, _request_refresh: imp
 /// Fire a server refresh, debounced. `force=true` bypasses the debounce
 /// (used by Enter-in-search-box, where the user has clearly committed).
 fn maybe_auto_refresh(state: &mut EditorState, force: bool) {
+    if crate::state::LIBRARY_LOCAL_ONLY {
+        return;
+    }
     if state.refreshing {
         return;
     }
@@ -320,40 +329,35 @@ fn library_clips_tab(ui: &mut egui::Ui, state: &mut EditorState) {
     let search_lower = state.library_search.to_lowercase();
     let clip_count = state.library.mellstroy_clips.len();
 
-    // ── Header row: clip count + channel badge ──
+    // ── Header row: clip count ──
     // Clips are loaded automatically on scroll and search.
-    ui.horizontal(|ui| {
-        ui.label(
-            RichText::new(format!("{} ({})", t("Clips"), clip_count))
-                .size(12.0)
-                .strong()
-                .color(Color32::from_rgb(220, 130, 50)),
-        );
-        ui.add_space(6.0);
-        ui.label(
-            RichText::new(format!("@{}", state.tg_channel))
-                .size(10.0)
-                .color(COL_TEXT_DIM)
-                .italics(),
-        );
-    });
-    // Clips are server-managed by design — the Refresh action POSTs
-    // to the in-process memstroy-assets-server which scrapes Telegram
-    // on the GUI's behalf. Surface that explicitly so users know which
-    // controls drive this list. Display the *connect-able* URL so the
-    // user never sees a confusing wildcard host like `0.0.0.0:8765`,
-    // which is a valid bind address but cannot be used as a request
-    // target on Windows / macOS.
     ui.label(
-        RichText::new(format!(
-            "\u{1F310} {}: {}",
-            crate::i18n::t("server"),
-            crate::state::rewrite_server_url_for_client(&state.server_url)
-        ))
-        .size(9.0)
-        .italics()
-        .color(COL_TEXT_DIM),
+        RichText::new(format!("{} ({})", t("Clips"), clip_count))
+            .size(12.0)
+            .strong()
+            .color(Color32::from_rgb(220, 130, 50)),
     );
+    if !crate::state::LIBRARY_LOCAL_ONLY {
+        ui.label(
+            RichText::new(format!(
+                "\u{1F310} {}: {}",
+                crate::i18n::t("server"),
+                crate::state::rewrite_server_url_for_client(&state.server_url)
+            ))
+            .size(9.0)
+            .italics()
+            .color(COL_TEXT_DIM),
+        );
+    } else {
+        ui.label(
+            RichText::new(crate::i18n::t(
+                "Local library — place .mp4 files in assets/clips/",
+            ))
+            .size(9.0)
+            .italics()
+            .color(COL_TEXT_DIM),
+        );
+    }
     if state.refreshing {
         ui.label(
             RichText::new(crate::i18n::t("refreshing..."))
@@ -370,7 +374,9 @@ fn library_clips_tab(ui: &mut egui::Ui, state: &mut EditorState) {
         .show(ui, |ui| {
             if state.library.mellstroy_clips.is_empty() {
                 let hint = if state.refreshing {
-                    t("Fetching clips from the server...")
+                    t("Refreshing local clips...")
+                } else if crate::state::LIBRARY_LOCAL_ONLY {
+                    t("No clips yet — copy .mp4 files into assets/clips/ and choose Refresh in the menu.")
                 } else {
                     t("No clips yet — start typing in the search box or scroll down to load clips.")
                 };
@@ -380,8 +386,7 @@ fn library_clips_tab(ui: &mut egui::Ui, state: &mut EditorState) {
                         .color(COL_TEXT_DIM)
                         .size(11.0),
                 );
-                // Auto-trigger refresh when empty and not already refreshing
-                if !state.refreshing {
+                if !state.refreshing && !crate::state::LIBRARY_LOCAL_ONLY {
                     maybe_auto_refresh(state, /*force=*/ false);
                 }
                 return;
@@ -460,7 +465,7 @@ fn library_clips_tab(ui: &mut egui::Ui, state: &mut EditorState) {
     let viewport_bottom = scroll_out.state.offset.y + scroll_out.inner_rect.height();
     let near_bottom = viewport_bottom + 80.0 >= scroll_out.content_size.y
         && scroll_out.content_size.y > scroll_out.inner_rect.height();
-    if near_bottom && !state.library.mellstroy_clips.is_empty() {
+    if near_bottom && !state.library.mellstroy_clips.is_empty() && !crate::state::LIBRARY_LOCAL_ONLY {
         maybe_auto_refresh(state, /*force=*/ false);
     }
 }
@@ -1020,12 +1025,16 @@ pub(crate) fn add_library_asset_at_playhead(
                 t_end: f32::MAX,
                 enabled: true,
                 kind: ModifierKind::Spin { speed_dps: 90.0 },
+                animated_params: Default::default(),
+                param_kfs: Default::default(),
             });
             modifiers.push(TrackModifier {
                 t_start: 0.0,
                 t_end: f32::MAX,
                 enabled: true,
                 kind: ModifierKind::Pulse { freq_hz: 1.5, amp_scale: 0.15 },
+                animated_params: Default::default(),
+                param_kfs: Default::default(),
             });
             modifiers.push(TrackModifier {
                 t_start: 0.0,
@@ -1034,6 +1043,8 @@ pub(crate) fn add_library_asset_at_playhead(
                 kind: ModifierKind::Wobble {
                     freq_hz: 1.0, amp_x: 12.0, amp_y: 12.0, amp_rot_deg: 0.0, phase: 0.0,
                 },
+                animated_params: Default::default(),
+                param_kfs: Default::default(),
             });
             let t_in = t;
             let t_out = (t + 4.0).min(dur);
@@ -1592,7 +1603,7 @@ fn inspector_multiselect(ui: &mut egui::Ui, state: &mut EditorState) {
         let mut cur = rot_last;
         let r = ui.add(
             egui::DragValue::new(&mut cur)
-                .range(-3600.0..=3600.0)
+                .range(crate::editor_limits::ROTATION_DEG)
                 .speed(0.5)
                 .suffix("\u{00B0}"),
         );
@@ -1702,7 +1713,7 @@ fn multi_apply_scale_factor(state: &mut EditorState, factor: f32, playhead: f32)
                 if let Some(a) = state.scene.actors.get_mut(ai) {
                     crate::kf_anim::write_actor_param(&mut a.layout, &mut a.animated_params,
                         playhead, param_ids::SCALE, false,
-                        |s| s.scale = (s.scale * factor).clamp(0.01, 50.0));
+                        |s| s.scale = crate::editor_limits::clamp_scale(s.scale * factor));
                 }
             }
             Selection::Overlay(oi) => {
@@ -1710,7 +1721,7 @@ fn multi_apply_scale_factor(state: &mut EditorState, factor: f32, playhead: f32)
                     let (layout, animated) = overlay_layout_and_params(ov);
                     crate::kf_anim::write_overlay_param(layout, animated,
                         playhead, param_ids::SCALE, false,
-                        |s| s.scale = (s.scale * factor).clamp(0.01, 50.0));
+                        |s| s.scale = crate::editor_limits::clamp_scale(s.scale * factor));
                 }
             }
             _ => {}
@@ -1859,12 +1870,14 @@ fn inspector_actor(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
     ).size(10.0).color(COL_TEXT_DIM));
     ui.add_space(6.0);
 
-    // Tab bar: Transform | Masks | Effects | Skeleton
+    // Tab bar: Transform | Masks | Effects
+    if state.inspector_tab > 2 {
+        state.inspector_tab = 0;
+    }
     ui.horizontal(|ui| {
         if ui.selectable_label(state.inspector_tab == 0, t("Transform")).clicked() { state.inspector_tab = 0; }
         if ui.selectable_label(state.inspector_tab == 1, t("Masks")).clicked() { state.inspector_tab = 1; }
         if ui.selectable_label(state.inspector_tab == 2, t("Effects")).clicked() { state.inspector_tab = 2; }
-        if ui.selectable_label(state.inspector_tab == 3, t("Skeleton")).clicked() { state.inspector_tab = 3; }
     });
     ui.separator();
     ui.add_space(4.0);
@@ -1876,32 +1889,12 @@ fn inspector_actor(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
         }
         1 => inspector_actor_masks(ui, state, i),
         2 => inspector_actor_effects(ui, state, i, actor_count, cache_count),
-        3 => inspector_actor_skeleton(ui, state, i),
         _ => {
             inspector_actor_transform(ui, state, i);
             inspector_actor_speed(ui, state, i);
         }
     }
 }
-
-/// Actor "Skeleton" tab — full skeleton-template authoring (point list,
-/// per-point keyframe timeline, easing controls, guide images) for the
-/// actor's source clip. Point placement happens directly on the canvas
-/// (see `canvas_preview::draw_canvas_skeleton_overlay`).
-fn inspector_actor_skeleton(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
-    let Some(ctx) = crate::skeleton_editor::SourceClipCtx::from_actor(state, i)
-    else {
-        ui.label(
-            RichText::new(t("Actor source could not be resolved."))
-                .size(11.0)
-                .italics()
-                .color(COL_TEXT_DIM),
-        );
-        return;
-    };
-    crate::skeleton_editor::inspector_skeleton_section(ui, state, &ctx);
-}
-
 
 // ─── Per-parameter keyframe strip helpers (transform layouts) ────────
 //
@@ -2009,12 +2002,13 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
         ui.add_space(4.0);
     }
 
+    let pos_before;
+    {
     let a = &mut state.scene.actors[i];
 
     // Snapshot animated_params BEFORE the toggle widgets run so we can
     // detect newly-animated params and seed an initial keyframe.
     let animated_before = a.animated_params.clone();
-    let a = &mut state.scene.actors[i];
 
     ui.label(RichText::new(t("Position & Scale")).size(12.0).strong());
     ui.add_space(4.0);
@@ -2023,6 +2017,7 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
     // and never mutates `layout`. The widget below is bound to a temp
     // copy, and only `.changed()` triggers a write through `kf_anim`.
     let cur = crate::kf_anim::sample_actor(&a.layout, &a.animated_params, playhead);
+    pos_before = cur.pos;
 
     let kf_count = a.layout.len();
     if kf_count <= 1 {
@@ -2092,8 +2087,12 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
     ui.horizontal(|ui| {
         crate::kf_anim::animated_toggle(ui, &mut a.animated_params, param_ids::SCALE, ("act_scale", i));
         ui.label(param_label(highlight.is_active(param_ids::SCALE), "Scale X:"));
-        let r = ui.add(egui::Slider::new(&mut new_scale, 0.05..=5.0).logarithmic(true));
+        let r = ui.add(
+            egui::Slider::new(&mut new_scale, *crate::editor_limits::SCALE.start()..=*crate::editor_limits::SCALE.end())
+                .logarithmic(true),
+        );
         if r.changed() {
+            new_scale = crate::editor_limits::clamp_scale(new_scale);
             crate::kf_anim::write_actor_param(
                 &mut a.layout, &mut a.animated_params, playhead,
                 param_ids::SCALE, false,
@@ -2149,8 +2148,15 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
             // uniform scale. Drag → set scale to that value, scale_y
             // stays at 1.0.
             let mut linked_scale = cur.scale;
-            let r = ui.add(egui::Slider::new(&mut linked_scale, 0.05..=5.0).logarithmic(true));
+            let r = ui.add(
+                egui::Slider::new(
+                    &mut linked_scale,
+                    *crate::editor_limits::SCALE.start()..=*crate::editor_limits::SCALE.end(),
+                )
+                .logarithmic(true),
+            );
             if r.changed() && linked_scale.is_finite() && linked_scale > 0.0 {
+                linked_scale = crate::editor_limits::clamp_scale(linked_scale);
                 crate::kf_anim::write_actor_param(
                     &mut a.layout, &mut a.animated_params, playhead,
                     param_ids::SCALE, false,
@@ -2161,8 +2167,15 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
                     |s| s.scale_y = 1.0);
             }
         } else {
-            let r = ui.add(egui::Slider::new(&mut new_scale_y, 0.1..=5.0).logarithmic(true));
+            let r = ui.add(
+                egui::Slider::new(
+                    &mut new_scale_y,
+                    *crate::editor_limits::SCALE_Y.start()..=*crate::editor_limits::SCALE_Y.end(),
+                )
+                .logarithmic(true),
+            );
             if r.changed() {
+                new_scale_y = crate::editor_limits::clamp_scale_y(new_scale_y);
                 crate::kf_anim::write_actor_param(
                     &mut a.layout, &mut a.animated_params, playhead,
                     param_ids::SCALE_Y, false,
@@ -2193,7 +2206,7 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
         ui.vertical(|ui| {
             let r = ui.add(
                 egui::DragValue::new(&mut new_rot)
-                    .range(-3600.0..=3600.0)
+                    .range(crate::editor_limits::ROTATION_DEG)
                     .speed(0.5)
                     .suffix("\u{00B0}")
                     .fixed_decimals(1),
@@ -2205,6 +2218,7 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
             }
         });
         if dial_changed {
+            new_rot = crate::editor_limits::clamp_rotation_deg(new_rot);
             crate::kf_anim::write_actor_param(
                 &mut a.layout, &mut a.animated_params, playhead,
                 param_ids::ROTATION, false,
@@ -2278,9 +2292,10 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
     ui.add_space(8.0);
     ui.checkbox(&mut a.visible, "Visible");
 
-    // Animation modifiers — wobble / shake / pulse / spin.
+    let actor_t_in = a.t_in.unwrap_or(0.0);
+    let mod_t_local = (playhead - actor_t_in).max(0.0);
     ui.add_space(8.0);
-    inspector_modifiers(ui, &mut a.modifiers, ("actor_mods", i));
+    inspector_modifiers(ui, &mut a.modifiers, mod_t_local, ("actor_mods", i));
 
     let clip_start = a.t_in.unwrap_or(0.0);
     let clip_end = a.t_out.unwrap_or(state.scene.output.duration);
@@ -2292,6 +2307,17 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
         clip_start,
         clip_end,
     );
+    }
+    let cur_after = crate::kf_anim::sample_actor(
+        &state.scene.actors[i].layout,
+        &state.scene.actors[i].animated_params,
+        playhead,
+    );
+    if (cur_after.pos[0] - pos_before[0]).abs() > 1.0e-5
+        || (cur_after.pos[1] - pos_before[1]).abs() > 1.0e-5
+    {
+        crate::kf_anim::sync_actor_transform_to_canvas(&mut state.scene, i, playhead);
+    }
 }
 
 /// Color a param label gold when its kf was just clicked from the timeline.
@@ -2403,6 +2429,7 @@ fn circular_rotation_widget(
 fn inspector_modifiers(
     ui: &mut egui::Ui,
     modifiers: &mut Vec<TrackModifier>,
+    t_local: f32,
     salt: impl std::hash::Hash + Copy,
 ) {
     egui::CollapsingHeader::new(
@@ -2464,34 +2491,60 @@ fn inspector_modifiers(
                         });
                         ui.add_space(2.0);
                         match &mut m.kind {
-                            ModifierKind::Wobble { freq_hz, amp_x, amp_y, amp_rot_deg, phase } => {
-                                ui.add(egui::Slider::new(freq_hz, 0.1..=10.0).text(t("Freq Hz")));
-                                ui.add(egui::Slider::new(amp_x, 0.0..=120.0).text(t("Amp X (px)")));
-                                ui.add(egui::Slider::new(amp_y, 0.0..=120.0).text(t("Amp Y (px)")));
-                                ui.add(egui::Slider::new(amp_rot_deg, 0.0..=45.0).text(t("Amp Rot \u{00B0}")));
-                                ui.add(egui::Slider::new(phase, 0.0..=std::f32::consts::TAU).text(t("Phase")));
+                            ModifierKind::Wobble { .. } => {
+                                inspector_modifier_anim_slider(
+                                    ui, m, "freq_hz", "Freq Hz", 0.1..=10.0, t_local, (salt, mi, "freq"),
+                                );
+                                inspector_modifier_anim_slider(
+                                    ui, m, "amp_x", "Amp X (px)", 0.0..=120.0, t_local, (salt, mi, "ax"),
+                                );
+                                inspector_modifier_anim_slider(
+                                    ui, m, "amp_y", "Amp Y (px)", 0.0..=120.0, t_local, (salt, mi, "ay"),
+                                );
+                                inspector_modifier_anim_slider(
+                                    ui, m, "amp_rot_deg", "Amp Rot °", 0.0..=45.0, t_local, (salt, mi, "ar"),
+                                );
+                                inspector_modifier_anim_slider(
+                                    ui, m, "phase", "Phase", 0.0..=std::f32::consts::TAU, t_local, (salt, mi, "ph"),
+                                );
                             }
-                            ModifierKind::Shake { freq_hz, amp_x, amp_y, seed } => {
-                                ui.add(egui::Slider::new(freq_hz, 1.0..=40.0).text(t("Freq Hz")));
-                                ui.add(egui::Slider::new(amp_x, 0.0..=80.0).text(t("Amp X (px)")));
-                                ui.add(egui::Slider::new(amp_y, 0.0..=80.0).text(t("Amp Y (px)")));
-                                ui.horizontal(|ui| {
-                                    ui.label(RichText::new(t("Seed")).size(10.0));
-                                    ui.add(egui::DragValue::new(seed).range(0..=u32::MAX).speed(1.0));
-                                });
+                            ModifierKind::Shake { .. } => {
+                                inspector_modifier_anim_slider(
+                                    ui, m, "freq_hz", "Freq Hz", 1.0..=40.0, t_local, (salt, mi, "freq"),
+                                );
+                                inspector_modifier_anim_slider(
+                                    ui, m, "amp_x", "Amp X (px)", 0.0..=80.0, t_local, (salt, mi, "ax"),
+                                );
+                                inspector_modifier_anim_slider(
+                                    ui, m, "amp_y", "Amp Y (px)", 0.0..=80.0, t_local, (salt, mi, "ay"),
+                                );
                             }
-                            ModifierKind::Pulse { freq_hz, amp_scale } => {
-                                ui.add(egui::Slider::new(freq_hz, 0.1..=10.0).text(t("Freq Hz")));
-                                ui.add(egui::Slider::new(amp_scale, -0.5..=0.5).text(t("Amp Scale")));
+                            ModifierKind::Pulse { .. } => {
+                                inspector_modifier_anim_slider(
+                                    ui, m, "freq_hz", "Freq Hz", 0.1..=10.0, t_local, (salt, mi, "freq"),
+                                );
+                                inspector_modifier_anim_slider(
+                                    ui, m, "amp_scale", "Amp Scale", -0.5..=0.5, t_local, (salt, mi, "as"),
+                                );
                             }
-                            ModifierKind::Spin { speed_dps } => {
-                                ui.add(egui::Slider::new(speed_dps, -720.0..=720.0).text(t("Speed \u{00B0}/s")));
+                            ModifierKind::Spin { .. } => {
+                                inspector_modifier_anim_slider(
+                                    ui, m, "speed_dps", "Speed °/s", -720.0..=720.0, t_local, (salt, mi, "spd"),
+                                );
                             }
-                            ModifierKind::Walk { freq_hz, amp_deg, bob_y, phase } => {
-                                ui.add(egui::Slider::new(freq_hz, 0.2..=6.0).text(t("Cadence Hz")));
-                                ui.add(egui::Slider::new(amp_deg, 0.0..=45.0).text(t("Sway \u{00B0}")));
-                                ui.add(egui::Slider::new(bob_y, 0.0..=40.0).text(t("Bob Y (px)")));
-                                ui.add(egui::Slider::new(phase, 0.0..=std::f32::consts::TAU).text(t("Phase")));
+                            ModifierKind::Walk { .. } => {
+                                inspector_modifier_anim_slider(
+                                    ui, m, "freq_hz", "Cadence Hz", 0.2..=6.0, t_local, (salt, mi, "freq"),
+                                );
+                                inspector_modifier_anim_slider(
+                                    ui, m, "amp_deg", "Sway °", 0.0..=45.0, t_local, (salt, mi, "sw"),
+                                );
+                                inspector_modifier_anim_slider(
+                                    ui, m, "bob_y", "Bob Y (px)", 0.0..=40.0, t_local, (salt, mi, "bob"),
+                                );
+                                inspector_modifier_anim_slider(
+                                    ui, m, "phase", "Phase", 0.0..=std::f32::consts::TAU, t_local, (salt, mi, "ph"),
+                                );
                             }
                         }
                     });
@@ -2530,6 +2583,99 @@ fn inspector_modifiers(
                 modifiers.push(TrackModifier::walk());
             }
         });
+    });
+}
+
+
+fn modifier_kind_param_get(kind: &ModifierKind, key: &str) -> Option<f32> {
+    match kind {
+        ModifierKind::Wobble { freq_hz, .. } if key == "freq_hz" => Some(*freq_hz),
+        ModifierKind::Wobble { amp_x, .. } if key == "amp_x" => Some(*amp_x),
+        ModifierKind::Wobble { amp_y, .. } if key == "amp_y" => Some(*amp_y),
+        ModifierKind::Wobble { amp_rot_deg, .. } if key == "amp_rot_deg" => Some(*amp_rot_deg),
+        ModifierKind::Wobble { phase, .. } if key == "phase" => Some(*phase),
+        ModifierKind::Shake { freq_hz, .. } if key == "freq_hz" => Some(*freq_hz),
+        ModifierKind::Shake { amp_x, .. } if key == "amp_x" => Some(*amp_x),
+        ModifierKind::Shake { amp_y, .. } if key == "amp_y" => Some(*amp_y),
+        ModifierKind::Pulse { freq_hz, .. } if key == "freq_hz" => Some(*freq_hz),
+        ModifierKind::Pulse { amp_scale, .. } if key == "amp_scale" => Some(*amp_scale),
+        ModifierKind::Spin { speed_dps } if key == "speed_dps" => Some(*speed_dps),
+        ModifierKind::Walk { freq_hz, .. } if key == "freq_hz" => Some(*freq_hz),
+        ModifierKind::Walk { amp_deg, .. } if key == "amp_deg" => Some(*amp_deg),
+        ModifierKind::Walk { bob_y, .. } if key == "bob_y" => Some(*bob_y),
+        ModifierKind::Walk { phase, .. } if key == "phase" => Some(*phase),
+        _ => None,
+    }
+}
+
+fn modifier_kind_param_set(kind: &mut ModifierKind, key: &str, v: f32) {
+    match kind {
+        ModifierKind::Wobble { freq_hz, .. } if key == "freq_hz" => *freq_hz = v,
+        ModifierKind::Wobble { amp_x, .. } if key == "amp_x" => *amp_x = v,
+        ModifierKind::Wobble { amp_y, .. } if key == "amp_y" => *amp_y = v,
+        ModifierKind::Wobble { amp_rot_deg, .. } if key == "amp_rot_deg" => *amp_rot_deg = v,
+        ModifierKind::Wobble { phase, .. } if key == "phase" => *phase = v,
+        ModifierKind::Shake { freq_hz, .. } if key == "freq_hz" => *freq_hz = v,
+        ModifierKind::Shake { amp_x, .. } if key == "amp_x" => *amp_x = v,
+        ModifierKind::Shake { amp_y, .. } if key == "amp_y" => *amp_y = v,
+        ModifierKind::Pulse { freq_hz, .. } if key == "freq_hz" => *freq_hz = v,
+        ModifierKind::Pulse { amp_scale, .. } if key == "amp_scale" => *amp_scale = v,
+        ModifierKind::Spin { speed_dps } if key == "speed_dps" => *speed_dps = v,
+        ModifierKind::Walk { freq_hz, .. } if key == "freq_hz" => *freq_hz = v,
+        ModifierKind::Walk { amp_deg, .. } if key == "amp_deg" => *amp_deg = v,
+        ModifierKind::Walk { bob_y, .. } if key == "bob_y" => *bob_y = v,
+        ModifierKind::Walk { phase, .. } if key == "phase" => *phase = v,
+        _ => {}
+    }
+}
+
+fn inspector_modifier_anim_slider(
+    ui: &mut egui::Ui,
+    m: &mut TrackModifier,
+    key: &'static str,
+    label: &'static str,
+    range: std::ops::RangeInclusive<f32>,
+    t_local: f32,
+    salt: impl std::hash::Hash + Copy,
+) {
+    let static_value = match modifier_kind_param_get(&m.kind, key) {
+        Some(v) => v,
+        None => return,
+    };
+    let is_animated = m.animated_params.contains(key);
+    let mut display = if is_animated {
+        m.param_kfs
+            .get(key)
+            .filter(|kfs| !kfs.is_empty())
+            .and_then(|kfs| memstroy_core::keyframe::sample(kfs, t_local))
+            .unwrap_or(static_value)
+    } else {
+        static_value
+    };
+
+    ui.horizontal(|ui| {
+        if crate::kf_anim::animated_toggle(ui, &mut m.animated_params, key, salt) {
+            if m.animated_params.contains(key) {
+                let entry = m.param_kfs.entry(key.to_string()).or_default();
+                if entry.is_empty() {
+                    entry.push(memstroy_core::Keyframe::new(t_local.max(0.0), static_value));
+                }
+            }
+        }
+        ui.label(t(label));
+        let resp = ui.add(egui::Slider::new(&mut display, range));
+        if resp.changed() {
+            if is_animated {
+                let entry = m.param_kfs.entry(key.to_string()).or_default();
+                if entry.is_empty() {
+                    entry.push(memstroy_core::Keyframe::new(t_local.max(0.0), display));
+                } else {
+                    memstroy_core::upsert_keyframe(entry, t_local.max(0.0), display);
+                }
+            } else {
+                modifier_kind_param_set(&mut m.kind, key, display);
+            }
+        }
     });
 }
 
@@ -3107,6 +3253,7 @@ fn inspector_actor_speed(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
         .unwrap_or(0.0);
 
     let mut new_speed: f32;
+    let mut speed_dirty = false;
     let actor_id;
     let t_in;
     let source_start;
@@ -3124,7 +3271,7 @@ fn inspector_actor_speed(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
             let resp = ui.add(
                 egui::DragValue::new(&mut new_speed)
                     .speed(0.01)
-                    .range(0.05..=16.0)
+                    .range(crate::editor_limits::CLIP_SPEED)
                     .fixed_decimals(3)
                     .suffix("x"),
             )
@@ -3132,12 +3279,14 @@ fn inspector_actor_speed(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
                 "Numeric speed multiplier. The clip's bar on the timeline shrinks when speeding up and stretches when slowing down. Bound audio follows automatically.",
             ));
             if resp.changed() && new_speed.is_finite() && new_speed > 0.0 {
-                a.speed = new_speed.max(0.05);
+                a.speed = crate::editor_limits::clamp_clip_speed(new_speed);
+                speed_dirty = true;
             }
             // Quick reset.
             if ui.small_button("1×").on_hover_text(t("Reset to 1.0x")).clicked() {
                 a.speed = 1.0;
                 new_speed = 1.0;
+                speed_dirty = true;
             }
         });
 
@@ -3159,13 +3308,15 @@ fn inspector_actor_speed(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
     // ── Cascade: when speed changed, also rewrite t_out so the
     // timeline bar shrinks/stretches in sync with the visible duration,
     // then mirror onto bound audio so linked layers move together.
-    let speed_now = state.scene.actors[i].speed.max(0.0001);
-    if source_duration > 0.0 {
-        let visible_dur =
-            ((source_duration - source_start).max(0.0)) / speed_now;
-        let new_t_out = t_in + visible_dur.max(0.05);
-        let cur_t_out = state.scene.actors[i].t_out.unwrap_or(0.0);
-        if (cur_t_out - new_t_out).abs() > 1.0e-3 {
+    // Only run on an actual edit — doing this every inspector frame
+    // overwrote razor splits and trims back to the full source length.
+    if speed_dirty {
+        let speed_now = crate::editor_limits::clamp_clip_speed(state.scene.actors[i].speed)
+            .max(0.0001);
+        if source_duration > 0.0 {
+            let visible_dur =
+                ((source_duration - source_start).max(0.0)) / speed_now;
+            let new_t_out = t_in + visible_dur.max(0.05);
             state.scene.actors[i].t_out = Some(new_t_out);
         }
     }
@@ -3177,7 +3328,7 @@ fn inspector_actor_speed(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
     for au in state.scene.audio.iter_mut() {
         if au.deleted { continue; }
         if au.parent_actor.as_deref() == Some(&actor_id) {
-            au.speed = actor_speed.max(0.05);
+            au.speed = crate::editor_limits::clamp_clip_speed(actor_speed);
         }
     }
     sync_audio_to_actor(state, i);
@@ -3528,30 +3679,56 @@ fn inspector_actor_effects(ui: &mut egui::Ui, state: &mut EditorState, i: usize,
     ui.label(RichText::new(t("Chroma Key")).size(12.0).strong().color(Color32::from_rgb(100, 255, 100)));
     ui.add_space(4.0);
 
-    // Eyedropper
     let mut chroma_changed = false;
-    ui.horizontal(|ui| {
-        if state.eyedropper_active {
-            ui.label(RichText::new(t("Click preview to pick color...")).color(Color32::from_rgb(255, 200, 50)).size(11.0));
-        } else if ui.button(t("Eyedropper")).on_hover_text(t("Pick color from preview")).clicked() {
-            state.eyedropper_active = true;
+    if ui
+        .checkbox(&mut a.chroma_key.enabled, t("Enable chroma key"))
+        .on_hover_text(t("Off by default for new clips — turn on to key out the background colour"))
+        .changed()
+    {
+        chroma_changed = true;
+    }
+
+    ui.add_enabled_ui(a.chroma_key.enabled, |ui| {
+        ui.horizontal(|ui| {
+            if state.eyedropper_active {
+                ui.label(
+                    RichText::new(t("Click preview to pick color..."))
+                        .color(Color32::from_rgb(255, 200, 50))
+                        .size(11.0),
+                );
+            } else if ui
+                .button(t("Eyedropper"))
+                .on_hover_text(t("Pick color from preview"))
+                .clicked()
+            {
+                state.eyedropper_active = true;
+            }
+            ui.label(t("Key:"));
+            if color_edit_u8(ui, &mut a.chroma_key.key_color) {
+                chroma_changed = true;
+            }
+        });
+
+        ui.add_space(4.0);
+        if ui
+            .add(egui::Slider::new(&mut a.chroma_key.similarity, 0.0..=1.0).text(t("Similarity")))
+            .changed()
+        {
+            chroma_changed = true;
         }
-        ui.label(t("Key:"));
-        if color_edit_u8(ui, &mut a.chroma_key.key_color) {
+        if ui
+            .add(egui::Slider::new(&mut a.chroma_key.blend, 0.0..=1.0).text(t("Blend")))
+            .changed()
+        {
+            chroma_changed = true;
+        }
+        if ui
+            .add(egui::Slider::new(&mut a.chroma_key.spill, 0.0..=1.0).text(t("Spill")))
+            .changed()
+        {
             chroma_changed = true;
         }
     });
-
-    ui.add_space(4.0);
-    if ui.add(egui::Slider::new(&mut a.chroma_key.similarity, 0.0..=1.0).text(t("Similarity"))).changed() {
-        chroma_changed = true;
-    }
-    if ui.add(egui::Slider::new(&mut a.chroma_key.blend, 0.0..=1.0).text(t("Blend"))).changed() {
-        chroma_changed = true;
-    }
-    if ui.add(egui::Slider::new(&mut a.chroma_key.spill, 0.0..=1.0).text(t("Spill"))).changed() {
-        chroma_changed = true;
-    }
 
     // Persist chroma settings as a sidecar next to the source clip so they
     // follow the asset across projects.
@@ -3572,10 +3749,6 @@ fn inspector_actor_effects(ui: &mut egui::Ui, state: &mut EditorState, i: usize,
 
     ui.add_space(12.0);
 
-    // Skeleton Attachments
-    inspector_actor_skeleton_attachments(ui, state, i);
-
-    ui.add_space(12.0);
     // Effect stack — generic post-process effects layered on top of CC.
     // Effect param keyframes are stored in clip-local time so they
     // travel with the actor when its `t_in` shifts on the timeline.
@@ -4539,13 +4712,18 @@ fn inspector_overlay(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
             ui.add_space(4.0);
 
             // Re-borrow for the main text inspector
-            let txt = match &mut state.scene.overlays[i] {
-                Overlay::Text(t) => t,
-                _ => unreachable!(),
+            let pos_edited = {
+                let txt = match &mut state.scene.overlays[i] {
+                    Overlay::Text(t) => t,
+                    _ => unreachable!(),
+                };
+                // Returns Option<TextAction> for backward compat — currently
+                // unused since the layer-order buttons were removed.
+                inspector_text_overlay(ui, txt, i, overlay_count, duration, playhead).1
             };
-            // Returns Option<TextAction> for backward compat — currently
-            // unused since the layer-order buttons were removed.
-            let _ = inspector_text_overlay(ui, txt, i, overlay_count, duration, playhead);
+            if pos_edited {
+                crate::kf_anim::sync_overlay_transform_to_canvas(&mut state.scene, i, playhead);
+            }
         }
         1 => {
             let img_id = match &state.scene.overlays[i] {
@@ -4603,25 +4781,42 @@ fn inspector_overlay(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
                 ui.add_space(4.0);
             }
 
-            // Re-borrow after parent selector
-            let im = match &mut state.scene.overlays[i] {
-                Overlay::Image(im) => im,
-                _ => unreachable!(),
-            };
-
             // The In / Out time controls were intentionally removed
             // from the inspector — the user adjusts an image's visible
             // window by dragging its clip edges in the layer panel.
             // Trying to maintain two sources of truth (drag handles +
             // numeric fields) was the source of multiple "image keeps
             // jumping back to old t_in" bugs.
+            let pos_edited = {
+                let im = match &mut state.scene.overlays[i] {
+                    Overlay::Image(im) => im,
+                    _ => unreachable!(),
+                };
+                let clip_dur = (im.t_out - im.t_in).max(0.0);
+                let local_t = (playhead - im.t_in).clamp(0.0, clip_dur);
+                inspector_overlay_state_widgets(
+                    ui,
+                    &mut im.layout,
+                    &mut im.animated_params,
+                    local_t,
+                    clip_dur,
+                    i,
+                    "img",
+                    state.kf_highlight.clone(),
+                )
+            };
+            if pos_edited {
+                crate::kf_anim::sync_overlay_transform_to_canvas(&mut state.scene, i, playhead);
+            }
+
+            let im = match &mut state.scene.overlays[i] {
+                Overlay::Image(im) => im,
+                _ => unreachable!(),
+            };
             let clip_dur = (im.t_out - im.t_in).max(0.0);
             let local_t = (playhead - im.t_in).clamp(0.0, clip_dur);
-            inspector_overlay_state_widgets(
-                ui, &mut im.layout, &mut im.animated_params, local_t, clip_dur, i, "img",
-                state.kf_highlight.clone());
             ui.add_space(8.0);
-            inspector_modifiers(ui, &mut im.modifiers, ("img_mods", i));
+            inspector_modifiers(ui, &mut im.modifiers, local_t, ("img_mods", i));
             ui.add_space(8.0);
             inspector_masks_section(ui, &mut im.effects, &mut state.mask_tool, ("img_masks", i));
             ui.add_space(8.0);
@@ -4713,7 +4908,7 @@ fn inspector_overlay(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
                 ui.add_space(4.0);
             }
 
-            // Re-borrow after parent selector
+            let (pos_edited, clip_dur, local_t) = {
             let v = match &mut state.scene.overlays[i] {
                 Overlay::Video(v) => v,
                 _ => unreachable!(),
@@ -4747,7 +4942,7 @@ fn inspector_overlay(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
                 let resp = ui.add(
                     egui::DragValue::new(&mut new_speed)
                         .speed(0.01)
-                        .range(0.05..=16.0)
+                        .range(crate::editor_limits::CLIP_SPEED)
                         .fixed_decimals(3)
                         .suffix("x"),
                 )
@@ -4755,7 +4950,7 @@ fn inspector_overlay(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
                     "Numeric speed multiplier — clip width on the timeline scales with this value.",
                 ));
                 if resp.changed() && new_speed.is_finite() && new_speed > 0.0 {
-                    v.speed = new_speed.max(0.05);
+                    v.speed = crate::editor_limits::clamp_clip_speed(new_speed);
                     speed_changed = true;
                 }
                 if ui.small_button("1\u{00D7}")
@@ -4781,57 +4976,35 @@ fn inspector_overlay(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
 
             let clip_dur = (v.t_out - v.t_in).max(0.0);
             let local_t = (playhead - v.t_in).clamp(0.0, clip_dur);
-            inspector_overlay_state_widgets(
-                ui, &mut v.layout, &mut v.animated_params, local_t, clip_dur, i, "vid",
-                state.kf_highlight.clone());
+            let pos_edited = inspector_overlay_state_widgets(
+                ui,
+                &mut v.layout,
+                &mut v.animated_params,
+                local_t,
+                clip_dur,
+                i,
+                "vid",
+                state.kf_highlight.clone(),
+            );
+            (pos_edited, clip_dur, local_t)
+            };
+            if pos_edited {
+                crate::kf_anim::sync_overlay_transform_to_canvas(&mut state.scene, i, playhead);
+            }
+            let v = match &mut state.scene.overlays[i] {
+                Overlay::Video(v) => v,
+                _ => unreachable!(),
+            };
             ui.add_space(8.0);
-            inspector_modifiers(ui, &mut v.modifiers, ("vid_mods", i));
+            inspector_modifiers(ui, &mut v.modifiers, local_t, ("vid_mods", i));
             ui.add_space(8.0);
             inspector_masks_section(ui, &mut v.effects, &mut state.mask_tool, ("vid_masks", i));
             ui.add_space(8.0);
             let fx_t_local = (playhead - v.t_in).max(0.0);
             inspector_effect_stack(ui, &mut v.effects, ("vid_fx", i), fx_t_local);
-            ui.add_space(12.0);
-            // ── Skeleton authoring for the video overlay's source clip.
-            // Same controls as the actor's "Skeleton" tab; collapsible
-            // here so it doesn't dominate the overlay inspector when the
-            // user isn't using it.
-            inspector_video_overlay_skeleton(ui, state, i);
         }
         _ => {}
     }
-}
-
-/// Skeleton authoring section for video overlays. Mirrors the
-/// actor "Skeleton" tab but is rendered in a collapsible header
-/// so the existing overlay inspector layout isn't disrupted.
-fn inspector_video_overlay_skeleton(
-    ui: &mut egui::Ui,
-    state: &mut EditorState,
-    i: usize,
-) {
-    egui::CollapsingHeader::new(
-        RichText::new(t("Skeleton"))
-            .size(12.0)
-            .strong()
-            .color(Color32::WHITE),
-    )
-    .id_source(("video_overlay_skeleton", i))
-    .default_open(false)
-    .show(ui, |ui| {
-        let Some(ctx) =
-            crate::skeleton_editor::SourceClipCtx::from_video_overlay(state, i)
-        else {
-            ui.label(
-                RichText::new(t("Video overlay source could not be resolved."))
-                    .size(10.0)
-                    .italics()
-                    .color(COL_TEXT_DIM),
-            );
-            return;
-        };
-        crate::skeleton_editor::inspector_skeleton_section(ui, state, &ctx);
-    });
 }
 
 // ─── IMAGE-ONLY INSPECTOR SECTIONS ───────────────────────────────────
@@ -5492,12 +5665,13 @@ fn inspector_overlay_state_widgets(
     salt_idx: usize,
     salt_kind: &'static str,
     highlight: crate::kf_anim::KfHighlight,
-) {
+) -> bool {
     use crate::kf_anim;
     use memstroy_core::param_ids;
 
     let animated_before = animated_params.clone();
     let cur = crate::kf_anim::sample_overlay(layout, animated_params, local_playhead);
+    let pos_before = cur.pos;
 
     let mut new_x = cur.pos[0];
     let mut new_y = cur.pos[1];
@@ -5622,9 +5796,10 @@ fn inspector_overlay_state_widgets(
         circular_rotation_widget(ui, (salt_kind, "rot_w", salt_idx), &mut new_rot, 80.0);
         let mut dial_changed = (new_rot - prev_rot).abs() > 1.0e-4;
         let r = ui.add(egui::DragValue::new(&mut new_rot)
-            .range(-3600.0..=3600.0).speed(0.5).suffix("\u{00B0}").fixed_decimals(1));
+            .range(crate::editor_limits::ROTATION_DEG).speed(0.5).suffix("\u{00B0}").fixed_decimals(1));
         if r.changed() { dial_changed = true; }
         if dial_changed {
+            new_rot = crate::editor_limits::clamp_rotation_deg(new_rot);
             crate::kf_anim::write_overlay_param(layout, animated_params, local_playhead,
                 param_ids::ROTATION, false, |s| s.rotation_deg = new_rot);
         }
@@ -5689,6 +5864,9 @@ fn inspector_overlay_state_widgets(
         local_playhead,
         clip_duration,
     );
+    let cur_after = crate::kf_anim::sample_overlay(layout, animated_params, local_playhead);
+    (cur_after.pos[0] - pos_before[0]).abs() > 1.0e-5
+        || (cur_after.pos[1] - pos_before[1]).abs() > 1.0e-5
 }
 
 /// Inspector layer-order actions for a text overlay. The buttons that
@@ -5712,7 +5890,7 @@ fn inspector_text_overlay(
     _total: usize,
     _duration: f32,
     playhead: f32,
-) -> Option<TextAction> {
+) -> (Option<TextAction>, bool) {
     // Header (delete button removed — use Delete/Backspace shortcut or
     // right-click on the timeline clip).
     ui.horizontal(|ui| {
@@ -5744,9 +5922,16 @@ fn inspector_text_overlay(
     // longer auto-inserts keyframes.
     let clip_dur = (t.t_out - t.t_in).max(0.0);
     let local_t = (playhead - t.t_in).clamp(0.0, clip_dur);
-    inspector_overlay_state_widgets(
-        ui, &mut t.layout, &mut t.animated_params, local_t, clip_dur, idx, "text",
-        crate::kf_anim::KfHighlight::default());
+    let pos_edited = inspector_overlay_state_widgets(
+        ui,
+        &mut t.layout,
+        &mut t.animated_params,
+        local_t,
+        clip_dur,
+        idx,
+        "text",
+        crate::kf_anim::KfHighlight::default(),
+    );
     ui.add_space(8.0);
 
     // ─── Font ─────────────────────────────────────────────────────
@@ -5971,7 +6156,7 @@ fn inspector_text_overlay(
     });
 
     ui.add_space(8.0);
-    inspector_modifiers(ui, &mut t.modifiers, ("text_mods", idx));
+    inspector_modifiers(ui, &mut t.modifiers, local_t, ("text_mods", idx));
     // NOTE: the per-effect "Effect stack" UI is intentionally NOT
     // surfaced for text overlays. The live preview path (this file)
     // does not yet rasterise text into a buffer that `apply_effect_stack_cpu`
@@ -5984,7 +6169,7 @@ fn inspector_text_overlay(
 
     // Layer/z-index actions are no longer exposed from the inspector — the
     // timeline track row order alone determines stacking.
-    None
+    (None, pos_edited)
 }
 
 // Logical font-family options always shown at the top of the picker,
@@ -6109,7 +6294,7 @@ fn inspector_render_frame(ui: &mut egui::Ui, state: &mut EditorState) {
         ui.vertical(|ui| {
             let r = ui.add(
                 egui::DragValue::new(&mut new_rot)
-                    .range(-3600.0..=3600.0)
+                    .range(crate::editor_limits::ROTATION_DEG)
                     .speed(0.5)
                     .suffix("\u{00B0}")
                     .fixed_decimals(1),
@@ -6121,6 +6306,7 @@ fn inspector_render_frame(ui: &mut egui::Ui, state: &mut EditorState) {
             }
         });
         if dial_changed {
+            new_rot = crate::editor_limits::clamp_rotation_deg(new_rot);
             crate::kf_anim::write_render_frame_param(
                 &mut rf.layout,
                 &mut rf.animated_params,
@@ -6189,7 +6375,7 @@ fn inspector_render_frame(ui: &mut egui::Ui, state: &mut EditorState) {
     // render-frame's eased keyframe state at preview/export time so the
     // user can add live camera-style motion without authoring every kf.
     ui.add_space(10.0);
-    inspector_modifiers(ui, &mut rf.modifiers, "rf_mods");
+    inspector_modifiers(ui, &mut rf.modifiers, rf_t_local, "rf_mods");
     ui.add_space(8.0);
     // Render frame is scene-time anchored — effect kfs use scene-time.
     inspector_effect_stack(ui, &mut rf.effects, "rf_fx", rf_t_local);
@@ -6334,7 +6520,7 @@ fn inspector_audio(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
             let resp = ui.add(
                 egui::DragValue::new(&mut display)
                     .speed(0.01)
-                    .range(0.05..=16.0)
+                    .range(crate::editor_limits::CLIP_SPEED)
                     .fixed_decimals(3)
                     .suffix("x"),
             )
@@ -6342,20 +6528,21 @@ fn inspector_audio(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
                 "Numeric playback speed. The clip bar on the timeline shrinks when speeding up and stretches when slowing down. If this audio is bound to a video clip, both update together.",
             ));
             if resp.changed() && display.is_finite() && display > 0.0 {
+                let clamped = crate::editor_limits::clamp_clip_speed(display);
                 if speed_animated {
                     if audio.speed_kfs.is_empty() {
                         audio.speed_kfs.push(memstroy_core::Keyframe::new(0.0, audio.speed));
                     }
-                    memstroy_core::upsert_keyframe(&mut audio.speed_kfs, t_local, display);
+                    memstroy_core::upsert_keyframe(&mut audio.speed_kfs, t_local, clamped);
                     // The static field still drives the timeline's
                     // visible duration; treat the keyframe edit as
                     // "set the static to whatever the user just typed
                     // at the playhead" so the bar resizes too.
-                    audio.speed = display.max(0.05);
+                    audio.speed = clamped;
                     new_speed = audio.speed;
                     speed_dirty = true;
                 } else {
-                    audio.speed = display.max(0.05);
+                    audio.speed = clamped;
                     new_speed = audio.speed;
                     speed_dirty = true;
                 }
@@ -6818,21 +7005,52 @@ enum SnapMode {
     TrimRight,
 }
 
-/// Identifies the clip currently being dragged, so its own edges are
-/// excluded from the snap-target list (a clip should never snap to
-/// itself).
-#[derive(Copy, Clone, PartialEq, Eq)]
-enum SnapExclude {
-    Actor(usize),
-    Overlay(usize),
-    Audio(usize),
-    Background(usize),
+/// Clips whose edges must not act as snap targets (the dragged clip
+/// itself, and every peer in a multi-selection group move).
+#[derive(Clone, Default)]
+struct SnapExcludeList {
+    actors: std::collections::HashSet<usize>,
+    overlays: std::collections::HashSet<usize>,
+    audio: std::collections::HashSet<usize>,
+    backgrounds: std::collections::HashSet<usize>,
+}
+
+impl SnapExcludeList {
+    fn for_drag(state: &EditorState, primary: Selection) -> Self {
+        let mut list = Self::default();
+        if state.canvas_selection.len() > 1 {
+            for sel in &state.canvas_selection {
+                list.insert_selection(*sel);
+            }
+        } else {
+            list.insert_selection(primary);
+        }
+        list
+    }
+
+    fn insert_selection(&mut self, sel: Selection) {
+        match sel {
+            Selection::Actor(i) => {
+                self.actors.insert(i);
+            }
+            Selection::Overlay(i) => {
+                self.overlays.insert(i);
+            }
+            Selection::Audio(i) => {
+                self.audio.insert(i);
+            }
+            Selection::Background(i) => {
+                self.backgrounds.insert(i);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Collect every snap-eligible scene-time on the timeline:
 /// every clip edge except the dragged clip's own, the playhead, the
 /// scene start (0.0), and the scene end. Used by `apply_snap_to_window`.
-fn collect_snap_targets(state: &EditorState, exclude: SnapExclude) -> Vec<f32> {
+fn collect_snap_targets(state: &EditorState, exclude: &SnapExcludeList) -> Vec<f32> {
     let mut out = Vec::with_capacity(
         state.scene.actors.len() * 2
             + state.scene.overlays.len() * 2
@@ -6843,28 +7061,22 @@ fn collect_snap_targets(state: &EditorState, exclude: SnapExclude) -> Vec<f32> {
     let dur = state.scene.output.duration.max(0.0);
 
     for (i, a) in state.scene.actors.iter().enumerate() {
-        if let SnapExclude::Actor(j) = exclude {
-            if i == j {
-                continue;
-            }
+        if exclude.actors.contains(&i) {
+            continue;
         }
         out.push(a.t_in.unwrap_or(0.0));
         out.push(a.t_out.unwrap_or(dur));
     }
     for (i, bg) in state.scene.backgrounds.iter().enumerate() {
-        if let SnapExclude::Background(j) = exclude {
-            if i == j {
-                continue;
-            }
+        if exclude.backgrounds.contains(&i) {
+            continue;
         }
         out.push(bg.start);
         out.push(bg.start + bg.duration);
     }
     for (i, ov) in state.scene.overlays.iter().enumerate() {
-        if let SnapExclude::Overlay(j) = exclude {
-            if i == j {
-                continue;
-            }
+        if exclude.overlays.contains(&i) {
+            continue;
         }
         let (s, e) = match ov {
             Overlay::Text(t) => (t.t_in, t.t_out),
@@ -6876,10 +7088,8 @@ fn collect_snap_targets(state: &EditorState, exclude: SnapExclude) -> Vec<f32> {
     }
     for (i, au) in state.scene.audio.iter().enumerate() {
         if au.deleted { continue; }
-        if let SnapExclude::Audio(j) = exclude {
-            if i == j {
-                continue;
-            }
+        if exclude.audio.contains(&i) {
+            continue;
         }
         out.push(au.t_in);
         out.push(au.t_out.unwrap_or(dur));
@@ -6889,16 +7099,15 @@ fn collect_snap_targets(state: &EditorState, exclude: SnapExclude) -> Vec<f32> {
     if dur > 0.0 {
         out.push(dur);
     }
+    out.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    out.dedup_by(|a, b| (*a - *b).abs() < 1.0e-5);
     out
 }
 
-/// Pixel-aware snap window: ~5 px on screen so the clip glides
-/// smoothly under the cursor instead of jumping in fixed scene-time
-/// chunks. Slightly more permissive than the actor-move-only path
-/// used to be (3 px) because the user explicitly asked for a
-/// "comfortable attach" feel — at 80 px/s default zoom this is ~62 ms.
+/// Pixel-aware snap window on screen — wide enough to "stick" to
+/// neighbouring clip edges without feeling mushy.
 fn snap_threshold_for_state(state: &EditorState) -> f32 {
-    (5.0 / state.timeline_zoom.max(1.0)).max(0.001)
+    (10.0 / state.timeline_zoom.max(1.0)).max(0.001)
 }
 
 /// Try to snap a clip's [t_in, t_out] window. Returns the (possibly
@@ -6912,12 +7121,13 @@ fn apply_snap_to_window(
     t_in: f32,
     t_out: f32,
     mode: SnapMode,
-    exclude: SnapExclude,
+    primary: Selection,
 ) -> (f32, f32, Option<f32>) {
     if !state.snap_enabled {
         return (t_in, t_out, None);
     }
-    let targets = collect_snap_targets(state, exclude);
+    let exclude = SnapExcludeList::for_drag(state, primary);
+    let targets = collect_snap_targets(state, &exclude);
     let threshold = snap_threshold_for_state(state);
 
     match mode {
@@ -6927,14 +7137,18 @@ fn apply_snap_to_window(
             let snapped_end = snap_time(t_out, &targets, threshold);
             let dx_start = (snapped_start - t_in).abs();
             let dx_end = (snapped_end - t_out).abs();
-            // Prefer whichever edge is closer to a target so the user
-            // gets the "stickier" attach point (start vs end) without
-            // the clip oscillating between two competing snaps.
-            if dx_start < threshold && dx_start <= dx_end {
-                let new_start = snapped_start.max(0.0);
-                return (new_start, new_start + dur, Some(snapped_start));
-            }
-            if dx_end < threshold {
+            let start_ok = dx_start < threshold;
+            let end_ok = dx_end < threshold;
+            if start_ok || end_ok {
+                let use_start = if start_ok && end_ok {
+                    dx_start <= dx_end
+                } else {
+                    start_ok
+                };
+                if use_start {
+                    let new_start = snapped_start.max(0.0);
+                    return (new_start, new_start + dur, Some(snapped_start));
+                }
                 let new_start = (snapped_end - dur).max(0.0);
                 return (new_start, new_start + dur, Some(snapped_end));
             }
@@ -8892,13 +9106,13 @@ fn apply_split(
             }
             // Frame caches: insert a placeholder at i+1 so subsequent
             // actors don't drift relative to their caches.
-            if i + 1 <= state.frame_caches.len() {
-                state.frame_caches.insert(
+            if i < state.scene.actors.len() {
+                let right_source = state.scene.actors[i + 1].source.clone();
+                crate::video_cache::FrameCache::insert_for_actor_split(
+                    &mut state.frame_caches,
+                    i,
                     i + 1,
-                    crate::video_cache::FrameCache::new(
-                        std::path::PathBuf::new(),
-                        i + 1,
-                    ),
+                    right_source,
                 );
             }
             // Mover index shift: any actor with index > i moves up by 1
@@ -9084,15 +9298,31 @@ fn pointer_blocked_by_floating_ui(ctx: &egui::Context, pos: egui::Pos2) -> bool 
     })
 }
 
-/// Best-effort pointer position for overlay blocking: prefer the press
-/// origin on the click frame, otherwise the active interact/hover point.
+/// Pointer position for floating-UI blocking during an active press.
+/// Only consult `press_origin` while the primary button is down — a
+/// stale origin from a toolbar click (e.g. "+ V Layer") used to keep
+/// `timeline_input_lock` asserted and block every clip drag until the
+/// next click elsewhere.
 fn timeline_pointer_for_overlay_block(ui: &egui::Ui) -> Option<egui::Pos2> {
     ui.input(|i| {
-        i.pointer
-            .press_origin()
-            .or(i.pointer.interact_pos())
-            .or(i.pointer.hover_pos())
+        let pressing = i.pointer.primary_down() || i.pointer.primary_pressed();
+        let press_pos = if pressing {
+            i.pointer.press_origin().or(i.pointer.interact_pos())
+        } else {
+            None
+        };
+        press_pos.or(i.pointer.interact_pos()).or(i.pointer.hover_pos())
     })
+}
+
+/// True when a floating window sits above `pos` during an active press.
+fn timeline_blocked_by_overlay(ui: &egui::Ui) -> bool {
+    let pressing = ui.input(|i| i.pointer.primary_down() || i.pointer.primary_pressed());
+    if !pressing {
+        return false;
+    }
+    timeline_pointer_for_overlay_block(ui)
+        .is_some_and(|p| pointer_blocked_by_floating_ui(ui.ctx(), p))
 }
 
 fn timeline_input_locked(ui: &egui::Ui) -> bool {
@@ -9227,7 +9457,18 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
 
         ui.separator();
 
-        ui.add(egui::DragValue::new(&mut state.playback_speed).range(0.1..=8.0).speed(0.05).prefix("x"));
+        {
+            let spd = ui.add(
+                egui::DragValue::new(&mut state.playback_speed)
+                    .range(crate::editor_limits::PLAYBACK_SPEED)
+                    .speed(0.05)
+                    .prefix("x"),
+            );
+            if spd.changed() {
+                state.playback_speed =
+                    crate::editor_limits::clamp_playback_speed(state.playback_speed);
+            }
+        }
 
         ui.separator();
 
@@ -9333,6 +9574,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
         {
             state.mutate(|_| {});
             let _ = state.insert_video_track_at_top();
+            state.reset_timeline_pointer_gesture();
             state.status = t("\u{2728} New video layer.").into();
         }
         if ui
@@ -9342,56 +9584,10 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
         {
             state.mutate(|_| {});
             state.add_audio_track();
+            state.sanitize_track_assignments();
+            state.reset_timeline_pointer_gesture();
             state.status = t("\u{2728} New audio layer.").into();
         }
-        if ui
-            .button(RichText::new(t("+ FX")).size(11.0).color(Color32::from_rgb(255, 140, 220)))
-            .on_hover_text(t("Add an FX element with effects on a video layer"))
-            .clicked()
-        {
-            let counter = state.scene.overlays.len() + 1;
-            let id = format!("fx_{}", counter);
-            let t_in = state.playhead;
-            let t_out = (t_in + 5.0).min(state.scene.output.duration.max(t_in + 0.1));
-            // Create as a Video overlay (no source) with a default Blur
-            // effect so the user has something to start with. It lives on
-            // a regular video track like any other overlay.
-            let overlay = Overlay::Image(memstroy_core::ImageOverlay {
-                id: id.clone(),
-                source: std::path::PathBuf::new(), // empty source = transparent
-                t_in,
-                t_out,
-                layout: vec![memstroy_core::Keyframe::new(0.0, memstroy_core::OverlayState {
-                    pos: [0.5, 0.5],
-                    scale: 1.0,
-                    scale_y: 1.0,
-                    rotation_deg: 0.0,
-                    opacity: 1.0,
-                    flip_x_anim: 1.0,
-                    flip_y_anim: 1.0,
-                })],
-                modifiers: Vec::new(),
-                skeleton_attachment: None,
-                effects: vec![
-                    memstroy_core::effects::Effect::new(
-                        memstroy_core::effects::EffectKind::Blur { radius: 8.0 }
-                    ),
-                ],
-                animated_params: Default::default(),
-                chroma_key: None,
-                z_order: 0,
-                parent_id: None,
-            });
-            state.scene.overlays.push(overlay);
-            let new_idx = state.scene.overlays.len() - 1;
-            let new_track = state.insert_video_track_at_top();
-            state.overlay_track_assignments.insert(new_idx, new_track);
-            state.selection = Selection::Overlay(new_idx);
-            state.canvas_selection.clear();
-            state.canvas_selection.push(Selection::Overlay(new_idx));
-            state.status = format!("{} {}", t("\u{2728} FX element:"), id);
-        }
-
         // The render-scale display lives on the canvas (render
         // window) only — the user explicitly asked for it to be
         // removed from the timeline / layers panel "tabs" toolbar
@@ -9530,14 +9726,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     let blocked_by_window = pointer_pos_opt
         .map(|p| pointer_blocked_by_floating_ui(ui.ctx(), p))
         .unwrap_or(false);
-    let blocked_by_overlay = timeline_pointer_for_overlay_block(ui)
-        .map(|p| pointer_blocked_by_floating_ui(ui.ctx(), p))
-        .unwrap_or(false);
-    if blocked_by_overlay {
-        ui.data_mut(|d| {
-            d.insert_temp::<bool>(egui::Id::new("timeline_input_lock"), true);
-        });
-    }
+    let blocked_by_overlay = timeline_blocked_by_overlay(ui);
     if pointer_in_viewport && !blocked_by_window && scroll_delta.y.abs() > 0.1 {
         let shift = ui.input(|i| i.modifiers.shift);
         if shift {
@@ -10356,7 +10545,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                 // neighbour edge / playhead within ~5 px.
                                 let (snapped_in, _, snap_t) = apply_snap_to_window(
                                     state, new_start, clip_end,
-                                    SnapMode::TrimLeft, SnapExclude::Background(bi));
+                                    SnapMode::TrimLeft, Selection::Background(bi));
                                 new_start = snapped_in;
                                 state.timeline_drag.snap_indicator = snap_t;
                                 let new_dur = (clip_end - new_start).max(0.1);
@@ -10385,7 +10574,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                 let mut new_end = (clip_end + delta_t).max(clip_start + 0.1);
                                 let (_, snapped_out, snap_t) = apply_snap_to_window(
                                     state, clip_start, new_end,
-                                    SnapMode::TrimRight, SnapExclude::Background(bi));
+                                    SnapMode::TrimRight, Selection::Background(bi));
                                 new_end = snapped_out;
                                 state.timeline_drag.snap_indicator = snap_t;
                                 let new_dur = (new_end - clip_start).max(0.1);
@@ -10407,7 +10596,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                 let dur = clip_end - clip_start;
                                 let (snapped_in, _, snap_t) = apply_snap_to_window(
                                     state, new_start, new_start + dur,
-                                    SnapMode::Move, SnapExclude::Background(bi));
+                                    SnapMode::Move, Selection::Background(bi));
                                 new_start = snapped_in;
                                 state.timeline_drag.snap_indicator = snap_t;
                                 let token = EditorState::drag_token("move_bg", bi);
@@ -10509,7 +10698,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             // Snap-to-edges on the in-edge.
                             let (snapped_in, _, snap_t) = apply_snap_to_window(
                                 state, new_in, clip_end,
-                                SnapMode::TrimLeft, SnapExclude::Actor(ai));
+                                SnapMode::TrimLeft, Selection::Actor(ai));
                             new_in = snapped_in;
                             state.timeline_drag.snap_indicator = snap_t;
                             let token = EditorState::drag_token("trim_actor_left", ai);
@@ -10575,7 +10764,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             // past its real footage.
                             let (_, snapped_out, snap_t) = apply_snap_to_window(
                                 state, clip_start, new_out,
-                                SnapMode::TrimRight, SnapExclude::Actor(ai));
+                                SnapMode::TrimRight, Selection::Actor(ai));
                             new_out = snapped_out.max(clip_start + 0.1);
                             if let Some(cap) = hard_cap_out {
                                 if new_out > cap { new_out = cap; }
@@ -10717,7 +10906,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             // indicator the timeline draws as a guide.
                             let (snapped_in, _, snap_t) = apply_snap_to_window(
                                 state, new_start, new_start + dur,
-                                SnapMode::Move, SnapExclude::Actor(ai));
+                                SnapMode::Move, Selection::Actor(ai));
                             new_start = snapped_in;
                             state.timeline_drag.snap_indicator = snap_t;
 
@@ -10910,7 +11099,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             // Snap-to-edges on the in-edge.
                             let (snapped_in, _, snap_t) = apply_snap_to_window(
                                 state, new_in, clip_end,
-                                SnapMode::TrimLeft, SnapExclude::Overlay(oi));
+                                SnapMode::TrimLeft, Selection::Overlay(oi));
                             new_in = snapped_in;
                             state.timeline_drag.snap_indicator = snap_t;
                             let shift = new_in - clip_start;
@@ -10955,7 +11144,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             let mut new_out = (clip_end + delta_t).max(clip_start + 0.1);
                             let (_, snapped_out, snap_t) = apply_snap_to_window(
                                 state, clip_start, new_out,
-                                SnapMode::TrimRight, SnapExclude::Overlay(oi));
+                                SnapMode::TrimRight, Selection::Overlay(oi));
                             new_out = snapped_out.max(clip_start + 0.1);
                             state.timeline_drag.snap_indicator = snap_t;
                             let token = EditorState::drag_token("trim_overlay_right", oi);
@@ -10993,7 +11182,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             // Snap-to-edges (start preferred, end fallback).
                             let (snapped_in, _, snap_t) = apply_snap_to_window(
                                 state, new_start, new_start + dur,
-                                SnapMode::Move, SnapExclude::Overlay(oi));
+                                SnapMode::Move, Selection::Overlay(oi));
                             new_start = snapped_in;
                             state.timeline_drag.snap_indicator = snap_t;
                             let new_end = new_start + dur;
@@ -11193,7 +11382,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             // Snap-to-edges on the in-edge.
                             let (snapped_in, _, snap_t) = apply_snap_to_window(
                                 state, new_in, clip_end,
-                                SnapMode::TrimLeft, SnapExclude::Audio(aui));
+                                SnapMode::TrimLeft, Selection::Audio(aui));
                             new_in = snapped_in;
                             state.timeline_drag.snap_indicator = snap_t;
                             let actual_delta = new_in - clip_start;
@@ -11221,7 +11410,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             let mut new_out = (clip_end + delta_t).max(clip_start + 0.1);
                             let (_, snapped_out, snap_t) = apply_snap_to_window(
                                 state, clip_start, new_out,
-                                SnapMode::TrimRight, SnapExclude::Audio(aui));
+                                SnapMode::TrimRight, Selection::Audio(aui));
                             new_out = snapped_out.max(clip_start + 0.1);
                             state.timeline_drag.snap_indicator = snap_t;
                             let token = EditorState::drag_token("trim_audio_right", aui);
@@ -11249,7 +11438,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             // the pair.
                             let (snapped_in, _, snap_t) = apply_snap_to_window(
                                 state, new_start, new_start + dur,
-                                SnapMode::Move, SnapExclude::Audio(aui));
+                                SnapMode::Move, Selection::Audio(aui));
                             new_start = snapped_in;
                             state.timeline_drag.snap_indicator = snap_t;
                             // Track active drag for lane-lock & new-lane intents.
@@ -11998,8 +12187,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                     Some(t) => t,
                     None => state.pick_or_create_empty_video_lane_at(drop_time),
                 };
-                add_actor_from_clip_at_time(state, &asset_path, drop_time);
-                if let Some(new_idx) = state.scene.actors.len().checked_sub(1) {
+                if let Some(new_idx) = add_actor_from_clip_at_time(state, &asset_path, drop_time) {
                     state.actor_track_assignments.insert(new_idx, assigned);
                     // The bound audio (added by add_actor_from_clip_at_time)
                     // is placed on the first audio lane by default.
@@ -12031,11 +12219,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                 state.playhead = saved_t;
             }
 
-            // Clear the drag state.
-            state.asset_drag.dragging = None;
-            state.asset_drag.kind = AssetDragKind::None;
-            state.asset_drag.label.clear();
-            state.asset_drag.thumbnail = None;
+            state.clear_asset_drag();
         }
     }
 
@@ -15192,6 +15376,9 @@ pub(crate) fn try_spawn_lazy_clip_download(
     clip_path: &std::path::Path,
     drop_target: crate::jobs::ClipDropTarget,
 ) -> bool {
+    if crate::state::LIBRARY_LOCAL_ONLY {
+        return false;
+    }
     if !dragged_clip_needs_download(state, clip_path) {
         return false;
     }
@@ -15254,7 +15441,7 @@ fn clip_duration_for_placement(state: &mut EditorState, path: &PathBuf, actor_id
     // Never block the UI thread on ffprobe when dropping a clip — use a
     // generous placeholder and refine timing when the async probe (or frame
     // extraction) reports the real duration.
-    const PLACEHOLDER: f32 = 60.0;
+    const PLACEHOLDER: f32 = crate::split_crop::CLIP_DURATION_PLACEHOLDER_SEC;
     if let (Some(handle), Some(tx)) = (state.tokio_handle.clone(), state.image_fx_tx.clone()) {
         let path2 = path.clone();
         let actor_id = actor_id.to_string();
@@ -15286,11 +15473,12 @@ pub fn reconcile_actor_clip_durations(state: &mut EditorState) {
         let Some(&duration) = state.video_duration_cache.get(&path) else {
             continue;
         };
-        let t_in = state.scene.actors[i].t_in.unwrap_or(0.0);
-        let want_out = t_in + duration.max(0.1);
-        let cur_out = state.scene.actors[i].t_out.unwrap_or(want_out);
-        if (cur_out - want_out).abs() > 0.05 {
-            state.scene.actors[i].t_out = Some(want_out);
+        let before = state.scene.actors[i].t_out;
+        crate::split_crop::reconcile_actor_t_out_for_source(
+            &mut state.scene.actors[i],
+            duration,
+        );
+        if state.scene.actors[i].t_out != before {
             sync_audio_to_actor(state, i);
         }
     }
@@ -15298,12 +15486,19 @@ pub fn reconcile_actor_clip_durations(state: &mut EditorState) {
 
 pub fn add_actor_from_clip(state: &mut EditorState, path: &PathBuf) {
     let t = state.playhead;
-    add_actor_from_clip_at_time(state, path, t);
+    let _ = add_actor_from_clip_at_time(state, path, t);
 }
 
 /// Load chroma sidecar for `path`, falling back to default when absent.
 fn load_chroma_for_clip(path: &PathBuf) -> ChromaKeyParams {
-    ChromaKeyParams::load_for_clip(path).unwrap_or_default()
+    if let Some(mut ck) = ChromaKeyParams::load_for_clip(path) {
+        // A saved sidecar means the user tuned this clip before — keep
+        // chroma on. Fresh drops with no sidecar stay disabled.
+        ck.enabled = true;
+        ck
+    } else {
+        ChromaKeyParams::default()
+    }
 }
 
 /// Push an `AudioTrack` matching `actor` so the embedded audio shows up as
@@ -15472,10 +15667,15 @@ pub fn add_text_overlay(state: &mut EditorState) -> usize {
 }
 
 /// Add an actor from a clip at a specific time (used by drag-to-track).
-pub(crate) fn add_actor_from_clip_at_time(state: &mut EditorState, path: &PathBuf, t: f32) {
+/// Returns the new actor index, or `None` when the file is not ready.
+pub(crate) fn add_actor_from_clip_at_time(
+    state: &mut EditorState,
+    path: &PathBuf,
+    t: f32,
+) -> Option<usize> {
     if !is_usable_local_video(path) {
         state.status = crate::i18n::t("Video file is not ready yet — wait for download").into();
-        return;
+        return None;
     }
 
     let counter = state.scene.actors.len() + 1;
@@ -15533,6 +15733,7 @@ pub(crate) fn add_actor_from_clip_at_time(state: &mut EditorState, path: &PathBu
     state.selection = Selection::Actor(new_actor_idx);
     state.request_media_preview = true;
     state.status = format!("{} {}", crate::i18n::t("Dropped actor:"), id);
+    Some(new_actor_idx)
 }
 
 /// Probe a media file and return its duration in seconds when ffprobe succeeds.
@@ -15576,8 +15777,7 @@ pub(crate) fn add_actor_from_clip_at_canvas(
     world_pos: [f32; 2],
 ) {
     let t = state.playhead;
-    add_actor_from_clip_at_time(state, path, t);
-    let new_actor_idx = match state.scene.actors.len().checked_sub(1) {
+    let new_actor_idx = match add_actor_from_clip_at_time(state, path, t) {
         Some(i) => i,
         None => return,
     };
@@ -15603,6 +15803,29 @@ pub(crate) fn add_actor_from_clip_at_canvas(
         element_id: actor_id,
         keyframes: vec![canvas_kf],
     });
+
+    let [rw, rh] = state.scene.render_frame.resolution;
+    if rw > 0 && rh > 0 {
+        let nx = world_pos[0] / rw as f32;
+        let ny = world_pos[1] / rh as f32;
+        let actor = &mut state.scene.actors[new_actor_idx];
+        crate::kf_anim::write_actor_param(
+            &mut actor.layout,
+            &mut actor.animated_params,
+            t,
+            memstroy_core::param_ids::POS_X,
+            false,
+            |s| s.pos[0] = nx,
+        );
+        crate::kf_anim::write_actor_param(
+            &mut actor.layout,
+            &mut actor.animated_params,
+            t,
+            memstroy_core::param_ids::POS_Y,
+            false,
+            |s| s.pos[1] = ny,
+        );
+    }
 
     state.selection = Selection::Actor(new_actor_idx);
     state.status = format!(

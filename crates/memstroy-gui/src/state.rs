@@ -27,6 +27,12 @@ use crate::undo::UndoStack;
 /// `[::]` / `0:0:0:0:0:0:0:0`. Anything else (including real IPs and
 /// hostnames) is returned untouched so a remote
 /// `https://assets.example.com` keeps working.
+/// When `true`, the editor never contacts `memstroy-assets-server` or
+/// downloads remote clips — only files under `assets/` are shown.
+/// Server fields and job hooks remain in the codebase for a future
+/// online-library mode.
+pub const LIBRARY_LOCAL_ONLY: bool = true;
+
 pub fn rewrite_server_url_for_client(url: &str) -> String {
     let trimmed = url.trim();
     if trimmed.is_empty() {
@@ -397,11 +403,22 @@ pub struct AudioWaveform {
     pub ready: bool,
     /// Whether extraction is currently running.
     pub extracting: bool,
+    /// ffmpeg could not decode peaks for this file.
+    pub failed: bool,
+    /// When the current extraction attempt started (for timeouts).
+    pub extracting_since: Option<std::time::Instant>,
 }
 
 impl Default for AudioWaveform {
     fn default() -> Self {
-        Self { peaks: Vec::new(), duration: 0.0, ready: false, extracting: false }
+        Self {
+            peaks: Vec::new(),
+            duration: 0.0,
+            ready: false,
+            extracting: false,
+            failed: false,
+            extracting_since: None,
+        }
     }
 }
 
@@ -481,6 +498,11 @@ pub struct EditorState {
     /// `EditorState::mutate_drag` for the full contract — the short
     /// version is "one undo snapshot per drag gesture, automatically".
     pub last_drag_group: Option<u64>,
+    /// Set when `mutate` / `mutate_state` / `undo` / `redo` already
+    /// pushed an undo snapshot this frame so the frame-level fallback
+    /// in `app.rs::update` does not double-push (or re-push a
+    /// post-undo state after Ctrl+Z).
+    pub frame_undo_fallback_suppressed: bool,
     /// Snapshot of the editor state captured the last time a pointer
     /// button was pressed. Used by `app.rs::update` as a frame-level
     /// catch-all for inspector edits (slider drags, button clicks, …)
@@ -1155,7 +1177,11 @@ impl EditorState {
         // produced (e.g. `https://assets.your-domain.example`). Either
         // way the literal goes through `obfstr` so it is not visible
         // verbatim in `strings(1)` over the binary.
-        s.server_url = crate::build_info::default_server_url();
+        if LIBRARY_LOCAL_ONLY {
+            s.server_url.clear();
+        } else {
+            s.server_url = crate::build_info::default_server_url();
+        }
         s.tg_channel = "MELLSTROYfonz".to_string();
         // Default catalogue depth for the "Refresh from Telegram"
         // button. Set to 500 (was 80) so the first refresh on a
@@ -1363,7 +1389,9 @@ impl EditorState {
         self.actor_track_assignments = snap.actor_track_assignments;
         self.overlay_track_assignments = snap.overlay_track_assignments;
         self.audio_track_assignments = snap.audio_track_assignments;
+        self.scene.purge_orphan_canvas_layouts();
         self.sanitize_track_assignments();
+        self.request_media_preview = true;
     }
 
     /// Save undo snapshot, then apply a mutation that may touch lane
@@ -1372,6 +1400,7 @@ impl EditorState {
         self.last_drag_group = None;
         let snap = self.build_undo_snapshot();
         self.undo.push_full(snap);
+        self.frame_undo_fallback_suppressed = true;
         f(self);
         self.sanitize_track_assignments();
     }
@@ -1382,6 +1411,7 @@ impl EditorState {
         if self.last_drag_group != Some(token) {
             self.last_drag_group = None;
             self.undo.push_full(self.build_undo_snapshot());
+            self.frame_undo_fallback_suppressed = true;
             self.last_drag_group = Some(token);
         }
     }
@@ -1427,6 +1457,7 @@ impl EditorState {
         self.last_drag_group = None;
         let snap = self.build_undo_snapshot();
         self.undo.push_full(snap);
+        self.frame_undo_fallback_suppressed = true;
         f(&mut self.scene);
     }
 
@@ -1449,6 +1480,7 @@ impl EditorState {
         if self.last_drag_group != Some(token) {
             let snap = self.build_undo_snapshot();
             self.undo.push_full(snap);
+            self.frame_undo_fallback_suppressed = true;
             self.last_drag_group = Some(token);
         }
         f(&mut self.scene);
@@ -1480,6 +1512,7 @@ impl EditorState {
         let cur = self.build_undo_snapshot();
         if let Some(prev) = self.undo.undo_full(cur) {
             self.restore_undo_snapshot(prev);
+            self.frame_undo_fallback_suppressed = true;
             self.status = "\u{21A9} Undo".into();
         }
     }
@@ -1490,6 +1523,7 @@ impl EditorState {
         let cur = self.build_undo_snapshot();
         if let Some(next) = self.undo.redo_full(cur) {
             self.restore_undo_snapshot(next);
+            self.frame_undo_fallback_suppressed = true;
             self.status = "\u{21AA} Redo".into();
         }
     }
@@ -1579,7 +1613,35 @@ impl EditorState {
         bump(&mut self.actor_track_assignments);
         bump(&mut self.audio_track_assignments);
         bump(&mut self.overlay_track_assignments);
+        self.sanitize_track_assignments();
         0
+    }
+
+    /// End a library → canvas / timeline asset drag gesture.
+    pub fn clear_asset_drag(&mut self) {
+        self.asset_drag.dragging = None;
+        self.asset_drag.kind = AssetDragKind::None;
+        self.asset_drag.label.clear();
+        self.asset_drag.thumbnail = None;
+    }
+
+    /// Clear in-flight timeline / element-drag state after toolbar
+    /// actions (e.g. "+ V Layer") so clip drags are not stuck behind
+    /// `timeline_input_lock` or a stale `dragging_clip` token.
+    pub fn reset_timeline_pointer_gesture(&mut self) {
+        self.timeline_scrubbing_playhead = false;
+        self.timeline_drag.dragging_clip = None;
+        self.timeline_drag.pending_new_lane = None;
+        self.timeline_drag.start_pointer_y = None;
+        self.timeline_drag.snap_indicator = None;
+        self.timeline_drag.group_anchor.clear();
+        self.timeline_drag.group_anchor_token = None;
+        self.timeline_drag.group_mover_anchor = None;
+        self.timeline_drag.pending_overlap.clear();
+        if self.element_drag.source.is_some() {
+            self.element_drag.source = None;
+            self.element_drag.label.clear();
+        }
     }
 
     /// Find a video lane that has no actor / overlay clip currently
@@ -2053,6 +2115,7 @@ impl EditorState {
     pub fn add_audio_track(&mut self) {
         let n = self.tracks.iter().filter(|t| t.kind == TrackKind::Audio).count() + 1;
         self.tracks.push(Track::audio(format!("A{}", n)));
+        self.sanitize_track_assignments();
     }
 
     /// Save timeline layout state (zoom, scroll, track heights) to a JSON file.
@@ -2511,7 +2574,9 @@ impl EditorState {
         }
         let snap = Self::scan_library_snapshot(self.assets_root.clone());
         self.apply_library_snapshot(snap);
-        self.fetch_server_clips_metadata();
+        if !LIBRARY_LOCAL_ONLY {
+            self.fetch_server_clips_metadata();
+        }
     }
 
     /// Fetch clip metadata from the server and merge with local clips.
@@ -2523,6 +2588,9 @@ impl EditorState {
     ///
     /// Gracefully degrades if server is unreachable (logs warning, continues with local-only clips).
     pub(crate) fn fetch_server_clips_metadata(&self) {
+        if LIBRARY_LOCAL_ONLY {
+            return;
+        }
         // Check if server_url is configured
         if self.server_url.trim().is_empty() {
             tracing::debug!("server_url not configured, skipping server metadata fetch");
