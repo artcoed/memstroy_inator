@@ -385,18 +385,67 @@ fn remove_overlay_at(state: &mut EditorState, idx: usize) {
     if idx >= state.scene.overlays.len() {
         return;
     }
+    let overlay_id = match &state.scene.overlays[idx] {
+        Overlay::Text(o) => o.id.clone(),
+        Overlay::Image(o) => o.id.clone(),
+        Overlay::Video(o) => o.id.clone(),
+    };
     state.mutate_state(|s| {
+        s.scene
+            .canvas_layouts
+            .retain(|cl| cl.element_id != overlay_id);
         s.scene.overlays.remove(idx);
+        s.scene.purge_orphan_canvas_layouts();
     });
     shift_overlay_assignments_after_remove(&mut state.overlay_track_assignments, idx);
-    state.canvas_selection.retain(|sel| {
-        !matches!(sel, Selection::Overlay(i) if *i == idx)
+    on_overlays_removed(state, &[idx]);
+}
+
+/// Keep the canvas image-search session in sync after overlay rows are
+/// removed (Delete key, search-popup dismiss, …).
+pub fn on_overlays_removed(state: &mut EditorState, removed_indices: &[usize]) {
+    if removed_indices.is_empty() {
+        return;
+    }
+    let mut removed = removed_indices.to_vec();
+    removed.sort_unstable();
+    removed.dedup();
+
+    if let Some(session) = state.canvas_image_search.as_mut() {
+        if let Some(placed) = session.placed_overlay {
+            if removed.contains(&placed) {
+                session.placed_overlay = None;
+            } else {
+                let shift = removed.iter().filter(|&&i| i < placed).count();
+                if shift > 0 {
+                    session.placed_overlay = Some(placed - shift);
+                }
+            }
+        }
+    }
+
+    for sel in [
+        &mut state.selection,
+    ] {
+        if let Selection::Overlay(i) = sel {
+            let shift = removed.iter().filter(|&&r| r < *i).count();
+            if removed.contains(i) {
+                *sel = Selection::None;
+            } else if shift > 0 {
+                *sel = Selection::Overlay(*i - shift);
+            }
+        }
+    }
+    state.canvas_selection.retain(|sel| match sel {
+        Selection::Overlay(i) => !removed.contains(i),
+        _ => true,
     });
-    if matches!(state.selection, Selection::Overlay(i) if i == idx) {
-        state.selection = Selection::None;
-    } else if let Selection::Overlay(i) = state.selection {
-        if i > idx {
-            state.selection = Selection::Overlay(i - 1);
+    for sel in state.canvas_selection.iter_mut() {
+        if let Selection::Overlay(i) = sel {
+            let shift = removed.iter().filter(|&&r| r < *i).count();
+            if shift > 0 {
+                *sel = Selection::Overlay(*i - shift);
+            }
         }
     }
 }
@@ -419,6 +468,18 @@ fn shift_overlay_assignments_after_remove(
 /// Cancel the active canvas image-search session (popup + frame + placed image).
 pub fn cancel_canvas_image_search(state: &mut EditorState) {
     dismiss_session(state, true);
+}
+
+/// Empty-canvas click while a web-image search session is active: hide the
+/// popup or end the session without deleting a placed image.
+pub fn on_canvas_empty_click(state: &mut EditorState) {
+    if canvas_search_ui_visible(state) {
+        hide_canvas_search_ui(state);
+        return;
+    }
+    if state.canvas_image_search.is_some() {
+        dismiss_session(state, false);
+    }
 }
 
 /// Render the inline search UI anchored to the canvas.
@@ -449,6 +510,7 @@ pub fn show_canvas_search_ui(
     let default_screen = [screen[0], screen[1]];
 
     let window_id = egui::Id::new("canvas_image_search_popup");
+    let pointer_down = ctx.input(|i| i.pointer.primary_down());
     let mut window = egui::Window::new(crate::i18n::t("Image search"))
         .id(window_id)
         .collapsible(false)
@@ -461,11 +523,12 @@ pub fn show_canvas_search_ui(
         .as_ref()
         .and_then(|s| s.ui_screen_pos)
     {
-        window = window.current_pos(Pos2::new(full_rect.min.x + x, full_rect.min.y + y));
-    } else if let Some(pos) = ctx.memory(|m| m.area_rect(window_id).map(|r| r.left_top())) {
-        window = window.current_pos(pos);
+        // Pin saved position only when the user is not dragging the title bar.
+        if !pointer_down {
+            window = window.current_pos(Pos2::new(full_rect.min.x + x, full_rect.min.y + y));
+        }
     } else {
-        window = window.current_pos(anchor_screen);
+        window = window.default_pos(anchor_screen);
     }
 
     if let Some(inner) = window.show(ctx, |ui| {
@@ -1029,9 +1092,10 @@ pub fn fit_overlay_to_selection_rect(
     let cy = (mn[1] + mx[1]) * 0.5;
     let [rw, rh] = state.scene.render_frame.resolution;
     let norm_pos = [cx / rw as f32, cy / rh as f32];
+    let scene_t = state.playhead;
 
     state.mutate_state(|s| {
-        upsert_overlay_world_center(&mut s.scene, overlay_idx, [cx, cy], norm_pos);
+        upsert_overlay_world_center(&mut s.scene, overlay_idx, [cx, cy], norm_pos, scene_t);
         let Some(Overlay::Image(im)) = s.scene.overlays.get_mut(overlay_idx) else {
             return;
         };
@@ -1052,11 +1116,12 @@ pub fn fit_overlay_to_selection_rect(
 
 /// Write world-pixel centre into `canvas_layouts` (preferred by
 /// `get_element_world_pos`) and keep the normalised layout track in sync.
-fn upsert_overlay_world_center(
+pub(crate) fn upsert_overlay_world_center(
     scene: &mut memstroy_core::Scene,
     overlay_idx: usize,
     world_center: [f32; 2],
     norm_pos: [f32; 2],
+    scene_t: f32,
 ) {
     let overlay_id = match scene.overlays.get(overlay_idx) {
         Some(Overlay::Image(im)) => im.id.clone(),
@@ -1088,7 +1153,7 @@ fn upsert_overlay_world_center(
             kf.value.pos = world_pos;
         } else {
             cl.keyframes.push(Keyframe::new(
-                0.0,
+                scene_t,
                 CanvasTransform {
                     pos: world_pos,
                     ..Default::default()
@@ -1099,7 +1164,7 @@ fn upsert_overlay_world_center(
         scene.canvas_layouts.push(CanvasLayout {
             element_id: overlay_id,
             keyframes: vec![Keyframe::new(
-                0.0,
+                scene_t,
                 CanvasTransform {
                     pos: world_pos,
                     ..Default::default()
@@ -1122,8 +1187,9 @@ pub fn place_overlay_at_world_point(
         (world_pos[1] / rh as f32).clamp(0.0, 1.0),
     ];
     let _ = img_dims;
+    let scene_t = state.playhead;
     state.mutate_state(|s| {
-        upsert_overlay_world_center(&mut s.scene, overlay_idx, world_pos, norm_pos);
+        upsert_overlay_world_center(&mut s.scene, overlay_idx, world_pos, norm_pos, scene_t);
         if let Some(Overlay::Image(im)) = s.scene.overlays.get_mut(overlay_idx) {
             if let Some(kf) = im.layout.first_mut() {
                 kf.value.scale = 1.0;
@@ -1133,6 +1199,26 @@ pub fn place_overlay_at_world_point(
         }
     });
     state.selection = Selection::Overlay(overlay_idx);
+}
+
+/// Sync a canvas-layout world centre after a library drag-drop (no crop).
+pub(crate) fn sync_overlay_canvas_world_center(
+    state: &mut EditorState,
+    overlay_idx: usize,
+    world_center: [f32; 2],
+) {
+    let [rw, rh] = state.scene.render_frame.resolution;
+    let norm_pos = [
+        (world_center[0] / rw as f32).clamp(0.0, 1.0),
+        (world_center[1] / rh as f32).clamp(0.0, 1.0),
+    ];
+    upsert_overlay_world_center(
+        &mut state.scene,
+        overlay_idx,
+        world_center,
+        norm_pos,
+        state.playhead,
+    );
 }
 
 /// Re-run checkerboard removal on an already placed web-search image.

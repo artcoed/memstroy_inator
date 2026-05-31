@@ -116,7 +116,9 @@ impl App {
         // server. Spawning a local one would mask configuration
         // mistakes (the editor would silently serve "" assets from a
         // brand-new empty cache dir) instead of surfacing them.
-        if crate::build_info::IS_CLIENT_BUILD {
+        if crate::state::LIBRARY_LOCAL_ONLY {
+            tracing::info!("library local-only mode: skipping assets-server bootstrap");
+        } else if crate::build_info::IS_CLIENT_BUILD {
             tracing::info!(
                 server_url = %state.server_url,
                 "client build: skipping in-process assets-server, using remote"
@@ -836,9 +838,8 @@ impl App {
         else {
             return;
         };
-        let t_in = self.state.scene.actors[idx].t_in.unwrap_or(0.0);
-        let t_out = t_in + duration.max(0.1);
-        self.state.scene.actors[idx].t_out = Some(t_out);
+        let actor = &mut self.state.scene.actors[idx];
+        crate::split_crop::reconcile_actor_t_out_for_source(actor, duration);
         crate::panels::sync_audio_to_actor(&mut self.state, idx);
         self.state.request_media_preview = true;
     }
@@ -869,6 +870,8 @@ impl App {
         let assets_root = self.state.assets_root.clone();
         let tx = self.tx.clone();
         self.rt.as_ref().unwrap().spawn(async move {
+            let videos_dir = assets_root.join("assets").join("videos");
+            let _ = crate::jobs::generate_video_library_thumbnails(&videos_dir).await;
             let snap = tokio::task::spawn_blocking(move || {
                 EditorState::scan_library_snapshot(assets_root)
             })
@@ -2381,10 +2384,71 @@ impl App {
                     }
                 }
             }
+            // Direct overlay picks (text, images, FX, …) were collected
+            // into `overlay_idxs` but never deleted — only actor-subtree
+            // expansion ran. Expand each selected overlay's subtree too.
+            for i in overlay_idxs.iter().copied() {
+                if i >= self.state.scene.overlays.len() {
+                    continue;
+                }
+                let root_id = match &self.state.scene.overlays[i] {
+                    memstroy_core::Overlay::Text(o) => o.id.clone(),
+                    memstroy_core::Overlay::Image(o) => o.id.clone(),
+                    memstroy_core::Overlay::Video(o) => o.id.clone(),
+                };
+                let subtree = self.state.scene.collect_element_subtree_ids(&root_id);
+                for id in subtree {
+                    if let Some(ai) = self
+                        .state
+                        .scene
+                        .actors
+                        .iter()
+                        .position(|a| a.id == id)
+                    {
+                        family_actor_idxs.push(ai);
+                    }
+                    if let Some(oi) = self.state.scene.overlays.iter().position(|ov| {
+                        match ov {
+                            memstroy_core::Overlay::Text(o) => o.id == *id,
+                            memstroy_core::Overlay::Image(o) => o.id == *id,
+                            memstroy_core::Overlay::Video(o) => o.id == *id,
+                        }
+                    }) {
+                        family_overlay_idxs.push(oi);
+                    }
+                }
+            }
             family_actor_idxs.sort_unstable();
             family_actor_idxs.dedup();
             family_overlay_idxs.sort_unstable();
             family_overlay_idxs.dedup();
+
+            let mut layout_ids: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            for &i in &family_actor_idxs {
+                if let Some(a) = self.state.scene.actors.get(i) {
+                    layout_ids.extend(
+                        self.state
+                            .scene
+                            .collect_element_subtree_ids(&a.id),
+                    );
+                }
+            }
+            for &i in &family_overlay_idxs {
+                if i >= self.state.scene.overlays.len() {
+                    continue;
+                }
+                let root_id = match &self.state.scene.overlays[i] {
+                    memstroy_core::Overlay::Text(o) => o.id.clone(),
+                    memstroy_core::Overlay::Image(o) => o.id.clone(),
+                    memstroy_core::Overlay::Video(o) => o.id.clone(),
+                };
+                layout_ids.extend(self.state.scene.collect_element_subtree_ids(&root_id));
+            }
+            self.state
+                .scene
+                .canvas_layouts
+                .retain(|cl| !layout_ids.contains(&cl.element_id));
 
             for i in family_actor_idxs.iter().rev().copied() {
                 if i >= self.state.scene.actors.len() {
@@ -2417,7 +2481,11 @@ impl App {
                     i,
                 );
             }
-            for i in audio_idxs.into_iter() {
+            crate::canvas_image_search::on_overlays_removed(
+                &mut self.state,
+                &family_overlay_idxs,
+            );
+            for i in audio_idxs.into_iter().rev() {
                 if i >= self.state.scene.audio.len() {
                     continue;
                 }
@@ -2474,19 +2542,29 @@ impl App {
                     let _removed_audio =
                         crate::panels::remove_audio_bound_to_actor(&mut self.state, &aid);
                 }
-                self.state.mutate(|s| {
-                    s.canvas_layouts
+                self.state.mutate_state(|s| {
+                    s.scene
+                        .canvas_layouts
                         .retain(|cl| !subtree.contains(&cl.element_id));
                     for idx in overlay_idxs.iter().rev().copied() {
-                        if idx < s.overlays.len() {
-                            s.overlays.remove(idx);
+                        if idx < s.scene.overlays.len() {
+                            s.scene.overlays.remove(idx);
                         }
+                        crate::panels::shift_assignments_after_remove(
+                            &mut s.overlay_track_assignments,
+                            idx,
+                        );
                     }
                     for idx in actor_idxs.iter().rev().copied() {
-                        if idx < s.actors.len() {
-                            s.actors.remove(idx);
+                        if idx < s.scene.actors.len() {
+                            s.scene.actors.remove(idx);
                         }
+                        crate::panels::shift_assignments_after_remove(
+                            &mut s.actor_track_assignments,
+                            idx,
+                        );
                     }
+                    s.scene.purge_orphan_canvas_layouts();
                 });
                 for idx in actor_idxs.iter().rev().copied() {
                     if idx < self.state.frame_caches.len() {
@@ -2495,16 +2573,6 @@ impl App {
                     if idx < self.frame_extract_results.len() {
                         self.frame_extract_results.remove(idx);
                     }
-                    crate::panels::shift_assignments_after_remove(
-                        &mut self.state.actor_track_assignments,
-                        idx,
-                    );
-                }
-                for idx in overlay_idxs.iter().rev().copied() {
-                    crate::panels::shift_assignments_after_remove(
-                        &mut self.state.overlay_track_assignments,
-                        idx,
-                    );
                 }
                 self.state.selection = Selection::None;
                 self.state.canvas_selection.clear();
@@ -2550,19 +2618,29 @@ impl App {
                     let _removed_audio =
                         crate::panels::remove_audio_bound_to_actor(&mut self.state, &aid);
                 }
-                self.state.mutate(|s| {
-                    s.canvas_layouts
+                self.state.mutate_state(|s| {
+                    s.scene
+                        .canvas_layouts
                         .retain(|cl| !subtree.contains(&cl.element_id));
                     for idx in overlay_idxs.iter().rev().copied() {
-                        if idx < s.overlays.len() {
-                            s.overlays.remove(idx);
+                        if idx < s.scene.overlays.len() {
+                            s.scene.overlays.remove(idx);
                         }
+                        crate::panels::shift_assignments_after_remove(
+                            &mut s.overlay_track_assignments,
+                            idx,
+                        );
                     }
                     for idx in actor_idxs.iter().rev().copied() {
-                        if idx < s.actors.len() {
-                            s.actors.remove(idx);
+                        if idx < s.scene.actors.len() {
+                            s.scene.actors.remove(idx);
                         }
+                        crate::panels::shift_assignments_after_remove(
+                            &mut s.actor_track_assignments,
+                            idx,
+                        );
                     }
+                    s.scene.purge_orphan_canvas_layouts();
                 });
                 for idx in actor_idxs.iter().rev().copied() {
                     if idx < self.state.frame_caches.len() {
@@ -2571,17 +2649,11 @@ impl App {
                     if idx < self.frame_extract_results.len() {
                         self.frame_extract_results.remove(idx);
                     }
-                    crate::panels::shift_assignments_after_remove(
-                        &mut self.state.actor_track_assignments,
-                        idx,
-                    );
                 }
-                for idx in overlay_idxs.iter().rev().copied() {
-                    crate::panels::shift_assignments_after_remove(
-                        &mut self.state.overlay_track_assignments,
-                        idx,
-                    );
-                }
+                crate::canvas_image_search::on_overlays_removed(
+                    &mut self.state,
+                    &overlay_idxs,
+                );
                 self.state.selection = Selection::None;
                 self.state.canvas_selection.clear();
                 self.state.multi_select.clear();
@@ -2811,15 +2883,12 @@ impl App {
         // frame — previously the empty PathBuf meant the right half
         // had no preview until a full re-extract was triggered.
         let right_source = self.state.scene.actors[pivot].source.clone();
-        if pivot <= self.state.frame_caches.len() {
-            self.state.frame_caches.insert(
-                pivot,
-                crate::video_cache::FrameCache::new(
-                    right_source,
-                    pivot,
-                ),
-            );
-        }
+        crate::video_cache::FrameCache::insert_for_actor_split(
+            &mut self.state.frame_caches,
+            i,
+            pivot,
+            right_source,
+        );
         if pivot <= self.frame_extract_results.len() {
             self.frame_extract_results.insert(pivot, std::sync::Arc::new(std::sync::Mutex::new(None)));
         }
@@ -3203,19 +3272,27 @@ impl App {
             self.state.audio_waveforms.push(crate::state::AudioWaveform::default());
         }
 
+        let mut started = 0usize;
         for audio_idx in 0..num_audio {
             let wf = &self.state.audio_waveforms[audio_idx];
-            if wf.ready || wf.extracting {
+            if wf.ready || wf.extracting || wf.failed {
                 continue;
             }
 
             let source = self.state.scene.audio[audio_idx].source.clone();
             if !source.exists() {
+                self.state.audio_waveforms[audio_idx].failed = true;
+                self.state.audio_waveforms[audio_idx].extracting = false;
+                self.state.audio_waveforms[audio_idx].extracting_since = None;
                 continue;
             }
 
             // Mark as extracting
             self.state.audio_waveforms[audio_idx].extracting = true;
+            self.state.audio_waveforms[audio_idx].failed = false;
+            self.state.audio_waveforms[audio_idx].extracting_since =
+                Some(std::time::Instant::now());
+            started += 1;
 
             let source_clone = source.clone();
             // Use a shared slot to communicate results back
@@ -3250,29 +3327,68 @@ impl App {
             self.waveform_extract_results[audio_idx] = result_slot;
         }
 
-        self.state.status = crate::i18n::t("\u{1F3B5} Extracting audio waveforms...").into();
+        if started > 0 {
+            self.state.status =
+                crate::i18n::t("\u{1F3B5} Extracting audio waveforms...").into();
+        }
     }
 
     /// Poll for waveform extraction completion across all audio tracks.
     fn poll_waveform_extraction(&mut self) {
+        const WF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
         for audio_idx in 0..self.waveform_extract_results.len() {
-            if audio_idx >= self.state.audio_waveforms.len() { break; }
-            if self.state.audio_waveforms[audio_idx].ready { continue; }
+            if audio_idx >= self.state.audio_waveforms.len() {
+                break;
+            }
+            let wf = &mut self.state.audio_waveforms[audio_idx];
+            if wf.ready {
+                continue;
+            }
+
+            if wf.extracting
+                && wf
+                    .extracting_since
+                    .is_some_and(|t| t.elapsed() > WF_TIMEOUT)
+            {
+                wf.extracting = false;
+                wf.failed = true;
+                wf.extracting_since = None;
+                self.state.status = format!(
+                    "{} {} {}",
+                    crate::i18n::t("\u{274C} Waveform failed:"),
+                    crate::i18n::t("audio"),
+                    audio_idx
+                );
+                continue;
+            }
 
             if let Ok(mut slot) = self.waveform_extract_results[audio_idx].lock() {
                 if let Some(result) = slot.take() {
-                    self.state.audio_waveforms[audio_idx].extracting = false;
-                    if let Some((peaks, duration)) = result {
-                        self.state.audio_waveforms[audio_idx].ready = true;
-                        self.state.audio_waveforms[audio_idx].peaks = peaks;
-                        self.state.audio_waveforms[audio_idx].duration = duration;
-                        self.state.status = format!(
-                            "{} ({} {}): {:.1}s",
-                            crate::i18n::t("\u{2705} Waveform ready"),
-                            crate::i18n::t("audio"),
-                            audio_idx,
-                            duration
-                        );
+                    wf.extracting = false;
+                    wf.extracting_since = None;
+                    match result {
+                        Some((peaks, duration)) => {
+                            wf.ready = true;
+                            wf.failed = false;
+                            wf.peaks = peaks;
+                            wf.duration = duration;
+                            self.state.status = format!(
+                                "{} ({} {}): {:.1}s",
+                                crate::i18n::t("\u{2705} Waveform ready"),
+                                crate::i18n::t("audio"),
+                                audio_idx,
+                                duration
+                            );
+                        }
+                        None => {
+                            wf.failed = true;
+                            self.state.status = format!(
+                                "{} {} {}",
+                                crate::i18n::t("\u{274C} Waveform failed:"),
+                                crate::i18n::t("audio"),
+                                audio_idx
+                            );
+                        }
                     }
                 }
             }
@@ -3327,6 +3443,7 @@ impl App {
             let mut cache = crate::video_cache::FrameCache::new(source.clone(), actor_idx);
             cache.extracting = true;
             cache.failed = false;
+            cache.extract_started_at = Some(std::time::Instant::now());
             self.state.frame_caches[actor_idx] = cache;
 
             let result_slot = self.frame_extract_results[actor_idx].clone();
@@ -3358,7 +3475,29 @@ impl App {
 
     /// Poll for frame extraction completion across all actors.
     fn poll_frame_extraction(&mut self) {
+        const EXTRACT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
         for actor_idx in 0..self.frame_extract_results.len() {
+            if actor_idx < self.state.frame_caches.len() {
+                let fc = &self.state.frame_caches[actor_idx];
+                if fc.extracting
+                    && !fc.ready
+                    && fc
+                        .extract_started_at
+                        .is_some_and(|t| t.elapsed() > EXTRACT_TIMEOUT)
+                {
+                    self.state.frame_caches[actor_idx].extracting = false;
+                    self.state.frame_caches[actor_idx].failed = true;
+                    self.state.frame_caches[actor_idx].extract_started_at = None;
+                    self.state.status = format!(
+                        "{} {} {}",
+                        crate::i18n::t("\u{274C} Preview frames failed:"),
+                        crate::i18n::t("actor"),
+                        actor_idx
+                    );
+                    continue;
+                }
+            }
+
             let outcome = if let Ok(mut slot) = self.frame_extract_results[actor_idx].lock() {
                 slot.take()
             } else {
@@ -3394,12 +3533,12 @@ impl App {
                     self.state
                         .video_duration_cache
                         .insert(path, duration);
-                    let want_out = actor_t_in + duration.max(0.1);
-                    if cur_out
-                        .map(|o| (o - want_out).abs() > 0.05)
-                        .unwrap_or(true)
-                    {
-                        self.state.scene.actors[actor_idx].t_out = Some(want_out);
+                    let before = cur_out;
+                    crate::split_crop::reconcile_actor_t_out_for_source(
+                        &mut self.state.scene.actors[actor_idx],
+                        duration,
+                    );
+                    if self.state.scene.actors[actor_idx].t_out != before {
                         crate::panels::sync_audio_to_actor(&mut self.state, actor_idx);
                     }
 
@@ -3422,6 +3561,7 @@ impl App {
                         fc.extracting = false;
                         fc.ready = false;
                         fc.failed = true;
+                        fc.extract_started_at = None;
                     }
                     self.state.status = format!(
                         "{} {} {}",
@@ -3566,6 +3706,12 @@ impl App {
 
     fn run_refresh(&mut self) {
         if self.state.refreshing {
+            return;
+        }
+        if crate::state::LIBRARY_LOCAL_ONLY {
+            self.state.reload_library();
+            self.state.status =
+                crate::i18n::t("\u{1F504} Local library refreshed.").into();
             return;
         }
         self.state.refreshing = true;
@@ -4213,9 +4359,9 @@ impl eframe::App for App {
             let needs_wf = self.state.scene.audio.iter().enumerate().any(|(i, au)| {
                 !au.deleted
                     && au.source.exists()
-                    && self.state.audio_waveforms.get(i)
-                        .map(|wf| !wf.ready && !wf.extracting)
-                        .unwrap_or(true)
+                    && self.state.audio_waveforms.get(i).is_none_or(|wf| {
+                        !wf.ready && !wf.extracting && !wf.failed
+                    })
             });
             if needs_wf {
                 self.start_waveform_extraction();
@@ -4234,7 +4380,11 @@ impl eframe::App for App {
         // inspector section that replaced it shares the main scene's
         // playhead, so no per-window key consumption is needed here.
 
-        // Keyboard shortcuts
+        // Keyboard shortcuts — capture frame snapshot *before* shortcuts
+        // so destructive edits (Delete) get a consistent undo baseline.
+        self.state.frame_undo_fallback_suppressed = false;
+        let frame_start_scene = self.state.build_undo_snapshot();
+
         self.handle_shortcuts(ctx);
 
         // ── Auto-rescan local asset directories ──
@@ -4271,29 +4421,19 @@ impl eframe::App for App {
         // Without it, those edits would never get an undo snapshot, and
         // the user only sees ONE history entry for an entire session
         // (which manifests as "Ctrl+Z bounces between two states").
-        let frame_start_scene = self.state.build_undo_snapshot();
+        // Note: `frame_start_scene` is captured above, before shortcuts.
 
-        // ── End the active drag-undo group when no mouse button is down ──
-        // The undo/redo system snapshots once per drag gesture by tracking
-        // a `last_drag_group` token. The token must be cleared as soon as
-        // the gesture ends (no pointer button held), so the *next* drag
-        // pushes a fresh undo entry instead of being absorbed into the
-        // previous one. See `EditorState::mutate_drag` for details.
-        // (`state.timeline_drag.dragging_clip` is also cleared on drag-end,
-        // but that's owned by `panels::timeline` itself — don't touch it
-        // from here or its lane-commit logic stops firing.)
         let any_pointer_down = ctx.input(|i| {
             i.pointer.primary_down()
                 || i.pointer.secondary_down()
                 || i.pointer.middle_down()
         });
-        if !any_pointer_down {
-            self.state.end_drag_group();
-        }
 
         // Play/pause: advance playhead
         if self.state.playing {
             let dt = ctx.input(|i| i.stable_dt).min(0.1); // cap at 100ms
+            self.state.playback_speed =
+                crate::editor_limits::clamp_playback_speed(self.state.playback_speed);
             self.state.playhead += dt * self.state.playback_speed;
 
             // Loop preview: clamp playhead within the loop region.
@@ -4380,14 +4520,6 @@ impl eframe::App for App {
 
                 // Refresh button at top of library
             });
-
-        // Timeline razor/split: drain the queued split immediately after the
-        // timeline has painted so the cut uses the click position and the
-        // exact clicked element (not whatever was previously selected).
-        if let Some((sel, cut_t)) = self.state.pending_timeline_split.take() {
-            self.state.selection = sel;
-            self.split_at_playhead(Some(cut_t));
-        }
 
         // Check if refresh was requested via flag
         if self.state.status == "__REFRESH_REQUESTED__" {
@@ -4793,6 +4925,14 @@ impl eframe::App for App {
                 panels::timeline(ui, &mut self.state);
             });
 
+        // Timeline razor/split: drain after the timeline panel has handled
+        // the click so the cut uses the click position and the exact clicked
+        // element (not whatever was previously selected).
+        if let Some((sel, cut_t)) = self.state.pending_timeline_split.take() {
+            self.state.selection = sel;
+            self.split_at_playhead(Some(cut_t));
+        }
+
         // Central panel: Preview
         egui::CentralPanel::default()
             .frame(
@@ -4962,6 +5102,7 @@ impl eframe::App for App {
             && self.state.last_drag_group.is_none()
             && !release_block_handled_undo
             && self.state.pre_press_scene.is_none()
+            && !self.state.frame_undo_fallback_suppressed
         {
             let pre_yaml =
                 serde_yaml::to_string(&frame_start_scene.scene).unwrap_or_default();
@@ -4976,6 +5117,14 @@ impl eframe::App for App {
             if pre_yaml != cur_yaml || assignments_changed {
                 self.state.undo.push_full(frame_start_scene);
             }
+        }
+
+        // End the drag-undo group only after release / fallback undo ran.
+        // Clearing it at the top of the frame (before the UI) made
+        // `mutate_drag_handled` always false on pointer-up, so Ctrl+Z
+        // pushed a duplicate snapshot for every canvas / timeline drag.
+        if !any_pointer_down {
+            self.state.end_drag_group();
         }
 
         // ── Toast notifications ──

@@ -1,3 +1,5 @@
+use std::collections::{BTreeMap, BTreeSet};
+
 use serde::{Deserialize, Serialize};
 
 use crate::easing::Easing;
@@ -124,6 +126,12 @@ pub struct TrackModifier {
     #[serde(default = "default_true_mod")]
     pub enabled: bool,
     pub kind: ModifierKind,
+    /// Param ids (e.g. `"freq_hz"`, `"amp_x"`) that write keyframes at edit time.
+    #[serde(default)]
+    pub animated_params: BTreeSet<String>,
+    /// Per-param clip-local keyframe tracks. Keys match `animated_params`.
+    #[serde(default)]
+    pub param_kfs: BTreeMap<String, Vec<Keyframe<f32>>>,
 }
 
 fn default_t_end() -> f32 { f32::MAX }
@@ -136,6 +144,71 @@ impl Default for TrackModifier {
             t_end: f32::MAX,
             enabled: true,
             kind: ModifierKind::default(),
+            animated_params: BTreeSet::new(),
+            param_kfs: BTreeMap::new(),
+        }
+    }
+}
+
+impl TrackModifier {
+    fn sample_f32(&self, key: &str, t: f32, fallback: f32) -> f32 {
+        if self.animated_params.contains(key) {
+            self.param_kfs
+                .get(key)
+                .filter(|kfs| !kfs.is_empty())
+                .and_then(|kfs| sample(kfs, t))
+                .unwrap_or(fallback)
+        } else {
+            fallback
+        }
+    }
+
+    /// Resolve modifier parameters at clip-local time `t`, honouring
+    /// any animated param tracks on this modifier instance.
+    pub fn sampled_kind(&self, t: f32) -> ModifierKind {
+        match &self.kind {
+            ModifierKind::Wobble {
+                freq_hz,
+                amp_x,
+                amp_y,
+                amp_rot_deg,
+                phase,
+            } => ModifierKind::Wobble {
+                freq_hz: self.sample_f32("freq_hz", t, *freq_hz),
+                amp_x: self.sample_f32("amp_x", t, *amp_x),
+                amp_y: self.sample_f32("amp_y", t, *amp_y),
+                amp_rot_deg: self.sample_f32("amp_rot_deg", t, *amp_rot_deg),
+                phase: self.sample_f32("phase", t, *phase),
+            },
+            ModifierKind::Shake {
+                freq_hz,
+                amp_x,
+                amp_y,
+                seed,
+            } => ModifierKind::Shake {
+                freq_hz: self.sample_f32("freq_hz", t, *freq_hz),
+                amp_x: self.sample_f32("amp_x", t, *amp_x),
+                amp_y: self.sample_f32("amp_y", t, *amp_y),
+                seed: *seed,
+            },
+            ModifierKind::Pulse { freq_hz, amp_scale } => ModifierKind::Pulse {
+                freq_hz: self.sample_f32("freq_hz", t, *freq_hz),
+                amp_scale: self.sample_f32("amp_scale", t, *amp_scale),
+            },
+            ModifierKind::Spin { speed_dps } => ModifierKind::Spin {
+                speed_dps: self.sample_f32("speed_dps", t, *speed_dps),
+            },
+            ModifierKind::Walk {
+                freq_hz,
+                amp_deg,
+                bob_y,
+                phase,
+            } => ModifierKind::Walk {
+                freq_hz: self.sample_f32("freq_hz", t, *freq_hz),
+                amp_deg: self.sample_f32("amp_deg", t, *amp_deg),
+                bob_y: self.sample_f32("bob_y", t, *bob_y),
+                phase: self.sample_f32("phase", t, *phase),
+            },
         }
     }
 }
@@ -233,7 +306,7 @@ pub fn evaluate_modifiers(modifiers: &[TrackModifier], t: f32) -> ModifierDelta 
             t >= m.t_start && t <= m.t_end
         };
         if !in_window { continue; }
-        match m.kind {
+        match m.sampled_kind(t) {
             ModifierKind::Wobble { freq_hz, amp_x, amp_y, amp_rot_deg, phase } => {
                 let w = std::f32::consts::TAU * freq_hz * t + phase;
                 out.dx += amp_x * w.sin();

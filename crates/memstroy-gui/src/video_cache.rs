@@ -49,6 +49,8 @@ pub struct FrameCache {
     pub extracting: bool,
     /// Set when ffmpeg/ffprobe could not build a preview (bad file, missing ffmpeg, …).
     pub failed: bool,
+    /// Wall-clock start of the in-flight extraction (for UI timeouts).
+    pub extract_started_at: Option<std::time::Instant>,
     /// Source frame dimensions (width, height) — read from first extracted frame.
     pub source_width: u32,
     pub source_height: u32,
@@ -110,6 +112,25 @@ struct ProcessedPreloadResult {
 }
 
 impl FrameCache {
+    /// After a razor split, the right-half actor can reuse the left
+    /// half's extracted frames (same source file) so preview sizing
+    /// and playback stay correct while a dedicated cache row exists.
+    pub fn seed_from_sibling(&mut self, sibling: &FrameCache) {
+        if self.source != sibling.source || !sibling.is_ready() {
+            return;
+        }
+        self.cache_dir = sibling.cache_dir.clone();
+        self.fps = sibling.fps;
+        self.frame_count = sibling.frame_count;
+        self.duration = sibling.duration;
+        self.source_width = sibling.source_width;
+        self.source_height = sibling.source_height;
+        self.ready = true;
+        self.extracting = false;
+        self.failed = false;
+        self.extract_started_at = None;
+    }
+
     /// Create a new empty frame cache (not yet ready).
     pub fn new(source: PathBuf, actor_index: usize) -> Self {
         Self {
@@ -122,6 +143,7 @@ impl FrameCache {
             ready: false,
             extracting: false,
             failed: false,
+            extract_started_at: None,
             source_width: 480,
             source_height: 270,
             texture: None,
@@ -184,6 +206,7 @@ impl FrameCache {
         self.ready = true;
         self.extracting = false;
         self.failed = false;
+        self.extract_started_at = None;
 
         // Initialize ring buffers. Decode only frame 0 on the UI thread —
         // loading all 90 slots here was freezing the app for 1–2s when
@@ -234,6 +257,25 @@ impl FrameCache {
         if !self.processed_preloading {
             self.trigger_processed_preload(frame_index, ck, cc, effects);
         }
+    }
+
+    /// Insert a cache slot for a new actor index, optionally cloning
+    /// probe metadata from an existing row that shares the same source.
+    pub fn insert_for_actor_split(
+        caches: &mut Vec<FrameCache>,
+        left_idx: usize,
+        right_idx: usize,
+        source: PathBuf,
+    ) {
+        while caches.len() <= right_idx {
+            let idx = caches.len();
+            caches.push(FrameCache::new(PathBuf::new(), idx));
+        }
+        let mut right = FrameCache::new(source, right_idx);
+        if left_idx < caches.len() {
+            right.seed_from_sibling(&caches[left_idx]);
+        }
+        caches.insert(right_idx, right);
     }
 
     /// Whether the cache has extracted frames and is ready for use.
@@ -380,7 +422,7 @@ impl FrameCache {
     ) -> ColorImage {
         let scaled = downscale_for_preview(raw, preview_dim);
 
-        let chroma_active = ck.similarity.is_finite() && ck.similarity >= 1.0e-5;
+        let chroma_active = ck.is_active();
         let cc_active = (cc.brightness.abs() > 1e-4)
             || (cc.contrast.abs() > 1e-4)
             || (cc.saturation.abs() > 1e-4)
@@ -801,6 +843,7 @@ fn hash_effect_params(
 ) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
+    ck.enabled.hash(&mut h);
     ck.key_color.hash(&mut h);
     bits(ck.similarity).hash(&mut h);
     bits(ck.blend).hash(&mut h);
@@ -958,7 +1001,7 @@ pub(crate) fn apply_effects_cpu_scalar(
     // skip the per-pixel loop entirely and just return a clone. This
     // is the common case when the user hasn't touched any color
     // controls — and saves a per-frame allocation+walk during playback.
-    let similarity_check = ck.similarity.is_finite() && ck.similarity >= 1.0e-5;
+    let similarity_check = ck.is_active();
     let cc_check = (cc.brightness.abs() > 1e-4)
         || (cc.contrast.abs() > 1e-4)
         || (cc.saturation.abs() > 1e-4)
@@ -1117,7 +1160,7 @@ pub(crate) fn apply_effects_cpu_simd(
     use wide::{f32x8, CmpGt, CmpLt};
 
     // ── Early-out checks (same as scalar) ──
-    let similarity_check = ck.similarity.is_finite() && ck.similarity >= 1.0e-5;
+    let similarity_check = ck.is_active();
     let cc_check = (cc.brightness.abs() > 1e-4)
         || (cc.contrast.abs() > 1e-4)
         || (cc.saturation.abs() > 1e-4)
@@ -2266,6 +2309,7 @@ mod tests {
     fn chroma_key_480p_under_16ms() {
         let img = synthetic_green_screen();
         let ck = memstroy_core::ChromaKeyParams {
+            enabled: true,
             key_color: [0, 255, 0],
             similarity: 0.3,
             blend: 0.1,
@@ -2297,12 +2341,14 @@ mod tests {
     #[test]
     fn hash_effect_params_changes_with_params() {
         let ck1 = memstroy_core::ChromaKeyParams {
+            enabled: true,
             key_color: [0, 255, 0],
             similarity: 0.3,
             blend: 0.1,
             spill: 0.2,
         };
         let ck2 = memstroy_core::ChromaKeyParams {
+            enabled: true,
             key_color: [0, 255, 0],
             similarity: 0.5, // changed
             blend: 0.1,
@@ -2346,6 +2392,7 @@ mod tests {
         let img = ColorImage { size: [100, 100], pixels };
 
         let ck = memstroy_core::ChromaKeyParams {
+            enabled: true,
             key_color: [0, 255, 0],
             similarity: 0.25,
             blend: 0.08,

@@ -313,6 +313,7 @@ fn handle_eyedropper_click_actor(
             let key = [pixel.r(), pixel.g(), pixel.b()];
 
             state.scene.actors[idx].chroma_key.key_color = key;
+            state.scene.actors[idx].chroma_key.enabled = true;
             // Persist the new key colour as part of the per-clip sidecar.
             let src = state.scene.actors[idx].source.clone();
             let chroma = state.scene.actors[idx].chroma_key.clone();
@@ -414,6 +415,7 @@ fn handle_eyedropper_click_overlay(
                 if ck.similarity < 1.0e-3 {
                     ck.similarity = 0.18;
                 }
+                ck.enabled = true;
                 im.chroma_key = Some(ck);
             }
             state.status = format!(
@@ -580,14 +582,21 @@ pub(crate) fn overlay_world_aabb(
     let wp = get_element_world_pos(state, element_id, &[], t);
     let center_x = wp.x + mod_delta.dx;
     let center_y = wp.y + mod_delta.dy;
+    let hit_center = if let Overlay::Image(img) = overlay {
+        overlay_image_world_center(
+            state,
+            img,
+            &ov_state,
+            WorldPos { x: center_x, y: center_y },
+        )
+    } else {
+        WorldPos { x: center_x, y: center_y }
+    };
 
-    // Use the texture-aware bbox so image overlays use real PNG
-    // dimensions (not the legacy 200×200 placeholder), keeping the
-    // marquee hit-rect aligned with the visible picture.
     let (ew, eh) = overlay_bbox_with_state(overlay, &ov_state, state);
     Some((
-        [center_x - ew * 0.5, center_y - eh * 0.5],
-        [center_x + ew * 0.5, center_y + eh * 0.5],
+        [hit_center.x - ew * 0.5, hit_center.y - eh * 0.5],
+        [hit_center.x + ew * 0.5, hit_center.y + eh * 0.5],
     ))
 }
 
@@ -1520,7 +1529,7 @@ fn draw_single_actor(
                 .collect();
             let actor_fx = &actor_fx_owned;
             let any_fx_active = actor_fx.iter().any(|e| e.enabled && e.intensity > 0.001);
-            let has_effects = actor_ck.similarity > 0.01
+            let has_effects = actor_ck.is_active()
                 || !actor_cc.is_identity()
                 || any_fx_active;
 
@@ -1590,7 +1599,7 @@ fn draw_single_actor(
             .map(|e| e.sampled_at(local_for_anim))
             .any(|e| e.enabled && e.intensity > 0.001);
         let needs_processed_warmup = cache_ready
-            && (actor_ck.similarity > 0.01
+            && (actor_ck.is_active()
                 || !actor_cc_warm.is_identity()
                 || any_fx_warm)
             && state
@@ -3553,7 +3562,7 @@ fn draw_selection_gizmo(
                 if state.selection != Selection::None {
                     state.canvas_selection.push(state.selection);
                 } else {
-                    crate::canvas_image_search::cancel_canvas_image_search(state);
+                    crate::canvas_image_search::on_canvas_empty_click(state);
                 }
             }
         }
@@ -4102,15 +4111,12 @@ fn move_selection_mode(state: &EditorState) -> crate::state::CanvasDragMode {
             CanvasDragMode::MoveActorLegacy { actor_idx: idx, initial_pos: initial_world }
         }
         Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
-            let ov_id = match &state.scene.overlays[idx] {
-                Overlay::Text(o) => o.id.as_str(),
-                Overlay::Image(im) => im.id.as_str(),
-                Overlay::Video(v) => v.id.as_str(),
-            };
-            let wp = get_element_world_pos(state, ov_id, &[], t);
+            let initial_world = overlay_visible_world_center(state, idx, t)
+                .map(|p| [p.x, p.y])
+                .unwrap_or([0.0, 0.0]);
             CanvasDragMode::MoveOverlay {
                 overlay_idx: idx,
-                initial_pos: [wp.x, wp.y],
+                initial_pos: initial_world,
             }
         }
         Selection::RenderFrame => {
@@ -4556,24 +4562,92 @@ fn write_selection_world_center(
                 Overlay::Image(im) => im.id.clone(),
                 Overlay::Video(v) => v.id.clone(),
             };
+            let animated_clone = match &state.scene.overlays[idx] {
+                Overlay::Text(t) => t.animated_params.clone(),
+                Overlay::Image(im) => im.animated_params.clone(),
+                Overlay::Video(v) => v.animated_params.clone(),
+            };
             let parent_id = match &state.scene.overlays[idx] {
                 Overlay::Text(t) => t.parent_id.clone(),
                 Overlay::Image(im) => im.parent_id.clone(),
                 Overlay::Video(v) => v.parent_id.clone(),
             };
             let mut stored_center = WorldPos { x: center[0], y: center[1] };
-            if let Some(pid) = parent_id {
-                let mut visited = vec![ov_id];
-                if let Some(pxf) = resolve_parent_transform(state, &pid, t, &mut visited) {
+            if let Some(ref pid) = parent_id {
+                let mut visited = vec![ov_id.clone()];
+                if let Some(pxf) = resolve_parent_transform(state, pid, t, &mut visited) {
                     stored_center = inverse_parent_transform(stored_center, &pxf);
                 }
             }
-            // Same decoupled-from-rf world→norm conversion as the
-            // actor branch above.
+            if let Overlay::Image(img) = &state.scene.overlays[idx] {
+                let sample_t = overlay_clip_local_time_at(state, idx, t);
+                let mut ov_state = overlay_visual_state(
+                    &state.scene,
+                    &state.scene.overlays[idx],
+                    &ov_id,
+                    parent_id.as_ref(),
+                    t,
+                    sample_t,
+                    &img.modifiers,
+                );
+                apply_canvas_transform_preview(
+                    state,
+                    &ov_id,
+                    &mut ov_state.rotation_deg,
+                    &mut ov_state.scale,
+                    &mut ov_state.scale_y,
+                );
+                stored_center =
+                    overlay_image_layout_anchor_from_visible(state, img, &ov_state, stored_center);
+            }
             let [rw, rh] = state.scene.render_frame.resolution;
             let world_w = rw as f32;
             let world_h = rh as f32;
-            if world_w <= 0.0 || world_h <= 0.0 { return; }
+            if world_w <= 0.0 || world_h <= 0.0 {
+                return;
+            }
+            if let Some(cl) = state
+                .scene
+                .canvas_layouts
+                .iter_mut()
+                .find(|cl| cl.element_id == ov_id)
+            {
+                let sx = stored_center.x;
+                let sy = stored_center.y;
+                crate::kf_anim::write_canvas_param(
+                    &mut cl.keyframes,
+                    &animated_clone,
+                    &[
+                        memstroy_core::param_ids::POS_X,
+                        memstroy_core::param_ids::POS_Y,
+                    ],
+                    t,
+                    |v| {
+                        v.pos.x = sx;
+                        v.pos.y = sy;
+                    },
+                );
+                let new_norm = [stored_center.x / world_w, stored_center.y / world_h];
+                let (layout, animated_params) =
+                    overlay_layout_and_animated_mut(&mut state.scene.overlays[idx]);
+                crate::kf_anim::write_overlay_param(
+                    layout,
+                    animated_params,
+                    local_t,
+                    memstroy_core::param_ids::POS_X,
+                    false,
+                    |v| v.pos[0] = new_norm[0],
+                );
+                crate::kf_anim::write_overlay_param(
+                    layout,
+                    animated_params,
+                    local_t,
+                    memstroy_core::param_ids::POS_Y,
+                    false,
+                    |v| v.pos[1] = new_norm[1],
+                );
+                return;
+            }
             let new_norm = [stored_center.x / world_w, stored_center.y / world_h];
             let (layout, animated_params) =
                 overlay_layout_and_animated_mut(&mut state.scene.overlays[idx]);
@@ -5124,25 +5198,7 @@ fn sniff_hit(state: &EditorState, pos: WorldPos) -> Option<Selection> {
         let half_w = ew * 0.5;
         let half_h = eh * 0.5;
         let hit_center = if let Overlay::Image(img) = overlay {
-            if let Some((full_w, full_h)) =
-                image_overlay_uncropped_size(img, &ov_state, state)
-            {
-                let adj = crate::image_effects::CropLayoutAdjust::from_inset(
-                    crate::image_effects::accumulated_crop_inset(&img.effects),
-                );
-                let off = image_crop_world_center_offset(
-                    full_w,
-                    full_h,
-                    adj,
-                    ov_state.rotation_deg,
-                );
-                WorldPos {
-                    x: ov_world.x + off.x,
-                    y: ov_world.y + off.y,
-                }
-            } else {
-                ov_world
-            }
+            overlay_image_world_center(state, img, &ov_state, ov_world)
         } else {
             ov_world
         };
@@ -5292,8 +5348,13 @@ fn selected_element_gizmo(
                 &mut ov_state.scale,
                 &mut ov_state.scale_y,
             );
-            let world_pos = get_element_world_pos(state, ov_id, &[], t);
-            let center_screen = state.canvas_viewport.world_to_screen(world_pos, viewport_size);
+            let layout_world = get_element_world_pos(state, ov_id, &[], t);
+            let hit_center = if let Overlay::Image(img) = overlay {
+                overlay_image_world_center(state, img, &ov_state, layout_world)
+            } else {
+                layout_world
+            };
+            let center_screen = state.canvas_viewport.world_to_screen(hit_center, viewport_size);
             let zoom = state.canvas_viewport.zoom;
             let mut gizmo = ElementGizmo {
                 center: Pos2::new(
@@ -5313,7 +5374,7 @@ fn selected_element_gizmo(
                     );
                     gizmo.half_w = full_w * 0.5 * zoom;
                     gizmo.half_h = full_h * 0.5 * zoom;
-                    apply_crop_to_element_gizmo(&mut gizmo, full_w, full_h, adj, zoom);
+                    apply_crop_to_element_gizmo_size_only(&mut gizmo, full_w, full_h, adj, zoom);
                 } else {
                     let (elem_w, elem_h) =
                         overlay_bbox_with_state(overlay, &ov_state, state);
@@ -5962,20 +6023,112 @@ fn image_crop_world_center_offset(
     }
 }
 
-/// Shrink / shift the yellow selection gizmo to match the visible crop.
-fn apply_crop_to_element_gizmo(
+/// World centre used for image overlay hit-testing — matches the visible
+/// crop, not the uncropped layout anchor.
+pub(crate) fn overlay_image_world_center(
+    state: &EditorState,
+    img: &memstroy_core::ImageOverlay,
+    ov_state: &memstroy_core::OverlayState,
+    layout_world: WorldPos,
+) -> WorldPos {
+    if let Some((full_w, full_h)) = image_overlay_uncropped_size(img, ov_state, state) {
+        let adj = crate::image_effects::CropLayoutAdjust::from_inset(
+            crate::image_effects::accumulated_crop_inset(&img.effects),
+        );
+        let off = image_crop_world_center_offset(full_w, full_h, adj, ov_state.rotation_deg);
+        WorldPos {
+            x: layout_world.x + off.x,
+            y: layout_world.y + off.y,
+        }
+    } else {
+        layout_world
+    }
+}
+
+/// Inverse of [`overlay_image_world_center`] — maps the on-screen centre
+/// (gizmo / pointer) back to the layout anchor stored in `canvas_layouts`.
+fn overlay_image_layout_anchor_from_visible(
+    state: &EditorState,
+    img: &memstroy_core::ImageOverlay,
+    ov_state: &memstroy_core::OverlayState,
+    visible_center: WorldPos,
+) -> WorldPos {
+    if let Some((full_w, full_h)) = image_overlay_uncropped_size(img, ov_state, state) {
+        let adj = crate::image_effects::CropLayoutAdjust::from_inset(
+            crate::image_effects::accumulated_crop_inset(&img.effects),
+        );
+        let off = image_crop_world_center_offset(full_w, full_h, adj, ov_state.rotation_deg);
+        WorldPos {
+            x: visible_center.x - off.x,
+            y: visible_center.y - off.y,
+        }
+    } else {
+        visible_center
+    }
+}
+
+/// Visible world centre for an overlay at `idx` (crop-aware for images).
+fn overlay_visible_world_center(state: &EditorState, idx: usize, t: f32) -> Option<WorldPos> {
+    let overlay = state.scene.overlays.get(idx)?;
+    let (ov_id, t_in, t_out, parent_id) = match overlay {
+        Overlay::Text(txt) => (txt.id.as_str(), txt.t_in, txt.t_out, txt.parent_id.as_ref()),
+        Overlay::Image(img) => (img.id.as_str(), img.t_in, img.t_out, img.parent_id.as_ref()),
+        Overlay::Video(vid) => (vid.id.as_str(), vid.t_in, vid.t_out, vid.parent_id.as_ref()),
+    };
+    let sample_t = if t >= t_in && t <= t_out {
+        t - t_in
+    } else if t < t_in {
+        0.0
+    } else {
+        (t_out - t_in).max(0.0)
+    };
+    let modifiers: &[TrackModifier] = match overlay {
+        Overlay::Text(txt) => &txt.modifiers,
+        Overlay::Image(img) => &img.modifiers,
+        Overlay::Video(vid) => &vid.modifiers,
+    };
+    let mut ov_state = overlay_visual_state(
+        &state.scene,
+        overlay,
+        ov_id,
+        parent_id,
+        t,
+        sample_t,
+        modifiers,
+    );
+    apply_canvas_transform_preview(
+        state,
+        ov_id,
+        &mut ov_state.rotation_deg,
+        &mut ov_state.scale,
+        &mut ov_state.scale_y,
+    );
+    let mod_delta = if t >= t_in && t <= t_out {
+        keyframe::evaluate_modifiers(modifiers, sample_t)
+    } else {
+        keyframe::ModifierDelta::default()
+    };
+    let layout_world = get_element_world_pos(state, ov_id, &[], t);
+    let center = WorldPos {
+        x: layout_world.x + mod_delta.dx,
+        y: layout_world.y + mod_delta.dy,
+    };
+    Some(if let Overlay::Image(img) = overlay {
+        overlay_image_world_center(state, img, &ov_state, center)
+    } else {
+        center
+    })
+}
+
+/// Shrink the yellow selection gizmo to match the visible crop extent.
+/// Centre offset is applied separately via [`overlay_image_world_center`].
+fn apply_crop_to_element_gizmo_size_only(
     gizmo: &mut ElementGizmo,
     full_w: f32,
     full_h: f32,
     adj: crate::image_effects::CropLayoutAdjust,
     zoom: f32,
 ) {
-    let ox = full_w * adj.center_x_frac * zoom;
-    let oy = full_h * adj.center_y_frac * zoom;
-    let rad = gizmo.rotation_deg.to_radians();
-    let (c, s) = (rad.cos(), rad.sin());
-    gizmo.center.x += ox * c - oy * s;
-    gizmo.center.y += ox * s + oy * c;
     gizmo.half_w = full_w * 0.5 * adj.visible_w_frac * zoom;
     gizmo.half_h = full_h * 0.5 * adj.visible_h_frac * zoom;
 }
@@ -7853,6 +8006,10 @@ pub fn handle_canvas_asset_drag(
 
     // ── Accept drop on release ──
     let mouse_released = ui.input(|i| i.pointer.any_released());
+    if mouse_released && !in_canvas {
+        state.clear_asset_drag();
+        return;
+    }
     if mouse_released && in_canvas {
         let world = state
             .canvas_viewport
@@ -7872,10 +8029,7 @@ pub fn handle_canvas_asset_drag(
                         world_y: world.y,
                     },
                 ) {
-                    state.asset_drag.dragging = None;
-                    state.asset_drag.kind = crate::state::AssetDragKind::None;
-                    state.asset_drag.label.clear();
-                    state.asset_drag.thumbnail = None;
+                    state.clear_asset_drag();
                     return;
                 }
                 crate::panels::add_actor_from_clip_at_canvas(
@@ -7926,20 +8080,23 @@ pub fn handle_canvas_asset_drag(
                         };
                         if let Some(kf) = layout.first_mut() {
                             kf.value.pos = [
-                                (world.x / world_w).clamp(-2.0, 3.0),
-                                (world.y / world_h).clamp(-2.0, 3.0),
+                                crate::editor_limits::clamp_pos_norm(world.x / world_w),
+                                crate::editor_limits::clamp_pos_norm(world.y / world_h),
                             ];
                         }
                     }
+                    let overlay_idx = state.scene.overlays.len().saturating_sub(1);
+                    crate::canvas_image_search::sync_overlay_canvas_world_center(
+                        state,
+                        overlay_idx,
+                        [world.x, world.y],
+                    );
                 }
             }
             crate::state::AssetDragKind::None => {}
         }
 
-        state.asset_drag.dragging = None;
-        state.asset_drag.kind = crate::state::AssetDragKind::None;
-        state.asset_drag.label.clear();
-        state.asset_drag.thumbnail = None;
+        state.clear_asset_drag();
     }
 }
 
