@@ -98,7 +98,16 @@ pub fn rasterize_text_overlay(
     // that's a viewport zoom; the model's font_size is already in
     // output-pixel units (matches what `drawtext fontsize=` consumed
     // before this rewrite).
-    let font_size = style.font_size.max(1.0);
+    // ── Hardening: bound everything that feeds the canvas allocation ──
+    // `style.*` come verbatim from an untrusted scene file. Without these
+    // caps a value like `box_padding = 1e9` makes the saturating `f32 as u32`
+    // cast below produce a ~u32::MAX canvas dimension and the final
+    // `ImageBuffer::from_pixel` attempts a multi-terabyte allocation (panic /
+    // OOM = render+preview DoS). Clamp the inputs and hard-cap the canvas.
+    const MAX_FONT_SIZE: f32 = 2048.0;
+    const MAX_TEXT_PAD: f32 = 4096.0;
+    const MAX_TEXT_CANVAS_DIM: u32 = 8192;
+    let font_size = style.font_size.max(1.0).min(MAX_FONT_SIZE);
     let scale = PxScale::from(font_size);
     let scaled = font.as_scaled(scale);
     let ascent = scaled.ascent();
@@ -120,23 +129,31 @@ pub fn rasterize_text_overlay(
     // PNG is rasterised at output resolution at scale = 1.0 (we let
     // the per-frame scale_expr resize the final PNG via the overlay
     // path, so animation continues to drive size).
-    let pad = style.box_padding.max(0.0);
-    let pad_l = style.box_extra_left.max(0.0);
-    let pad_r = style.box_extra_right.max(0.0);
-    let radius = style.box_corner_radius.max(0.0);
+    let pad = style.box_padding.max(0.0).min(MAX_TEXT_PAD);
+    let pad_l = style.box_extra_left.max(0.0).min(MAX_TEXT_PAD);
+    let pad_r = style.box_extra_right.max(0.0).min(MAX_TEXT_PAD);
+    let radius = style.box_corner_radius.max(0.0).min(MAX_TEXT_PAD);
     let plate_w = max_line_w + pad * 2.0 + pad_l + pad_r;
     let plate_h = total_h + pad * 2.0;
 
     // Stroke bleed — the glyph outline can extend beyond the plate by
     // up to `outline_width` px. Pad the canvas so we don't clip it.
     let stroke_w = if style.outline.is_some() {
-        style.outline_width.max(0.0)
+        style.outline_width.max(0.0).min(MAX_TEXT_PAD)
     } else {
         0.0
     };
-    let canvas_extra = stroke_w.ceil() as u32 + 2;
-    let canvas_w = (plate_w.ceil() as u32 + canvas_extra * 2).max(2);
-    let canvas_h = (plate_h.ceil() as u32 + canvas_extra * 2).max(2);
+    // Saturating arithmetic + a hard cap: `plate_w`/`plate_h` can still be huge
+    // when the text string itself is pathologically long, so the final `as u32`
+    // casts saturate and we clamp the result to MAX_TEXT_CANVAS_DIM. This bounds
+    // the allocation to at most 8192*8192*4 ≈ 256 MiB instead of crashing.
+    let canvas_extra = (stroke_w.ceil() as u32).saturating_add(2);
+    let canvas_w = (plate_w.ceil() as u32)
+        .saturating_add(canvas_extra.saturating_mul(2))
+        .clamp(2, MAX_TEXT_CANVAS_DIM);
+    let canvas_h = (plate_h.ceil() as u32)
+        .saturating_add(canvas_extra.saturating_mul(2))
+        .clamp(2, MAX_TEXT_CANVAS_DIM);
 
     let plate_origin_x = canvas_extra as f32;
     let plate_origin_y = canvas_extra as f32;

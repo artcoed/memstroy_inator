@@ -201,6 +201,12 @@ impl SkeletonTemplate {
 
     /// Set a keyframe for a point at time `t`. Inserts or updates.
     pub fn set_point_keyframe(&mut self, point_name: &str, t: f32, state: PointState, easing: Easing) {
+        // Reject non-finite times: a NaN/inf time would make the `partial_cmp`
+        // sort below return `None` and panic the `unwrap`. Untrusted scenes can
+        // seed `.nan` keyframe times via serde, so guard at the insertion point.
+        if !t.is_finite() {
+            return;
+        }
         let point = self.points.get_mut(point_name);
         let Some(point) = point else { return; };
 
@@ -211,7 +217,9 @@ impl SkeletonTemplate {
             existing.easing = easing;
         } else {
             point.track.push(Keyframe { t, value: state, easing });
-            point.track.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap());
+            // Total-order-safe: a pre-existing non-finite time loaded from an
+            // untrusted scene must not panic the sort (matches keyframe.rs).
+            point.track.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
         }
     }
 

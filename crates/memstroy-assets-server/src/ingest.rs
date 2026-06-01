@@ -6,10 +6,25 @@
 //! we re-index the asset store so the new files become visible to the
 //! GUI without requiring a server restart.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tracing::{info, warn};
 
 use crate::store::AssetStore;
+
+/// Guards against unbounded concurrent ingest jobs. An unauthenticated flood of
+/// `POST /api/ingest/tg` would otherwise spawn arbitrarily many long-lived
+/// download tasks, exhausting the (2-worker) runtime and the disk volume.
+static INGEST_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Releases the `INGEST_RUNNING` flag when the ingest task ends — including on
+/// an early return or a panic-unwind — so a failed job can't wedge the guard.
+struct IngestGuard;
+impl Drop for IngestGuard {
+    fn drop(&mut self) {
+        INGEST_RUNNING.store(false, Ordering::SeqCst);
+    }
+}
 
 /// JPEG bytes used as a last-resort thumbnail when both ffmpeg-from-video
 /// and the Telegram poster fallback fail. Same image as the
@@ -27,14 +42,28 @@ const PLACEHOLDER_THUMB: &[u8] = include_bytes!("../assets/fallback.jpg");
 ///
 /// The task will abort gracefully if it takes longer than 30 seconds
 /// to start, preventing hangs when there's no internet connection.
-pub fn spawn_tg_ingest(store: AssetStore, channel: String, limit: u32) {
+/// Spawn a Telegram ingest job unless one is already running. Returns `true`
+/// when a new job was started, `false` when one was already in flight (so the
+/// caller can reject the request instead of piling on more work).
+pub fn try_spawn_tg_ingest(store: AssetStore, channel: String, limit: u32) -> bool {
+    // Acquire the single-ingest guard. `compare_exchange` fails when another
+    // job already set the flag.
+    if INGEST_RUNNING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        warn!("ingest already in progress; rejecting new request");
+        return false;
+    }
     tokio::spawn(async move {
+        // Released when this task ends (success, timeout, or panic-unwind).
+        let _guard = IngestGuard;
         // Set a timeout for the entire ingest operation to prevent hangs
         // when there's no internet connection or the server is shutting down
         // Increased to 5 minutes to allow downloading multiple clips
         let timeout_secs = if limit >= 10 { 600 } else { 300 };
         let timeout_duration = Duration::from_secs(timeout_secs);
-        
+
         match tokio::time::timeout(timeout_duration, run_ingest(store, channel, limit)).await {
             Ok(_) => {
                 info!("Telegram ingest completed successfully");
@@ -44,6 +73,7 @@ pub fn spawn_tg_ingest(store: AssetStore, channel: String, limit: u32) {
             }
         }
     });
+    true
 }
 
 async fn run_ingest(store: AssetStore, channel: String, limit: u32) {

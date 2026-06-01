@@ -1120,6 +1120,56 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
+/// True when `url` points at a public `http`/`https` host — i.e. NOT a
+/// loopback / link-local / private / unique-local address and not a
+/// `localhost` name. Keeps the web-image-search fetch (and its redirect
+/// chain) from being used as an SSRF probe against the user's own machine or
+/// LAN (e.g. `http://127.0.0.1:8765` — the in-process assets server — or
+/// `http://169.254.169.254/…` cloud metadata) and rejects non-http schemes
+/// like `file://`. Uses `reqwest::Url` (re-exported) so no new dependency.
+fn is_public_http_url(url: &reqwest::Url) -> bool {
+    if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
+    let Some(host) = url.host_str() else { return false };
+    // `host_str` keeps the brackets around IPv6 literals.
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return ip_is_public(ip);
+    }
+    let h = host.to_ascii_lowercase();
+    h != "localhost" && !h.ends_with(".localhost")
+}
+
+/// Reject the IP ranges that should never be reachable from a remote image
+/// URL: loopback, private/RFC1918, CGNAT, link-local (incl. the cloud
+/// metadata endpoint), unspecified, broadcast, documentation, and IPv6 ULA.
+fn ip_is_public(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            !(v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                // CGNAT / shared address space 100.64.0.0/10
+                || (o[0] == 100 && (o[1] & 0xC0) == 64))
+        }
+        IpAddr::V6(v6) => {
+            let o = v6.octets();
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                // unique-local fc00::/7
+                || (o[0] & 0xFE) == 0xFC
+                // link-local fe80::/10
+                || (o[0] == 0xFE && (o[1] & 0xC0) == 0x80))
+        }
+    }
+}
+
 fn parse_ddg_results(v: &serde_json::Value) -> Vec<WebImageHit> {
     let arr = match v.get("results").and_then(|r| r.as_array()) {
         Some(a) => a,
@@ -1156,6 +1206,20 @@ fn parse_ddg_results(v: &serde_json::Value) -> Vec<WebImageHit> {
             .and_then(|n| n.as_u64())
             .unwrap_or(0) as u32;
         if image.is_empty() {
+            continue;
+        }
+        // Drop results whose image/thumbnail URL is not a public http(s) URL.
+        // The thumbnail is auto-loaded by egui's image loader (which also
+        // resolves `file://` URIs) and the image is fetched on click — both are
+        // SSRF / local-file-read sinks if a non-public URL slips through. Real
+        // DuckDuckGo results are always https CDN URLs, so this never drops a
+        // legitimate hit.
+        let url_ok = |u: &str| {
+            reqwest::Url::parse(u)
+                .map(|p| is_public_http_url(&p))
+                .unwrap_or(false)
+        };
+        if !url_ok(&image) || !url_ok(&thumb) {
             continue;
         }
         hits.push(WebImageHit::new(image, thumb, title, url, width, height));
@@ -1222,15 +1286,35 @@ async fn run_web_image_download(
     title_hint: &str,
     dest_dir: &std::path::Path,
 ) -> Result<LibraryAsset, String> {
+    // Reject non-public targets before connecting. Defence-in-depth: results
+    // are already filtered in `parse_ddg_results`, but this entry point is also
+    // reachable with URLs echoed back through job events.
+    let parsed = reqwest::Url::parse(image_url)
+        .map_err(|e| format!("Invalid image URL: {e}"))?;
+    if !is_public_http_url(&parsed) {
+        return Err(format!("Refusing to fetch non-public URL: {image_url}"));
+    }
+
     let client = reqwest::Client::builder()
         .user_agent(UA)
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(45))
+        // Re-validate every redirect hop so an attacker-controlled public
+        // origin can't 30x-redirect us onto loopback / LAN / metadata.
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 5 {
+                attempt.error("too many redirects")
+            } else if is_public_http_url(attempt.url()) {
+                attempt.follow()
+            } else {
+                attempt.error("redirect to non-public host blocked")
+            }
+        }))
         .build()
         .map_err(|e| format!("HTTP client init failed: {e}"))?;
 
-    let resp = client
-        .get(image_url)
+    let mut resp = client
+        .get(parsed)
         .header("Accept", "image/*,*/*;q=0.8")
         .send()
         .await
@@ -1247,10 +1331,27 @@ async fn run_web_image_download(
         .and_then(ext_from_mime)
         .or_else(|| ext_from_url(image_url))
         .unwrap_or("png");
-    let bytes = resp
-        .bytes()
+    // Cap the body size. `resp.bytes()` buffers an unbounded body into memory
+    // (memory-exhaustion DoS from an attacker-controlled origin); read in
+    // chunks with a hard ceiling and reject early if the advertised
+    // Content-Length already exceeds it.
+    const MAX_IMAGE_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
+    if let Some(len) = resp.content_length() {
+        if len > MAX_IMAGE_BYTES as u64 {
+            return Err(format!("Image too large: {len} bytes (max {MAX_IMAGE_BYTES})"));
+        }
+    }
+    let mut bytes: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
         .await
-        .map_err(|e| format!("Couldn't read response body: {e}"))?;
+        .map_err(|e| format!("Couldn't read response body: {e}"))?
+    {
+        if bytes.len() + chunk.len() > MAX_IMAGE_BYTES {
+            return Err(format!("Image exceeds {MAX_IMAGE_BYTES} bytes; aborted"));
+        }
+        bytes.extend_from_slice(&chunk[..]);
+    }
 
     if bytes.is_empty() {
         return Err("Empty response body".to_string());

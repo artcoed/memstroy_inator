@@ -223,7 +223,12 @@ impl<S: Source<Item = f32>> Reverb<S> {
     pub fn new(inner: S, mix: f32) -> Self {
         let channels = (inner.channels() as usize).min(8).max(1);
         let mix = mix.clamp(0.0, 1.0);
-        let sr = inner.sample_rate().max(1) as usize;
+        // Cap the reported sample rate used for buffer sizing. An upstream
+        // Speed adapter reports `original_sr * rate`, and `rate` derives from
+        // the unclamped scene `speed`/`pitch` fields — an absurd value makes
+        // `sample_rate()` saturate near u32::MAX and would size this delay line
+        // at many gigabytes (OOM = DoS). 384 kHz covers every real audio device.
+        let sr = (inner.sample_rate().max(1) as usize).min(384_000);
         // ~120 ms per channel → buffer length = sr * 0.12 * channels
         let per_channel = (sr as f32 * 0.12).round().max(1.0) as usize;
         let delay = vec![0.0; per_channel.saturating_mul(channels)];
