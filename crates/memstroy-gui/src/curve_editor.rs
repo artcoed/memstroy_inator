@@ -942,8 +942,8 @@ fn transform_curve_editor<T>(
     clear_param: fn(&mut Vec<Keyframe<T>>, &BTreeSet<String>, &str, f32),
     enable_param: fn(&mut Vec<Keyframe<T>>, &BTreeSet<String>, &str, f32),
     get_property: fn(&T, usize) -> f32,
-    set_property: fn(&mut T, usize, f32),
-    default_value: fn() -> T,
+    _set_property: fn(&mut T, usize, f32),
+    _default_value: fn() -> T,
     param_change_times: fn(
         &[Keyframe<T>],
         &BTreeSet<String>,
@@ -1417,7 +1417,6 @@ fn transform_curve_editor<T>(
     // actual property changes — this fixes the "position kfs showing
     // in scale menu" bug.
     let diamond_size = 6.0;
-    let mut drag_from_t: Option<f32> = None;
     let mut click_idx: Option<usize> = None;
     let mut delete_at_t: Option<f32> = None;
     let ctrl_held = ui.input(|i| i.modifiers.ctrl || i.modifiers.mac_cmd);
@@ -1430,12 +1429,20 @@ fn transform_curve_editor<T>(
         let center = Pos2::new(cx, cy);
 
         let is_ce_selected = ce_selected.contains(&pi);
+        let id = ui.make_persistent_id(("curve_kf", param_id, pi));
+        let drag_anchor_id = id.with("single_drag_anchor");
+        let drag_offset_id = id.with("single_drag_offset");
+        let single_drag_offset = ui
+            .data(|d| d.get_temp::<egui::Vec2>(drag_offset_id))
+            .unwrap_or(egui::Vec2::ZERO);
 
         let display_center = if is_ce_selected && *ce_multi_drag {
             Pos2::new(
                 center.x + ce_multi_drag_delta.x,
                 center.y + ce_multi_drag_delta.y,
             )
+        } else if single_drag_offset != egui::Vec2::ZERO {
+            center + single_drag_offset
         } else {
             center
         };
@@ -1491,11 +1498,13 @@ fn transform_curve_editor<T>(
         }
 
         let diamond_rect = Rect::from_center_size(display_center, Vec2::splat(diamond_size * 2.5));
-        let id = ui.make_persistent_id(("curve_kf", param_id, pi));
         let kf_resp = ui.interact(diamond_rect, id, Sense::click_and_drag());
 
         if kf_resp.drag_started() {
-            drag_from_t = Some(pt.t);
+            ui.data_mut(|d| {
+                d.insert_temp(drag_anchor_id, (pt.t, pt.value));
+                d.insert_temp(drag_offset_id, egui::Vec2::ZERO);
+            });
             if is_ce_selected && ce_selected.len() > 1 {
                 *ce_multi_drag = true;
                 *ce_multi_drag_delta = egui::Vec2::ZERO;
@@ -1504,12 +1513,27 @@ fn transform_curve_editor<T>(
         if kf_resp.dragged() {
             if is_ce_selected && *ce_multi_drag {
                 *ce_multi_drag_delta += kf_resp.drag_delta();
-            } else if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
-                let old_t = drag_from_t.unwrap_or(pt.t);
-                let new_t =
-                    graph_x_to_time(pos.x, time_min, time_max, inner_rect).clamp(0.0, time_max);
-                let new_v =
-                    graph_y_to_value(pos.y, val_min, val_max, inner_rect).clamp(val_min, val_max);
+            } else {
+                ui.data_mut(|d| d.insert_temp(drag_offset_id, kf_resp.drag_delta()));
+            }
+        }
+        if kf_resp.drag_stopped() && is_ce_selected && *ce_multi_drag {
+            ui.data_mut(|d| {
+                d.remove::<(f32, f32)>(drag_anchor_id);
+                d.remove::<egui::Vec2>(drag_offset_id);
+            });
+        } else if kf_resp.drag_stopped() {
+            let anchor = ui.data(|d| d.get_temp::<(f32, f32)>(drag_anchor_id));
+            let final_delta = ui
+                .data(|d| d.get_temp::<egui::Vec2>(drag_offset_id))
+                .unwrap_or_else(|| kf_resp.drag_delta());
+            if let Some((old_t, old_value)) = anchor {
+                let old_cx = time_to_graph_x(old_t, time_min, time_max, inner_rect);
+                let old_cy = value_to_graph_y(old_value, val_min, val_max, inner_rect);
+                let new_t = graph_x_to_time(old_cx + final_delta.x, time_min, time_max, inner_rect)
+                    .clamp(0.0, time_max);
+                let new_v = graph_y_to_value(old_cy + final_delta.y, val_min, val_max, inner_rect)
+                    .clamp(val_min, val_max);
                 rekey_param(
                     keyframes,
                     canvas_slot,
@@ -1519,11 +1543,11 @@ fn transform_curve_editor<T>(
                     new_t,
                     new_v,
                 );
-                drag_from_t = Some(new_t);
             }
-        }
-        if kf_resp.drag_stopped() && is_ce_selected && *ce_multi_drag {
-            drag_from_t = None;
+            ui.data_mut(|d| {
+                d.remove::<(f32, f32)>(drag_anchor_id);
+                d.remove::<egui::Vec2>(drag_offset_id);
+            });
         }
         if kf_resp.clicked() {
             click_idx = Some(pi);
@@ -1904,9 +1928,9 @@ fn scalar_curve_editor(
     }
 
     let diamond_size = 6.0;
-    let mut drag_idx: Option<usize> = None;
     let mut click_idx: Option<usize> = None;
     let mut delete_idx: Option<usize> = None;
+    let mut drag_commit: Option<(usize, f32, f32, egui::Vec2)> = None;
     let ctrl_held = ui.input(|i| i.modifiers.ctrl || i.modifiers.mac_cmd);
     let shift_held = ui.input(|i| i.modifiers.shift);
 
@@ -1916,6 +1940,12 @@ fn scalar_curve_editor(
         let center = Pos2::new(cx, cy);
 
         let is_ce_selected = ce_selected.contains(&ki);
+        let id = ui.make_persistent_id(("audio_curve_kf", ki));
+        let drag_anchor_id = id.with("single_drag_anchor");
+        let drag_offset_id = id.with("single_drag_offset");
+        let single_drag_offset = ui
+            .data(|d| d.get_temp::<egui::Vec2>(drag_offset_id))
+            .unwrap_or(egui::Vec2::ZERO);
 
         // Apply multi-drag offset for display.
         let display_center = if is_ce_selected && *ce_multi_drag {
@@ -1923,6 +1953,8 @@ fn scalar_curve_editor(
                 center.x + ce_multi_drag_delta.x,
                 center.y + ce_multi_drag_delta.y,
             )
+        } else if single_drag_offset != egui::Vec2::ZERO {
+            center + single_drag_offset
         } else {
             center
         };
@@ -1951,10 +1983,13 @@ fn scalar_curve_editor(
         ));
 
         let diamond_rect = Rect::from_center_size(display_center, Vec2::splat(diamond_size * 2.5));
-        let id = ui.make_persistent_id(("audio_curve_kf", ki));
         let kf_resp = ui.interact(diamond_rect, id, Sense::click_and_drag());
 
         if kf_resp.drag_started() {
+            ui.data_mut(|d| {
+                d.insert_temp(drag_anchor_id, (kf.t, kf.value));
+                d.insert_temp(drag_offset_id, egui::Vec2::ZERO);
+            });
             if is_ce_selected && ce_selected.len() > 1 {
                 *ce_multi_drag = true;
                 *ce_multi_drag_delta = egui::Vec2::ZERO;
@@ -1964,12 +1999,26 @@ fn scalar_curve_editor(
             if is_ce_selected && *ce_multi_drag {
                 *ce_multi_drag_delta += kf_resp.drag_delta();
             } else {
-                drag_idx = Some(ki);
+                ui.data_mut(|d| d.insert_temp(drag_offset_id, kf_resp.drag_delta()));
             }
         }
         if kf_resp.drag_stopped() && is_ce_selected && *ce_multi_drag {
-            // Defer commit to after the loop.
-            drag_idx = None;
+            ui.data_mut(|d| {
+                d.remove::<(f32, f32)>(drag_anchor_id);
+                d.remove::<egui::Vec2>(drag_offset_id);
+            });
+        } else if kf_resp.drag_stopped() {
+            let anchor = ui.data(|d| d.get_temp::<(f32, f32)>(drag_anchor_id));
+            let final_delta = ui
+                .data(|d| d.get_temp::<egui::Vec2>(drag_offset_id))
+                .unwrap_or_else(|| kf_resp.drag_delta());
+            if let Some((old_t, old_value)) = anchor {
+                drag_commit = Some((ki, old_t, old_value, final_delta));
+            }
+            ui.data_mut(|d| {
+                d.remove::<(f32, f32)>(drag_anchor_id);
+                d.remove::<egui::Vec2>(drag_offset_id);
+            });
         }
         if kf_resp.clicked() {
             click_idx = Some(ki);
@@ -2054,13 +2103,17 @@ fn scalar_curve_editor(
             }
         }
     }
-    if let Some(ki) = drag_idx {
-        if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
-            let new_t = graph_x_to_time(pos.x, time_min, time_max, inner_rect).clamp(0.0, time_max);
-            let new_v =
-                graph_y_to_value(pos.y, val_min, val_max, inner_rect).clamp(val_min, val_max);
+    if let Some((ki, old_t, old_value, final_delta)) = drag_commit {
+        if ki < kfs.len() {
+            let old_cx = time_to_graph_x(old_t, time_min, time_max, inner_rect);
+            let old_cy = value_to_graph_y(old_value, val_min, val_max, inner_rect);
+            let new_t = graph_x_to_time(old_cx + final_delta.x, time_min, time_max, inner_rect)
+                .clamp(0.0, time_max);
+            let new_v = graph_y_to_value(old_cy + final_delta.y, val_min, val_max, inner_rect)
+                .clamp(val_min, val_max);
             kfs[ki].t = new_t;
             kfs[ki].value = new_v;
+            kfs.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
         }
     }
     if response.double_clicked() {
@@ -2080,7 +2133,7 @@ fn scalar_curve_editor(
     }
 
     // ── Marquee (rubber-band) selection ──
-    if drag_idx.is_none() && !*ce_multi_drag {
+    if !*ce_multi_drag {
         let primary_pressed = ui.input(|i| i.pointer.primary_pressed());
         let press_origin = ui.input(|i| i.pointer.press_origin());
         let any_down = ui.input(|i| i.pointer.any_down());

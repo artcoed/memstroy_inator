@@ -1671,7 +1671,7 @@ fn canvas_asset_hit(
 }
 
 fn kick_canvas_download(state: &mut EditorState, tx: &Sender<JobEvent>, hit_idx: usize) {
-    let (hit, world_pos) = {
+    let (hit, world_pos, selection_rect) = {
         let session = match state.canvas_image_search.as_mut() {
             Some(s) => s,
             None => return,
@@ -1687,6 +1687,7 @@ fn kick_canvas_download(state: &mut EditorState, tx: &Sender<JobEvent>, hit_idx:
         (
             session.results[hit_idx].clone(),
             canvas_resource_drop_world(session),
+            session.selection_rect(),
         )
     };
 
@@ -1699,7 +1700,7 @@ fn kick_canvas_download(state: &mut EditorState, tx: &Sender<JobEvent>, hit_idx:
                 session.results[hit_idx].downloading = false;
             }
         }
-        place_canvas_media_resource(state, tx, &hit, world_pos);
+        place_canvas_media_resource(state, tx, &hit, world_pos, selection_rect);
         return;
     }
 
@@ -1775,6 +1776,7 @@ fn place_canvas_media_resource(
     tx: &Sender<JobEvent>,
     hit: &WebImageHit,
     world_pos: [f32; 2],
+    selection_rect: Option<([f32; 2], [f32; 2])>,
 ) {
     let Some(path) = hit.local_path.clone() else {
         if let Some(session) = state.canvas_image_search.as_mut() {
@@ -1786,7 +1788,11 @@ fn place_canvas_media_resource(
     match hit.resource_kind {
         SearchResourceKind::Clip => {
             if EditorState::is_usable_local_video(&path) {
-                crate::panels::add_actor_from_clip_at_canvas(state, &path, world_pos);
+                if let Some(new_idx) =
+                    crate::panels::add_actor_from_clip_at_canvas(state, &path, world_pos)
+                {
+                    fit_media_actor_to_canvas_selection(state, new_idx, selection_rect, hit);
+                }
                 state.library_tab = LibraryTab::Clips;
                 state.canvas_image_search = None;
                 return;
@@ -1799,6 +1805,7 @@ fn place_canvas_media_resource(
             ) else {
                 return;
             };
+            fit_media_actor_to_canvas_selection(state, new_idx, selection_rect, hit);
             let actor_id = state.scene.actors[new_idx].id.clone();
             if !crate::panels::try_spawn_lazy_clip_download(
                 state,
@@ -1812,7 +1819,11 @@ fn place_canvas_media_resource(
         }
         SearchResourceKind::Video => {
             if EditorState::is_usable_local_video(&path) {
-                crate::panels::add_actor_from_video_at_canvas(state, &path, world_pos);
+                if let Some(new_idx) =
+                    crate::panels::add_actor_from_video_at_canvas(state, &path, world_pos)
+                {
+                    fit_media_actor_to_canvas_selection(state, new_idx, selection_rect, hit);
+                }
                 state.library_tab = LibraryTab::Videos;
                 state.canvas_image_search = None;
                 return;
@@ -1832,6 +1843,7 @@ fn place_canvas_media_resource(
             ) else {
                 return;
             };
+            fit_media_actor_to_canvas_selection(state, new_idx, selection_rect, hit);
             let actor_id = state.scene.actors[new_idx].id.clone();
             let Some(handle) = state.tokio_handle.clone() else {
                 state.status =
@@ -1853,6 +1865,21 @@ fn place_canvas_media_resource(
             state.canvas_image_search = None;
         }
         SearchResourceKind::Image => {}
+    }
+}
+
+fn hit_media_dims(hit: &WebImageHit) -> Option<(u32, u32)> {
+    (hit.width > 0 && hit.height > 0).then_some((hit.width, hit.height))
+}
+
+fn fit_media_actor_to_canvas_selection(
+    state: &mut EditorState,
+    actor_idx: usize,
+    selection_rect: Option<([f32; 2], [f32; 2])>,
+    hit: &WebImageHit,
+) {
+    if let Some(rect) = selection_rect {
+        crate::panels::fit_actor_to_selection_rect(state, actor_idx, rect, hit_media_dims(hit));
     }
 }
 

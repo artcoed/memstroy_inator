@@ -10245,6 +10245,10 @@ fn broadcast_footage_sequence_move_delta(
     if members.len() < 2 {
         return;
     }
+    let sequence_member_ids: std::collections::HashSet<String> = members
+        .iter()
+        .filter_map(|idx| state.scene.actors.get(*idx).map(|actor| actor.id.clone()))
+        .collect();
 
     let need_snapshot = state
         .timeline_drag
@@ -10309,6 +10313,11 @@ fn broadcast_footage_sequence_move_delta(
         shift_actor_timeline_by(state, mover_idx, target - primary_now);
         defer_overlap_resolution(state, MovedClipKind::Actor(mover_idx));
     }
+    if let Some(actor) = state.scene.actors.get(mover_idx) {
+        let root_id = actor.id.clone();
+        let frame_dt = actor.t_in.unwrap_or(0.0) - mover_orig_t_in;
+        shift_parented_descendants_timeline_by(state, &root_id, frame_dt, &sequence_member_ids);
+    }
     for anchor in anchors {
         let Selection::Actor(ai) = anchor.sel else {
             continue;
@@ -10319,7 +10328,7 @@ fn broadcast_footage_sequence_move_delta(
         let new_start = (anchor.t_in + accumulated).max(0.0);
         let current = state.scene.actors[ai].t_in.unwrap_or(0.0);
         let dt = new_start - current;
-        shift_actor_timeline_by(state, ai, dt);
+        shift_sequence_actor_with_descendants(state, ai, dt, &sequence_member_ids);
         defer_overlap_resolution(state, MovedClipKind::Actor(ai));
     }
 }
@@ -12306,6 +12315,127 @@ fn shift_actor_timeline_by(state: &mut EditorState, actor_idx: usize, dt: f32) {
     sync_audio_to_actor(state, actor_idx);
 }
 
+fn shift_overlay_timeline_by(state: &mut EditorState, overlay_idx: usize, dt: f32) {
+    if dt.abs() <= 1.0e-5 || overlay_idx >= state.scene.overlays.len() {
+        return;
+    }
+    let element_id = match &state.scene.overlays[overlay_idx] {
+        Overlay::Text(t) => t.id.clone(),
+        Overlay::Image(im) => im.id.clone(),
+        Overlay::Video(v) => v.id.clone(),
+    };
+    match &mut state.scene.overlays[overlay_idx] {
+        Overlay::Text(t) => {
+            t.t_in = (t.t_in + dt).max(0.0);
+            t.t_out = (t.t_out + dt).max(t.t_in + 0.001);
+        }
+        Overlay::Image(im) => {
+            im.t_in = (im.t_in + dt).max(0.0);
+            im.t_out = (im.t_out + dt).max(im.t_in + 0.001);
+        }
+        Overlay::Video(v) => {
+            v.t_in = (v.t_in + dt).max(0.0);
+            v.t_out = (v.t_out + dt).max(v.t_in + 0.001);
+        }
+    }
+    shift_canvas_layout_timeline_by(&mut state.scene, &element_id, dt);
+}
+
+fn collect_parented_descendants_excluding(
+    scene: &Scene,
+    root_id: &str,
+    excluded: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut queue = vec![root_id.to_string()];
+    while let Some(parent) = queue.pop() {
+        for actor in &scene.actors {
+            if actor.parent_id.as_deref() == Some(parent.as_str()) {
+                if excluded.contains(&actor.id) || out.iter().any(|id| id == &actor.id) {
+                    continue;
+                }
+                out.push(actor.id.clone());
+                queue.push(actor.id.clone());
+            }
+        }
+        for overlay in &scene.overlays {
+            let (child_id, child_parent) = match overlay {
+                Overlay::Text(o) => (&o.id, o.parent_id.as_deref()),
+                Overlay::Image(o) => (&o.id, o.parent_id.as_deref()),
+                Overlay::Video(o) => (&o.id, o.parent_id.as_deref()),
+            };
+            if child_parent == Some(parent.as_str()) {
+                if excluded.contains(child_id) || out.iter().any(|id| id == child_id) {
+                    continue;
+                }
+                out.push(child_id.clone());
+                queue.push(child_id.clone());
+            }
+        }
+    }
+    out
+}
+
+fn shift_element_timeline_by_id(
+    state: &mut EditorState,
+    element_id: &str,
+    dt: f32,
+) -> Option<Selection> {
+    if let Some(actor_idx) = state
+        .scene
+        .actors
+        .iter()
+        .position(|actor| actor.id == element_id)
+    {
+        shift_actor_timeline_by(state, actor_idx, dt);
+        return Some(Selection::Actor(actor_idx));
+    }
+    if let Some(overlay_idx) = state.scene.overlays.iter().position(|overlay| match overlay {
+        Overlay::Text(o) => o.id == element_id,
+        Overlay::Image(o) => o.id == element_id,
+        Overlay::Video(o) => o.id == element_id,
+    }) {
+        shift_overlay_timeline_by(state, overlay_idx, dt);
+        return Some(Selection::Overlay(overlay_idx));
+    }
+    None
+}
+
+fn shift_parented_descendants_timeline_by(
+    state: &mut EditorState,
+    root_id: &str,
+    dt: f32,
+    excluded: &std::collections::HashSet<String>,
+) {
+    if dt.abs() <= 1.0e-5 {
+        return;
+    }
+    let descendants = collect_parented_descendants_excluding(&state.scene, root_id, excluded);
+    for element_id in descendants {
+        match shift_element_timeline_by_id(state, &element_id, dt) {
+            Some(Selection::Actor(ai)) => defer_overlap_resolution(state, MovedClipKind::Actor(ai)),
+            Some(Selection::Overlay(oi)) => {
+                defer_overlap_resolution(state, MovedClipKind::Overlay(oi))
+            }
+            _ => {}
+        }
+    }
+}
+
+fn shift_sequence_actor_with_descendants(
+    state: &mut EditorState,
+    actor_idx: usize,
+    dt: f32,
+    sequence_member_ids: &std::collections::HashSet<String>,
+) {
+    if actor_idx >= state.scene.actors.len() {
+        return;
+    }
+    let actor_id = state.scene.actors[actor_idx].id.clone();
+    shift_actor_timeline_by(state, actor_idx, dt);
+    shift_parented_descendants_timeline_by(state, &actor_id, dt, sequence_member_ids);
+}
+
 fn move_footage_sequence_from_anchors(
     state: &mut EditorState,
     sequence_id: &str,
@@ -12329,6 +12459,16 @@ fn move_footage_sequence_from_anchors(
     }
 
     let dt = raw_dt.max(-min_anchor_t);
+    let sequence_member_ids: std::collections::HashSet<String> = state
+        .scene
+        .actors
+        .iter()
+        .filter(|actor| {
+            actor.mellstroy_footage.enabled
+                && actor.mellstroy_footage.sequence_id.as_deref() == Some(sequence_id)
+        })
+        .map(|actor| actor.id.clone())
+        .collect();
     for anchor in anchors {
         let Selection::Actor(idx) = anchor.sel else {
             continue;
@@ -12343,7 +12483,7 @@ fn move_footage_sequence_from_anchors(
         }
         let cur = actor.t_in.unwrap_or(0.0);
         let target = (anchor.t_in + dt).max(0.0);
-        shift_actor_timeline_by(state, idx, target - cur);
+        shift_sequence_actor_with_descendants(state, idx, target - cur, &sequence_member_ids);
         defer_overlap_resolution(state, MovedClipKind::Actor(idx));
     }
     dt
@@ -12362,8 +12502,12 @@ fn shift_footage_sequence_at_or_after(state: &mut EditorState, sequence_id: &str
         })
         .map(|(idx, _)| idx)
         .collect();
+    let sequence_member_ids: std::collections::HashSet<String> = indices
+        .iter()
+        .filter_map(|idx| state.scene.actors.get(*idx).map(|actor| actor.id.clone()))
+        .collect();
     for idx in indices {
-        shift_actor_timeline_by(state, idx, dt);
+        shift_sequence_actor_with_descendants(state, idx, dt, &sequence_member_ids);
     }
 }
 
@@ -20925,18 +21069,16 @@ pub(crate) fn add_actor_from_clip_at_canvas(
     state: &mut EditorState,
     path: &PathBuf,
     world_pos: [f32; 2],
-) {
-    let _ =
-        add_actor_from_clip_at_canvas_with_footage_flag(state, path, world_pos, false, false, None);
+) -> Option<usize> {
+    add_actor_from_clip_at_canvas_with_footage_flag(state, path, world_pos, false, false, None)
 }
 
 pub(crate) fn add_actor_from_video_at_canvas(
     state: &mut EditorState,
     path: &PathBuf,
     world_pos: [f32; 2],
-) {
-    let _ =
-        add_actor_from_clip_at_canvas_with_footage_flag(state, path, world_pos, false, false, None);
+) -> Option<usize> {
+    add_actor_from_clip_at_canvas_with_footage_flag(state, path, world_pos, false, false, None)
 }
 
 pub(crate) fn add_pending_actor_from_clip_at_canvas(
@@ -21040,6 +21182,132 @@ fn add_actor_from_clip_at_canvas_with_footage_flag(
         world_pos[1]
     );
     Some(new_actor_idx)
+}
+
+fn fit_actor_source_dims_for_canvas(
+    state: &EditorState,
+    actor_idx: usize,
+    hinted_dims: Option<(u32, u32)>,
+) -> Option<(f32, f32)> {
+    let actor_count = state.scene.actors.len().max(1);
+    let dims = hinted_dims
+        .filter(|(w, h)| *w > 0 && *h > 0)
+        .or_else(|| {
+            let actor = state.scene.actors.get(actor_idx)?;
+            media_dimensions_for_source(state, &actor.source)
+        })
+        .or_else(|| {
+            let actor = state.scene.actors.get(actor_idx)?;
+            (!is_usable_local_video(&actor.source)).then_some((1080, 1920))
+        })?;
+
+    crate::video_cache::scaled_preview_dimensions(dims.0, dims.1, actor_count)
+        .map(|(w, h)| (w as f32, h as f32))
+        .or_else(|| Some((dims.0 as f32, dims.1 as f32)))
+}
+
+/// Fit a canvas-dropped actor exactly into a world-space selection frame.
+/// The actor renderer supports independent Y scale, so clip/video resources
+/// can fill the same RMB selection rectangle that web images use.
+pub(crate) fn fit_actor_to_selection_rect(
+    state: &mut EditorState,
+    actor_idx: usize,
+    rect: ([f32; 2], [f32; 2]),
+    hinted_dims: Option<(u32, u32)>,
+) {
+    if actor_idx >= state.scene.actors.len() {
+        return;
+    }
+    let (mn, mx) = rect;
+    let rect_w = (mx[0] - mn[0]).abs().max(1.0);
+    let rect_h = (mx[1] - mn[1]).abs().max(1.0);
+    let Some((src_w, src_h)) = fit_actor_source_dims_for_canvas(state, actor_idx, hinted_dims)
+    else {
+        return;
+    };
+    if src_w < 1.0 || src_h < 1.0 {
+        return;
+    }
+
+    let cx = (mn[0] + mx[0]) * 0.5;
+    let cy = (mn[1] + mx[1]) * 0.5;
+    let scale_x = (rect_w / src_w).max(0.001);
+    let scale_y_abs = (rect_h / src_h).max(0.001);
+    let scale = scale_x;
+    let scale_y = (scale_y_abs / scale).max(0.001);
+    let scene_t = state.playhead;
+    let actor_id = state.scene.actors[actor_idx].id.clone();
+
+    use memstroy_core::{CanvasLayout, CanvasTransform, Keyframe, WorldPos};
+    if let Some(cl) = state
+        .scene
+        .canvas_layouts
+        .iter_mut()
+        .find(|cl| cl.element_id == actor_id)
+    {
+        if let Some(kf) = cl.keyframes.first_mut() {
+            kf.value.pos = WorldPos { x: cx, y: cy };
+        } else {
+            cl.keyframes.push(Keyframe::new(
+                scene_t,
+                CanvasTransform {
+                    pos: WorldPos { x: cx, y: cy },
+                    ..Default::default()
+                },
+            ));
+        }
+    } else {
+        state.scene.canvas_layouts.push(CanvasLayout {
+            element_id: actor_id.clone(),
+            keyframes: vec![Keyframe::new(
+                scene_t,
+                CanvasTransform {
+                    pos: WorldPos { x: cx, y: cy },
+                    ..Default::default()
+                },
+            )],
+        });
+    }
+
+    let [rw, rh] = state.scene.render_frame.resolution;
+    let world_w = rw as f32;
+    let world_h = rh as f32;
+    if world_w <= 0.0 || world_h <= 0.0 {
+        return;
+    }
+    let actor = &mut state.scene.actors[actor_idx];
+    crate::kf_anim::write_actor_param(
+        &mut actor.layout,
+        &mut actor.animated_params,
+        scene_t,
+        memstroy_core::param_ids::POS_X,
+        false,
+        |s| s.pos[0] = crate::editor_limits::clamp_pos_norm(cx / world_w),
+    );
+    crate::kf_anim::write_actor_param(
+        &mut actor.layout,
+        &mut actor.animated_params,
+        scene_t,
+        memstroy_core::param_ids::POS_Y,
+        false,
+        |s| s.pos[1] = crate::editor_limits::clamp_pos_norm(cy / world_h),
+    );
+    crate::kf_anim::write_actor_param(
+        &mut actor.layout,
+        &mut actor.animated_params,
+        scene_t,
+        memstroy_core::param_ids::SCALE,
+        false,
+        |s| s.scale = crate::editor_limits::clamp_scale(scale),
+    );
+    crate::kf_anim::write_actor_param(
+        &mut actor.layout,
+        &mut actor.animated_params,
+        scene_t,
+        memstroy_core::param_ids::SCALE_Y,
+        false,
+        |s| s.scale_y = crate::editor_limits::clamp_scale(scale_y),
+    );
 }
 
 #[cfg(test)]
@@ -21362,6 +21630,53 @@ mod timeline_resolution_tests {
         let sampled =
             memstroy_core::sample_canvas_layout(&state.scene.canvas_layouts[0].keyframes, 3.5);
         assert_close(sampled.pos.x, 320.0);
+    }
+
+    #[test]
+    fn sequence_move_shifts_parented_overlay_with_actor() {
+        let mut state = test_state();
+        state.tracks = vec![crate::state::Track::video("V1")];
+
+        let mut clip = actor("clip", 2.0, 5.0, 0.0, 1.0);
+        clip.mellstroy_footage.enabled = true;
+        clip.mellstroy_footage.sequence_id = Some("seq".into());
+        state.scene.actors.push(clip);
+        state.actor_track_assignments.insert(0, 0);
+
+        let mut child = video_overlay("child", 2.25, 4.25, 0.0, 1.0);
+        if let Overlay::Video(v) = &mut child {
+            v.parent_id = Some("clip".into());
+        }
+        state.scene.overlays.push(child);
+        state.scene.canvas_layouts.push(CanvasLayout {
+            element_id: "child".into(),
+            keyframes: vec![Keyframe::new(
+                2.25,
+                CanvasTransform {
+                    pos: WorldPos { x: 40.0, y: 50.0 },
+                    ..CanvasTransform::default()
+                },
+            )],
+        });
+
+        let anchors = vec![crate::state::GroupMoveAnchor {
+            sel: Selection::Actor(0),
+            t_in: 2.0,
+            track: Some(0),
+        }];
+
+        let applied = move_footage_sequence_from_anchors(&mut state, "seq", &anchors, 1.0);
+
+        assert_close(applied, 1.0);
+        assert_close(state.scene.actors[0].t_in.unwrap(), 3.0);
+        match &state.scene.overlays[0] {
+            Overlay::Video(v) => {
+                assert_close(v.t_in, 3.25);
+                assert_close(v.t_out, 5.25);
+            }
+            _ => panic!("expected video overlay"),
+        }
+        assert_close(state.scene.canvas_layouts[0].keyframes[0].t, 3.25);
     }
 
     #[test]

@@ -2731,8 +2731,22 @@ impl App {
         // require remapping. The kinds themselves are independent
         // (actors / overlays / audio / backgrounds live in separate
         // Vecs) so the order across kinds doesn't matter.
-        let multi_targets: Vec<Selection> = if state_canvas_selection_count(self) > 1 {
-            self.state.canvas_selection.clone()
+        let multi_targets: Vec<Selection> = if state_canvas_selection_count(self) > 1
+            || self.state.multi_select.len() > 1
+        {
+            let mut targets = self.state.canvas_selection.clone();
+            for &actor_idx in &self.state.multi_select {
+                let sel = Selection::Actor(actor_idx);
+                if !targets.contains(&sel) {
+                    targets.push(sel);
+                }
+            }
+            if !matches!(self.state.selection, Selection::None)
+                && !targets.contains(&self.state.selection)
+            {
+                targets.push(self.state.selection);
+            }
+            targets
         } else {
             Vec::new()
         };
@@ -2771,6 +2785,34 @@ impl App {
             audio_idxs.dedup();
             bg_idxs.sort_unstable();
             bg_idxs.dedup();
+
+            // Deleting a selected bound audio row should delete the
+            // video actor it belongs to, just like the single-selection
+            // audio branch below. Add those parent actors to the actor
+            // bucket before subtree expansion and before we filter bound
+            // audio rows out of the explicit audio bucket.
+            for &aui in &audio_idxs {
+                let Some(parent_id) = self
+                    .state
+                    .scene
+                    .audio
+                    .get(aui)
+                    .and_then(|audio| audio.parent_actor.clone())
+                else {
+                    continue;
+                };
+                if let Some(actor_idx) = self
+                    .state
+                    .scene
+                    .actors
+                    .iter()
+                    .position(|actor| actor.id == parent_id)
+                {
+                    actor_idxs.push(actor_idx);
+                }
+            }
+            actor_idxs.sort_unstable();
+            actor_idxs.dedup();
 
             // ── Cascade preview ──
             // Audio rows whose `parent_actor` matches an actor we're

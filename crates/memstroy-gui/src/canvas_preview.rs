@@ -3420,8 +3420,7 @@ enum DisplayMode {
 // ─── ELEMENT POSITION RESOLUTION ─────────────────────────────────────
 
 pub use memstroy_core::{
-    apply_parent_inheritance_actor, apply_parent_inheritance_overlay, apply_parent_transform,
-    inverse_parent_transform, overlay_visual_state, ParentTransform,
+    apply_parent_inheritance_actor, inverse_parent_transform, overlay_visual_state, ParentTransform,
 };
 
 /// Resolve the full parent transform chain for an element identified by
@@ -7158,16 +7157,6 @@ fn try_select_at(state: &mut EditorState, pos: WorldPos) {
     let cam_world_h = rh as f32 / rf_state.zoom.max(1e-6);
     let frame_tl_x = rf_state.pos.x - cam_world_w * 0.5;
     let frame_tl_y = rf_state.pos.y - cam_world_h * 0.5;
-    // ── World-fixed dims (used by every overlay / actor hit-test).
-    //    Mirrors the renderer in `draw_canvas_overlays` /
-    //    `get_element_world_pos`: the legacy normalised `pos` is
-    //    interpreted against a FIXED reference rectangle of size
-    //    `rf.resolution` anchored at world (0, 0). Without this fix
-    //    moving / zooming the render frame shifted every collider
-    //    away from its visible element — the user's "коллайдеры
-    //    в неверных местах" report.
-    let world_w = rw as f32;
-    let world_h = rh as f32;
 
     // ── Build a unified hit-test order across actors + overlays ──
     //
@@ -7199,10 +7188,28 @@ fn try_select_at(state: &mut EditorState, pos: WorldPos) {
         match cand {
             HitCand::Overlay(idx) => {
                 let overlay = &state.scene.overlays[idx];
-                let (t_in, t_out, layout) = match overlay {
-                    Overlay::Text(txt) => (txt.t_in, txt.t_out, &txt.layout),
-                    Overlay::Image(img) => (img.t_in, img.t_out, &img.layout),
-                    Overlay::Video(vid) => (vid.t_in, vid.t_out, &vid.layout),
+                let (ov_id, t_in, t_out, parent_id, modifiers) = match overlay {
+                    Overlay::Text(txt) => (
+                        txt.id.as_str(),
+                        txt.t_in,
+                        txt.t_out,
+                        txt.parent_id.as_ref(),
+                        txt.modifiers.as_slice(),
+                    ),
+                    Overlay::Image(img) => (
+                        img.id.as_str(),
+                        img.t_in,
+                        img.t_out,
+                        img.parent_id.as_ref(),
+                        img.modifiers.as_slice(),
+                    ),
+                    Overlay::Video(vid) => (
+                        vid.id.as_str(),
+                        vid.t_in,
+                        vid.t_out,
+                        vid.parent_id.as_ref(),
+                        vid.modifiers.as_slice(),
+                    ),
                 };
                 if !state.canvas_show_inactive_previews && !(t >= t_in && t <= t_out) {
                     continue;
@@ -7214,38 +7221,43 @@ fn try_select_at(state: &mut EditorState, pos: WorldPos) {
                 } else {
                     t_out - t_in
                 };
-                let ov_state = sample_overlay_transform(overlay, sample_t);
-
-                let ov_world = WorldPos {
-                    x: ov_state.pos[0] * world_w,
-                    y: ov_state.pos[1] * world_h,
-                };
-                let (ew, eh) = overlay_bbox_with_state(overlay, &ov_state, state);
-                let (hit_cx, hit_cy) = if let Overlay::Image(img) = overlay {
-                    if let Some((full_w, full_h)) =
-                        image_overlay_uncropped_size(img, &ov_state, state)
-                    {
-                        let adj = crate::image_effects::CropLayoutAdjust::from_inset(
-                            crate::image_effects::accumulated_crop_inset(&img.effects),
-                        );
-                        let off = image_crop_world_center_offset(
-                            full_w,
-                            full_h,
-                            adj,
-                            ov_state.rotation_deg,
-                        );
-                        (ov_world.x + off.x, ov_world.y + off.y)
-                    } else {
-                        (ov_world.x, ov_world.y)
-                    }
+                let mut ov_state = overlay_visual_state(
+                    &state.scene,
+                    overlay,
+                    ov_id,
+                    parent_id,
+                    t,
+                    sample_t,
+                    modifiers,
+                );
+                apply_canvas_transform_preview(
+                    state,
+                    ov_id,
+                    &mut ov_state.rotation_deg,
+                    &mut ov_state.scale,
+                    &mut ov_state.scale_y,
+                );
+                let mod_delta = if t >= t_in && t <= t_out {
+                    keyframe::evaluate_modifiers(modifiers, sample_t)
                 } else {
-                    (ov_world.x, ov_world.y)
+                    keyframe::ModifierDelta::default()
                 };
-                if pos.x >= hit_cx - ew * 0.5
-                    && pos.x <= hit_cx + ew * 0.5
-                    && pos.y >= hit_cy - eh * 0.5
-                    && pos.y <= hit_cy + eh * 0.5
-                {
+                let mut ov_world = get_element_world_pos(state, ov_id, &[], t);
+                ov_world.x += mod_delta.dx;
+                ov_world.y += mod_delta.dy;
+                let (ew, eh) = overlay_bbox_with_state(overlay, &ov_state, state);
+                let hit_center = if let Overlay::Image(img) = overlay {
+                    overlay_image_world_center(state, img, &ov_state, ov_world)
+                } else {
+                    ov_world
+                };
+                if world_point_in_oriented_rect(
+                    pos,
+                    hit_center,
+                    ew * 0.5,
+                    eh * 0.5,
+                    ov_state.rotation_deg,
+                ) {
                     element_hits.push(Selection::Overlay(idx));
                 }
             }
@@ -7256,18 +7268,42 @@ fn try_select_at(state: &mut EditorState, pos: WorldPos) {
                 if !state.canvas_show_inactive_previews && !(t >= t_in && t <= t_out) {
                     continue;
                 }
-                let world_pos = get_element_world_pos(state, &actor.id, &actor.layout, t);
-                let actor_scale = sample_actor_transform(actor, t).scale;
+                let mut world_pos = get_element_world_pos(state, &actor.id, &actor.layout, t);
+                let actor_st = sample_actor_transform(actor, t);
+                let mut actor_scale = actor_st.scale;
+                let mut actor_scale_y = actor_st.scale_y;
+                let mut rotation_deg = actor_st.rotation_deg;
+                apply_canvas_transform_preview(
+                    state,
+                    &actor.id,
+                    &mut rotation_deg,
+                    &mut actor_scale,
+                    &mut actor_scale_y,
+                );
+                let mod_delta = if t >= t_in && t <= t_out {
+                    keyframe::evaluate_modifiers(&actor.modifiers, t - t_in)
+                } else {
+                    keyframe::ModifierDelta::default()
+                };
+                world_pos.x += mod_delta.dx;
+                world_pos.y += mod_delta.dy;
+                rotation_deg += mod_delta.d_rotation_deg;
+                actor_scale = (actor_scale + mod_delta.d_scale).max(0.001);
+                if let Some(ref pid) = actor.parent_id {
+                    let mut visited = vec![actor.id.clone()];
+                    if let Some(pxf) = resolve_parent_transform(state, pid, t, &mut visited) {
+                        apply_parent_inheritance_actor(
+                            &mut rotation_deg,
+                            &mut actor_scale,
+                            &mut actor_scale_y,
+                            &pxf,
+                        );
+                    }
+                }
                 let (base_w, base_h) = actor_source_dimensions(state, idx);
-                let elem_width = base_w * actor_scale;
-                let elem_height = base_h * actor_scale;
-                let half_w = elem_width * 0.5;
-                let half_h = elem_height * 0.5;
-                if pos.x >= world_pos.x - half_w
-                    && pos.x <= world_pos.x + half_w
-                    && pos.y >= world_pos.y - half_h
-                    && pos.y <= world_pos.y + half_h
-                {
+                let half_w = base_w * actor_scale * 0.5;
+                let half_h = base_h * actor_scale * actor_scale_y * 0.5;
+                if world_point_in_oriented_rect(pos, world_pos, half_w, half_h, rotation_deg) {
                     element_hits.push(Selection::Actor(idx));
                 }
             }
@@ -7358,45 +7394,112 @@ fn is_point_on_selection(state: &EditorState, pos: WorldPos) -> bool {
             if !actor.visible {
                 return false;
             }
-            let world_pos = get_element_world_pos(state, &actor.id, &actor.layout, t);
-            let actor_scale = sample_actor_transform(actor, t).scale;
+            let t_in = actor.t_in.unwrap_or(0.0);
+            let t_out = actor.t_out.unwrap_or(state.scene.output.duration);
+            let mut world_pos = get_element_world_pos(state, &actor.id, &actor.layout, t);
+            let actor_st = sample_actor_transform(actor, t);
+            let mut actor_scale = actor_st.scale;
+            let mut actor_scale_y = actor_st.scale_y;
+            let mut rotation_deg = actor_st.rotation_deg;
+            apply_canvas_transform_preview(
+                state,
+                &actor.id,
+                &mut rotation_deg,
+                &mut actor_scale,
+                &mut actor_scale_y,
+            );
+            let mod_delta = if t >= t_in && t <= t_out {
+                keyframe::evaluate_modifiers(&actor.modifiers, t - t_in)
+            } else {
+                keyframe::ModifierDelta::default()
+            };
+            world_pos.x += mod_delta.dx;
+            world_pos.y += mod_delta.dy;
+            rotation_deg += mod_delta.d_rotation_deg;
+            actor_scale = (actor_scale + mod_delta.d_scale).max(0.001);
+            if let Some(ref pid) = actor.parent_id {
+                let mut visited = vec![actor.id.clone()];
+                if let Some(pxf) = resolve_parent_transform(state, pid, t, &mut visited) {
+                    apply_parent_inheritance_actor(
+                        &mut rotation_deg,
+                        &mut actor_scale,
+                        &mut actor_scale_y,
+                        &pxf,
+                    );
+                }
+            }
             let (base_w, base_h) = actor_source_dimensions(state, idx);
             let half_w = base_w * actor_scale * 0.5;
-            let half_h = base_h * actor_scale * 0.5;
-            pos.x >= world_pos.x - half_w
-                && pos.x <= world_pos.x + half_w
-                && pos.y >= world_pos.y - half_h
-                && pos.y <= world_pos.y + half_h
+            let half_h = base_h * actor_scale * actor_scale_y * 0.5;
+            world_point_in_oriented_rect(pos, world_pos, half_w, half_h, rotation_deg)
         }
         Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
             let overlay = &state.scene.overlays[idx];
-            // World-fixed dims — `pos` is anchored at world (0, 0)
-            // so the render frame's pos / zoom never shifts the
-            // collider off the visible image.
-            let rf = &state.scene.render_frame;
-            let [rw, rh] = rf.resolution;
-            let world_w = rw as f32;
-            let world_h = rh as f32;
-            let (t_in, t_out, layout) = match overlay {
-                Overlay::Text(txt) => (txt.t_in, txt.t_out, &txt.layout),
-                Overlay::Image(img) => (img.t_in, img.t_out, &img.layout),
-                Overlay::Video(vid) => (vid.t_in, vid.t_out, &vid.layout),
+            let (ov_id, t_in, t_out, parent_id, modifiers) = match overlay {
+                Overlay::Text(txt) => (
+                    txt.id.as_str(),
+                    txt.t_in,
+                    txt.t_out,
+                    txt.parent_id.as_ref(),
+                    txt.modifiers.as_slice(),
+                ),
+                Overlay::Image(img) => (
+                    img.id.as_str(),
+                    img.t_in,
+                    img.t_out,
+                    img.parent_id.as_ref(),
+                    img.modifiers.as_slice(),
+                ),
+                Overlay::Video(vid) => (
+                    vid.id.as_str(),
+                    vid.t_in,
+                    vid.t_out,
+                    vid.parent_id.as_ref(),
+                    vid.modifiers.as_slice(),
+                ),
             };
             let sample_t = if t >= t_in && t <= t_out {
                 t - t_in
             } else {
                 0.0
             };
-            let ov_state = sample_overlay_transform(overlay, sample_t);
-            let ov_world = WorldPos {
-                x: ov_state.pos[0] * world_w,
-                y: ov_state.pos[1] * world_h,
+            let mut ov_state = overlay_visual_state(
+                &state.scene,
+                overlay,
+                ov_id,
+                parent_id,
+                t,
+                sample_t,
+                modifiers,
+            );
+            apply_canvas_transform_preview(
+                state,
+                ov_id,
+                &mut ov_state.rotation_deg,
+                &mut ov_state.scale,
+                &mut ov_state.scale_y,
+            );
+            let mod_delta = if t >= t_in && t <= t_out {
+                keyframe::evaluate_modifiers(modifiers, sample_t)
+            } else {
+                keyframe::ModifierDelta::default()
             };
+            let mut ov_world = get_element_world_pos(state, ov_id, &[], t);
+            ov_world.x += mod_delta.dx;
+            ov_world.y += mod_delta.dy;
             let (ew, eh) = overlay_bbox_with_state(overlay, &ov_state, state);
-            pos.x >= ov_world.x - ew * 0.5
-                && pos.x <= ov_world.x + ew * 0.5
-                && pos.y >= ov_world.y - eh * 0.5
-                && pos.y <= ov_world.y + eh * 0.5
+            let hit_center = if let Overlay::Image(img) = overlay {
+                overlay_image_world_center(state, img, &ov_state, ov_world)
+            } else {
+                ov_world
+            };
+            world_point_in_oriented_rect(
+                pos,
+                hit_center,
+                ew * 0.5,
+                eh * 0.5,
+                ov_state.rotation_deg,
+            )
         }
         _ => false,
     }
@@ -9587,7 +9690,7 @@ mod transform_hierarchy_tests {
         let local = inverse_parent_transform(world, &parent);
         assert_close(local.x, 10.0);
         assert_close(local.y, 20.0);
-        let roundtrip = apply_parent_transform(local, &parent);
+        let roundtrip = memstroy_core::apply_parent_transform(local, &parent);
         assert_close(roundtrip.x, world.x);
         assert_close(roundtrip.y, world.y);
     }
