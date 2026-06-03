@@ -438,6 +438,14 @@ fn hash_mask_shape<H: std::hash::Hasher>(shape: &MaskShape, h: &mut H) {
                 ((p[1] * 1000.0) as i32).hash(h);
             }
         }
+        MaskShape::BrushStroke { points, radius } => {
+            ((radius * 1000.0) as i32).hash(h);
+            (points.len() as u32).hash(h);
+            for p in points {
+                ((p[0] * 1000.0) as i32).hash(h);
+                ((p[1] * 1000.0) as i32).hash(h);
+            }
+        }
     }
 }
 

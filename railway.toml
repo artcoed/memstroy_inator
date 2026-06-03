@@ -3,16 +3,16 @@
 # - The container builds via Nixpacks (Rust auto-detected from Cargo.toml).
 # - We bind the assets-server binary as the start command.
 # - PORT is injected by Railway; main.rs honours it.
-# - ASSETS_ROOT defaults to /data/assets which expects a mounted Volume.
-#   Mount one named "assets" with a mount path of /data so the asset
-#   tree survives redeploys.
+# - At runtime Railway exposes RAILWAY_VOLUME_MOUNT_PATH for the attached
+#   Volume. The server uses it automatically unless ASSETS_ROOT points
+#   inside the same mounted volume.
 
 [build]
 builder = "nixpacks"
 buildCommand = "cargo build --release -p memstroy-assets-server"
 
 [deploy]
-startCommand = "./target/release/memstroy-assets-server --root /data/assets"
+startCommand = "./target/release/memstroy-assets-server"
 healthcheckPath = "/api/health"
 healthcheckTimeout = 30
 restartPolicyType = "on_failure"
@@ -23,4 +23,3 @@ name = "memstroy-assets-server"
 
 [services.variables]
 RUST_LOG = "info,memstroy_assets_server=info"
-ASSETS_ROOT = "/data/assets"

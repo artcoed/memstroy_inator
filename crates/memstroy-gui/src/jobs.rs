@@ -1664,7 +1664,20 @@ pub fn spawn_ai_background_remove(
     mask_polygon_uv: Option<Vec<[f32; 2]>>,
 ) {
     rt.spawn(async move {
-        let result = run_ai_background_remove(&path, &model_path, mask_polygon_uv.as_deref()).await;
+        let task_path = path.clone();
+        let task_model_path = model_path.clone();
+        let task_mask = mask_polygon_uv.clone();
+        let result = match tokio::spawn(async move {
+            run_ai_background_remove(&task_path, &task_model_path, task_mask.as_deref()).await
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(join_err) if join_err.is_panic() => {
+                Err("AI cutout worker crashed while removing the background.".to_string())
+            }
+            Err(join_err) => Err(format!("AI cutout worker stopped: {join_err}")),
+        };
         let _ = tx.send(JobEvent::AiBgRemoveFinished {
             overlay_idx,
             path,

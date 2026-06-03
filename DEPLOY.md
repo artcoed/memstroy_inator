@@ -3,7 +3,7 @@
 The shared assets server is an axum-based HTTP service that serves
 clips / videos / images / sounds / particles / text resources to Memstroy
 editors. It is designed for Railway with a persistent Volume: admins upload
-resources into `/data/assets`, the server re-indexes immediately, and users
+resources into the mounted volume, the server re-indexes immediately, and users
 can search and stream assets on demand.
 
 ## Build configuration
@@ -26,14 +26,16 @@ The project uses **conditional compilation** to optimize build times:
 1. **Create a new Railway project** linked to this repository.
 2. **Add a persistent Volume:**
    - Settings → Volumes → New Volume
-   - Mount path: `/data`
+   - Mount path: any absolute path, for example `/assets` or `/data`
    - Size: 20+ GB depending on the expected video library size
 3. **Set environment variables** (Settings → Variables):
    - `RUST_LOG` = `info,memstroy_assets_server=info`
-   - `ASSETS_ROOT` = `/data/assets` (already in railway.toml as default)
+   - `ASSETS_ROOT` is optional. If set, it must point inside the mounted
+     Railway Volume. Otherwise the server uses Railway's automatic
+     `RAILWAY_VOLUME_MOUNT_PATH`.
 4. Railway will build via the `nixpacks.toml` config (in repo root):
    - Build: `cargo build --release -p memstroy-assets-server`
-   - Start: `./target/release/memstroy-assets-server --root /data/assets`
+   - Start: `./target/release/memstroy-assets-server`
    - **Note**: Only the server package is built on Railway. The `-p memstroy-assets-server`
      flag is required because the workspace's `default-members` excludes the server package
      to speed up local client builds.
@@ -104,3 +106,11 @@ cargo build --release -p memstroy-assets-server
 PORT=8080 ASSETS_ROOT=./assets ./target/release/memstroy-assets-server
 curl http://localhost:8080/api/health
 ```
+
+## Volume troubleshooting
+
+On Railway, the server logs `persistent asset volume ready` with the resolved
+root path. If Volume Usage stays at `0 B` while uploads return success, the
+server is probably writing outside the mounted volume. Check the Volume
+Settings mount path and either remove `ASSETS_ROOT` or set it to that mount
+path (or a subdirectory inside it).

@@ -29,7 +29,7 @@ struct Cli {
     /// Missing subdirectories are created on start-up.
     ///
     /// On Railway this should point at a mounted volume so the
-    /// asset library survives container restarts (e.g. `--root /data/assets`).
+    /// asset library survives container restarts.
     #[arg(long)]
     root: Option<PathBuf>,
 }
@@ -49,15 +49,7 @@ async fn main() -> Result<()> {
         Err(_) => cli.addr,
     };
 
-    let root = match cli.root {
-        Some(p) => p,
-        None => match std::env::var("ASSETS_ROOT") {
-            Ok(p) => PathBuf::from(p),
-            Err(_) => std::env::current_dir()
-                .context("getting current dir")?
-                .join("assets"),
-        },
-    };
+    let root = resolve_asset_root(cli.root)?;
     tokio::fs::create_dir_all(&root)
         .await
         .with_context(|| format!("creating asset root {}", root.display()))?;
@@ -98,4 +90,116 @@ fn init_tracing() {
         .with_env_filter(filter)
         .with_target(false)
         .try_init();
+}
+
+fn resolve_asset_root(cli_root: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(path) = cli_root {
+        return Ok(path);
+    }
+    let assets_root = env_path("ASSETS_ROOT");
+    let railway_volume = env_path("RAILWAY_VOLUME_MOUNT_PATH");
+    match (assets_root, railway_volume) {
+        (Some(assets_root), Some(railway_volume)) => {
+            if assets_root.starts_with(&railway_volume) {
+                Ok(assets_root)
+            } else {
+                tracing::warn!(
+                    assets_root = %assets_root.display(),
+                    railway_volume = %railway_volume.display(),
+                    "ASSETS_ROOT is outside the Railway volume; using RAILWAY_VOLUME_MOUNT_PATH"
+                );
+                Ok(railway_volume)
+            }
+        }
+        (Some(assets_root), None) => Ok(assets_root),
+        (None, Some(railway_volume)) => Ok(railway_volume),
+        (None, None) => Ok(std::env::current_dir()
+            .context("getting current dir")?
+            .join("assets")),
+    }
+}
+
+fn env_path(name: &str) -> Option<PathBuf> {
+    let raw = std::env::var_os(name)?;
+    let text = raw.to_string_lossy();
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(raw))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvRestore {
+        name: &'static str,
+        old: Option<OsString>,
+    }
+
+    impl EnvRestore {
+        fn unset(name: &'static str) -> Self {
+            let old = std::env::var_os(name);
+            std::env::remove_var(name);
+            Self { name, old }
+        }
+
+        fn set(name: &'static str, value: &str) -> Self {
+            let old = std::env::var_os(name);
+            std::env::set_var(name, value);
+            Self { name, old }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            if let Some(old) = &self.old {
+                std::env::set_var(self.name, old);
+            } else {
+                std::env::remove_var(self.name);
+            }
+        }
+    }
+
+    #[test]
+    fn asset_root_prefers_cli_then_assets_root_inside_railway_volume() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _assets = EnvRestore::set("ASSETS_ROOT", "/data/assets");
+        let _volume = EnvRestore::set("RAILWAY_VOLUME_MOUNT_PATH", "/data");
+
+        assert_eq!(
+            resolve_asset_root(Some(PathBuf::from("/cli/assets"))).unwrap(),
+            PathBuf::from("/cli/assets")
+        );
+        assert_eq!(
+            resolve_asset_root(None).unwrap(),
+            PathBuf::from("/data/assets")
+        );
+    }
+
+    #[test]
+    fn asset_root_uses_railway_volume_when_assets_root_is_outside_volume() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _assets = EnvRestore::set("ASSETS_ROOT", "/data/assets");
+        let _volume = EnvRestore::set("RAILWAY_VOLUME_MOUNT_PATH", "/assets");
+
+        assert_eq!(resolve_asset_root(None).unwrap(), PathBuf::from("/assets"));
+    }
+
+    #[test]
+    fn asset_root_uses_railway_volume_when_assets_root_missing() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _assets = EnvRestore::unset("ASSETS_ROOT");
+        let _volume = EnvRestore::set("RAILWAY_VOLUME_MOUNT_PATH", "/mounted-volume");
+
+        assert_eq!(
+            resolve_asset_root(None).unwrap(),
+            PathBuf::from("/mounted-volume")
+        );
+    }
 }

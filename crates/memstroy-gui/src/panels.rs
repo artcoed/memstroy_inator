@@ -969,6 +969,10 @@ fn draw_asset_grid_cell(
 
     // Drag interaction
     if resp.dragged() {
+        let duration_secs = asset
+            .duration_secs
+            .or_else(|| state.video_duration_cache.get(&asset.path).copied())
+            .filter(|d| d.is_finite() && *d > 0.01);
         state.asset_drag.dragging = Some(asset.path.clone());
         state.asset_drag.pending_web_image_url = None;
         state.asset_drag.kind = kind;
@@ -976,13 +980,19 @@ fn draw_asset_grid_cell(
         state.asset_drag.thumbnail = asset.thumbnail.clone();
         state.asset_drag.server_id = asset.server_id.clone();
         state.asset_drag.downloaded = asset.downloaded;
-        state.asset_drag.duration_secs = asset.duration_secs;
+        state.asset_drag.duration_secs = duration_secs;
         state.asset_drag.width = asset.width;
         state.asset_drag.height = asset.height;
-        if let Some(duration) = asset.duration_secs.filter(|d| d.is_finite() && *d > 0.01) {
+        if let Some(duration) = duration_secs {
             state
                 .video_duration_cache
                 .insert(asset.path.clone(), duration);
+        } else if matches!(
+            kind,
+            AssetDragKind::Clip | AssetDragKind::Video | AssetDragKind::Sound
+        ) && asset.downloaded
+        {
+            ensure_media_duration_probe(state, &asset.path);
         }
         if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
             state.asset_drag.pos = [pos.x, pos.y];
@@ -990,9 +1000,13 @@ fn draw_asset_grid_cell(
     }
     // Double-click adds at playhead
     if resp.double_clicked() {
+        let duration_secs = asset
+            .duration_secs
+            .or_else(|| state.video_duration_cache.get(&asset.path).copied())
+            .filter(|d| d.is_finite() && *d > 0.01);
         state.asset_drag.server_id = asset.server_id.clone();
         state.asset_drag.downloaded = asset.downloaded;
-        state.asset_drag.duration_secs = asset.duration_secs;
+        state.asset_drag.duration_secs = duration_secs;
         state.asset_drag.width = asset.width;
         state.asset_drag.height = asset.height;
         if try_spawn_lazy_server_asset_download(
@@ -1126,6 +1140,10 @@ fn library_asset_card(
 
     let card_resp = card_resp.interact(Sense::click_and_drag());
     if card_resp.dragged() {
+        let duration_secs = asset
+            .duration_secs
+            .or_else(|| state.video_duration_cache.get(&asset.path).copied())
+            .filter(|d| d.is_finite() && *d > 0.01);
         state.asset_drag.dragging = Some(asset.path.clone());
         state.asset_drag.pending_web_image_url = None;
         state.asset_drag.kind = kind;
@@ -1133,13 +1151,19 @@ fn library_asset_card(
         state.asset_drag.thumbnail = asset.thumbnail.clone();
         state.asset_drag.server_id = asset.server_id.clone();
         state.asset_drag.downloaded = asset.downloaded;
-        state.asset_drag.duration_secs = asset.duration_secs;
+        state.asset_drag.duration_secs = duration_secs;
         state.asset_drag.width = asset.width;
         state.asset_drag.height = asset.height;
-        if let Some(duration) = asset.duration_secs.filter(|d| d.is_finite() && *d > 0.01) {
+        if let Some(duration) = duration_secs {
             state
                 .video_duration_cache
                 .insert(asset.path.clone(), duration);
+        } else if matches!(
+            kind,
+            AssetDragKind::Clip | AssetDragKind::Video | AssetDragKind::Sound
+        ) && asset.downloaded
+        {
+            ensure_media_duration_probe(state, &asset.path);
         }
         if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
             state.asset_drag.pos = [pos.x, pos.y];
@@ -1452,6 +1476,10 @@ fn clip_card_grid_item(
 
     // Drag interaction
     if resp.dragged() {
+        let duration_secs = clip
+            .duration_secs
+            .or_else(|| state.video_duration_cache.get(&clip.path).copied())
+            .filter(|d| d.is_finite() && *d > 0.01);
         state.asset_drag.dragging = Some(clip.path.clone());
         state.asset_drag.pending_web_image_url = None;
         state.asset_drag.kind = AssetDragKind::Clip;
@@ -1459,13 +1487,15 @@ fn clip_card_grid_item(
         state.asset_drag.thumbnail = clip.thumbnail.clone();
         state.asset_drag.server_id = clip.server_id.clone();
         state.asset_drag.downloaded = clip.downloaded;
-        state.asset_drag.duration_secs = clip.duration_secs;
+        state.asset_drag.duration_secs = duration_secs;
         state.asset_drag.width = clip.width;
         state.asset_drag.height = clip.height;
-        if let Some(duration) = clip.duration_secs.filter(|d| d.is_finite() && *d > 0.01) {
+        if let Some(duration) = duration_secs {
             state
                 .video_duration_cache
                 .insert(clip.path.clone(), duration);
+        } else if clip.downloaded {
+            ensure_media_duration_probe(state, &clip.path);
         }
         if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
             state.asset_drag.pos = [pos.x, pos.y];
@@ -1583,6 +1613,10 @@ fn clip_card(ui: &mut egui::Ui, state: &mut EditorState, clip: &crate::state::Li
     // timeline (drop target inside the timeline area decides what happens).
     let card_resp = card_resp.interact(Sense::click_and_drag());
     if card_resp.dragged() {
+        let duration_secs = clip
+            .duration_secs
+            .or_else(|| state.video_duration_cache.get(&clip.path).copied())
+            .filter(|d| d.is_finite() && *d > 0.01);
         state.asset_drag.dragging = Some(clip.path.clone());
         state.asset_drag.pending_web_image_url = None;
         state.asset_drag.kind = AssetDragKind::Clip;
@@ -1590,13 +1624,15 @@ fn clip_card(ui: &mut egui::Ui, state: &mut EditorState, clip: &crate::state::Li
         state.asset_drag.thumbnail = clip.thumbnail.clone();
         state.asset_drag.server_id = clip.server_id.clone();
         state.asset_drag.downloaded = clip.downloaded;
-        state.asset_drag.duration_secs = clip.duration_secs;
+        state.asset_drag.duration_secs = duration_secs;
         state.asset_drag.width = clip.width;
         state.asset_drag.height = clip.height;
-        if let Some(duration) = clip.duration_secs.filter(|d| d.is_finite() && *d > 0.01) {
+        if let Some(duration) = duration_secs {
             state
                 .video_duration_cache
                 .insert(clip.path.clone(), duration);
+        } else if clip.downloaded {
+            ensure_media_duration_probe(state, &clip.path);
         }
         if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
             state.asset_drag.pos = [pos.x, pos.y];
@@ -3906,6 +3942,7 @@ fn inspector_effect_kind_params(
                     memstroy_core::MaskShape::Rect { .. } => 0,
                     memstroy_core::MaskShape::Ellipse { .. } => 1,
                     memstroy_core::MaskShape::Polygon { .. } => 2,
+                    memstroy_core::MaskShape::BrushStroke { .. } => 3,
                 },
                 _ => 0,
             };
@@ -4024,6 +4061,15 @@ fn inspector_effect_kind_params(
                                 crate::i18n::t("Polygon"),
                                 points.len(),
                                 crate::i18n::t("points")
+                            )
+                        }
+                        memstroy_core::MaskShape::BrushStroke { points, radius } => {
+                            format!(
+                                "{} ({} {}, {:.2})",
+                                crate::i18n::t("Brush"),
+                                points.len(),
+                                crate::i18n::t("points"),
+                                radius
                             )
                         }
                     };
@@ -4535,6 +4581,7 @@ fn inspector_masks_section(
                 MaskShape::Rect { .. } => crate::i18n::t("Rectangle mask"),
                 MaskShape::Ellipse { .. } => crate::i18n::t("Ellipse mask"),
                 MaskShape::Polygon { .. } => crate::i18n::t("Freehand mask"),
+                MaskShape::BrushStroke { .. } => crate::i18n::t("Brush mask"),
             },
             EffectKind::Crop { .. } => crate::i18n::t("Crop"),
             EffectKind::ColorKey { .. } => crate::i18n::t("Color key mask"),
@@ -4628,6 +4675,32 @@ fn inspector_masks_section(
                                     {
                                         *replace_target = Some((target, ei));
                                         *mask_tool = MaskTool::SegmentMask;
+                                    }
+                                });
+                            }
+                            MaskShape::BrushStroke { .. } => {
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .button(format!(
+                                            "PEN {} {}",
+                                            crate::i18n::t("Repaint"),
+                                            crate::i18n::t("brush"),
+                                        ))
+                                        .clicked()
+                                    {
+                                        *replace_target = Some((target, ei));
+                                        *mask_tool = MaskTool::BrushDraw;
+                                    }
+                                    if ui
+                                        .button(format!(
+                                            "ERASE {} {}",
+                                            crate::i18n::t("Repaint"),
+                                            crate::i18n::t("brush"),
+                                        ))
+                                        .clicked()
+                                    {
+                                        *replace_target = Some((target, ei));
+                                        *mask_tool = MaskTool::Eraser;
                                     }
                                 });
                             }
@@ -4838,6 +4911,7 @@ fn shape_kind_name(shape: &memstroy_core::MaskShape) -> &'static str {
         MaskShape::Rect { .. } => crate::i18n::t("rectangle"),
         MaskShape::Ellipse { .. } => crate::i18n::t("ellipse"),
         MaskShape::Polygon { .. } => crate::i18n::t("polygon"),
+        MaskShape::BrushStroke { .. } => crate::i18n::t("brush"),
     }
 }
 
@@ -6437,6 +6511,24 @@ fn inspector_image_tools_section(ui: &mut egui::Ui, state: &mut EditorState, ove
                 state.selection = Selection::Overlay(overlay_idx);
                 state.mask_tool = MaskTool::Eraser;
             }
+        });
+        ui.horizontal(|ui| {
+            ui.label(crate::i18n::t("Size"));
+            ui.add(egui::Slider::new(
+                &mut state.mask_brush_radius_uv,
+                0.004..=0.14,
+            ));
+        });
+        ui.horizontal(|ui| {
+            ui.label(crate::i18n::t("Blur"));
+            ui.add(egui::Slider::new(&mut state.mask_brush_feather, 0.0..=0.12));
+        });
+        ui.horizontal(|ui| {
+            ui.label(crate::i18n::t("Pressure"));
+            ui.add(egui::Slider::new(
+                &mut state.mask_brush_pressure,
+                0.05..=1.0,
+            ));
         });
 
         ui.add_space(6.0);
@@ -12726,6 +12818,19 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                 egui::pos2(tracks_rect.max.x, diamond_bot - 1.0),
             );
             let scene_dur = state.scene.output.duration.max(0.0);
+            paint_parent_pick_timeline_feedback(
+                ui,
+                painter_rf,
+                state,
+                "__render_frame__",
+                content_rect_rf,
+                0.0,
+                scene_dur,
+                state.timeline_scroll,
+                pps,
+                track_left,
+                track_right,
+            );
 
             // ── Per-param keyframe rows under the render-frame
             // diamond strip. Mirrors the per-track `draw_param_kf_rows`
@@ -14983,6 +15088,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                     Overlay::Image(im) => im.id.clone(),
                     Overlay::Video(v) => v.id.clone(),
                 }),
+                Selection::RenderFrame => Some("__render_frame__".to_string()),
                 _ => None,
             };
             if let Some(parent_id) = parent_id {
@@ -15214,6 +15320,21 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
         let drag_pos = egui::pos2(state.asset_drag.pos[0], state.asset_drag.pos[1]);
         let drop_t_secs =
             x_to_time(drag_pos.x, state.timeline_scroll, pps, track_left).clamp(0.0, duration);
+        if matches!(
+            state.asset_drag.kind,
+            AssetDragKind::Clip | AssetDragKind::Video | AssetDragKind::Sound
+        ) && state.asset_drag.duration_secs.is_none()
+        {
+            if let Some(path) = state.asset_drag.dragging.clone() {
+                if let Some(d) = state.video_duration_cache.get(&path).copied() {
+                    if d.is_finite() && d > 0.01 {
+                        state.asset_drag.duration_secs = Some(d);
+                    }
+                } else if state.asset_drag.downloaded {
+                    ensure_media_duration_probe(state, &path);
+                }
+            }
+        }
         let (preview_duration, preview_duration_known) = match state.asset_drag.kind {
             AssetDragKind::Image | AssetDragKind::Particle => (1.0_f32, true),
             AssetDragKind::Clip | AssetDragKind::Video | AssetDragKind::Sound => state
@@ -18831,6 +18952,36 @@ pub(crate) fn clip_thumbnail_for_source(
         .and_then(|c| c.thumbnail.clone())
 }
 
+fn spawn_media_duration_probe(state: &mut EditorState, path: &PathBuf, actor_id: String) {
+    if state.video_duration_cache.contains_key(path)
+        || state.duration_probe_pending.contains(path)
+        || !path.is_file()
+    {
+        return;
+    }
+    let (Some(handle), Some(tx)) = (state.tokio_handle.clone(), state.image_fx_tx.clone()) else {
+        return;
+    };
+    state.duration_probe_pending.insert(path.clone());
+    let path2 = path.clone();
+    handle.spawn(async move {
+        let path_probe = path2.clone();
+        let duration = tokio::task::spawn_blocking(move || probe_video_duration(&path_probe))
+            .await
+            .ok()
+            .flatten();
+        let _ = tx.send(crate::jobs::JobEvent::VideoDurationProbed {
+            actor_id,
+            path: path2,
+            duration,
+        });
+    });
+}
+
+fn ensure_media_duration_probe(state: &mut EditorState, path: &PathBuf) {
+    spawn_media_duration_probe(state, path, String::new());
+}
+
 /// Non-blocking duration: use cache, else spawn ffprobe in the background.
 fn clip_duration_for_placement(state: &mut EditorState, path: &PathBuf, actor_id: &str) -> f32 {
     if let Some(&d) = state.video_duration_cache.get(path) {
@@ -18840,22 +18991,7 @@ fn clip_duration_for_placement(state: &mut EditorState, path: &PathBuf, actor_id
     // generous placeholder and refine timing when the async probe (or frame
     // extraction) reports the real duration.
     const PLACEHOLDER: f32 = crate::split_crop::CLIP_DURATION_PLACEHOLDER_SEC;
-    if let (Some(handle), Some(tx)) = (state.tokio_handle.clone(), state.image_fx_tx.clone()) {
-        let path2 = path.clone();
-        let actor_id = actor_id.to_string();
-        handle.spawn(async move {
-            let path_probe = path2.clone();
-            let duration = tokio::task::spawn_blocking(move || probe_video_duration(&path_probe))
-                .await
-                .ok()
-                .flatten();
-            let _ = tx.send(crate::jobs::JobEvent::VideoDurationProbed {
-                actor_id,
-                path: path2,
-                duration,
-            });
-        });
-    }
+    spawn_media_duration_probe(state, path, actor_id.to_string());
     PLACEHOLDER
 }
 

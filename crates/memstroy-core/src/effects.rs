@@ -217,6 +217,10 @@ pub enum MaskShape {
     /// last point back to the first when rendering / hit-testing. UV
     /// coordinates per vertex. Drawn by the freehand mask tool.
     Polygon { points: Vec<[f32; 2]> },
+    /// Open brush stroke — pixels within `radius` UV units of the
+    /// polyline are considered inside. Used by the image eraser/draw
+    /// tools so brush strokes do not behave like closed lasso shapes.
+    BrushStroke { points: Vec<[f32; 2]>, radius: f32 },
 }
 
 impl MaskShape {
@@ -261,6 +265,9 @@ impl MaskShape {
                 du * du + dv * dv <= 1.0
             }
             MaskShape::Polygon { points } => point_in_polygon(u, v, points),
+            MaskShape::BrushStroke { points, radius } => {
+                brush_min_dist(u, v, points) <= radius.max(1e-6)
+            }
         }
     }
 
@@ -300,6 +307,9 @@ impl MaskShape {
                 } else {
                     -d
                 }
+            }
+            MaskShape::BrushStroke { points, radius } => {
+                radius.max(1e-6) - brush_min_dist(u, v, points)
             }
         }
     }
@@ -342,6 +352,28 @@ fn polygon_min_edge_dist(u: f32, v: f32, pts: &[[f32; 2]]) -> f32 {
         }
     }
     best
+}
+
+#[inline]
+fn brush_min_dist(u: f32, v: f32, pts: &[[f32; 2]]) -> f32 {
+    match pts {
+        [] => f32::INFINITY,
+        [p] => {
+            let dx = u - p[0];
+            let dy = v - p[1];
+            (dx * dx + dy * dy).sqrt()
+        }
+        _ => {
+            let mut best = f32::MAX;
+            for pair in pts.windows(2) {
+                let d = point_to_segment_dist(u, v, pair[0], pair[1]);
+                if d < best {
+                    best = d;
+                }
+            }
+            best
+        }
+    }
 }
 
 #[inline]
@@ -681,6 +713,10 @@ impl Effect {
                     },
                     MaskShape::Polygon { points } => MaskShape::Polygon {
                         points: points.clone(),
+                    },
+                    MaskShape::BrushStroke { points, radius } => MaskShape::BrushStroke {
+                        points: points.clone(),
+                        radius: *radius,
                     },
                 };
                 K::Mask {

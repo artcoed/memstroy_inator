@@ -163,6 +163,25 @@ pub fn inspector_web_image_tools(ui: &mut egui::Ui, state: &mut EditorState, ove
     ui.add_space(4.0);
 
     ui.horizontal(|ui| {
+        ui.label(crate::i18n::t("Size"));
+        ui.add(egui::Slider::new(
+            &mut state.mask_brush_radius_uv,
+            0.004..=0.14,
+        ));
+    });
+    ui.horizontal(|ui| {
+        ui.label(crate::i18n::t("Blur"));
+        ui.add(egui::Slider::new(&mut state.mask_brush_feather, 0.0..=0.12));
+    });
+    ui.horizontal(|ui| {
+        ui.label(crate::i18n::t("Pressure"));
+        ui.add(egui::Slider::new(
+            &mut state.mask_brush_pressure,
+            0.05..=1.0,
+        ));
+    });
+
+    ui.horizontal(|ui| {
         if ui
             .add_enabled(!ai_busy, egui::Button::new(crate::i18n::t("Brush select")))
             .on_hover_text(crate::i18n::t(
@@ -680,229 +699,268 @@ fn draw_popup_body(
             .stroke(Stroke::new(1.0, Color32::from_rgb(100, 180, 255)))
             .inner_margin(egui::Margin::same(8.0))
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(crate::i18n::t("Search resources"))
-                            .size(11.0)
-                            .strong()
-                            .color(Color32::from_rgb(210, 220, 230)),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .small_button("X")
-                            .on_hover_text(crate::i18n::t("Delete frame and image"))
-                            .clicked()
-                        {
-                            dismiss_all = true;
-                            placed_idx = session.placed_overlay;
-                        }
-                        if ui
-                            .add_sized(
-                                [84.0, 24.0],
-                                egui::Button::new(
-                                    RichText::new(crate::i18n::t("Apply")).size(11.0),
-                                ),
-                            )
-                            .on_hover_text(crate::i18n::t("Close search and keep the image"))
-                            .clicked()
-                        {
-                            apply_ui = true;
-                        }
-                    });
-                });
-
-                ui.horizontal(|ui| {
-                    let te = ui.add(
-                        egui::TextEdit::singleline(&mut session.query)
-                            .hint_text(crate::i18n::t("Search resources…"))
-                            .desired_width((ui.available_width() - 112.0).max(140.0)),
-                    );
-                    if session.focus_input {
-                        te.request_focus();
-                        session.focus_input = false;
-                    }
-                    if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        kick_search_now = true;
-                    }
-                    if ui
-                        .add_sized(
-                            [78.0, 24.0],
-                            egui::Button::new(RichText::new(crate::i18n::t("Search")).size(11.0)),
-                        )
-                        .clicked()
-                    {
-                        kick_search_now = true;
-                    }
-                });
-
-                let prev_transparent = session.transparent_only;
-                ui.checkbox(
-                    &mut session.transparent_only,
-                    crate::i18n::t("Transparent background only"),
-                );
-                if prev_transparent != session.transparent_only
-                    && !session.last_sent_query.is_empty()
-                    && !session.searching
-                {
-                    re_search_transparent = true;
-                }
-
-                if session.transparent_only {
-                    ui.add_space(4.0);
-                    ui.label(
-                        RichText::new(crate::i18n::t("Checkerboard removal"))
-                            .size(11.0)
-                            .strong(),
-                    );
-                    ui.horizontal(|ui| {
-                        ui.label(crate::i18n::t("Color tolerance"));
-                        if ui
-                            .add(
-                                egui::Slider::new(&mut session.checker_color_tolerance, 8..=48)
-                                    .show_value(true),
-                            )
-                            .changed()
-                        {
-                            strip_settings_changed = true;
-                        }
-                    });
-                    if ui
-                        .checkbox(
-                            &mut session.checker_edge_flood,
-                            crate::i18n::t("Also remove light edges"),
-                        )
-                        .changed()
-                    {
-                        strip_settings_changed = true;
-                    }
-                    if session.checker_edge_flood {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .max_height(860.0)
+                    .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            ui.label(crate::i18n::t("Edge brightness"));
+                            ui.label(
+                                RichText::new(crate::i18n::t("Search resources"))
+                                    .size(11.0)
+                                    .strong()
+                                    .color(Color32::from_rgb(210, 220, 230)),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .small_button("X")
+                                        .on_hover_text(crate::i18n::t("Delete frame and image"))
+                                        .clicked()
+                                    {
+                                        dismiss_all = true;
+                                        placed_idx = session.placed_overlay;
+                                    }
+                                    if ui
+                                        .add_sized(
+                                            [84.0, 24.0],
+                                            egui::Button::new(
+                                                RichText::new(crate::i18n::t("Apply")).size(11.0),
+                                            ),
+                                        )
+                                        .on_hover_text(crate::i18n::t(
+                                            "Close search and keep the image",
+                                        ))
+                                        .clicked()
+                                    {
+                                        apply_ui = true;
+                                    }
+                                },
+                            );
+                        });
+
+                        ui.horizontal(|ui| {
+                            let te = ui.add(
+                                egui::TextEdit::singleline(&mut session.query)
+                                    .hint_text(crate::i18n::t("Search resources…"))
+                                    .desired_width((ui.available_width() - 112.0).max(140.0)),
+                            );
+                            if session.focus_input {
+                                te.request_focus();
+                                session.focus_input = false;
+                            }
+                            if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                kick_search_now = true;
+                            }
                             if ui
-                                .add(
-                                    egui::Slider::new(
-                                        &mut session.checker_edge_brightness,
-                                        235..=255,
+                                .add_sized(
+                                    [78.0, 24.0],
+                                    egui::Button::new(
+                                        RichText::new(crate::i18n::t("Search")).size(11.0),
+                                    ),
+                                )
+                                .clicked()
+                            {
+                                kick_search_now = true;
+                            }
+                        });
+
+                        let prev_transparent = session.transparent_only;
+                        ui.checkbox(
+                            &mut session.transparent_only,
+                            crate::i18n::t("Transparent background only"),
+                        );
+                        if prev_transparent != session.transparent_only
+                            && !session.last_sent_query.is_empty()
+                            && !session.searching
+                        {
+                            re_search_transparent = true;
+                        }
+
+                        if session.transparent_only {
+                            ui.add_space(4.0);
+                            ui.label(
+                                RichText::new(crate::i18n::t("Checkerboard removal"))
+                                    .size(11.0)
+                                    .strong(),
+                            );
+                            ui.horizontal(|ui| {
+                                ui.label(crate::i18n::t("Color tolerance"));
+                                if ui
+                                    .add(
+                                        egui::Slider::new(
+                                            &mut session.checker_color_tolerance,
+                                            8..=48,
+                                        )
+                                        .show_value(true),
                                     )
-                                    .show_value(true),
+                                    .changed()
+                                {
+                                    strip_settings_changed = true;
+                                }
+                            });
+                            if ui
+                                .checkbox(
+                                    &mut session.checker_edge_flood,
+                                    crate::i18n::t("Also remove light edges"),
                                 )
                                 .changed()
                             {
                                 strip_settings_changed = true;
                             }
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label(crate::i18n::t("Neutral tolerance"));
-                            if ui
-                                .add(
-                                    egui::Slider::new(
-                                        &mut session.checker_neutral_tolerance,
-                                        8..=40,
-                                    )
-                                    .show_value(true),
-                                )
-                                .changed()
-                            {
-                                strip_settings_changed = true;
+                            if session.checker_edge_flood {
+                                ui.horizontal(|ui| {
+                                    ui.label(crate::i18n::t("Edge brightness"));
+                                    if ui
+                                        .add(
+                                            egui::Slider::new(
+                                                &mut session.checker_edge_brightness,
+                                                235..=255,
+                                            )
+                                            .show_value(true),
+                                        )
+                                        .changed()
+                                    {
+                                        strip_settings_changed = true;
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label(crate::i18n::t("Neutral tolerance"));
+                                    if ui
+                                        .add(
+                                            egui::Slider::new(
+                                                &mut session.checker_neutral_tolerance,
+                                                8..=40,
+                                            )
+                                            .show_value(true),
+                                        )
+                                        .changed()
+                                    {
+                                        strip_settings_changed = true;
+                                    }
+                                });
                             }
-                        });
-                    }
-                }
-
-                if session.searching {
-                    ui.label(RichText::new(crate::i18n::t("Searching…")).small());
-                } else if !session.status.is_empty() {
-                    ui.label(RichText::new(&session.status).small().weak());
-                }
-
-                let start = session.carousel_start;
-                let total = session.results.len();
-                let thumb = 72.0;
-                let controls_w = 64.0;
-                carousel_page_size = (((ui.available_width() - controls_w) / (thumb + 10.0))
-                    .floor()
-                    .max(2.0) as usize)
-                    .min(CAROUSEL_PAGE_SIZE);
-                let can_prev = start >= carousel_page_size;
-                let end = (start + carousel_page_size).min(total);
-                let has_next_local = end < total;
-                let has_next_remote = session.next_offset.is_some();
-                let need_fetch = !has_next_local && has_next_remote && !session.searching;
-
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(
-                            can_prev,
-                            egui::Button::new(RichText::new("<").size(16.0))
-                                .min_size(Vec2::new(32.0, thumb)),
-                        )
-                        .on_hover_text(crate::i18n::t("Previous results"))
-                        .clicked()
-                    {
-                        carousel_prev = true;
-                    }
-
-                    for idx in start..end {
-                        let hit = session.results.get(idx).cloned();
-                        let Some(hit) = hit else {
-                            continue;
-                        };
-                        let size = Vec2::splat(thumb);
-                        ui.vertical(|ui| {
-                            let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
-                            ui.painter().rect_filled(
-                                rect,
-                                Rounding::same(4.0),
-                                Color32::from_rgb(18, 18, 14),
-                            );
-                            let img = egui::Image::from_uri(hit.thumbnail_url.clone())
-                                .fit_to_exact_size(size)
-                                .maintain_aspect_ratio(true)
-                                .rounding(Rounding::same(4.0));
-                            img.paint_at(ui, rect);
-                            if hit.downloading {
-                                ui.painter().rect_filled(
-                                    rect,
-                                    Rounding::same(4.0),
-                                    Color32::from_rgba_premultiplied(0, 0, 0, 140),
-                                );
-                            }
-                            if resp.clicked() && !hit.downloading {
-                                download_idx = Some(idx);
-                            }
-                            let title = if hit.title.trim().is_empty() {
-                                crate::i18n::t("(untitled)").to_string()
-                            } else {
-                                compact_text(&hit.title, 34)
-                            };
-                            ui.add_sized(
-                                [thumb, 24.0],
-                                egui::Label::new(
-                                    RichText::new(title)
-                                        .size(9.0)
-                                        .color(Color32::from_rgb(210, 210, 200)),
-                                )
-                                .truncate(),
-                            );
-                        });
-                    }
-
-                    if ui
-                        .add_enabled(
-                            has_next_local || has_next_remote,
-                            egui::Button::new(RichText::new(">").size(16.0))
-                                .min_size(Vec2::new(32.0, thumb)),
-                        )
-                        .on_hover_text(crate::i18n::t("Next results"))
-                        .clicked()
-                    {
-                        if has_next_local {
-                            carousel_next_local = true;
-                        } else if need_fetch {
-                            carousel_next_fetch = true;
                         }
-                    }
-                });
+
+                        if session.searching {
+                            ui.label(RichText::new(crate::i18n::t("Searching…")).small());
+                        } else if !session.status.is_empty() {
+                            ui.label(RichText::new(&session.status).small().weak());
+                        }
+
+                        let start = session.carousel_start;
+                        let total = session.results.len();
+                        let thumb = 72.0;
+                        let controls_w = 64.0;
+                        carousel_page_size =
+                            (((ui.available_width() - controls_w) / (thumb + 10.0))
+                                .floor()
+                                .max(2.0) as usize)
+                                .min(CAROUSEL_PAGE_SIZE);
+                        let can_prev = start >= carousel_page_size;
+                        let end = (start + carousel_page_size).min(total);
+                        let has_next_local = end < total;
+                        let has_next_remote = session.next_offset.is_some();
+                        let need_fetch = !has_next_local && has_next_remote && !session.searching;
+
+                        let row_w = ui.available_width().max(160.0);
+                        let row_h = thumb + 28.0;
+                        let (row_rect, _) =
+                            ui.allocate_exact_size(Vec2::new(row_w, row_h), Sense::hover());
+                        let arrow_w = 32.0;
+                        let gap = 8.0;
+                        let prev_rect =
+                            Rect::from_min_size(row_rect.left_top(), Vec2::new(arrow_w, thumb));
+                        let next_rect = Rect::from_min_size(
+                            Pos2::new(row_rect.right() - arrow_w, row_rect.top()),
+                            Vec2::new(arrow_w, thumb),
+                        );
+                        let cards_rect = Rect::from_min_max(
+                            Pos2::new(prev_rect.right() + gap, row_rect.top()),
+                            Pos2::new(next_rect.left() - gap, row_rect.bottom()),
+                        );
+
+                        if ui
+                            .put(
+                                prev_rect,
+                                egui::Button::new(RichText::new("<").size(16.0))
+                                    .min_size(Vec2::new(arrow_w, thumb)),
+                            )
+                            .on_hover_text(crate::i18n::t("Previous results"))
+                            .clicked()
+                            && can_prev
+                        {
+                            carousel_prev = true;
+                        }
+
+                        ui.allocate_ui_at_rect(cards_rect, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing = Vec2::new(10.0, 0.0);
+                                for idx in start..end {
+                                    let hit = session.results.get(idx).cloned();
+                                    let Some(hit) = hit else {
+                                        continue;
+                                    };
+                                    let size = Vec2::splat(thumb);
+                                    ui.vertical(|ui| {
+                                        let (rect, resp) =
+                                            ui.allocate_exact_size(size, Sense::click());
+                                        ui.painter().rect_filled(
+                                            rect,
+                                            Rounding::same(4.0),
+                                            Color32::from_rgb(18, 18, 14),
+                                        );
+                                        let img = egui::Image::from_uri(hit.thumbnail_url.clone())
+                                            .fit_to_exact_size(size)
+                                            .maintain_aspect_ratio(true)
+                                            .rounding(Rounding::same(4.0));
+                                        img.paint_at(ui, rect);
+                                        if hit.downloading {
+                                            ui.painter().rect_filled(
+                                                rect,
+                                                Rounding::same(4.0),
+                                                Color32::from_rgba_premultiplied(0, 0, 0, 140),
+                                            );
+                                        }
+                                        if resp.clicked() && !hit.downloading {
+                                            download_idx = Some(idx);
+                                        }
+                                        let title = if hit.title.trim().is_empty() {
+                                            crate::i18n::t("(untitled)").to_string()
+                                        } else {
+                                            compact_text(&hit.title, 34)
+                                        };
+                                        ui.add_sized(
+                                            [thumb, 24.0],
+                                            egui::Label::new(
+                                                RichText::new(title)
+                                                    .size(9.0)
+                                                    .color(Color32::from_rgb(210, 210, 200)),
+                                            )
+                                            .truncate(),
+                                        );
+                                    });
+                                }
+                            });
+                        });
+
+                        if ui
+                            .put(
+                                next_rect,
+                                egui::Button::new(RichText::new(">").size(16.0))
+                                    .min_size(Vec2::new(arrow_w, thumb)),
+                            )
+                            .on_hover_text(crate::i18n::t("Next results"))
+                            .clicked()
+                            && (has_next_local || has_next_remote)
+                        {
+                            if has_next_local {
+                                carousel_next_local = true;
+                            } else if need_fetch {
+                                carousel_next_fetch = true;
+                            }
+                        }
+                    });
             });
     }
 

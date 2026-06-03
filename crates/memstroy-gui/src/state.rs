@@ -782,7 +782,7 @@ pub struct EditorState {
     pub clipboard: Vec<ClipboardItem>,
     /// Keyframes copied from the per-param rows. This has priority over
     /// element clipboard when `selected_keyframes` is non-empty.
-    pub keyframe_clipboard: Vec<crate::kf_anim::SelectedKeyframe>,
+    pub keyframe_clipboard: Vec<KeyframeClipboardItem>,
     /// Multi-selection on the canvas. Mirrors `selection` for the
     /// inspector but holds the FULL set the user has painted with
     /// Ctrl/Shift+click or a marquee. Ctrl+C copies every entry; Ctrl+V
@@ -840,6 +840,12 @@ pub struct EditorState {
     /// When set by the inspector's Repaint action, the next committed mask replaces
     /// this existing effect instead of pushing a new one.
     pub mask_replace_target: Option<(Selection, usize)>,
+    /// Brush radius for eraser/draw mask tools in element UV units.
+    pub mask_brush_radius_uv: f32,
+    /// Soft edge for brush masks in element UV units.
+    pub mask_brush_feather: f32,
+    /// Strength applied to new brush masks.
+    pub mask_brush_pressure: f32,
 
     /// Live cursor UV (in element-local coords, 0..1) updated every
     /// frame while `MaskTool::SegmentMask` is armed and the user is
@@ -912,6 +918,8 @@ pub struct EditorState {
     /// repeatedly. Populated lazily — entries are added on first probe
     /// and never expire within a session.
     pub video_duration_cache: std::collections::HashMap<std::path::PathBuf, f32>,
+    /// Media paths currently being probed for duration in the background.
+    pub duration_probe_pending: std::collections::HashSet<std::path::PathBuf>,
 
     /// `.mp4` paths currently downloading from the assets-server. Drop
     /// handlers must not spawn actors against a partial/missing file
@@ -1279,6 +1287,9 @@ impl EditorState {
         // Free canvas viewport
         s.canvas_viewport = memstroy_core::EditorViewport::default();
         s.canvas_panning = false;
+        s.mask_brush_radius_uv = 0.035;
+        s.mask_brush_feather = 0.025;
+        s.mask_brush_pressure = 1.0;
 
         // Multi-tab: start with one untitled tab
         let initial_scene = Scene::default();
@@ -1326,6 +1337,7 @@ impl EditorState {
         s.last_library_rescan = None;
         s.library_dir_fingerprint = Vec::new();
         s.video_duration_cache = std::collections::HashMap::new();
+        s.duration_probe_pending = std::collections::HashSet::new();
 
         // ── Load persistent editor preferences (language, master
         // volume, autosave interval, snap toggle) and apply the bits
@@ -3933,7 +3945,15 @@ impl EditorState {
         if self.selected_keyframes.is_empty() {
             return 0;
         }
-        self.keyframe_clipboard = self.selected_keyframes.clone();
+        let items: Vec<KeyframeClipboardItem> = self
+            .selected_keyframes
+            .iter()
+            .filter_map(|sk| self.snapshot_keyframe_for_clipboard(sk))
+            .collect();
+        if items.is_empty() {
+            return 0;
+        }
+        self.keyframe_clipboard = items;
         self.clipboard.clear();
         self.keyframe_clipboard.len()
     }
@@ -3950,14 +3970,20 @@ impl EditorState {
         self.last_drag_group = None;
         self.undo.push_full(self.build_undo_snapshot());
         self.frame_undo_fallback_suppressed = true;
+        let explicit_target = self.keyframe_paste_target_layer();
         let mut pasted = Vec::new();
         let mut count = 0usize;
-        for sk in buf {
-            let new_t = (self.playhead + (sk.t - min_t)).max(0.0);
-            if self.copy_one_keyframe_to_time(&sk, new_t) {
-                let mut next = sk.clone();
-                next.t = new_t;
-                pasted.push(next);
+        for item in buf {
+            let new_t = (self.playhead + (item.t - min_t)).max(0.0);
+            let target_layer = explicit_target
+                .clone()
+                .unwrap_or_else(|| item.source_layer.clone());
+            if self.paste_keyframe_item_to_layer(&item, &target_layer, new_t) {
+                pasted.push(crate::kf_anim::SelectedKeyframe {
+                    layer: target_layer,
+                    param_id: item.param_id.clone(),
+                    t: new_t,
+                });
                 count += 1;
             }
         }
@@ -3967,52 +3993,198 @@ impl EditorState {
         count
     }
 
-    fn copy_one_keyframe_to_time(
-        &mut self,
+    fn keyframe_paste_target_layer(&self) -> Option<crate::kf_anim::SelectedLayer> {
+        match self.selection {
+            Selection::Actor(i) => Some(crate::kf_anim::SelectedLayer::Actor(i)),
+            Selection::Overlay(i) => Some(crate::kf_anim::SelectedLayer::Overlay(i)),
+            Selection::RenderFrame => Some(crate::kf_anim::SelectedLayer::RenderFrame),
+            Selection::Audio(i) => Some(crate::kf_anim::SelectedLayer::Audio(i)),
+            _ => None,
+        }
+    }
+
+    fn snapshot_keyframe_for_clipboard(
+        &self,
         sk: &crate::kf_anim::SelectedKeyframe,
-        new_t: f32,
-    ) -> bool {
+    ) -> Option<KeyframeClipboardItem> {
         const EPS: f32 = 1.0e-3;
-        match sk.layer {
+        let (value, easing) = match &sk.layer {
             crate::kf_anim::SelectedLayer::Actor(ai) => {
-                let Some(actor) = self.scene.actors.get_mut(ai) else {
-                    return false;
-                };
-                replace_or_push_keyframe(&mut actor.layout, sk.t, new_t)
+                let actor = self.scene.actors.get(*ai)?;
+                if let Some((fx_idx, key)) = parse_fx_param_id(&sk.param_id) {
+                    effect_keyframe_value(&actor.effects, fx_idx, key, sk.t)?
+                } else {
+                    if !actor.animated_params.contains(&sk.param_id) {
+                        return None;
+                    }
+                    (
+                        memstroy_core::sample_actor_param_at(
+                            &actor.layout,
+                            &actor.animated_params,
+                            &sk.param_id,
+                            sk.t,
+                        ),
+                        layout_easing_at(&actor.layout, sk.t),
+                    )
+                }
             }
             crate::kf_anim::SelectedLayer::Overlay(oi) => {
-                let Some(ov) = self.scene.overlays.get_mut(oi) else {
-                    return false;
-                };
+                let ov = self.scene.overlays.get(*oi)?;
                 match ov {
-                    memstroy_core::Overlay::Text(t) => {
-                        replace_or_push_keyframe(&mut t.layout, sk.t, new_t)
-                    }
-                    memstroy_core::Overlay::Image(im) => {
-                        replace_or_push_keyframe(&mut im.layout, sk.t, new_t)
-                    }
-                    memstroy_core::Overlay::Video(v) => {
-                        replace_or_push_keyframe(&mut v.layout, sk.t, new_t)
-                    }
+                    memstroy_core::Overlay::Text(t) => overlay_keyframe_value(
+                        &t.layout,
+                        &t.animated_params,
+                        &t.effects,
+                        &sk.param_id,
+                        sk.t,
+                    )?,
+                    memstroy_core::Overlay::Image(im) => overlay_keyframe_value(
+                        &im.layout,
+                        &im.animated_params,
+                        &im.effects,
+                        &sk.param_id,
+                        sk.t,
+                    )?,
+                    memstroy_core::Overlay::Video(v) => overlay_keyframe_value(
+                        &v.layout,
+                        &v.animated_params,
+                        &v.effects,
+                        &sk.param_id,
+                        sk.t,
+                    )?,
                 }
             }
             crate::kf_anim::SelectedLayer::RenderFrame => {
-                replace_or_push_keyframe(&mut self.scene.render_frame.layout, sk.t, new_t)
+                if !self
+                    .scene
+                    .render_frame
+                    .animated_params
+                    .contains(&sk.param_id)
+                {
+                    return None;
+                }
+                (
+                    memstroy_core::sample_render_frame_param_at(
+                        &self.scene.render_frame.layout,
+                        &self.scene.render_frame.animated_params,
+                        &sk.param_id,
+                        sk.t,
+                    ),
+                    layout_easing_at(&self.scene.render_frame.layout, sk.t),
+                )
             }
             crate::kf_anim::SelectedLayer::Audio(aui) => {
-                let Some(audio) = self.scene.audio.get_mut(aui) else {
+                let audio = self.scene.audio.get(*aui)?;
+                if !audio.animated_params.contains(&sk.param_id) {
+                    return None;
+                }
+                let kfs = crate::kf_anim::audio_param_kfs(audio, &sk.param_id)?;
+                let src = kfs.iter().find(|kf| (kf.t - sk.t).abs() < EPS)?;
+                (src.value, src.easing)
+            }
+        };
+        Some(KeyframeClipboardItem {
+            source_layer: sk.layer.clone(),
+            param_id: sk.param_id.clone(),
+            t: sk.t,
+            value,
+            easing,
+        })
+    }
+
+    fn paste_keyframe_item_to_layer(
+        &mut self,
+        item: &KeyframeClipboardItem,
+        layer: &crate::kf_anim::SelectedLayer,
+        new_t: f32,
+    ) -> bool {
+        match layer {
+            crate::kf_anim::SelectedLayer::Actor(ai) => {
+                let Some(actor) = self.scene.actors.get_mut(*ai) else {
                     return false;
                 };
-                let Some(kfs) = crate::kf_anim::audio_param_kfs_mut(audio, &sk.param_id) else {
+                if let Some((fx_idx, key)) = parse_fx_param_id(&item.param_id) {
+                    return paste_effect_keyframe(&mut actor.effects, fx_idx, key, item, new_t);
+                }
+                if !actor.animated_params.contains(&item.param_id) {
+                    return false;
+                }
+                let animated = actor.animated_params.clone();
+                memstroy_core::author_actor_param_keyframe(
+                    &mut actor.layout,
+                    &animated,
+                    &item.param_id,
+                    new_t,
+                    item.value,
+                );
+                set_layout_easing_at(&mut actor.layout, new_t, item.easing);
+                true
+            }
+            crate::kf_anim::SelectedLayer::Overlay(oi) => {
+                let Some(ov) = self.scene.overlays.get_mut(*oi) else {
                     return false;
                 };
-                let Some(src) = kfs.iter().find(|kf| (kf.t - sk.t).abs() < EPS).cloned() else {
+                match ov {
+                    memstroy_core::Overlay::Text(t) => paste_overlay_keyframe(
+                        &mut t.layout,
+                        &mut t.animated_params,
+                        &mut t.effects,
+                        item,
+                        new_t,
+                    ),
+                    memstroy_core::Overlay::Image(im) => paste_overlay_keyframe(
+                        &mut im.layout,
+                        &mut im.animated_params,
+                        &mut im.effects,
+                        item,
+                        new_t,
+                    ),
+                    memstroy_core::Overlay::Video(v) => paste_overlay_keyframe(
+                        &mut v.layout,
+                        &mut v.animated_params,
+                        &mut v.effects,
+                        item,
+                        new_t,
+                    ),
+                }
+            }
+            crate::kf_anim::SelectedLayer::RenderFrame => {
+                if !self
+                    .scene
+                    .render_frame
+                    .animated_params
+                    .contains(&item.param_id)
+                {
+                    return false;
+                }
+                let animated = self.scene.render_frame.animated_params.clone();
+                memstroy_core::author_render_frame_param_keyframe(
+                    &mut self.scene.render_frame.layout,
+                    &animated,
+                    &item.param_id,
+                    new_t,
+                    item.value,
+                );
+                set_layout_easing_at(&mut self.scene.render_frame.layout, new_t, item.easing);
+                true
+            }
+            crate::kf_anim::SelectedLayer::Audio(aui) => {
+                const EPS: f32 = 1.0e-3;
+                let Some(audio) = self.scene.audio.get_mut(*aui) else {
+                    return false;
+                };
+                if !audio.animated_params.contains(&item.param_id) {
+                    return false;
+                }
+                let Some(kfs) = crate::kf_anim::audio_param_kfs_mut(audio, &item.param_id) else {
                     return false;
                 };
                 kfs.retain(|kf| (kf.t - new_t).abs() >= EPS);
-                let mut next = src;
-                next.t = new_t;
-                kfs.push(next);
+                kfs.push(memstroy_core::Keyframe {
+                    t: new_t,
+                    value: item.value,
+                    easing: item.easing,
+                });
                 kfs.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
                 true
             }
@@ -4311,6 +4483,118 @@ fn replace_or_push_keyframe<T: Clone>(
     next.t = new_t;
     layout.push(next);
     layout.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
+    true
+}
+
+fn parse_fx_param_id(param_id: &str) -> Option<(usize, &str)> {
+    let rest = param_id.strip_prefix("fx_")?;
+    let sep = rest.find('_')?;
+    let idx = rest[..sep].parse::<usize>().ok()?;
+    Some((idx, &rest[sep + 1..]))
+}
+
+fn layout_easing_at<T>(layout: &[memstroy_core::Keyframe<T>], t: f32) -> memstroy_core::Easing {
+    const EPS: f32 = 1.0e-3;
+    layout
+        .iter()
+        .find(|kf| (kf.t - t).abs() < EPS)
+        .map(|kf| kf.easing)
+        .unwrap_or(memstroy_core::Easing::Linear)
+}
+
+fn set_layout_easing_at<T>(
+    layout: &mut [memstroy_core::Keyframe<T>],
+    t: f32,
+    easing: memstroy_core::Easing,
+) {
+    const EPS: f32 = 1.0e-3;
+    if let Some(kf) = layout.iter_mut().find(|kf| (kf.t - t).abs() < EPS) {
+        kf.easing = easing;
+    }
+}
+
+fn effect_keyframe_value(
+    effects: &[memstroy_core::Effect],
+    fx_idx: usize,
+    key: &str,
+    t: f32,
+) -> Option<(f32, memstroy_core::Easing)> {
+    const EPS: f32 = 1.0e-3;
+    let eff = effects.get(fx_idx)?;
+    if !eff.animated_params.contains(key) {
+        return None;
+    }
+    let kfs = eff.param_kfs.get(key)?;
+    let src = kfs.iter().find(|kf| (kf.t - t).abs() < EPS)?;
+    Some((src.value, src.easing))
+}
+
+fn overlay_keyframe_value(
+    layout: &[memstroy_core::Keyframe<memstroy_core::OverlayState>],
+    animated_params: &std::collections::BTreeSet<String>,
+    effects: &[memstroy_core::Effect],
+    param_id: &str,
+    t: f32,
+) -> Option<(f32, memstroy_core::Easing)> {
+    if let Some((fx_idx, key)) = parse_fx_param_id(param_id) {
+        return effect_keyframe_value(effects, fx_idx, key, t);
+    }
+    if !animated_params.contains(param_id) {
+        return None;
+    }
+    Some((
+        memstroy_core::sample_overlay_param_at(layout, animated_params, param_id, t),
+        layout_easing_at(layout, t),
+    ))
+}
+
+fn paste_effect_keyframe(
+    effects: &mut [memstroy_core::Effect],
+    fx_idx: usize,
+    key: &str,
+    item: &KeyframeClipboardItem,
+    new_t: f32,
+) -> bool {
+    const EPS: f32 = 1.0e-3;
+    let Some(eff) = effects.get_mut(fx_idx) else {
+        return false;
+    };
+    if !eff.animated_params.contains(key) {
+        return false;
+    }
+    let kfs = eff.param_kfs.entry(key.to_string()).or_default();
+    kfs.retain(|kf| (kf.t - new_t).abs() >= EPS);
+    kfs.push(memstroy_core::Keyframe {
+        t: new_t,
+        value: item.value,
+        easing: item.easing,
+    });
+    kfs.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
+    true
+}
+
+fn paste_overlay_keyframe(
+    layout: &mut Vec<memstroy_core::Keyframe<memstroy_core::OverlayState>>,
+    animated_params: &mut std::collections::BTreeSet<String>,
+    effects: &mut Vec<memstroy_core::Effect>,
+    item: &KeyframeClipboardItem,
+    new_t: f32,
+) -> bool {
+    if let Some((fx_idx, key)) = parse_fx_param_id(&item.param_id) {
+        return paste_effect_keyframe(effects, fx_idx, key, item, new_t);
+    }
+    if !animated_params.contains(&item.param_id) {
+        return false;
+    }
+    let animated = animated_params.clone();
+    memstroy_core::author_overlay_param_keyframe(
+        layout,
+        &animated,
+        &item.param_id,
+        new_t,
+        item.value,
+    );
+    set_layout_easing_at(layout, new_t, item.easing);
     true
 }
 
@@ -4702,6 +4986,15 @@ pub enum ClipboardItem {
     Audio(memstroy_core::AudioTrack),
 }
 
+#[derive(Clone, Debug)]
+pub struct KeyframeClipboardItem {
+    pub source_layer: crate::kf_anim::SelectedLayer,
+    pub param_id: String,
+    pub t: f32,
+    pub value: f32,
+    pub easing: memstroy_core::Easing,
+}
+
 /// Currently armed mask / crop tool. Used by the canvas to dispatch
 /// pointer-drag input to the mask painter instead of the regular
 /// transform handlers. Stored on [`EditorState`] so the toolbar above
@@ -4760,10 +5053,10 @@ pub enum MaskTool {
     /// Rectangle crop — drag on canvas commits `EffectKind::Crop` so
     /// pixels outside the box are discarded (not just masked).
     CropRect,
-    /// Freehand eraser — polygon mask with `invert: true` (hides inside
-    /// the stroke, revealing what was underneath).
+    /// Freehand eraser — open brush-stroke mask with `invert: true`
+    /// (hides inside the circular stroke, revealing what was underneath).
     Eraser,
-    /// Freehand brush / draw — polygon mask keeping the stroked region.
+    /// Freehand brush / draw — open brush-stroke mask keeping the stroked region.
     BrushDraw,
 }
 
@@ -5064,6 +5357,9 @@ mod timeline_lane_tests {
     fn keyframe_clipboard_pastes_selected_keyframes_at_playhead() {
         let mut state = EditorState::new();
         let mut actor = test_actor("kf", 0.0, 10.0);
+        actor
+            .animated_params
+            .insert(memstroy_core::param_ids::SCALE.to_string());
         let mut value = ActorState::default();
         value.scale = 2.5;
         actor.layout.push(Keyframe::new(2.0, value));
@@ -5085,5 +5381,45 @@ mod timeline_lane_tests {
             .expect("pasted keyframe at playhead");
         assert_eq!(pasted.value.scale, 2.5);
         assert_eq!(state.clipboard.len(), 0);
+    }
+
+    #[test]
+    fn keyframe_clipboard_pastes_to_selected_compatible_actor() {
+        let mut state = EditorState::new();
+        let mut source = test_actor("source", 0.0, 10.0);
+        source
+            .animated_params
+            .insert(memstroy_core::param_ids::SCALE.to_string());
+        let mut source_value = ActorState::default();
+        source_value.scale = 2.5;
+        source.layout.push(Keyframe::new(2.0, source_value));
+
+        let mut target = test_actor("target", 0.0, 10.0);
+        target
+            .animated_params
+            .insert(memstroy_core::param_ids::SCALE.to_string());
+        state.scene.actors.push(source);
+        state.scene.actors.push(target);
+        state.selected_keyframes = vec![SelectedKeyframe {
+            layer: SelectedLayer::Actor(0),
+            param_id: "scale".to_string(),
+            t: 2.0,
+        }];
+        state.selection = Selection::Actor(1);
+        state.playhead = 6.0;
+
+        assert_eq!(state.copy_selected_keyframes_to_clipboard(), 1);
+        assert_eq!(state.paste_keyframes_from_clipboard(), 1);
+
+        assert!(state.scene.actors[0]
+            .layout
+            .iter()
+            .all(|kf| (kf.t - 6.0).abs() >= 1.0e-3));
+        let pasted = state.scene.actors[1]
+            .layout
+            .iter()
+            .find(|kf| (kf.t - 6.0).abs() < 1.0e-3)
+            .expect("pasted keyframe on target actor");
+        assert_eq!(pasted.value.scale, 2.5);
     }
 }

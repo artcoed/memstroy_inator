@@ -12,6 +12,16 @@ use crate::jobs::{spawn_refresh, spawn_render, JobEvent};
 use crate::panels;
 use crate::state::{EditorState, SceneExitAction, Selection};
 
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let keep = max_chars.saturating_sub(1);
+    let mut out = text.chars().take(keep).collect::<String>();
+    out.push('…');
+    out
+}
+
 pub struct App {
     rt: Option<Runtime>,
     state: EditorState,
@@ -1130,24 +1140,32 @@ impl App {
         path: std::path::PathBuf,
         duration: Option<f32>,
     ) {
+        self.state.duration_probe_pending.remove(&path);
         let Some(duration) = duration.filter(|d| *d > 0.01) else {
             return;
         };
         self.state
             .video_duration_cache
             .insert(path.clone(), duration);
-        let Some(idx) = self
-            .state
-            .scene
-            .actors
-            .iter()
-            .position(|a| a.id == actor_id && a.source == path)
-        else {
-            return;
-        };
-        let actor = &mut self.state.scene.actors[idx];
-        crate::split_crop::reconcile_actor_t_out_for_source(actor, duration);
-        crate::panels::sync_audio_to_actor(&mut self.state, idx);
+        if self.state.asset_drag.dragging.as_ref() == Some(&path)
+            && self.state.asset_drag.duration_secs.is_none()
+        {
+            self.state.asset_drag.duration_secs = Some(duration);
+        }
+        let mut touched = Vec::new();
+        for (idx, actor) in self.state.scene.actors.iter_mut().enumerate() {
+            if actor.source != path {
+                continue;
+            }
+            if !actor_id.is_empty() && actor.id != actor_id {
+                continue;
+            }
+            crate::split_crop::reconcile_actor_t_out_for_source(actor, duration);
+            touched.push(idx);
+        }
+        for idx in touched {
+            crate::panels::sync_audio_to_actor(&mut self.state, idx);
+        }
         self.state.request_media_preview = true;
     }
 
@@ -1332,18 +1350,26 @@ impl App {
                                             Some((i, self.state.editing_tab_buf.clone()));
                                     }
                                 } else {
-                                    let label = if dirty {
+                                    let full_label = if dirty {
                                         format!("\u{2022} {}", tab_name)
                                     } else {
                                         tab_name.clone()
                                     };
-                                    let resp = ui.add(
+                                    let label = truncate_chars(&full_label, 28);
+                                    let resp = ui.add_sized(
+                                        [150.0, 18.0],
                                         egui::Label::new(
                                             RichText::new(label).size(12.0).color(text_col),
                                         )
+                                        .truncate()
                                         .selectable(false)
                                         .sense(egui::Sense::click()),
                                     );
+                                    let resp = if full_label.chars().count() > 28 {
+                                        resp.on_hover_text(full_label)
+                                    } else {
+                                        resp
+                                    };
                                     if resp.clicked() && !is_active {
                                         switch_to = Some(i);
                                         close_tab = None;
@@ -1490,6 +1516,13 @@ impl App {
                     let width = 220.0;
                     let (rect, resp) =
                         ui.allocate_exact_size(egui::vec2(width, row_height), egui::Sense::click());
+                    let visible_text = truncate_chars(&text, 36);
+                    let truncated = visible_text != text;
+                    let resp = if truncated {
+                        resp.on_hover_text(text.clone())
+                    } else {
+                        resp
+                    };
                     let visuals = ui.style().interact(&resp);
                     if resp.hovered() {
                         ui.painter().rect_filled(rect, 3.0, visuals.bg_fill);
@@ -1503,10 +1536,14 @@ impl App {
                         egui::FontId::monospace(12.0),
                         Color32::from_rgb(190, 190, 205),
                     );
-                    ui.painter().text(
+                    let text_clip = egui::Rect::from_min_max(
+                        egui::pos2(text_pos.x, rect.top()),
+                        egui::pos2(rect.right() - 6.0, rect.bottom()),
+                    );
+                    ui.painter().with_clip_rect(text_clip).text(
                         text_pos,
                         egui::Align2::LEFT_CENTER,
-                        text,
+                        visible_text,
                         egui::FontId::proportional(12.0),
                         visuals.text_color(),
                     );
@@ -3798,7 +3835,15 @@ impl App {
                         .map(|e| e.sampled_at(local_for_anim))
                         .collect();
 
-                    self.state.video_duration_cache.insert(path, duration);
+                    self.state.duration_probe_pending.remove(&path);
+                    self.state
+                        .video_duration_cache
+                        .insert(path.clone(), duration);
+                    if self.state.asset_drag.dragging.as_ref() == Some(&path)
+                        && self.state.asset_drag.duration_secs.is_none()
+                    {
+                        self.state.asset_drag.duration_secs = Some(duration);
+                    }
                     let before = cur_out;
                     crate::split_crop::reconcile_actor_t_out_for_source(
                         &mut self.state.scene.actors[actor_idx],

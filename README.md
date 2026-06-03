@@ -153,7 +153,9 @@ cargo run -p memstroy-assets-server --release -- \
 При старте сервер создаёт недостающие подкаталоги (`clips/`,
 `videos/`, `images/`, `sounds/`, `particles/`, `text/`) и индексирует
 уже сохранённые файлы. Он ничего не удаляет при рестарте: для Railway
-корень должен указывать на mounted Volume, например `/data/assets`.
+корень должен указывать на mounted Volume. Если `--root` не передан, сервер
+использует `ASSETS_ROOT`, а на Railway проверяет его относительно
+`RAILWAY_VOLUME_MOUNT_PATH` и не пишет в путь вне volume.
 
 Пользовательские клиенты читают каталог через:
 

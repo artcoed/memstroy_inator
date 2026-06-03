@@ -970,6 +970,14 @@ fn hash_mask_shape<H: std::hash::Hasher>(shape: &memstroy_core::MaskShape, h: &m
                 bits(p[1]).hash(h);
             }
         }
+        M::BrushStroke { points, radius } => {
+            bits(*radius).hash(h);
+            (points.len() as u32).hash(h);
+            for p in points {
+                bits(p[0]).hash(h);
+                bits(p[1]).hash(h);
+            }
+        }
     }
 }
 

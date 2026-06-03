@@ -7,4 +7,4 @@ nixPkgs = ["...", "ffmpeg"]
 cmds = ["cargo build --release -p memstroy-assets-server"]
 
 [start]
-cmd = "./target/release/memstroy-assets-server --root ${ASSETS_ROOT:-/data/assets}"
+cmd = "./target/release/memstroy-assets-server"

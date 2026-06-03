@@ -996,10 +996,16 @@ pub fn enable_actor_param_animation(
     param_id: &str,
     seed_t: f32,
 ) {
-    let mut with_param = animated_params.clone();
-    with_param.insert(param_id.to_string());
-    let value = actor_get(&sample_actor_layout(layout, &with_param, seed_t), param_id);
-    upsert_actor_param_keyframe(layout, &with_param, param_id, seed_t, value);
+    let mut without_param = animated_params.clone();
+    without_param.remove(param_id);
+    let value = actor_get(
+        &sample_actor_layout(layout, &without_param, seed_t),
+        param_id,
+    );
+    for kf in layout.iter_mut() {
+        actor_set(&mut kf.value, param_id, value);
+    }
+    upsert_actor_param_keyframe(layout, animated_params, param_id, seed_t, value);
 }
 
 pub fn enable_overlay_param_animation(
@@ -1008,13 +1014,16 @@ pub fn enable_overlay_param_animation(
     param_id: &str,
     seed_t: f32,
 ) {
-    let mut with_param = animated_params.clone();
-    with_param.insert(param_id.to_string());
+    let mut without_param = animated_params.clone();
+    without_param.remove(param_id);
     let value = overlay_get(
-        &sample_overlay_layout(layout, &with_param, seed_t),
+        &sample_overlay_layout(layout, &without_param, seed_t),
         param_id,
     );
-    upsert_overlay_param_keyframe(layout, &with_param, param_id, seed_t, value);
+    for kf in layout.iter_mut() {
+        overlay_set(&mut kf.value, param_id, value);
+    }
+    upsert_overlay_param_keyframe(layout, animated_params, param_id, seed_t, value);
 }
 
 pub fn enable_render_frame_param_animation(
@@ -1023,13 +1032,16 @@ pub fn enable_render_frame_param_animation(
     param_id: &str,
     seed_t: f32,
 ) {
-    let mut with_param = animated_params.clone();
-    with_param.insert(param_id.to_string());
+    let mut without_param = animated_params.clone();
+    without_param.remove(param_id);
     let value = rf_get(
-        &sample_render_frame_layout(layout, &with_param, seed_t),
+        &sample_render_frame_layout(layout, &without_param, seed_t),
         param_id,
     );
-    upsert_render_frame_param_keyframe(layout, &with_param, param_id, seed_t, value);
+    for kf in layout.iter_mut() {
+        rf_set(&mut kf.value, param_id, value);
+    }
+    upsert_render_frame_param_keyframe(layout, animated_params, param_id, seed_t, value);
 }
 
 /// Apply enable/disable side effects after the inspector toggles
@@ -1198,6 +1210,44 @@ mod tests {
         assert!(
             scale_times.iter().any(|t| (*t - 1.5).abs() < EPS),
             "scale row should show playhead diamond, got {scale_times:?}"
+        );
+    }
+
+    #[test]
+    fn enabling_rotation_does_not_reuse_position_keyframe_times() {
+        let mut animated = BTreeSet::new();
+        animated.insert(param_ids::POS_X.to_string());
+        animated.insert(param_ids::POS_Y.to_string());
+        animated.insert(param_ids::ROTATION.to_string());
+        let mut layout = vec![
+            Keyframe::new(
+                2.0,
+                ActorState {
+                    pos: [0.2, 0.4],
+                    rotation_deg: 0.0,
+                    ..ActorState::default()
+                },
+            ),
+            Keyframe::new(
+                5.0,
+                ActorState {
+                    pos: [0.8, 0.4],
+                    rotation_deg: 25.0,
+                    ..ActorState::default()
+                },
+            ),
+        ];
+
+        enable_actor_param_animation(&mut layout, &animated, param_ids::ROTATION, 8.0);
+
+        let pos_x_times = actor_param_timeline_times(&layout, &animated, param_ids::POS_X);
+        assert_eq!(pos_x_times, vec![2.0, 5.0]);
+
+        let rot_times = actor_param_timeline_times(&layout, &animated, param_ids::ROTATION);
+        assert_eq!(
+            rot_times,
+            vec![8.0],
+            "rotation row must not inherit position times: {rot_times:?}"
         );
     }
 

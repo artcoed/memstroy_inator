@@ -1134,6 +1134,24 @@ fn draw_render_frame(
             Stroke::new(2.0, COL_RENDER_FRAME),
         ));
     }
+    if state.parent_pick_child_id.as_deref() != Some("__render_frame__") {
+        let hovered = state.parent_pick_child_id.is_some()
+            && painter
+                .ctx()
+                .input(|i| i.pointer.hover_pos())
+                .map(|p| point_in_screen_quad(p, &[tl, tr, br, bl]))
+                .unwrap_or(false);
+        if hovered {
+            painter
+                .ctx()
+                .set_cursor_icon(egui::CursorIcon::PointingHand);
+            painter.add(egui::Shape::convex_polygon(
+                vec![tl, tr, br, bl],
+                Color32::TRANSPARENT,
+                Stroke::new(3.0, Color32::from_rgb(255, 220, 90)),
+            ));
+        }
+    }
 
     // Corner resize handles for the render frame (rotated to follow the frame).
     let handle_size = 8.0;
@@ -1168,6 +1186,24 @@ fn draw_render_frame(
             COL_RENDER_FRAME,
         );
     }
+}
+
+fn point_in_screen_quad(p: Pos2, quad: &[Pos2; 4]) -> bool {
+    let mut sign = 0.0_f32;
+    for i in 0..4 {
+        let a = quad[i];
+        let b = quad[(i + 1) % 4];
+        let cross = (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
+        if cross.abs() < 1.0e-4 {
+            continue;
+        }
+        if sign == 0.0 {
+            sign = cross.signum();
+        } else if sign * cross < 0.0 {
+            return false;
+        }
+    }
+    true
 }
 
 /// Compute the four screen-space corners of the render frame (TL, TR, BR, BL).
@@ -1532,11 +1568,6 @@ fn draw_canvas_elements(
             }
         }
     }
-
-    // Draw the keyframe trajectory for the selected element on top of
-    // everything else, so the user can see the animation path with numbered
-    // points and per-keyframe parameter callouts.
-    draw_selection_keyframe_trajectory(painter, full_rect, state, viewport_size);
 }
 
 // ─── SINGLE-ELEMENT DRAWING (used by unified z-order pass) ──────────
@@ -3505,6 +3536,7 @@ fn selection_element_id(state: &EditorState, sel: Selection) -> Option<String> {
             Overlay::Image(im) => Some(im.id.clone()),
             Overlay::Video(v) => Some(v.id.clone()),
         }),
+        Selection::RenderFrame => Some("__render_frame__".to_string()),
         _ => None,
     }
 }
@@ -3878,6 +3910,9 @@ fn draw_selection_gizmo(
             );
             let rf_center_hit = (mouse - rf_center).length() < RF_CENTER_RADIUS * 2.5;
             if rf_center_hit {
+                if apply_parent_pick_if_active(state, Selection::RenderFrame) {
+                    return;
+                }
                 state.selection = Selection::RenderFrame;
             } else {
                 try_select_at(state, click_world);
@@ -7204,6 +7239,9 @@ fn try_select_at(state: &mut EditorState, pos: WorldPos) {
     if lx >= -half_w && lx <= half_w && ly >= -half_h && ly <= half_h {
         state.canvas_click_cycle_world = None;
         state.canvas_click_cycle_index = 0;
+        if apply_parent_pick_if_active(state, Selection::RenderFrame) {
+            return;
+        }
         state.selection = Selection::RenderFrame;
         return;
     }
@@ -7562,6 +7600,9 @@ pub(crate) fn handle_mask_draw_input(
     // the same code path; a single `CanvasDragMode::DrawMask` carries
     // the active tool tag.
     let pointer_pos = ui.input(|i| i.pointer.hover_pos());
+    if matches!(state.mask_tool, MaskTool::Eraser | MaskTool::BrushDraw) {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+    }
 
     // Pointer-down inside the selected element starts the drag.
     if response.drag_started() || (response.clicked() && pointer_pos.is_some()) {
@@ -7598,7 +7639,13 @@ pub(crate) fn handle_mask_draw_input(
                         Some(prev) => {
                             let dx = uv[0] - prev[0];
                             let dy = uv[1] - prev[1];
-                            (dx * dx + dy * dy).sqrt() > 0.005
+                            let min_step = if matches!(tool, MaskTool::Eraser | MaskTool::BrushDraw)
+                            {
+                                (state.mask_brush_radius_uv * 0.28).clamp(0.002, 0.02)
+                            } else {
+                                0.005
+                            };
+                            (dx * dx + dy * dy).sqrt() > min_step
                         }
                         None => true,
                     };
@@ -7929,7 +7976,7 @@ fn commit_mask_draft(
             },
         )),
         MaskTool::Eraser | MaskTool::BrushDraw => {
-            if pts.len() < 3 {
+            if pts.is_empty() {
                 None
             } else {
                 let clamped: Vec<[f32; 2]> = pts
@@ -7937,17 +7984,16 @@ fn commit_mask_draft(
                     .map(|p| [p[0].clamp(0.0, 1.0), p[1].clamp(0.0, 1.0)])
                     .collect();
                 let invert = matches!(tool, MaskTool::Eraser);
-                Some(memstroy_core::Effect::new(
-                    memstroy_core::EffectKind::Mask {
-                        shape: memstroy_core::MaskShape::Polygon { points: clamped },
-                        feather: if matches!(tool, MaskTool::BrushDraw) {
-                            0.01
-                        } else {
-                            0.0
-                        },
-                        invert,
+                let mut effect = memstroy_core::Effect::new(memstroy_core::EffectKind::Mask {
+                    shape: memstroy_core::MaskShape::BrushStroke {
+                        points: clamped,
+                        radius: state.mask_brush_radius_uv.clamp(0.002, 0.25),
                     },
-                ))
+                    feather: state.mask_brush_feather.clamp(0.0, 0.25),
+                    invert,
+                });
+                effect.intensity = state.mask_brush_pressure.clamp(0.05, 1.0);
+                Some(effect)
             }
         }
         MaskTool::Eyedropper => {
@@ -8278,11 +8324,31 @@ fn draw_mask_draft(
                     painter.line_segment([prev, cur], stroke);
                     prev = cur;
                 }
-                // Ghost line back to the start so the user knows the
-                // path will be closed on release.
-                if let Some(&first) = state.mask_draft_points.first() {
-                    painter.line_segment([prev, to_screen(first)], stroke_dash);
+                if matches!(tool, MaskTool::FreehandMask) {
+                    // Ghost line back to the start so the user knows the
+                    // path will be closed on release. Brush tools stay open.
+                    if let Some(&first) = state.mask_draft_points.first() {
+                        painter.line_segment([prev, to_screen(first)], stroke_dash);
+                    }
+                } else {
+                    let brush_radius =
+                        state.mask_brush_radius_uv.clamp(0.002, 0.25) * half_w.min(half_h) * 2.0;
+                    painter.circle_stroke(prev, brush_radius, Stroke::new(1.25, stroke.color));
+                    if state.mask_brush_feather > 0.001 {
+                        let feather_radius = (state.mask_brush_radius_uv
+                            + state.mask_brush_feather)
+                            .clamp(0.002, 0.35)
+                            * half_w.min(half_h)
+                            * 2.0;
+                        painter.circle_stroke(prev, feather_radius, stroke_dash);
+                    }
                 }
+            } else if matches!(tool, MaskTool::Eraser | MaskTool::BrushDraw) {
+                let p = to_screen(last_uv);
+                let brush_radius =
+                    state.mask_brush_radius_uv.clamp(0.002, 0.25) * half_w.min(half_h) * 2.0;
+                painter.circle_stroke(p, brush_radius, Stroke::new(1.25, stroke.color));
+                painter.circle_filled(p, 2.5, stroke.color);
             }
         }
         MaskTool::Eyedropper => {
