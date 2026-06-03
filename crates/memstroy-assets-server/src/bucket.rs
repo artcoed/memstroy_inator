@@ -10,7 +10,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use aws_sdk_s3::config::{Builder as S3ConfigBuilder, Credentials, Region};
+use aws_sdk_s3::config::{BehaviorVersion, Builder as S3ConfigBuilder, Credentials, Region};
 use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
@@ -74,6 +74,7 @@ impl BucketStore {
             "memstroy-railway-bucket",
         );
         let mut builder = S3ConfigBuilder::new()
+            .behavior_version(BehaviorVersion::latest())
             .credentials_provider(credentials)
             .region(Region::new(config.region.clone()))
             .endpoint_url(config.endpoint_url.clone());
