@@ -27,8 +27,8 @@ use std::sync::atomic::{AtomicU8, Ordering};
 /// Supported languages for the editor UI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum Lang {
-    #[default]
     En,
+    #[default]
     Ru,
 }
 
@@ -59,7 +59,7 @@ impl Lang {
 
 // ─── Global flag ─────────────────────────────────────────────────────
 
-static GLOBAL_LANG: AtomicU8 = AtomicU8::new(0);
+static GLOBAL_LANG: AtomicU8 = AtomicU8::new(1);
 
 /// Update the globally-active language. Call this once at startup
 /// (after loading settings) and whenever the user changes the language
@@ -104,6 +104,9 @@ fn ru_lookup(key: &str) -> Option<&'static str> {
         "\u{1F4BE} Save scene as..." => "\u{1F4BE} Сохранить сцену как…",
         "\u{1F504} Open last autosave" => "\u{1F504} Открыть последний автосейв",
         "\u{1F504} Open autosave" => "\u{1F504} Открыть автосейв",
+        "Open autosave" => "Открыть автосейв",
+        "Open autosave (loading)" => "Автосейвы загружаются",
+        "Open autosave (none)" => "Автосейвов нет",
         "(no autosaves yet)" => "(автосейвов пока нет)",
         "recent" => "недавно",
         "Settings" => "Настройки",

@@ -49,6 +49,14 @@ pub const MAX_RESULTS_PER_PAGE: usize = 200;
 /// going higher mostly hurts paint cost.
 pub const MAX_TOTAL_RESULTS: usize = 1_000;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SearchResourceKind {
+    #[default]
+    Image,
+    Clip,
+    Video,
+}
+
 /// One image hit returned by the search backend.
 ///
 /// `Serialize`/`Deserialize` are derived so future "save the last
@@ -78,6 +86,20 @@ pub struct WebImageHit {
     /// pump-events handler.
     #[serde(default)]
     pub local_path: Option<PathBuf>,
+    /// Canvas resource search reuses this card model for local/server
+    /// clips and videos. Plain web-image search leaves it at Image.
+    #[serde(default, skip)]
+    pub resource_kind: SearchResourceKind,
+    /// Server asset id for canvas resource hits that still need a
+    /// download before placement.
+    #[serde(default, skip)]
+    pub server_id: Option<String>,
+    /// Whether the primary file is available locally.
+    #[serde(default, skip)]
+    pub downloaded: bool,
+    /// Server/local duration hint for video placeholder placement.
+    #[serde(default, skip)]
+    pub duration_secs: Option<f32>,
     /// True while a download for this row is in flight. Cleared by
     /// the pump-events handler regardless of success / failure so the
     /// UI doesn't get stuck with a permanent spinner.
@@ -107,6 +129,10 @@ impl WebImageHit {
             width,
             height,
             local_path: None,
+            resource_kind: SearchResourceKind::Image,
+            server_id: None,
+            downloaded: false,
+            duration_secs: None,
             downloading: false,
             last_error: None,
         }

@@ -10,11 +10,13 @@ use memstroy_core::{
 };
 
 use crate::jobs::{
-    spawn_ai_background_remove, spawn_web_image_download, spawn_web_image_search, JobEvent,
-    WebImageSearchOptions, WebSearchTarget,
+    spawn_ai_background_remove, spawn_canvas_server_assets_search, spawn_web_image_download,
+    spawn_web_image_search, JobEvent, WebImageSearchOptions, WebSearchTarget,
 };
-use crate::state::{CanvasMarquee, EditorState, LibraryAsset, LibraryTab, MaskTool, Selection};
-use crate::web_image_search::WebImageHit;
+use crate::state::{
+    AssetDragKind, CanvasMarquee, EditorState, LibraryAsset, LibraryTab, MaskTool, Selection,
+};
+use crate::web_image_search::{SearchResourceKind, WebImageHit};
 
 /// How many preview cards the carousel shows at once.
 pub const CAROUSEL_PAGE_SIZE: usize = 8;
@@ -1521,6 +1523,25 @@ pub fn kick_canvas_search(state: &mut EditorState, tx: &Sender<JobEvent>, append
     }
     session.searching = true;
 
+    if !append && !crate::state::LIBRARY_LOCAL_ONLY {
+        for (kind, tab) in [
+            (AssetDragKind::Clip, LibraryTab::Clips),
+            (AssetDragKind::Video, LibraryTab::Videos),
+        ] {
+            if let Some(kind_token) = EditorState::server_kind_for_tab(tab) {
+                spawn_canvas_server_assets_search(
+                    &handle,
+                    tx.clone(),
+                    state.server_url.clone(),
+                    kind,
+                    kind_token,
+                    q.clone(),
+                    state.server_preview_cache_root(),
+                );
+            }
+        }
+    }
+
     spawn_web_image_search(
         &handle,
         tx.clone(),
@@ -1536,59 +1557,162 @@ pub fn kick_canvas_search(state: &mut EditorState, tx: &Sender<JobEvent>, append
 
 fn local_resource_hits(state: &EditorState, query: &str) -> Vec<WebImageHit> {
     let q = query.trim().to_lowercase();
-    state
-        .library
-        .images
-        .iter()
-        .filter(|asset| {
-            q.is_empty()
-                || asset.id.to_lowercase().contains(&q)
-                || asset.label.to_lowercase().contains(&q)
-        })
-        .take(CAROUSEL_PAGE_SIZE)
-        .map(|asset| {
-            let thumb = asset
-                .thumbnail
-                .as_ref()
-                .unwrap_or(&asset.path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            let uri = format!("file:///{}", thumb);
-            let mut hit = WebImageHit::new(
-                uri.clone(),
-                uri,
-                asset.label.clone(),
-                crate::i18n::t("local resource").to_string(),
-                0,
-                0,
-            );
-            hit.local_path = Some(asset.path.clone());
-            hit
-        })
-        .collect()
+    let mut out = Vec::new();
+
+    for clip in state.library.mellstroy_clips.iter().filter(|clip| {
+        q.is_empty()
+            || clip.description.to_lowercase().contains(&q)
+            || clip.label.to_lowercase().contains(&q)
+            || clip
+                .server_id
+                .as_deref()
+                .unwrap_or_default()
+                .to_lowercase()
+                .contains(&q)
+            || clip
+                .path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_lowercase()
+                .contains(&q)
+    }) {
+        out.push(canvas_clip_hit(clip));
+        if out.len() >= 32 {
+            break;
+        }
+    }
+
+    for asset in state.library.videos.iter().filter(|asset| {
+        q.is_empty()
+            || asset.id.to_lowercase().contains(&q)
+            || asset.label.to_lowercase().contains(&q)
+            || asset
+                .server_id
+                .as_deref()
+                .unwrap_or_default()
+                .to_lowercase()
+                .contains(&q)
+    }) {
+        out.push(canvas_asset_hit(asset, SearchResourceKind::Video));
+        if out.len() >= 64 {
+            break;
+        }
+    }
+
+    for asset in state.library.images.iter().filter(|asset| {
+        q.is_empty()
+            || asset.id.to_lowercase().contains(&q)
+            || asset.label.to_lowercase().contains(&q)
+            || asset
+                .server_id
+                .as_deref()
+                .unwrap_or_default()
+                .to_lowercase()
+                .contains(&q)
+    }) {
+        out.push(canvas_asset_hit(asset, SearchResourceKind::Image));
+        if out.len() >= 96 {
+            break;
+        }
+    }
+
+    out
+}
+
+fn file_uri(path: &Path) -> String {
+    format!("file:///{}", path.to_string_lossy().replace('\\', "/"))
+}
+
+fn canvas_clip_hit(clip: &crate::state::LibraryClip) -> WebImageHit {
+    let thumb_path = clip.thumbnail.as_ref().unwrap_or(&clip.path);
+    let thumb_uri = file_uri(thumb_path);
+    let title = if clip.label.trim().is_empty() {
+        clip.description.clone()
+    } else {
+        clip.label.clone()
+    };
+    let mut hit = WebImageHit::new(
+        file_uri(&clip.path),
+        thumb_uri,
+        title,
+        crate::i18n::t("local clip").to_string(),
+        clip.width.unwrap_or(0),
+        clip.height.unwrap_or(0),
+    );
+    hit.local_path = Some(clip.path.clone());
+    hit.resource_kind = SearchResourceKind::Clip;
+    hit.server_id = clip.server_id.clone();
+    hit.downloaded = clip.downloaded;
+    hit.duration_secs = clip.duration_secs;
+    hit
+}
+
+fn canvas_asset_hit(
+    asset: &crate::state::LibraryAsset,
+    resource_kind: SearchResourceKind,
+) -> WebImageHit {
+    let thumb_path = asset.thumbnail.as_ref().unwrap_or(&asset.path);
+    let thumb_uri = file_uri(thumb_path);
+    let mut hit = WebImageHit::new(
+        file_uri(&asset.path),
+        thumb_uri,
+        asset.label.clone(),
+        crate::i18n::t("local resource").to_string(),
+        asset.width.unwrap_or(0),
+        asset.height.unwrap_or(0),
+    );
+    hit.local_path = Some(asset.path.clone());
+    hit.resource_kind = resource_kind;
+    hit.server_id = asset.server_id.clone();
+    hit.downloaded = asset.downloaded;
+    hit.duration_secs = asset.duration_secs;
+    hit
 }
 
 fn kick_canvas_download(state: &mut EditorState, tx: &Sender<JobEvent>, hit_idx: usize) {
+    let (hit, world_pos) = {
+        let session = match state.canvas_image_search.as_mut() {
+            Some(s) => s,
+            None => return,
+        };
+        if hit_idx >= session.results.len() {
+            return;
+        }
+        if session.results[hit_idx].downloading {
+            return;
+        }
+        session.results[hit_idx].downloading = true;
+        session.results[hit_idx].last_error = None;
+        (
+            session.results[hit_idx].clone(),
+            canvas_resource_drop_world(session),
+        )
+    };
+
+    if matches!(
+        hit.resource_kind,
+        SearchResourceKind::Clip | SearchResourceKind::Video
+    ) {
+        if let Some(session) = state.canvas_image_search.as_mut() {
+            if hit_idx < session.results.len() {
+                session.results[hit_idx].downloading = false;
+            }
+        }
+        place_canvas_media_resource(state, tx, &hit, world_pos);
+        return;
+    }
+
     let dest = state.images_dir();
     let handle = state.tokio_handle.clone();
-    let session = match state.canvas_image_search.as_mut() {
-        Some(s) => s,
-        None => return,
-    };
-    if hit_idx >= session.results.len() {
-        return;
-    }
-    if session.results[hit_idx].downloading {
-        return;
-    }
-    session.results[hit_idx].downloading = true;
-    session.results[hit_idx].last_error = None;
-
-    let hit = session.results[hit_idx].clone();
     state.library_tab = LibraryTab::Images;
 
     if let Some(local) = hit.local_path.clone() {
-        session.results[hit_idx].downloading = false;
+        if let Some(session) = state.canvas_image_search.as_mut() {
+            if hit_idx < session.results.len() {
+                session.results[hit_idx].downloading = false;
+            }
+        }
         let asset = LibraryAsset {
             id: local
                 .file_stem()
@@ -1609,14 +1733,23 @@ fn kick_canvas_download(state: &mut EditorState, tx: &Sender<JobEvent>, hit_idx:
     }
 
     let Some(handle) = handle else {
-        session.results[hit_idx].downloading = false;
-        session.results[hit_idx].last_error =
-            Some(crate::i18n::t("Tokio runtime missing").to_string());
+        if let Some(session) = state.canvas_image_search.as_mut() {
+            if hit_idx < session.results.len() {
+                session.results[hit_idx].downloading = false;
+                session.results[hit_idx].last_error =
+                    Some(crate::i18n::t("Tokio runtime missing").to_string());
+            }
+        }
         return;
     };
 
-    let request_id = session.next_request_id;
-    session.next_request_id = session.next_request_id.wrapping_add(1);
+    let request_id = if let Some(session) = state.canvas_image_search.as_mut() {
+        let request_id = session.next_request_id;
+        session.next_request_id = session.next_request_id.wrapping_add(1);
+        request_id
+    } else {
+        return;
+    };
 
     spawn_web_image_download(
         &handle,
@@ -1627,6 +1760,100 @@ fn kick_canvas_download(state: &mut EditorState, tx: &Sender<JobEvent>, hit_idx:
         request_id,
         false,
     );
+}
+
+fn canvas_resource_drop_world(session: &CanvasImageSearchSession) -> [f32; 2] {
+    if let Some((mn, mx)) = session.selection_rect() {
+        [(mn[0] + mx[0]) * 0.5, (mn[1] + mx[1]) * 0.5]
+    } else {
+        session.ui_anchor_world
+    }
+}
+
+fn place_canvas_media_resource(
+    state: &mut EditorState,
+    tx: &Sender<JobEvent>,
+    hit: &WebImageHit,
+    world_pos: [f32; 2],
+) {
+    let Some(path) = hit.local_path.clone() else {
+        if let Some(session) = state.canvas_image_search.as_mut() {
+            session.status = crate::i18n::t("Cannot place resource: missing local path").into();
+        }
+        return;
+    };
+
+    match hit.resource_kind {
+        SearchResourceKind::Clip => {
+            if EditorState::is_usable_local_video(&path) {
+                crate::panels::add_actor_from_clip_at_canvas(state, &path, world_pos);
+                state.library_tab = LibraryTab::Clips;
+                state.canvas_image_search = None;
+                return;
+            }
+            let Some(new_idx) = crate::panels::add_pending_actor_from_clip_at_canvas(
+                state,
+                &path,
+                world_pos,
+                hit.duration_secs,
+            ) else {
+                return;
+            };
+            let actor_id = state.scene.actors[new_idx].id.clone();
+            if !crate::panels::try_spawn_lazy_clip_download(
+                state,
+                &path,
+                crate::jobs::ClipDropTarget::ExistingActor { actor_id },
+            ) {
+                state.status = crate::i18n::t("Cannot download clip: missing server id").into();
+            }
+            state.library_tab = LibraryTab::Clips;
+            state.canvas_image_search = None;
+        }
+        SearchResourceKind::Video => {
+            if EditorState::is_usable_local_video(&path) {
+                crate::panels::add_actor_from_video_at_canvas(state, &path, world_pos);
+                state.library_tab = LibraryTab::Videos;
+                state.canvas_image_search = None;
+                return;
+            }
+            let Some(server_id) = hit.server_id.clone() else {
+                if let Some(session) = state.canvas_image_search.as_mut() {
+                    session.status =
+                        crate::i18n::t("Cannot download asset: missing server id").to_string();
+                }
+                return;
+            };
+            let Some(new_idx) = crate::panels::add_pending_actor_from_video_at_canvas(
+                state,
+                &path,
+                world_pos,
+                hit.duration_secs,
+            ) else {
+                return;
+            };
+            let actor_id = state.scene.actors[new_idx].id.clone();
+            let Some(handle) = state.tokio_handle.clone() else {
+                state.status =
+                    crate::i18n::t("Cannot download asset: background worker not ready").into();
+                return;
+            };
+            state.pending_clip_downloads.insert(path.clone());
+            crate::jobs::spawn_server_asset_download(
+                &handle,
+                tx.clone(),
+                state.server_url.clone(),
+                server_id,
+                AssetDragKind::Video,
+                path,
+                crate::jobs::ServerAssetDropTarget::ExistingActor { actor_id },
+            );
+            state.status = crate::i18n::t("Downloading server asset...").into();
+            state.library_tab = LibraryTab::Videos;
+            state.canvas_image_search = None;
+        }
+        SearchResourceKind::Image => {}
+    }
 }
 
 /// Apply a finished web search to the active canvas session.
@@ -1655,7 +1882,11 @@ pub fn ingest_canvas_search_result(
                 let mut local = session
                     .results
                     .iter()
-                    .filter(|h| h.local_path.is_some())
+                    .filter(|h| {
+                        h.resource_kind != SearchResourceKind::Image
+                            || h.local_path.is_some()
+                            || h.server_id.is_some()
+                    })
                     .cloned()
                     .collect::<Vec<_>>();
                 local.extend(hits);
@@ -1677,12 +1908,128 @@ pub fn ingest_canvas_search_result(
         }
         Err(e) => {
             if page_offset == 0 {
-                session.results.clear();
+                session.results.retain(|h| {
+                    h.resource_kind != SearchResourceKind::Image
+                        || h.local_path.is_some()
+                        || h.server_id.is_some()
+                });
             }
             session.next_offset = None;
             session.status = format!("Error: {}", e);
         }
     }
+}
+
+pub fn ingest_canvas_server_assets_result(
+    state: &mut EditorState,
+    kind: AssetDragKind,
+    query: &str,
+    result: Result<crate::jobs::ServerAssetsPage, String>,
+) {
+    let Some(session) = state.canvas_image_search.as_ref() else {
+        return;
+    };
+    if session.last_sent_query.trim() != query.trim() {
+        return;
+    }
+    let page = match result {
+        Ok(page) => page,
+        Err(e) => {
+            if let Some(session) = state.canvas_image_search.as_mut() {
+                if session.status.is_empty() {
+                    session.status = format!("{} {}", crate::i18n::t("Server assets failed:"), e);
+                }
+            }
+            return;
+        }
+    };
+    let tab = match kind {
+        AssetDragKind::Clip => LibraryTab::Clips,
+        AssetDragKind::Video => LibraryTab::Videos,
+        _ => return,
+    };
+    let server_ids = page
+        .items
+        .iter()
+        .map(|item| item.id.clone())
+        .collect::<Vec<_>>();
+    state.ingest_server_assets_page(tab, query, page);
+
+    let mut hits = Vec::new();
+    match kind {
+        AssetDragKind::Clip => {
+            for id in &server_ids {
+                if let Some(clip) = state
+                    .library
+                    .mellstroy_clips
+                    .iter()
+                    .find(|clip| clip.server_id.as_deref() == Some(id.as_str()))
+                {
+                    hits.push(canvas_clip_hit(clip));
+                }
+            }
+        }
+        AssetDragKind::Video => {
+            for id in &server_ids {
+                if let Some(asset) = state
+                    .library
+                    .videos
+                    .iter()
+                    .find(|asset| asset.server_id.as_deref() == Some(id.as_str()))
+                {
+                    hits.push(canvas_asset_hit(asset, SearchResourceKind::Video));
+                }
+            }
+        }
+        _ => {}
+    }
+
+    if let Some(session) = state.canvas_image_search.as_mut() {
+        insert_canvas_resource_hits(session, hits);
+        let n = session.results.len();
+        session.status = if n == 0 {
+            crate::i18n::t("No results.").to_string()
+        } else {
+            format!("{} {}.", crate::i18n::t("Got"), n)
+        };
+    }
+}
+
+fn same_canvas_hit(a: &WebImageHit, b: &WebImageHit) -> bool {
+    if a.resource_kind == b.resource_kind {
+        if let (Some(a_id), Some(b_id)) = (a.server_id.as_ref(), b.server_id.as_ref()) {
+            return a_id == b_id;
+        }
+        if let (Some(a_path), Some(b_path)) = (a.local_path.as_ref(), b.local_path.as_ref()) {
+            return a_path == b_path;
+        }
+    }
+    a.image_url == b.image_url
+}
+
+fn insert_canvas_resource_hits(session: &mut CanvasImageSearchSession, hits: Vec<WebImageHit>) {
+    let mut fresh = Vec::new();
+    for hit in hits {
+        if session.results.iter().any(|old| same_canvas_hit(old, &hit))
+            || fresh.iter().any(|old| same_canvas_hit(old, &hit))
+        {
+            continue;
+        }
+        fresh.push(hit);
+    }
+    if fresh.is_empty() {
+        return;
+    }
+    let insert_at = session
+        .results
+        .iter()
+        .position(|hit| {
+            hit.resource_kind == SearchResourceKind::Image
+                && hit.local_path.is_none()
+                && hit.server_id.is_none()
+        })
+        .unwrap_or(session.results.len());
+    session.results.splice(insert_at..insert_at, fresh);
 }
 
 /// Mark download state on canvas session hits and place the image.

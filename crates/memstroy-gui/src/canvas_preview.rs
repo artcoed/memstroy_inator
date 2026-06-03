@@ -93,6 +93,13 @@ fn actor_source_dimensions(state: &EditorState, actor_idx: usize) -> (f32, f32) 
             }
             return (w as f32, h as f32);
         }
+        if actor_source_waits_for_download(state, &actor.source) {
+            if let Some((preview_w, preview_h)) =
+                crate::video_cache::scaled_preview_dimensions(1080, 1920, state.scene.actors.len())
+            {
+                return (preview_w as f32, preview_h as f32);
+            }
+        }
     }
     (1080.0, 1920.0)
 }

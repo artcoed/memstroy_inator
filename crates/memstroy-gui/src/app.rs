@@ -93,6 +93,11 @@ pub struct App {
     /// Set when the user chose "Don't save" on quit — next close
     /// request is allowed through without prompting again.
     force_app_close: bool,
+    /// Cached autosave rows for the File menu. Scanned on a worker
+    /// thread so opening the menu never blocks on filesystem metadata.
+    autosave_menu_entries: Vec<crate::autosave::AutosaveEntry>,
+    autosave_menu_loading: bool,
+    autosave_menu_last_refresh: Option<std::time::Instant>,
 }
 
 fn audio_actor_overlap(
@@ -270,7 +275,7 @@ impl App {
         // File > Open last autosave, so the user can open it on demand
         // without an interruption on launch.
 
-        Self {
+        let mut app = Self {
             rt: Some(rt),
             state,
             tx,
@@ -290,7 +295,12 @@ impl App {
             last_internal_copy_at: None,
             pending_scene_exit: None,
             force_app_close: false,
-        }
+            autosave_menu_entries: Vec::new(),
+            autosave_menu_loading: false,
+            autosave_menu_last_refresh: None,
+        };
+        app.refresh_autosave_menu_async();
+        app
     }
 
     /// If the active tab has edits, queue destructive exit actions and
@@ -318,6 +328,18 @@ impl App {
         if needs_close {
             self.force_app_close = true;
         }
+    }
+
+    fn refresh_autosave_menu_async(&mut self) {
+        if self.autosave_menu_loading {
+            return;
+        }
+        self.autosave_menu_loading = true;
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let entries = crate::autosave::list_entries();
+            let _ = tx.send(JobEvent::AutosavesListed(entries));
+        });
     }
 
     /// Try to save the active tab for an exit flow. Returns true when
@@ -821,6 +843,18 @@ impl App {
                             format!("{} {}", crate::i18n::t("Server assets failed:"), e);
                     }
                 },
+                JobEvent::CanvasServerAssetsLoaded {
+                    kind,
+                    query,
+                    result,
+                } => {
+                    crate::canvas_image_search::ingest_canvas_server_assets_result(
+                        &mut self.state,
+                        kind,
+                        &query,
+                        result,
+                    );
+                }
                 JobEvent::ServerAssetCountsLoaded { result } => match result {
                     Ok(counts) => {
                         let first_load = self.state.server_asset_counts.is_none();
@@ -864,6 +898,11 @@ impl App {
                     duration,
                 } => {
                     self.handle_video_duration_probed(actor_id, path, duration);
+                }
+                JobEvent::AutosavesListed(entries) => {
+                    self.autosave_menu_entries = entries;
+                    self.autosave_menu_loading = false;
+                    self.autosave_menu_last_refresh = Some(std::time::Instant::now());
                 }
                 JobEvent::LibraryScanned(snap) => {
                     self.library_reload_in_progress = false;
@@ -1625,12 +1664,24 @@ impl App {
                 }
                 ui.separator();
 
-                // Autosaves are flattened into the File menu. A nested
-                // submenu here is easy to leave open accidentally while
-                // moving the pointer across the top bar.
-                let autosave_entries = crate::autosave::list_entries();
+                // Autosaves are flattened into the File menu. The scan
+                // itself is cached and refreshed on a worker thread so a
+                // menu open never stalls the top bar on filesystem IO.
+                let autosave_cache_stale = self
+                    .autosave_menu_last_refresh
+                    .map(|t| t.elapsed() > std::time::Duration::from_secs(5))
+                    .unwrap_or(true);
+                if autosave_cache_stale && !self.autosave_menu_loading {
+                    self.refresh_autosave_menu_async();
+                }
+                let autosave_entries = self.autosave_menu_entries.clone();
                 if autosave_entries.is_empty() {
-                    let _ = menu_row(ui, "R", t("Open autosave (none)").to_string());
+                    let label = if self.autosave_menu_loading {
+                        t("Open autosave (loading)").to_string()
+                    } else {
+                        t("Open autosave (none)").to_string()
+                    };
+                    let _ = menu_row(ui, "R", label);
                 } else {
                     ui.add_space(2.0);
                     ui.label(

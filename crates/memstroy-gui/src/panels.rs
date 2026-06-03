@@ -11930,6 +11930,31 @@ fn apply_remove(
 /// Minimum duration of each half after a razor cut (seconds).
 const MIN_SPLIT_HALF_SEC: f32 = 0.05;
 
+fn split_time_for_pointer_x(
+    pointer_x: f32,
+    scroll: f32,
+    pps: f32,
+    track_left: f32,
+    clip_start: f32,
+    clip_end: f32,
+) -> Option<f32> {
+    if !pointer_x.is_finite()
+        || !scroll.is_finite()
+        || !pps.is_finite()
+        || pps.abs() <= 1.0e-6
+        || !clip_start.is_finite()
+        || !clip_end.is_finite()
+    {
+        return None;
+    }
+    let min_t = clip_start + MIN_SPLIT_HALF_SEC;
+    let max_t = clip_end - MIN_SPLIT_HALF_SEC;
+    if max_t <= min_t {
+        return None;
+    }
+    Some(x_to_time(pointer_x, scroll, pps, track_left).clamp(min_t, max_t))
+}
+
 /// Queue a timeline razor split at scene-time `cut_t` for `sel`.
 pub(crate) fn queue_timeline_split(state: &mut EditorState, sel: Selection, cut_t: f32) {
     state.pending_timeline_split = Some((sel, cut_t));
@@ -17358,11 +17383,9 @@ fn draw_clip(
                 .interact_pointer_pos()
                 .or_else(|| ui.input(|i| i.pointer.press_origin()));
             if let Some(pos) = pos {
-                let t = x_to_time(pos.x, scroll, pps, track_left).clamp(
-                    clip_start + MIN_SPLIT_HALF_SEC,
-                    clip_end - MIN_SPLIT_HALF_SEC,
+                return split_time_for_pointer_x(
+                    pos.x, scroll, pps, track_left, clip_start, clip_end,
                 );
-                return Some(t);
             }
         }
         return Some(clip_start); // signal selection
@@ -17775,8 +17798,9 @@ fn draw_audio_clip(
     if resp.clicked() {
         if _split_mode {
             if let Some(pos) = resp.interact_pointer_pos() {
-                let t = (pos.x - track_left) / pps + scroll;
-                return Some(t);
+                return split_time_for_pointer_x(
+                    pos.x, scroll, pps, track_left, clip_start, clip_end,
+                );
             }
         }
         return Some(clip_start);
@@ -20351,9 +20375,18 @@ pub(crate) fn media_dimensions_for_source(
         };
         (w > 0 && h > 0).then_some((w, h))
     }
+    fn thumbnail_dims(path: Option<&PathBuf>) -> Option<(u32, u32)> {
+        let path = path?;
+        let img = image::open(path).ok()?;
+        let dims = (img.width(), img.height());
+        (dims.0 > 0 && dims.1 > 0).then_some(dims)
+    }
 
     if let Some(clip) = find_library_clip_by_path(state, source) {
         if let Some(dims) = valid_dims(clip.width, clip.height) {
+            return Some(dims);
+        }
+        if let Some(dims) = thumbnail_dims(clip.thumbnail.as_ref()) {
             return Some(dims);
         }
     }
@@ -20367,13 +20400,24 @@ pub(crate) fn media_dimensions_for_source(
         if let Some(dims) = valid_dims(clip.width, clip.height) {
             return Some(dims);
         }
+        if let Some(dims) = thumbnail_dims(clip.thumbnail.as_ref()) {
+            return Some(dims);
+        }
     }
-    state
+    if let Some(asset) = state
         .library
         .videos
         .iter()
         .find(|asset| asset.server_id.as_deref() == Some(stem) || asset.path == source)
-        .and_then(|asset| valid_dims(asset.width, asset.height))
+    {
+        if let Some(dims) = valid_dims(asset.width, asset.height) {
+            return Some(dims);
+        }
+        if let Some(dims) = thumbnail_dims(asset.thumbnail.as_ref()) {
+            return Some(dims);
+        }
+    }
+    None
 }
 
 fn spawn_media_duration_probe(state: &mut EditorState, path: &PathBuf, actor_id: String) {
@@ -20467,7 +20511,7 @@ pub fn reconcile_actor_clip_durations(state: &mut EditorState) {
 
 pub fn add_actor_from_clip(state: &mut EditorState, path: &PathBuf) {
     let t = state.playhead;
-    let _ = add_actor_from_clip_at_time_with_footage_flag(state, path, t, true, false, None);
+    let _ = add_actor_from_clip_at_time_with_footage_flag(state, path, t, false, false, None);
 }
 
 pub fn add_actor_from_video_asset(state: &mut EditorState, path: &PathBuf) {
@@ -20717,7 +20761,7 @@ pub(crate) fn add_actor_from_clip_at_time(
     path: &PathBuf,
     t: f32,
 ) -> Option<usize> {
-    add_actor_from_clip_at_time_with_footage_flag(state, path, t, true, false, None)
+    add_actor_from_clip_at_time_with_footage_flag(state, path, t, false, false, None)
 }
 
 pub(crate) fn add_actor_from_video_at_time(
@@ -20734,7 +20778,7 @@ pub(crate) fn add_pending_actor_from_clip_at_time(
     t: f32,
     duration_hint: Option<f32>,
 ) -> Option<usize> {
-    add_actor_from_clip_at_time_with_footage_flag(state, path, t, true, true, duration_hint)
+    add_actor_from_clip_at_time_with_footage_flag(state, path, t, false, true, duration_hint)
 }
 
 pub(crate) fn add_pending_actor_from_video_at_time(
@@ -20883,7 +20927,7 @@ pub(crate) fn add_actor_from_clip_at_canvas(
     world_pos: [f32; 2],
 ) {
     let _ =
-        add_actor_from_clip_at_canvas_with_footage_flag(state, path, world_pos, true, false, None);
+        add_actor_from_clip_at_canvas_with_footage_flag(state, path, world_pos, false, false, None);
 }
 
 pub(crate) fn add_actor_from_video_at_canvas(
@@ -20905,7 +20949,7 @@ pub(crate) fn add_pending_actor_from_clip_at_canvas(
         state,
         path,
         world_pos,
-        true,
+        false,
         true,
         duration_hint,
     )
@@ -21092,7 +21136,7 @@ mod timeline_resolution_tests {
     }
 
     #[test]
-    fn mellstroy_clip_defaults_on_regular_video_defaults_off() {
+    fn footage_flag_defaults_off_for_clip_and_regular_video() {
         let clip = temp_video("clip-default");
         let video = temp_video("video-default");
         let mut state = test_state();
@@ -21104,11 +21148,19 @@ mod timeline_resolution_tests {
         let video_idx =
             add_actor_from_video_at_time(&mut state, &video, 3.0).expect("video actor should add");
 
-        assert!(state.scene.actors[clip_idx].mellstroy_footage.enabled);
+        assert!(!state.scene.actors[clip_idx].mellstroy_footage.enabled);
         assert!(!state.scene.actors[video_idx].mellstroy_footage.enabled);
 
         let _ = std::fs::remove_file(clip);
         let _ = std::fs::remove_file(video);
+    }
+
+    #[test]
+    fn split_time_for_too_short_clip_returns_none() {
+        assert!(split_time_for_pointer_x(50.0, 0.0, 100.0, 0.0, 1.0, 1.04).is_none());
+        let t = split_time_for_pointer_x(50.0, 0.0, 100.0, 0.0, 1.0, 2.0)
+            .expect("normal clip should split");
+        assert_close(t, 1.05);
     }
 
     #[test]

@@ -110,6 +110,12 @@ pub enum JobEvent {
         limit: u64,
         result: Result<ServerAssetsPage, String>,
     },
+    /// Server-side resource search results for the canvas popup.
+    CanvasServerAssetsLoaded {
+        kind: crate::state::AssetDragKind,
+        query: String,
+        result: Result<ServerAssetsPage, String>,
+    },
     /// Lightweight aggregate counts from `/api/assets/counts`.
     ServerAssetCountsLoaded {
         result: Result<ServerAssetCounts, String>,
@@ -134,6 +140,8 @@ pub enum JobEvent {
         path: PathBuf,
         duration: Option<f32>,
     },
+    /// Autosave menu entries were scanned off the UI thread.
+    AutosavesListed(Vec<crate::autosave::AutosaveEntry>),
     /// Background filesystem scan finished — apply on the UI thread.
     LibraryScanned(crate::state::LibraryScanSnapshot),
     /// Background library scan failed (worker thread panic / join error).
@@ -676,6 +684,33 @@ pub fn spawn_server_assets_page(
             query,
             offset,
             limit,
+            result,
+        });
+    });
+}
+
+pub fn spawn_canvas_server_assets_search(
+    rt: &Handle,
+    tx: Sender<JobEvent>,
+    server_url: String,
+    kind: crate::state::AssetDragKind,
+    kind_token: &'static str,
+    query: String,
+    preview_cache_root: PathBuf,
+) {
+    rt.spawn(async move {
+        let result = fetch_server_assets_page(
+            server_url,
+            kind_token,
+            query.clone(),
+            0,
+            48,
+            preview_cache_root,
+        )
+        .await;
+        let _ = tx.send(JobEvent::CanvasServerAssetsLoaded {
+            kind,
+            query,
             result,
         });
     });
@@ -1418,7 +1453,7 @@ async fn run_web_image_search(
             ("t", "h_"),
         ])
         .header("Accept", "text/html,application/xhtml+xml")
-        .header("Accept-Language", "en-US,en;q=0.5")
+        .header("Accept-Language", "ru-RU,ru;q=0.9,en-US;q=0.5,en;q=0.3")
         .send()
         .await
         .map_err(|e| format!("Couldn't reach DuckDuckGo: {e}"))?;
@@ -1455,7 +1490,7 @@ async fn run_web_image_search(
         ])
         .header("Accept", "application/json")
         .header("Referer", "https://duckduckgo.com/")
-        .header("Accept-Language", "en-US,en;q=0.5")
+        .header("Accept-Language", "ru-RU,ru;q=0.9,en-US;q=0.5,en;q=0.3")
         .send()
         .await
         .map_err(|e| format!("Image-search request failed: {e}"))?;

@@ -323,9 +323,10 @@ impl std::fmt::Debug for GroupMoveAnchor {
     }
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone)]
 pub struct FootageSequenceControllerSnapshot {
     pub layout: Vec<memstroy_core::Keyframe<memstroy_core::ActorState>>,
+    pub canvas_layout: Option<memstroy_core::CanvasLayout>,
     pub animated_params: std::collections::BTreeSet<String>,
     pub modifiers: Vec<memstroy_core::TrackModifier>,
     pub effects: Vec<memstroy_core::Effect>,
@@ -1597,6 +1598,12 @@ impl EditorState {
         let actor = self.scene.actors.get(actor_idx)?;
         Some(FootageSequenceControllerSnapshot {
             layout: actor.layout.clone(),
+            canvas_layout: self
+                .scene
+                .canvas_layouts
+                .iter()
+                .find(|cl| cl.element_id == actor.id)
+                .cloned(),
             animated_params: actor.animated_params.clone(),
             modifiers: actor.modifiers.clone(),
             effects: actor.effects.clone(),
@@ -1613,10 +1620,10 @@ impl EditorState {
         let Some(after) = self.footage_sequence_controller_snapshot(controller_idx) else {
             return false;
         };
-        if &after == before {
+        if footage_sequence_controller_snapshot_eq(&after, before) {
             return false;
         }
-        self.sync_footage_sequence_controller_now(controller_idx)
+        self.apply_footage_sequence_controller_delta(controller_idx, before, &after)
     }
 
     pub fn sync_footage_sequence_controller_now(&mut self, controller_idx: usize) -> bool {
@@ -1642,14 +1649,91 @@ impl EditorState {
             {
                 continue;
             }
-            actor.layout = snapshot.layout.clone();
-            actor.animated_params = snapshot.animated_params.clone();
+            // Do not copy the sequence controller transform verbatim:
+            // sequence segments can have their own relative offsets and
+            // keyframes. Inspector transform edits use
+            // `apply_footage_sequence_controller_delta` with a before/after
+            // snapshot instead. This "sync now" path is kept for shared
+            // masks/effects applied from canvas tools.
             actor.modifiers = snapshot.modifiers.clone();
             actor.effects = snapshot.effects.clone();
             actor.chroma_key = snapshot.chroma_key.clone();
             actor.color_correction = snapshot.color_correction.clone();
             touched = true;
         }
+        if touched {
+            self.request_media_preview = true;
+        }
+        touched
+    }
+
+    fn apply_footage_sequence_controller_delta(
+        &mut self,
+        controller_idx: usize,
+        before: &FootageSequenceControllerSnapshot,
+        after: &FootageSequenceControllerSnapshot,
+    ) -> bool {
+        let Some(controller) = self.scene.actors.get(controller_idx) else {
+            return false;
+        };
+        if !controller.mellstroy_footage.enabled || controller.mellstroy_footage.slot {
+            return false;
+        }
+        let Some(sequence_id) = controller.mellstroy_footage.sequence_id.clone() else {
+            return false;
+        };
+
+        let layout_delta_times = footage_sequence_delta_times(before, after);
+        let mut touched = false;
+        let target_indices: Vec<usize> = self
+            .scene
+            .actors
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, actor)| {
+                (idx != controller_idx
+                    && actor.mellstroy_footage.enabled
+                    && !actor.mellstroy_footage.slot
+                    && actor.mellstroy_footage.sequence_id.as_deref() == Some(sequence_id.as_str()))
+                .then_some(idx)
+            })
+            .collect();
+
+        for idx in target_indices {
+            let actor_id = {
+                let Some(actor) = self.scene.actors.get_mut(idx) else {
+                    continue;
+                };
+                apply_actor_sequence_layout_delta(
+                    &mut actor.layout,
+                    &mut actor.animated_params,
+                    before,
+                    after,
+                    &layout_delta_times,
+                );
+                actor.modifiers = after.modifiers.clone();
+                actor.effects = after.effects.clone();
+                actor.chroma_key = after.chroma_key.clone();
+                actor.color_correction = after.color_correction.clone();
+                actor.id.clone()
+            };
+            if let Some(cl) = self
+                .scene
+                .canvas_layouts
+                .iter_mut()
+                .find(|cl| cl.element_id == actor_id)
+            {
+                apply_canvas_sequence_layout_delta(
+                    cl,
+                    before,
+                    after,
+                    self.scene.render_frame.resolution,
+                    &layout_delta_times,
+                );
+            }
+            touched = true;
+        }
+
         if touched {
             self.request_media_preview = true;
         }
@@ -4869,6 +4953,218 @@ fn replace_or_push_keyframe<T: Clone>(
     true
 }
 
+fn upsert_sequence_keyframe<T: Clone>(
+    layout: &mut Vec<memstroy_core::Keyframe<T>>,
+    t: f32,
+    value: T,
+) {
+    const EPS: f32 = 1.0e-3;
+    if let Some(kf) = layout.iter_mut().find(|kf| (kf.t - t).abs() < EPS) {
+        kf.value = value;
+        return;
+    }
+    layout.push(memstroy_core::Keyframe::new(t, value));
+    layout.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
+}
+
+fn footage_sequence_controller_snapshot_eq(
+    a: &FootageSequenceControllerSnapshot,
+    b: &FootageSequenceControllerSnapshot,
+) -> bool {
+    a.layout == b.layout
+        && canvas_layout_snapshot_eq(&a.canvas_layout, &b.canvas_layout)
+        && a.animated_params == b.animated_params
+        && a.modifiers == b.modifiers
+        && a.effects == b.effects
+        && a.chroma_key == b.chroma_key
+        && a.color_correction == b.color_correction
+}
+
+fn canvas_layout_snapshot_eq(
+    a: &Option<memstroy_core::CanvasLayout>,
+    b: &Option<memstroy_core::CanvasLayout>,
+) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a.element_id == b.element_id && a.keyframes == b.keyframes,
+        _ => false,
+    }
+}
+
+fn push_sequence_time(times: &mut Vec<f32>, t: f32) {
+    if !t.is_finite() {
+        return;
+    }
+    const EPS: f32 = 1.0e-3;
+    if !times.iter().any(|old| (*old - t).abs() < EPS) {
+        times.push(t.max(0.0));
+    }
+}
+
+fn footage_sequence_delta_times(
+    before: &FootageSequenceControllerSnapshot,
+    after: &FootageSequenceControllerSnapshot,
+) -> Vec<f32> {
+    let mut times = Vec::new();
+    for kf in before.layout.iter().chain(after.layout.iter()) {
+        push_sequence_time(&mut times, kf.t);
+    }
+    for layout in [before.canvas_layout.as_ref(), after.canvas_layout.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        for kf in &layout.keyframes {
+            push_sequence_time(&mut times, kf.t);
+        }
+    }
+    if times.is_empty() {
+        times.push(0.0);
+    }
+    times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    times
+}
+
+fn sequence_ratio(after: f32, before: f32) -> f32 {
+    if before.abs() > 1.0e-6 && after.is_finite() && before.is_finite() {
+        after / before
+    } else {
+        1.0
+    }
+}
+
+fn apply_actor_sequence_delta(
+    mut child: memstroy_core::ActorState,
+    before: memstroy_core::ActorState,
+    after: memstroy_core::ActorState,
+) -> memstroy_core::ActorState {
+    child.pos[0] += after.pos[0] - before.pos[0];
+    child.pos[1] += after.pos[1] - before.pos[1];
+    child.scale = (child.scale * sequence_ratio(after.scale, before.scale)).max(0.001);
+    child.scale_y = (child.scale_y * sequence_ratio(after.scale_y, before.scale_y)).max(0.001);
+    child.rotation_deg += after.rotation_deg - before.rotation_deg;
+    child.opacity = (child.opacity + (after.opacity - before.opacity)).clamp(0.0, 1.0);
+    child.flip_x_anim =
+        (child.flip_x_anim + (after.flip_x_anim - before.flip_x_anim)).clamp(-1.0, 1.0);
+    child.flip_y_anim =
+        (child.flip_y_anim + (after.flip_y_anim - before.flip_y_anim)).clamp(-1.0, 1.0);
+    child
+}
+
+fn apply_actor_sequence_layout_delta(
+    layout: &mut Vec<memstroy_core::Keyframe<memstroy_core::ActorState>>,
+    animated_params: &mut std::collections::BTreeSet<String>,
+    before: &FootageSequenceControllerSnapshot,
+    after: &FootageSequenceControllerSnapshot,
+    delta_times: &[f32],
+) {
+    use memstroy_core::param_ids;
+    let child_sample_params = animated_params.clone();
+    const TRANSFORM_PARAMS: [&str; 7] = [
+        param_ids::POS_X,
+        param_ids::POS_Y,
+        param_ids::SCALE,
+        param_ids::SCALE_Y,
+        param_ids::ROTATION,
+        param_ids::OPACITY,
+        param_ids::FLIP_X,
+    ];
+    for param in TRANSFORM_PARAMS {
+        if after.animated_params.contains(param) {
+            animated_params.insert(param.to_string());
+        }
+    }
+    if after.animated_params.contains(param_ids::FLIP_Y) {
+        animated_params.insert(param_ids::FLIP_Y.to_string());
+    }
+
+    let original = layout.clone();
+    let mut times = original.iter().map(|kf| kf.t).collect::<Vec<_>>();
+    for &t in delta_times {
+        push_sequence_time(&mut times, t);
+    }
+    if times.is_empty() {
+        times.push(0.0);
+    }
+    times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    for t in times {
+        let child = memstroy_core::sample_actor_layout(&original, &child_sample_params, t);
+        let before_state =
+            memstroy_core::sample_actor_layout(&before.layout, &before.animated_params, t);
+        let after_state =
+            memstroy_core::sample_actor_layout(&after.layout, &after.animated_params, t);
+        upsert_sequence_keyframe(
+            layout,
+            t,
+            apply_actor_sequence_delta(child, before_state, after_state),
+        );
+    }
+}
+
+fn sequence_controller_canvas_at(
+    snapshot: &FootageSequenceControllerSnapshot,
+    resolution: [u32; 2],
+    t: f32,
+) -> memstroy_core::CanvasTransform {
+    if let Some(layout) = snapshot.canvas_layout.as_ref() {
+        return memstroy_core::sample_canvas_layout(&layout.keyframes, t);
+    }
+    let actor_state =
+        memstroy_core::sample_actor_layout(&snapshot.layout, &snapshot.animated_params, t);
+    memstroy_core::CanvasTransform {
+        pos: memstroy_core::WorldPos {
+            x: actor_state.pos[0] * resolution[0] as f32,
+            y: actor_state.pos[1] * resolution[1] as f32,
+        },
+        scale: actor_state.scale,
+        rotation_deg: actor_state.rotation_deg,
+        opacity: actor_state.opacity,
+        ..Default::default()
+    }
+}
+
+fn apply_canvas_sequence_delta(
+    mut child: memstroy_core::CanvasTransform,
+    before: memstroy_core::CanvasTransform,
+    after: memstroy_core::CanvasTransform,
+) -> memstroy_core::CanvasTransform {
+    child.pos.x += after.pos.x - before.pos.x;
+    child.pos.y += after.pos.y - before.pos.y;
+    child.scale = (child.scale * sequence_ratio(after.scale, before.scale)).max(0.001);
+    child.rotation_deg += after.rotation_deg - before.rotation_deg;
+    child.opacity = (child.opacity + (after.opacity - before.opacity)).clamp(0.0, 1.0);
+    child
+}
+
+fn apply_canvas_sequence_layout_delta(
+    layout: &mut memstroy_core::CanvasLayout,
+    before: &FootageSequenceControllerSnapshot,
+    after: &FootageSequenceControllerSnapshot,
+    resolution: [u32; 2],
+    delta_times: &[f32],
+) {
+    let original = layout.keyframes.clone();
+    let mut times = original.iter().map(|kf| kf.t).collect::<Vec<_>>();
+    for &t in delta_times {
+        push_sequence_time(&mut times, t);
+    }
+    if times.is_empty() {
+        times.push(0.0);
+    }
+    times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    for t in times {
+        let child = memstroy_core::sample_canvas_layout(&original, t);
+        let before_transform = sequence_controller_canvas_at(before, resolution, t);
+        let after_transform = sequence_controller_canvas_at(after, resolution, t);
+        upsert_sequence_keyframe(
+            &mut layout.keyframes,
+            t,
+            apply_canvas_sequence_delta(child, before_transform, after_transform),
+        );
+    }
+}
+
 fn parse_fx_param_id(param_id: &str) -> Option<(usize, &str)> {
     let rest = param_id.strip_prefix("fx_")?;
     let sep = rest.find('_')?;
@@ -5818,11 +6114,12 @@ mod timeline_lane_tests {
     }
 
     #[test]
-    fn sequence_controller_sync_copies_group_fields_but_skips_slots() {
+    fn sequence_controller_sync_applies_transform_delta_and_skips_slots() {
         let mut state = EditorState::new();
         let mut controller = test_actor("controller", 0.0, 1.0);
         let mut peer = test_actor("peer", 1.0, 2.0);
         let mut slot = test_actor("slot", 2.0, 3.0);
+        peer.layout[0].value.pos = [0.70, 0.80];
         for actor in [&mut controller, &mut peer, &mut slot] {
             actor.mellstroy_footage.enabled = true;
             actor.mellstroy_footage.sequence_id = Some("seq".into());
@@ -5841,11 +6138,12 @@ mod timeline_lane_tests {
         state.scene.actors[0].effects.push(Effect::color_key());
 
         assert!(state.sync_footage_sequence_controller_from_snapshot(0, &before));
-        assert_eq!(state.scene.actors[1].layout, state.scene.actors[0].layout);
-        assert_eq!(
-            state.scene.actors[1].animated_params,
-            state.scene.actors[0].animated_params
-        );
+        let peer_pos = state.scene.actors[1].layout[0].value.pos;
+        assert!((peer_pos[0] - 0.45).abs() < 1.0e-4, "{peer_pos:?}");
+        assert!((peer_pos[1] - 0.43).abs() < 1.0e-4, "{peer_pos:?}");
+        assert!(state.scene.actors[1]
+            .animated_params
+            .contains(memstroy_core::param_ids::POS_X));
         assert_eq!(state.scene.actors[1].effects, state.scene.actors[0].effects);
         assert_ne!(state.scene.actors[2].layout, state.scene.actors[0].layout);
         assert!(state.request_media_preview);

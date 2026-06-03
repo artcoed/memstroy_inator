@@ -26,7 +26,7 @@ use crate::state::EditorState;
 /// Persistent editor preferences. Stored as JSON for human readability.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EditorSettings {
-    /// UI language. Defaults to English.
+    /// UI language. Defaults to Russian.
     #[serde(default)]
     pub language: Lang,
 
