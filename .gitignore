@@ -22,4 +22,14 @@ Cargo.lock.bak
 .DS_Store
 # Build outputs
 /dist/
-/dist/
+/target/
+
+# Executables
+*.exe
+*.msi
+
+# Specific dist folders
+/dist/**/*
+/dist/bin/**/*
+
+**/.cache/
