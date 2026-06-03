@@ -26,8 +26,9 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{info, warn};
 
+use crate::bucket::{env_truthy, BucketStore};
 use crate::model::{AssetKind, AssetSummary};
-use crate::store::{ensure_asset_derivatives, AssetStore};
+use crate::store::{ensure_asset_derivatives, entry_from_primary, AssetStore};
 
 // ---------------------------------------------------------------------------
 // Embedded placeholder assets
@@ -52,6 +53,21 @@ const FALLBACK_SOUND: &[u8] = include_bytes!("../assets/fallback.wav");
 
 const DEFAULT_MAX_UPLOAD_BYTES: u64 = 512 * 1024 * 1024;
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone)]
+struct AppState {
+    store: AssetStore,
+    bucket: Option<Arc<BucketStore>>,
+}
+
+impl AppState {
+    fn new(store: AssetStore, bucket: Option<BucketStore>) -> Self {
+        Self {
+            store,
+            bucket: bucket.map(Arc::new),
+        }
+    }
+}
 
 fn fallback_download_response(id: &str, kind: AssetKind) -> Response {
     let (bytes, mime, ext): (&'static [u8], &'static str, &'static str) = match kind {
@@ -110,10 +126,16 @@ fn fallback_text_response() -> Response {
 /// drive it through `tower::ServiceExt::oneshot` without binding a
 /// real socket.
 pub fn router(store: AssetStore) -> Router {
+    router_with_bucket(store, None)
+}
+
+/// Build the public router backed by an optional S3-compatible bucket.
+pub fn router_with_bucket(store: AssetStore, bucket: Option<BucketStore>) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
         .allow_headers(Any);
+    let state = AppState::new(store, bucket);
 
     Router::new()
         .route("/api/health", get(health))
@@ -123,7 +145,7 @@ pub fn router(store: AssetStore) -> Router {
         .route("/api/assets/:id/download", get(get_download))
         .route("/api/assets/:id/text", get(get_text))
         .route("/api/admin/assets", post(post_admin_asset))
-        .with_state(store)
+        .with_state(state)
         .layer(cors)
         .layer(DefaultBodyLimit::disable())
 }
@@ -132,7 +154,8 @@ pub fn router(store: AssetStore) -> Router {
 // /api/health
 // ---------------------------------------------------------------------------
 
-async fn health(State(store): State<AssetStore>) -> Json<serde_json::Value> {
+async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let store = &state.store;
     let root = store.root();
     let root_metadata = tokio::fs::metadata(&root).await.ok();
     let railway_volume_mount_path = env_string("RAILWAY_VOLUME_MOUNT_PATH");
@@ -146,8 +169,15 @@ async fn health(State(store): State<AssetStore>) -> Json<serde_json::Value> {
         .map(|(kind, count)| json!({ "kind": kind, "count": count }))
         .collect();
 
+    let bucket = state.bucket.as_ref();
     Json(json!({
         "ok": true,
+        "storage_backend": if bucket.is_some() { "bucket" } else { "local" },
+        "bucket_configured": bucket.is_some(),
+        "bucket_name": bucket.map(|b| b.bucket_name()),
+        "bucket_endpoint": bucket.map(|b| b.endpoint_url()),
+        "bucket_region": bucket.map(|b| b.region()),
+        "bucket_presign_secs": bucket.map(|b| b.presign_secs()),
         "count": store.count(),
         "counts_by_kind": counts_by_kind,
         "asset_root": root,
@@ -217,13 +247,15 @@ struct ListResponse {
 }
 
 async fn list_assets(
-    State(store): State<AssetStore>,
+    State(state): State<AppState>,
     Query(q): Query<ListQuery>,
 ) -> Result<Json<ListResponse>, ApiError> {
     let kinds = parse_kind_list(q.kind.as_deref());
     let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
 
-    let (total, page) = store.filtered(&kinds, q.q.as_deref(), q.offset, limit);
+    let (total, page) = state
+        .store
+        .filtered(&kinds, q.q.as_deref(), q.offset, limit);
     let items: Vec<AssetSummary> = page.iter().map(AssetSummary::from_entry).collect();
     let has_more = q.offset.saturating_add(items.len() as u64) < total;
 
@@ -248,10 +280,10 @@ fn parse_kind_list(raw: Option<&str>) -> Vec<AssetKind> {
 // ---------------------------------------------------------------------------
 
 async fn get_asset(
-    State(store): State<AssetStore>,
+    State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<crate::model::AssetEntry>, ApiError> {
-    store.get(&id).map(Json).ok_or(ApiError::NotFound)
+    state.store.get(&id).map(Json).ok_or(ApiError::NotFound)
 }
 
 // ---------------------------------------------------------------------------
@@ -259,13 +291,23 @@ async fn get_asset(
 // ---------------------------------------------------------------------------
 
 async fn get_preview(
-    State(store): State<AssetStore>,
+    State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let Some(entry) = store.get(&id) else {
+    let Some(entry) = state.store.get(&id) else {
         return Ok(fallback_preview_response());
     };
+    if let (Some(bucket), Some(key)) =
+        (state.bucket.as_ref(), entry.thumbnail_object_key.as_deref())
+    {
+        return redirect_to_presigned(bucket, key, "preview")
+            .await
+            .or_else(|e| {
+                warn!(id = %entry.id, key, error = ?e, "bucket preview redirect failed; serving placeholder");
+                Ok(fallback_preview_response())
+            });
+    }
     let Some(thumb) = entry.thumbnail else {
         return Ok(fallback_preview_response());
     };
@@ -312,13 +354,21 @@ async fn get_preview(
 // ---------------------------------------------------------------------------
 
 async fn get_download(
-    State(store): State<AssetStore>,
+    State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let Some(entry) = store.get(&id) else {
+    let Some(entry) = state.store.get(&id) else {
         return Ok(fallback_download_response(&id, AssetKind::Clip));
     };
+    if let (Some(bucket), Some(key)) = (state.bucket.as_ref(), entry.object_key.as_deref()) {
+        return redirect_to_presigned(bucket, key, "download")
+            .await
+            .or_else(|e| {
+                warn!(id = %entry.id, key, error = ?e, "bucket download redirect failed; serving placeholder");
+                Ok(fallback_download_response(&entry.id, entry.kind))
+            });
+    }
 
     // Check file size and stream large files instead of loading into memory
     let metadata = match tokio::fs::metadata(&entry.path).await {
@@ -336,6 +386,33 @@ async fn get_download(
             e
         })
         .or_else(|_| Ok(fallback_download_response(&entry.id, entry.kind)))
+}
+
+async fn redirect_to_presigned(
+    bucket: &BucketStore,
+    key: &str,
+    purpose: &'static str,
+) -> Result<Response, ApiError> {
+    let url = bucket
+        .presigned_get_url(key)
+        .await
+        .map_err(|e| ApiError::BadRequest(format!("presign bucket object: {e}").into()))?;
+    let location = HeaderValue::from_str(&url)
+        .map_err(|e| ApiError::BadRequest(format!("invalid presigned URL: {e}").into()))?;
+    Ok(Response::builder()
+        .status(StatusCode::TEMPORARY_REDIRECT)
+        .header(header::LOCATION, location)
+        .header(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("private, no-store"),
+        )
+        .header("x-memstroy-storage", HeaderValue::from_static("bucket"))
+        .header(
+            "x-memstroy-redirect-purpose",
+            HeaderValue::from_static(purpose),
+        )
+        .body(Body::empty())
+        .expect("valid response"))
 }
 
 fn sanitize_filename(name: &str) -> String {
@@ -498,14 +575,34 @@ fn range_not_satisfiable(file_size: u64) -> Response {
 // ---------------------------------------------------------------------------
 
 async fn get_text(
-    State(store): State<AssetStore>,
+    State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
-    let Some(entry) = store.get(&id) else {
+    let Some(entry) = state.store.get(&id) else {
         return Ok(fallback_text_response());
     };
     if entry.kind != AssetKind::Text {
         return Err(ApiError::NotFound);
+    }
+
+    if let (Some(bucket), Some(key)) = (state.bucket.as_ref(), entry.object_key.as_deref()) {
+        const MAX_TEXT_SIZE: usize = 25 * 1024 * 1024;
+        let body = match bucket.get_small_text(key, MAX_TEXT_SIZE).await {
+            Ok(Some(s)) => s,
+            Ok(None) => return Ok(fallback_text_response()),
+            Err(e) => {
+                warn!(id = %entry.id, key, error = %e, "bucket text read failed; serving placeholder");
+                return Ok(fallback_text_response());
+            }
+        };
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; charset=utf-8"),
+            )
+            .body(Body::from(body))
+            .expect("valid response"));
     }
 
     let metadata = match tokio::fs::metadata(&entry.path).await {
@@ -553,6 +650,9 @@ async fn get_text(
 struct AdminAssetResponse {
     created: bool,
     asset: AssetSummary,
+    storage_backend: String,
+    object_key: Option<String>,
+    thumbnail_object_key: Option<String>,
     asset_root: PathBuf,
     stored_path: PathBuf,
     size_bytes: u64,
@@ -565,12 +665,14 @@ struct UploadedFile {
 }
 
 async fn post_admin_asset(
-    State(store): State<AssetStore>,
+    State(state): State<AppState>,
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Result<Json<AdminAssetResponse>, ApiError> {
     check_admin_token(&headers)?;
 
+    let store = state.store.clone();
+    let bucket = state.bucket.clone();
     let root = store.root();
     if root.as_os_str().is_empty() {
         return Err(ApiError::BadRequest("asset root is not configured".into()));
@@ -654,7 +756,12 @@ async fn post_admin_asset(
                 .and_then(|s| s.to_str())
         })
         .unwrap_or("asset");
-    let stem = unique_stem(&root.join(kind.subdir()), &sanitize_stem(stem_hint), &ext).await;
+    let requested_stem = sanitize_stem(stem_hint);
+    let stem = if bucket.is_some() {
+        unique_stem_in_store(&store, &requested_stem)
+    } else {
+        unique_stem(&root.join(kind.subdir()), &requested_stem, &ext).await
+    };
     let dest_dir = root.join(kind.subdir());
     tokio::fs::create_dir_all(&dest_dir)
         .await
@@ -701,24 +808,55 @@ async fn post_admin_asset(
         );
     }
 
-    let entry = store
-        .upsert_primary(&root, &dest, kind)
-        .map_err(|e| ApiError::BadRequest(format!("index uploaded asset: {e}").into()))?;
+    let entry = if let Some(bucket) = bucket.as_ref() {
+        let uploaded = bucket
+            .upload_local_asset_files(&dest, kind)
+            .await
+            .map_err(|e| ApiError::BadRequest(format!("upload asset to bucket: {e}").into()))?;
+        let mut entry = entry_from_primary(&dest, kind)
+            .map_err(|e| ApiError::BadRequest(format!("index uploaded asset: {e}").into()))?;
+        entry.object_key = Some(uploaded.primary_key.clone());
+        entry.thumbnail_object_key = uploaded.thumbnail_key.clone();
+        entry.path = PathBuf::from(format!(
+            "s3://{}/{}",
+            bucket.bucket_name(),
+            uploaded.primary_key
+        ));
+        entry.thumbnail = None;
+        let entry = store
+            .upsert_entry(&root, entry)
+            .map_err(|e| ApiError::BadRequest(format!("index uploaded asset: {e}").into()))?;
+        if !env_truthy("MEMSTROY_BUCKET_KEEP_LOCAL") {
+            cleanup_uploaded_local_files(&dest).await;
+        }
+        entry
+    } else {
+        store
+            .upsert_primary(&root, &dest, kind)
+            .map_err(|e| ApiError::BadRequest(format!("index uploaded asset: {e}").into()))?
+    };
 
     info!(
         id = %entry.id,
         kind = ?kind,
         bytes = entry.size_bytes,
         root = %root.display(),
-        path = %dest.display(),
+        path = %entry.path.display(),
         "admin asset uploaded"
     );
 
     Ok(Json(AdminAssetResponse {
         created: true,
         asset: AssetSummary::from_entry(&entry),
+        storage_backend: if entry.object_key.is_some() {
+            "bucket".to_string()
+        } else {
+            "local".to_string()
+        },
+        object_key: entry.object_key.clone(),
+        thumbnail_object_key: entry.thumbnail_object_key.clone(),
         asset_root: root,
-        stored_path: dest,
+        stored_path: entry.path.clone(),
         size_bytes: entry.size_bytes,
     }))
 }
@@ -833,6 +971,43 @@ async fn unique_stem(dir: &FsPath, requested: &str, ext: &str) -> String {
         n += 1;
     }
     stem
+}
+
+fn unique_stem_in_store(store: &AssetStore, requested: &str) -> String {
+    let base = if requested.is_empty() {
+        "asset"
+    } else {
+        requested
+    };
+    let mut stem = base.to_string();
+    let mut n = 1u32;
+    while store.get(&stem).is_some() {
+        stem = format!("{base}-{n}");
+        n += 1;
+    }
+    stem
+}
+
+async fn cleanup_uploaded_local_files(primary: &FsPath) {
+    let mut paths = vec![
+        primary.to_path_buf(),
+        primary.with_extension("label"),
+        primary.with_extension("txt"),
+        primary.with_extension("tags"),
+        primary.with_extension("meta.json"),
+    ];
+    if let (Some(parent), Some(stem)) = (
+        primary.parent(),
+        primary.file_stem().and_then(|s| s.to_str()),
+    ) {
+        for ext in ["png", "jpg", "jpeg", "webp"] {
+            paths.push(parent.join(format!("{stem}.thumb.{ext}")));
+            paths.push(parent.join("thumbs").join(format!("{stem}.{ext}")));
+        }
+    }
+    for path in paths {
+        let _ = tokio::fs::remove_file(path).await;
+    }
 }
 
 fn extension_from_name(name: &str) -> Option<String> {

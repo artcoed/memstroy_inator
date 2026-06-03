@@ -38,9 +38,11 @@
 #![warn(rust_2018_idioms)]
 
 pub mod api;
+pub mod bucket;
 pub mod model;
 pub mod store;
 
+pub use bucket::BucketStore;
 pub use model::{AssetEntry, AssetKind, AssetSummary};
 pub use store::AssetStore;
 
@@ -54,6 +56,11 @@ pub fn router(store: AssetStore) -> axum::Router {
     api::router(store)
 }
 
+/// Build the API router with an S3-compatible bucket backend.
+pub fn router_with_bucket(store: AssetStore, bucket: BucketStore) -> axum::Router {
+    api::router_with_bucket(store, Some(bucket))
+}
+
 /// Start the HTTP server on the given address with the given asset
 /// store. The returned [`JoinHandle`] resolves when the server stops
 /// (either gracefully or because of a fatal error such as a failed
@@ -63,6 +70,20 @@ pub fn router(store: AssetStore) -> axum::Router {
 ///
 pub fn start(addr: SocketAddr, store: AssetStore) -> JoinHandle<()> {
     let app = router(store);
+    spawn_server(addr, app)
+}
+
+/// Start the HTTP server with a bucket-backed asset store.
+pub fn start_with_bucket(
+    addr: SocketAddr,
+    store: AssetStore,
+    bucket: BucketStore,
+) -> JoinHandle<()> {
+    let app = router_with_bucket(store, bucket);
+    spawn_server(addr, app)
+}
+
+fn spawn_server(addr: SocketAddr, app: axum::Router) -> JoinHandle<()> {
     tokio::spawn(async move {
         let listener = match tokio::net::TcpListener::bind(addr).await {
             Ok(l) => l,

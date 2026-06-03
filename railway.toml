@@ -23,3 +23,5 @@ name = "memstroy-assets-server"
 
 [services.variables]
 RUST_LOG = "info,memstroy_assets_server=info"
+MEMSTROY_STORAGE_BACKEND = "bucket"
+MEMSTROY_BUCKET_PRESIGN_SECS = "3600"

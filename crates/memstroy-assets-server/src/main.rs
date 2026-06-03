@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use memstroy_assets_server::{start, AssetStore};
+use memstroy_assets_server::{start, start_with_bucket, AssetStore, BucketStore};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
@@ -60,20 +60,44 @@ async fn main() -> Result<()> {
     }
 
     let store = AssetStore::new();
-    store.index_dir(&root)?;
-
-    for (kind, count) in store.count_by_kind() {
-        tracing::info!(kind = ?kind, count, "indexed");
-    }
-
-    tracing::info!(
-        root = %root.display(),
-        assets_root_env = ?std::env::var_os("ASSETS_ROOT"),
-        railway_volume_mount_path = ?std::env::var_os("RAILWAY_VOLUME_MOUNT_PATH"),
-        "persistent asset volume ready"
-    );
-
-    let handle = start(addr, store);
+    let handle = if let Some(bucket) = BucketStore::from_env().await? {
+        if env_truthy("MEMSTROY_BUCKET_MIGRATE_LOCAL") {
+            let uploaded = bucket
+                .migrate_local_tree(&root)
+                .await
+                .context("migrating local asset tree to bucket")?;
+            tracing::info!(uploaded, "bucket migration pass completed");
+        }
+        let entries = bucket
+            .index_entries()
+            .await
+            .context("indexing bucket assets")?;
+        store.replace_index(&root, entries);
+        for (kind, count) in store.count_by_kind() {
+            tracing::info!(kind = ?kind, count, "indexed");
+        }
+        tracing::info!(
+            root = %root.display(),
+            bucket = %bucket.bucket_name(),
+            endpoint = %bucket.endpoint_url(),
+            region = %bucket.region(),
+            presign_secs = bucket.presign_secs(),
+            "bucket asset storage ready"
+        );
+        start_with_bucket(addr, store, bucket)
+    } else {
+        store.index_dir(&root)?;
+        for (kind, count) in store.count_by_kind() {
+            tracing::info!(kind = ?kind, count, "indexed");
+        }
+        tracing::info!(
+            root = %root.display(),
+            assets_root_env = ?std::env::var_os("ASSETS_ROOT"),
+            railway_volume_mount_path = ?std::env::var_os("RAILWAY_VOLUME_MOUNT_PATH"),
+            "persistent asset volume ready"
+        );
+        start(addr, store)
+    };
 
     // Wait for Ctrl+C signal
     tokio::select! {
@@ -132,6 +156,16 @@ fn env_path(name: &str) -> Option<PathBuf> {
     } else {
         Some(PathBuf::from(raw))
     }
+}
+
+fn env_truthy(name: &str) -> bool {
+    let Some(raw) = std::env::var_os(name) else {
+        return false;
+    };
+    matches!(
+        raw.to_string_lossy().trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 #[cfg(test)]

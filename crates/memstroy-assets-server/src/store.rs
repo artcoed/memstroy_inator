@@ -101,6 +101,24 @@ impl AssetStore {
     /// do not pay for a full recursive reindex on every admin upload.
     pub fn upsert_primary(&self, root: &Path, path: &Path, kind: AssetKind) -> Result<AssetEntry> {
         let entry = entry_from_primary(path, kind)?;
+        self.upsert_entry(root, entry)
+    }
+
+    /// Replace the whole index with entries loaded from an external
+    /// catalogue, such as an object-storage bucket.
+    pub fn replace_index(&self, root: &Path, entries: Vec<AssetEntry>) {
+        let mut by_id: BTreeMap<String, AssetEntry> = BTreeMap::new();
+        for entry in entries {
+            by_id.insert(entry.id.clone(), entry);
+        }
+        let mut inner = self.inner.write().expect("store rwlock poisoned");
+        inner.root = root.to_path_buf();
+        inner.by_id = by_id;
+        info!(count = inner.by_id.len(), root = %root.display(), "asset index replaced");
+    }
+
+    /// Insert or replace a fully-built entry in the in-memory index.
+    pub fn upsert_entry(&self, root: &Path, entry: AssetEntry) -> Result<AssetEntry> {
         let mut inner = self.inner.write().expect("store rwlock poisoned");
         inner.root = root.to_path_buf();
         inner.by_id.insert(entry.id.clone(), entry.clone());
@@ -199,7 +217,7 @@ impl AssetStore {
     }
 }
 
-fn entry_from_primary(path: &Path, kind: AssetKind) -> Result<AssetEntry> {
+pub(crate) fn entry_from_primary(path: &Path, kind: AssetKind) -> Result<AssetEntry> {
     let stem = path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -237,6 +255,8 @@ fn entry_from_primary(path: &Path, kind: AssetKind) -> Result<AssetEntry> {
         description,
         path: path.to_path_buf(),
         thumbnail,
+        object_key: None,
+        thumbnail_object_key: None,
         size_bytes,
         file_name,
         extension,

@@ -95,11 +95,20 @@ pub struct AssetEntry {
     /// contents; for everything else it is the contents of the
     /// `<stem>.txt` sidecar (or empty).
     pub description: String,
-    /// Absolute path to the asset file on disk.
+    /// Absolute path to the asset file on disk, or an `s3://...`
+    /// marker when the bytes live in object storage.
     pub path: PathBuf,
     /// Path to a thumbnail file, if one was found. The server uses
     /// this for `GET /api/assets/:id/preview`.
     pub thumbnail: Option<PathBuf>,
+    /// Object-storage key for the primary asset when running against
+    /// an S3-compatible bucket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_key: Option<String>,
+    /// Object-storage key for the thumbnail when running against an
+    /// S3-compatible bucket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbnail_object_key: Option<String>,
     /// Size of the primary asset file in bytes.
     pub size_bytes: u64,
     /// Original file name as stored in the volume.
@@ -166,10 +175,8 @@ impl AssetSummary {
 
     pub fn from_entry(entry: &AssetEntry) -> Self {
         let description = truncate_chars(&entry.description, Self::DESCRIPTION_LIMIT);
-        let preview_url = entry
-            .thumbnail
-            .as_ref()
-            .map(|_| format!("/api/assets/{}/preview", entry.id));
+        let has_preview = entry.thumbnail.is_some() || entry.thumbnail_object_key.is_some();
+        let preview_url = has_preview.then(|| format!("/api/assets/{}/preview", entry.id));
         AssetSummary {
             id: entry.id.clone(),
             kind: entry.kind,
