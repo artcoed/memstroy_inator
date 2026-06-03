@@ -2,20 +2,19 @@
 //!
 //! [`AssetStore`] is cheap to clone (it's a thin handle around an
 //! `Arc<RwLock<Inner>>`) so it can be shared with axum handlers via
-//! `with_state(...)` and with background ingest tasks via
-//! `tokio::spawn`. Callers re-run [`AssetStore::index_dir`] whenever
-//! the on-disk library changes (e.g. after a TG ingest job finishes)
-//! to refresh the cache.
+//! `with_state(...)`. Callers re-run [`AssetStore::index_dir`] whenever
+//! the on-disk library changes to refresh the cache.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
 use walkdir::WalkDir;
 
-use crate::model::{AssetEntry, AssetKind};
+use crate::model::{AssetEntry, AssetKind, AssetMediaMeta};
 
 #[derive(Default)]
 struct Inner {
@@ -38,7 +37,11 @@ impl AssetStore {
     /// Asset root currently associated with the store. Returns an
     /// empty path before the first call to [`Self::index_dir`].
     pub fn root(&self) -> PathBuf {
-        self.inner.read().expect("store rwlock poisoned").root.clone()
+        self.inner
+            .read()
+            .expect("store rwlock poisoned")
+            .root
+            .clone()
     }
 
     /// Walk `root` (which is expected to contain `clips/`, `videos/`,
@@ -51,8 +54,6 @@ impl AssetStore {
     /// `<stem>.txt`, `<stem>.tags`, `<stem>.label`, `<stem>.thumb.png`
     /// are picked up as metadata for their primary asset.
     ///
-    /// For memory-constrained environments (500MB RAM), descriptions
-    /// are truncated to 500 chars to reduce memory footprint.
     pub fn index_dir(&self, root: &Path) -> Result<()> {
         let root = root.to_path_buf();
         let mut by_id: BTreeMap<String, AssetEntry> = BTreeMap::new();
@@ -89,23 +90,28 @@ impl AssetStore {
                 let size_bytes = metadata.len();
 
                 let label = read_sidecar_string(&path, "label").unwrap_or_else(|| stem.clone());
-                
-                // Truncate descriptions to save memory (500 chars max)
+
                 let description = match kind {
-                    AssetKind::Text => {
-                        let full = std::fs::read_to_string(&path).unwrap_or_default();
-                        truncate_string(full, 500)
-                    },
-                    _ => {
-                        let full = read_sidecar_string(&path, "txt").unwrap_or_default();
-                        truncate_string(full, 500)
-                    }
+                    AssetKind::Text => std::fs::read_to_string(&path).unwrap_or_default(),
+                    _ => read_sidecar_string(&path, "txt").unwrap_or_default(),
                 };
-                
+
                 let tags = read_sidecar_string(&path, "tags")
                     .map(parse_tags)
                     .unwrap_or_default();
+                let _ = ensure_asset_derivatives(&path, kind);
                 let thumbnail = find_thumbnail(&path, kind);
+                let media_meta = read_media_meta(&path).unwrap_or_default();
+                let file_name = path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let extension = path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
 
                 by_id.insert(
                     stem.clone(),
@@ -117,6 +123,11 @@ impl AssetStore {
                         path,
                         thumbnail,
                         size_bytes,
+                        file_name,
+                        extension,
+                        duration_secs: media_meta.duration_secs,
+                        width: media_meta.width,
+                        height: media_meta.height,
                         tags,
                     },
                 );
@@ -132,7 +143,11 @@ impl AssetStore {
 
     /// Total number of indexed assets.
     pub fn count(&self) -> usize {
-        self.inner.read().expect("store rwlock poisoned").by_id.len()
+        self.inner
+            .read()
+            .expect("store rwlock poisoned")
+            .by_id
+            .len()
     }
 
     /// Counts grouped by kind, sorted by [`AssetKind::ALL`] order.
@@ -166,9 +181,9 @@ impl AssetStore {
             .collect()
     }
 
-    /// Filter and paginate the index. Filtering is performed against
-    /// a fresh snapshot of the index so the read lock is held only
-    /// briefly.
+    /// Filter and paginate the index. Search first matches exact
+    /// substrings, then falls back to typo-tolerant Levenshtein scoring
+    /// over id, label, description and tags.
     ///
     /// * `kinds` — if non-empty, only entries whose kind is in the set
     ///   are kept.
@@ -181,45 +196,109 @@ impl AssetStore {
         offset: u64,
         limit: u64,
     ) -> (u64, Vec<AssetEntry>) {
-        let snapshot = self.list();
-        let needle = query.map(|q| q.trim().to_lowercase()).filter(|q| !q.is_empty());
-        let filtered: Vec<AssetEntry> = snapshot
-            .into_iter()
+        let needle = query
+            .map(|q| q.trim().to_lowercase())
+            .filter(|q| !q.is_empty());
+        let guard = self.inner.read().expect("store rwlock poisoned");
+        let mut scored: Vec<(u32, &AssetEntry)> = guard
+            .by_id
+            .values()
             .filter(|entry| kinds.is_empty() || kinds.contains(&entry.kind))
-            .filter(|entry| match &needle {
-                None => true,
-                Some(q) => {
-                    entry.label.to_lowercase().contains(q)
-                        || entry.description.to_lowercase().contains(q)
-                        || entry.id.to_lowercase().contains(q)
-                        || entry
-                            .tags
-                            .iter()
-                            .any(|t| t.to_lowercase().contains(q))
-                }
+            .filter_map(|entry| {
+                let score = match &needle {
+                    None => 0,
+                    Some(q) => relevance_score(entry, q)?,
+                };
+                Some((score, entry))
             })
             .collect();
+        if needle.is_some() {
+            scored.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.id.cmp(&b.1.id)));
+        }
 
-        let total = filtered.len() as u64;
-        let page: Vec<AssetEntry> = filtered
+        let total = scored.len() as u64;
+        let page: Vec<AssetEntry> = scored
             .into_iter()
             .skip(offset as usize)
             .take(limit as usize)
+            .map(|(_, entry)| entry.clone())
             .collect();
         (total, page)
     }
+}
+
+fn relevance_score(entry: &AssetEntry, query: &str) -> Option<u32> {
+    let fields = [
+        entry.id.as_str(),
+        entry.label.as_str(),
+        entry.description.as_str(),
+    ];
+    let exact = fields
+        .iter()
+        .any(|field| field.to_lowercase().contains(query))
+        || entry
+            .tags
+            .iter()
+            .any(|tag| tag.to_lowercase().contains(query));
+    if exact {
+        return Some(0);
+    }
+
+    let mut best = u32::MAX;
+    for token in searchable_tokens(entry) {
+        let distance = levenshtein(&token, query) as u32;
+        let max_len = token.chars().count().max(query.chars().count()) as u32;
+        let allowed = (max_len / 3).max(1).min(4);
+        if distance <= allowed {
+            best = best.min(distance + 1);
+        }
+    }
+    (best != u32::MAX).then_some(best)
+}
+
+fn searchable_tokens(entry: &AssetEntry) -> Vec<String> {
+    let mut tokens = Vec::new();
+    for raw in [&entry.id, &entry.label, &entry.description] {
+        tokens.extend(split_search_tokens(raw));
+    }
+    for tag in &entry.tags {
+        tokens.extend(split_search_tokens(tag));
+    }
+    tokens
+}
+
+fn split_search_tokens(raw: &str) -> impl Iterator<Item = String> + '_ {
+    raw.split(|c: char| !c.is_alphanumeric())
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| s.chars().count() >= 3)
+}
+
+fn levenshtein(a: &str, b: &str) -> usize {
+    let b_chars: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b_chars.len()).collect();
+    let mut curr = vec![0; b_chars.len() + 1];
+
+    for (i, ca) in a.chars().enumerate() {
+        curr[0] = i + 1;
+        for (j, cb) in b_chars.iter().enumerate() {
+            let cost = usize::from(ca != *cb);
+            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b_chars.len()]
 }
 
 fn is_primary_for_kind(path: &Path, kind: AssetKind) -> bool {
     // Skip the well-known sidecar suffixes so e.g. `clips/12.txt`
     // isn't picked up as its own asset.
     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-        if name.contains(".thumb.") {
+        if name.contains(".thumb.") || name.contains(".meta.") {
             return false;
         }
     }
     if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-        if stem.ends_with(".thumb") {
+        if stem.ends_with(".thumb") || stem.ends_with(".meta") {
             return false;
         }
     }
@@ -240,13 +319,14 @@ fn is_primary_for_kind(path: &Path, kind: AssetKind) -> bool {
     }
 
     // Anything inside a `thumbs/` directory is a thumbnail, not a
-    // primary asset (this matches the convention used by `memstroy-tg`
-    // when it generates per-clip preview images).
+    // primary asset.
     if path.components().any(|c| c.as_os_str() == "thumbs") {
         return false;
     }
 
-    kind.primary_extensions().iter().any(|allowed| *allowed == ext)
+    kind.primary_extensions()
+        .iter()
+        .any(|allowed| *allowed == ext)
 }
 
 fn read_sidecar_string(primary: &Path, ext: &str) -> Option<String> {
@@ -279,8 +359,8 @@ fn find_thumbnail(primary: &Path, kind: AssetKind) -> Option<PathBuf> {
         }
     }
 
-    // 2. `<parent>/thumbs/<stem>.<ext>` (matches what `memstroy-tg`
-    //     produces when generating ffmpeg-based clip thumbnails).
+    // 2. `<parent>/thumbs/<stem>.<ext>` keeps compatibility with older
+    //    libraries that stored generated previews in a shared subfolder.
     let thumbs_dir = parent.join("thumbs");
     if thumbs_dir.is_dir() {
         for ext in ["jpg", "jpeg", "png", "webp"] {
@@ -314,14 +394,165 @@ fn find_thumbnail(primary: &Path, kind: AssetKind) -> Option<PathBuf> {
     None
 }
 
-/// Truncate a string to a maximum length, preserving UTF-8 boundaries.
-fn truncate_string(s: String, max_len: usize) -> String {
-    if s.len() <= max_len {
-        return s;
+pub fn media_meta_path(primary: &Path) -> PathBuf {
+    primary.with_extension("meta.json")
+}
+
+fn read_media_meta(primary: &Path) -> Option<AssetMediaMeta> {
+    let raw = std::fs::read_to_string(media_meta_path(primary)).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+pub fn ensure_asset_derivatives(primary: &Path, kind: AssetKind) -> Result<()> {
+    if matches!(kind, AssetKind::Clip | AssetKind::Video) && find_thumbnail(primary, kind).is_none()
+    {
+        if let Err(e) = generate_video_thumbnail(primary) {
+            warn!(
+                path = %primary.display(),
+                error = %e,
+                "server thumbnail generation failed"
+            );
+        }
     }
-    let mut truncated = s.chars().take(max_len).collect::<String>();
-    truncated.push_str("…");
-    truncated
+
+    let meta_path = media_meta_path(primary);
+    if !meta_path.exists() {
+        match probe_media_meta(primary) {
+            Ok(meta) => {
+                let body = serde_json::to_vec_pretty(&meta)?;
+                std::fs::write(&meta_path, body)
+                    .with_context(|| format!("writing {}", meta_path.display()))?;
+            }
+            Err(e) => {
+                warn!(
+                    path = %primary.display(),
+                    error = %e,
+                    "server media metadata probe failed"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn generate_video_thumbnail(primary: &Path) -> Result<()> {
+    let parent = primary
+        .parent()
+        .with_context(|| format!("{} has no parent", primary.display()))?;
+    let stem = primary
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .with_context(|| format!("{} has no stem", primary.display()))?;
+    let thumb = parent.join(format!("{stem}.thumb.jpg"));
+    let mut cmd = Command::new(ffmpeg_binary());
+    cmd.args([
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-ss",
+        "0.2",
+        "-i",
+    ])
+    .arg(primary)
+    .args(["-frames:v", "1", "-vf", "scale=360:-1", "-q:v", "4"])
+    .arg(&thumb)
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null());
+    let status = cmd.status().context("spawn ffmpeg thumbnail")?;
+    if status.success() && thumb.exists() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("ffmpeg exited with {status}"))
+    }
+}
+
+fn probe_media_meta(primary: &Path) -> Result<AssetMediaMeta> {
+    let output = Command::new(ffprobe_binary())
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration:stream=width,height",
+            "-of",
+            "json",
+        ])
+        .arg(primary)
+        .stdin(Stdio::null())
+        .output()
+        .context("spawn ffprobe metadata")?;
+    if !output.status.success() {
+        return Err(anyhow::anyhow!("ffprobe exited with {}", output.status));
+    }
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).context("parse ffprobe json")?;
+    let duration_secs = json
+        .get("format")
+        .and_then(|f| f.get("duration"))
+        .and_then(|v| {
+            v.as_f64()
+                .map(|n| n as f32)
+                .or_else(|| v.as_str().and_then(|s| s.parse::<f32>().ok()))
+        })
+        .filter(|d| d.is_finite() && *d > 0.0);
+    let mut width = None;
+    let mut height = None;
+    if let Some(streams) = json.get("streams").and_then(|v| v.as_array()) {
+        for stream in streams {
+            let w = stream
+                .get("width")
+                .and_then(|v| v.as_u64())
+                .and_then(|v| u32::try_from(v).ok());
+            let h = stream
+                .get("height")
+                .and_then(|v| v.as_u64())
+                .and_then(|v| u32::try_from(v).ok());
+            if w.is_some() || h.is_some() {
+                width = w;
+                height = h;
+                break;
+            }
+        }
+    }
+    Ok(AssetMediaMeta {
+        duration_secs,
+        width,
+        height,
+    })
+}
+
+fn ffmpeg_binary() -> PathBuf {
+    std::env::var_os("MEMSTROY_FFMPEG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(if cfg!(windows) {
+                "ffmpeg.exe"
+            } else {
+                "ffmpeg"
+            })
+        })
+}
+
+fn ffprobe_binary() -> PathBuf {
+    if let Some(path) = std::env::var_os("MEMSTROY_FFPROBE") {
+        return PathBuf::from(path);
+    }
+    let mut sibling = ffmpeg_binary();
+    sibling.set_file_name(if cfg!(windows) {
+        "ffprobe.exe"
+    } else {
+        "ffprobe"
+    });
+    if sibling.exists() {
+        sibling
+    } else {
+        PathBuf::from(if cfg!(windows) {
+            "ffprobe.exe"
+        } else {
+            "ffprobe"
+        })
+    }
 }
 
 #[allow(dead_code)]

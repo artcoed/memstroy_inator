@@ -395,9 +395,7 @@ impl AudioEngine {
             });
 
             let stream: Box<dyn Source<Item = f32> + Send> = match take_secs {
-                Some(td) if td > 0.0 => {
-                    Box::new(stream.take_duration(Duration::from_secs_f32(td)))
-                }
+                Some(td) if td > 0.0 => Box::new(stream.take_duration(Duration::from_secs_f32(td))),
                 _ => Box::new(stream),
             };
             let stream = dsp::DynSource::new(stream);
@@ -422,8 +420,7 @@ impl AudioEngine {
             } else {
                 None
             };
-            let total_samples = take_secs
-                .map(|td| (td * sr) as u64);
+            let total_samples = take_secs.map(|td| (td * sr) as u64);
             let fade_out_samples = if spec.fade_out > 0.0 && total_samples.is_some() {
                 Some((spec.fade_out * sr) as u64)
             } else {
@@ -458,7 +455,9 @@ impl AudioEngine {
     /// them. Call this every UI frame.
     pub fn poll_pending(&mut self) {
         let cur_gen = self.generation;
-        let Some((gen, rx)) = self.pending.take() else { return };
+        let Some((gen, rx)) = self.pending.take() else {
+            return;
+        };
         if gen != cur_gen {
             for ready in rx.try_iter() {
                 ready.sink.stop();
@@ -554,8 +553,7 @@ fn resolve_audio_source(src: &Path) -> Option<PathBuf> {
     // symphonia adapters have been reliable across our test corpus.
     // Anything outside this list — notably `m4a` and other MP4-family
     // audio — falls through to the ffmpeg pre-extract below.
-    let safe_native =
-        matches!(ext.as_str(), "mp3" | "wav" | "flac" | "ogg" | "oga" | "aac");
+    let safe_native = matches!(ext.as_str(), "mp3" | "wav" | "flac" | "ogg" | "oga" | "aac");
     if safe_native {
         return Some(src.to_path_buf());
     }

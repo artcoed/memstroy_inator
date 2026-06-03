@@ -83,7 +83,12 @@ fn scan_font_dirs() -> Vec<PathBuf> {
     // Win 11 отображается только 2"). The legacy `C:/Windows/Fonts`
     // root above only catches the `installforAllUsers` path.
     if let Ok(local) = std::env::var("LOCALAPPDATA") {
-        roots.push(PathBuf::from(local).join("Microsoft").join("Windows").join("Fonts"));
+        roots.push(
+            PathBuf::from(local)
+                .join("Microsoft")
+                .join("Windows")
+                .join("Fonts"),
+        );
     }
 
     let mut out = Vec::new();
@@ -97,13 +102,18 @@ fn scan_font_dirs() -> Vec<PathBuf> {
 }
 
 fn walk_ttfs(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
-    let Ok(read) = std::fs::read_dir(dir) else { return };
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in read.flatten() {
         let path = entry.path();
         if path.is_dir() {
             walk_ttfs(&path, out);
         } else if matches!(
-            path.extension().and_then(|s| s.to_str()).map(|s| s.to_lowercase()).as_deref(),
+            path.extension()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_lowercase())
+                .as_deref(),
             Some("ttf" | "otf")
         ) {
             out.push(path);

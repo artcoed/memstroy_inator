@@ -87,7 +87,11 @@ fn is_unspecified_ipv6(host: &str) -> bool {
         return true;
     }
     let groups: Vec<&str> = host.split(':').collect();
-    if groups.len() == 8 && groups.iter().all(|g| !g.is_empty() && g.chars().all(|c| c == '0')) {
+    if groups.len() == 8
+        && groups
+            .iter()
+            .all(|g| !g.is_empty() && g.chars().all(|c| c == '0'))
+    {
         return true;
     }
     false
@@ -118,10 +122,7 @@ mod url_rewrite_tests {
 
     #[test]
     fn ipv6_unspecified_long_form_in_brackets() {
-        assert_eq!(
-            r("http://[0:0:0:0:0:0:0:0]:8765"),
-            "http://[::1]:8765"
-        );
+        assert_eq!(r("http://[0:0:0:0:0:0:0:0]:8765"), "http://[::1]:8765");
     }
 
     #[test]
@@ -267,13 +268,12 @@ pub struct TimelineDrag {
     /// the queue is drained and `enforce_no_overlap_on_layer` runs
     /// once per unique mover.
     pub pending_overlap: Vec<PendingOverlapMover>,
-    /// Scene-time of the active snap target this frame. `Some` when
-    /// the dragged clip's edge is currently glued to a neighbour
-    /// edge / playhead / scene boundary; the timeline draws a thin
-    /// vertical guide at this time so the user gets visual confirm
-    /// of which target the edge attached to. Cleared at the start of
-    /// every timeline() pass and at drag-end so a stale guide can't
-    /// linger after the snap goes away.
+    /// Scene-time of the active element-edge snap target this frame.
+    /// `Some` when the dragged clip's edge is currently glued to a
+    /// neighbouring clip edge; playhead / scene-boundary snaps are
+    /// intentionally silent so the yellow guide only marks edge-to-edge
+    /// alignment. Cleared at the start of every timeline() pass and at
+    /// drag-end so a stale guide can't linger after the snap goes away.
     pub snap_indicator: Option<f32>,
     /// Snapshot of every multi-selected peer's start time at the
     /// moment the user began the current group drag. The primary's
@@ -290,6 +290,13 @@ pub struct TimelineDrag {
     /// by `(primary_now - mover_anchor)` rather than the per-frame
     /// delta arg, which can drift when arms apply different clamps.
     pub group_mover_anchor: Option<f32>,
+    /// Snapshot for linked Mellstroy-footage sequences. This is separate
+    /// from multi-select group movement so a single selected sequence
+    /// segment can move its siblings without polluting canvas_selection.
+    pub footage_sequence_anchor: Vec<GroupMoveAnchor>,
+    pub footage_sequence_anchor_token: Option<u64>,
+    pub footage_sequence_mover_anchor: Option<f32>,
+    pub footage_sequence_id: Option<String>,
 }
 
 /// Per-peer snapshot used by the group-move broadcast helper.
@@ -335,11 +342,27 @@ pub enum NewLaneIntent {
     AudioBottomForAudio(usize),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FootageSequenceSide {
+    Left,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct FootageSequencePopup {
+    pub actor_idx: usize,
+    pub side: FootageSequenceSide,
+    pub anchor: egui::Pos2,
+}
+
 /// Drag-and-drop state for an item being dragged out of the clip library.
 #[derive(Default, Clone)]
 pub struct AssetDrag {
     /// Path of the clip being dragged.
     pub dragging: Option<PathBuf>,
+    /// Web-search image URL while the user is dragging a result whose
+    /// file has not finished downloading yet.
+    pub pending_web_image_url: Option<String>,
     /// Kind of asset being dragged.
     pub kind: AssetDragKind,
     /// Current pointer position during the drag (used to anchor the ghost).
@@ -348,9 +371,22 @@ pub struct AssetDrag {
     pub label: String,
     /// Optional thumbnail used by the drag ghost preview.
     pub thumbnail: Option<PathBuf>,
+    /// Server asset id for server-backed rows. Kept separate from
+    /// `dragging` so the cache path can be local while the UI still
+    /// treats the row as a server resource.
+    pub server_id: Option<String>,
+    /// Whether the primary file is already available locally.
+    pub downloaded: bool,
+    /// Server-provided duration used for timeline drop previews before
+    /// the file has been downloaded and ffprobe can run locally.
+    pub duration_secs: Option<f32>,
+    /// Server-provided pixel width for visual assets.
+    pub width: Option<u32>,
+    /// Server-provided pixel height for visual assets.
+    pub height: Option<u32>,
 }
 
-#[derive(Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AssetDragKind {
     #[default]
     None,
@@ -425,33 +461,42 @@ impl Default for AudioWaveform {
 impl AudioWaveform {
     /// Extract audio peaks from a file using ffmpeg. Returns peaks vector.
     /// This runs synchronously and should be called from a background thread.
-    pub fn extract_peaks(audio_path: &std::path::Path, num_samples: usize) -> Option<(Vec<f32>, f32)> {
-        let ffprobe = {
-            let mut p = memstroy_render::ffmpeg_binary();
-            p.set_file_name("ffprobe");
-            if !p.exists() { std::path::PathBuf::from("ffprobe") } else { p }
-        };
+    pub fn extract_peaks(
+        audio_path: &std::path::Path,
+        num_samples: usize,
+    ) -> Option<(Vec<f32>, f32)> {
+        let ffprobe = memstroy_render::ffprobe_binary();
 
         // Get duration
         let duration = {
             let mut cmd = std::process::Command::new(&ffprobe);
-            cmd.args(["-v", "error", "-show_entries", "format=duration",
-                      "-of", "default=noprint_wrappers=1:nokey=1"])
-                .arg(audio_path);
+            cmd.args([
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+            ])
+            .arg(audio_path);
             match memstroy_render::hide_console_std(&mut cmd).output() {
-                Ok(out) => String::from_utf8_lossy(&out.stdout).trim().parse::<f32>().unwrap_or(0.0),
+                Ok(out) => String::from_utf8_lossy(&out.stdout)
+                    .trim()
+                    .parse::<f32>()
+                    .unwrap_or(0.0),
                 Err(_) => return None,
             }
         };
 
-        if duration <= 0.0 { return None; }
+        if duration <= 0.0 {
+            return None;
+        }
 
         // Extract raw PCM samples via ffmpeg, downsample to mono 8kHz
         let ffmpeg = memstroy_render::ffmpeg_binary();
         let output = {
             let mut cmd = std::process::Command::new(&ffmpeg);
-            cmd.args(["-y", "-hide_banner", "-loglevel", "error",
-                      "-i"])
+            cmd.args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
                 .arg(audio_path)
                 .args(["-ac", "1", "-ar", "8000", "-f", "s16le", "-"]);
             memstroy_render::hide_console_std(&mut cmd).output()
@@ -463,16 +508,23 @@ impl AudioWaveform {
         };
 
         // Convert i16 PCM to peaks
-        let samples: Vec<i16> = raw.chunks_exact(2)
+        let samples: Vec<i16> = raw
+            .chunks_exact(2)
             .map(|c| i16::from_le_bytes([c[0], c[1]]))
             .collect();
 
-        if samples.is_empty() { return None; }
+        if samples.is_empty() {
+            return None;
+        }
 
         let chunk_size = (samples.len() / num_samples).max(1);
-        let peaks: Vec<f32> = samples.chunks(chunk_size)
+        let peaks: Vec<f32> = samples
+            .chunks(chunk_size)
             .map(|chunk| {
-                let max_val = chunk.iter().map(|s| s.unsigned_abs() as f32).fold(0.0_f32, f32::max);
+                let max_val = chunk
+                    .iter()
+                    .map(|s| s.unsigned_abs() as f32)
+                    .fold(0.0_f32, f32::max);
                 (max_val / 32768.0).clamp(0.0, 1.0)
             })
             .collect();
@@ -531,6 +583,11 @@ pub struct EditorState {
     pub timeline_v_zoom: f32,
     /// Timeline vertical scroll offset in pixels (top of viewport in scaled-track-space)
     pub timeline_v_scroll: f32,
+    /// Keep the playhead visible in the layer-panel timeline while playback/scrubbing moves.
+    pub timeline_follow_playhead: bool,
+    /// Show FIRST/LAST ghost previews for visual elements whose time window does not
+    /// contain the current playhead. When false, the canvas draws only active elements.
+    pub canvas_show_inactive_previews: bool,
     /// Split tool active: when true, clicking on a clip cuts it at the click position.
     pub split_tool_active: bool,
     /// Queued split from the timeline razor tool: (element, scene-time cut).
@@ -554,6 +611,8 @@ pub struct EditorState {
     /// Fixed tracks (lanes). Video tracks are kept above audio tracks at all
     /// times — see `enforce_track_order`.
     pub tracks: Vec<Track>,
+    /// Whole-layer selection made by clicking a layer header.
+    pub selected_track: Option<usize>,
     /// Timeline drag state for clip movement between tracks.
     pub timeline_drag: TimelineDrag,
     /// Asset drag from library to timeline.
@@ -669,8 +728,16 @@ pub struct EditorState {
     pub kf_multi_drag_active: bool,
     /// Accumulated pixel offset for the in-progress multi-keyframe drag.
     pub kf_multi_drag_dx: f32,
+    /// Set during a timeline frame when the pointer press belongs to
+    /// the per-parameter keyframe rows. The general timeline marquee
+    /// uses this to avoid clearing the layer selection from underneath
+    /// the expanded keyframe panel.
+    pub kf_rows_pointer_active: bool,
     /// Open easing picker for a param-row keyframe (right-click).
     pub kf_easing_popup: Option<KfEasingPopup>,
+    /// Small helper menu opened by the plus handles on Mellstroy footage
+    /// timeline clips.
+    pub footage_sequence_popup: Option<FootageSequencePopup>,
 
     // ─── Curve editor marquee (rubber-band multi-select) ───────────
     /// Active marquee for selecting keyframes in the curve editor.
@@ -713,6 +780,9 @@ pub struct EditorState {
     /// on a brand-new track ABOVE the current ones so the user can
     /// freely tweak the duplicate without touching the source.
     pub clipboard: Vec<ClipboardItem>,
+    /// Keyframes copied from the per-param rows. This has priority over
+    /// element clipboard when `selected_keyframes` is non-empty.
+    pub keyframe_clipboard: Vec<crate::kf_anim::SelectedKeyframe>,
     /// Multi-selection on the canvas. Mirrors `selection` for the
     /// inspector but holds the FULL set the user has painted with
     /// Ctrl/Shift+click or a marquee. Ctrl+C copies every entry; Ctrl+V
@@ -723,6 +793,10 @@ pub struct EditorState {
     /// the user is dragging an empty area to lasso multiple elements at
     /// once. World-pixel coords for both corners.
     pub canvas_marquee: Option<CanvasMarquee>,
+    /// Repeated-click cycling state for stacked canvas elements. Stores the last
+    /// clicked world point and the next hit index to choose from the z-ordered hit list.
+    pub canvas_click_cycle_world: Option<[f32; 2]>,
+    pub canvas_click_cycle_index: usize,
 
     /// Active marquee on the timeline panel. `Some` while the user is
     /// dragging an empty area between clips to lasso a group of clips.
@@ -763,6 +837,9 @@ pub struct EditorState {
     /// Cleared on commit / cancel. Lives on the editor state because
     /// `CanvasDragMode` derives `Copy` and can't store a Vec.
     pub mask_draft_points: Vec<[f32; 2]>,
+    /// When set by the inspector's Repaint action, the next committed mask replaces
+    /// this existing effect instead of pushing a new one.
+    pub mask_replace_target: Option<(Selection, usize)>,
 
     /// Live cursor UV (in element-local coords, 0..1) updated every
     /// frame while `MaskTool::SegmentMask` is armed and the user is
@@ -773,6 +850,9 @@ pub struct EditorState {
     /// `None` when the cursor is off-element or the tool is idle.
     /// Reset alongside `mask_draft_points` on commit / cancel.
     pub mask_segment_cursor_uv: Option<[f32; 2]>,
+    /// Parent-picking mode. Holds the child element id that should receive the next
+    /// canvas/layer-panel element click as its parent.
+    pub parent_pick_child_id: Option<String>,
 
     /// State for the "Shared" library tab — talks to a separate
     /// `memstroy-assets-server` instance over HTTP and lazily streams
@@ -785,6 +865,9 @@ pub struct EditorState {
     /// developer running `cargo run -p memstroy-assets-server` next to
     /// the GUI gets the right URL out of the box.
     pub server_url: String,
+    /// Paged server catalogue state. Each visible library tab advances
+    /// its own cursor and stops requesting once `exhausted` is true.
+    pub server_library_pages: ServerLibraryPages,
     /// Telegram channel name (without the leading `@`) the GUI asks the
     /// server to refresh. Surfaced on the Clips tab so the user can
     /// edit it without leaving the editor.
@@ -837,7 +920,12 @@ pub struct EditorState {
 
     /// Drops that arrived for a finished download but whose .mp4 isn't
     /// yet readable (server-side processing, OneDrive sync, etc.).
-    pub deferred_clip_placements: Vec<(PathBuf, crate::jobs::ClipDropTarget, String, std::time::Instant)>,
+    pub deferred_clip_placements: Vec<(
+        PathBuf,
+        crate::jobs::ClipDropTarget,
+        String,
+        std::time::Instant,
+    )>,
 
     /// Debounced `reload_library` — set by background jobs, drained on
     /// the next UI frame so metadata sync does not freeze the editor.
@@ -868,9 +956,7 @@ pub struct EditorState {
     /// EditorState stays `Send` for any future background users; the
     /// lock is only held for the few microseconds spent on the lookup
     /// or the one-time decode.
-    pub image_textures: std::sync::Mutex<
-        std::collections::HashMap<PathBuf, ImageTextureSlot>,
-    >,
+    pub image_textures: std::sync::Mutex<std::collections::HashMap<PathBuf, ImageTextureSlot>>,
     /// Cache of effects-baked image textures keyed by
     /// `(source_path, effects_signature)`. The actual cache lives in
     /// `crate::image_fx_cache::ImageFxCache` — a two-layer LRU with a
@@ -932,9 +1018,7 @@ pub enum ImageTextureSlot {
     /// first paint (very common for files dropped from the web image
     /// search before the download finished) was permanently disabled
     /// because the cached `Failed` slot was never invalidated.
-    Failed {
-        last_attempt: std::time::Instant,
-    },
+    Failed { last_attempt: std::time::Instant },
 }
 
 /// A single scene tab with its own file path and name.
@@ -960,10 +1044,7 @@ pub enum SceneExitAction {
     CloseTab(usize),
     NewTab,
     NewScene,
-    OpenScene {
-        path: PathBuf,
-        is_memstroy: bool,
-    },
+    OpenScene { path: PathBuf, is_memstroy: bool },
     Quit,
 }
 
@@ -979,7 +1060,9 @@ impl SceneTab {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
-        nanos.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(counter)
+        nanos
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .wrapping_add(counter)
     }
 }
 
@@ -1017,11 +1100,19 @@ pub struct LibraryAsset {
     /// Optional thumbnail (`.png` / `.webp`) used by the drag ghost
     /// and the row card. Falls back to a generic icon when absent.
     pub thumbnail: Option<PathBuf>,
+    /// True when the primary file is already cached locally. Server
+    /// rows can show a thumbnail/name/metadata while this is false.
+    pub downloaded: bool,
+    /// Server-side asset id. `None` means this is a purely local file.
+    pub server_id: Option<String>,
+    pub duration_secs: Option<f32>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
 }
 
 /// Which sub-library is currently visible in the panel. Persisted on
 /// the editor state so the UI keeps the user's last tab choice.
-#[derive(Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LibraryTab {
     #[default]
     Clips,
@@ -1053,6 +1144,41 @@ pub struct LibraryClip {
     /// downloaded — the GUI uses it to fetch downloads on demand.
     /// `None` for purely-local clips that aren't on the server.
     pub server_id: Option<String>,
+    pub label: String,
+    pub duration_secs: Option<f32>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ServerLibraryPageState {
+    pub query: String,
+    pub offset: u64,
+    pub total: Option<u64>,
+    pub loading: bool,
+    pub exhausted: bool,
+    pub error: Option<String>,
+}
+
+impl Default for ServerLibraryPageState {
+    fn default() -> Self {
+        Self {
+            query: String::new(),
+            offset: 0,
+            total: None,
+            loading: false,
+            exhausted: false,
+            error: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ServerLibraryPages {
+    pub clips: ServerLibraryPageState,
+    pub videos: ServerLibraryPageState,
+    pub sounds: ServerLibraryPageState,
+    pub images: ServerLibraryPageState,
 }
 
 /// Result of scanning asset folders on a background thread.
@@ -1109,6 +1235,8 @@ impl EditorState {
         s.timeline_scroll = 0.0;
         s.timeline_v_zoom = 1.0;
         s.timeline_v_scroll = 0.0;
+        s.timeline_follow_playhead = false;
+        s.canvas_show_inactive_previews = true;
         s.split_tool_active = false;
         s.ffmpeg_available = check_ffmpeg();
         s.razor_mode = false;
@@ -1137,7 +1265,8 @@ impl EditorState {
         s.recovery_pending = None;
         s.recovery_dialog_open = false;
         s.autosave_toast_until = None;
-        s.startup_toast_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(15));
+        s.startup_toast_until =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(15));
 
         // Loop preview defaults
         s.loop_mode = false;
@@ -1239,9 +1368,7 @@ impl EditorState {
         if data[0] == 0xFF && data[1] == 0xD8 {
             return false;
         }
-        if n >= 8
-            && data[..8] == [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]
-        {
+        if n >= 8 && data[..8] == [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A] {
             return false;
         }
         // ISO BMFF (mp4/m4v/mov) — `ftyp` may not sit at byte 4
@@ -1281,12 +1408,15 @@ impl EditorState {
         if !path.is_file() {
             return false;
         }
-        let ext_ok = path.extension().and_then(|s| s.to_str()).is_some_and(|ext| {
-            matches!(
-                ext.to_ascii_lowercase().as_str(),
-                "mp4" | "mov" | "webm" | "mkv" | "m4v"
-            )
-        });
+        let ext_ok = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .is_some_and(|ext| {
+                matches!(
+                    ext.to_ascii_lowercase().as_str(),
+                    "mp4" | "mov" | "webm" | "mkv" | "m4v"
+                )
+            });
         if !ext_ok {
             return false;
         }
@@ -1419,6 +1549,8 @@ impl EditorState {
     /// Clamp lane indices after undo/redo or legacy snapshots so every
     /// clip still maps to a valid video/audio row in the layers panel.
     pub fn sanitize_track_assignments(&mut self) {
+        self.enforce_track_order();
+        self.renumber_tracks();
         let video_lanes = self.video_track_indices();
         let audio_lanes = self.audio_track_indices();
         let default_actor = video_lanes.first().copied().unwrap_or(0);
@@ -1446,6 +1578,27 @@ impl EditorState {
         for lane in self.audio_track_assignments.values_mut() {
             if !audio_lanes.contains(lane) {
                 *lane = default_audio;
+            }
+        }
+        self.selected_track = self.selected_track.filter(|idx| *idx < self.tracks.len());
+    }
+
+    /// Rename tracks from their current screen order. Top video row is V1;
+    /// top audio row is A1. This prevents duplicate layer labels after
+    /// deleting and recreating rows.
+    pub fn renumber_tracks(&mut self) {
+        let mut video_n = 1usize;
+        let mut audio_n = 1usize;
+        for track in &mut self.tracks {
+            match track.kind {
+                TrackKind::Video => {
+                    track.name = format!("V{}", video_n);
+                    video_n += 1;
+                }
+                TrackKind::Audio => {
+                    track.name = format!("A{}", audio_n);
+                    audio_n += 1;
+                }
             }
         }
     }
@@ -1579,6 +1732,10 @@ impl EditorState {
         remap(&mut self.actor_track_assignments);
         remap(&mut self.audio_track_assignments);
         remap(&mut self.overlay_track_assignments);
+        self.selected_track = self
+            .selected_track
+            .and_then(|old| old_to_new.get(old).copied());
+        self.renumber_tracks();
     }
 
     /// Insert a new video track immediately before the first audio track
@@ -1586,43 +1743,179 @@ impl EditorState {
     /// track's index. Existing assignments are bumped by 1 wherever they
     /// referenced a row at or after the insertion point.
     pub fn insert_video_track_at_bottom(&mut self) -> usize {
-        let n = self.tracks.iter().filter(|t| t.kind == TrackKind::Video).count() + 1;
-        let pos = self.tracks.iter()
+        let n = self
+            .tracks
+            .iter()
+            .filter(|t| t.kind == TrackKind::Video)
+            .count()
+            + 1;
+        let pos = self
+            .tracks
+            .iter()
             .position(|t| t.kind == TrackKind::Audio)
             .unwrap_or(self.tracks.len());
         self.tracks.insert(pos, Track::video(format!("V{}", n)));
         let bump = |m: &mut std::collections::HashMap<usize, usize>, pivot: usize| {
             for v in m.values_mut() {
-                if *v >= pivot { *v += 1; }
+                if *v >= pivot {
+                    *v += 1;
+                }
             }
         };
         bump(&mut self.actor_track_assignments, pos);
         bump(&mut self.audio_track_assignments, pos);
         bump(&mut self.overlay_track_assignments, pos);
+        if let Some(sel) = self.selected_track.as_mut() {
+            if *sel >= pos {
+                *sel += 1;
+            }
+        }
+        self.renumber_tracks();
         pos
     }
 
     /// Insert a new video track at index 0 (top). Returns 0. Every existing
     /// assignment is shifted up by one so it keeps referring to the same row.
     pub fn insert_video_track_at_top(&mut self) -> usize {
-        let n = self.tracks.iter().filter(|t| t.kind == TrackKind::Video).count() + 1;
+        let n = self
+            .tracks
+            .iter()
+            .filter(|t| t.kind == TrackKind::Video)
+            .count()
+            + 1;
         self.tracks.insert(0, Track::video(format!("V{}", n)));
         let bump = |m: &mut std::collections::HashMap<usize, usize>| {
-            for v in m.values_mut() { *v += 1; }
+            for v in m.values_mut() {
+                *v += 1;
+            }
         };
         bump(&mut self.actor_track_assignments);
         bump(&mut self.audio_track_assignments);
         bump(&mut self.overlay_track_assignments);
+        if let Some(sel) = self.selected_track.as_mut() {
+            *sel += 1;
+        }
         self.sanitize_track_assignments();
         0
+    }
+
+    /// Remove empty timeline lanes while keeping at least one video and one audio lane.
+    /// Track assignments are remapped so clips stay on the same visual rows.
+    pub fn delete_empty_tracks(&mut self) -> usize {
+        let mut occupied = vec![false; self.tracks.len()];
+        if !self.scene.backgrounds.is_empty() && !occupied.is_empty() {
+            occupied[0] = true;
+        }
+        for lane in self.actor_track_assignments.values() {
+            if *lane < occupied.len() {
+                occupied[*lane] = true;
+            }
+        }
+        for lane in self.overlay_track_assignments.values() {
+            if *lane < occupied.len() {
+                occupied[*lane] = true;
+            }
+        }
+        for (ai, au) in self.scene.audio.iter().enumerate() {
+            if au.deleted {
+                continue;
+            }
+            let lane = self
+                .audio_track_assignments
+                .get(&ai)
+                .copied()
+                .unwrap_or_else(|| self.audio_track_indices().first().copied().unwrap_or(0));
+            if lane < occupied.len() {
+                occupied[lane] = true;
+            }
+        }
+
+        let video_count = self
+            .tracks
+            .iter()
+            .filter(|t| t.kind == TrackKind::Video)
+            .count();
+        let audio_count = self
+            .tracks
+            .iter()
+            .filter(|t| t.kind == TrackKind::Audio)
+            .count();
+        let mut seen_video_remove = 0usize;
+        let mut seen_audio_remove = 0usize;
+        let mut keep = vec![true; self.tracks.len()];
+        for (i, track) in self.tracks.iter().enumerate() {
+            if occupied.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            match track.kind {
+                TrackKind::Video if video_count.saturating_sub(seen_video_remove) > 1 => {
+                    keep[i] = false;
+                    seen_video_remove += 1;
+                }
+                TrackKind::Audio if audio_count.saturating_sub(seen_audio_remove) > 1 => {
+                    keep[i] = false;
+                    seen_audio_remove += 1;
+                }
+                _ => {}
+            }
+        }
+        let removed = keep.iter().filter(|&&k| !k).count();
+        if removed == 0 {
+            return 0;
+        }
+
+        let mut old_to_new = vec![0usize; self.tracks.len()];
+        let mut new_tracks = Vec::with_capacity(self.tracks.len() - removed);
+        for (old, track) in self.tracks.iter().cloned().enumerate() {
+            if keep[old] {
+                old_to_new[old] = new_tracks.len();
+                new_tracks.push(track);
+            } else {
+                let fallback = match track.kind {
+                    TrackKind::Video => new_tracks
+                        .iter()
+                        .position(|t| t.kind == TrackKind::Video)
+                        .unwrap_or(0),
+                    TrackKind::Audio => new_tracks
+                        .iter()
+                        .position(|t| t.kind == TrackKind::Audio)
+                        .unwrap_or(0),
+                };
+                old_to_new[old] = fallback;
+            }
+        }
+        self.tracks = new_tracks;
+        let remap = |m: &mut std::collections::HashMap<usize, usize>| {
+            for v in m.values_mut() {
+                if *v < old_to_new.len() {
+                    *v = old_to_new[*v];
+                }
+            }
+        };
+        remap(&mut self.actor_track_assignments);
+        remap(&mut self.overlay_track_assignments);
+        remap(&mut self.audio_track_assignments);
+        self.selected_track = self
+            .selected_track
+            .and_then(|old| old_to_new.get(old).copied())
+            .filter(|idx| *idx < self.tracks.len());
+        self.enforce_track_order();
+        self.sanitize_track_assignments();
+        removed
     }
 
     /// End a library → canvas / timeline asset drag gesture.
     pub fn clear_asset_drag(&mut self) {
         self.asset_drag.dragging = None;
+        self.asset_drag.pending_web_image_url = None;
         self.asset_drag.kind = AssetDragKind::None;
         self.asset_drag.label.clear();
         self.asset_drag.thumbnail = None;
+        self.asset_drag.server_id = None;
+        self.asset_drag.downloaded = false;
+        self.asset_drag.duration_secs = None;
+        self.asset_drag.width = None;
+        self.asset_drag.height = None;
     }
 
     /// Clear in-flight timeline / element-drag state after toolbar
@@ -1637,6 +1930,10 @@ impl EditorState {
         self.timeline_drag.group_anchor.clear();
         self.timeline_drag.group_anchor_token = None;
         self.timeline_drag.group_mover_anchor = None;
+        self.timeline_drag.footage_sequence_anchor.clear();
+        self.timeline_drag.footage_sequence_anchor_token = None;
+        self.timeline_drag.footage_sequence_mover_anchor = None;
+        self.timeline_drag.footage_sequence_id = None;
         self.timeline_drag.pending_overlap.clear();
         if self.element_drag.source.is_some() {
             self.element_drag.source = None;
@@ -1659,13 +1956,10 @@ impl EditorState {
                     .actor_track_assignments
                     .get(&ai)
                     .copied()
-                    .unwrap_or_else(|| {
-                        self.video_track_indices()
-                            .first()
-                            .copied()
-                            .unwrap_or(0)
-                    });
-                if assigned != lane { continue; }
+                    .unwrap_or_else(|| self.video_track_indices().first().copied().unwrap_or(0));
+                if assigned != lane {
+                    continue;
+                }
                 let a = &self.scene.actors[ai];
                 let t_in = a.t_in.unwrap_or(0.0);
                 let t_out = a.t_out.unwrap_or(scene_dur);
@@ -1677,11 +1971,17 @@ impl EditorState {
                     break;
                 }
             }
-            if busy { continue; }
+            if busy {
+                continue;
+            }
             // Overlays assigned to this lane.
             let default_overlay_lane = {
                 let v = self.video_track_indices();
-                if v.len() >= 2 { v[1] } else { v.first().copied().unwrap_or(0) }
+                if v.len() >= 2 {
+                    v[1]
+                } else {
+                    v.first().copied().unwrap_or(0)
+                }
             };
             for (oi, ov) in self.scene.overlays.iter().enumerate() {
                 let assigned = self
@@ -1689,7 +1989,9 @@ impl EditorState {
                     .get(&oi)
                     .copied()
                     .unwrap_or(default_overlay_lane);
-                if assigned != lane { continue; }
+                if assigned != lane {
+                    continue;
+                }
                 let (t_in, t_out) = match ov {
                     memstroy_core::Overlay::Text(o) => (o.t_in, o.t_out),
                     memstroy_core::Overlay::Image(o) => (o.t_in, o.t_out),
@@ -1714,8 +2016,26 @@ impl EditorState {
     /// candidate placement range. Required for image overlays that span
     /// several seconds at the playhead.
     pub fn find_empty_video_lane_for_range(&self, t_in: f32, t_out: f32) -> Option<usize> {
+        self.find_nearest_empty_video_lane_for_range(t_in, t_out, None)
+    }
+
+    /// Like [`Self::find_empty_video_lane_for_range`], but when an anchor
+    /// lane is supplied it prefers the empty lane closest to that anchor.
+    pub fn find_nearest_empty_video_lane_for_range(
+        &self,
+        t_in: f32,
+        t_out: f32,
+        near_lane: Option<usize>,
+    ) -> Option<usize> {
         let scene_dur = self.scene.output.duration.max(0.0);
-        for &lane in self.video_track_indices().iter() {
+        let mut lanes = self.video_track_indices();
+        if let Some(anchor) = near_lane {
+            lanes.sort_by_key(|lane| {
+                let dist = (*lane as isize - anchor as isize).unsigned_abs();
+                (dist, *lane)
+            });
+        }
+        for &lane in lanes.iter() {
             if self.tracks.get(lane).map(|t| t.locked).unwrap_or(false) {
                 continue;
             }
@@ -1725,12 +2045,7 @@ impl EditorState {
                     .actor_track_assignments
                     .get(&ai)
                     .copied()
-                    .unwrap_or_else(|| {
-                        self.video_track_indices()
-                            .first()
-                            .copied()
-                            .unwrap_or(0)
-                    });
+                    .unwrap_or_else(|| self.video_track_indices().first().copied().unwrap_or(0));
                 if assigned != lane {
                     continue;
                 }
@@ -1792,12 +2107,17 @@ impl EditorState {
     }
 
     /// Range-aware lane picker for image / overlay clips.
-    pub fn pick_or_create_empty_video_lane_for_range(
+    pub fn pick_or_create_empty_video_lane_for_range(&mut self, t_in: f32, t_out: f32) -> usize {
+        self.pick_or_create_nearest_empty_video_lane_for_range(t_in, t_out, None)
+    }
+
+    pub fn pick_or_create_nearest_empty_video_lane_for_range(
         &mut self,
         t_in: f32,
         t_out: f32,
+        near_lane: Option<usize>,
     ) -> usize {
-        if let Some(lane) = self.find_empty_video_lane_for_range(t_in, t_out) {
+        if let Some(lane) = self.find_nearest_empty_video_lane_for_range(t_in, t_out, near_lane) {
             lane
         } else {
             self.insert_video_track_at_top()
@@ -1807,20 +2127,35 @@ impl EditorState {
     /// Insert a new audio track immediately after the last video track
     /// (i.e. at the top of the audio block). Returns the new track's index.
     pub fn insert_audio_track_at_top(&mut self) -> usize {
-        let n = self.tracks.iter().filter(|t| t.kind == TrackKind::Audio).count() + 1;
-        let pos = self.tracks.iter()
+        let n = self
+            .tracks
+            .iter()
+            .filter(|t| t.kind == TrackKind::Audio)
+            .count()
+            + 1;
+        let pos = self
+            .tracks
+            .iter()
             .rposition(|t| t.kind == TrackKind::Video)
             .map(|p| p + 1)
             .unwrap_or(0);
         self.tracks.insert(pos, Track::audio(format!("A{}", n)));
         let bump = |m: &mut std::collections::HashMap<usize, usize>, pivot: usize| {
             for v in m.values_mut() {
-                if *v >= pivot { *v += 1; }
+                if *v >= pivot {
+                    *v += 1;
+                }
             }
         };
         bump(&mut self.actor_track_assignments, pos);
         bump(&mut self.audio_track_assignments, pos);
         bump(&mut self.overlay_track_assignments, pos);
+        if let Some(sel) = self.selected_track.as_mut() {
+            if *sel >= pos {
+                *sel += 1;
+            }
+        }
+        self.renumber_tracks();
         pos
     }
 
@@ -1849,14 +2184,18 @@ impl EditorState {
             }
             let mut busy = false;
             for (aui, au) in self.scene.audio.iter().enumerate() {
-                if au.deleted { continue; }
+                if au.deleted {
+                    continue;
+                }
                 let assigned = self
                     .audio_track_assignments
                     .get(&aui)
                     .copied()
                     .filter(|t| audio_lanes.contains(t))
                     .unwrap_or_else(|| audio_lanes[aui % audio_lanes.len()]);
-                if assigned != lane { continue; }
+                if assigned != lane {
+                    continue;
+                }
                 let other_in = au.t_in;
                 let other_out = au.t_out.unwrap_or(scene_dur);
                 // Half-open overlap test: ranges [a_in, a_out] and
@@ -1878,16 +2217,164 @@ impl EditorState {
     /// back to a freshly-inserted lane right after the video stack
     /// when every existing lane is busy (or when no audio lanes exist
     /// yet). Mirrors `pick_or_create_empty_video_lane_at` for sound.
-    pub fn pick_or_create_empty_audio_lane_for_range(
+    pub fn pick_or_create_empty_audio_lane_for_range(&mut self, t_in: f32, t_out: f32) -> usize {
+        self.pick_or_create_nearest_empty_audio_lane_for_range(t_in, t_out, None)
+    }
+
+    pub fn find_nearest_empty_audio_lane_for_range(
+        &self,
+        t_in: f32,
+        t_out: f32,
+        near_lane: Option<usize>,
+    ) -> Option<usize> {
+        let scene_dur = self.scene.output.duration.max(0.0);
+        let mut audio_lanes = self.audio_track_indices();
+        if let Some(anchor) = near_lane {
+            audio_lanes.sort_by_key(|lane| {
+                let dist = (*lane as isize - anchor as isize).unsigned_abs();
+                (dist, *lane)
+            });
+        }
+        if audio_lanes.is_empty() {
+            return None;
+        }
+        for &lane in audio_lanes.iter() {
+            if self.tracks.get(lane).map(|t| t.locked).unwrap_or(false) {
+                continue;
+            }
+            let mut busy = false;
+            for (aui, au) in self.scene.audio.iter().enumerate() {
+                if au.deleted {
+                    continue;
+                }
+                let assigned = self
+                    .audio_track_assignments
+                    .get(&aui)
+                    .copied()
+                    .filter(|t| audio_lanes.contains(t))
+                    .unwrap_or_else(|| audio_lanes[aui % audio_lanes.len()]);
+                if assigned != lane {
+                    continue;
+                }
+                let other_in = au.t_in;
+                let other_out = au.t_out.unwrap_or(scene_dur);
+                if t_in < other_out && other_in < t_out {
+                    busy = true;
+                    break;
+                }
+            }
+            if !busy {
+                return Some(lane);
+            }
+        }
+        None
+    }
+
+    pub fn pick_or_create_nearest_empty_audio_lane_for_range(
         &mut self,
         t_in: f32,
         t_out: f32,
+        near_lane: Option<usize>,
     ) -> usize {
-        if let Some(lane) = self.find_empty_audio_lane_for_range(t_in, t_out) {
+        if let Some(lane) = self.find_nearest_empty_audio_lane_for_range(t_in, t_out, near_lane) {
             lane
         } else {
             self.insert_audio_track_at_top()
         }
+    }
+
+    pub fn track_is_empty(&self, track_idx: usize) -> bool {
+        if track_idx >= self.tracks.len() {
+            return true;
+        }
+        if track_idx == 0
+            && self.tracks[track_idx].kind == TrackKind::Video
+            && !self.scene.backgrounds.is_empty()
+        {
+            return false;
+        }
+        if self
+            .actor_track_assignments
+            .values()
+            .any(|&lane| lane == track_idx)
+        {
+            return false;
+        }
+        if self
+            .overlay_track_assignments
+            .values()
+            .any(|&lane| lane == track_idx)
+        {
+            return false;
+        }
+        for (aui, au) in self.scene.audio.iter().enumerate() {
+            if au.deleted {
+                continue;
+            }
+            if self.audio_track_assignments.get(&aui).copied() == Some(track_idx) {
+                return false;
+            }
+        }
+        true
+    }
+
+    pub fn select_track_contents(&mut self, track_idx: usize) -> usize {
+        self.selected_track = Some(track_idx);
+        self.canvas_selection.clear();
+        if track_idx >= self.tracks.len() {
+            self.selection = Selection::None;
+            return 0;
+        }
+        for (ai, _) in self.scene.actors.iter().enumerate() {
+            if self.actor_track_assignments.get(&ai).copied() == Some(track_idx) {
+                self.canvas_selection.push(Selection::Actor(ai));
+            }
+        }
+        for (oi, _) in self.scene.overlays.iter().enumerate() {
+            if self.overlay_track_assignments.get(&oi).copied() == Some(track_idx) {
+                self.canvas_selection.push(Selection::Overlay(oi));
+            }
+        }
+        for (aui, au) in self.scene.audio.iter().enumerate() {
+            if au.deleted {
+                continue;
+            }
+            if self.audio_track_assignments.get(&aui).copied() == Some(track_idx) {
+                self.canvas_selection.push(Selection::Audio(aui));
+            }
+        }
+        self.selection = self
+            .canvas_selection
+            .first()
+            .copied()
+            .unwrap_or(Selection::None);
+        self.canvas_selection.len()
+    }
+
+    pub fn delete_empty_track(&mut self, track_idx: usize) -> bool {
+        if track_idx >= self.tracks.len() || !self.track_is_empty(track_idx) {
+            return false;
+        }
+        let kind = self.tracks[track_idx].kind;
+        let same_kind_count = self.tracks.iter().filter(|t| t.kind == kind).count();
+        if same_kind_count <= 1 {
+            return false;
+        }
+        self.tracks.remove(track_idx);
+        let shift = |m: &mut std::collections::HashMap<usize, usize>| {
+            for lane in m.values_mut() {
+                if *lane > track_idx {
+                    *lane -= 1;
+                }
+            }
+        };
+        shift(&mut self.actor_track_assignments);
+        shift(&mut self.overlay_track_assignments);
+        shift(&mut self.audio_track_assignments);
+        self.selected_track = None;
+        self.renumber_tracks();
+        self.sanitize_track_assignments();
+        true
     }
 
     // ─── Tab management ──────────────────────────────────────────────
@@ -1909,8 +2396,7 @@ impl EditorState {
         if idx >= self.scene_tabs.len() {
             return false;
         }
-        Self::scene_content_digest(&self.scene_tabs[idx].scene)
-            != self.scene_tabs[idx].saved_digest
+        Self::scene_content_digest(&self.scene_tabs[idx].scene) != self.scene_tabs[idx].saved_digest
     }
 
     /// Whether a (possibly inactive) tab has unsaved edits.
@@ -1977,7 +2463,9 @@ impl EditorState {
 
     /// Switch to tab at index.
     pub fn switch_tab(&mut self, idx: usize) {
-        if idx >= self.scene_tabs.len() || idx == self.active_tab { return; }
+        if idx >= self.scene_tabs.len() || idx == self.active_tab {
+            return;
+        }
         self.sync_scene_to_tab();
         self.active_tab = idx;
         self.sync_tab_to_scene();
@@ -1989,7 +2477,9 @@ impl EditorState {
     /// indices (left-shift when closing a tab to the left of active,
     /// clamp to last when closing the rightmost active tab).
     pub fn close_tab(&mut self, idx: usize) {
-        if idx >= self.scene_tabs.len() { return; }
+        if idx >= self.scene_tabs.len() {
+            return;
+        }
 
         // Always sync the active tab's working scene back to its slot
         // first, so closing a different tab doesn't lose unsaved edits.
@@ -2111,10 +2601,9 @@ impl EditorState {
         }
     }
 
-    /// Add a new audio track at the bottom of the layers panel.
+    /// Add a new audio track at the top of the audio block.
     pub fn add_audio_track(&mut self) {
-        let n = self.tracks.iter().filter(|t| t.kind == TrackKind::Audio).count() + 1;
-        self.tracks.push(Track::audio(format!("A{}", n)));
+        self.insert_audio_track_at_top();
         self.sanitize_track_assignments();
     }
 
@@ -2137,8 +2626,12 @@ impl EditorState {
 
     /// Load timeline layout state (zoom, scroll, track heights) from a JSON file.
     pub fn load_layout(&mut self, path: &std::path::Path) {
-        let Ok(contents) = std::fs::read_to_string(path) else { return };
-        let Ok(data) = serde_json::from_str::<serde_json::Value>(&contents) else { return };
+        let Ok(contents) = std::fs::read_to_string(path) else {
+            return;
+        };
+        let Ok(data) = serde_json::from_str::<serde_json::Value>(&contents) else {
+            return;
+        };
         self.apply_layout_json(&data);
     }
 
@@ -2170,9 +2663,18 @@ impl EditorState {
                     Some("audio") => TrackKind::Audio,
                     _ => TrackKind::Video,
                 };
-                let muted = entry.get("muted").and_then(|v| v.as_bool()).unwrap_or(false);
-                let locked = entry.get("locked").and_then(|v| v.as_bool()).unwrap_or(false);
-                let visible = entry.get("visible").and_then(|v| v.as_bool()).unwrap_or(true);
+                let muted = entry
+                    .get("muted")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let locked = entry
+                    .get("locked")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let visible = entry
+                    .get("visible")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
                 let height = entry.get("height").and_then(|v| v.as_f64()).unwrap_or(40.0) as f32;
                 new_tracks.push(Track {
                     name,
@@ -2209,9 +2711,7 @@ impl EditorState {
                     for pair in arr {
                         if let Some(p) = pair.as_array() {
                             if p.len() == 2 {
-                                if let (Some(k), Some(v)) =
-                                    (p[0].as_u64(), p[1].as_u64())
-                                {
+                                if let (Some(k), Some(v)) = (p[0].as_u64(), p[1].as_u64()) {
                                     out.insert(k as usize, v as usize);
                                 }
                             }
@@ -2275,8 +2775,7 @@ impl EditorState {
             })
             .collect();
         let dump_assignments = |m: &std::collections::HashMap<usize, usize>| {
-            let mut pairs: Vec<(usize, usize)> =
-                m.iter().map(|(&k, &v)| (k, v)).collect();
+            let mut pairs: Vec<(usize, usize)> = m.iter().map(|(&k, &v)| (k, v)).collect();
             pairs.sort_by_key(|(k, _)| *k);
             pairs
                 .into_iter()
@@ -2334,8 +2833,8 @@ impl EditorState {
     /// installing the scene into the active tab.
     pub fn load_memstroy(&mut self, path: &std::path::Path) -> Result<Scene, String> {
         let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-        let bundle: serde_json::Value = serde_json::from_str(&raw)
-            .map_err(|e| format!("invalid .memstroy json: {e}"))?;
+        let bundle: serde_json::Value =
+            serde_json::from_str(&raw).map_err(|e| format!("invalid .memstroy json: {e}"))?;
         let scene_value = bundle
             .get("scene")
             .cloned()
@@ -2355,31 +2854,37 @@ impl EditorState {
         let thumbs_dir = clips_dir.join("thumbs");
         let mut clips: Vec<LibraryClip> = Vec::new();
         let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-        
+
         // First pass: scan for txt files (metadata)
         if let Ok(entries) = std::fs::read_dir(&clips_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if !path.is_file() { continue; }
+                if !path.is_file() {
+                    continue;
+                }
                 let ext = path
                     .extension()
                     .and_then(|s| s.to_str())
                     .map(str::to_ascii_lowercase)
                     .unwrap_or_default();
-                if ext != "txt" { continue; }
-                
+                if ext != "txt" {
+                    continue;
+                }
+
                 let stem = path
                     .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("")
                     .to_string();
-                if stem.is_empty() { continue; }
-                
+                if stem.is_empty() {
+                    continue;
+                }
+
                 // Skip if already processed
                 if !seen_ids.insert(stem.clone()) {
                     continue;
                 }
-                
+
                 let id: u64 = stem.parse::<u64>().unwrap_or_else(|_| {
                     use std::collections::hash_map::DefaultHasher;
                     use std::hash::{Hash, Hasher};
@@ -2387,56 +2892,66 @@ impl EditorState {
                     stem.hash(&mut h);
                     h.finish()
                 });
-                
+
                 let mp4_path = clips_dir.join(format!("{}.mp4", stem));
                 let downloaded = Self::is_usable_local_video(&mp4_path);
-                
+
                 let description = std::fs::read_to_string(&path)
                     .map(|s| s.trim().to_string())
                     .unwrap_or_default();
-                
+
                 let thumbnail = crate::jobs::find_local_thumbnail(clips_dir, &stem);
-                
+
                 info!(
                     "Loaded clip from txt: id={}, stem={}, downloaded={}, has_thumb={}, desc_len={}",
                     id, stem, downloaded, thumbnail.is_some(), description.len()
                 );
-                
+
                 clips.push(LibraryClip {
                     id,
                     path: mp4_path,
+                    label: stem.clone(),
                     description,
                     downloaded,
                     thumbnail,
                     server_id: Some(stem),
+                    duration_secs: None,
+                    width: None,
+                    height: None,
                 });
             }
         }
-        
+
         // Second pass: scan for thumbnails without txt files
         if let Ok(entries) = std::fs::read_dir(&thumbs_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if !path.is_file() { continue; }
+                if !path.is_file() {
+                    continue;
+                }
                 let ext = path
                     .extension()
                     .and_then(|s| s.to_str())
                     .map(str::to_ascii_lowercase)
                     .unwrap_or_default();
-                if ext != "jpg" && ext != "png" { continue; }
-                
+                if ext != "jpg" && ext != "png" {
+                    continue;
+                }
+
                 let stem = path
                     .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("")
                     .to_string();
-                if stem.is_empty() { continue; }
-                
+                if stem.is_empty() {
+                    continue;
+                }
+
                 // Skip if already processed from txt
                 if !seen_ids.insert(stem.clone()) {
                     continue;
                 }
-                
+
                 let id: u64 = stem.parse::<u64>().unwrap_or_else(|_| {
                     use std::collections::hash_map::DefaultHasher;
                     use std::hash::{Hash, Hasher};
@@ -2444,54 +2959,65 @@ impl EditorState {
                     stem.hash(&mut h);
                     h.finish()
                 });
-                
+
                 let mp4_path = clips_dir.join(format!("{}.mp4", stem));
                 let downloaded = Self::is_usable_local_video(&mp4_path);
-                
+
                 let txt_path = clips_dir.join(format!("{}.txt", stem));
                 let description = std::fs::read_to_string(&txt_path)
                     .map(|s| s.trim().to_string())
                     .unwrap_or_default();
-                
+
                 info!(
                     "Loaded clip from thumbnail: id={}, stem={}, downloaded={}, desc_len={}",
-                    id, stem, downloaded, description.len()
+                    id,
+                    stem,
+                    downloaded,
+                    description.len()
                 );
-                
+
                 clips.push(LibraryClip {
                     id,
                     path: mp4_path,
+                    label: stem.clone(),
                     description,
                     downloaded,
                     thumbnail: Some(path),
                     server_id: Some(stem),
+                    duration_secs: None,
+                    width: None,
+                    height: None,
                 });
             }
         }
-        
+
         // Third pass: scan for mp4 files without metadata (legacy clips)
         if let Ok(entries) = std::fs::read_dir(&clips_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if !path.is_file() { continue; }
+                if !path.is_file() {
+                    continue;
+                }
                 let ext = path
                     .extension()
                     .and_then(|s| s.to_str())
                     .map(str::to_ascii_lowercase)
                     .unwrap_or_default();
-                if ext != "mp4" { continue; }
-                
+                if ext != "mp4" {
+                    continue;
+                }
+
                 let stem = path
                     .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("clip")
                     .to_string();
-                
+
                 // Skip if already processed
                 if !seen_ids.insert(stem.clone()) {
                     continue;
                 }
-                
+
                 let id: u64 = stem.parse::<u64>().unwrap_or_else(|_| {
                     use std::collections::hash_map::DefaultHasher;
                     use std::hash::{Hash, Hasher};
@@ -2499,26 +3025,33 @@ impl EditorState {
                     stem.hash(&mut h);
                     h.finish()
                 });
-                
+
                 let thumbnail = crate::jobs::find_local_thumbnail(clips_dir, &stem);
-                
+
                 let txt_path = clips_dir.join(format!("{}.txt", stem));
                 let description = std::fs::read_to_string(&txt_path)
                     .map(|s| s.trim().to_string())
                     .unwrap_or_default();
-                
+
                 info!(
                     "Loaded legacy clip from mp4: id={}, stem={}, has_thumb={}, desc_len={}",
-                    id, stem, thumbnail.is_some(), description.len()
+                    id,
+                    stem,
+                    thumbnail.is_some(),
+                    description.len()
                 );
-                
+
                 clips.push(LibraryClip {
                     id,
                     path: path.clone(),
+                    label: stem.clone(),
                     description,
                     downloaded: true,
                     thumbnail,
                     server_id: Some(stem),
+                    duration_secs: None,
+                    width: None,
+                    height: None,
                 });
             }
         }
@@ -2552,7 +3085,11 @@ impl EditorState {
     /// Apply a background scan result on the UI thread.
     pub fn apply_library_snapshot(&mut self, snap: LibraryScanSnapshot) {
         let downloaded_count = snap.mellstroy_clips.iter().filter(|c| c.downloaded).count();
-        let server_only_count = snap.mellstroy_clips.iter().filter(|c| !c.downloaded).count();
+        let server_only_count = snap
+            .mellstroy_clips
+            .iter()
+            .filter(|c| !c.downloaded)
+            .count();
         tracing::info!(
             "Loaded {} clips ({} downloaded, {} server-only)",
             snap.mellstroy_clips.len(),
@@ -2574,8 +3111,320 @@ impl EditorState {
         }
         let snap = Self::scan_library_snapshot(self.assets_root.clone());
         self.apply_library_snapshot(snap);
-        if !LIBRARY_LOCAL_ONLY {
-            self.fetch_server_clips_metadata();
+    }
+
+    pub fn server_preview_cache_root(&self) -> PathBuf {
+        self.assets_root.join("server-previews")
+    }
+
+    pub fn server_cache_dir_for_tab(&self, tab: LibraryTab) -> Option<PathBuf> {
+        match tab {
+            LibraryTab::Clips => Some(self.clips_dir()),
+            LibraryTab::Videos => Some(self.assets_root.join("server-cache").join("videos")),
+            LibraryTab::Sounds => Some(self.assets_root.join("server-cache").join("sounds")),
+            LibraryTab::Images => Some(self.assets_root.join("server-cache").join("images")),
+            LibraryTab::Particles => None,
+        }
+    }
+
+    pub fn server_kind_for_tab(tab: LibraryTab) -> Option<&'static str> {
+        match tab {
+            LibraryTab::Clips => Some("clip"),
+            LibraryTab::Videos => Some("video"),
+            LibraryTab::Sounds => Some("sound"),
+            LibraryTab::Images => Some("image"),
+            LibraryTab::Particles => None,
+        }
+    }
+
+    pub fn server_page_state(&self, tab: LibraryTab) -> Option<&ServerLibraryPageState> {
+        match tab {
+            LibraryTab::Clips => Some(&self.server_library_pages.clips),
+            LibraryTab::Videos => Some(&self.server_library_pages.videos),
+            LibraryTab::Sounds => Some(&self.server_library_pages.sounds),
+            LibraryTab::Images => Some(&self.server_library_pages.images),
+            LibraryTab::Particles => None,
+        }
+    }
+
+    pub fn server_page_state_mut(
+        &mut self,
+        tab: LibraryTab,
+    ) -> Option<&mut ServerLibraryPageState> {
+        match tab {
+            LibraryTab::Clips => Some(&mut self.server_library_pages.clips),
+            LibraryTab::Videos => Some(&mut self.server_library_pages.videos),
+            LibraryTab::Sounds => Some(&mut self.server_library_pages.sounds),
+            LibraryTab::Images => Some(&mut self.server_library_pages.images),
+            LibraryTab::Particles => None,
+        }
+    }
+
+    pub fn reset_server_page_for_tab(&mut self, tab: LibraryTab, query: String) {
+        if let Some(page) = self.server_page_state_mut(tab) {
+            page.query = query;
+            page.offset = 0;
+            page.total = None;
+            page.loading = false;
+            page.exhausted = false;
+            page.error = None;
+        }
+        match tab {
+            LibraryTab::Clips => self.library.mellstroy_clips.retain(|c| c.downloaded),
+            LibraryTab::Videos => self
+                .library
+                .videos
+                .retain(|a| a.server_id.is_none() || a.downloaded),
+            LibraryTab::Sounds => self
+                .library
+                .sounds
+                .retain(|a| a.server_id.is_none() || a.downloaded),
+            LibraryTab::Images => self
+                .library
+                .images
+                .retain(|a| a.server_id.is_none() || a.downloaded),
+            LibraryTab::Particles => {}
+        }
+    }
+
+    pub fn mark_server_page_loading(&mut self, tab: LibraryTab, query: String) {
+        if let Some(page) = self.server_page_state_mut(tab) {
+            if page.query != query {
+                page.query = query;
+                page.offset = 0;
+                page.total = None;
+                page.exhausted = false;
+            }
+            page.loading = true;
+            page.error = None;
+        }
+    }
+
+    pub fn ingest_server_assets_page(
+        &mut self,
+        tab: LibraryTab,
+        query: &str,
+        page: crate::jobs::ServerAssetsPage,
+    ) {
+        if self
+            .server_page_state(tab)
+            .map(|state_page| state_page.query.as_str() != query)
+            .unwrap_or(true)
+        {
+            return;
+        }
+        {
+            let Some(state_page) = self.server_page_state_mut(tab) else {
+                return;
+            };
+            state_page.loading = false;
+            state_page.error = None;
+            state_page.total = Some(page.total);
+            state_page.offset = page.offset.saturating_add(page.items.len() as u64);
+            state_page.exhausted = !page.has_more || page.items.is_empty();
+        }
+
+        if page.offset == 0 {
+            match tab {
+                LibraryTab::Clips => self.library.mellstroy_clips.retain(|c| c.downloaded),
+                LibraryTab::Videos => self
+                    .library
+                    .videos
+                    .retain(|a| a.server_id.is_none() || a.downloaded),
+                LibraryTab::Sounds => self
+                    .library
+                    .sounds
+                    .retain(|a| a.server_id.is_none() || a.downloaded),
+                LibraryTab::Images => self
+                    .library
+                    .images
+                    .retain(|a| a.server_id.is_none() || a.downloaded),
+                LibraryTab::Particles => {}
+            }
+        }
+
+        for item in page.items {
+            match tab {
+                LibraryTab::Clips => self.merge_server_clip(item),
+                LibraryTab::Videos | LibraryTab::Sounds | LibraryTab::Images => {
+                    self.merge_server_library_asset(tab, item);
+                }
+                LibraryTab::Particles => {}
+            }
+        }
+    }
+
+    pub fn set_server_assets_page_error(&mut self, tab: LibraryTab, query: &str, error: String) {
+        let Some(page) = self.server_page_state_mut(tab) else {
+            return;
+        };
+        if page.query != query {
+            return;
+        }
+        page.loading = false;
+        page.error = Some(error);
+    }
+
+    pub fn mark_server_asset_downloaded(
+        &mut self,
+        kind: AssetDragKind,
+        server_id: &str,
+        path: PathBuf,
+    ) {
+        match kind {
+            AssetDragKind::Video => {
+                if let Some(row) = self
+                    .library
+                    .videos
+                    .iter_mut()
+                    .find(|a| a.server_id.as_deref() == Some(server_id))
+                {
+                    row.path = path;
+                    row.downloaded = true;
+                }
+            }
+            AssetDragKind::Sound => {
+                if let Some(row) = self
+                    .library
+                    .sounds
+                    .iter_mut()
+                    .find(|a| a.server_id.as_deref() == Some(server_id))
+                {
+                    row.path = path;
+                    row.downloaded = true;
+                }
+            }
+            AssetDragKind::Image | AssetDragKind::Particle => {
+                if let Some(row) = self
+                    .library
+                    .images
+                    .iter_mut()
+                    .find(|a| a.server_id.as_deref() == Some(server_id))
+                {
+                    row.path = path.clone();
+                    row.thumbnail = Some(path);
+                    row.downloaded = true;
+                }
+            }
+            AssetDragKind::Clip => {
+                if let Some(row) = self
+                    .library
+                    .mellstroy_clips
+                    .iter_mut()
+                    .find(|c| c.server_id.as_deref() == Some(server_id))
+                {
+                    row.path = path;
+                    row.downloaded = true;
+                }
+            }
+            AssetDragKind::None => {}
+        }
+    }
+
+    fn merge_server_clip(&mut self, item: crate::jobs::ServerAssetSummary) {
+        let safe_id = crate::jobs::sanitise_id(&item.id);
+        let ext = non_empty_ext(&item.extension).unwrap_or("mp4");
+        let path = self.clips_dir().join(format!("{safe_id}.{ext}"));
+        let downloaded = Self::is_usable_local_video(&path);
+        let id = safe_id
+            .parse::<u64>()
+            .unwrap_or_else(|_| stable_hash_u64(&safe_id));
+        let label = if item.label.trim().is_empty() {
+            safe_id.clone()
+        } else {
+            item.label.clone()
+        };
+        let description = if item.description.trim().is_empty() {
+            label.clone()
+        } else {
+            item.description.clone()
+        };
+        let thumbnail = item
+            .local_preview
+            .clone()
+            .or_else(|| crate::jobs::find_local_thumbnail(&self.clips_dir(), &safe_id));
+        if let Some(duration) = item.duration_secs.filter(|d| d.is_finite() && *d > 0.01) {
+            self.video_duration_cache.insert(path.clone(), duration);
+        }
+        let row = LibraryClip {
+            id,
+            path,
+            label,
+            description,
+            downloaded,
+            thumbnail,
+            server_id: Some(item.id.clone()),
+            duration_secs: item.duration_secs,
+            width: item.width,
+            height: item.height,
+        };
+        if let Some(existing) = self
+            .library
+            .mellstroy_clips
+            .iter_mut()
+            .find(|c| c.server_id.as_deref() == Some(item.id.as_str()))
+        {
+            *existing = row;
+        } else {
+            self.library.mellstroy_clips.push(row);
+        }
+    }
+
+    fn merge_server_library_asset(
+        &mut self,
+        tab: LibraryTab,
+        item: crate::jobs::ServerAssetSummary,
+    ) {
+        let safe_id = crate::jobs::sanitise_id(&item.id);
+        let ext = non_empty_ext(&item.extension).unwrap_or(match tab {
+            LibraryTab::Videos => "mp4",
+            LibraryTab::Sounds => "wav",
+            LibraryTab::Images => "png",
+            _ => "bin",
+        });
+        let Some(dir) = self.server_cache_dir_for_tab(tab) else {
+            return;
+        };
+        let path = dir.join(format!("{safe_id}.{ext}"));
+        let downloaded = match tab {
+            LibraryTab::Videos => Self::is_usable_local_video(&path),
+            LibraryTab::Sounds | LibraryTab::Images => path.is_file(),
+            _ => false,
+        };
+        let label = if item.label.trim().is_empty() {
+            safe_id.clone()
+        } else {
+            item.label.clone()
+        };
+        if matches!(tab, LibraryTab::Videos) {
+            if let Some(duration) = item.duration_secs.filter(|d| d.is_finite() && *d > 0.01) {
+                self.video_duration_cache.insert(path.clone(), duration);
+            }
+        }
+        let row = LibraryAsset {
+            id: safe_id,
+            path,
+            label,
+            thumbnail: item.local_preview.clone(),
+            downloaded,
+            server_id: Some(item.id.clone()),
+            duration_secs: item.duration_secs,
+            width: item.width,
+            height: item.height,
+        };
+        let target = match tab {
+            LibraryTab::Videos => &mut self.library.videos,
+            LibraryTab::Sounds => &mut self.library.sounds,
+            LibraryTab::Images => &mut self.library.images,
+            _ => return,
+        };
+        if let Some(existing) = target
+            .iter_mut()
+            .find(|a| a.server_id.as_deref() == Some(item.id.as_str()))
+        {
+            *existing = row;
+        } else {
+            target.push(row);
         }
     }
 
@@ -2587,6 +3436,7 @@ impl EditorState {
     /// 3. Sends a `JobEvent::RefreshLibraryReloaded` to trigger UI refresh
     ///
     /// Gracefully degrades if server is unreachable (logs warning, continues with local-only clips).
+    #[allow(dead_code)]
     pub(crate) fn fetch_server_clips_metadata(&self) {
         if LIBRARY_LOCAL_ONLY {
             return;
@@ -2602,7 +3452,7 @@ impl EditorState {
             tracing::debug!("tokio runtime handle not available, skipping server metadata fetch");
             return;
         };
-        
+
         let Some(tx) = self.image_fx_tx.clone() else {
             tracing::debug!("job event sender not available, skipping server metadata fetch");
             return;
@@ -2610,7 +3460,7 @@ impl EditorState {
 
         let server_url = self.server_url.clone();
         let clips_dir = self.clips_dir();
-        
+
         // Get current local clip IDs to avoid duplicates
         let local_clip_ids: std::collections::HashSet<String> = self
             .library
@@ -2627,7 +3477,7 @@ impl EditorState {
         // Spawn async task to fetch server metadata
         handle.spawn(async move {
             use std::time::Duration;
-            
+
             // Rewrite server URL for client (handle 0.0.0.0 -> 127.0.0.1)
             let server = crate::state::rewrite_server_url_for_client(&server_url)
                 .trim_end_matches('/')
@@ -2757,7 +3607,7 @@ impl EditorState {
                     updated_count,
                     generated_thumbs
                 );
-                
+
                 // Trigger UI refresh to reload library with new metadata
                 let _ = tx.send(crate::jobs::JobEvent::RefreshLibraryReloaded(
                     format!("Loaded {} clips from server", updated_count)
@@ -2931,6 +3781,7 @@ impl EditorState {
         let n = buf.len();
         if n > 0 {
             self.clipboard = buf;
+            self.keyframe_clipboard.clear();
         }
         n
     }
@@ -2952,6 +3803,7 @@ impl EditorState {
         // Take a single undo snapshot for the whole paste batch.
         self.last_drag_group = None;
         self.undo.push_full(self.build_undo_snapshot());
+        self.frame_undo_fallback_suppressed = true;
 
         // Mapping from old actor id → new actor id, so bound audio
         // tracks copied alongside their parent actor can re-link to
@@ -2974,6 +3826,8 @@ impl EditorState {
                     };
                     a.t_in = Some(playhead);
                     a.t_out = Some(playhead + dur);
+                    let t_out = playhead + dur;
+                    let new_track = self.pick_or_create_empty_video_lane_for_range(playhead, t_out);
                     let new_idx = self.scene.actors.len();
                     self.scene.actors.push(a);
                     // Each pasted actor lands on the first empty video
@@ -2982,9 +3836,6 @@ impl EditorState {
                     // canvas-drop behaviour and matches the user's
                     // mental model of "paste shows up on whichever
                     // empty layer is closest right now".
-                    let t_out = playhead + dur;
-                    let new_track =
-                        self.pick_or_create_empty_video_lane_for_range(playhead, t_out);
                     self.actor_track_assignments.insert(new_idx, new_track);
                     new_selections.push(Selection::Actor(new_idx));
                 }
@@ -3014,10 +3865,10 @@ impl EditorState {
                             v.t_out = new_t_out;
                         }
                     }
-                    let new_idx = self.scene.overlays.len();
-                    self.scene.overlays.push(o);
                     let new_track =
                         self.pick_or_create_empty_video_lane_for_range(playhead, new_t_out);
+                    let new_idx = self.scene.overlays.len();
+                    self.scene.overlays.push(o);
                     self.overlay_track_assignments.insert(new_idx, new_track);
                     new_selections.push(Selection::Overlay(new_idx));
                 }
@@ -3033,12 +3884,18 @@ impl EditorState {
                     // pasted in this batch, re-link to the new actor id
                     // so the duplicate pair stays connected. Otherwise
                     // clear the binding (standalone copy).
-                    match au.parent_actor.as_ref().and_then(|old| actor_id_remap.get(old).cloned()) {
+                    match au
+                        .parent_actor
+                        .as_ref()
+                        .and_then(|old| actor_id_remap.get(old).cloned())
+                    {
                         Some(new_parent_id) => {
                             au.parent_actor = Some(new_parent_id.clone());
                             // Sync audio timing to the freshly-pasted
                             // parent actor so they stay in lock-step.
-                            if let Some(parent) = self.scene.actors.iter().find(|a| a.id == new_parent_id) {
+                            if let Some(parent) =
+                                self.scene.actors.iter().find(|a| a.id == new_parent_id)
+                            {
                                 au.t_in = parent.t_in.unwrap_or(playhead);
                                 au.t_out = parent.t_out;
                                 au.source_start = parent.source_start;
@@ -3051,11 +3908,10 @@ impl EditorState {
                             au.t_in = playhead;
                         }
                     }
+                    let new_track =
+                        self.pick_or_create_empty_audio_lane_for_range(playhead, playhead + 1.0);
                     let new_idx = self.scene.audio.len();
                     self.scene.audio.push(au);
-                    let new_track = self.pick_or_create_empty_audio_lane_for_range(
-                        playhead, playhead + 1.0,
-                    );
                     self.audio_track_assignments.insert(new_idx, new_track);
                     new_selections.push(Selection::Audio(new_idx));
                 }
@@ -3071,6 +3927,96 @@ impl EditorState {
         self.canvas_selection = new_selections.clone();
 
         new_selections.len()
+    }
+
+    pub fn copy_selected_keyframes_to_clipboard(&mut self) -> usize {
+        if self.selected_keyframes.is_empty() {
+            return 0;
+        }
+        self.keyframe_clipboard = self.selected_keyframes.clone();
+        self.clipboard.clear();
+        self.keyframe_clipboard.len()
+    }
+
+    pub fn paste_keyframes_from_clipboard(&mut self) -> usize {
+        if self.keyframe_clipboard.is_empty() {
+            return 0;
+        }
+        let buf = self.keyframe_clipboard.clone();
+        let min_t = buf.iter().map(|kf| kf.t).fold(f32::INFINITY, f32::min);
+        if !min_t.is_finite() {
+            return 0;
+        }
+        self.last_drag_group = None;
+        self.undo.push_full(self.build_undo_snapshot());
+        self.frame_undo_fallback_suppressed = true;
+        let mut pasted = Vec::new();
+        let mut count = 0usize;
+        for sk in buf {
+            let new_t = (self.playhead + (sk.t - min_t)).max(0.0);
+            if self.copy_one_keyframe_to_time(&sk, new_t) {
+                let mut next = sk.clone();
+                next.t = new_t;
+                pasted.push(next);
+                count += 1;
+            }
+        }
+        if !pasted.is_empty() {
+            self.selected_keyframes = pasted;
+        }
+        count
+    }
+
+    fn copy_one_keyframe_to_time(
+        &mut self,
+        sk: &crate::kf_anim::SelectedKeyframe,
+        new_t: f32,
+    ) -> bool {
+        const EPS: f32 = 1.0e-3;
+        match sk.layer {
+            crate::kf_anim::SelectedLayer::Actor(ai) => {
+                let Some(actor) = self.scene.actors.get_mut(ai) else {
+                    return false;
+                };
+                replace_or_push_keyframe(&mut actor.layout, sk.t, new_t)
+            }
+            crate::kf_anim::SelectedLayer::Overlay(oi) => {
+                let Some(ov) = self.scene.overlays.get_mut(oi) else {
+                    return false;
+                };
+                match ov {
+                    memstroy_core::Overlay::Text(t) => {
+                        replace_or_push_keyframe(&mut t.layout, sk.t, new_t)
+                    }
+                    memstroy_core::Overlay::Image(im) => {
+                        replace_or_push_keyframe(&mut im.layout, sk.t, new_t)
+                    }
+                    memstroy_core::Overlay::Video(v) => {
+                        replace_or_push_keyframe(&mut v.layout, sk.t, new_t)
+                    }
+                }
+            }
+            crate::kf_anim::SelectedLayer::RenderFrame => {
+                replace_or_push_keyframe(&mut self.scene.render_frame.layout, sk.t, new_t)
+            }
+            crate::kf_anim::SelectedLayer::Audio(aui) => {
+                let Some(audio) = self.scene.audio.get_mut(aui) else {
+                    return false;
+                };
+                let Some(kfs) = crate::kf_anim::audio_param_kfs_mut(audio, &sk.param_id) else {
+                    return false;
+                };
+                let Some(src) = kfs.iter().find(|kf| (kf.t - sk.t).abs() < EPS).cloned() else {
+                    return false;
+                };
+                kfs.retain(|kf| (kf.t - new_t).abs() >= EPS);
+                let mut next = src;
+                next.t = new_t;
+                kfs.push(next);
+                kfs.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
+                true
+            }
+        }
     }
 
     // ─── System-clipboard image paste ───────────────────────────────
@@ -3119,7 +4065,9 @@ impl EditorState {
             filename = format!("clipboard_{}_{}.png", stamp, suffix);
             path = dir.join(&filename);
             suffix += 1;
-            if suffix > 1000 { break; }
+            if suffix > 1000 {
+                break;
+            }
         }
         let buf = image::RgbaImage::from_raw(width, height, rgba.to_vec())
             .ok_or_else(|| "failed to wrap clipboard image".to_string())?;
@@ -3135,6 +4083,11 @@ impl EditorState {
             path: path.clone(),
             label: id,
             thumbnail: Some(path),
+            downloaded: true,
+            server_id: None,
+            duration_secs: None,
+            width: Some(width),
+            height: Some(height),
         };
         // Refresh the library listing so the new file shows up on the
         // Images tab with a thumbnail.
@@ -3200,6 +4153,11 @@ impl EditorState {
             path: path.clone(),
             label: id,
             thumbnail: Some(path),
+            downloaded: true,
+            server_id: None,
+            duration_secs: None,
+            width: Some(width),
+            height: Some(height),
         };
         self.reload_library();
         Ok(asset)
@@ -3287,6 +4245,11 @@ impl EditorState {
             path: path.clone(),
             label: id,
             thumbnail: Some(path),
+            downloaded: true,
+            server_id: None,
+            duration_secs: None,
+            width: Some(width),
+            height: Some(height),
         };
         self.reload_library();
         Ok(asset)
@@ -3300,15 +4263,16 @@ impl EditorState {
         let t = self.playhead;
         let dur = self.scene.output.duration.max(0.1);
         let t_in = t;
-        let t_out = (t + 3.0).min(dur).max(t + 0.1);
+        let t_out = (t + 1.0).min(dur.max(t + 0.1)).max(t + 0.1);
         let overlay_id = unique_overlay_id(&self.scene.overlays, &asset.id);
         let source = asset.path.clone();
         let mut new_idx = 0usize;
         self.mutate_state(|s| {
             let lane = s.pick_or_create_empty_video_lane_for_range(t_in, t_out);
             new_idx = s.scene.overlays.len();
-            s.scene.overlays.push(memstroy_core::Overlay::Image(
-                memstroy_core::ImageOverlay {
+            s.scene
+                .overlays
+                .push(memstroy_core::Overlay::Image(memstroy_core::ImageOverlay {
                     id: overlay_id,
                     source,
                     t_in,
@@ -3324,14 +4288,30 @@ impl EditorState {
                     chroma_key: None,
                     z_order: 0,
                     parent_id: None,
-                },
-            ));
+                }));
             s.overlay_track_assignments.insert(new_idx, lane);
             s.selection = Selection::Overlay(new_idx);
             s.canvas_selection.clear();
         });
         new_idx
     }
+}
+
+fn replace_or_push_keyframe<T: Clone>(
+    layout: &mut Vec<memstroy_core::Keyframe<T>>,
+    old_t: f32,
+    new_t: f32,
+) -> bool {
+    const EPS: f32 = 1.0e-3;
+    let Some(src) = layout.iter().find(|kf| (kf.t - old_t).abs() < EPS).cloned() else {
+        return false;
+    };
+    layout.retain(|kf| (kf.t - new_t).abs() >= EPS);
+    let mut next = src;
+    next.t = new_t;
+    layout.push(next);
+    layout.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
+    true
 }
 
 fn unique_actor_id(actors: &[memstroy_core::Actor], base: &str) -> String {
@@ -3416,10 +4396,9 @@ impl AssetCategory {
                 lower.as_str(),
                 "mp3" | "wav" | "ogg" | "flac" | "aac" | "m4a" | "opus"
             ),
-            AssetCategory::Image | AssetCategory::Particle => matches!(
-                lower.as_str(),
-                "png" | "jpg" | "jpeg" | "webp" | "gif"
-            ),
+            AssetCategory::Image | AssetCategory::Particle => {
+                matches!(lower.as_str(), "png" | "jpg" | "jpeg" | "webp" | "gif")
+            }
             AssetCategory::Video => matches!(
                 lower.as_str(),
                 "mp4" | "mov" | "webm" | "avi" | "mkv" | "m4v"
@@ -3439,13 +4418,19 @@ fn scan_asset_dir(dir: &std::path::Path, category: AssetCategory) -> Vec<Library
     let mut out: Vec<LibraryAsset> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.is_file() { continue; }
-        let ext = path.extension()
+        if !path.is_file() {
+            continue;
+        }
+        let ext = path
+            .extension()
             .and_then(|e| e.to_str())
             .map(str::to_ascii_lowercase)
             .unwrap_or_default();
-        if ext.is_empty() || !category.is_supported(&ext) { continue; }
-        let id = path.file_stem()
+        if ext.is_empty() || !category.is_supported(&ext) {
+            continue;
+        }
+        let id = path
+            .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("asset")
             .to_string();
@@ -3470,7 +4455,11 @@ fn scan_asset_dir(dir: &std::path::Path, category: AssetCategory) -> Vec<Library
         let label = match std::fs::read_to_string(&txt_path) {
             Ok(s) => {
                 let trimmed = s.trim().to_string();
-                if trimmed.is_empty() { id.clone() } else { trimmed }
+                if trimmed.is_empty() {
+                    id.clone()
+                } else {
+                    trimmed
+                }
             }
             Err(_) => id.clone(),
         };
@@ -3479,10 +4468,36 @@ fn scan_asset_dir(dir: &std::path::Path, category: AssetCategory) -> Vec<Library
             path: path.clone(),
             label,
             thumbnail,
+            downloaded: true,
+            server_id: None,
+            duration_secs: None,
+            width: None,
+            height: None,
         });
     }
-    out.sort_by(|a, b| a.label.to_ascii_lowercase().cmp(&b.label.to_ascii_lowercase()));
+    out.sort_by(|a, b| {
+        a.label
+            .to_ascii_lowercase()
+            .cmp(&b.label.to_ascii_lowercase())
+    });
     out
+}
+
+fn stable_hash_u64(raw: &str) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    raw.hash(&mut h);
+    h.finish()
+}
+
+fn non_empty_ext(raw: &str) -> Option<&str> {
+    let ext = raw.trim().trim_start_matches('.');
+    (!ext.is_empty()
+        && ext
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+    .then_some(ext)
 }
 
 /// Inexpensive `(file_count, latest_mtime_unix_secs)` summary of a
@@ -3537,7 +4552,6 @@ fn check_ffmpeg() -> bool {
         .stderr(std::process::Stdio::null());
     memstroy_render::hide_console_std(&mut cmd).status().is_ok()
 }
-
 
 // ─── CANVAS INTERACTION STATE ────────────────────────────────────────
 
@@ -3755,7 +4769,9 @@ pub enum MaskTool {
 
 impl MaskTool {
     #[allow(dead_code)]
-    pub fn is_active(self) -> bool { self != MaskTool::None }
+    pub fn is_active(self) -> bool {
+        self != MaskTool::None
+    }
     pub fn label(self) -> &'static str {
         match self {
             MaskTool::None => "Select",
@@ -3797,13 +4813,22 @@ pub enum CanvasDragMode {
     None,
     /// Move the selected actor in canvas world-pixel space.
     /// `initial_pos` is the actor's world-pixel centre at drag start.
-    MoveActorWorld { actor_idx: usize, initial_pos: [f32; 2] },
+    MoveActorWorld {
+        actor_idx: usize,
+        initial_pos: [f32; 2],
+    },
     /// Move the selected actor using the legacy normalised layout track.
     /// `initial_pos` is the element's world-pixel centre at drag start.
-    MoveActorLegacy { actor_idx: usize, initial_pos: [f32; 2] },
+    MoveActorLegacy {
+        actor_idx: usize,
+        initial_pos: [f32; 2],
+    },
     /// Move the selected overlay. `initial_pos` is the world-pixel centre
     /// at drag start (after parent transforms).
-    MoveOverlay { overlay_idx: usize, initial_pos: [f32; 2] },
+    MoveOverlay {
+        overlay_idx: usize,
+        initial_pos: [f32; 2],
+    },
     /// Resize the selected element using a specific handle. The element is
     /// anchored at the opposite handle so it stretches in the direction of
     /// the drag. `handle` is 0..3 = corners (TL,TR,BR,BL), 4..7 = edges
@@ -3821,7 +4846,10 @@ pub enum CanvasDragMode {
     /// Move the render frame in world space.
     MoveRenderFrame { initial_pos: [f32; 2] },
     /// Resize (zoom) the render frame.
-    ResizeRenderFrame { initial_zoom: f32, anchor_distance: f32 },
+    ResizeRenderFrame {
+        initial_zoom: f32,
+        anchor_distance: f32,
+    },
     /// Active rubber-band (marquee) selection. The user pressed the
     /// primary button on an empty area of the canvas and is dragging to
     /// lasso multiple elements at once. World-pixel coordinates of the
@@ -3832,10 +4860,7 @@ pub enum CanvasDragMode {
     /// `extend` is set when the user held Ctrl/Shift/Cmd at drag-start
     /// — on commit, the lasso ADDS to the existing `canvas_selection`
     /// instead of replacing it.
-    Marquee {
-        start_world: [f32; 2],
-        extend: bool,
-    },
+    Marquee { start_world: [f32; 2], extend: bool },
     /// Rotate the selected element around its centre. `start_angle_rad`
     /// is the angle from element-centre to pointer at drag start (radians).
     /// `initial_rot_deg` is the element's rotation at drag start.
@@ -3863,8 +4888,8 @@ pub enum CanvasDragMode {
 
 #[cfg(test)]
 mod video_header_tests {
-    use std::io::Write;
     use super::EditorState;
+    use std::io::Write;
 
     /// `video_file_has_valid_header` must not read the whole file —
     /// only the first 512 bytes.  We create a 1 MiB file with a valid
@@ -3872,10 +4897,7 @@ mod video_header_tests {
     /// returns true without blocking on the full contents.
     #[test]
     fn large_mp4_header_sniff_ok() {
-        let mut tmp = tempfile::Builder::new()
-            .suffix(".mp4")
-            .tempfile()
-            .unwrap();
+        let mut tmp = tempfile::Builder::new().suffix(".mp4").tempfile().unwrap();
         let mut data = vec![0u8; 1024 * 1024]; // 1 MiB
         data[0..8].copy_from_slice(b"\x00\x00\x00\x08ftyp");
         std::io::Write::write_all(&mut tmp, &data).unwrap();
@@ -3888,15 +4910,180 @@ mod video_header_tests {
     /// JPEG disguised as `.mp4` must be rejected.
     #[test]
     fn jpeg_masquerading_as_mp4_rejected() {
-        let mut tmp = tempfile::Builder::new()
-            .suffix(".mp4")
-            .tempfile()
-            .unwrap();
+        let mut tmp = tempfile::Builder::new().suffix(".mp4").tempfile().unwrap();
         let data = b"\xFF\xD8\xFF\xE0\x00\x10JFIF";
         std::io::Write::write_all(&mut tmp, data).unwrap();
         tmp.flush().unwrap();
         let path = tmp.path();
         let ok = EditorState::is_usable_local_video(path);
         assert!(!ok, "JPEG header must be rejected even with .mp4 extension");
+    }
+}
+
+#[cfg(test)]
+mod timeline_lane_tests {
+    use std::{collections::BTreeSet, path::PathBuf};
+
+    use memstroy_core::{
+        Actor, ActorState, AudioTrack, ChromaKeyParams, ColorCorrection, Keyframe, Transition,
+    };
+
+    use super::{EditorState, Selection, Track, TrackKind};
+    use crate::kf_anim::{SelectedKeyframe, SelectedLayer};
+
+    fn test_actor(id: &str, t_in: f32, t_out: f32) -> Actor {
+        Actor {
+            id: id.to_string(),
+            source: PathBuf::from(format!("{id}.mp4")),
+            anchors: None,
+            chroma_key: ChromaKeyParams::default(),
+            layout: vec![Keyframe::new(0.0, ActorState::default())],
+            t_in: Some(t_in),
+            t_out: Some(t_out),
+            source_start: 0.0,
+            loop_source: false,
+            flip_horizontal: false,
+            attachments: Vec::new(),
+            skeleton_attachments: Vec::new(),
+            modifiers: Vec::new(),
+            visible: true,
+            color_correction: ColorCorrection::default(),
+            transition_in: Transition::default(),
+            transition_out: Transition::default(),
+            transition_duration: 0.3,
+            effects: Vec::new(),
+            speed: 1.0,
+            animated_params: BTreeSet::new(),
+            z_order: 0,
+            parent_id: None,
+            mellstroy_footage: Default::default(),
+            mute_audio: false,
+        }
+    }
+
+    fn test_audio(id: &str, t_in: f32, t_out: f32) -> AudioTrack {
+        let mut audio = AudioTrack::default();
+        audio.id = id.to_string();
+        audio.source = PathBuf::from(format!("{id}.wav"));
+        audio.t_in = t_in;
+        audio.t_out = Some(t_out);
+        audio
+    }
+
+    #[test]
+    fn sanitize_orders_and_renumbers_tracks_after_load_like_state() {
+        let mut state = EditorState::new();
+        state.tracks = vec![
+            Track::video("V3"),
+            Track::audio("A9"),
+            Track::video("V1"),
+            Track::audio("A3"),
+        ];
+        state.selected_track = Some(2);
+
+        state.sanitize_track_assignments();
+
+        assert_eq!(
+            state
+                .tracks
+                .iter()
+                .map(|t| t.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["V1", "V2", "A1", "A2"]
+        );
+        assert_eq!(
+            state.tracks.iter().map(|t| t.kind).collect::<Vec<_>>(),
+            vec![
+                TrackKind::Video,
+                TrackKind::Video,
+                TrackKind::Audio,
+                TrackKind::Audio
+            ]
+        );
+        assert_eq!(state.selected_track, Some(1));
+    }
+
+    #[test]
+    fn nearest_empty_video_lane_prefers_closest_free_row() {
+        let mut state = EditorState::new();
+        state.scene.actors.push(test_actor("busy", 0.0, 10.0));
+        state.actor_track_assignments.insert(0, 1);
+
+        assert_eq!(
+            state.find_nearest_empty_video_lane_for_range(2.0, 3.0, Some(1)),
+            Some(0)
+        );
+        assert_eq!(
+            state.find_nearest_empty_video_lane_for_range(10.0, 11.0, Some(1)),
+            Some(1),
+            "touching the previous clip end is not an overlap"
+        );
+    }
+
+    #[test]
+    fn nearest_empty_audio_lane_mirrors_video_and_creates_at_audio_top() {
+        let mut state = EditorState::new();
+        state.scene.audio.push(test_audio("a0", 0.0, 10.0));
+        state.audio_track_assignments.insert(0, 3);
+
+        assert_eq!(
+            state.find_nearest_empty_audio_lane_for_range(2.0, 3.0, Some(3)),
+            Some(4)
+        );
+
+        state.scene.audio.push(test_audio("a1", 0.0, 10.0));
+        state.audio_track_assignments.insert(1, 4);
+        let created = state.pick_or_create_nearest_empty_audio_lane_for_range(2.0, 3.0, Some(3));
+
+        assert_eq!(created, 3);
+        assert_eq!(state.tracks[3].name, "A1");
+        assert_eq!(state.audio_track_assignments.get(&0), Some(&4));
+        assert_eq!(state.audio_track_assignments.get(&1), Some(&5));
+    }
+
+    #[test]
+    fn paste_multi_selection_places_each_copy_sequentially() {
+        let mut state = EditorState::new();
+        state.scene.actors.push(test_actor("one", 0.0, 1.0));
+        state.scene.actors.push(test_actor("two", 0.0, 1.0));
+        state.actor_track_assignments.insert(0, 0);
+        state.actor_track_assignments.insert(1, 0);
+        state.canvas_selection = vec![Selection::Actor(0), Selection::Actor(1)];
+        state.playhead = 5.0;
+
+        assert_eq!(state.copy_selection_to_clipboard(), 2);
+        assert_eq!(state.paste_clipboard(), 2);
+
+        assert_eq!(state.scene.actors[2].t_in, Some(5.0));
+        assert_eq!(state.scene.actors[3].t_in, Some(5.0));
+        assert_eq!(state.actor_track_assignments.get(&2), Some(&0));
+        assert_eq!(state.actor_track_assignments.get(&3), Some(&1));
+    }
+
+    #[test]
+    fn keyframe_clipboard_pastes_selected_keyframes_at_playhead() {
+        let mut state = EditorState::new();
+        let mut actor = test_actor("kf", 0.0, 10.0);
+        let mut value = ActorState::default();
+        value.scale = 2.5;
+        actor.layout.push(Keyframe::new(2.0, value));
+        state.scene.actors.push(actor);
+        state.selected_keyframes = vec![SelectedKeyframe {
+            layer: SelectedLayer::Actor(0),
+            param_id: "scale".to_string(),
+            t: 2.0,
+        }];
+        state.playhead = 5.0;
+
+        assert_eq!(state.copy_selected_keyframes_to_clipboard(), 1);
+        assert_eq!(state.paste_keyframes_from_clipboard(), 1);
+
+        let pasted = state.scene.actors[0]
+            .layout
+            .iter()
+            .find(|kf| (kf.t - 5.0).abs() < 1.0e-3)
+            .expect("pasted keyframe at playhead");
+        assert_eq!(pasted.value.scale, 2.5);
+        assert_eq!(state.clipboard.len(), 0);
     }
 }

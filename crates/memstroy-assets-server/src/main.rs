@@ -1,8 +1,7 @@
 //! Binary entry point for `memstroy-assets-server`.
 //!
-//! Parses CLI args, builds the [`AssetStore`], walks the asset root
-//! once, logs how many entries were found per kind, and then runs the
-//! axum server until it returns.
+//! Parses CLI args, builds the [`AssetStore`], indexes the persistent
+//! asset root once, and then runs the axum server until it returns.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -30,30 +29,12 @@ struct Cli {
     /// Missing subdirectories are created on start-up.
     ///
     /// On Railway this should point at a mounted volume so the
-    /// scraped asset library survives container restarts (e.g.
-    /// `--root /data/assets`).
+    /// asset library survives container restarts (e.g. `--root /data/assets`).
     #[arg(long)]
     root: Option<PathBuf>,
-
-    /// Telegram channel to scrape automatically on startup, right
-    /// after the cleanup + initial index. Pairs with the startup
-    /// cleanup: cleanup wipes the old library, auto-ingest immediately
-    /// repopulates it with fresh clips. If omitted (and
-    /// `MEMSTROY_INGEST_CHANNEL` is also unset), auto-ingest is
-    /// skipped and the server boots with whatever survived cleanup —
-    /// the `POST /api/ingest/tg` endpoint still works for manual
-    /// invocations.
-    #[arg(long)]
-    ingest_channel: Option<String>,
-
-    /// How many recent clips the auto-ingest job should fetch.
-    /// Matches the default used by `POST /api/ingest/tg`. The env
-    /// fallback is `MEMSTROY_INGEST_LIMIT`.
-    #[arg(long)]
-    ingest_limit: Option<u32>,
 }
 
-#[tokio::main(worker_threads = 2)]
+#[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
@@ -80,11 +61,10 @@ async fn main() -> Result<()> {
     tokio::fs::create_dir_all(&root)
         .await
         .with_context(|| format!("creating asset root {}", root.display()))?;
-
-    // Auto-cleanup on startup to free disk space (critical for 500MB Railway volume)
-    tracing::info!("Running startup cleanup to free disk space...");
-    if let Err(e) = cleanup_old_clips(&root).await {
-        tracing::warn!(error = %e, "startup cleanup failed, continuing anyway");
+    for kind in memstroy_assets_server::AssetKind::ALL {
+        tokio::fs::create_dir_all(root.join(kind.subdir()))
+            .await
+            .with_context(|| format!("creating {} directory", kind.subdir()))?;
     }
 
     let store = AssetStore::new();
@@ -94,61 +74,10 @@ async fn main() -> Result<()> {
         tracing::info!(kind = ?kind, count, "indexed");
     }
 
-    // Kick off the Telegram ingest job on startup if a channel is
-    // configured. Pairs with the startup cleanup above: cleanup
-    // intentionally wipes the old library on every boot, and this
-    // immediately starts pulling fresh clips so the server is useful
-    // again as quickly as possible. The ingest task runs in the
-    // background — it does not block the HTTP server from coming up,
-    // and the store is re-indexed by the task itself when downloads
-    // finish.
-    let ingest_channel = cli
-        .ingest_channel
-        .or_else(|| std::env::var("MEMSTROY_INGEST_CHANNEL").ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    let ingest_limit = cli
-        .ingest_limit
-        .or_else(|| {
-            std::env::var("MEMSTROY_INGEST_LIMIT")
-                .ok()
-                .and_then(|s| s.parse::<u32>().ok())
-        })
-        .unwrap_or(10);
-
-    match ingest_channel {
-        Some(channel) => {
-            tracing::info!(
-                channel = %channel,
-                limit = ingest_limit,
-                "auto-ingest: scheduling Telegram scrape on startup",
-            );
-            memstroy_assets_server::ingest::spawn_tg_ingest(
-                store.clone(),
-                channel,
-                ingest_limit,
-            );
-        }
-        None => {
-            tracing::info!(
-                "auto-ingest: no channel configured \
-                 (set --ingest-channel or MEMSTROY_INGEST_CHANNEL to enable); \
-                 manual POST /api/ingest/tg still works",
-            );
-        }
-    }
-
-    tracing::info!(
-        "Server optimized for low-memory environments (500MB RAM):\n\
-         - File streaming enabled for files >50MB\n\
-         - Max response limit: 500 items\n\
-         - Max ingest batch: 100 items\n\
-         - Concurrent downloads: 2\n\
-         - Worker threads: 2"
-    );
+    tracing::info!(root = %root.display(), "persistent asset volume ready");
 
     let handle = start(addr, store);
-    
+
     // Wait for Ctrl+C signal
     tokio::select! {
         result = handle => {
@@ -158,7 +87,7 @@ async fn main() -> Result<()> {
             tracing::info!("Received shutdown signal, exiting...");
         }
     }
-    
+
     Ok(())
 }
 
@@ -169,58 +98,4 @@ fn init_tracing() {
         .with_env_filter(filter)
         .with_target(false)
         .try_init();
-}
-
-/// Delete all clips and their metadata to free disk space.
-/// This runs automatically on server startup to ensure we have space for new ingests.
-async fn cleanup_old_clips(root: &PathBuf) -> Result<()> {
-    let clips_dir = root.join("clips");
-    let thumbs_dir = clips_dir.join("thumbs");
-    
-    let mut deleted_files = 0u64;
-    let mut freed_bytes = 0u64;
-    
-    // Delete all files in clips/ directory
-    if clips_dir.exists() {
-        let mut entries = tokio::fs::read_dir(&clips_dir).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
-            if path.is_file() {
-                if let Ok(metadata) = tokio::fs::metadata(&path).await {
-                    freed_bytes += metadata.len();
-                }
-                if let Err(e) = tokio::fs::remove_file(&path).await {
-                    tracing::warn!(path = %path.display(), error = %e, "failed to delete file");
-                } else {
-                    deleted_files += 1;
-                }
-            }
-        }
-    }
-    
-    // Delete all thumbnails
-    if thumbs_dir.exists() {
-        let mut entries = tokio::fs::read_dir(&thumbs_dir).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
-            if path.is_file() {
-                if let Ok(metadata) = tokio::fs::metadata(&path).await {
-                    freed_bytes += metadata.len();
-                }
-                if let Err(e) = tokio::fs::remove_file(&path).await {
-                    tracing::warn!(path = %path.display(), error = %e, "failed to delete thumbnail");
-                } else {
-                    deleted_files += 1;
-                }
-            }
-        }
-    }
-    
-    tracing::info!(
-        deleted_files,
-        freed_mb = freed_bytes / 1024 / 1024,
-        "Startup cleanup complete"
-    );
-    
-    Ok(())
 }

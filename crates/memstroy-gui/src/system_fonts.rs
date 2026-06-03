@@ -241,13 +241,13 @@ fn read_family_name(path: &PathBuf) -> Option<String> {
         if rec.name_id != ttf_parser::name_id::FAMILY {
             continue;
         }
-        let Some(name) = rec.to_string() else { continue };
+        let Some(name) = rec.to_string() else {
+            continue;
+        };
         // English (US) Microsoft = (3, 0x409) — the canonical source
         // for human-readable Windows family names. Otherwise just
         // remember the last non-empty hit and keep looking.
-        if rec.platform_id == ttf_parser::PlatformId::Windows
-            && rec.language_id == 0x0409
-        {
+        if rec.platform_id == ttf_parser::PlatformId::Windows && rec.language_id == 0x0409 {
             return Some(name);
         }
         if best.is_none() {

@@ -109,11 +109,7 @@ pub fn submit_image_fx_job(
             );
         }
 
-        let _ = tx.send(JobEvent::ImageFxReady(ImageFxResult {
-            path,
-            sig,
-            outcome,
-        }));
+        let _ = tx.send(JobEvent::ImageFxReady(ImageFxResult { path, sig, outcome }));
         // Nudge egui so the App's pump_events drain runs even when
         // the user is idle (no input -> no implicit repaint).
         ctx.request_repaint();
@@ -166,7 +162,6 @@ fn run_bake(
     })
 }
 
-
 /// Look up an effect-baked texture for `(path, effects)`, dispatching
 /// a background bake on a cache miss. Mirrors the helper that the
 /// canvas-preview path uses so secondary surfaces (e.g. the image
@@ -212,9 +207,7 @@ pub fn lookup_or_dispatch_image_fx(
         }
     }
 
-    if let (Some(handle), Some(tx)) =
-        (state.tokio_handle.as_ref(), state.image_fx_tx.as_ref())
-    {
+    if let (Some(handle), Some(tx)) = (state.tokio_handle.as_ref(), state.image_fx_tx.as_ref()) {
         submit_image_fx_job(
             handle,
             tx,

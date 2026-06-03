@@ -97,9 +97,13 @@ pub fn apply_effect_stack(
 ) -> (f32, f32, f32, f32) {
     let mut crop = (0.0_f32, 0.0_f32, 0.0_f32, 0.0_f32);
     for eff in effects {
-        if !eff.enabled { continue; }
+        if !eff.enabled {
+            continue;
+        }
         let i = eff.intensity.clamp(0.0, 1.0);
-        if i <= 0.001 { continue; }
+        if i <= 0.001 {
+            continue;
+        }
         match &eff.kind {
             EffectKind::Blur { radius } => {
                 let r = ((radius * i) as i32).max(1);
@@ -116,10 +120,12 @@ pub fn apply_effect_stack(
             }
             EffectKind::Sepia => {
                 blend_each_pixel(rgba, i, |r, g, b| {
-                    let rf = r as f32; let gf = g as f32; let bf = b as f32;
-                    let nr = (0.393*rf + 0.769*gf + 0.189*bf).clamp(0.0, 255.0) as u8;
-                    let ng = (0.349*rf + 0.686*gf + 0.168*bf).clamp(0.0, 255.0) as u8;
-                    let nb = (0.272*rf + 0.534*gf + 0.131*bf).clamp(0.0, 255.0) as u8;
+                    let rf = r as f32;
+                    let gf = g as f32;
+                    let bf = b as f32;
+                    let nr = (0.393 * rf + 0.769 * gf + 0.189 * bf).clamp(0.0, 255.0) as u8;
+                    let ng = (0.349 * rf + 0.686 * gf + 0.168 * bf).clamp(0.0, 255.0) as u8;
+                    let nb = (0.272 * rf + 0.534 * gf + 0.131 * bf).clamp(0.0, 255.0) as u8;
                     [nr, ng, nb]
                 });
             }
@@ -148,7 +154,13 @@ pub fn apply_effect_stack(
                 });
             }
             EffectKind::Glow { radius, intensity } => {
-                glow_or_bloom(rgba, w, h, ((radius * i) as i32).max(1), (intensity * i).clamp(0.0, 2.0));
+                glow_or_bloom(
+                    rgba,
+                    w,
+                    h,
+                    ((radius * i) as i32).max(1),
+                    (intensity * i).clamp(0.0, 2.0),
+                );
             }
             EffectKind::Bloom { radius } => {
                 glow_or_bloom(rgba, w, h, ((radius * i) as i32).max(1), 0.6 * i);
@@ -156,9 +168,7 @@ pub fn apply_effect_stack(
             EffectKind::Brightness { amount } => {
                 let factor = 1.0 + (amount * i);
                 blend_each_pixel(rgba, i, |r, g, b| {
-                    let s = |c: u8| -> u8 {
-                        ((c as f32 * factor).clamp(0.0, 255.0)) as u8
-                    };
+                    let s = |c: u8| -> u8 { ((c as f32 * factor).clamp(0.0, 255.0)) as u8 };
                     [s(r), s(g), s(b)]
                 });
             }
@@ -192,16 +202,21 @@ pub fn apply_effect_stack(
             EffectKind::Noise { amount } => {
                 noise(rgba, w, h, (amount * i).clamp(0.0, 1.0));
             }
-            EffectKind::Wave { amplitude, wavelength } => {
+            EffectKind::Wave {
+                amplitude,
+                wavelength,
+            } => {
                 wave(rgba, w, h, amplitude * i, wavelength.max(1.0));
             }
             EffectKind::OldFilm => {
                 // Sepia + grain + gentle vignette as a single preset.
                 blend_each_pixel(rgba, i, |r, g, b| {
-                    let rf = r as f32; let gf = g as f32; let bf = b as f32;
-                    let nr = (0.393*rf + 0.769*gf + 0.189*bf).clamp(0.0, 255.0) as u8;
-                    let ng = (0.349*rf + 0.686*gf + 0.168*bf).clamp(0.0, 255.0) as u8;
-                    let nb = (0.272*rf + 0.534*gf + 0.131*bf).clamp(0.0, 255.0) as u8;
+                    let rf = r as f32;
+                    let gf = g as f32;
+                    let bf = b as f32;
+                    let nr = (0.393 * rf + 0.769 * gf + 0.189 * bf).clamp(0.0, 255.0) as u8;
+                    let ng = (0.349 * rf + 0.686 * gf + 0.168 * bf).clamp(0.0, 255.0) as u8;
+                    let nb = (0.272 * rf + 0.534 * gf + 0.131 * bf).clamp(0.0, 255.0) as u8;
                     [nr, ng, nb]
                 });
                 noise(rgba, w, h, 0.15 * i);
@@ -214,7 +229,12 @@ pub fn apply_effect_stack(
             EffectKind::Glitch { strength } => {
                 glitch(rgba, w, h, (strength * i).clamp(0.0, 1.0));
             }
-            EffectKind::Crop { left, top, right, bottom } => {
+            EffectKind::Crop {
+                left,
+                top,
+                right,
+                bottom,
+            } => {
                 let l = (left * i).clamp(0.0, 0.49);
                 let t = (top * i).clamp(0.0, 0.49);
                 let r = (right * i).clamp(0.0, 0.49);
@@ -224,10 +244,20 @@ pub fn apply_effect_stack(
                 crop.2 = (crop.2 + r).min(0.49);
                 crop.3 = (crop.3 + b).min(0.49);
             }
-            EffectKind::Mask { shape, feather, invert } => {
+            EffectKind::Mask {
+                shape,
+                feather,
+                invert,
+            } => {
                 apply_mask_alpha(rgba, w, h, shape, *feather, *invert, i);
             }
-            EffectKind::ColorKey { color, similarity, blend, spill, invert } => {
+            EffectKind::ColorKey {
+                color,
+                similarity,
+                blend,
+                spill,
+                invert,
+            } => {
                 apply_color_key_alpha(rgba, w, h, *color, *similarity, *blend, *spill, *invert, i);
             }
         }
@@ -242,47 +272,131 @@ pub fn signature(effects: &[Effect]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     for eff in effects {
-        if !eff.enabled { continue; }
+        if !eff.enabled {
+            continue;
+        }
         let i = (eff.intensity * 1000.0) as i32;
         i.hash(&mut h);
         match &eff.kind {
-            EffectKind::Blur { radius } => { 1u8.hash(&mut h); ((radius * 100.0) as i32).hash(&mut h); }
-            EffectKind::Sharpen { amount } => { 2u8.hash(&mut h); ((amount * 100.0) as i32).hash(&mut h); }
-            EffectKind::Grayscale => { 3u8.hash(&mut h); }
-            EffectKind::Sepia => { 4u8.hash(&mut h); }
-            EffectKind::Invert => { 5u8.hash(&mut h); }
-            EffectKind::HueShift { degrees } => { 6u8.hash(&mut h); ((degrees * 10.0) as i32).hash(&mut h); }
-            EffectKind::Vignette { strength } => { 7u8.hash(&mut h); ((strength * 100.0) as i32).hash(&mut h); }
-            EffectKind::Pixelate { block_size } => { 8u8.hash(&mut h); ((block_size * 10.0) as i32).hash(&mut h); }
-            EffectKind::Posterize { levels } => { 9u8.hash(&mut h); levels.hash(&mut h); }
-            EffectKind::Glow { radius, intensity } => { 10u8.hash(&mut h); ((radius * 10.0) as i32).hash(&mut h); ((intensity * 100.0) as i32).hash(&mut h); }
-            EffectKind::Brightness { amount } => { 11u8.hash(&mut h); ((amount * 100.0) as i32).hash(&mut h); }
-            EffectKind::Contrast { amount } => { 12u8.hash(&mut h); ((amount * 100.0) as i32).hash(&mut h); }
-            EffectKind::Saturation { amount } => { 13u8.hash(&mut h); ((amount * 100.0) as i32).hash(&mut h); }
-            EffectKind::EdgeDetect { threshold } => { 14u8.hash(&mut h); ((threshold * 100.0) as i32).hash(&mut h); }
-            EffectKind::MirrorH => { 15u8.hash(&mut h); }
-            EffectKind::MirrorV => { 16u8.hash(&mut h); }
-            EffectKind::ChromaticAberration { offset } => { 17u8.hash(&mut h); ((offset * 10.0) as i32).hash(&mut h); }
-            EffectKind::Noise { amount } => { 18u8.hash(&mut h); ((amount * 100.0) as i32).hash(&mut h); }
-            EffectKind::Wave { amplitude, wavelength } => { 19u8.hash(&mut h); ((amplitude * 10.0) as i32).hash(&mut h); ((wavelength * 10.0) as i32).hash(&mut h); }
-            EffectKind::OldFilm => { 20u8.hash(&mut h); }
-            EffectKind::Vhs => { 21u8.hash(&mut h); }
-            EffectKind::Glitch { strength } => { 22u8.hash(&mut h); ((strength * 100.0) as i32).hash(&mut h); }
-            EffectKind::Bloom { radius } => { 23u8.hash(&mut h); ((radius * 10.0) as i32).hash(&mut h); }
-            EffectKind::Crop { left, top, right, bottom } => {
+            EffectKind::Blur { radius } => {
+                1u8.hash(&mut h);
+                ((radius * 100.0) as i32).hash(&mut h);
+            }
+            EffectKind::Sharpen { amount } => {
+                2u8.hash(&mut h);
+                ((amount * 100.0) as i32).hash(&mut h);
+            }
+            EffectKind::Grayscale => {
+                3u8.hash(&mut h);
+            }
+            EffectKind::Sepia => {
+                4u8.hash(&mut h);
+            }
+            EffectKind::Invert => {
+                5u8.hash(&mut h);
+            }
+            EffectKind::HueShift { degrees } => {
+                6u8.hash(&mut h);
+                ((degrees * 10.0) as i32).hash(&mut h);
+            }
+            EffectKind::Vignette { strength } => {
+                7u8.hash(&mut h);
+                ((strength * 100.0) as i32).hash(&mut h);
+            }
+            EffectKind::Pixelate { block_size } => {
+                8u8.hash(&mut h);
+                ((block_size * 10.0) as i32).hash(&mut h);
+            }
+            EffectKind::Posterize { levels } => {
+                9u8.hash(&mut h);
+                levels.hash(&mut h);
+            }
+            EffectKind::Glow { radius, intensity } => {
+                10u8.hash(&mut h);
+                ((radius * 10.0) as i32).hash(&mut h);
+                ((intensity * 100.0) as i32).hash(&mut h);
+            }
+            EffectKind::Brightness { amount } => {
+                11u8.hash(&mut h);
+                ((amount * 100.0) as i32).hash(&mut h);
+            }
+            EffectKind::Contrast { amount } => {
+                12u8.hash(&mut h);
+                ((amount * 100.0) as i32).hash(&mut h);
+            }
+            EffectKind::Saturation { amount } => {
+                13u8.hash(&mut h);
+                ((amount * 100.0) as i32).hash(&mut h);
+            }
+            EffectKind::EdgeDetect { threshold } => {
+                14u8.hash(&mut h);
+                ((threshold * 100.0) as i32).hash(&mut h);
+            }
+            EffectKind::MirrorH => {
+                15u8.hash(&mut h);
+            }
+            EffectKind::MirrorV => {
+                16u8.hash(&mut h);
+            }
+            EffectKind::ChromaticAberration { offset } => {
+                17u8.hash(&mut h);
+                ((offset * 10.0) as i32).hash(&mut h);
+            }
+            EffectKind::Noise { amount } => {
+                18u8.hash(&mut h);
+                ((amount * 100.0) as i32).hash(&mut h);
+            }
+            EffectKind::Wave {
+                amplitude,
+                wavelength,
+            } => {
+                19u8.hash(&mut h);
+                ((amplitude * 10.0) as i32).hash(&mut h);
+                ((wavelength * 10.0) as i32).hash(&mut h);
+            }
+            EffectKind::OldFilm => {
+                20u8.hash(&mut h);
+            }
+            EffectKind::Vhs => {
+                21u8.hash(&mut h);
+            }
+            EffectKind::Glitch { strength } => {
+                22u8.hash(&mut h);
+                ((strength * 100.0) as i32).hash(&mut h);
+            }
+            EffectKind::Bloom { radius } => {
+                23u8.hash(&mut h);
+                ((radius * 10.0) as i32).hash(&mut h);
+            }
+            EffectKind::Crop {
+                left,
+                top,
+                right,
+                bottom,
+            } => {
                 24u8.hash(&mut h);
                 ((left * 1000.0) as i32).hash(&mut h);
                 ((top * 1000.0) as i32).hash(&mut h);
                 ((right * 1000.0) as i32).hash(&mut h);
                 ((bottom * 1000.0) as i32).hash(&mut h);
             }
-            EffectKind::Mask { shape, feather, invert } => {
+            EffectKind::Mask {
+                shape,
+                feather,
+                invert,
+            } => {
                 25u8.hash(&mut h);
                 ((feather * 1000.0) as i32).hash(&mut h);
                 invert.hash(&mut h);
                 hash_mask_shape(shape, &mut h);
             }
-            EffectKind::ColorKey { color, similarity, blend, spill, invert } => {
+            EffectKind::ColorKey {
+                color,
+                similarity,
+                blend,
+                spill,
+                invert,
+            } => {
                 26u8.hash(&mut h);
                 color.hash(&mut h);
                 ((similarity * 1000.0) as i32).hash(&mut h);
@@ -300,7 +414,12 @@ fn hash_mask_shape<H: std::hash::Hasher>(shape: &MaskShape, h: &mut H) {
     use std::hash::Hash;
     std::mem::discriminant(shape).hash(h);
     match shape {
-        MaskShape::Rect { left, top, right, bottom } => {
+        MaskShape::Rect {
+            left,
+            top,
+            right,
+            bottom,
+        } => {
             ((left * 1000.0) as i32).hash(h);
             ((top * 1000.0) as i32).hash(h);
             ((right * 1000.0) as i32).hash(h);
@@ -335,7 +454,9 @@ fn apply_mask_alpha(
     invert: bool,
     intensity: f32,
 ) {
-    if rgba.len() < (w as usize) * (h as usize) * 4 { return; }
+    if rgba.len() < (w as usize) * (h as usize) * 4 {
+        return;
+    }
     let i = intensity.clamp(0.0, 1.0);
     let feather = feather.clamp(0.0, 0.5);
     let inv_w = 1.0 / (w as f32).max(1.0);
@@ -373,7 +494,11 @@ pub(crate) fn sample_mask_alpha(
     if feather <= 1e-6 {
         keep = if margin >= 0.0 { 1.0 } else { 0.0 };
     }
-    if invert { 1.0 - keep } else { keep }
+    if invert {
+        1.0 - keep
+    } else {
+        keep
+    }
 }
 
 // ─── COLOUR-KEY MASK (eyedropper) ─────────────────────────────────────
@@ -404,14 +529,24 @@ pub(crate) fn apply_color_key_alpha(
     invert: bool,
     intensity: f32,
 ) {
-    if rgba.len() < (w as usize) * (h as usize) * 4 { return; }
+    if rgba.len() < (w as usize) * (h as usize) * 4 {
+        return;
+    }
     let i = intensity.clamp(0.0, 1.0);
     // Mirror `chromakey_filter`'s "disabled below 1e-5" rule so a
     // dialed-down ColorKey effect renders identically on both the
     // preview and the export — the export emits a no-op `null`
     // filter on that threshold, so the preview must do nothing too.
-    let similarity = if similarity.is_finite() { similarity.clamp(0.0, 1.0) } else { 0.0 };
-    let blend = if blend.is_finite() { blend.clamp(0.0, 1.0) } else { 0.0 };
+    let similarity = if similarity.is_finite() {
+        similarity.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let blend = if blend.is_finite() {
+        blend.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
     if similarity < 1.0e-5 && !invert {
         return;
     }
@@ -419,7 +554,7 @@ pub(crate) fn apply_color_key_alpha(
     let kg = key_color[1] as f32;
     let kb = key_color[2] as f32;
     let key_cb = -0.169 * kr - 0.331 * kg + 0.500 * kb + 128.0;
-    let key_cr =  0.500 * kr - 0.419 * kg - 0.081 * kb + 128.0;
+    let key_cr = 0.500 * kr - 0.419 * kg - 0.081 * kb + 128.0;
     let dist_norm = 255.0 * std::f32::consts::SQRT_2;
     let total = (w as usize) * (h as usize);
     for px in 0..total {
@@ -428,7 +563,7 @@ pub(crate) fn apply_color_key_alpha(
         let g = rgba[idx + 1] as f32;
         let b = rgba[idx + 2] as f32;
         let cb = -0.169 * r - 0.331 * g + 0.500 * b + 128.0;
-        let cr =  0.500 * r - 0.419 * g - 0.081 * b + 128.0;
+        let cr = 0.500 * r - 0.419 * g - 0.081 * b + 128.0;
         let du = cb - key_cb;
         let dv = cr - key_cr;
         let diff = (du * du + dv * dv).sqrt() / dist_norm;
@@ -439,7 +574,9 @@ pub(crate) fn apply_color_key_alpha(
         } else {
             1.0
         };
-        if invert { alpha_keep = 1.0 - alpha_keep; }
+        if invert {
+            alpha_keep = 1.0 - alpha_keep;
+        }
         let orig = rgba[idx + 3] as f32;
         let target = orig * alpha_keep;
         let out = orig + (target - orig) * i;
@@ -453,15 +590,13 @@ pub(crate) fn apply_color_key_alpha(
 /// result back with `intensity`. Alpha is left untouched. Pixels that
 /// are fully transparent are skipped — they typically carry uninit
 /// colour data that would corrupt the output.
-fn blend_each_pixel<F: Fn(u8, u8, u8) -> [u8; 3]>(
-    rgba: &mut Vec<u8>,
-    intensity: f32,
-    f: F,
-) {
+fn blend_each_pixel<F: Fn(u8, u8, u8) -> [u8; 3]>(rgba: &mut Vec<u8>, intensity: f32, f: F) {
     let i = intensity.clamp(0.0, 1.0);
     let inv = 1.0 - i;
     for px in rgba.chunks_exact_mut(4) {
-        if px[3] == 0 { continue; }
+        if px[3] == 0 {
+            continue;
+        }
         let [r, g, b] = f(px[0], px[1], px[2]);
         px[0] = ((r as f32 * i) + (px[0] as f32 * inv)) as u8;
         px[1] = ((g as f32 * i) + (px[1] as f32 * inv)) as u8;
@@ -473,7 +608,9 @@ fn blend_each_pixel<F: Fn(u8, u8, u8) -> [u8; 3]>(
 /// `r <= 0`. Alpha is blurred along with the colour so the drop-shadow
 /// edges of the picture stay smooth.
 fn box_blur_rgba(rgba: &mut Vec<u8>, w: u32, h: u32, r: i32) {
-    if r <= 0 { return; }
+    if r <= 0 {
+        return;
+    }
     let w_i = w as i32;
     let h_i = h as i32;
     let mut tmp = vec![0u8; rgba.len()];
@@ -532,14 +669,22 @@ fn box_blur_rgba(rgba: &mut Vec<u8>, w: u32, h: u32, r: i32) {
 
 /// 3×3 unsharp-mask sharpen. `amount` is a master scale 0..3.
 fn sharpen(rgba: &mut Vec<u8>, w: u32, h: u32, amount: f32) {
-    if amount <= 0.001 { return; }
+    if amount <= 0.001 {
+        return;
+    }
     let w_i = w as i32;
     let h_i = h as i32;
     let src = rgba.clone();
     let kern = [
-        0.0, -amount, 0.0,
-        -amount, 1.0 + 4.0 * amount, -amount,
-        0.0, -amount, 0.0,
+        0.0,
+        -amount,
+        0.0,
+        -amount,
+        1.0 + 4.0 * amount,
+        -amount,
+        0.0,
+        -amount,
+        0.0,
     ];
     for y in 0..h_i {
         for x in 0..w_i {
@@ -571,27 +716,33 @@ fn hue_shift(rgba: &mut Vec<u8>, degrees: f32) {
     let sin_a = rad.sin();
     // Rotation matrix in YIQ-ish space (close enough for preview).
     let mr = [
-        0.213 + 0.787*cos_a - 0.213*sin_a,
-        0.715 - 0.715*cos_a - 0.715*sin_a,
-        0.072 - 0.072*cos_a + 0.928*sin_a,
+        0.213 + 0.787 * cos_a - 0.213 * sin_a,
+        0.715 - 0.715 * cos_a - 0.715 * sin_a,
+        0.072 - 0.072 * cos_a + 0.928 * sin_a,
     ];
     let mg = [
-        0.213 - 0.213*cos_a + 0.143*sin_a,
-        0.715 + 0.285*cos_a + 0.140*sin_a,
-        0.072 - 0.072*cos_a - 0.283*sin_a,
+        0.213 - 0.213 * cos_a + 0.143 * sin_a,
+        0.715 + 0.285 * cos_a + 0.140 * sin_a,
+        0.072 - 0.072 * cos_a - 0.283 * sin_a,
     ];
     let mb = [
-        0.213 - 0.213*cos_a - 0.787*sin_a,
-        0.715 - 0.715*cos_a + 0.715*sin_a,
-        0.072 + 0.928*cos_a + 0.072*sin_a,
+        0.213 - 0.213 * cos_a - 0.787 * sin_a,
+        0.715 - 0.715 * cos_a + 0.715 * sin_a,
+        0.072 + 0.928 * cos_a + 0.072 * sin_a,
     ];
     for px in rgba.chunks_exact_mut(4) {
-        if px[3] == 0 { continue; }
-        let r = px[0] as f32; let g = px[1] as f32; let b = px[2] as f32;
-        let nr = (r*mr[0] + g*mr[1] + b*mr[2]).clamp(0.0, 255.0) as u8;
-        let ng = (r*mg[0] + g*mg[1] + b*mg[2]).clamp(0.0, 255.0) as u8;
-        let nb = (r*mb[0] + g*mb[1] + b*mb[2]).clamp(0.0, 255.0) as u8;
-        px[0] = nr; px[1] = ng; px[2] = nb;
+        if px[3] == 0 {
+            continue;
+        }
+        let r = px[0] as f32;
+        let g = px[1] as f32;
+        let b = px[2] as f32;
+        let nr = (r * mr[0] + g * mr[1] + b * mr[2]).clamp(0.0, 255.0) as u8;
+        let ng = (r * mg[0] + g * mg[1] + b * mg[2]).clamp(0.0, 255.0) as u8;
+        let nb = (r * mb[0] + g * mb[1] + b * mb[2]).clamp(0.0, 255.0) as u8;
+        px[0] = nr;
+        px[1] = ng;
+        px[2] = nb;
     }
 }
 
@@ -603,7 +754,7 @@ fn vignette(rgba: &mut Vec<u8>, w: u32, h: u32, strength: f32) {
         for x in 0..w {
             let dx = x as f32 - cx;
             let dy = y as f32 - cy;
-            let d = (dx*dx + dy*dy).sqrt() / max_d;
+            let d = (dx * dx + dy * dy).sqrt() / max_d;
             // Tail off near the centre, dim toward the edges.
             let dim = (1.0 - strength * d.powi(2)).clamp(0.0, 1.0);
             let idx = ((y * w + x) as usize) * 4;
@@ -615,7 +766,9 @@ fn vignette(rgba: &mut Vec<u8>, w: u32, h: u32, strength: f32) {
 }
 
 fn pixelate(rgba: &mut Vec<u8>, w: u32, h: u32, block: u32) {
-    if block <= 1 { return; }
+    if block <= 1 {
+        return;
+    }
     let w_i = w as i32;
     let h_i = h as i32;
     let block_i = block as i32;
@@ -641,7 +794,9 @@ fn pixelate(rgba: &mut Vec<u8>, w: u32, h: u32, block: u32) {
 }
 
 fn glow_or_bloom(rgba: &mut Vec<u8>, w: u32, h: u32, radius: i32, intensity: f32) {
-    if radius <= 0 || intensity <= 0.001 { return; }
+    if radius <= 0 || intensity <= 0.001 {
+        return;
+    }
     // Bright-pass extract.
     let mut bright = rgba.clone();
     for px in bright.chunks_exact_mut(4) {
@@ -716,7 +871,9 @@ fn mirror_vertical(rgba: &mut Vec<u8>, w: u32, h: u32) {
 }
 
 fn chromatic_aberration(rgba: &mut Vec<u8>, w: u32, h: u32, offset: i32) {
-    if offset == 0 { return; }
+    if offset == 0 {
+        return;
+    }
     let w_i = w as i32;
     let h_i = h as i32;
     let src = rgba.clone();
@@ -735,7 +892,9 @@ fn chromatic_aberration(rgba: &mut Vec<u8>, w: u32, h: u32, offset: i32) {
 }
 
 fn noise(rgba: &mut Vec<u8>, w: u32, h: u32, amount: f32) {
-    if amount <= 0.001 { return; }
+    if amount <= 0.001 {
+        return;
+    }
     // Simple LCG for determinism without pulling in a rand crate.
     let mut seed: u32 = (w.wrapping_mul(73856093) ^ h.wrapping_mul(19349663)).wrapping_add(1);
     let amp = amount * 60.0;
@@ -749,7 +908,9 @@ fn noise(rgba: &mut Vec<u8>, w: u32, h: u32, amount: f32) {
 }
 
 fn wave(rgba: &mut Vec<u8>, w: u32, h: u32, amplitude: f32, wavelength: f32) {
-    if amplitude.abs() < 0.5 { return; }
+    if amplitude.abs() < 0.5 {
+        return;
+    }
     let w_i = w as i32;
     let h_i = h as i32;
     let src = rgba.clone();
@@ -768,7 +929,9 @@ fn wave(rgba: &mut Vec<u8>, w: u32, h: u32, amplitude: f32, wavelength: f32) {
 fn scanlines(rgba: &mut Vec<u8>, w: u32, h: u32, strength: f32) {
     let w_i = w as usize;
     for y in 0..h as usize {
-        if y % 2 == 0 { continue; }
+        if y % 2 == 0 {
+            continue;
+        }
         for x in 0..w_i {
             let idx = (y * w_i + x) * 4;
             let dim = 1.0 - strength;
@@ -780,7 +943,9 @@ fn scanlines(rgba: &mut Vec<u8>, w: u32, h: u32, strength: f32) {
 }
 
 fn glitch(rgba: &mut Vec<u8>, w: u32, h: u32, strength: f32) {
-    if strength <= 0.001 { return; }
+    if strength <= 0.001 {
+        return;
+    }
     let w_i = w as i32;
     let h_i = h as i32;
     let src = rgba.clone();

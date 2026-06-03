@@ -25,9 +25,8 @@ pub async fn download_videos(
     let work: Vec<(u64, String, PathBuf)> = posts
         .iter()
         .filter_map(|p| {
-            p.downloadable_video().map(|u| {
-                (p.id, u.to_string(), dir.join(format!("{}.mp4", p.id)))
-            })
+            p.downloadable_video()
+                .map(|u| (p.id, u.to_string(), dir.join(format!("{}.mp4", p.id))))
         })
         .collect();
 
@@ -146,7 +145,9 @@ pub async fn incremental_refresh(
         matching.iter().map(|p| (p.id, p)).collect();
 
     // Download sequentially from oldest to newest for predictability
-    fs::create_dir_all(clips_dir).await.context("mkdir clips dir")?;
+    fs::create_dir_all(clips_dir)
+        .await
+        .context("mkdir clips dir")?;
     let client = build_client()?;
     let mut stats = DownloadStats::default();
 
@@ -155,9 +156,8 @@ pub async fn incremental_refresh(
         .iter()
         .filter_map(|id| {
             post_by_id.get(id).and_then(|p| {
-                p.downloadable_video().map(|url| {
-                    (*id, url.to_string(), clips_dir.join(format!("{}.mp4", id)))
-                })
+                p.downloadable_video()
+                    .map(|url| (*id, url.to_string(), clips_dir.join(format!("{}.mp4", id))))
             })
         })
         .collect();
@@ -236,19 +236,16 @@ pub async fn generate_thumbnail(video: &Path, output: &Path) -> Result<()> {
     let ffmpeg = {
         let mut p = memstroy_render::ffmpeg_binary();
         p.set_file_name("ffmpeg");
-        if p.exists() { p } else { std::path::PathBuf::from("ffmpeg") }
+        if p.exists() {
+            p
+        } else {
+            std::path::PathBuf::from("ffmpeg")
+        }
     };
     let status = tokio::process::Command::new(&ffmpeg)
-        .args([
-            "-y", "-hide_banner", "-loglevel", "error",
-            "-i",
-        ])
+        .args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
         .arg(video.as_os_str())
-        .args([
-            "-frames:v", "1",
-            "-vf", "scale=160:-1",
-            "-q:v", "5",
-        ])
+        .args(["-frames:v", "1", "-vf", "scale=160:-1", "-q:v", "5"])
         .arg(output.as_os_str())
         .status()
         .await?;

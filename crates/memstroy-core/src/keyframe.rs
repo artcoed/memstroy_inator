@@ -18,7 +18,11 @@ pub struct Keyframe<T> {
 
 impl<T> Keyframe<T> {
     pub fn new(t: f32, value: T) -> Self {
-        Self { t, value, easing: Easing::default() }
+        Self {
+            t,
+            value,
+            easing: Easing::default(),
+        }
     }
 
     pub fn with_easing(mut self, e: Easing) -> Self {
@@ -72,16 +76,9 @@ pub fn sample<T: Clone + Lerp>(track: &[Keyframe<T>], t: f32) -> Option<T> {
 /// Insert a keyframe at `t`, replacing any existing keyframe within
 /// `epsilon`. Returns the index of the (possibly replaced or inserted) entry.
 /// Sorts the track by time afterwards.
-pub fn upsert_keyframe<T: Clone + Lerp>(
-    track: &mut Vec<Keyframe<T>>,
-    t: f32,
-    value: T,
-) -> usize {
-    let epsilon = 1.0e-3;
-    if let Some(pos) = track
-        .iter()
-        .position(|kf| (kf.t - t).abs() < epsilon)
-    {
+pub fn upsert_keyframe<T: Clone + Lerp>(track: &mut Vec<Keyframe<T>>, t: f32, value: T) -> usize {
+    let epsilon = 1.0 / 120.0;
+    if let Some(pos) = track.iter().position(|kf| (kf.t - t).abs() < epsilon) {
         track[pos].value = value;
         return pos;
     }
@@ -92,8 +89,6 @@ pub fn upsert_keyframe<T: Clone + Lerp>(
         .position(|kf| (kf.t - t).abs() < epsilon)
         .unwrap_or(0)
 }
-
-
 
 // ─── ANIMATION MODIFIERS ─────────────────────────────────────────────
 //
@@ -134,8 +129,12 @@ pub struct TrackModifier {
     pub param_kfs: BTreeMap<String, Vec<Keyframe<f32>>>,
 }
 
-fn default_t_end() -> f32 { f32::MAX }
-fn default_true_mod() -> bool { true }
+fn default_t_end() -> f32 {
+    f32::MAX
+}
+fn default_true_mod() -> bool {
+    true
+}
 
 impl Default for TrackModifier {
     fn default() -> Self {
@@ -239,14 +238,9 @@ pub enum ModifierKind {
     },
     /// Periodic scale breathing — adds `amp_scale * sin(2π·f·t)` on top
     /// of the sampled scale.
-    Pulse {
-        freq_hz: f32,
-        amp_scale: f32,
-    },
+    Pulse { freq_hz: f32, amp_scale: f32 },
     /// Continuous rotation at `speed_dps` degrees per second.
-    Spin {
-        speed_dps: f32,
-    },
+    Spin { speed_dps: f32 },
     /// Pendulum-style left/right rotation that imitates a walking gait —
     /// the element rocks between `-amp_deg` and `+amp_deg` at `freq_hz`
     /// cycles per second around its current rotation. Optional
@@ -298,22 +292,37 @@ impl ModifierDelta {
 pub fn evaluate_modifiers(modifiers: &[TrackModifier], t: f32) -> ModifierDelta {
     let mut out = ModifierDelta::default();
     for m in modifiers {
-        if !m.enabled { continue; }
+        if !m.enabled {
+            continue;
+        }
         // `t_end < t_start` means "always active".
         let in_window = if m.t_end < m.t_start {
             true
         } else {
             t >= m.t_start && t <= m.t_end
         };
-        if !in_window { continue; }
+        if !in_window {
+            continue;
+        }
         match m.sampled_kind(t) {
-            ModifierKind::Wobble { freq_hz, amp_x, amp_y, amp_rot_deg, phase } => {
+            ModifierKind::Wobble {
+                freq_hz,
+                amp_x,
+                amp_y,
+                amp_rot_deg,
+                phase,
+            } => {
                 let w = std::f32::consts::TAU * freq_hz * t + phase;
                 out.dx += amp_x * w.sin();
                 out.dy += amp_y * (w * 0.7).cos();
                 out.d_rotation_deg += amp_rot_deg * w.sin();
             }
-            ModifierKind::Shake { freq_hz, amp_x, amp_y, seed } => {
+            ModifierKind::Shake {
+                freq_hz,
+                amp_x,
+                amp_y,
+                seed,
+            } => {
                 // Hash-based jitter: stable per-frame at a given t/seed.
                 let phase_x = ((seed as f32) * 0.137).fract() * std::f32::consts::TAU;
                 let phase_y = ((seed as f32) * 0.731 + 1.7).fract() * std::f32::consts::TAU;
@@ -334,7 +343,12 @@ pub fn evaluate_modifiers(modifiers: &[TrackModifier], t: f32) -> ModifierDelta 
             ModifierKind::Spin { speed_dps } => {
                 out.d_rotation_deg += speed_dps * t;
             }
-            ModifierKind::Walk { freq_hz, amp_deg, bob_y, phase } => {
+            ModifierKind::Walk {
+                freq_hz,
+                amp_deg,
+                bob_y,
+                phase,
+            } => {
                 let w = std::f32::consts::TAU * freq_hz * t + phase;
                 out.d_rotation_deg += amp_deg * w.sin();
                 if bob_y.abs() > 1.0e-4 {

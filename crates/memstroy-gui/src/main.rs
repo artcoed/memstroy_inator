@@ -20,6 +20,7 @@ mod canvas_preview;
 mod curve_editor;
 mod editor_limits;
 
+mod canvas_image_search;
 mod frame_snapshot;
 mod fx_preview;
 mod gpu_preview;
@@ -31,8 +32,8 @@ mod jobs;
 mod kf_anim;
 mod panels;
 mod settings;
-mod skeleton_editor;
 mod shell_reveal;
+mod skeleton_editor;
 mod split_crop;
 mod state;
 mod system_fonts;
@@ -40,21 +41,58 @@ mod title_templates;
 mod undo;
 mod video_cache;
 mod web_image_search;
-mod canvas_image_search;
 
 use anyhow::Result;
 use tracing_subscriber::EnvFilter;
 
+#[cfg(windows)]
+struct AppMutexGuard(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl Drop for AppMutexGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn create_installer_app_mutex() -> Option<AppMutexGuard> {
+    let name: Vec<u16> = "MemstroyInatorAppMutex\0".encode_utf16().collect();
+    let handle = unsafe {
+        windows_sys::Win32::System::Threading::CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr())
+    };
+    if handle.is_null() {
+        None
+    } else {
+        Some(AppMutexGuard(handle))
+    }
+}
+
+fn graphics_mode() -> String {
+    std::env::args()
+        .find_map(|arg| {
+            arg.strip_prefix("--graphics=")
+                .map(|v| v.trim().to_ascii_lowercase())
+        })
+        .or_else(|| std::env::var("MEMSTROY_GRAPHICS").ok())
+        .map(|v| v.trim().to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
 fn main() -> Result<()> {
+    #[cfg(windows)]
+    let _installer_app_mutex = create_installer_app_mutex();
+
     let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new(
-                    // Default: app at debug, everything else at info, but
-                    // silence the symphonia container/codec parsers since they
-                    // spam "skipping junk" / "invalid mpeg audio header" warnings
-                    // for clips that simply have no decodable audio stream.
-                    "info,memstroy_gui=debug,\
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            EnvFilter::new(
+                // Default: app at debug, everything else at info, but
+                // silence the symphonia container/codec parsers since they
+                // spam "skipping junk" / "invalid mpeg audio header" warnings
+                // for clips that simply have no decodable audio stream.
+                "info,memstroy_gui=debug,\
                      symphonia=error,\
                      symphonia_core=error,\
                      symphonia_format_mp3=error,\
@@ -63,9 +101,9 @@ fn main() -> Result<()> {
                      symphonia_codec_pcm=error,\
                      symphonia_bundle_mp3=error,\
                      symphonia_bundle_flac=error,\
-                     lewton=error"
-                )),
-        )
+                     lewton=error",
+            )
+        }))
         .with_target(false)
         .try_init();
 
@@ -91,8 +129,7 @@ fn main() -> Result<()> {
         .with_inner_size([1480.0, 900.0])
         .with_min_inner_size([1100.0, 700.0])
         .with_title("Memstroy-inator");
-    const APP_ICON_PNG: &[u8] =
-        include_bytes!("../../../assets/internal_images/catost.png");
+    const APP_ICON_PNG: &[u8] = include_bytes!("../../../assets/internal_images/catost.png");
     match image::load_from_memory(APP_ICON_PNG) {
         Ok(img) => {
             let rgba = img.to_rgba8();
@@ -108,10 +145,31 @@ fn main() -> Result<()> {
         }
     }
 
-    let opts = eframe::NativeOptions {
+    let gfx = graphics_mode();
+    let mut opts = eframe::NativeOptions {
         viewport,
+        renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
+    match gfx.as_str() {
+        "safe" | "safe-graphics" | "wgpu" => {
+            opts.renderer = eframe::Renderer::Wgpu;
+            opts.wgpu_options.supported_backends = eframe::wgpu::Backends::PRIMARY;
+            opts.hardware_acceleration = eframe::HardwareAcceleration::Preferred;
+            tracing::info!("graphics mode: WGPU safe path");
+        }
+        "software" | "soft" => {
+            opts.renderer = eframe::Renderer::Glow;
+            opts.hardware_acceleration = eframe::HardwareAcceleration::Off;
+            tracing::info!("graphics mode: software-preferred glow path");
+        }
+        "glow" | "" => {
+            tracing::info!("graphics mode: default glow path");
+        }
+        other => {
+            tracing::warn!("unknown graphics mode '{other}', using default glow path");
+        }
+    }
 
     eframe::run_native(
         "memstroy-gui",

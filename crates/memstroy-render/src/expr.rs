@@ -87,12 +87,7 @@ where
                 format!("({:.6}+({:.6})*({u})*({u}))", v0, v1 - v0, u = u)
             }
             Easing::EaseOut => {
-                format!(
-                    "({:.6}+({:.6})*(1-(1-{u})*(1-{u})))",
-                    v0,
-                    v1 - v0,
-                    u = u,
-                )
+                format!("({:.6}+({:.6})*(1-(1-{u})*(1-{u})))", v0, v1 - v0, u = u,)
             }
             Easing::EaseInOut => {
                 format!(
@@ -114,13 +109,7 @@ where
                 )
             }
         };
-        expr = format!(
-            "if(lt({var},{:.6}),{},{})",
-            b.t,
-            segment,
-            expr,
-            var = var,
-        );
+        expr = format!("if(lt({var},{:.6}),{},{})", b.t, segment, expr, var = var,);
     }
     expr
 }
@@ -199,10 +188,18 @@ impl ModifierExpr {
             dscale: "0".into(),
         }
     }
-    pub fn dx_is_zero(&self) -> bool { self.dx == "0" }
-    pub fn dy_is_zero(&self) -> bool { self.dy == "0" }
-    pub fn drot_is_zero(&self) -> bool { self.drot_deg == "0" }
-    pub fn dscale_is_zero(&self) -> bool { self.dscale == "0" }
+    pub fn dx_is_zero(&self) -> bool {
+        self.dx == "0"
+    }
+    pub fn dy_is_zero(&self) -> bool {
+        self.dy == "0"
+    }
+    pub fn drot_is_zero(&self) -> bool {
+        self.drot_deg == "0"
+    }
+    pub fn dscale_is_zero(&self) -> bool {
+        self.dscale == "0"
+    }
 }
 
 /// Build the modifier offset expressions in clip-local time `t - t_in`.
@@ -235,10 +232,7 @@ pub(crate) fn build_modifier_expr(modifiers: &[TrackModifier], t_in: f32) -> Mod
                 amp_rot_deg,
                 phase,
             } => {
-                let omega = format!(
-                    "(2*PI*{:.6}*{}+{:.6})",
-                    freq_hz, local, phase,
-                );
+                let omega = format!("(2*PI*{:.6}*{}+{:.6})", freq_hz, local, phase,);
                 if amp_x.abs() > 1e-6 {
                     push(&mut dx, format!("({:.6})*sin({})", amp_x, omega));
                 }
@@ -246,10 +240,7 @@ pub(crate) fn build_modifier_expr(modifiers: &[TrackModifier], t_in: f32) -> Mod
                     push(&mut dy, format!("({:.6})*cos({}*0.7)", amp_y, omega));
                 }
                 if amp_rot_deg.abs() > 1e-6 {
-                    push(
-                        &mut drot,
-                        format!("({:.6})*sin({})", amp_rot_deg, omega),
-                    );
+                    push(&mut drot, format!("({:.6})*sin({})", amp_rot_deg, omega));
                 }
             }
             ModifierKind::Shake {
@@ -262,10 +253,8 @@ pub(crate) fn build_modifier_expr(modifiers: &[TrackModifier], t_in: f32) -> Mod
                 // (`evaluate_modifiers` in keyframe.rs). We hash the
                 // seed to a phase so two Shake instances with
                 // different seeds don't produce identical jitter.
-                let phase_x =
-                    ((seed as f32) * 0.137).fract() * std::f32::consts::TAU;
-                let phase_y =
-                    ((seed as f32) * 0.731 + 1.7).fract() * std::f32::consts::TAU;
+                let phase_x = ((seed as f32) * 0.137).fract() * std::f32::consts::TAU;
+                let phase_y = ((seed as f32) * 0.731 + 1.7).fract() * std::f32::consts::TAU;
                 let w = format!("(2*PI*{:.6}*{})", freq_hz, local);
                 let nx = format!(
                     "(sin(({w})+{px:.6})+0.5*sin(({w})*2.13+{px:.6})+0.25*sin(({w})*4.27+{px:.6}))",
@@ -287,10 +276,7 @@ pub(crate) fn build_modifier_expr(modifiers: &[TrackModifier], t_in: f32) -> Mod
             ModifierKind::Pulse { freq_hz, amp_scale } => {
                 if amp_scale.abs() > 1e-6 {
                     let omega = format!("(2*PI*{:.6}*{})", freq_hz, local);
-                    push(
-                        &mut dscale,
-                        format!("({:.6})*sin({})", amp_scale, omega),
-                    );
+                    push(&mut dscale, format!("({:.6})*sin({})", amp_scale, omega));
                 }
             }
             ModifierKind::Spin { speed_dps } => {
@@ -304,10 +290,7 @@ pub(crate) fn build_modifier_expr(modifiers: &[TrackModifier], t_in: f32) -> Mod
                 bob_y,
                 phase,
             } => {
-                let omega = format!(
-                    "(2*PI*{:.6}*{}+{:.6})",
-                    freq_hz, local, phase,
-                );
+                let omega = format!("(2*PI*{:.6}*{}+{:.6})", freq_hz, local, phase,);
                 if amp_deg.abs() > 1e-6 {
                     push(&mut drot, format!("({:.6})*sin({})", amp_deg, omega));
                 }
@@ -326,7 +309,11 @@ pub(crate) fn build_modifier_expr(modifiers: &[TrackModifier], t_in: f32) -> Mod
         dx: if dx.is_empty() { "0".into() } else { dx },
         dy: if dy.is_empty() { "0".into() } else { dy },
         drot_deg: if drot.is_empty() { "0".into() } else { drot },
-        dscale: if dscale.is_empty() { "0".into() } else { dscale },
+        dscale: if dscale.is_empty() {
+            "0".into()
+        } else {
+            dscale
+        },
     }
 }
 
@@ -344,22 +331,50 @@ pub(crate) trait PositionedState {
     fn flip_y_anim(&self) -> f32;
 }
 impl PositionedState for ActorState {
-    fn pos(&self) -> [f32; 2] { self.pos }
-    fn scale(&self) -> f32 { self.scale }
-    fn scale_y(&self) -> f32 { self.scale_y }
-    fn rotation_deg(&self) -> f32 { self.rotation_deg }
-    fn opacity(&self) -> f32 { self.opacity }
-    fn flip_x_anim(&self) -> f32 { self.flip_x_anim }
-    fn flip_y_anim(&self) -> f32 { self.flip_y_anim }
+    fn pos(&self) -> [f32; 2] {
+        self.pos
+    }
+    fn scale(&self) -> f32 {
+        self.scale
+    }
+    fn scale_y(&self) -> f32 {
+        self.scale_y
+    }
+    fn rotation_deg(&self) -> f32 {
+        self.rotation_deg
+    }
+    fn opacity(&self) -> f32 {
+        self.opacity
+    }
+    fn flip_x_anim(&self) -> f32 {
+        self.flip_x_anim
+    }
+    fn flip_y_anim(&self) -> f32 {
+        self.flip_y_anim
+    }
 }
 impl PositionedState for OverlayState {
-    fn pos(&self) -> [f32; 2] { self.pos }
-    fn scale(&self) -> f32 { self.scale }
-    fn scale_y(&self) -> f32 { self.scale_y }
-    fn rotation_deg(&self) -> f32 { self.rotation_deg }
-    fn opacity(&self) -> f32 { self.opacity }
-    fn flip_x_anim(&self) -> f32 { self.flip_x_anim }
-    fn flip_y_anim(&self) -> f32 { self.flip_y_anim }
+    fn pos(&self) -> [f32; 2] {
+        self.pos
+    }
+    fn scale(&self) -> f32 {
+        self.scale
+    }
+    fn scale_y(&self) -> f32 {
+        self.scale_y
+    }
+    fn rotation_deg(&self) -> f32 {
+        self.rotation_deg
+    }
+    fn opacity(&self) -> f32 {
+        self.opacity
+    }
+    fn flip_x_anim(&self) -> f32 {
+        self.flip_x_anim
+    }
+    fn flip_y_anim(&self) -> f32 {
+        self.flip_y_anim
+    }
 }
 
 /// Per-element transform expressions ready to plug into ffmpeg.
@@ -404,7 +419,6 @@ pub(crate) struct ElementTransform {
     pub vflip: bool,
 }
 
-
 struct ParentTransformExpr {
     x: String,
     y: String,
@@ -414,26 +428,49 @@ struct ParentTransformExpr {
 }
 
 fn expr_add(a: String, b: String) -> String {
-    if b == "0" { a } else if a == "0" { b } else { format!("(({})+({}))", a, b) }
+    if b == "0" {
+        a
+    } else if a == "0" {
+        b
+    } else {
+        format!("(({})+({}))", a, b)
+    }
 }
 
 fn expr_mul(a: String, b: String) -> String {
-    if a == "1" { b } else if b == "1" { a } else { format!("(({})*({}))", a, b) }
+    if a == "1" {
+        b
+    } else if b == "1" {
+        a
+    } else {
+        format!("(({})*({}))", a, b)
+    }
 }
 
 fn expr_scale_add(base: String, delta: String) -> String {
-    if delta == "0" { base } else { format!("(({})+({}))", base, delta) }
+    if delta == "0" {
+        base
+    } else {
+        format!("(({})+({}))", base, delta)
+    }
 }
 
-fn canvas_transform_expr(scene: &Scene, element_id: &str) -> Option<(String, String, String, String)> {
-    scene.canvas_layouts.iter().find(|cl| cl.element_id == element_id).map(|cl| {
-        (
-            piecewise(&cl.keyframes, |t: &CanvasTransform| t.pos.x),
-            piecewise(&cl.keyframes, |t: &CanvasTransform| t.pos.y),
-            piecewise(&cl.keyframes, |t: &CanvasTransform| t.rotation_deg),
-            piecewise(&cl.keyframes, |t: &CanvasTransform| t.scale),
-        )
-    })
+fn canvas_transform_expr(
+    scene: &Scene,
+    element_id: &str,
+) -> Option<(String, String, String, String)> {
+    scene
+        .canvas_layouts
+        .iter()
+        .find(|cl| cl.element_id == element_id)
+        .map(|cl| {
+            (
+                piecewise(&cl.keyframes, |t: &CanvasTransform| t.pos.x),
+                piecewise(&cl.keyframes, |t: &CanvasTransform| t.pos.y),
+                piecewise(&cl.keyframes, |t: &CanvasTransform| t.rotation_deg),
+                piecewise(&cl.keyframes, |t: &CanvasTransform| t.scale),
+            )
+        })
 }
 
 fn apply_parent_expr(x: String, y: String, parent: &ParentTransformExpr) -> (String, String) {
@@ -442,12 +479,22 @@ fn apply_parent_expr(x: String, y: String, parent: &ParentTransformExpr) -> (Str
     let theta = format!("(({})*PI/180)", parent.rot_deg);
     let cos_t = format!("cos({})", theta);
     let sin_t = format!("sin({})", theta);
-    let wx = format!("(({})+(({})*({})-({})*({})))", parent.x, sx, cos_t, sy, sin_t);
-    let wy = format!("(({})+(({})*({})+({})*({})))", parent.y, sx, sin_t, sy, cos_t);
+    let wx = format!(
+        "(({})+(({})*({})-({})*({})))",
+        parent.x, sx, cos_t, sy, sin_t
+    );
+    let wy = format!(
+        "(({})+(({})*({})+({})*({})))",
+        parent.y, sx, sin_t, sy, cos_t
+    );
     (wx, wy)
 }
 
-fn parent_transform_expr(scene: &Scene, parent_id: &str, visited: &mut Vec<String>) -> Option<ParentTransformExpr> {
+fn parent_transform_expr(
+    scene: &Scene,
+    parent_id: &str,
+    visited: &mut Vec<String>,
+) -> Option<ParentTransformExpr> {
     if visited.iter().any(|id| id == parent_id) {
         return None;
     }
@@ -456,31 +503,64 @@ fn parent_transform_expr(scene: &Scene, parent_id: &str, visited: &mut Vec<Strin
     if parent_id == "__render_frame__" {
         let rf = &scene.render_frame;
         let mods = build_modifier_expr(&rf.modifiers, 0.0);
-        let x = expr_add(piecewise(&rf.layout, |s: &RenderFrameState| s.pos.x), mods.dx);
-        let y = expr_add(piecewise(&rf.layout, |s: &RenderFrameState| s.pos.y), mods.dy);
-        let rot_deg = expr_add(piecewise(&rf.layout, |s: &RenderFrameState| s.rotation_deg), mods.drot_deg);
-        return Some(ParentTransformExpr { x, y, rot_deg, scale_x: "1".into(), scale_y: "1".into() });
+        let x = expr_add(
+            piecewise(&rf.layout, |s: &RenderFrameState| s.pos.x),
+            mods.dx,
+        );
+        let y = expr_add(
+            piecewise(&rf.layout, |s: &RenderFrameState| s.pos.y),
+            mods.dy,
+        );
+        let rot_deg = expr_add(
+            piecewise(&rf.layout, |s: &RenderFrameState| s.rotation_deg),
+            mods.drot_deg,
+        );
+        return Some(ParentTransformExpr {
+            x,
+            y,
+            rot_deg,
+            scale_x: "1".into(),
+            scale_y: "1".into(),
+        });
     }
 
     let [out_w, out_h] = scene.output.resolution;
     let mut out = if let Some(actor) = scene.actors.iter().find(|a| a.id == parent_id) {
         let mods = build_modifier_expr(&actor.modifiers, actor.t_in.unwrap_or(0.0));
-        let (x, y, rot_deg, scale_x) = if let Some((cx, cy, crot, cscale)) = canvas_transform_expr(scene, &actor.id) {
-            (cx, cy, crot, cscale)
-        } else {
-            (
-                format!("(({px})*{w:.4})", px = piecewise(&actor.layout, |s: &ActorState| s.pos[0]), w = out_w as f32),
-                format!("(({py})*{h:.4})", py = piecewise(&actor.layout, |s: &ActorState| s.pos[1]), h = out_h as f32),
-                piecewise(&actor.layout, |s: &ActorState| s.rotation_deg),
-                piecewise(&actor.layout, |s: &ActorState| s.scale),
-            )
-        };
+        let (x, y, rot_deg, scale_x) =
+            if let Some((cx, cy, crot, cscale)) = canvas_transform_expr(scene, &actor.id) {
+                (cx, cy, crot, cscale)
+            } else {
+                (
+                    format!(
+                        "(({px})*{w:.4})",
+                        px = piecewise(&actor.layout, |s: &ActorState| s.pos[0]),
+                        w = out_w as f32
+                    ),
+                    format!(
+                        "(({py})*{h:.4})",
+                        py = piecewise(&actor.layout, |s: &ActorState| s.pos[1]),
+                        h = out_h as f32
+                    ),
+                    piecewise(&actor.layout, |s: &ActorState| s.rotation_deg),
+                    piecewise(&actor.layout, |s: &ActorState| s.scale),
+                )
+            };
         let x = expr_add(x, mods.dx);
         let y = expr_add(y, mods.dy);
         let rot_deg = expr_add(rot_deg, mods.drot_deg);
         let scale_x = expr_scale_add(scale_x, mods.dscale);
-        let scale_y = expr_mul(scale_x.clone(), piecewise(&actor.layout, |s: &ActorState| s.scale_y));
-        ParentTransformExpr { x, y, rot_deg, scale_x, scale_y }
+        let scale_y = expr_mul(
+            scale_x.clone(),
+            piecewise(&actor.layout, |s: &ActorState| s.scale_y),
+        );
+        ParentTransformExpr {
+            x,
+            y,
+            rot_deg,
+            scale_x,
+            scale_y,
+        }
     } else if let Some(ov) = scene.overlays.iter().find(|ov| match ov {
         Overlay::Text(o) => o.id == parent_id,
         Overlay::Image(o) => o.id == parent_id,
@@ -493,22 +573,40 @@ fn parent_transform_expr(scene: &Scene, parent_id: &str, visited: &mut Vec<Strin
         };
         let base = LayoutTimeBase::ClipLocal { t_in };
         let mods = build_modifier_expr(modifiers, t_in);
-        let (x, y, rot_deg, scale_x) = if let Some((cx, cy, crot, cscale)) = canvas_transform_expr(scene, id) {
-            (cx, cy, crot, cscale)
-        } else {
-            (
-                format!("(({px})*{w:.4})", px = piecewise_layout(layout, |s: &OverlayState| s.pos[0], base), w = out_w as f32),
-                format!("(({py})*{h:.4})", py = piecewise_layout(layout, |s: &OverlayState| s.pos[1], base), h = out_h as f32),
-                piecewise_layout(layout, |s: &OverlayState| s.rotation_deg, base),
-                piecewise_layout(layout, |s: &OverlayState| s.scale, base),
-            )
-        };
+        let (x, y, rot_deg, scale_x) =
+            if let Some((cx, cy, crot, cscale)) = canvas_transform_expr(scene, id) {
+                (cx, cy, crot, cscale)
+            } else {
+                (
+                    format!(
+                        "(({px})*{w:.4})",
+                        px = piecewise_layout(layout, |s: &OverlayState| s.pos[0], base),
+                        w = out_w as f32
+                    ),
+                    format!(
+                        "(({py})*{h:.4})",
+                        py = piecewise_layout(layout, |s: &OverlayState| s.pos[1], base),
+                        h = out_h as f32
+                    ),
+                    piecewise_layout(layout, |s: &OverlayState| s.rotation_deg, base),
+                    piecewise_layout(layout, |s: &OverlayState| s.scale, base),
+                )
+            };
         let x = expr_add(x, mods.dx);
         let y = expr_add(y, mods.dy);
         let rot_deg = expr_add(rot_deg, mods.drot_deg);
         let scale_x = expr_scale_add(scale_x, mods.dscale);
-        let scale_y = expr_mul(scale_x.clone(), piecewise_layout(layout, |s: &OverlayState| s.scale_y, base));
-        ParentTransformExpr { x, y, rot_deg, scale_x, scale_y }
+        let scale_y = expr_mul(
+            scale_x.clone(),
+            piecewise_layout(layout, |s: &OverlayState| s.scale_y, base),
+        );
+        ParentTransformExpr {
+            x,
+            y,
+            rot_deg,
+            scale_x,
+            scale_y,
+        }
     } else {
         return None;
     };
@@ -634,10 +732,7 @@ where
     let rf_zoom_eased = if rf_mods.dscale_is_zero() {
         rf_zoom_kf.clone()
     } else {
-        format!(
-            "(({})/(max(0.001,1+({}))))",
-            rf_zoom_kf, rf_mods.dscale,
-        )
+        format!("(({})/(max(0.001,1+({}))))", rf_zoom_kf, rf_mods.dscale,)
     };
 
     // Detect whether the rf camera is the static identity transform
@@ -660,8 +755,8 @@ where
         .canvas_layouts
         .iter()
         .find(|cl| cl.element_id == element_id);
-    let skeleton_world = skeleton_attachment
-        .and_then(|att| resolve_skeleton_attachment_world(scene, att));
+    let skeleton_world =
+        skeleton_attachment.and_then(|att| resolve_skeleton_attachment_world(scene, att));
     let (world_x, world_y) = if let Some((sx, sy)) = skeleton_world {
         // Skeleton override fully replaces the world position — same
         // semantics as `canvas_preview::resolve_overlay_attachment_world`,
@@ -713,8 +808,9 @@ where
         format!("(({})+({}))", world_y, mods.dy)
     };
 
-    let parent_expr = scene.element_parent_id(element_id)
-        .and_then(|parent_id| parent_transform_expr(scene, parent_id, &mut vec![element_id.to_string()]));
+    let parent_expr = scene.element_parent_id(element_id).and_then(|parent_id| {
+        parent_transform_expr(scene, parent_id, &mut vec![element_id.to_string()])
+    });
     let (world_x, world_y) = if let Some(parent) = parent_expr.as_ref() {
         apply_parent_expr(world_x, world_y, parent)
     } else {
@@ -831,11 +927,15 @@ where
     // Plus `-rf.rotation_deg` so the element counter-rotates with the
     // un-rotated rf, mirroring `frame_snapshot`'s
     // `rotation_rad = (layout.rotation_deg - rf_state.rotation_deg).to_radians()`.
-    let rot_deg_layout = piecewise_layout(legacy_layout, |s: &S| s.rotation_deg(), layout_time_base);
+    let rot_deg_layout =
+        piecewise_layout(legacy_layout, |s: &S| s.rotation_deg(), layout_time_base);
     let layout_has_rot = legacy_layout
         .iter()
         .any(|kf| kf.value.rotation_deg().abs() > 0.05);
-    let parent_has_rot = parent_expr.as_ref().map(|p| p.rot_deg != "0").unwrap_or(false);
+    let parent_has_rot = parent_expr
+        .as_ref()
+        .map(|p| p.rot_deg != "0")
+        .unwrap_or(false);
     let rot_expr = if layout_has_rot || !mods.drot_is_zero() || parent_has_rot || !rf_rot_is_zero {
         let elem_rot_deg = if mods.drot_is_zero() {
             rot_deg_layout
@@ -892,8 +992,11 @@ where
     let opacity_animated = legacy_layout
         .windows(2)
         .any(|w| (w[0].value.opacity() - w[1].value.opacity()).abs() > 1e-3);
-    let opacity_expr_t =
-        piecewise_in_var(legacy_layout, |s: &S| s.opacity().clamp(0.0, 1.0), &layout_time_base.geq_var());
+    let opacity_expr_t = piecewise_in_var(
+        legacy_layout,
+        |s: &S| s.opacity().clamp(0.0, 1.0),
+        &layout_time_base.geq_var(),
+    );
 
     // ── Flip — static midpoint sample, same fallback the preview's
     //    canvas mesh path uses for the dominant side of an animation.
@@ -951,10 +1054,7 @@ pub(crate) fn color_correction_filters(
     let mut out = Vec::new();
     let mut eq_parts: Vec<String> = Vec::new();
     if cc.brightness.abs() > 1e-4 {
-        eq_parts.push(format!(
-            "brightness={:.4}",
-            cc.brightness.clamp(-1.0, 1.0),
-        ));
+        eq_parts.push(format!("brightness={:.4}", cc.brightness.clamp(-1.0, 1.0),));
     }
     if (cc.contrast - 1.0).abs() > 1e-4 {
         eq_parts.push(format!("contrast={:.4}", cc.contrast.max(0.0)));
@@ -972,10 +1072,7 @@ pub(crate) fn color_correction_filters(
         // `canvas_preview.rs`). 0.5× felt right in side-by-side
         // matching against the preview thumbnail.
         let t = cc.temperature.clamp(-1.0, 1.0) * 0.5;
-        out.push(format!(
-            "colorbalance=rs={:.4}:bs={:.4}",
-            t, -t,
-        ));
+        out.push(format!("colorbalance=rs={:.4}:bs={:.4}", t, -t,));
     }
 
     // ── Lift / Gain / Gamma per RGB channel ──────────────────────────
@@ -1068,7 +1165,6 @@ pub(crate) fn color_correction_filters(
     out
 }
 
-
 /// Whether a tone curve is the identity `(0,0)–(1,1)` line. Mirrors
 /// the private check in `memstroy_core::scene` so we can skip
 /// emitting a `curves=` filter for unchanged channels.
@@ -1145,8 +1241,16 @@ pub(crate) fn resolve_skeleton_attachment_world(
     // Normalised point coords with the attachment offset baked in.
     let nx_kf = piecewise(&point.track, |p: &memstroy_core::skeleton::PointState| p.x);
     let ny_kf = piecewise(&point.track, |p: &memstroy_core::skeleton::PointState| p.y);
-    let nx = format!("(({nx})+({off:.6})-0.5)", nx = nx_kf, off = attachment.offset[0]);
-    let ny = format!("(({ny})+({off:.6})-0.5)", ny = ny_kf, off = attachment.offset[1]);
+    let nx = format!(
+        "(({nx})+({off:.6})-0.5)",
+        nx = nx_kf,
+        off = attachment.offset[0]
+    );
+    let ny = format!(
+        "(({ny})+({off:.6})-0.5)",
+        ny = ny_kf,
+        off = attachment.offset[1]
+    );
 
     // Local-space pixel offset from the host's centre.
     let local_x = format!(
@@ -1222,8 +1326,7 @@ fn find_skeleton_template<'a>(
 /// but the asset lives under a new `assets_root`.
 fn find_host_actor<'a>(scene: &'a Scene, template: &SkeletonTemplate) -> Option<&'a Actor> {
     scene.actors.iter().find(|a| {
-        a.source == template.source_clip
-            || a.source.file_name() == template.source_clip.file_name()
+        a.source == template.source_clip || a.source.file_name() == template.source_clip.file_name()
     })
 }
 
@@ -1236,7 +1339,11 @@ fn find_host_actor<'a>(scene: &'a Scene, template: &SkeletonTemplate) -> Option<
 fn host_world_pos(scene: &Scene, host: &Actor) -> (String, String) {
     let [out_w, out_h] = scene.output.resolution;
 
-    if let Some(cl) = scene.canvas_layouts.iter().find(|cl| cl.element_id == host.id) {
+    if let Some(cl) = scene
+        .canvas_layouts
+        .iter()
+        .find(|cl| cl.element_id == host.id)
+    {
         return (
             piecewise(&cl.keyframes, |t: &CanvasTransform| t.pos.x),
             piecewise(&cl.keyframes, |t: &CanvasTransform| t.pos.y),
@@ -1470,10 +1577,7 @@ mod tests {
         eff.animated_params.insert("intensity".into());
         eff.param_kfs.insert(
             "intensity".into(),
-            vec![
-                Keyframe::new(0.0, 0.0_f32),
-                Keyframe::new(1.0, 1.0_f32),
-            ],
+            vec![Keyframe::new(0.0, 0.0_f32), Keyframe::new(1.0, 1.0_f32)],
         );
         let chain = effect_animated_filter_chain(&eff, 0.0, 1.0, dummy_filter).unwrap();
         assert!(chain.contains(":enable='between(t,"));

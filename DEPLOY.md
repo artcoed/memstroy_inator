@@ -1,8 +1,10 @@
 # Deploying memstroy-assets-server to Railway
 
-The shared assets server is a small axum-based HTTP service that serves
-clips / images / sounds / particles to any number of Memstroy editors.
-It's designed to run on a single host and stream assets on demand.
+The shared assets server is an axum-based HTTP service that serves
+clips / videos / images / sounds / particles / text resources to Memstroy
+editors. It is designed for Railway with a persistent Volume: admins upload
+resources into `/data/assets`, the server re-indexes immediately, and users
+can search and stream assets on demand.
 
 ## Build configuration
 
@@ -13,7 +15,7 @@ The project uses **conditional compilation** to optimize build times:
   
 - **Client distribution** (`scripts/package-client.ps1`): Builds GUI **without**
   the assets-server dependency using `--no-default-features`. This excludes
-  heavy dependencies like `axum`, `tower-http`, and `scraper`, cutting build
+  heavy dependencies like `axum` and `tower-http`, cutting build
   time roughly in half and reducing binary size.
   
 - **Railway deployment**: Only builds `memstroy-assets-server` binary via
@@ -25,7 +27,7 @@ The project uses **conditional compilation** to optimize build times:
 2. **Add a persistent Volume:**
    - Settings → Volumes → New Volume
    - Mount path: `/data`
-   - Size: 5–20 GB depending on how many clips you plan to scrape
+   - Size: 20+ GB depending on the expected video library size
 3. **Set environment variables** (Settings → Variables):
    - `RUST_LOG` = `info,memstroy_assets_server=info`
    - `ASSETS_ROOT` = `/data/assets` (already in railway.toml as default)
@@ -35,47 +37,45 @@ The project uses **conditional compilation** to optimize build times:
    - **Note**: Only the server package is built on Railway. The `-p memstroy-assets-server`
      flag is required because the workspace's `default-members` excludes the server package
      to speed up local client builds.
-   - **Auto-cleanup**: Server automatically deletes all old clips on startup to free disk space
 5. **Configure a public domain** (Settings → Networking → Generate domain)
    so the editor clients can reach the server.
-
-## Automatic cleanup on startup
-
-**IMPORTANT**: The server now automatically deletes all clips and thumbnails on every startup
-to free disk space. This is critical for Railway's 500MB disk limit.
-
-- On startup, all files in `/data/assets/clips/` and `/data/assets/clips/thumbs/` are deleted
-- This frees space for fresh ingests from Telegram
-- After cleanup, run a fresh ingest to populate with new clips
-
-## Manual cleanup endpoint
-
-If you need to free space without restarting:
-
-```bash
-curl -X POST https://your-app.up.railway.app/api/cleanup
-```
-
-Response:
-```json
-{
-  "success": true,
-  "deleted_files": 150,
-  "freed_bytes": 450000000,
-  "freed_mb": 429
-}
-```
-
 
 ## Endpoint summary
 
 - `GET /api/health` — health check (used by Railway's healthcheck)
-- `GET /api/assets?kind=clip&limit=100&offset=0` — list assets (paginated)
+- `GET /api/assets?kind=clip&limit=100&offset=0&q=query` — list assets with paginated fuzzy search
 - `GET /api/assets/:id` — full asset record (path, mime, etc.)
 - `GET /api/assets/:id/preview` — thumbnail bytes (if available)
 - `GET /api/assets/:id/download` — full asset bytes (lazy download)
 - `GET /api/assets/:id/text` — text sidecar bytes
-- `POST /api/ingest/tg` — kick a Telegram channel ingest (body: `{"channel": "name", "limit": 500}`)
+- `POST /api/admin/assets` — admin resource upload via `multipart/form-data`
+
+## Admin upload contract
+
+`POST /api/admin/assets` accepts:
+
+- `kind`: one of `clip`, `video`, `image`, `sound`, `particle`, `text`
+- `asset`: primary file. For clips/videos this is the video file.
+- `description`: free-form text sidecar. For clips this is the clip description.
+- `id`: optional stable id. If omitted, the server derives it from the filename.
+- `label`: optional display name.
+- `tags`: optional comma- or newline-separated tags.
+- `thumbnail`: optional `png`, `jpg`, `jpeg`, or `webp` preview.
+
+If `ADMIN_TOKEN` is set in Railway variables, calls must include either
+`Authorization: Bearer <token>` or `X-Admin-Token: <token>`.
+
+Example:
+
+```bash
+curl -X POST https://your-app.up.railway.app/api/admin/assets \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -F kind=clip \
+  -F description="Funny clip description" \
+  -F tags="meme,short" \
+  -F asset=@clip.mp4 \
+  -F thumbnail=@clip.jpg
+```
 
 ## Editor client configuration
 
@@ -93,10 +93,9 @@ MEMSTROY_DEFAULT_SERVER_URL=https://my-app.up.railway.app cargo build --release 
 ## Resource sizing
 
 The server is mostly disk-bound:
-- ~50 MB RAM at idle
-- 1 GB tier is enough for development; bump to 2 GB if you ingest
-  large channels (>1000 clips) frequently
-- Disk: each clip is ~5–20 MB; budget accordingly on the volume
+- Assets are streamed from disk; downloads do not buffer entire videos in RAM.
+- The in-memory index stores metadata only.
+- Disk: each clip is commonly 5–50 MB; size the Railway Volume for the catalogue.
 
 ## Local testing of the deploy build
 

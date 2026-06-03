@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum AnchorPoint {
     Nose,
-    Head,           // synthesized centre between eyes/nose
+    Head, // synthesized centre between eyes/nose
     LeftEye,
     RightEye,
     LeftEar,

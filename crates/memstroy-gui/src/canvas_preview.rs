@@ -7,7 +7,7 @@ use egui::{Color32, Pos2, Rect, Rounding, Sense, Stroke, Vec2};
 use memstroy_core::*;
 use std::collections::HashSet;
 
-use crate::state::{EditorState, Selection, TrackKind};
+use crate::state::{CanvasDragMode, EditorState, MaskTool, Selection, TrackKind};
 
 // ─── COLORS ──────────────────────────────────────────────────────────
 
@@ -28,7 +28,6 @@ const COL_ROTATION_HANDLE: Color32 = Color32::from_rgb(120, 220, 255);
 /// hit-tests don't overlap.
 const ROTATION_HANDLE_OFFSET: f32 = 28.0;
 const ROTATION_HANDLE_RADIUS: f32 = 7.0;
-
 
 // ─── LAYER ORDER HELPERS ─────────────────────────────────────────────
 //
@@ -92,7 +91,6 @@ fn overlay_is_behind_actors(state: &EditorState, overlay_idx: usize) -> bool {
     })
 }
 
-
 // ─── MAIN ENTRY POINT ────────────────────────────────────────────────
 
 /// Render the free canvas preview panel.
@@ -122,24 +120,32 @@ pub fn canvas_preview(ui: &mut egui::Ui, state: &mut EditorState) {
     //    selected actor's preview frame and writes it to the actor's
     //    chroma_key.key_color. We handle this BEFORE the regular drag/click
     //    pipeline so it pre-empts selection and gizmo interactions.
-    if state.eyedropper_active && response.clicked() {
-        if let Some(click_pos) = response.interact_pointer_pos() {
-            handle_eyedropper_click(ui, state, full_rect, viewport_size, click_pos);
+    if state.eyedropper_active {
+        if let Some(p) = ui.input(|i| i.pointer.hover_pos()) {
+            if chroma_eyedropper_can_sample(state, full_rect, viewport_size, p) {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+            } else {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::NotAllowed);
+            }
         }
-        // The click is consumed regardless of success — the user expects
-        // one click to either commit or exit eyedropper mode.
-        state.eyedropper_active = false;
-        return;
+        if response.clicked() {
+            if let Some(click_pos) = response.interact_pointer_pos() {
+                if chroma_eyedropper_can_sample(state, full_rect, viewport_size, click_pos) {
+                    handle_eyedropper_click(ui, state, full_rect, viewport_size, click_pos);
+                } else {
+                    state.status =
+                        crate::i18n::t("Eyedropper: click on the selected image.").into();
+                }
+            }
+            // The click is consumed regardless of success — the user expects
+            // one click to either commit or exit eyedropper mode.
+            state.eyedropper_active = false;
+            return;
+        }
     }
 
     // ── RMB drag on empty canvas → image selection frame ──
-    handle_canvas_image_search_rmb_input(
-        ui,
-        &response,
-        state,
-        full_rect,
-        viewport_size,
-    );
+    handle_canvas_image_search_rmb_input(ui, &response, state, full_rect, viewport_size);
 
     // ── Handle pan/zoom input ──
     handle_canvas_input(ui, &response, state, viewport_size, full_rect);
@@ -205,12 +211,7 @@ pub fn canvas_preview(ui: &mut egui::Ui, state: &mut EditorState) {
     draw_canvas_marquee(&painter, full_rect, state, viewport_size);
 
     // ── Canvas image-search selection frames (RMB drag) ──
-    crate::canvas_image_search::draw_selection_frames(
-        &painter,
-        full_rect,
-        state,
-        viewport_size,
-    );
+    crate::canvas_image_search::draw_selection_frames(&painter, full_rect, state, viewport_size);
 
     // ── Mask / crop drawing preview overlay (drawn last so the
     //    in-progress shape sits on top of every gizmo). Visual only;
@@ -222,12 +223,7 @@ pub fn canvas_preview(ui: &mut egui::Ui, state: &mut EditorState) {
     handle_canvas_asset_drag(ui, state, full_rect, viewport_size);
 
     // ── Inline canvas image search UI (text field + carousel) ──
-    crate::canvas_image_search::show_canvas_search_ui(
-        ui.ctx(),
-        state,
-        full_rect,
-        viewport_size,
-    );
+    crate::canvas_image_search::show_canvas_search_ui(ui.ctx(), state, full_rect, viewport_size);
 }
 
 /// When the eyedropper is armed and the user clicks on the preview, sample
@@ -251,8 +247,30 @@ fn handle_eyedropper_click(
             handle_eyedropper_click_overlay(ui, state, full_rect, viewport_size, click_pos, idx);
         }
         _ => {
-            state.status = crate::i18n::t("Eyedropper: select an actor or image overlay first.").into();
+            state.status =
+                crate::i18n::t("Eyedropper: select an actor or image overlay first.").into();
         }
+    }
+}
+
+fn chroma_eyedropper_can_sample(
+    state: &EditorState,
+    full_rect: Rect,
+    viewport_size: [f32; 2],
+    pos: Pos2,
+) -> bool {
+    match state.selection {
+        Selection::Actor(idx) => {
+            actor_screen_rect(state, full_rect, viewport_size, idx).is_some_and(|r| r.contains(pos))
+        }
+        Selection::Overlay(idx) => {
+            if !matches!(state.scene.overlays.get(idx), Some(Overlay::Image(_))) {
+                return false;
+            }
+            selected_element_screen_rect(state, full_rect, viewport_size)
+                .is_some_and(|r| r.contains(pos))
+        }
+        _ => false,
     }
 }
 
@@ -318,12 +336,19 @@ fn handle_eyedropper_click_actor(
             let src = state.scene.actors[idx].source.clone();
             let chroma = state.scene.actors[idx].chroma_key.clone();
             let _ = chroma.save_alongside_clip(&src);
-            state.status = format!("{} #{:02X}{:02X}{:02X}", crate::i18n::t("Picked chroma key"), key[0], key[1], key[2]);
+            state.status = format!(
+                "{} #{:02X}{:02X}{:02X}",
+                crate::i18n::t("Picked chroma key"),
+                key[0],
+                key[1],
+                key[2]
+            );
             ui.ctx().request_repaint();
             return;
         }
     }
-    state.status = crate::i18n::t("Eyedropper: frame not yet decoded — try again in a moment.").into();
+    state.status =
+        crate::i18n::t("Eyedropper: frame not yet decoded — try again in a moment.").into();
 }
 
 /// Eyedropper handler for image overlays. Loads the source image
@@ -348,9 +373,10 @@ fn handle_eyedropper_click_overlay(
     let path = match &state.scene.overlays[idx] {
         Overlay::Image(im) => im.source.clone(),
         _ => {
-            state.status =
-                crate::i18n::t("Eyedropper: overlay must be an image (text / video not supported here).")
-                    .into();
+            state.status = crate::i18n::t(
+                "Eyedropper: overlay must be an image (text / video not supported here).",
+            )
+            .into();
             return;
         }
     };
@@ -402,10 +428,7 @@ fn handle_eyedropper_click_overlay(
             let pixel = rgba.get_pixel(px as u32, py as u32);
             let key = [pixel[0], pixel[1], pixel[2]];
             if let Overlay::Image(im) = &mut state.scene.overlays[idx] {
-                let mut ck = im
-                    .chroma_key
-                    .clone()
-                    .unwrap_or_default();
+                let mut ck = im.chroma_key.clone().unwrap_or_default();
                 ck.key_color = key;
                 // Default similarity is 0 in `ChromaKeyParams::default`;
                 // bump it to a sensible starting value when the user
@@ -421,12 +444,18 @@ fn handle_eyedropper_click_overlay(
             state.status = format!(
                 "{} #{:02X}{:02X}{:02X}",
                 crate::i18n::t("Picked overlay key"),
-                key[0], key[1], key[2]
+                key[0],
+                key[1],
+                key[2]
             );
             ui.ctx().request_repaint();
         }
         Err(e) => {
-            state.status = format!("{} {}", crate::i18n::t("Eyedropper: failed to read overlay image —"), e);
+            state.status = format!(
+                "{} {}",
+                crate::i18n::t("Eyedropper: failed to read overlay image —"),
+                e
+            );
         }
     }
 }
@@ -447,24 +476,31 @@ fn actor_screen_rect(
     let (src_w, src_h) = if let Some(fc) = state.frame_caches.get(idx) {
         if fc.is_ready() && fc.frame_count > 0 {
             (fc.source_width as f32, fc.source_height as f32)
-        } else { (1080.0_f32, 1920.0) }
-    } else { (1080.0_f32, 1920.0) };
+        } else {
+            (1080.0_f32, 1920.0)
+        }
+    } else {
+        (1080.0_f32, 1920.0)
+    };
 
-    let actor_state =
-        memstroy_core::sample_actor_layout(&actor.layout, &actor.animated_params, t);
+    let actor_state = memstroy_core::sample_actor_layout(&actor.layout, &actor.animated_params, t);
     let elem_w = src_w * actor_state.scale;
     let elem_h = src_h * actor_state.scale * actor_state.scale_y;
 
-    let center_screen = state.canvas_viewport.world_to_screen(world_pos, viewport_size);
+    let center_screen = state
+        .canvas_viewport
+        .world_to_screen(world_pos, viewport_size);
     let half_w = elem_w * 0.5 * state.canvas_viewport.zoom;
     let half_h = elem_h * 0.5 * state.canvas_viewport.zoom;
 
     Some(Rect::from_center_size(
-        Pos2::new(full_rect.min.x + center_screen[0], full_rect.min.y + center_screen[1]),
+        Pos2::new(
+            full_rect.min.x + center_screen[0],
+            full_rect.min.y + center_screen[1],
+        ),
         Vec2::new(half_w * 2.0, half_h * 2.0),
     ))
 }
-
 
 // ─── MARQUEE (RUBBER-BAND) HELPERS ───────────────────────────────────
 //
@@ -480,7 +516,7 @@ fn actor_screen_rect(
 //     around every element currently in `state.canvas_selection`, so
 //     the user can see who's "in the bag" while they keep dragging.
 
-const COL_MARQUEE_FILL: Color32 = Color32::from_rgba_premultiplied(255, 220, 80, 30);
+const COL_MARQUEE_FILL: Color32 = Color32::from_rgba_premultiplied(255, 220, 80, 6);
 const COL_MARQUEE_STROKE: Color32 = Color32::from_rgb(255, 220, 80);
 const COL_MULTI_SELECT_BORDER: Color32 = Color32::from_rgb(255, 180, 60);
 
@@ -498,11 +534,14 @@ pub(crate) fn actor_world_aabb(
     let (src_w, src_h) = if let Some(fc) = state.frame_caches.get(idx) {
         if fc.is_ready() && fc.frame_count > 0 {
             (fc.source_width as f32, fc.source_height as f32)
-        } else { (1080.0_f32, 1920.0) }
-    } else { (1080.0_f32, 1920.0) };
+        } else {
+            (1080.0_f32, 1920.0)
+        }
+    } else {
+        (1080.0_f32, 1920.0)
+    };
 
-    let actor_state =
-        memstroy_core::sample_actor_layout(&actor.layout, &actor.animated_params, t);
+    let actor_state = memstroy_core::sample_actor_layout(&actor.layout, &actor.animated_params, t);
     let mut effective_scale = actor_state.scale;
     let mut effective_scale_y = actor_state.scale_y;
     // Apply parent's scale if this actor has a parent (mirrors the
@@ -511,7 +550,12 @@ pub(crate) fn actor_world_aabb(
         let mut visited = vec![actor.id.clone()];
         if let Some(pxf) = resolve_parent_transform(state, pid, t, &mut visited) {
             let mut rot = 0.0_f32;
-            apply_parent_inheritance_actor(&mut rot, &mut effective_scale, &mut effective_scale_y, &pxf);
+            apply_parent_inheritance_actor(
+                &mut rot,
+                &mut effective_scale,
+                &mut effective_scale_y,
+                &pxf,
+            );
         }
     }
     let elem_w = src_w * effective_scale;
@@ -538,8 +582,13 @@ pub(crate) fn overlay_world_aabb(
         Overlay::Image(img) => (img.t_in, img.t_out, &img.layout),
         Overlay::Video(vid) => (vid.t_in, vid.t_out, &vid.layout),
     };
-    let sample_t = if t >= t_in && t <= t_out { t - t_in }
-        else if t < t_in { 0.0 } else { (t_out - t_in).max(0.0) };
+    let sample_t = if t >= t_in && t <= t_out {
+        t - t_in
+    } else if t < t_in {
+        0.0
+    } else {
+        (t_out - t_in).max(0.0)
+    };
     let element_id = match overlay {
         Overlay::Text(o) => o.id.as_str(),
         Overlay::Image(o) => o.id.as_str(),
@@ -587,10 +636,16 @@ pub(crate) fn overlay_world_aabb(
             state,
             img,
             &ov_state,
-            WorldPos { x: center_x, y: center_y },
+            WorldPos {
+                x: center_x,
+                y: center_y,
+            },
         )
     } else {
-        WorldPos { x: center_x, y: center_y }
+        WorldPos {
+            x: center_x,
+            y: center_y,
+        }
     };
 
     let (ew, eh) = overlay_bbox_with_state(overlay, &ov_state, state);
@@ -639,12 +694,8 @@ fn fx_zone_tint_for_effects(effects: &[memstroy_core::effects::Effect]) -> Optio
             }
         }
         K::EdgeDetect { .. } => Color32::from_rgba_unmultiplied(40, 220, 220, alpha),
-        K::MirrorH | K::MirrorV => {
-            Color32::from_rgba_unmultiplied(140, 200, 140, alpha)
-        }
-        K::ChromaticAberration { .. } => {
-            Color32::from_rgba_unmultiplied(255, 80, 220, alpha)
-        }
+        K::MirrorH | K::MirrorV => Color32::from_rgba_unmultiplied(140, 200, 140, alpha),
+        K::ChromaticAberration { .. } => Color32::from_rgba_unmultiplied(255, 80, 220, alpha),
         K::Noise { .. } => Color32::from_rgba_unmultiplied(180, 180, 180, alpha),
         K::Wave { .. } => Color32::from_rgba_unmultiplied(80, 200, 220, alpha),
         K::OldFilm => Color32::from_rgba_unmultiplied(180, 150, 100, alpha),
@@ -653,9 +704,9 @@ fn fx_zone_tint_for_effects(effects: &[memstroy_core::effects::Effect]) -> Optio
         K::Sharpen { .. } => Color32::from_rgba_unmultiplied(220, 220, 100, alpha),
         K::Crop { .. } => Color32::from_rgba_unmultiplied(255, 140, 220, alpha),
         K::Mask { .. } => Color32::from_rgba_unmultiplied(255, 200, 80, alpha),
-        K::ColorKey { color, .. } => Color32::from_rgba_unmultiplied(
-            color[0], color[1], color[2], alpha,
-        ),
+        K::ColorKey { color, .. } => {
+            Color32::from_rgba_unmultiplied(color[0], color[1], color[2], alpha)
+        }
     };
     Some(c)
 }
@@ -664,8 +715,7 @@ fn fx_zone_tint_for_effects(effects: &[memstroy_core::effects::Effect]) -> Optio
 fn aabbs_overlap(a: ([f32; 2], [f32; 2]), b: ([f32; 2], [f32; 2])) -> bool {
     let (a_min, a_max) = a;
     let (b_min, b_max) = b;
-    a_min[0] <= b_max[0] && a_max[0] >= b_min[0]
-        && a_min[1] <= b_max[1] && a_max[1] >= b_min[1]
+    a_min[0] <= b_max[0] && a_max[0] >= b_min[0] && a_min[1] <= b_max[1] && a_max[1] >= b_min[1]
 }
 
 /// Convert the world-coord marquee rectangle into a list of selected
@@ -678,7 +728,9 @@ fn aabbs_overlap(a: ([f32; 2], [f32; 2]), b: ([f32; 2], [f32; 2])) -> bool {
 /// element — but the inspector itself short-circuits to a count when
 /// the lasso captured more than one item.
 fn commit_marquee_selection(state: &mut EditorState, extend: bool) {
-    let Some(marquee) = state.canvas_marquee else { return; };
+    let Some(marquee) = state.canvas_marquee else {
+        return;
+    };
     let (mn, mx) = marquee.rect_world();
     // Reject zero-size lassos (≤ 2 world-pixels in either dimension).
     // Treat these as an empty-area click instead of a selection paint —
@@ -700,7 +752,9 @@ fn commit_marquee_selection(state: &mut EditorState, extend: bool) {
     // they're full-canvas clips and would always match.
     let mut hits: Vec<Selection> = Vec::new();
     for idx in 0..state.scene.actors.len() {
-        if !state.scene.actors[idx].visible { continue; }
+        if !state.scene.actors[idx].visible {
+            continue;
+        }
         if let Some(aabb) = actor_world_aabb(state, idx, state.playhead) {
             if aabbs_overlap(aabb, marquee_box) {
                 hits.push(Selection::Actor(idx));
@@ -744,7 +798,9 @@ fn draw_canvas_marquee(
     state: &EditorState,
     viewport_size: [f32; 2],
 ) {
-    let Some(marquee) = state.canvas_marquee else { return; };
+    let Some(marquee) = state.canvas_marquee else {
+        return;
+    };
     let (mn, mx) = marquee.rect_world();
     let tl_screen = state.canvas_viewport.world_to_screen(
         memstroy_core::WorldPos { x: mn[0], y: mn[1] },
@@ -755,11 +811,21 @@ fn draw_canvas_marquee(
         viewport_size,
     );
     let rect = Rect::from_min_max(
-        Pos2::new(full_rect.min.x + tl_screen[0], full_rect.min.y + tl_screen[1]),
-        Pos2::new(full_rect.min.x + br_screen[0], full_rect.min.y + br_screen[1]),
+        Pos2::new(
+            full_rect.min.x + tl_screen[0],
+            full_rect.min.y + tl_screen[1],
+        ),
+        Pos2::new(
+            full_rect.min.x + br_screen[0],
+            full_rect.min.y + br_screen[1],
+        ),
     );
     painter.rect_filled(rect, Rounding::same(1.0), COL_MARQUEE_FILL);
-    painter.rect_stroke(rect, Rounding::same(1.0), Stroke::new(1.0, COL_MARQUEE_STROKE));
+    painter.rect_stroke(
+        rect,
+        Rounding::same(1.0),
+        Stroke::new(1.0, COL_MARQUEE_STROKE),
+    );
 }
 
 /// Paint a slim outline around every element in `state.canvas_selection`
@@ -780,13 +846,17 @@ fn draw_multi_selection_borders(
     }
     for sel in &state.canvas_selection {
         // Skip the primary — its handles/border are drawn elsewhere.
-        if *sel == state.selection { continue; }
+        if *sel == state.selection {
+            continue;
+        }
         let aabb = match *sel {
             Selection::Actor(i) => actor_world_aabb(state, i, state.playhead),
             Selection::Overlay(i) => overlay_world_aabb(state, i, state.playhead),
             _ => None,
         };
-        let Some((mn, mx)) = aabb else { continue; };
+        let Some((mn, mx)) = aabb else {
+            continue;
+        };
         let tl = state.canvas_viewport.world_to_screen(
             memstroy_core::WorldPos { x: mn[0], y: mn[1] },
             viewport_size,
@@ -799,10 +869,13 @@ fn draw_multi_selection_borders(
             Pos2::new(full_rect.min.x + tl[0], full_rect.min.y + tl[1]),
             Pos2::new(full_rect.min.x + br[0], full_rect.min.y + br[1]),
         );
-        painter.rect_stroke(rect, Rounding::same(2.0), Stroke::new(1.5, COL_MULTI_SELECT_BORDER));
+        painter.rect_stroke(
+            rect,
+            Rounding::same(2.0),
+            Stroke::new(1.5, COL_MULTI_SELECT_BORDER),
+        );
     }
 }
-
 
 // ─── INPUT HANDLING ──────────────────────────────────────────────────
 
@@ -815,7 +888,7 @@ fn handle_canvas_image_search_rmb_input(
     viewport_size: [f32; 2],
 ) {
     use crate::canvas_image_search::{
-        open_search_popup_at, open_selection_frame_session, RMB_MIN_TRAVEL_PX, MIN_FRAME_WORLD_PX,
+        open_search_popup_at, open_selection_frame_session, MIN_FRAME_WORLD_PX, RMB_MIN_TRAVEL_PX,
     };
 
     if state.canvas_panning || state.mask_tool.is_active() {
@@ -833,6 +906,7 @@ fn handle_canvas_image_search_rmb_input(
         && secondary_pressed
         && response.hovered()
     {
+        crate::canvas_image_search::dismiss_session(state, false);
         if let Some(p) = press_origin {
             let local = [p.x - full_rect.min.x, p.y - full_rect.min.y];
             let world = state.canvas_viewport.screen_to_world(local, viewport_size);
@@ -885,26 +959,25 @@ fn handle_canvas_input(
     let right_down = ui.input(|i| i.pointer.secondary_down());
     let rmb_frame = crate::canvas_image_search::rmb_gesture_active(state);
 
-    let should_pan = middle_down || (right_down && !rmb_frame) || (space_held && response.dragged());
+    let should_start_pan =
+        middle_down || (right_down && !rmb_frame) || (space_held && response.dragged());
+    let pan_buttons_down = middle_down
+        || (right_down && !rmb_frame)
+        || (space_held && ui.input(|i| i.pointer.primary_down()));
     let pointer_in_canvas = ui
         .input(|i| i.pointer.hover_pos())
         .is_some_and(|p| full_rect.contains(p));
-    let use_raw_delta = middle_down || (right_down && !rmb_frame) || state.canvas_panning;
+    if should_start_pan && pointer_in_canvas {
+        state.canvas_panning = true;
+    }
 
-    if should_pan && (pointer_in_canvas || state.canvas_panning) {
-        let delta = if use_raw_delta {
-            ui.input(|i| i.pointer.delta())
-        } else {
-            response.drag_delta()
-        };
+    if state.canvas_panning && pan_buttons_down {
+        let delta = ui.input(|i| i.pointer.delta());
         if delta.length_sq() > 0.0 {
             state.canvas_viewport.pan([delta.x, delta.y]);
-            state.canvas_panning = true;
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
-        } else if middle_down || (right_down && !rmb_frame) {
-            state.canvas_panning = true;
         }
-    } else if !middle_down && !(right_down && !rmb_frame) && !(space_held && ui.input(|i| i.pointer.primary_down())) {
+    } else if !pan_buttons_down {
         state.canvas_panning = false;
     }
 
@@ -937,7 +1010,6 @@ fn handle_canvas_input(
     }
 }
 
-
 // ─── GRID ────────────────────────────────────────────────────────────
 
 fn draw_canvas_grid(
@@ -960,10 +1032,19 @@ fn draw_canvas_grid(
         let wx = ix as f32 * base_spacing;
         let screen = viewport.world_to_screen(WorldPos { x: wx, y: 0.0 }, viewport_size);
         let sx = full_rect.min.x + screen[0];
-        if sx < full_rect.min.x || sx > full_rect.max.x { continue; }
-        let col = if ix % major_every == 0 { COL_GRID_MAJOR } else { COL_GRID_MINOR };
+        if sx < full_rect.min.x || sx > full_rect.max.x {
+            continue;
+        }
+        let col = if ix % major_every == 0 {
+            COL_GRID_MAJOR
+        } else {
+            COL_GRID_MINOR
+        };
         painter.line_segment(
-            [Pos2::new(sx, full_rect.min.y), Pos2::new(sx, full_rect.max.y)],
+            [
+                Pos2::new(sx, full_rect.min.y),
+                Pos2::new(sx, full_rect.max.y),
+            ],
             Stroke::new(0.5, col),
         );
     }
@@ -975,10 +1056,19 @@ fn draw_canvas_grid(
         let wy = iy as f32 * base_spacing;
         let screen = viewport.world_to_screen(WorldPos { x: 0.0, y: wy }, viewport_size);
         let sy = full_rect.min.y + screen[1];
-        if sy < full_rect.min.y || sy > full_rect.max.y { continue; }
-        let col = if iy % major_every == 0 { COL_GRID_MAJOR } else { COL_GRID_MINOR };
+        if sy < full_rect.min.y || sy > full_rect.max.y {
+            continue;
+        }
+        let col = if iy % major_every == 0 {
+            COL_GRID_MAJOR
+        } else {
+            COL_GRID_MINOR
+        };
         painter.line_segment(
-            [Pos2::new(full_rect.min.x, sy), Pos2::new(full_rect.max.x, sy)],
+            [
+                Pos2::new(full_rect.min.x, sy),
+                Pos2::new(full_rect.max.x, sy),
+            ],
             Stroke::new(0.5, col),
         );
     }
@@ -989,14 +1079,20 @@ fn choose_grid_spacing(zoom: f32) -> f32 {
     let target_screen_px = 60.0;
     let raw = target_screen_px / zoom;
     // Snap to nice round values
-    if raw < 25.0 { 20.0 }
-    else if raw < 60.0 { 50.0 }
-    else if raw < 125.0 { 100.0 }
-    else if raw < 300.0 { 200.0 }
-    else if raw < 600.0 { 500.0 }
-    else { 1000.0 }
+    if raw < 25.0 {
+        20.0
+    } else if raw < 60.0 {
+        50.0
+    } else if raw < 125.0 {
+        100.0
+    } else if raw < 300.0 {
+        200.0
+    } else if raw < 600.0 {
+        500.0
+    } else {
+        1000.0
+    }
 }
-
 
 // ─── RENDER FRAME RECTANGLE ──────────────────────────────────────────
 
@@ -1030,11 +1126,7 @@ fn draw_render_frame(
     let is_rotated = rotation_rad.abs() > 0.001;
     if !is_rotated {
         let aabb = Rect::from_min_max(tl, br);
-        painter.rect_stroke(
-            aabb,
-            Rounding::ZERO,
-            Stroke::new(2.0, COL_RENDER_FRAME),
-        );
+        painter.rect_stroke(aabb, Rounding::ZERO, Stroke::new(2.0, COL_RENDER_FRAME));
     } else {
         painter.add(egui::Shape::convex_polygon(
             vec![tl, tr, br, bl],
@@ -1109,16 +1201,21 @@ fn render_frame_corners_screen(
     };
 
     let tl_w = corner_world(-half_w, -half_h);
-    let tr_w = corner_world( half_w, -half_h);
-    let br_w = corner_world( half_w,  half_h);
-    let bl_w = corner_world(-half_w,  half_h);
+    let tr_w = corner_world(half_w, -half_h);
+    let br_w = corner_world(half_w, half_h);
+    let bl_w = corner_world(-half_w, half_h);
 
     let to_screen = |w: WorldPos| -> Pos2 {
         let s = state.canvas_viewport.world_to_screen(w, viewport_size);
         Pos2::new(full_rect.min.x + s[0], full_rect.min.y + s[1])
     };
 
-    [to_screen(tl_w), to_screen(tr_w), to_screen(br_w), to_screen(bl_w)]
+    [
+        to_screen(tl_w),
+        to_screen(tr_w),
+        to_screen(br_w),
+        to_screen(bl_w),
+    ]
 }
 
 /// Sample the RenderFrame state at time t.
@@ -1133,7 +1230,9 @@ fn sample_render_frame(rf: &RenderFrame, t: f32) -> RenderFrameState {
 /// modifiers visually perturb the rendered output on top of that.
 fn sample_render_frame_eased(rf: &RenderFrame, t: f32) -> RenderFrameState {
     let mut s = sample_render_frame(rf, t);
-    if rf.modifiers.is_empty() { return s; }
+    if rf.modifiers.is_empty() {
+        return s;
+    }
     let delta = keyframe::evaluate_modifiers(&rf.modifiers, t);
     s.pos.x += delta.dx;
     s.pos.y += delta.dy;
@@ -1159,7 +1258,9 @@ fn resolve_overlay_attachment_world(
     // Find the matching template (by name or source-clip filename).
     let template = state.scene.skeleton_templates.iter().find(|tmpl| {
         tmpl.name == attachment.skeleton_id
-            || tmpl.source_clip.file_stem()
+            || tmpl
+                .source_clip
+                .file_stem()
                 .and_then(|s| s.to_str())
                 .map(|s| s == attachment.skeleton_id)
                 .unwrap_or(false)
@@ -1168,23 +1269,25 @@ fn resolve_overlay_attachment_world(
 
     // Find the host actor that uses this template's source clip.
     let (host_idx, host_actor) = state.scene.actors.iter().enumerate().find(|(_, a)| {
-        a.source == template.source_clip
-            || a.source.file_name() == template.source_clip.file_name()
+        a.source == template.source_clip || a.source.file_name() == template.source_clip.file_name()
     })?;
-    if !host_actor.visible { return None; }
+    if !host_actor.visible {
+        return None;
+    }
 
     // Host actor's world center + dimensions at `t`.
     let host_world = get_element_world_pos(state, &host_actor.id, &host_actor.layout, t);
-    let host_state = memstroy_core::sample_actor_layout(
-        &host_actor.layout,
-        &host_actor.animated_params,
-        t,
-    );
+    let host_state =
+        memstroy_core::sample_actor_layout(&host_actor.layout, &host_actor.animated_params, t);
     let (src_w, src_h) = if let Some(fc) = state.frame_caches.get(host_idx) {
         if fc.is_ready() && fc.frame_count > 0 {
             (fc.source_width as f32, fc.source_height as f32)
-        } else { (1080.0_f32, 1920.0) }
-    } else { (1080.0_f32, 1920.0) };
+        } else {
+            (1080.0_f32, 1920.0)
+        }
+    } else {
+        (1080.0_f32, 1920.0)
+    };
     let elem_w = src_w * host_state.scale;
     let elem_h = src_h * host_state.scale * host_state.scale_y;
 
@@ -1203,7 +1306,6 @@ fn resolve_overlay_attachment_world(
         y: host_world.y + local_x * sn + local_y * cs,
     })
 }
-
 
 // ─── ELEMENTS ON CANVAS ──────────────────────────────────────────────
 
@@ -1236,7 +1338,9 @@ fn pick_actors_for_canvas(state: &EditorState, t: f32) -> HashSet<usize> {
     for (_track, indices) in by_track {
         let active = indices.iter().copied().find(|&ai| {
             let a = &state.scene.actors[ai];
-            if !a.visible { return false; }
+            if !a.visible {
+                return false;
+            }
             let t_in = a.t_in.unwrap_or(0.0);
             let t_out = a.t_out.unwrap_or(duration);
             t >= t_in && t <= t_out
@@ -1245,13 +1349,20 @@ fn pick_actors_for_canvas(state: &EditorState, t: f32) -> HashSet<usize> {
             keep.insert(ai);
             continue;
         }
+        if !state.canvas_show_inactive_previews {
+            continue;
+        }
         // No active clip on this track — pick the one closest to t.
         let best = indices.iter().copied().min_by(|&a, &b| {
             let dist = |ai: usize| -> f32 {
                 let actor = &state.scene.actors[ai];
                 let t_in = actor.t_in.unwrap_or(0.0);
                 let t_out = actor.t_out.unwrap_or(duration);
-                if t < t_in { (t_in - t).abs() } else { (t - t_out).abs() }
+                if t < t_in {
+                    (t_in - t).abs()
+                } else {
+                    (t - t_out).abs()
+                }
             };
             dist(a)
                 .partial_cmp(&dist(b))
@@ -1285,6 +1396,8 @@ fn pick_overlays_for_canvas(state: &EditorState, t: f32) -> HashSet<usize> {
             Overlay::Image(im) => {
                 if t >= im.t_in && t <= im.t_out {
                     keep.insert(oi);
+                } else if state.canvas_show_inactive_previews {
+                    keep.insert(oi);
                 }
                 continue;
             }
@@ -1307,6 +1420,9 @@ fn pick_overlays_for_canvas(state: &EditorState, t: f32) -> HashSet<usize> {
             keep.insert(oi);
             continue;
         }
+        if !state.canvas_show_inactive_previews {
+            continue;
+        }
         // No clip currently active on this lane — pick the closest one
         // (in time) so the user still has a visible preview of "what
         // this lane will show".
@@ -1317,7 +1433,11 @@ fn pick_overlays_for_canvas(state: &EditorState, t: f32) -> HashSet<usize> {
                     Overlay::Image(o) => (o.t_in, o.t_out),
                     Overlay::Video(o) => (o.t_in, o.t_out),
                 };
-                if t < t_in { (t_in - t).abs() } else { (t - t_out).abs() }
+                if t < t_in {
+                    (t_in - t).abs()
+                } else {
+                    (t - t_out).abs()
+                }
             };
             dist(a)
                 .partial_cmp(&dist(b))
@@ -1357,7 +1477,10 @@ fn draw_canvas_elements(
     // each element in order.
 
     #[derive(Clone, Copy)]
-    enum ElementKind { Actor, Overlay }
+    enum ElementKind {
+        Actor,
+        Overlay,
+    }
 
     let actors_to_draw = pick_actors_for_canvas(state, t);
     let overlays_to_draw = pick_overlays_for_canvas(state, t);
@@ -1366,19 +1489,29 @@ fn draw_canvas_elements(
 
     // Collect actors.
     for (idx, actor) in state.scene.actors.iter().enumerate() {
-        if !actor.visible { continue; }
-        if !actors_to_draw.contains(&idx) { continue; }
+        if !actor.visible {
+            continue;
+        }
+        if !actors_to_draw.contains(&idx) {
+            continue;
+        }
         let track = actor_track_index(state, idx);
         elements.push((track, ElementKind::Actor, idx));
     }
 
-    // Collect overlays (image/video filtered by pick, text always included).
+    // Collect overlays (image/video filtered by pick, text included only when active
+    // unless ghost previews are enabled).
     for (idx, ov) in state.scene.overlays.iter().enumerate() {
         let dominated = match ov {
-            Overlay::Text(_) => false, // text always drawn
+            Overlay::Text(t) => {
+                !state.canvas_show_inactive_previews
+                    && !(t.t_in <= state.playhead && state.playhead <= t.t_out)
+            }
             _ => !overlays_to_draw.contains(&idx),
         };
-        if dominated { continue; }
+        if dominated {
+            continue;
+        }
         let track = overlay_track_index(state, idx);
         elements.push((track, ElementKind::Overlay, idx));
     }
@@ -1443,12 +1576,17 @@ fn draw_single_actor(
     } else {
         (1080.0_f32, 1920.0)
     };
-    let actor_state =
-        memstroy_core::sample_actor_layout(&actor.layout, &actor.animated_params, t);
+    let actor_state = memstroy_core::sample_actor_layout(&actor.layout, &actor.animated_params, t);
     let mut actor_scale = actor_state.scale;
     let mut actor_scale_y = actor_state.scale_y;
     let mut actor_rotation = actor_state.rotation_deg;
-    apply_canvas_transform_preview(state, &actor.id, &mut actor_rotation, &mut actor_scale, &mut actor_scale_y);
+    apply_canvas_transform_preview(
+        state,
+        &actor.id,
+        &mut actor_rotation,
+        &mut actor_scale,
+        &mut actor_scale_y,
+    );
     let mod_delta = if matches!(display_mode, DisplayMode::Active) {
         keyframe::evaluate_modifiers(&actor.modifiers, t - t_in)
     } else {
@@ -1480,23 +1618,35 @@ fn draw_single_actor(
         x: world_pos.x + mod_delta.dx,
         y: world_pos.y + mod_delta.dy,
     };
-    let center_screen = state.canvas_viewport.world_to_screen(world_pos_with_mod, viewport_size);
+    let center_screen = state
+        .canvas_viewport
+        .world_to_screen(world_pos_with_mod, viewport_size);
     let half_w = elem_width * 0.5 * state.canvas_viewport.zoom;
     let half_h = elem_height * 0.5 * state.canvas_viewport.zoom;
 
     let elem_rect = Rect::from_center_size(
-        Pos2::new(full_rect.min.x + center_screen[0], full_rect.min.y + center_screen[1]),
+        Pos2::new(
+            full_rect.min.x + center_screen[0],
+            full_rect.min.y + center_screen[1],
+        ),
         Vec2::new(half_w * 2.0, half_h * 2.0),
     );
 
-    if !full_rect.intersects(elem_rect) { return; }
+    if !full_rect.intersects(elem_rect) {
+        return;
+    }
 
     let base_tint = match display_mode {
         DisplayMode::Active => Color32::WHITE,
         _ => COL_INACTIVE_TINT,
     };
     let alpha = (actor_opacity * (base_tint.a() as f32 / 255.0)).clamp(0.0, 1.0);
-    let tint = Color32::from_rgba_unmultiplied(base_tint.r(), base_tint.g(), base_tint.b(), (alpha * 255.0) as u8);
+    let tint = Color32::from_rgba_unmultiplied(
+        base_tint.r(),
+        base_tint.g(),
+        base_tint.b(),
+        (alpha * 255.0) as u8,
+    );
 
     let speed = actor.speed.max(0.0001);
     let mut local_t = match display_mode {
@@ -1519,19 +1669,18 @@ fn draw_single_actor(
             let actor_ck = &state.scene.actors[idx].chroma_key;
             let actor_t_in = state.scene.actors[idx].t_in.unwrap_or(0.0);
             let local_for_anim = (state.playhead - actor_t_in).max(0.0);
-            let actor_cc_owned: memstroy_core::ColorCorrection =
-                state.scene.actors[idx].color_correction.sampled_at(local_for_anim);
+            let actor_cc_owned: memstroy_core::ColorCorrection = state.scene.actors[idx]
+                .color_correction
+                .sampled_at(local_for_anim);
             let actor_cc = &actor_cc_owned;
-            let actor_fx_owned: Vec<memstroy_core::Effect> = state
-                .scene.actors[idx].effects
+            let actor_fx_owned: Vec<memstroy_core::Effect> = state.scene.actors[idx]
+                .effects
                 .iter()
                 .map(|e| e.sampled_at(local_for_anim))
                 .collect();
             let actor_fx = &actor_fx_owned;
             let any_fx_active = actor_fx.iter().any(|e| e.enabled && e.intensity > 0.001);
-            let has_effects = actor_ck.is_active()
-                || !actor_cc.is_identity()
-                || any_fx_active;
+            let has_effects = actor_ck.is_active() || !actor_cc.is_identity() || any_fx_active;
 
             let texture = if has_effects {
                 fc.ensure_processed_preload(local_t, actor_ck, actor_cc, actor_fx);
@@ -1547,7 +1696,11 @@ fn draw_single_actor(
             if let Some(tex) = texture {
                 let rotation_rad = actor_rotation.to_radians();
                 let static_hflip = state.scene.actors[idx].flip_horizontal;
-                let combined_x = if static_hflip { -actor_flip_x } else { actor_flip_x };
+                let combined_x = if static_hflip {
+                    -actor_flip_x
+                } else {
+                    actor_flip_x
+                };
                 let combined_y = actor_flip_y;
                 let abs_fx = combined_x.abs().max(0.02);
                 let abs_fy = combined_y.abs().max(0.02);
@@ -1557,11 +1710,21 @@ fn draw_single_actor(
                 let cos_r = rotation_rad.cos();
                 let sin_r = rotation_rad.sin();
                 let corners_local = [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]];
-                let (uv_l, uv_r) = if combined_x < 0.0 { (1.0, 0.0) } else { (0.0, 1.0) };
-                let (uv_t, uv_b) = if combined_y < 0.0 { (1.0, 0.0) } else { (0.0, 1.0) };
+                let (uv_l, uv_r) = if combined_x < 0.0 {
+                    (1.0, 0.0)
+                } else {
+                    (0.0, 1.0)
+                };
+                let (uv_t, uv_b) = if combined_y < 0.0 {
+                    (1.0, 0.0)
+                } else {
+                    (0.0, 1.0)
+                };
                 let uv_corners = [
-                    Pos2::new(uv_l, uv_t), Pos2::new(uv_r, uv_t),
-                    Pos2::new(uv_r, uv_b), Pos2::new(uv_l, uv_b),
+                    Pos2::new(uv_l, uv_t),
+                    Pos2::new(uv_r, uv_t),
+                    Pos2::new(uv_r, uv_b),
+                    Pos2::new(uv_l, uv_b),
                 ];
                 let mut mesh = egui::Mesh::with_texture(tex.id());
                 for ci in 0..4 {
@@ -1599,16 +1762,14 @@ fn draw_single_actor(
             .map(|e| e.sampled_at(local_for_anim))
             .any(|e| e.enabled && e.intensity > 0.001);
         let needs_processed_warmup = cache_ready
-            && (actor_ck.is_active()
-                || !actor_cc_warm.is_identity()
-                || any_fx_warm)
+            && (actor_ck.is_active() || !actor_cc_warm.is_identity() || any_fx_warm)
             && state
                 .frame_caches
                 .get(idx)
                 .map(|fc| !fc.processed_frame_warm())
                 .unwrap_or(false);
-        let preview_pending = !preview_failed
-            && (extracting || !cache_ready || needs_processed_warmup);
+        let preview_pending =
+            !preview_failed && (extracting || !cache_ready || needs_processed_warmup);
 
         // While ffmpeg extracts preview frames, show the library
         // thumbnail so the user sees the clip land on canvas; once
@@ -1650,14 +1811,21 @@ fn draw_single_actor(
         }
     }
 
-    let multi_selected = state.canvas_selection.iter().any(|s| *s == Selection::Actor(idx));
+    let multi_selected = state
+        .canvas_selection
+        .iter()
+        .any(|s| *s == Selection::Actor(idx));
     if state.selection == Selection::Actor(idx) || multi_selected {
         let border_col = if state.selection == Selection::Actor(idx) {
             COL_SELECTED_BORDER
         } else {
             Color32::from_rgb(255, 180, 60)
         };
-        let border_width = if state.selection == Selection::Actor(idx) { 2.0 } else { 1.5 };
+        let border_width = if state.selection == Selection::Actor(idx) {
+            2.0
+        } else {
+            1.5
+        };
         // Axis-aligned fallback only when the clip is not rotated — the
         // rotation-aware OBB in `draw_selection_handles` owns the
         // selected outline otherwise (avoids the "double yellow box").
@@ -1678,7 +1846,8 @@ fn draw_single_actor(
         };
         painter.text(
             Pos2::new(elem_rect.min.x + 4.0, elem_rect.min.y + 4.0),
-            egui::Align2::LEFT_TOP, badge,
+            egui::Align2::LEFT_TOP,
+            badge,
             egui::FontId::proportional(9.0),
             Color32::from_rgb(255, 180, 80),
         );
@@ -1734,15 +1903,27 @@ fn draw_canvas_backgrounds(
             y: rf_state.pos.y + world_h * 0.5,
         };
 
-        let tl_screen = state.canvas_viewport.world_to_screen(tl_world, viewport_size);
-        let br_screen = state.canvas_viewport.world_to_screen(br_world, viewport_size);
+        let tl_screen = state
+            .canvas_viewport
+            .world_to_screen(tl_world, viewport_size);
+        let br_screen = state
+            .canvas_viewport
+            .world_to_screen(br_world, viewport_size);
 
         let bg_rect = Rect::from_min_max(
-            Pos2::new(full_rect.min.x + tl_screen[0], full_rect.min.y + tl_screen[1]),
-            Pos2::new(full_rect.min.x + br_screen[0], full_rect.min.y + br_screen[1]),
+            Pos2::new(
+                full_rect.min.x + tl_screen[0],
+                full_rect.min.y + tl_screen[1],
+            ),
+            Pos2::new(
+                full_rect.min.x + br_screen[0],
+                full_rect.min.y + br_screen[1],
+            ),
         );
 
-        if !full_rect.intersects(bg_rect) { continue; }
+        if !full_rect.intersects(bg_rect) {
+            continue;
+        }
 
         // Draw background representation
         let (fill_color, label) = match &bg.source {
@@ -1752,11 +1933,17 @@ fn draw_canvas_backgrounds(
             }
             MediaSource::Image { path } => {
                 let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("img");
-                (Color32::from_rgb(30, 50, 70), format!("{} {}", crate::i18n::t("BG:"), name))
+                (
+                    Color32::from_rgb(30, 50, 70),
+                    format!("{} {}", crate::i18n::t("BG:"), name),
+                )
             }
             MediaSource::Video { path, .. } => {
                 let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("vid");
-                (Color32::from_rgb(25, 40, 60), format!("{} {}", crate::i18n::t("BG:"), name))
+                (
+                    Color32::from_rgb(25, 40, 60),
+                    format!("{} {}", crate::i18n::t("BG:"), name),
+                )
             }
         };
 
@@ -1776,7 +1963,11 @@ fn draw_canvas_backgrounds(
         // Border if selected
         let is_selected = state.selection == Selection::Background(idx);
         if is_selected {
-            painter.rect_stroke(bg_rect, Rounding::ZERO, Stroke::new(2.0, COL_SELECTED_BORDER));
+            painter.rect_stroke(
+                bg_rect,
+                Rounding::ZERO,
+                Stroke::new(2.0, COL_SELECTED_BORDER),
+            );
         }
 
         // Label
@@ -1797,7 +1988,8 @@ fn draw_canvas_backgrounds(
             };
             painter.text(
                 Pos2::new(bg_rect.min.x + 6.0, bg_rect.min.y + 6.0),
-                egui::Align2::LEFT_TOP, badge,
+                egui::Align2::LEFT_TOP,
+                badge,
                 egui::FontId::proportional(9.0),
                 Color32::from_rgb(100, 180, 255),
             );
@@ -1863,7 +2055,11 @@ fn draw_canvas_overlays_impl(
     // BehindActors pass; everything else renders OnTop. That keeps the
     // "below actors" semantics auto-derived from the timeline layout
     // for every overlay kind, not just text.
-    let mut order: Vec<(usize, usize)> = state.scene.overlays.iter().enumerate()
+    let mut order: Vec<(usize, usize)> = state
+        .scene
+        .overlays
+        .iter()
+        .enumerate()
         .filter(|(idx, ov)| {
             // Single-element mode: only draw the requested overlay.
             if let Some(only) = only_idx {
@@ -1876,7 +2072,9 @@ fn draw_canvas_overlays_impl(
                     OverlayPass::BehindActors => behind,
                     OverlayPass::OnTop => !behind,
                 };
-                if !kind_ok { return false; }
+                if !kind_ok {
+                    return false;
+                }
             }
             // Image / Video overlays on the same lane: only the chosen
             // one. Text overlays bypass the filter (always allowed).
@@ -1967,7 +2165,9 @@ fn draw_canvas_overlays_impl(
                 world_pos = p;
             }
         }
-        let center_screen = state.canvas_viewport.world_to_screen(world_pos, viewport_size);
+        let center_screen = state
+            .canvas_viewport
+            .world_to_screen(world_pos, viewport_size);
         let center_pos = Pos2::new(
             full_rect.min.x + center_screen[0],
             full_rect.min.y + center_screen[1],
@@ -1975,7 +2175,16 @@ fn draw_canvas_overlays_impl(
 
         match overlay {
             Overlay::Text(txt) => {
-                draw_text_overlay(painter, full_rect, state, idx, txt, &ov_state, center_pos, display_mode);
+                draw_text_overlay(
+                    painter,
+                    full_rect,
+                    state,
+                    idx,
+                    txt,
+                    &ov_state,
+                    center_pos,
+                    display_mode,
+                );
             }
             Overlay::Image(img) => {
                 let zoom = state.canvas_viewport.zoom;
@@ -1996,11 +2205,11 @@ fn draw_canvas_overlays_impl(
                     let fx_h = 400.0_f32 * ov_state.scale * ov_state.scale_y;
                     let half_w = fx_w * 0.5 * zoom;
                     let half_h = fx_h * 0.5 * zoom;
-                    let elem_rect = Rect::from_center_size(
-                        center_pos,
-                        Vec2::new(half_w * 2.0, half_h * 2.0),
-                    );
-                    if !full_rect.intersects(elem_rect) { continue; }
+                    let elem_rect =
+                        Rect::from_center_size(center_pos, Vec2::new(half_w * 2.0, half_h * 2.0));
+                    if !full_rect.intersects(elem_rect) {
+                        continue;
+                    }
 
                     // ── Live FX preview ──
                     // Try to bake/fetch a preview that shows the FX
@@ -2012,14 +2221,8 @@ fn draw_canvas_overlays_impl(
                     // image yet.
                     //
                     // Compute world-space bbox of the FX zone.
-                    let fx_bbox_min = [
-                        world_pos.x - fx_w * 0.5,
-                        world_pos.y - fx_h * 0.5,
-                    ];
-                    let fx_bbox_max = [
-                        world_pos.x + fx_w * 0.5,
-                        world_pos.y + fx_h * 0.5,
-                    ];
+                    let fx_bbox_min = [world_pos.x - fx_w * 0.5, world_pos.y - fx_h * 0.5];
+                    let fx_bbox_max = [world_pos.x + fx_w * 0.5, world_pos.y + fx_h * 0.5];
                     let fx_preview_tex = crate::fx_preview::ensure_fx_preview(
                         state,
                         &state.fx_preview_cache,
@@ -2037,7 +2240,12 @@ fn draw_canvas_overlays_impl(
                     let cos_r = rotation_rad.cos();
                     let sin_r = rotation_rad.sin();
                     let center = elem_rect.center();
-                    let corners_local = [[-half_w, -half_h], [half_w, -half_h], [half_w, half_h], [-half_w, half_h]];
+                    let corners_local = [
+                        [-half_w, -half_h],
+                        [half_w, -half_h],
+                        [half_w, half_h],
+                        [-half_w, half_h],
+                    ];
                     let corners: [Pos2; 4] = std::array::from_fn(|i| {
                         let lx = corners_local[i][0];
                         let ly = corners_local[i][1];
@@ -2098,7 +2306,9 @@ fn draw_canvas_overlays_impl(
                     let label_text = if active_count == 0 {
                         format!("FX: {}", img.id)
                     } else if active_count == 1 {
-                        let kind_label = img.effects.iter()
+                        let kind_label = img
+                            .effects
+                            .iter()
                             .find(|e| e.enabled)
                             .map(|e| e.kind.label())
                             .unwrap_or("FX");
@@ -2127,7 +2337,9 @@ fn draw_canvas_overlays_impl(
                 let half_h = elem_h * 0.5 * zoom;
                 let elem_rect =
                     Rect::from_center_size(center_pos, Vec2::new(half_w * 2.0, half_h * 2.0));
-                if !full_rect.intersects(elem_rect) { continue; }
+                if !full_rect.intersects(elem_rect) {
+                    continue;
+                }
 
                 let tex_handle: Option<egui::TextureHandle> = state
                     .image_textures
@@ -2151,18 +2363,19 @@ fn draw_canvas_overlays_impl(
                 } else {
                     [0.0_f32; 4]
                 };
-                let fx_tex_handle: Option<egui::TextureHandle> =
-                    if !img.effects.is_empty() && tex_handle.is_some() {
-                        match ensure_image_fx_loaded(state, &img.source, &img.effects, painter.ctx()) {
-                            Some((tex, crop)) => {
-                                crop_inset = crop;
-                                Some(tex)
-                            }
-                            None => None,
+                let fx_tex_handle: Option<egui::TextureHandle> = if !img.effects.is_empty()
+                    && tex_handle.is_some()
+                {
+                    match ensure_image_fx_loaded(state, &img.source, &img.effects, painter.ctx()) {
+                        Some((tex, crop)) => {
+                            crop_inset = crop;
+                            Some(tex)
                         }
-                    } else {
-                        None
-                    };
+                        None => None,
+                    }
+                } else {
+                    None
+                };
                 let tex_for_draw = fx_tex_handle.or(tex_handle);
 
                 if let Some(tex) = tex_for_draw {
@@ -2216,8 +2429,10 @@ fn draw_canvas_overlays_impl(
                         (uv_t_base, uv_b_base)
                     };
                     let uv_corners = [
-                        Pos2::new(uv_l, uv_t), Pos2::new(uv_r, uv_t),
-                        Pos2::new(uv_r, uv_b), Pos2::new(uv_l, uv_b),
+                        Pos2::new(uv_l, uv_t),
+                        Pos2::new(uv_r, uv_t),
+                        Pos2::new(uv_r, uv_b),
+                        Pos2::new(uv_l, uv_b),
                     ];
                     let alpha_factor = match display_mode {
                         DisplayMode::Active => 1.0,
@@ -2258,11 +2473,18 @@ fn draw_canvas_overlays_impl(
                     // Fall back to the labelled placeholder so the user
                     // can still see WHERE the overlay is and remove it.
                     draw_overlay_placeholder(
-                        painter, elem_rect, COL_OVERLAY_IMAGE, idx, state,
+                        painter,
+                        elem_rect,
+                        COL_OVERLAY_IMAGE,
+                        idx,
+                        state,
                         &format!(
                             "{} {}",
                             crate::i18n::t("IMG (missing):"),
-                            img.source.file_name().and_then(|s| s.to_str()).unwrap_or("?")
+                            img.source
+                                .file_name()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("?")
                         ),
                         display_mode,
                     );
@@ -2273,11 +2495,27 @@ fn draw_canvas_overlays_impl(
                 let elem_h = 300.0 * 16.0 / 9.0 * ov_state.scale * ov_state.scale_y;
                 let half_w = elem_w * 0.5 * state.canvas_viewport.zoom;
                 let half_h = elem_h * 0.5 * state.canvas_viewport.zoom;
-                let elem_rect = Rect::from_center_size(center_pos, Vec2::new(half_w * 2.0, half_h * 2.0));
-                if !full_rect.intersects(elem_rect) { continue; }
-                draw_overlay_placeholder(painter, elem_rect, COL_OVERLAY_VIDEO, idx, state,
-                    &format!("{} {}", crate::i18n::t("VID:"), vid.source.file_name().and_then(|s| s.to_str()).unwrap_or("?")),
-                    display_mode);
+                let elem_rect =
+                    Rect::from_center_size(center_pos, Vec2::new(half_w * 2.0, half_h * 2.0));
+                if !full_rect.intersects(elem_rect) {
+                    continue;
+                }
+                draw_overlay_placeholder(
+                    painter,
+                    elem_rect,
+                    COL_OVERLAY_VIDEO,
+                    idx,
+                    state,
+                    &format!(
+                        "{} {}",
+                        crate::i18n::t("VID:"),
+                        vid.source
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("?")
+                    ),
+                    display_mode,
+                );
             }
         }
     }
@@ -2293,7 +2531,10 @@ fn draw_overlay_placeholder(
     label: &str,
     display_mode: DisplayMode,
 ) {
-    let alpha = match display_mode { DisplayMode::Active => 200u8, _ => 100u8 };
+    let alpha = match display_mode {
+        DisplayMode::Active => 200u8,
+        _ => 100u8,
+    };
     let fill = Color32::from_rgba_premultiplied(
         (color.r() as u16 * 40 / 255) as u8,
         (color.g() as u16 * 40 / 255) as u8,
@@ -2302,8 +2543,10 @@ fn draw_overlay_placeholder(
     );
     painter.rect_filled(elem_rect, Rounding::same(4.0), fill);
     painter.text(
-        elem_rect.center(), egui::Align2::CENTER_CENTER,
-        label, egui::FontId::proportional(10.0),
+        elem_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        label,
+        egui::FontId::proportional(10.0),
         Color32::from_rgb(160, 160, 180),
     );
     if display_mode != DisplayMode::Active {
@@ -2314,7 +2557,8 @@ fn draw_overlay_placeholder(
         };
         painter.text(
             Pos2::new(elem_rect.min.x + 4.0, elem_rect.min.y + 4.0),
-            egui::Align2::LEFT_TOP, badge,
+            egui::Align2::LEFT_TOP,
+            badge,
             egui::FontId::proportional(9.0),
             Color32::from_rgb(255, 180, 80),
         );
@@ -2374,12 +2618,20 @@ fn draw_text_overlay(
     // plate along that axis. `min(0.02)` keeps the plate from
     // disappearing exactly at the crossover point.
     let flip_x_factor = if ov_state.flip_x_anim.abs() < 1.0e-3 {
-        if ov_state.flip_x_anim < 0.0 { -0.02 } else { 0.02 }
+        if ov_state.flip_x_anim < 0.0 {
+            -0.02
+        } else {
+            0.02
+        }
     } else {
         ov_state.flip_x_anim
     };
     let flip_y_factor = if ov_state.flip_y_anim.abs() < 1.0e-3 {
-        if ov_state.flip_y_anim < 0.0 { -0.02 } else { 0.02 }
+        if ov_state.flip_y_anim < 0.0 {
+            -0.02
+        } else {
+            0.02
+        }
     } else {
         ov_state.flip_y_anim
     };
@@ -2418,19 +2670,29 @@ fn draw_text_overlay(
     let font_id = egui::FontId::new(effective_size, family);
 
     // Per-line layout: split text into lines and measure each in egui.
-    let lines: Vec<&str> = if txt.text.is_empty() { vec![" "] } else { txt.text.lines().collect() };
+    let lines: Vec<&str> = if txt.text.is_empty() {
+        vec![" "]
+    } else {
+        txt.text.lines().collect()
+    };
     let line_h = effective_size * 1.2;
 
     // Build galleys for each line so we can size the plate accurately.
-    let galleys: Vec<std::sync::Arc<egui::epaint::text::Galley>> = lines.iter().map(|l| {
-        let job = egui::text::LayoutJob::simple_singleline(
-            l.to_string(),
-            font_id.clone(),
-            apply_alpha(Color32::from_rgb(style.color[0], style.color[1], style.color[2]),
-                        ov_state.opacity, display_mode),
-        );
-        painter.layout_job(job)
-    }).collect();
+    let galleys: Vec<std::sync::Arc<egui::epaint::text::Galley>> = lines
+        .iter()
+        .map(|l| {
+            let job = egui::text::LayoutJob::simple_singleline(
+                l.to_string(),
+                font_id.clone(),
+                apply_alpha(
+                    Color32::from_rgb(style.color[0], style.color[1], style.color[2]),
+                    ov_state.opacity,
+                    display_mode,
+                ),
+            );
+            painter.layout_job(job)
+        })
+        .collect();
 
     let max_line_w = galleys.iter().map(|g| g.size().x).fold(0.0_f32, f32::max);
     let total_h = galleys.len() as f32 * line_h;
@@ -2465,9 +2727,14 @@ fn draw_text_overlay(
 
     // Skip if completely off-screen (use a generous rotation-aware margin)
     let bbox_margin = if rotated { plate_w.max(plate_h) } else { 50.0 };
-    if !full_rect.intersects(plate_rect.expand(bbox_margin)) { return; }
+    if !full_rect.intersects(plate_rect.expand(bbox_margin)) {
+        return;
+    }
 
-    let alpha_factor = match display_mode { DisplayMode::Active => 1.0, _ => 0.5 };
+    let alpha_factor = match display_mode {
+        DisplayMode::Active => 1.0,
+        _ => 0.5,
+    };
     let plate_opacity = style.box_opacity.clamp(0.0, 1.0) * ov_state.opacity * alpha_factor;
 
     // Flip channels — `flip_x_factor` and `flip_y_factor` carry both
@@ -2563,7 +2830,9 @@ fn draw_text_overlay(
     // ─── Plate background ────────────────────────────────────────
     if let Some(box_color) = style.box_color {
         let primary = Color32::from_rgba_unmultiplied(
-            box_color[0], box_color[1], box_color[2],
+            box_color[0],
+            box_color[1],
+            box_color[2],
             (plate_opacity * 255.0) as u8,
         );
 
@@ -2581,9 +2850,7 @@ fn draw_text_overlay(
                     ];
                     painter.add(egui::Shape::convex_polygon(pts, primary, Stroke::NONE));
                 }
-                if style.box_outline_width > 0.0
-                    || matches!(kind, TextBoxKind::OutlineOnly)
-                {
+                if style.box_outline_width > 0.0 || matches!(kind, TextBoxKind::OutlineOnly) {
                     let border_color_rgb = style.box_outline_color.unwrap_or([0, 0, 0]);
                     let border_color = Color32::from_rgba_unmultiplied(
                         border_color_rgb[0],
@@ -2675,7 +2942,9 @@ fn draw_text_overlay(
     let stroke_w = (style.outline_width * zoom * ov_state.scale).max(0.0);
     let glyph_color = apply_alpha(
         Color32::from_rgb(style.color[0], style.color[1], style.color[2]),
-        ov_state.opacity, display_mode);
+        ov_state.opacity,
+        display_mode,
+    );
 
     // Compute starting Y for vertical centering
     let mut y = plate_rect.center().y - total_h * 0.5 + line_h * 0.5;
@@ -2685,11 +2954,7 @@ fn draw_text_overlay(
     // so we emulate weight by repainting each line with a sub-pixel
     // horizontal offset. Two extra passes feel close enough to a bold
     // weight without ghosting.
-    let bold_offsets: &[f32] = if style.bold {
-        &[0.0, 0.7, 1.4]
-    } else {
-        &[0.0]
-    };
+    let bold_offsets: &[f32] = if style.bold { &[0.0, 0.7, 1.4] } else { &[0.0] };
 
     // Flip channels — same continuous factors used for the plate
     // above. The per-line glyph mesh in `paint_text_line_flipped`
@@ -2715,14 +2980,23 @@ fn draw_text_overlay(
             if let Some(stroke_rgb) = style.outline {
                 let stroke_color = apply_alpha(
                     Color32::from_rgb(stroke_rgb[0], stroke_rgb[1], stroke_rgb[2]),
-                    ov_state.opacity, display_mode);
+                    ov_state.opacity,
+                    display_mode,
+                );
                 let n_steps = 8;
                 for step in 0..n_steps {
                     let theta = (step as f32) / (n_steps as f32) * std::f32::consts::TAU;
                     let off = Vec2::new(theta.cos() * stroke_w, theta.sin() * stroke_w);
                     paint_text_line_flipped(
-                        painter, pos + off, &lines[li], font_id.clone(),
-                        stroke_color, rotation_rad, center_pos, line_flip_x, line_flip_y,
+                        painter,
+                        pos + off,
+                        &lines[li],
+                        font_id.clone(),
+                        stroke_color,
+                        rotation_rad,
+                        center_pos,
+                        line_flip_x,
+                        line_flip_y,
                     );
                 }
             }
@@ -2731,10 +3005,21 @@ fn draw_text_overlay(
         // Main glyph fill — repeated once per bold offset to synthesise
         // weight on the bundled font.
         for &dx in bold_offsets {
-            let p = if dx > 0.0 { pos + Vec2::new(dx, 0.0) } else { pos };
+            let p = if dx > 0.0 {
+                pos + Vec2::new(dx, 0.0)
+            } else {
+                pos
+            };
             paint_text_line_flipped(
-                painter, p, &lines[li], font_id.clone(), glyph_color,
-                rotation_rad, center_pos, line_flip_x, line_flip_y,
+                painter,
+                p,
+                &lines[li],
+                font_id.clone(),
+                glyph_color,
+                rotation_rad,
+                center_pos,
+                line_flip_x,
+                line_flip_y,
             );
         }
         y += line_h;
@@ -2755,12 +3040,18 @@ fn draw_text_overlay(
                 painter.line_segment([w[0], w[1]], Stroke::new(2.0, COL_SELECTED_BORDER));
             }
         } else {
-            painter.rect_stroke(plate_rect.expand(2.0), Rounding::same(radius + 2.0),
-                Stroke::new(2.0, COL_SELECTED_BORDER));
+            painter.rect_stroke(
+                plate_rect.expand(2.0),
+                Rounding::same(radius + 2.0),
+                Stroke::new(2.0, COL_SELECTED_BORDER),
+            );
         }
     } else if display_mode == DisplayMode::Active && !needs_polygon_plate {
-        painter.rect_stroke(plate_rect, Rounding::same(radius),
-            Stroke::new(0.5, Color32::from_rgba_unmultiplied(120, 200, 140, 60)));
+        painter.rect_stroke(
+            plate_rect,
+            Rounding::same(radius),
+            Stroke::new(0.5, Color32::from_rgba_unmultiplied(120, 200, 140, 60)),
+        );
     }
 
     // Display mode badge (kept axis-aligned for legibility)
@@ -2772,7 +3063,8 @@ fn draw_text_overlay(
         };
         painter.text(
             Pos2::new(plate_rect.min.x + 4.0, plate_rect.min.y + 4.0),
-            egui::Align2::LEFT_TOP, badge,
+            egui::Align2::LEFT_TOP,
+            badge,
             egui::FontId::proportional(9.0),
             Color32::from_rgb(255, 180, 80),
         );
@@ -2893,7 +3185,10 @@ fn paint_text_line_flipped(
 
 /// Apply a per-state opacity factor to a base color.
 fn apply_alpha(base: Color32, ov_opacity: f32, mode: DisplayMode) -> Color32 {
-    let mode_factor = match mode { DisplayMode::Active => 1.0, _ => 0.5 };
+    let mode_factor = match mode {
+        DisplayMode::Active => 1.0,
+        _ => 0.5,
+    };
     let a = ((base.a() as f32) * ov_opacity * mode_factor).clamp(0.0, 255.0) as u8;
     Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), a)
 }
@@ -2908,7 +3203,9 @@ fn draw_vertical_gradient(
 ) {
     let n_strips = 24usize;
     let h = rect.height();
-    if h <= 0.0 { return; }
+    if h <= 0.0 {
+        return;
+    }
     let strip_h = h / n_strips as f32;
     for i in 0..n_strips {
         let t = (i as f32 + 0.5) / n_strips as f32;
@@ -2923,9 +3220,19 @@ fn draw_vertical_gradient(
         );
         // Apply rounding only to top and bottom strips.
         let rounding = if i == 0 {
-            Rounding { nw: radius, ne: radius, sw: 0.0, se: 0.0 }
+            Rounding {
+                nw: radius,
+                ne: radius,
+                sw: 0.0,
+                se: 0.0,
+            }
         } else if i == n_strips - 1 {
-            Rounding { nw: 0.0, ne: 0.0, sw: radius, se: radius }
+            Rounding {
+                nw: 0.0,
+                ne: 0.0,
+                sw: radius,
+                se: radius,
+            }
         } else {
             Rounding::ZERO
         };
@@ -2941,9 +3248,13 @@ fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
 /// Helper: truncate a string to max_chars.
 #[allow(dead_code)]
 fn truncate_str(s: &str, max_chars: usize) -> &str {
-    if s.len() <= max_chars { return s; }
+    if s.len() <= max_chars {
+        return s;
+    }
     let mut end = max_chars;
-    while end > 0 && !s.is_char_boundary(end) { end -= 1; }
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
     &s[..end]
 }
 
@@ -2953,7 +3264,6 @@ enum DisplayMode {
     BeforeStart,
     AfterEnd,
 }
-
 
 // ─── ELEMENT POSITION RESOLUTION ─────────────────────────────────────
 
@@ -2975,7 +3285,11 @@ pub fn resolve_parent_transform(
 }
 
 fn safe_div(num: f32, den: f32) -> f32 {
-    if den.abs() > 1.0e-6 { num / den } else { 1.0 }
+    if den.abs() > 1.0e-6 {
+        num / den
+    } else {
+        1.0
+    }
 }
 
 /// World coords relative to the render frame.
@@ -3008,7 +3322,7 @@ pub(crate) fn get_element_world_pos(
     // attachment to be honoured here too so the gizmo doesn't drift
     // off the picture's centre when an attachment is active.
     if let Some(att) = state.scene.overlays.iter().find_map(|ov| match ov {
-        Overlay::Text(o)  if o.id == element_id => o.skeleton_attachment.as_ref(),
+        Overlay::Text(o) if o.id == element_id => o.skeleton_attachment.as_ref(),
         Overlay::Image(o) if o.id == element_id => o.skeleton_attachment.as_ref(),
         Overlay::Video(o) if o.id == element_id => o.skeleton_attachment.as_ref(),
         _ => None,
@@ -3033,9 +3347,13 @@ pub(crate) fn get_element_world_pos(
     };
 
     // Check canvas_layouts for this element (scene-time keyframes).
-    let base_pos = if let Some(cl) = state.scene.canvas_layouts.iter().find(|cl| cl.element_id == element_id) {
-        keyframe::sample(&cl.keyframes, sample_t)
-            .map(|transform| transform.pos)
+    let base_pos = if let Some(cl) = state
+        .scene
+        .canvas_layouts
+        .iter()
+        .find(|cl| cl.element_id == element_id)
+    {
+        keyframe::sample(&cl.keyframes, sample_t).map(|transform| transform.pos)
     } else {
         None
     };
@@ -3078,7 +3396,10 @@ pub(crate) fn get_element_world_pos(
     // ── Parent transform propagation ──
     // If this element has a parent, apply the parent's accumulated
     // transform (position, rotation, scale) to the child's local pos.
-    let parent_id = state.scene.actors.iter()
+    let parent_id = state
+        .scene
+        .actors
+        .iter()
         .find(|a| a.id == element_id)
         .and_then(|a| a.parent_id.clone())
         .or_else(|| {
@@ -3102,7 +3423,6 @@ pub(crate) fn get_element_world_pos(
     base_pos
 }
 
-
 /// Sample an actor's transform at scene time `t` (per-param tracks).
 fn sample_actor_transform(actor: &memstroy_core::Actor, t: f32) -> ActorState {
     memstroy_core::sample_actor_layout(&actor.layout, &actor.animated_params, t)
@@ -3111,21 +3431,15 @@ fn sample_actor_transform(actor: &memstroy_core::Actor, t: f32) -> ActorState {
 /// Sample an overlay's transform at clip-local time `t` (per-param tracks).
 fn sample_overlay_transform(overlay: &Overlay, local_t: f32) -> OverlayState {
     match overlay {
-        Overlay::Text(t) => memstroy_core::sample_overlay_layout(
-            &t.layout,
-            &t.animated_params,
-            local_t,
-        ),
-        Overlay::Image(im) => memstroy_core::sample_overlay_layout(
-            &im.layout,
-            &im.animated_params,
-            local_t,
-        ),
-        Overlay::Video(v) => memstroy_core::sample_overlay_layout(
-            &v.layout,
-            &v.animated_params,
-            local_t,
-        ),
+        Overlay::Text(t) => {
+            memstroy_core::sample_overlay_layout(&t.layout, &t.animated_params, local_t)
+        }
+        Overlay::Image(im) => {
+            memstroy_core::sample_overlay_layout(&im.layout, &im.animated_params, local_t)
+        }
+        Overlay::Video(v) => {
+            memstroy_core::sample_overlay_layout(&v.layout, &v.animated_params, local_t)
+        }
     }
 }
 
@@ -3197,19 +3511,29 @@ fn selection_element_id(state: &EditorState, sel: Selection) -> Option<String> {
 
 fn selection_position_animated(state: &EditorState, sel: Selection) -> bool {
     match sel {
-        Selection::Actor(i) => state.scene.actors.get(i).map(|a| {
-            a.animated_params.contains(memstroy_core::param_ids::POS_X)
-                || a.animated_params.contains(memstroy_core::param_ids::POS_Y)
-        }).unwrap_or(false),
-        Selection::Overlay(i) => state.scene.overlays.get(i).map(|ov| {
-            let ap = match ov {
-                Overlay::Text(t) => &t.animated_params,
-                Overlay::Image(im) => &im.animated_params,
-                Overlay::Video(v) => &v.animated_params,
-            };
-            ap.contains(memstroy_core::param_ids::POS_X)
-                || ap.contains(memstroy_core::param_ids::POS_Y)
-        }).unwrap_or(false),
+        Selection::Actor(i) => state
+            .scene
+            .actors
+            .get(i)
+            .map(|a| {
+                a.animated_params.contains(memstroy_core::param_ids::POS_X)
+                    || a.animated_params.contains(memstroy_core::param_ids::POS_Y)
+            })
+            .unwrap_or(false),
+        Selection::Overlay(i) => state
+            .scene
+            .overlays
+            .get(i)
+            .map(|ov| {
+                let ap = match ov {
+                    Overlay::Text(t) => &t.animated_params,
+                    Overlay::Image(im) => &im.animated_params,
+                    Overlay::Video(v) => &v.animated_params,
+                };
+                ap.contains(memstroy_core::param_ids::POS_X)
+                    || ap.contains(memstroy_core::param_ids::POS_Y)
+            })
+            .unwrap_or(false),
         _ => false,
     }
 }
@@ -3220,35 +3544,54 @@ fn selection_rotation_animated(state: &EditorState, sel: Selection) -> bool {
             .scene
             .actors
             .get(i)
-            .map(|a| a.animated_params.contains(memstroy_core::param_ids::ROTATION))
+            .map(|a| {
+                a.animated_params
+                    .contains(memstroy_core::param_ids::ROTATION)
+            })
             .unwrap_or(false),
-        Selection::Overlay(i) => state.scene.overlays.get(i).map(|ov| {
-            let ap = match ov {
-                Overlay::Text(t) => &t.animated_params,
-                Overlay::Image(im) => &im.animated_params,
-                Overlay::Video(v) => &v.animated_params,
-            };
-            ap.contains(memstroy_core::param_ids::ROTATION)
-        }).unwrap_or(false),
+        Selection::Overlay(i) => state
+            .scene
+            .overlays
+            .get(i)
+            .map(|ov| {
+                let ap = match ov {
+                    Overlay::Text(t) => &t.animated_params,
+                    Overlay::Image(im) => &im.animated_params,
+                    Overlay::Video(v) => &v.animated_params,
+                };
+                ap.contains(memstroy_core::param_ids::ROTATION)
+            })
+            .unwrap_or(false),
         _ => false,
     }
 }
 
 fn selection_scale_animated(state: &EditorState, sel: Selection) -> bool {
     match sel {
-        Selection::Actor(i) => state.scene.actors.get(i).map(|a| {
-            a.animated_params.contains(memstroy_core::param_ids::SCALE)
-                || a.animated_params.contains(memstroy_core::param_ids::SCALE_Y)
-        }).unwrap_or(false),
-        Selection::Overlay(i) => state.scene.overlays.get(i).map(|ov| {
-            let ap = match ov {
-                Overlay::Text(t) => &t.animated_params,
-                Overlay::Image(im) => &im.animated_params,
-                Overlay::Video(v) => &v.animated_params,
-            };
-            ap.contains(memstroy_core::param_ids::SCALE)
-                || ap.contains(memstroy_core::param_ids::SCALE_Y)
-        }).unwrap_or(false),
+        Selection::Actor(i) => state
+            .scene
+            .actors
+            .get(i)
+            .map(|a| {
+                a.animated_params.contains(memstroy_core::param_ids::SCALE)
+                    || a.animated_params
+                        .contains(memstroy_core::param_ids::SCALE_Y)
+            })
+            .unwrap_or(false),
+        Selection::Overlay(i) => state
+            .scene
+            .overlays
+            .get(i)
+            .map(|ov| {
+                let ap = match ov {
+                    Overlay::Text(t) => &t.animated_params,
+                    Overlay::Image(im) => &im.animated_params,
+                    Overlay::Video(v) => &v.animated_params,
+                };
+                ap.contains(memstroy_core::param_ids::SCALE)
+                    || ap.contains(memstroy_core::param_ids::SCALE_Y)
+            })
+            .unwrap_or(false),
         _ => false,
     }
 }
@@ -3301,7 +3644,6 @@ fn commit_canvas_drag_preview(state: &mut EditorState) {
     state.canvas_drag.drag_start_playhead = None;
     state.canvas_drag.preview_element_id = None;
 }
-
 
 // ─── SELECTION & DRAG STATE MACHINE ──────────────────────────────────
 //
@@ -3396,9 +3738,7 @@ fn draw_selection_gizmo(
             // `i.pointer.press_origin()` carries the press location
             // we want; we still fall back to the post-drift position
             // when the pointer state is somehow unavailable.
-            let start = ui
-                .input(|i| i.pointer.press_origin())
-                .unwrap_or(start_resp);
+            let start = ui.input(|i| i.pointer.press_origin()).unwrap_or(start_resp);
             let local = [start.x - full_rect.min.x, start.y - full_rect.min.y];
             let world = state.canvas_viewport.screen_to_world(local, viewport_size);
             let modifiers = ui.input(|i| i.modifiers);
@@ -3464,8 +3804,7 @@ fn draw_selection_gizmo(
                     // scale and rotation — apply_drag adds the primary's
                     // accumulated delta to each entry per frame so the
                     // group moves together without drift.
-                    state.canvas_drag.multi_drag_snapshot =
-                        snapshot_multi_drag(state);
+                    state.canvas_drag.multi_drag_snapshot = snapshot_multi_drag(state);
                 }
             }
         }
@@ -3482,9 +3821,7 @@ fn draw_selection_gizmo(
             // drag-end, so the user sees live preview of who's inside
             // while they drag (handled by per-element highlights), but
             // commit only happens once on release.
-            if let crate::state::CanvasDragMode::Marquee { extend, .. } =
-                state.canvas_drag.mode
-            {
+            if let crate::state::CanvasDragMode::Marquee { extend, .. } = state.canvas_drag.mode {
                 commit_marquee_selection(state, extend);
                 state.canvas_marquee = None;
             }
@@ -3510,7 +3847,10 @@ fn draw_selection_gizmo(
     }
 
     // ── Click to select (egui distinguishes click from drag automatically) ──
-    if response.clicked() && state.canvas_drag.mode == crate::state::CanvasDragMode::None {
+    if response.clicked()
+        && response.hovered()
+        && state.canvas_drag.mode == crate::state::CanvasDragMode::None
+    {
         if let Some(mouse) = response.interact_pointer_pos() {
             let local = [mouse.x - full_rect.min.x, mouse.y - full_rect.min.y];
             let click_world = state.canvas_viewport.screen_to_world(local, viewport_size);
@@ -3642,10 +3982,26 @@ fn decide_drag_mode(
             (gizmo.local_to_screen(hw, -hh), 1, bl),
             (gizmo.local_to_screen(hw, hh), 2, tl),
             (gizmo.local_to_screen(-hw, hh), 3, tr),
-            (gizmo.local_to_screen(0.0, -hh), 4, screen_to_world_xy(gizmo.local_to_screen(0.0, hh))),
-            (gizmo.local_to_screen(hw, 0.0), 5, screen_to_world_xy(gizmo.local_to_screen(-hw, 0.0))),
-            (gizmo.local_to_screen(0.0, hh), 6, screen_to_world_xy(gizmo.local_to_screen(0.0, -hh))),
-            (gizmo.local_to_screen(-hw, 0.0), 7, screen_to_world_xy(gizmo.local_to_screen(hw, 0.0))),
+            (
+                gizmo.local_to_screen(0.0, -hh),
+                4,
+                screen_to_world_xy(gizmo.local_to_screen(0.0, hh)),
+            ),
+            (
+                gizmo.local_to_screen(hw, 0.0),
+                5,
+                screen_to_world_xy(gizmo.local_to_screen(-hw, 0.0)),
+            ),
+            (
+                gizmo.local_to_screen(0.0, hh),
+                6,
+                screen_to_world_xy(gizmo.local_to_screen(0.0, -hh)),
+            ),
+            (
+                gizmo.local_to_screen(-hw, 0.0),
+                7,
+                screen_to_world_xy(gizmo.local_to_screen(hw, 0.0)),
+            ),
         ];
         let _ = (zoom, world_cx, world_cy, tl, tr);
 
@@ -3661,10 +4017,10 @@ fn decide_drag_mode(
             if (start - *handle_pos).length() < ELEM_HANDLE_SIZE * 3.0 {
                 let initial_scale = current_selection_scale(state).unwrap_or(1.0);
                 let initial_scale_y = current_selection_scale_y(state).unwrap_or(1.0);
-                let initial_pos_world = current_selection_world_center(state)
-                    .unwrap_or([world_cx, world_cy]);
-                let (base_w, base_h) = current_selection_base_dims(state)
-                    .unwrap_or((1080.0, 1920.0));
+                let initial_pos_world =
+                    current_selection_world_center(state).unwrap_or([world_cx, world_cy]);
+                let (base_w, base_h) =
+                    current_selection_base_dims(state).unwrap_or((1080.0, 1920.0));
                 return CanvasDragMode::ResizeSelection {
                     handle: *handle_id,
                     initial_scale,
@@ -3685,10 +4041,17 @@ fn decide_drag_mode(
     // 3. Click on the render frame's center handle → MoveRenderFrame.
     let rf = &state.scene.render_frame;
     let rf_state = sample_render_frame(rf, state.playhead);
-    let center_screen = state.canvas_viewport.world_to_screen(rf_state.pos, viewport_size);
-    let rf_center = Pos2::new(full_rect.min.x + center_screen[0], full_rect.min.y + center_screen[1]);
+    let center_screen = state
+        .canvas_viewport
+        .world_to_screen(rf_state.pos, viewport_size);
+    let rf_center = Pos2::new(
+        full_rect.min.x + center_screen[0],
+        full_rect.min.y + center_screen[1],
+    );
     if (start - rf_center).length() < RF_CENTER_RADIUS * 2.0 {
-        return CanvasDragMode::MoveRenderFrame { initial_pos: [rf_state.pos.x, rf_state.pos.y] };
+        return CanvasDragMode::MoveRenderFrame {
+            initial_pos: [rf_state.pos.x, rf_state.pos.y],
+        };
     }
 
     // 3b. When the render frame is the selection, dragging anywhere
@@ -3791,7 +4154,10 @@ fn apply_drag(
             });
         }
 
-        CanvasDragMode::MoveActorWorld { actor_idx, initial_pos } => {
+        CanvasDragMode::MoveActorWorld {
+            actor_idx,
+            initial_pos,
+        } => {
             if actor_idx < state.scene.actors.len() {
                 let proposed_x = initial_pos[0] + world_dx;
                 let proposed_y = initial_pos[1] + world_dy;
@@ -3815,7 +4181,10 @@ fn apply_drag(
             }
         }
 
-        CanvasDragMode::MoveActorLegacy { actor_idx, initial_pos } => {
+        CanvasDragMode::MoveActorLegacy {
+            actor_idx,
+            initial_pos,
+        } => {
             if actor_idx < state.scene.actors.len() {
                 // `initial_pos` is the world centre at drag start (see
                 // `move_selection_mode`). Apply the screen delta in
@@ -3837,7 +4206,10 @@ fn apply_drag(
             }
         }
 
-        CanvasDragMode::MoveOverlay { overlay_idx, initial_pos } => {
+        CanvasDragMode::MoveOverlay {
+            overlay_idx,
+            initial_pos,
+        } => {
             if overlay_idx < state.scene.overlays.len() {
                 let proposed_x = initial_pos[0] + world_dx;
                 let proposed_y = initial_pos[1] + world_dy;
@@ -3856,8 +4228,13 @@ fn apply_drag(
         }
 
         CanvasDragMode::ResizeSelection {
-            handle, initial_scale, initial_scale_y, initial_pos_world,
-            anchor_world, base_w, base_h,
+            handle,
+            initial_scale,
+            initial_scale_y,
+            initial_pos_world,
+            anchor_world,
+            base_w,
+            base_h,
         } => {
             // Convert pointer to world space.
             let viewport = &state.canvas_viewport;
@@ -3868,9 +4245,9 @@ fn apply_drag(
             // For each handle, decide which axes change, and what the new
             // dragged-edge world position is.
             let (changes_x, changes_y) = match handle {
-                0 | 1 | 2 | 3 => (true, true),     // corners
-                4 | 6 => (false, true),            // top / bottom edges
-                5 | 7 => (true, false),            // right / left edges
+                0 | 1 | 2 | 3 => (true, true), // corners
+                4 | 6 => (false, true),        // top / bottom edges
+                5 | 7 => (true, false),        // right / left edges
                 _ => (true, true),
             };
 
@@ -3922,10 +4299,14 @@ fn apply_drag(
 
             let new_w = if changes_x {
                 ((snapped_cur_x - anchor_world[0]).abs()).max(base_w * 0.05)
-            } else { init_w };
+            } else {
+                init_w
+            };
             let new_h = if changes_y {
                 ((snapped_cur_y - anchor_world[1]).abs()).max(base_h * 0.05)
-            } else { init_h };
+            } else {
+                init_h
+            };
 
             // Shift = uniform scale (lock aspect ratio).
             let (final_w, final_h) = if shift_held && changes_x && changes_y {
@@ -3934,19 +4315,33 @@ fn apply_drag(
                 let ry = new_h / init_h.max(1e-3);
                 let r = if rx.abs() >= ry.abs() { rx } else { ry };
                 (init_w * r, init_h * r)
-            } else { (new_w, new_h) };
+            } else {
+                (new_w, new_h)
+            };
 
             // Compute new center in world space:
             //   - For axes that change: midpoint between pointer and anchor.
             //   - For axes that don't change: keep initial center.
             let cx = if changes_x {
-                let signed = if snapped_cur_x >= anchor_world[0] { 1.0 } else { -1.0 };
+                let signed = if snapped_cur_x >= anchor_world[0] {
+                    1.0
+                } else {
+                    -1.0
+                };
                 anchor_world[0] + signed * final_w * 0.5
-            } else { initial_pos_world[0] };
+            } else {
+                initial_pos_world[0]
+            };
             let cy = if changes_y {
-                let signed = if snapped_cur_y >= anchor_world[1] { 1.0 } else { -1.0 };
+                let signed = if snapped_cur_y >= anchor_world[1] {
+                    1.0
+                } else {
+                    -1.0
+                };
                 anchor_world[1] + signed * final_h * 0.5
-            } else { initial_pos_world[1] };
+            } else {
+                initial_pos_world[1]
+            };
 
             // Derive scale, scale_y from final dims.
             let new_scale = (final_w / base_w.max(1e-3)).clamp(0.05, 100.0);
@@ -3991,7 +4386,10 @@ fn apply_drag(
             // silently spawning a mid-track keyframe — that's what
             // produced "parameter-less" diamonds during playback drags
             // before this fix.
-            let t = state.canvas_drag.drag_start_playhead.unwrap_or(state.playhead);
+            let t = state
+                .canvas_drag
+                .drag_start_playhead
+                .unwrap_or(state.playhead);
             let new_x = initial_pos[0] + world_dx;
             let new_y = initial_pos[1] + world_dy;
             crate::kf_anim::write_render_frame_param(
@@ -4024,9 +4422,14 @@ fn apply_drag(
             // that v1 needed is gone with it.
         }
 
-        CanvasDragMode::ResizeRenderFrame { initial_zoom, anchor_distance } => {
+        CanvasDragMode::ResizeRenderFrame {
+            initial_zoom,
+            anchor_distance,
+        } => {
             let rf_state = sample_render_frame(&state.scene.render_frame, state.playhead);
-            let center_screen = state.canvas_viewport.world_to_screen(rf_state.pos, viewport_size);
+            let center_screen = state
+                .canvas_viewport
+                .world_to_screen(rf_state.pos, viewport_size);
             let rf_center = Pos2::new(
                 full_rect.min.x + center_screen[0],
                 full_rect.min.y + center_screen[1],
@@ -4035,7 +4438,10 @@ fn apply_drag(
             if anchor_distance > 1.0 {
                 let factor = (cur_dist / anchor_distance).max(0.05);
                 let new_zoom = (initial_zoom / factor).clamp(0.1, 10.0);
-                let t = state.canvas_drag.drag_start_playhead.unwrap_or(state.playhead);
+                let t = state
+                    .canvas_drag
+                    .drag_start_playhead
+                    .unwrap_or(state.playhead);
                 // Same gating as MoveRenderFrame above — the resize
                 // becomes static when SCALE isn't in
                 // `animated_params`, otherwise upserts a kf at the
@@ -4054,18 +4460,28 @@ fn apply_drag(
             }
         }
 
-        CanvasDragMode::RotateSelection { initial_rot_deg, center_screen, start_angle_rad } => {
+        CanvasDragMode::RotateSelection {
+            initial_rot_deg,
+            center_screen,
+            start_angle_rad,
+        } => {
             // Map current pointer to angle around the element's centre,
             // subtract the start angle, and add to the initial rotation.
             // Hold Shift to snap to 15° increments.
             let dx = cur.x - center_screen[0];
             let dy = cur.y - center_screen[1];
-            if dx.abs() < 0.001 && dy.abs() < 0.001 { return; }
+            if dx.abs() < 0.001 && dy.abs() < 0.001 {
+                return;
+            }
             let cur_angle = dy.atan2(dx);
             let mut delta_deg = (cur_angle - start_angle_rad).to_degrees();
             // Wrap delta to (-180, 180] so spinning past the wrap stays smooth.
-            while delta_deg > 180.0 { delta_deg -= 360.0; }
-            while delta_deg < -180.0 { delta_deg += 360.0; }
+            while delta_deg > 180.0 {
+                delta_deg -= 360.0;
+            }
+            while delta_deg < -180.0 {
+                delta_deg += 360.0;
+            }
             let mut new_rot = initial_rot_deg + delta_deg;
             if shift_held {
                 new_rot = (new_rot / 15.0).round() * 15.0;
@@ -4089,7 +4505,10 @@ fn apply_drag(
 
 fn move_selection_mode(state: &EditorState) -> crate::state::CanvasDragMode {
     use crate::state::CanvasDragMode;
-    let t = state.canvas_drag.drag_start_playhead.unwrap_or(state.playhead);
+    let t = state
+        .canvas_drag
+        .drag_start_playhead
+        .unwrap_or(state.playhead);
     match state.selection {
         Selection::Actor(idx) if idx < state.scene.actors.len() => {
             let actor = &state.scene.actors[idx];
@@ -4100,7 +4519,12 @@ fn move_selection_mode(state: &EditorState) -> crate::state::CanvasDragMode {
             // the pointer.
             let wp = get_element_world_pos(state, &actor_id, &actor.layout, t);
             let initial_world = [wp.x, wp.y];
-            if let Some(cl) = state.scene.canvas_layouts.iter().find(|cl| cl.element_id == actor_id) {
+            if let Some(cl) = state
+                .scene
+                .canvas_layouts
+                .iter()
+                .find(|cl| cl.element_id == actor_id)
+            {
                 if !cl.keyframes.is_empty() {
                     return CanvasDragMode::MoveActorWorld {
                         actor_idx: idx,
@@ -4108,7 +4532,10 @@ fn move_selection_mode(state: &EditorState) -> crate::state::CanvasDragMode {
                     };
                 }
             }
-            CanvasDragMode::MoveActorLegacy { actor_idx: idx, initial_pos: initial_world }
+            CanvasDragMode::MoveActorLegacy {
+                actor_idx: idx,
+                initial_pos: initial_world,
+            }
         }
         Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
             let initial_world = overlay_visible_world_center(state, idx, t)
@@ -4161,9 +4588,7 @@ fn current_selection_rotation(state: &EditorState) -> Option<f32> {
         }
         Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
             let local_t = overlay_clip_local_time(state, idx);
-            Some(
-                sample_overlay_transform(&state.scene.overlays[idx], local_t).rotation_deg,
-            )
+            Some(sample_overlay_transform(&state.scene.overlays[idx], local_t).rotation_deg)
         }
         Selection::RenderFrame => {
             let rf_state = sample_render_frame(&state.scene.render_frame, t);
@@ -4177,7 +4602,10 @@ fn current_selection_rotation(state: &EditorState) -> Option<f32> {
 /// bounding rect. It floats above the top-mid handle, attached by a stem
 /// (drawn in `draw_selection_handles`).
 fn rotation_handle_screen_pos(elem_rect: Rect) -> Pos2 {
-    Pos2::new(elem_rect.center().x, elem_rect.min.y - ROTATION_HANDLE_OFFSET)
+    Pos2::new(
+        elem_rect.center().x,
+        elem_rect.min.y - ROTATION_HANDLE_OFFSET,
+    )
 }
 
 fn rotation_handle_screen_pos_gizmo(g: &ElementGizmo) -> Pos2 {
@@ -4192,9 +4620,7 @@ fn current_selection_scale_y(state: &EditorState) -> Option<f32> {
         }
         Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
             let local_t = overlay_clip_local_time(state, idx);
-            Some(
-                sample_overlay_transform(&state.scene.overlays[idx], local_t).scale_y,
-            )
+            Some(sample_overlay_transform(&state.scene.overlays[idx], local_t).scale_y)
         }
         // Render frame is locked to its output aspect ratio.
         Selection::RenderFrame => Some(1.0),
@@ -4211,8 +4637,12 @@ fn current_selection_base_dims(state: &EditorState) -> Option<(f32, f32)> {
             let (base_w, base_h) = if let Some(fc) = state.frame_caches.get(idx) {
                 if fc.is_ready() && fc.frame_count > 0 {
                     (fc.source_width as f32, fc.source_height as f32)
-                } else { (1080.0, 1920.0) }
-            } else { (1080.0, 1920.0) };
+                } else {
+                    (1080.0, 1920.0)
+                }
+            } else {
+                (1080.0, 1920.0)
+            };
             Some((base_w, base_h))
         }
         Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
@@ -4222,7 +4652,15 @@ fn current_selection_base_dims(state: &EditorState) -> Option<(f32, f32)> {
             // PNG dimensions when they're loaded so resize handles snap
             // to the visible picture corners (not the legacy 200×200
             // placeholder).
-            let neutral = OverlayState { pos: [0.0, 0.0], scale: 1.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 1.0, flip_x_anim: 1.0, flip_y_anim: 1.0 };
+            let neutral = OverlayState {
+                pos: [0.0, 0.0],
+                scale: 1.0,
+                scale_y: 1.0,
+                rotation_deg: 0.0,
+                opacity: 1.0,
+                flip_x_anim: 1.0,
+                flip_y_anim: 1.0,
+            };
             Some(overlay_bbox_with_state(ov, &neutral, state))
         }
         Selection::RenderFrame => {
@@ -4330,19 +4768,15 @@ fn snapshot_multi_drag(state: &EditorState) -> Vec<crate::state::MultiDragEntry>
     let mut out = Vec::with_capacity(state.canvas_selection.len());
     for sel in &state.canvas_selection {
         let pos = match *sel {
-            Selection::Actor(i) => {
-                actor_world_aabb(state, i, state.playhead).map(|(mn, mx)| {
-                    [(mn[0] + mx[0]) * 0.5, (mn[1] + mx[1]) * 0.5]
-                })
-            }
-            Selection::Overlay(i) => {
-                overlay_world_aabb(state, i, state.playhead).map(|(mn, mx)| {
-                    [(mn[0] + mx[0]) * 0.5, (mn[1] + mx[1]) * 0.5]
-                })
-            }
+            Selection::Actor(i) => actor_world_aabb(state, i, state.playhead)
+                .map(|(mn, mx)| [(mn[0] + mx[0]) * 0.5, (mn[1] + mx[1]) * 0.5]),
+            Selection::Overlay(i) => overlay_world_aabb(state, i, state.playhead)
+                .map(|(mn, mx)| [(mn[0] + mx[0]) * 0.5, (mn[1] + mx[1]) * 0.5]),
             _ => None,
         };
-        let Some(initial_pos) = pos else { continue; };
+        let Some(initial_pos) = pos else {
+            continue;
+        };
         let (initial_scale, initial_scale_y, initial_rotation) =
             sample_selection_transform(state, *sel);
         out.push(crate::state::MultiDragEntry {
@@ -4394,7 +4828,9 @@ fn broadcast_multi_translation(state: &mut EditorState, total_dx: f32, total_dy:
     let primary = state.selection;
     let snapshot = state.canvas_drag.multi_drag_snapshot.clone();
     for entry in snapshot {
-        if entry.selection == primary { continue; }
+        if entry.selection == primary {
+            continue;
+        }
         let new_center = [
             entry.initial_pos[0] + total_dx,
             entry.initial_pos[1] + total_dy,
@@ -4415,7 +4851,9 @@ fn broadcast_multi_scale(state: &mut EditorState, scale_factor: f32, scale_y_fac
     let token_y = canvas_drag_token(CANVAS_TOKEN_SCALE_Y, state.selection);
     let snapshot = state.canvas_drag.multi_drag_snapshot.clone();
     for entry in snapshot {
-        if entry.selection == primary { continue; }
+        if entry.selection == primary {
+            continue;
+        }
         let new_scale = (entry.initial_scale * scale_factor).clamp(0.05, 100.0);
         let new_scale_y = (entry.initial_scale_y * scale_y_factor).clamp(0.05, 100.0);
         write_selection_scale(state, entry.selection, new_scale, token_x, true);
@@ -4435,7 +4873,9 @@ fn broadcast_multi_rotation(state: &mut EditorState, delta_deg: f32) {
     let token = canvas_drag_token(CANVAS_TOKEN_ROTATION, state.selection);
     let snapshot = state.canvas_drag.multi_drag_snapshot.clone();
     for entry in snapshot {
-        if entry.selection == primary { continue; }
+        if entry.selection == primary {
+            continue;
+        }
         let new_rot = (entry.initial_rotation + delta_deg).clamp(-3600.0, 3600.0);
         write_selection_rotation(state, entry.selection, new_rot, token, true);
     }
@@ -4465,7 +4905,10 @@ fn write_selection_world_center(
     // start (frozen for the duration of the gesture). Outside an active
     // drag the live playhead is used so single inspector edits still
     // land at the visible time.
-    let t = state.canvas_drag.drag_start_playhead.unwrap_or(state.playhead);
+    let t = state
+        .canvas_drag
+        .drag_start_playhead
+        .unwrap_or(state.playhead);
     // ── Undo grouping: one snapshot per drag gesture. ──
     state.push_drag_undo_if_needed(token);
     match sel {
@@ -4481,14 +4924,20 @@ fn write_selection_world_center(
             // static.
             let animated_clone = state.scene.actors[idx].animated_params.clone();
             let parent_id = state.scene.actors[idx].parent_id.clone();
-            let mut stored_center = WorldPos { x: center[0], y: center[1] };
+            let mut stored_center = WorldPos {
+                x: center[0],
+                y: center[1],
+            };
             if let Some(pid) = parent_id {
                 let mut visited = vec![actor_id.clone()];
                 if let Some(pxf) = resolve_parent_transform(state, &pid, t, &mut visited) {
                     stored_center = inverse_parent_transform(stored_center, &pxf);
                 }
             }
-            if let Some(cl) = state.scene.canvas_layouts.iter_mut()
+            if let Some(cl) = state
+                .scene
+                .canvas_layouts
+                .iter_mut()
                 .find(|cl| cl.element_id == actor_id)
             {
                 let sx = stored_center.x;
@@ -4541,17 +4990,25 @@ fn write_selection_world_center(
             let [rw, rh] = state.scene.render_frame.resolution;
             let world_w = rw as f32;
             let world_h = rh as f32;
-            if world_w <= 0.0 || world_h <= 0.0 { return; }
+            if world_w <= 0.0 || world_h <= 0.0 {
+                return;
+            }
             let new_norm = [stored_center.x / world_w, stored_center.y / world_h];
             let actor = &mut state.scene.actors[idx];
             crate::kf_anim::write_actor_param(
-                &mut actor.layout, &mut actor.animated_params, t,
-                memstroy_core::param_ids::POS_X, false,
+                &mut actor.layout,
+                &mut actor.animated_params,
+                t,
+                memstroy_core::param_ids::POS_X,
+                false,
                 |v| v.pos[0] = new_norm[0],
             );
             crate::kf_anim::write_actor_param(
-                &mut actor.layout, &mut actor.animated_params, t,
-                memstroy_core::param_ids::POS_Y, false,
+                &mut actor.layout,
+                &mut actor.animated_params,
+                t,
+                memstroy_core::param_ids::POS_Y,
+                false,
                 |v| v.pos[1] = new_norm[1],
             );
         }
@@ -4572,7 +5029,10 @@ fn write_selection_world_center(
                 Overlay::Image(im) => im.parent_id.clone(),
                 Overlay::Video(v) => v.parent_id.clone(),
             };
-            let mut stored_center = WorldPos { x: center[0], y: center[1] };
+            let mut stored_center = WorldPos {
+                x: center[0],
+                y: center[1],
+            };
             if let Some(ref pid) = parent_id {
                 let mut visited = vec![ov_id.clone()];
                 if let Some(pxf) = resolve_parent_transform(state, pid, t, &mut visited) {
@@ -4652,15 +5112,21 @@ fn write_selection_world_center(
             let (layout, animated_params) =
                 overlay_layout_and_animated_mut(&mut state.scene.overlays[idx]);
             crate::kf_anim::write_overlay_param(
-                layout, animated_params, local_t,
-                memstroy_core::param_ids::POS_X, false,
+                layout,
+                animated_params,
+                local_t,
+                memstroy_core::param_ids::POS_X,
+                false,
                 |v| v.pos[0] = new_norm[0],
             );
             let (layout, animated_params) =
                 overlay_layout_and_animated_mut(&mut state.scene.overlays[idx]);
             crate::kf_anim::write_overlay_param(
-                layout, animated_params, local_t,
-                memstroy_core::param_ids::POS_Y, false,
+                layout,
+                animated_params,
+                local_t,
+                memstroy_core::param_ids::POS_Y,
+                false,
                 |v| v.pos[1] = new_norm[1],
             );
         }
@@ -4686,8 +5152,6 @@ fn write_selection_world_center(
     }
 }
 
-
-
 pub fn set_element_parent_preserve_world(
     state: &mut EditorState,
     element_id: &str,
@@ -4706,7 +5170,9 @@ pub fn set_element_parent_preserve_world(
         return false;
     };
     let current_world = match sel {
-        Selection::Actor(idx) => get_element_world_pos(state, element_id, &state.scene.actors[idx].layout, t),
+        Selection::Actor(idx) => {
+            get_element_world_pos(state, element_id, &state.scene.actors[idx].layout, t)
+        }
         Selection::Overlay(idx) => {
             let dummy: &[Keyframe<ActorState>] = &[];
             let sample_t = overlay_clip_local_time_at(state, idx, t);
@@ -4751,14 +5217,20 @@ fn write_selection_scale_y(
         state.canvas_drag.preview_scale_y = Some(s);
         return;
     }
-    let t = state.canvas_drag.drag_start_playhead.unwrap_or(state.playhead);
+    let t = state
+        .canvas_drag
+        .drag_start_playhead
+        .unwrap_or(state.playhead);
     state.push_drag_undo_if_needed(token);
     match sel {
         Selection::Actor(idx) if idx < state.scene.actors.len() => {
             let actor = &mut state.scene.actors[idx];
             crate::kf_anim::write_actor_param(
-                &mut actor.layout, &mut actor.animated_params, t,
-                memstroy_core::param_ids::SCALE_Y, false,
+                &mut actor.layout,
+                &mut actor.animated_params,
+                t,
+                memstroy_core::param_ids::SCALE_Y,
+                false,
                 |v| v.scale_y = s,
             );
         }
@@ -4767,8 +5239,11 @@ fn write_selection_scale_y(
             let (layout, animated_params) =
                 overlay_layout_and_animated_mut(&mut state.scene.overlays[idx]);
             crate::kf_anim::write_overlay_param(
-                layout, animated_params, local_t,
-                memstroy_core::param_ids::SCALE_Y, false,
+                layout,
+                animated_params,
+                local_t,
+                memstroy_core::param_ids::SCALE_Y,
+                false,
                 |v| v.scale_y = s,
             );
         }
@@ -4801,14 +5276,20 @@ fn write_selection_scale(
         state.canvas_drag.preview_scale = Some(s);
         return;
     }
-    let t = state.canvas_drag.drag_start_playhead.unwrap_or(state.playhead);
+    let t = state
+        .canvas_drag
+        .drag_start_playhead
+        .unwrap_or(state.playhead);
     state.push_drag_undo_if_needed(token);
     match sel {
         Selection::Actor(idx) if idx < state.scene.actors.len() => {
             let actor = &mut state.scene.actors[idx];
             crate::kf_anim::write_actor_param(
-                &mut actor.layout, &mut actor.animated_params, t,
-                memstroy_core::param_ids::SCALE, false,
+                &mut actor.layout,
+                &mut actor.animated_params,
+                t,
+                memstroy_core::param_ids::SCALE,
+                false,
                 |v| v.scale = s,
             );
         }
@@ -4817,8 +5298,11 @@ fn write_selection_scale(
             let (layout, animated_params) =
                 overlay_layout_and_animated_mut(&mut state.scene.overlays[idx]);
             crate::kf_anim::write_overlay_param(
-                layout, animated_params, local_t,
-                memstroy_core::param_ids::SCALE, false,
+                layout,
+                animated_params,
+                local_t,
+                memstroy_core::param_ids::SCALE,
+                false,
                 |v| v.scale = s,
             );
         }
@@ -4871,14 +5355,20 @@ fn write_selection_rotation(
         state.canvas_drag.preview_rotation_deg = Some(new_rot_deg);
         return;
     }
-    let t = state.canvas_drag.drag_start_playhead.unwrap_or(state.playhead);
+    let t = state
+        .canvas_drag
+        .drag_start_playhead
+        .unwrap_or(state.playhead);
     state.push_drag_undo_if_needed(token);
     match sel {
         Selection::Actor(idx) if idx < state.scene.actors.len() => {
             let actor = &mut state.scene.actors[idx];
             crate::kf_anim::write_actor_param(
-                &mut actor.layout, &mut actor.animated_params, t,
-                memstroy_core::param_ids::ROTATION, false,
+                &mut actor.layout,
+                &mut actor.animated_params,
+                t,
+                memstroy_core::param_ids::ROTATION,
+                false,
                 |v| v.rotation_deg = new_rot_deg,
             );
         }
@@ -4887,8 +5377,11 @@ fn write_selection_rotation(
             let (layout, animated_params) =
                 overlay_layout_and_animated_mut(&mut state.scene.overlays[idx]);
             crate::kf_anim::write_overlay_param(
-                layout, animated_params, local_t,
-                memstroy_core::param_ids::ROTATION, false,
+                layout,
+                animated_params,
+                local_t,
+                memstroy_core::param_ids::ROTATION,
+                false,
                 |v| v.rotation_deg = new_rot_deg,
             );
         }
@@ -5089,7 +5582,9 @@ fn overlay_clip_local_time(state: &EditorState, ov_idx: usize) -> f32 {
 /// time explicitly. Used by the canvas drag setters so they can re-anchor
 /// every kf write to the drag-start playhead instead of the live one.
 fn overlay_clip_local_time_at(state: &EditorState, ov_idx: usize, scene_t: f32) -> f32 {
-    if ov_idx >= state.scene.overlays.len() { return scene_t; }
+    if ov_idx >= state.scene.overlays.len() {
+        return scene_t;
+    }
     let t_in = match &state.scene.overlays[ov_idx] {
         Overlay::Text(t) => t.t_in,
         Overlay::Image(im) => im.t_in,
@@ -5140,7 +5635,11 @@ fn sniff_hit(state: &EditorState, pos: WorldPos) -> Option<Selection> {
     // topmost row on the timeline panel hits first. Overlays drawn BEHIND
     // the actors are de-prioritised so a click on a stacked spot selects
     // the on-top element first.
-    let mut order: Vec<(usize, i32)> = state.scene.overlays.iter().enumerate()
+    let mut order: Vec<(usize, i32)> = state
+        .scene
+        .overlays
+        .iter()
+        .enumerate()
         .map(|(i, _)| {
             let bias = if overlay_is_behind_actors(state, i) {
                 1_000_000
@@ -5160,8 +5659,13 @@ fn sniff_hit(state: &EditorState, pos: WorldPos) -> Option<Selection> {
             Overlay::Image(img) => (img.t_in, img.t_out, &img.layout),
             Overlay::Video(vid) => (vid.t_in, vid.t_out, &vid.layout),
         };
-        let sample_t = if t >= t_in && t <= t_out { t - t_in }
-            else if t < t_in { 0.0 } else { t_out - t_in };
+        let sample_t = if t >= t_in && t <= t_out {
+            t - t_in
+        } else if t < t_in {
+            0.0
+        } else {
+            t_out - t_in
+        };
         let ov_id = match overlay {
             Overlay::Text(o) => o.id.as_str(),
             Overlay::Image(o) => o.id.as_str(),
@@ -5208,7 +5712,9 @@ fn sniff_hit(state: &EditorState, pos: WorldPos) -> Option<Selection> {
     }
 
     for (idx, actor) in state.scene.actors.iter().enumerate().rev() {
-        if !actor.visible { continue; }
+        if !actor.visible {
+            continue;
+        }
         let world_pos = get_element_world_pos(state, &actor.id, &actor.layout, t);
         let actor_st = sample_actor_transform(actor, t);
         let mut actor_scale = actor_st.scale;
@@ -5228,8 +5734,12 @@ fn sniff_hit(state: &EditorState, pos: WorldPos) -> Option<Selection> {
         let (base_w, base_h) = if let Some(fc) = state.frame_caches.get(idx) {
             if fc.is_ready() && fc.frame_count > 0 {
                 (fc.source_width as f32, fc.source_height as f32)
-            } else { (1080.0, 1920.0) }
-        } else { (1080.0, 1920.0) };
+            } else {
+                (1080.0, 1920.0)
+            }
+        } else {
+            (1080.0, 1920.0)
+        };
         let half_w = base_w * actor_scale * 0.5;
         let half_h = base_h * actor_scale * actor_scale_y * 0.5;
         if world_point_in_oriented_rect(pos, world_pos, half_w, half_h, rotation_deg) {
@@ -5255,7 +5765,9 @@ fn selected_element_gizmo(
             let sample_t = state
                 .canvas_drag
                 .drag_start_playhead
-                .filter(|_| state.canvas_drag.preview_element_id.as_deref() == Some(actor.id.as_str()))
+                .filter(|_| {
+                    state.canvas_drag.preview_element_id.as_deref() == Some(actor.id.as_str())
+                })
                 .unwrap_or(t);
             let world_pos = get_element_world_pos(state, &actor.id, &actor.layout, t);
             let actor_st = sample_actor_transform(actor, sample_t);
@@ -5289,7 +5801,9 @@ fn selected_element_gizmo(
             } else {
                 (1080.0, 1920.0)
             };
-            let center_screen = state.canvas_viewport.world_to_screen(world_pos, viewport_size);
+            let center_screen = state
+                .canvas_viewport
+                .world_to_screen(world_pos, viewport_size);
             let zoom = state.canvas_viewport.zoom;
             Some(ElementGizmo {
                 center: Pos2::new(
@@ -5326,7 +5840,11 @@ fn selected_element_gizmo(
                     vid.parent_id.as_ref(),
                 ),
             };
-            let sample_t = if t >= t_in && t <= t_out { t - t_in } else { 0.0 };
+            let sample_t = if t >= t_in && t <= t_out {
+                t - t_in
+            } else {
+                0.0
+            };
             let modifiers: &[TrackModifier] = match overlay {
                 Overlay::Text(txt) => &txt.modifiers,
                 Overlay::Image(img) => &img.modifiers,
@@ -5354,7 +5872,9 @@ fn selected_element_gizmo(
             } else {
                 layout_world
             };
-            let center_screen = state.canvas_viewport.world_to_screen(hit_center, viewport_size);
+            let center_screen = state
+                .canvas_viewport
+                .world_to_screen(hit_center, viewport_size);
             let zoom = state.canvas_viewport.zoom;
             let mut gizmo = ElementGizmo {
                 center: Pos2::new(
@@ -5366,8 +5886,7 @@ fn selected_element_gizmo(
                 rotation_deg: ov_state.rotation_deg,
             };
             if let Overlay::Image(img) = overlay {
-                if let Some((full_w, full_h)) =
-                    image_overlay_uncropped_size(img, &ov_state, state)
+                if let Some((full_w, full_h)) = image_overlay_uncropped_size(img, &ov_state, state)
                 {
                     let adj = crate::image_effects::CropLayoutAdjust::from_inset(
                         crate::image_effects::accumulated_crop_inset(&img.effects),
@@ -5376,8 +5895,7 @@ fn selected_element_gizmo(
                     gizmo.half_h = full_h * 0.5 * zoom;
                     apply_crop_to_element_gizmo_size_only(&mut gizmo, full_w, full_h, adj, zoom);
                 } else {
-                    let (elem_w, elem_h) =
-                        overlay_bbox_with_state(overlay, &ov_state, state);
+                    let (elem_w, elem_h) = overlay_bbox_with_state(overlay, &ov_state, state);
                     gizmo.half_w = elem_w * 0.5 * zoom;
                     gizmo.half_h = elem_h * 0.5 * zoom;
                 }
@@ -5419,10 +5937,20 @@ fn render_frame_screen_rect(state: &EditorState, full_rect: Rect, viewport_size:
     let [rw, rh] = rf.resolution;
     let world_w = rw as f32 / rf_state.zoom;
     let world_h = rh as f32 / rf_state.zoom;
-    let tl_world = WorldPos { x: rf_state.pos.x - world_w * 0.5, y: rf_state.pos.y - world_h * 0.5 };
-    let br_world = WorldPos { x: rf_state.pos.x + world_w * 0.5, y: rf_state.pos.y + world_h * 0.5 };
-    let tl = state.canvas_viewport.world_to_screen(tl_world, viewport_size);
-    let br = state.canvas_viewport.world_to_screen(br_world, viewport_size);
+    let tl_world = WorldPos {
+        x: rf_state.pos.x - world_w * 0.5,
+        y: rf_state.pos.y - world_h * 0.5,
+    };
+    let br_world = WorldPos {
+        x: rf_state.pos.x + world_w * 0.5,
+        y: rf_state.pos.y + world_h * 0.5,
+    };
+    let tl = state
+        .canvas_viewport
+        .world_to_screen(tl_world, viewport_size);
+    let br = state
+        .canvas_viewport
+        .world_to_screen(br_world, viewport_size);
     Rect::from_min_max(
         Pos2::new(full_rect.min.x + tl[0], full_rect.min.y + tl[1]),
         Pos2::new(full_rect.min.x + br[0], full_rect.min.y + br[1]),
@@ -5446,14 +5974,29 @@ fn update_hover_cursor(
         let hw = gizmo.half_w;
         let hh = gizmo.half_h;
         let handle_specs: [(Pos2, egui::CursorIcon); 8] = [
-            (gizmo.local_to_screen(-hw, -hh), egui::CursorIcon::ResizeNwSe),
+            (
+                gizmo.local_to_screen(-hw, -hh),
+                egui::CursorIcon::ResizeNwSe,
+            ),
             (gizmo.local_to_screen(hw, -hh), egui::CursorIcon::ResizeNeSw),
             (gizmo.local_to_screen(hw, hh), egui::CursorIcon::ResizeNwSe),
             (gizmo.local_to_screen(-hw, hh), egui::CursorIcon::ResizeNeSw),
-            (gizmo.local_to_screen(0.0, -hh), egui::CursorIcon::ResizeVertical),
-            (gizmo.local_to_screen(hw, 0.0), egui::CursorIcon::ResizeHorizontal),
-            (gizmo.local_to_screen(0.0, hh), egui::CursorIcon::ResizeVertical),
-            (gizmo.local_to_screen(-hw, 0.0), egui::CursorIcon::ResizeHorizontal),
+            (
+                gizmo.local_to_screen(0.0, -hh),
+                egui::CursorIcon::ResizeVertical,
+            ),
+            (
+                gizmo.local_to_screen(hw, 0.0),
+                egui::CursorIcon::ResizeHorizontal,
+            ),
+            (
+                gizmo.local_to_screen(0.0, hh),
+                egui::CursorIcon::ResizeVertical,
+            ),
+            (
+                gizmo.local_to_screen(-hw, 0.0),
+                egui::CursorIcon::ResizeHorizontal,
+            ),
         ];
         for (handle_pos, cursor) in handle_specs {
             if (hover - handle_pos).length() < ELEM_HANDLE_SIZE * 2.0 {
@@ -5476,8 +6019,13 @@ fn update_hover_cursor(
         }
     }
     let rf_state = sample_render_frame(&state.scene.render_frame, state.playhead);
-    let center_screen = state.canvas_viewport.world_to_screen(rf_state.pos, viewport_size);
-    let rf_center = Pos2::new(full_rect.min.x + center_screen[0], full_rect.min.y + center_screen[1]);
+    let center_screen = state
+        .canvas_viewport
+        .world_to_screen(rf_state.pos, viewport_size);
+    let rf_center = Pos2::new(
+        full_rect.min.x + center_screen[0],
+        full_rect.min.y + center_screen[1],
+    );
     if (hover - rf_center).length() < RF_CENTER_RADIUS * 2.0 {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
     }
@@ -5495,7 +6043,12 @@ fn actor_kf_world_pos(
     rf_resolution: [u32; 2],
 ) -> WorldPos {
     // Prefer canvas_layouts world coords if present; pick the kf nearest in t.
-    if let Some(cl) = state.scene.canvas_layouts.iter().find(|cl| cl.element_id == actor_id) {
+    if let Some(cl) = state
+        .scene
+        .canvas_layouts
+        .iter()
+        .find(|cl| cl.element_id == actor_id)
+    {
         if !cl.keyframes.is_empty() {
             // Approximation: sample at center of clip — simple and stable
             if let Some(kf) = cl.keyframes.first() {
@@ -5538,16 +6091,25 @@ fn draw_selection_keyframe_trajectory(
 
     // Collect each keyframe's world position for the active selection.
     #[derive(Clone)]
-    struct KfPoint { world: WorldPos }
+    struct KfPoint {
+        world: WorldPos,
+    }
 
     let points: Vec<KfPoint> = match state.selection {
         Selection::Actor(idx) if idx < state.scene.actors.len() => {
             let actor = &state.scene.actors[idx];
-            if actor.layout.len() < 2 { return; }
-            actor.layout.iter().map(|kf| {
-                let world = actor_kf_world_pos(state, &actor.id, &kf.value, &rf_state, rf_resolution);
-                KfPoint { world }
-            }).collect()
+            if actor.layout.len() < 2 {
+                return;
+            }
+            actor
+                .layout
+                .iter()
+                .map(|kf| {
+                    let world =
+                        actor_kf_world_pos(state, &actor.id, &kf.value, &rf_state, rf_resolution);
+                    KfPoint { world }
+                })
+                .collect()
         }
         Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
             let layout: &[Keyframe<OverlayState>] = match &state.scene.overlays[idx] {
@@ -5555,7 +6117,9 @@ fn draw_selection_keyframe_trajectory(
                 Overlay::Image(im) => &im.layout,
                 Overlay::Video(v) => &v.layout,
             };
-            if layout.len() < 2 { return; }
+            if layout.len() < 2 {
+                return;
+            }
             // World-fixed dims — `pos` is interpreted against the
             // resolution rectangle anchored at world (0, 0). Mirrors
             // the renderer in `draw_canvas_overlays`. Without this
@@ -5563,24 +6127,34 @@ fn draw_selection_keyframe_trajectory(
             // whenever the user repositions the render frame.
             let world_w = rf_resolution[0] as f32;
             let world_h = rf_resolution[1] as f32;
-            layout.iter().map(|kf| {
-                let world = WorldPos {
-                    x: kf.value.pos[0] * world_w,
-                    y: kf.value.pos[1] * world_h,
-                };
-                KfPoint { world }
-            }).collect()
+            layout
+                .iter()
+                .map(|kf| {
+                    let world = WorldPos {
+                        x: kf.value.pos[0] * world_w,
+                        y: kf.value.pos[1] * world_h,
+                    };
+                    KfPoint { world }
+                })
+                .collect()
         }
         _ => return,
     };
 
-    if points.len() < 2 { return; }
+    if points.len() < 2 {
+        return;
+    }
 
     // Convert each kf world position to screen pos.
-    let screen_pts: Vec<Pos2> = points.iter().map(|p| {
-        let s = state.canvas_viewport.world_to_screen(p.world, viewport_size);
-        Pos2::new(full_rect.min.x + s[0], full_rect.min.y + s[1])
-    }).collect();
+    let screen_pts: Vec<Pos2> = points
+        .iter()
+        .map(|p| {
+            let s = state
+                .canvas_viewport
+                .world_to_screen(p.world, viewport_size);
+            Pos2::new(full_rect.min.x + s[0], full_rect.min.y + s[1])
+        })
+        .collect();
 
     // Polyline connecting consecutive keyframes.
     let path_color = Color32::from_rgba_premultiplied(255, 220, 80, 200);
@@ -5597,7 +6171,8 @@ fn draw_selection_keyframe_trajectory(
         painter.circle_stroke(*pt, dot_radius, Stroke::new(1.2, dot_stroke));
         // Number inside the dot — small enough to be unobtrusive.
         painter.text(
-            *pt, egui::Align2::CENTER_CENTER,
+            *pt,
+            egui::Align2::CENTER_CENTER,
             (i + 1).to_string(),
             egui::FontId::proportional(9.0),
             Color32::from_rgb(20, 20, 20),
@@ -5626,7 +6201,11 @@ fn draw_selection_handles(
         for corner in &corners {
             let hr = Rect::from_center_size(*corner, Vec2::splat(ELEM_HANDLE_SIZE));
             painter.rect_filled(hr, Rounding::same(2.0), handle_color);
-            painter.rect_stroke(hr, Rounding::same(2.0), Stroke::new(1.0, Color32::from_rgb(40, 40, 40)));
+            painter.rect_stroke(
+                hr,
+                Rounding::same(2.0),
+                Stroke::new(1.0, Color32::from_rgb(40, 40, 40)),
+            );
         }
         let midpoints = [
             gizmo.local_to_screen(0.0, -gizmo.half_h),
@@ -5635,7 +6214,10 @@ fn draw_selection_handles(
             gizmo.local_to_screen(gizmo.half_w, 0.0),
         ];
         for mp in &midpoints {
-            let hr = Rect::from_center_size(*mp, Vec2::new(ELEM_HANDLE_SIZE * 1.4, ELEM_HANDLE_SIZE * 0.7));
+            let hr = Rect::from_center_size(
+                *mp,
+                Vec2::new(ELEM_HANDLE_SIZE * 1.4, ELEM_HANDLE_SIZE * 0.7),
+            );
             painter.rect_filled(hr, Rounding::same(2.0), handle_color);
         }
         for i in 0..4 {
@@ -5652,7 +6234,11 @@ fn draw_selection_handles(
             Stroke::new(1.5, Color32::from_rgb(80, 160, 200)),
         );
         painter.circle_filled(rot_pos, ROTATION_HANDLE_RADIUS, COL_ROTATION_HANDLE);
-        painter.circle_stroke(rot_pos, ROTATION_HANDLE_RADIUS, Stroke::new(1.5, Color32::from_rgb(20, 40, 60)));
+        painter.circle_stroke(
+            rot_pos,
+            ROTATION_HANDLE_RADIUS,
+            Stroke::new(1.5, Color32::from_rgb(20, 40, 60)),
+        );
         // Tiny "↻" hint glyph.
         painter.text(
             rot_pos,
@@ -5665,10 +6251,19 @@ fn draw_selection_handles(
 
     // Render frame center handle
     let rf_state = sample_render_frame(&state.scene.render_frame, state.playhead);
-    let center_screen = state.canvas_viewport.world_to_screen(rf_state.pos, viewport_size);
-    let rf_center = Pos2::new(full_rect.min.x + center_screen[0], full_rect.min.y + center_screen[1]);
+    let center_screen = state
+        .canvas_viewport
+        .world_to_screen(rf_state.pos, viewport_size);
+    let rf_center = Pos2::new(
+        full_rect.min.x + center_screen[0],
+        full_rect.min.y + center_screen[1],
+    );
     painter.circle_filled(rf_center, RF_CENTER_RADIUS, COL_RENDER_FRAME_HANDLE);
-    painter.circle_stroke(rf_center, RF_CENTER_RADIUS, Stroke::new(1.5, Color32::WHITE));
+    painter.circle_stroke(
+        rf_center,
+        RF_CENTER_RADIUS,
+        Stroke::new(1.5, Color32::WHITE),
+    );
 }
 
 // ─── ELEMENT RESIZE HANDLES ──────────────────────────────────────────
@@ -5692,22 +6287,33 @@ fn draw_element_resize_handles(
     let elem_rect = match state.selection {
         Selection::Actor(idx) if idx < state.scene.actors.len() => {
             let actor = &state.scene.actors[idx];
-            if !actor.visible { return; }
+            if !actor.visible {
+                return;
+            }
             let world_pos = get_element_world_pos(state, &actor.id, &actor.layout, t);
             let actor_scale = sample_actor_transform(actor, t).scale;
             // Use real source dimensions from frame cache
             let (base_w, base_h) = if let Some(fc) = state.frame_caches.get(idx) {
                 if fc.is_ready() && fc.frame_count > 0 {
                     (fc.source_width as f32, fc.source_height as f32)
-                } else { (1080.0, 1920.0) }
-            } else { (1080.0, 1920.0) };
+                } else {
+                    (1080.0, 1920.0)
+                }
+            } else {
+                (1080.0, 1920.0)
+            };
             let elem_width = base_w * actor_scale;
             let elem_height = base_h * actor_scale;
-            let center_screen = state.canvas_viewport.world_to_screen(world_pos, viewport_size);
+            let center_screen = state
+                .canvas_viewport
+                .world_to_screen(world_pos, viewport_size);
             let half_w = elem_width * 0.5 * state.canvas_viewport.zoom;
             let half_h = elem_height * 0.5 * state.canvas_viewport.zoom;
             Rect::from_center_size(
-                Pos2::new(full_rect.min.x + center_screen[0], full_rect.min.y + center_screen[1]),
+                Pos2::new(
+                    full_rect.min.x + center_screen[0],
+                    full_rect.min.y + center_screen[1],
+                ),
                 Vec2::new(half_w * 2.0, half_h * 2.0),
             )
         }
@@ -5718,7 +6324,11 @@ fn draw_element_resize_handles(
                 Overlay::Image(img) => (img.t_in, img.t_out, &img.layout),
                 Overlay::Video(vid) => (vid.t_in, vid.t_out, &vid.layout),
             };
-            let sample_t = if t >= t_in && t <= t_out { t - t_in } else { 0.0 };
+            let sample_t = if t >= t_in && t <= t_out {
+                t - t_in
+            } else {
+                0.0
+            };
             let ov_state = sample_overlay_transform(overlay, sample_t);
             // World-fixed dims — see the matching block above.
             let rf = &state.scene.render_frame;
@@ -5730,11 +6340,16 @@ fn draw_element_resize_handles(
                 y: ov_state.pos[1] * world_h,
             };
             let (elem_w, elem_h) = overlay_bbox_with_state(overlay, &ov_state, state);
-            let center_screen = state.canvas_viewport.world_to_screen(world_pos, viewport_size);
+            let center_screen = state
+                .canvas_viewport
+                .world_to_screen(world_pos, viewport_size);
             let half_w = elem_w * 0.5 * state.canvas_viewport.zoom;
             let half_h = elem_h * 0.5 * state.canvas_viewport.zoom;
             Rect::from_center_size(
-                Pos2::new(full_rect.min.x + center_screen[0], full_rect.min.y + center_screen[1]),
+                Pos2::new(
+                    full_rect.min.x + center_screen[0],
+                    full_rect.min.y + center_screen[1],
+                ),
                 Vec2::new(half_w * 2.0, half_h * 2.0),
             )
         }
@@ -5751,7 +6366,11 @@ fn draw_element_resize_handles(
     for (corner, _cursor) in &corners {
         let hr = Rect::from_center_size(*corner, Vec2::splat(handle_size));
         painter.rect_filled(hr, Rounding::same(2.0), handle_color);
-        painter.rect_stroke(hr, Rounding::same(2.0), Stroke::new(1.0, Color32::from_rgb(40, 40, 40)));
+        painter.rect_stroke(
+            hr,
+            Rounding::same(2.0),
+            Stroke::new(1.0, Color32::from_rgb(40, 40, 40)),
+        );
     }
 
     // Draw edge midpoint handles
@@ -5767,7 +6386,11 @@ fn draw_element_resize_handles(
     }
 
     // Draw selection border
-    painter.rect_stroke(elem_rect, Rounding::same(2.0), Stroke::new(1.5, handle_color));
+    painter.rect_stroke(
+        elem_rect,
+        Rounding::same(2.0),
+        Stroke::new(1.5, handle_color),
+    );
 
     // Handle corner drag for scaling
     if response.dragged() && !state.canvas_panning {
@@ -5789,7 +6412,8 @@ fn draw_element_resize_handles(
                 // Scale based on drag distance from center
                 let center = elem_rect.center();
                 let prev_dist = ((ox - center.x).powi(2) + (oy - center.y).powi(2)).sqrt();
-                let curr_dist = ((origin.x - center.x).powi(2) + (origin.y - center.y).powi(2)).sqrt();
+                let curr_dist =
+                    ((origin.x - center.x).powi(2) + (origin.y - center.y).powi(2)).sqrt();
                 if prev_dist > 1.0 {
                     let scale_factor = curr_dist / prev_dist;
                     match state.selection {
@@ -5800,9 +6424,24 @@ fn draw_element_resize_handles(
                         }
                         Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
                             match &mut state.scene.overlays[idx] {
-                                Overlay::Text(t) => { if let Some(kf) = t.layout.first_mut() { kf.value.scale = (kf.value.scale * scale_factor).clamp(0.05, 100.0); } }
-                                Overlay::Image(i) => { if let Some(kf) = i.layout.first_mut() { kf.value.scale = (kf.value.scale * scale_factor).clamp(0.05, 100.0); } }
-                                Overlay::Video(v) => { if let Some(kf) = v.layout.first_mut() { kf.value.scale = (kf.value.scale * scale_factor).clamp(0.05, 100.0); } }
+                                Overlay::Text(t) => {
+                                    if let Some(kf) = t.layout.first_mut() {
+                                        kf.value.scale =
+                                            (kf.value.scale * scale_factor).clamp(0.05, 100.0);
+                                    }
+                                }
+                                Overlay::Image(i) => {
+                                    if let Some(kf) = i.layout.first_mut() {
+                                        kf.value.scale =
+                                            (kf.value.scale * scale_factor).clamp(0.05, 100.0);
+                                    }
+                                }
+                                Overlay::Video(v) => {
+                                    if let Some(kf) = v.layout.first_mut() {
+                                        kf.value.scale =
+                                            (kf.value.scale * scale_factor).clamp(0.05, 100.0);
+                                    }
+                                }
                             }
                         }
                         _ => {}
@@ -5844,19 +6483,40 @@ fn draw_render_frame_handles(
     let world_h = rh as f32 / rf_state.zoom;
 
     // Compute corners of render frame in screen space
-    let tl_world = WorldPos { x: rf_state.pos.x - world_w * 0.5, y: rf_state.pos.y - world_h * 0.5 };
-    let br_world = WorldPos { x: rf_state.pos.x + world_w * 0.5, y: rf_state.pos.y + world_h * 0.5 };
+    let tl_world = WorldPos {
+        x: rf_state.pos.x - world_w * 0.5,
+        y: rf_state.pos.y - world_h * 0.5,
+    };
+    let br_world = WorldPos {
+        x: rf_state.pos.x + world_w * 0.5,
+        y: rf_state.pos.y + world_h * 0.5,
+    };
     let center_world = rf_state.pos;
 
-    let tl_screen = state.canvas_viewport.world_to_screen(tl_world, viewport_size);
-    let br_screen = state.canvas_viewport.world_to_screen(br_world, viewport_size);
-    let center_screen = state.canvas_viewport.world_to_screen(center_world, viewport_size);
+    let tl_screen = state
+        .canvas_viewport
+        .world_to_screen(tl_world, viewport_size);
+    let br_screen = state
+        .canvas_viewport
+        .world_to_screen(br_world, viewport_size);
+    let center_screen = state
+        .canvas_viewport
+        .world_to_screen(center_world, viewport_size);
 
     let frame_rect = Rect::from_min_max(
-        Pos2::new(full_rect.min.x + tl_screen[0], full_rect.min.y + tl_screen[1]),
-        Pos2::new(full_rect.min.x + br_screen[0], full_rect.min.y + br_screen[1]),
+        Pos2::new(
+            full_rect.min.x + tl_screen[0],
+            full_rect.min.y + tl_screen[1],
+        ),
+        Pos2::new(
+            full_rect.min.x + br_screen[0],
+            full_rect.min.y + br_screen[1],
+        ),
     );
-    let center_pos = Pos2::new(full_rect.min.x + center_screen[0], full_rect.min.y + center_screen[1]);
+    let center_pos = Pos2::new(
+        full_rect.min.x + center_screen[0],
+        full_rect.min.y + center_screen[1],
+    );
 
     // Draw center handle (for moving the render frame)
     let handle_radius = 8.0;
@@ -5908,7 +6568,8 @@ fn draw_render_frame_handles(
             if near_rf_corner && state.selection == Selection::None {
                 // Resize = change zoom of the render frame
                 let prev_dist = ((ox - center_pos.x).powi(2) + (oy - center_pos.y).powi(2)).sqrt();
-                let curr_dist = ((origin.x - center_pos.x).powi(2) + (origin.y - center_pos.y).powi(2)).sqrt();
+                let curr_dist =
+                    ((origin.x - center_pos.x).powi(2) + (origin.y - center_pos.y).powi(2)).sqrt();
                 if prev_dist > 1.0 {
                     let scale_factor = curr_dist / prev_dist;
                     if let Some(kf) = state.scene.render_frame.layout.first_mut() {
@@ -5929,7 +6590,11 @@ fn overlay_bbox(overlay: &Overlay, ov_state: &OverlayState) -> (f32, f32) {
     match overlay {
         Overlay::Text(txt) => {
             let style = &txt.style;
-            let lines: Vec<&str> = if txt.text.is_empty() { vec![" "] } else { txt.text.lines().collect() };
+            let lines: Vec<&str> = if txt.text.is_empty() {
+                vec![" "]
+            } else {
+                txt.text.lines().collect()
+            };
             let max_chars = lines.iter().map(|l| l.chars().count()).max().unwrap_or(1) as f32;
             let font = style.font_size;
             // Glyphs are now scaled by `ov_state.scale` (and `scale_y`
@@ -5944,15 +6609,10 @@ fn overlay_bbox(overlay: &Overlay, ov_state: &OverlayState) -> (f32, f32) {
             let text_h = (lines.len() as f32) * font * 1.2 * sy;
             // Plate padding scales uniformly with `ov_state.scale`
             // (matches `draw_text_overlay`).
-            let pad_w = (style.box_padding * 2.0
-                + style.box_extra_left
-                + style.box_extra_right)
-                * sx;
+            let pad_w =
+                (style.box_padding * 2.0 + style.box_extra_left + style.box_extra_right) * sx;
             let pad_h = style.box_padding * 2.0 * sy;
-            (
-                (text_w + pad_w).max(40.0),
-                (text_h + pad_h).max(20.0),
-            )
+            ((text_w + pad_w).max(40.0), (text_h + pad_h).max(20.0))
         }
         Overlay::Image(_) => (200.0 * sx, 200.0 * sy),
         Overlay::Video(_) => (300.0 * sx, 300.0 * 16.0 / 9.0 * sy),
@@ -6152,8 +6812,7 @@ fn ensure_image_loaded(
     // path. 500 ms is short enough that the user perceives the file
     // appearing "as soon as it's written", but long enough that we
     // don't burn CPU when the file genuinely won't decode.
-    const FAILED_RETRY_COOLDOWN: std::time::Duration =
-        std::time::Duration::from_millis(500);
+    const FAILED_RETRY_COOLDOWN: std::time::Duration = std::time::Duration::from_millis(500);
 
     // Fast path: already in the map.
     let mut should_retry = false;
@@ -6196,10 +6855,8 @@ fn ensure_image_loaded(
             let w = rgba.width();
             let h = rgba.height();
             let pixels = rgba.into_raw();
-            let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                [w as usize, h as usize],
-                &pixels,
-            );
+            let color_image =
+                egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &pixels);
             use std::collections::hash_map::DefaultHasher;
             use std::hash::{Hash, Hasher};
             let mut hasher = DefaultHasher::new();
@@ -6302,9 +6959,7 @@ fn ensure_image_fx_loaded(
     // Cache miss. Dispatch a background bake — the worker will dedup
     // concurrent submissions for the same (path, sig) so it's safe to
     // call this every frame while the entry stays in `Pending`.
-    if let (Some(handle), Some(tx)) =
-        (state.tokio_handle.as_ref(), state.image_fx_tx.as_ref())
-    {
+    if let (Some(handle), Some(tx)) = (state.tokio_handle.as_ref(), state.image_fx_tx.as_ref()) {
         crate::image_fx_worker::submit_image_fx_job(
             handle,
             tx,
@@ -6321,6 +6976,26 @@ fn ensure_image_fx_loaded(
         // Treat as "no fx available" so draws fall back cleanly.
     }
     None
+}
+
+fn apply_parent_pick_if_active(state: &mut EditorState, picked: Selection) -> bool {
+    let Some(child_id) = state.parent_pick_child_id.take() else {
+        return false;
+    };
+    let Some(parent_id) = selection_element_id(state, picked) else {
+        state.parent_pick_child_id = Some(child_id);
+        return false;
+    };
+    if parent_id == child_id {
+        state.status = crate::i18n::t("Cannot parent an element to itself.").into();
+        return true;
+    }
+    if set_element_parent_preserve_world(state, &child_id, Some(parent_id.clone())) {
+        state.status = format!("{} {}", crate::i18n::t("Parent element"), parent_id);
+    } else {
+        state.status = crate::i18n::t("Parent pick failed.").into();
+    }
+    true
 }
 
 /// Try to select an element at the given world position.
@@ -6359,49 +7034,30 @@ fn try_select_at(state: &mut EditorState, pos: WorldPos) {
 
     // ── Build a unified hit-test order across actors + overlays ──
     //
-    // Z-rank mirrors the canvas render z-order so that whatever the
-    // user sees on top is what gets selected first:
-    //
-    //   pass 1: overlays classified as "behind actors"
-    //           (any actor sits on a higher row than the overlay)
-    //   pass 2: actors
-    //   pass 3: overlays "on top" of actors
-    //
-    // Within each pass the layer-panel order wins: the row that sits
-    // higher on the panel (smaller `track_index`) gets a higher z and
-    // therefore a higher selection priority. Within the same track,
-    // the later-added element (larger scene index) wins, matching the
-    // draw-in-scene-order tie-breaker used by `draw_canvas_overlays`
-    // and `draw_canvas_elements`.
+    // Z-rank mirrors the layer-panel order used by `draw_canvas_elements`:
+    // smaller track index = higher row = visually on top = selected first.
+    // Repeated clicks at the same point cycle through this sorted hit list.
     enum HitCand {
         Actor(usize),
         Overlay(usize),
     }
-    // Multiplier large enough to dominate any plausible track / scene
-    // index combination so passes never bleed into each other.
-    const PASS_STRIDE: i64 = 10_000_000_000;
     const TRACK_STRIDE: i64 = 100_000;
     let mut cands: Vec<(i64, HitCand)> = Vec::new();
     for (idx, _) in state.scene.overlays.iter().enumerate() {
         let track = overlay_track_index(state, idx) as i64;
-        let pass: i64 = if overlay_is_behind_actors(state, idx) { 1 } else { 3 };
-        // Smaller track => higher panel row => higher z (on top).
-        // Larger scene idx => drawn later within track => higher z.
-        let within = -track * TRACK_STRIDE + idx as i64;
-        cands.push((pass * PASS_STRIDE + within, HitCand::Overlay(idx)));
+        cands.push((-track * TRACK_STRIDE + idx as i64, HitCand::Overlay(idx)));
     }
     for (idx, actor) in state.scene.actors.iter().enumerate() {
-        if !actor.visible { continue; }
+        if !actor.visible {
+            continue;
+        }
         let track = actor_track_index(state, idx) as i64;
-        // Same within-pass tie-breaker as overlays so two actors that
-        // overlap on the canvas are picked by panel row first, then by
-        // scene order.
-        let within = -track * TRACK_STRIDE + idx as i64;
-        cands.push((2 * PASS_STRIDE + within, HitCand::Actor(idx)));
+        cands.push((-track * TRACK_STRIDE + idx as i64, HitCand::Actor(idx)));
     }
     // Highest z (drawn last / on top) checked first.
     cands.sort_by(|a, b| b.0.cmp(&a.0));
 
+    let mut element_hits: Vec<Selection> = Vec::new();
     for (_, cand) in cands {
         match cand {
             HitCand::Overlay(idx) => {
@@ -6411,8 +7067,16 @@ fn try_select_at(state: &mut EditorState, pos: WorldPos) {
                     Overlay::Image(img) => (img.t_in, img.t_out, &img.layout),
                     Overlay::Video(vid) => (vid.t_in, vid.t_out, &vid.layout),
                 };
-                let sample_t = if t >= t_in && t <= t_out { t - t_in }
-                    else if t < t_in { 0.0 } else { t_out - t_in };
+                if !state.canvas_show_inactive_previews && !(t >= t_in && t <= t_out) {
+                    continue;
+                }
+                let sample_t = if t >= t_in && t <= t_out {
+                    t - t_in
+                } else if t < t_in {
+                    0.0
+                } else {
+                    t_out - t_in
+                };
                 let ov_state = sample_overlay_transform(overlay, sample_t);
 
                 let ov_world = WorldPos {
@@ -6440,43 +7104,82 @@ fn try_select_at(state: &mut EditorState, pos: WorldPos) {
                 } else {
                     (ov_world.x, ov_world.y)
                 };
-                if pos.x >= hit_cx - ew * 0.5 && pos.x <= hit_cx + ew * 0.5
-                    && pos.y >= hit_cy - eh * 0.5 && pos.y <= hit_cy + eh * 0.5
+                if pos.x >= hit_cx - ew * 0.5
+                    && pos.x <= hit_cx + ew * 0.5
+                    && pos.y >= hit_cy - eh * 0.5
+                    && pos.y <= hit_cy + eh * 0.5
                 {
-                    state.selection = Selection::Overlay(idx);
-                    return;
+                    element_hits.push(Selection::Overlay(idx));
                 }
             }
             HitCand::Actor(idx) => {
                 let actor = &state.scene.actors[idx];
+                let t_in = actor.t_in.unwrap_or(0.0);
+                let t_out = actor.t_out.unwrap_or(state.scene.output.duration);
+                if !state.canvas_show_inactive_previews && !(t >= t_in && t <= t_out) {
+                    continue;
+                }
                 let world_pos = get_element_world_pos(state, &actor.id, &actor.layout, t);
                 let actor_scale = sample_actor_transform(actor, t).scale;
                 let (base_w, base_h) = if let Some(fc) = state.frame_caches.get(idx) {
                     if fc.is_ready() && fc.frame_count > 0 {
                         (fc.source_width as f32, fc.source_height as f32)
-                    } else { (1080.0, 1920.0) }
-                } else { (1080.0, 1920.0) };
+                    } else {
+                        (1080.0, 1920.0)
+                    }
+                } else {
+                    (1080.0, 1920.0)
+                };
                 let elem_width = base_w * actor_scale;
                 let elem_height = base_h * actor_scale;
                 let half_w = elem_width * 0.5;
                 let half_h = elem_height * 0.5;
-                if pos.x >= world_pos.x - half_w && pos.x <= world_pos.x + half_w
-                    && pos.y >= world_pos.y - half_h && pos.y <= world_pos.y + half_h
+                if pos.x >= world_pos.x - half_w
+                    && pos.x <= world_pos.x + half_w
+                    && pos.y >= world_pos.y - half_h
+                    && pos.y <= world_pos.y + half_h
                 {
-                    state.selection = Selection::Actor(idx);
-                    return;
+                    element_hits.push(Selection::Actor(idx));
                 }
             }
         }
     }
 
+    if !element_hits.is_empty() {
+        let clicked = [pos.x, pos.y];
+        let same_spot = state
+            .canvas_click_cycle_world
+            .map(|prev| {
+                let dx = prev[0] - clicked[0];
+                let dy = prev[1] - clicked[1];
+                (dx * dx + dy * dy).sqrt() < 8.0
+            })
+            .unwrap_or(false);
+        if !same_spot {
+            state.canvas_click_cycle_index = 0;
+        }
+        let idx = state.canvas_click_cycle_index % element_hits.len();
+        let picked = element_hits[idx];
+        state.canvas_click_cycle_world = Some(clicked);
+        state.canvas_click_cycle_index = (idx + 1) % element_hits.len();
+        if apply_parent_pick_if_active(state, picked) {
+            return;
+        }
+        state.selection = picked;
+        return;
+    }
+
     // Check backgrounds (click inside render frame area)
     for (idx, bg) in state.scene.backgrounds.iter().enumerate().rev() {
         let bg_end = bg.start + bg.duration;
-        if pos.x >= frame_tl_x && pos.x <= frame_tl_x + cam_world_w
-            && pos.y >= frame_tl_y && pos.y <= frame_tl_y + cam_world_h
+        if pos.x >= frame_tl_x
+            && pos.x <= frame_tl_x + cam_world_w
+            && pos.y >= frame_tl_y
+            && pos.y <= frame_tl_y + cam_world_h
         {
             if t >= bg.start && t <= bg_end {
+                state.canvas_click_cycle_world = None;
+                state.canvas_click_cycle_index = 0;
                 state.selection = Selection::Background(idx);
                 return;
             }
@@ -6499,10 +7202,15 @@ fn try_select_at(state: &mut EditorState, pos: WorldPos) {
     let half_w = cam_world_w * 0.5;
     let half_h = cam_world_h * 0.5;
     if lx >= -half_w && lx <= half_w && ly >= -half_h && ly <= half_h {
+        state.canvas_click_cycle_world = None;
+        state.canvas_click_cycle_index = 0;
         state.selection = Selection::RenderFrame;
         return;
     }
 
+    state.canvas_click_cycle_world = None;
+    state.canvas_click_cycle_index = 0;
+    state.parent_pick_child_id = None;
     state.selection = Selection::None;
 }
 
@@ -6513,18 +7221,26 @@ fn is_point_on_selection(state: &EditorState, pos: WorldPos) -> bool {
     match state.selection {
         Selection::Actor(idx) if idx < state.scene.actors.len() => {
             let actor = &state.scene.actors[idx];
-            if !actor.visible { return false; }
+            if !actor.visible {
+                return false;
+            }
             let world_pos = get_element_world_pos(state, &actor.id, &actor.layout, t);
             let actor_scale = sample_actor_transform(actor, t).scale;
             let (base_w, base_h) = if let Some(fc) = state.frame_caches.get(idx) {
                 if fc.is_ready() && fc.frame_count > 0 {
                     (fc.source_width as f32, fc.source_height as f32)
-                } else { (1080.0, 1920.0) }
-            } else { (1080.0, 1920.0) };
+                } else {
+                    (1080.0, 1920.0)
+                }
+            } else {
+                (1080.0, 1920.0)
+            };
             let half_w = base_w * actor_scale * 0.5;
             let half_h = base_h * actor_scale * 0.5;
-            pos.x >= world_pos.x - half_w && pos.x <= world_pos.x + half_w
-                && pos.y >= world_pos.y - half_h && pos.y <= world_pos.y + half_h
+            pos.x >= world_pos.x - half_w
+                && pos.x <= world_pos.x + half_w
+                && pos.y >= world_pos.y - half_h
+                && pos.y <= world_pos.y + half_h
         }
         Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
             let overlay = &state.scene.overlays[idx];
@@ -6540,20 +7256,25 @@ fn is_point_on_selection(state: &EditorState, pos: WorldPos) -> bool {
                 Overlay::Image(img) => (img.t_in, img.t_out, &img.layout),
                 Overlay::Video(vid) => (vid.t_in, vid.t_out, &vid.layout),
             };
-            let sample_t = if t >= t_in && t <= t_out { t - t_in } else { 0.0 };
+            let sample_t = if t >= t_in && t <= t_out {
+                t - t_in
+            } else {
+                0.0
+            };
             let ov_state = sample_overlay_transform(overlay, sample_t);
             let ov_world = WorldPos {
                 x: ov_state.pos[0] * world_w,
                 y: ov_state.pos[1] * world_h,
             };
             let (ew, eh) = overlay_bbox_with_state(overlay, &ov_state, state);
-            pos.x >= ov_world.x - ew * 0.5 && pos.x <= ov_world.x + ew * 0.5
-                && pos.y >= ov_world.y - eh * 0.5 && pos.y <= ov_world.y + eh * 0.5
+            pos.x >= ov_world.x - ew * 0.5
+                && pos.x <= ov_world.x + ew * 0.5
+                && pos.y >= ov_world.y - eh * 0.5
+                && pos.y <= ov_world.y + eh * 0.5
         }
         _ => false,
     }
 }
-
 
 // ─── PREVIEW EFFECTS (CHROMAKEY + COLOR CORRECTION) ──────────────────
 
@@ -6627,7 +7348,6 @@ fn apply_preview_effects(
     out
 }
 
-
 // ─── VIEWPORT CONTROLS ───────────────────────────────────────────────
 
 fn draw_viewport_controls(
@@ -6645,52 +7365,55 @@ fn draw_viewport_controls(
 
     // Fit button
     let fit_rect = Rect::from_min_size(
-        Pos2::new(full_rect.max.x - margin - btn_size.x * 3.0 - 8.0, full_rect.max.y - margin - btn_size.y),
+        Pos2::new(
+            full_rect.max.x - margin - btn_size.x * 3.0 - 8.0,
+            full_rect.max.y - margin - btn_size.y,
+        ),
         btn_size,
     );
     let fit_resp = ui.put(fit_rect, egui::Button::new("F").small());
-    if fit_resp.on_hover_text(crate::i18n::t("Fit render frame in view")).clicked() {
+    if fit_resp
+        .on_hover_text(crate::i18n::t("Fit render frame in view"))
+        .clicked()
+    {
         let rf = &state.scene.render_frame;
         let rf_state = sample_render_frame(rf, state.playhead);
-        state.canvas_viewport.fit_render_frame(
-            rf_state.pos,
-            rf.resolution,
-            viewport_size,
-        );
+        state
+            .canvas_viewport
+            .fit_render_frame(rf_state.pos, rf.resolution, viewport_size);
     }
 
     // Zoom in
-    let zin_rect = Rect::from_min_size(
-        Pos2::new(fit_rect.max.x + 4.0, fit_rect.min.y),
-        btn_size,
-    );
+    let zin_rect = Rect::from_min_size(Pos2::new(fit_rect.max.x + 4.0, fit_rect.min.y), btn_size);
     let zin_resp = ui.put(zin_rect, egui::Button::new("+").small());
     if zin_resp.on_hover_text(crate::i18n::t("Zoom in")).clicked() {
         state.canvas_viewport.zoom = (state.canvas_viewport.zoom * 1.3).min(50.0);
     }
 
     // Zoom out
-    let zout_rect = Rect::from_min_size(
-        Pos2::new(zin_rect.max.x + 4.0, fit_rect.min.y),
-        btn_size,
-    );
+    let zout_rect = Rect::from_min_size(Pos2::new(zin_rect.max.x + 4.0, fit_rect.min.y), btn_size);
     let zout_resp = ui.put(zout_rect, egui::Button::new("-").small());
-    if zout_resp.on_hover_text(crate::i18n::t("Zoom out")).clicked() {
+    if zout_resp
+        .on_hover_text(crate::i18n::t("Zoom out"))
+        .clicked()
+    {
         state.canvas_viewport.zoom = (state.canvas_viewport.zoom / 1.3).max(0.01);
     }
 
     // Zoom level indicator
     let zoom_text = format!("{:.0}%", state.canvas_viewport.zoom * 100.0);
-    let text_pos = Pos2::new(full_rect.max.x - margin - 50.0, full_rect.max.y - margin - btn_size.y - 16.0);
+    let text_pos = Pos2::new(
+        full_rect.max.x - margin - 50.0,
+        full_rect.max.y - margin - btn_size.y - 16.0,
+    );
     ui.painter().text(
-        text_pos, egui::Align2::RIGHT_BOTTOM,
-        zoom_text, egui::FontId::proportional(9.0),
+        text_pos,
+        egui::Align2::RIGHT_BOTTOM,
+        zoom_text,
+        egui::FontId::proportional(9.0),
         Color32::from_rgb(100, 100, 120),
     );
 }
-
-
-
 
 // ─── MASK / CROP TOOLBAR ─────────────────────────────────────────────
 //
@@ -6701,11 +7424,7 @@ fn draw_viewport_controls(
 
 /// No-op — mask toolbar removed from canvas. Tools are armed from the
 /// inspector panel only.
-fn draw_mask_toolbar(
-    _ui: &mut egui::Ui,
-    _full_rect: Rect,
-    state: &mut EditorState,
-) {
+fn draw_mask_toolbar(_ui: &mut egui::Ui, _full_rect: Rect, state: &mut EditorState) {
     // Show a minimal status badge when a mask tool is armed (so the
     // user knows the canvas is in mask-draw mode and can press Esc).
     if state.mask_tool != crate::state::MaskTool::None {
@@ -6723,8 +7442,6 @@ fn draw_mask_toolbar(
 // to that bounding box is stored / appended. On release the resulting
 // shape is committed to the element's `effects` stack as the right
 // `EffectKind` variant for the active tool.
-
-use crate::state::MaskTool;
 
 /// True when the mask drawing pipeline should consume this pointer
 /// gesture instead of the default transform handler. Always returns
@@ -6763,7 +7480,11 @@ fn screen_to_element_uv(
     let u = (lx / (gizmo.half_w * 2.0)) + 0.5;
     let v = (ly / (gizmo.half_h * 2.0)) + 0.5;
     let elem_rect = selected_element_screen_rect(state, full_rect, viewport_size)?;
-    Some(([u.clamp(-0.5, 1.5), v.clamp(-0.5, 1.5)], state.selection, elem_rect))
+    Some((
+        [u.clamp(-0.5, 1.5), v.clamp(-0.5, 1.5)],
+        state.selection,
+        elem_rect,
+    ))
 }
 
 /// Sample the rotation (in degrees, CW positive) of the currently-
@@ -6804,14 +7525,24 @@ pub(crate) fn handle_mask_draw_input(
     // start a DrawMask drag for what's meant to be a one-shot click.
     if state.mask_tool == MaskTool::Eyedropper {
         let pointer_pos = ui.input(|i| i.pointer.hover_pos());
+        let can_sample = pointer_pos
+            .and_then(|p| screen_to_element_uv(state, full_rect, viewport_size, p))
+            .is_some();
+        ui.ctx().set_cursor_icon(if can_sample {
+            egui::CursorIcon::Crosshair
+        } else {
+            egui::CursorIcon::NotAllowed
+        });
         if response.clicked() || response.drag_started() {
             if let Some(p) = pointer_pos {
-                handle_eyedropper_mask_click(ui, state, full_rect, viewport_size, p);
+                if can_sample {
+                    handle_eyedropper_mask_click(ui, state, full_rect, viewport_size, p);
+                } else {
+                    state.status =
+                        crate::i18n::t("Eyedropper mask: click on the picture itself.").into();
+                }
             }
         }
-        // Always keep the cursor as a crosshair so the user knows the
-        // tool is armed even between clicks.
-        ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
         return true;
     }
 
@@ -6856,9 +7587,7 @@ pub(crate) fn handle_mask_draw_input(
     if let crate::state::CanvasDragMode::DrawMask { tool, .. } = state.canvas_drag.mode {
         ui.ctx().request_repaint();
         if let Some(p) = pointer_pos {
-            if let Some((uv, _, _)) =
-                screen_to_element_uv(state, full_rect, viewport_size, p)
-            {
+            if let Some((uv, _, _)) = screen_to_element_uv(state, full_rect, viewport_size, p) {
                 if matches!(
                     tool,
                     MaskTool::FreehandMask | MaskTool::Eraser | MaskTool::BrushDraw
@@ -6888,8 +7617,11 @@ pub(crate) fn handle_mask_draw_input(
     // Pointer-release commits the shape.
     let released = ui.input(|i| i.pointer.any_released());
     if released {
-        if let crate::state::CanvasDragMode::DrawMask { tool, start_uv, target } =
-            state.canvas_drag.mode
+        if let crate::state::CanvasDragMode::DrawMask {
+            tool,
+            start_uv,
+            target,
+        } = state.canvas_drag.mode
         {
             commit_mask_draft(state, tool, start_uv, target);
             state.canvas_drag.mode = crate::state::CanvasDragMode::None;
@@ -6980,7 +7712,12 @@ fn handle_segment_mask_input(
     // Helper: commit the in-flight polygon via `commit_mask_draft`,
     // then reset the carrier + draft.
     fn commit_segment(state: &mut EditorState) {
-        if let CanvasDragMode::DrawMask { tool, start_uv, target } = state.canvas_drag.mode {
+        if let CanvasDragMode::DrawMask {
+            tool,
+            start_uv,
+            target,
+        } = state.canvas_drag.mode
+        {
             commit_mask_draft(state, tool, start_uv, target);
         }
         state.canvas_drag.mode = CanvasDragMode::None;
@@ -7001,9 +7738,8 @@ fn handle_segment_mask_input(
     // Enter / Return → commit (≥ 3 vertices). Lets the user finish
     // the polygon from the keyboard if a clean closure click is
     // awkward (e.g. when the first vertex is occluded by other UI).
-    let enter_pressed = ui.input(|i| {
-        i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Space)
-    });
+    let enter_pressed =
+        ui.input(|i| i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Space));
     if enter_pressed && state.mask_draft_points.len() >= 3 {
         commit_segment(state);
         return;
@@ -7011,16 +7747,19 @@ fn handle_segment_mask_input(
 
     // Left-click → place a vertex (or close the polygon).
     if response.clicked() {
-        let Some(p) = pointer else { return; };
-        let Some((uv, target, _rect)) =
-            screen_to_element_uv(state, full_rect, viewport_size, p)
+        let Some(p) = pointer else {
+            return;
+        };
+        let Some((uv, target, _rect)) = screen_to_element_uv(state, full_rect, viewport_size, p)
         else {
             // No element selected (or click was outside its bounding
             // box). Surface a hint instead of silently swallowing the
             // click — the user otherwise gets no feedback for why
             // their vertex didn't appear.
-            state.status =
-                crate::i18n::t("Segment mask: select an actor or image overlay first, then click on it.").into();
+            state.status = crate::i18n::t(
+                "Segment mask: select an actor or image overlay first, then click on it.",
+            )
+            .into();
             return;
         };
 
@@ -7085,7 +7824,9 @@ fn commit_mask_draft(
     target: Selection,
 ) {
     let pts = state.mask_draft_points.clone();
-    if pts.is_empty() { return; }
+    if pts.is_empty() {
+        return;
+    }
     // Bound the rect / ellipse to the smallest enclosing axis-aligned
     // box of the drag (start, current).
     let last_uv = *pts.last().unwrap_or(&start_uv);
@@ -7141,7 +7882,9 @@ fn commit_mask_draft(
             ))
         }
         MaskTool::FreehandMask => {
-            if pts.len() < 3 { None } else {
+            if pts.len() < 3 {
+                None
+            } else {
                 let clamped: Vec<[f32; 2]> = pts
                     .into_iter()
                     .map(|p| [p[0].clamp(0.0, 1.0), p[1].clamp(0.0, 1.0)])
@@ -7161,7 +7904,9 @@ fn commit_mask_draft(
             // clamp + minimum-vertex check so the resulting mask is
             // guaranteed to fall inside the source UV (matches what
             // the renderer / FFmpeg expects).
-            if pts.len() < 3 { None } else {
+            if pts.len() < 3 {
+                None
+            } else {
                 let clamped: Vec<[f32; 2]> = pts
                     .into_iter()
                     .map(|p| [p[0].clamp(0.0, 1.0), p[1].clamp(0.0, 1.0)])
@@ -7195,7 +7940,11 @@ fn commit_mask_draft(
                 Some(memstroy_core::Effect::new(
                     memstroy_core::EffectKind::Mask {
                         shape: memstroy_core::MaskShape::Polygon { points: clamped },
-                        feather: if matches!(tool, MaskTool::BrushDraw) { 0.01 } else { 0.0 },
+                        feather: if matches!(tool, MaskTool::BrushDraw) {
+                            0.01
+                        } else {
+                            0.0
+                        },
                         invert,
                     },
                 ))
@@ -7214,36 +7963,53 @@ fn commit_mask_draft(
         MaskTool::None => None,
     };
 
-    let Some(effect) = new_effect else { return; };
+    let Some(effect) = new_effect else {
+        return;
+    };
     let replace_crop = matches!(effect.kind, memstroy_core::EffectKind::Crop { .. });
+    let replace_target = state.mask_replace_target.take();
 
     // Fold the new effect into the target element's stack inside a
     // single `mutate` call so it lands as one undo step.
-    state.mutate(|scene| {
-        match target {
-            Selection::Actor(i) if i < scene.actors.len() => {
-                if replace_crop {
-                    scene.actors[i]
-                        .effects
-                        .retain(|e| !matches!(e.kind, memstroy_core::EffectKind::Crop { .. }));
+    state.mutate(|scene| match target {
+        Selection::Actor(i) if i < scene.actors.len() => {
+            if let Some((rt, effect_idx)) = replace_target {
+                if rt == target && effect_idx < scene.actors[i].effects.len() {
+                    scene.actors[i].effects[effect_idx] = effect.clone();
+                    return;
                 }
-                scene.actors[i].effects.push(effect.clone());
             }
-            Selection::Overlay(i) if i < scene.overlays.len() => {
-                let effects = match &mut scene.overlays[i] {
-                    memstroy_core::Overlay::Text(t) => &mut t.effects,
-                    memstroy_core::Overlay::Image(im) => &mut im.effects,
-                    memstroy_core::Overlay::Video(v) => &mut v.effects,
-                };
-                if replace_crop {
-                    effects.retain(|e| !matches!(e.kind, memstroy_core::EffectKind::Crop { .. }));
-                }
-                effects.push(effect.clone());
+            if replace_crop {
+                scene.actors[i]
+                    .effects
+                    .retain(|e| !matches!(e.kind, memstroy_core::EffectKind::Crop { .. }));
             }
-            _ => {}
+            scene.actors[i].effects.push(effect.clone());
         }
+        Selection::Overlay(i) if i < scene.overlays.len() => {
+            let effects = match &mut scene.overlays[i] {
+                memstroy_core::Overlay::Text(t) => &mut t.effects,
+                memstroy_core::Overlay::Image(im) => &mut im.effects,
+                memstroy_core::Overlay::Video(v) => &mut v.effects,
+            };
+            if let Some((rt, effect_idx)) = replace_target {
+                if rt == target && effect_idx < effects.len() {
+                    effects[effect_idx] = effect.clone();
+                    return;
+                }
+            }
+            if replace_crop {
+                effects.retain(|e| !matches!(e.kind, memstroy_core::EffectKind::Crop { .. }));
+            }
+            effects.push(effect.clone());
+        }
+        _ => {}
     });
     state.status = format!("\u{2702} {} {}", tool.label(), crate::i18n::t("applied"));
+    state.mask_tool = MaskTool::None;
+    state.mask_draft_points.clear();
+    state.mask_segment_cursor_uv = None;
+    state.canvas_drag.mode = CanvasDragMode::None;
 }
 
 /// Eyedropper colour-key mask — the click handler for
@@ -7271,8 +8037,7 @@ fn handle_eyedropper_mask_click(
     viewport_size: [f32; 2],
     pointer: Pos2,
 ) {
-    let Some((uv, target, _rect)) =
-        screen_to_element_uv(state, full_rect, viewport_size, pointer)
+    let Some((uv, target, _rect)) = screen_to_element_uv(state, full_rect, viewport_size, pointer)
     else {
         state.status = crate::i18n::t("Eyedropper mask: select an element first.").into();
         return;
@@ -7295,18 +8060,23 @@ fn handle_eyedropper_mask_click(
         _ => None,
     };
     let Some(rgb) = picked else {
-        state.status =
-            crate::i18n::t("Eyedropper mask: source frame not yet decoded — try again in a moment.").into();
+        state.status = crate::i18n::t(
+            "Eyedropper mask: source frame not yet decoded — try again in a moment.",
+        )
+        .into();
         return;
     };
 
     // Apply the picked colour: overwrite the latest ColorKey entry on
     // the layer if there is one, otherwise push a fresh one.
     let label = format!(
-        "\u{1F4A7} {} #{:02X}{:02X}{:02X}",
+        "⌖ {} #{:02X}{:02X}{:02X}",
         crate::i18n::t("Color key:"),
-        rgb[0], rgb[1], rgb[2],
+        rgb[0],
+        rgb[1],
+        rgb[2],
     );
+    let replace_target = state.mask_replace_target.take();
     state.mutate(|scene| {
         let effects: &mut Vec<memstroy_core::Effect> = match target {
             Selection::Actor(i) => &mut scene.actors[i].effects,
@@ -7317,6 +8087,16 @@ fn handle_eyedropper_mask_click(
             },
             _ => return,
         };
+        if let Some((rt, effect_idx)) = replace_target {
+            if rt == target {
+                if let Some(eff) = effects.get_mut(effect_idx) {
+                    if let memstroy_core::EffectKind::ColorKey { color, .. } = &mut eff.kind {
+                        *color = rgb;
+                        return;
+                    }
+                }
+            }
+        }
         // Prefer the rightmost existing ColorKey so the user's most
         // recently-added entry is the one that updates.
         let existing = effects
@@ -7339,6 +8119,9 @@ fn handle_eyedropper_mask_click(
         }
     });
     state.status = label;
+    state.mask_tool = MaskTool::None;
+    state.mask_draft_points.clear();
+    state.mask_segment_cursor_uv = None;
     ui.ctx().request_repaint();
 }
 
@@ -7390,7 +8173,9 @@ fn sample_overlay_pixel(state: &EditorState, idx: usize, uv: [f32; 2]) -> Option
     let rgba = image::open(&path_buf).ok()?.to_rgba8();
     let w = rgba.width() as usize;
     let h = rgba.height() as usize;
-    if w == 0 || h == 0 { return None; }
+    if w == 0 || h == 0 {
+        return None;
+    }
     let px = ((uv[0] * w as f32) as usize).min(w - 1);
     let py = ((uv[1] * h as f32) as usize).min(h - 1);
     let raw = rgba.as_raw();
@@ -7416,14 +8201,11 @@ fn draw_mask_draft(
     state: &EditorState,
     viewport_size: [f32; 2],
 ) {
-    let crate::state::CanvasDragMode::DrawMask { tool, start_uv, .. } =
-        state.canvas_drag.mode
+    let crate::state::CanvasDragMode::DrawMask { tool, start_uv, .. } = state.canvas_drag.mode
     else {
         return;
     };
-    let Some(elem_rect) =
-        selected_element_screen_rect(state, full_rect, viewport_size)
-    else {
+    let Some(elem_rect) = selected_element_screen_rect(state, full_rect, viewport_size) else {
         return;
     };
     let rotation_deg = selected_element_rotation_deg(state);
@@ -7444,10 +8226,7 @@ fn draw_mask_draft(
     };
     let stroke_main = Stroke::new(1.5, Color32::from_rgb(255, 200, 50));
     let stroke_dash = Stroke::new(1.0, Color32::from_rgba_premultiplied(255, 200, 50, 160));
-    let last_uv = *state
-        .mask_draft_points
-        .last()
-        .unwrap_or(&start_uv);
+    let last_uv = *state.mask_draft_points.last().unwrap_or(&start_uv);
     match tool {
         MaskTool::RectMask | MaskTool::CropRect => {
             // Draw the rectangle as a closed polyline in element-local
@@ -7479,10 +8258,7 @@ fn draw_mask_draft(
             let mut prev = to_screen([cx_uv + rx_uv, cy_uv]);
             for s in 1..=segments {
                 let theta = (s as f32 / segments as f32) * std::f32::consts::TAU;
-                let cur = to_screen([
-                    cx_uv + rx_uv * theta.cos(),
-                    cy_uv + ry_uv * theta.sin(),
-                ]);
+                let cur = to_screen([cx_uv + rx_uv * theta.cos(), cy_uv + ry_uv * theta.sin()]);
                 painter.line_segment([prev, cur], stroke_main);
                 prev = cur;
             }
@@ -7570,7 +8346,6 @@ fn draw_mask_draft(
         MaskTool::None => {}
     }
 }
-
 
 // ─── SNAP HELPERS ────────────────────────────────────────────────────
 /// element doesn't snap to itself.
@@ -7707,13 +8482,23 @@ fn snap_to_render_frame_rotated_edges(
         // (signed local target axis, distance, line origin in local,
         //  line angle_rad in world)
         // Left edge:   local x = -half_w, line direction = local Y axis
-        ( -half_w - lx,                      (-half_w - lx).abs(),  [-half_w, 0.0], rad + std::f32::consts::FRAC_PI_2 ),
+        (
+            -half_w - lx,
+            (-half_w - lx).abs(),
+            [-half_w, 0.0],
+            rad + std::f32::consts::FRAC_PI_2,
+        ),
         // Right edge:  local x = +half_w, line direction = local Y axis
-        ( half_w  - lx,                      (half_w  - lx).abs(),  [ half_w, 0.0], rad + std::f32::consts::FRAC_PI_2 ),
+        (
+            half_w - lx,
+            (half_w - lx).abs(),
+            [half_w, 0.0],
+            rad + std::f32::consts::FRAC_PI_2,
+        ),
         // Top edge:    local y = -half_h, line direction = local X axis
-        ( -half_h - ly,                      (-half_h - ly).abs(),  [0.0, -half_h], rad ),
+        (-half_h - ly, (-half_h - ly).abs(), [0.0, -half_h], rad),
         // Bottom edge: local y = +half_h, line direction = local X axis
-        ( half_h  - ly,                      (half_h  - ly).abs(),  [0.0,  half_h], rad ),
+        (half_h - ly, (half_h - ly).abs(), [0.0, half_h], rad),
     ];
 
     let mut best_idx: Option<usize> = None;
@@ -7753,10 +8538,7 @@ fn snap_to_render_frame_rotated_edges(
 
 /// Collect every world-space X (vertical-line) and Y (horizontal-line) snap
 /// target available in the current scene.
-fn collect_snap_targets(
-    state: &EditorState,
-    exclude: Option<SnapExclude>,
-) -> (Vec<f32>, Vec<f32>) {
+fn collect_snap_targets(state: &EditorState, exclude: Option<SnapExclude>) -> (Vec<f32>, Vec<f32>) {
     let mut xs = Vec::new();
     let mut ys = Vec::new();
 
@@ -7833,9 +8615,13 @@ fn draw_snap_guides(
     for guide in &state.canvas_drag.snap_guides {
         match guide.axis {
             crate::state::SnapAxis::Vertical => {
-                let s = state
-                    .canvas_viewport
-                    .world_to_screen(WorldPos { x: guide.world, y: 0.0 }, viewport_size);
+                let s = state.canvas_viewport.world_to_screen(
+                    WorldPos {
+                        x: guide.world,
+                        y: 0.0,
+                    },
+                    viewport_size,
+                );
                 let sx = full_rect.min.x + s[0];
                 if sx >= full_rect.min.x && sx <= full_rect.max.x {
                     painter.line_segment(
@@ -7848,9 +8634,13 @@ fn draw_snap_guides(
                 }
             }
             crate::state::SnapAxis::Horizontal => {
-                let s = state
-                    .canvas_viewport
-                    .world_to_screen(WorldPos { x: 0.0, y: guide.world }, viewport_size);
+                let s = state.canvas_viewport.world_to_screen(
+                    WorldPos {
+                        x: 0.0,
+                        y: guide.world,
+                    },
+                    viewport_size,
+                );
                 let sy = full_rect.min.y + s[1];
                 if sy >= full_rect.min.y && sy <= full_rect.max.y {
                     painter.line_segment(
@@ -7882,8 +8672,12 @@ fn draw_snap_guides(
                     x: guide.line_origin[0] + dir_x * len,
                     y: guide.line_origin[1] + dir_y * len,
                 };
-                let p1 = state.canvas_viewport.world_to_screen(p1_world, viewport_size);
-                let p2 = state.canvas_viewport.world_to_screen(p2_world, viewport_size);
+                let p1 = state
+                    .canvas_viewport
+                    .world_to_screen(p1_world, viewport_size);
+                let p2 = state
+                    .canvas_viewport
+                    .world_to_screen(p2_world, viewport_size);
                 let p1s = Pos2::new(full_rect.min.x + p1[0], full_rect.min.y + p1[1]);
                 let p2s = Pos2::new(full_rect.min.x + p2[0], full_rect.min.y + p2[1]);
                 painter.line_segment([p1s, p2s], Stroke::new(1.0, col));
@@ -7891,7 +8685,6 @@ fn draw_snap_guides(
         }
     }
 }
-
 
 // ─── LIBRARY DRAG-TO-CANVAS ──────────────────────────────────────────
 
@@ -7910,9 +8703,8 @@ pub fn handle_canvas_asset_drag(
     }
 
     let pointer_pos = ui.input(|i| i.pointer.hover_pos().or(i.pointer.interact_pos()));
-    let drag_pos = pointer_pos.unwrap_or_else(|| {
-        egui::pos2(state.asset_drag.pos[0], state.asset_drag.pos[1])
-    });
+    let drag_pos =
+        pointer_pos.unwrap_or_else(|| egui::pos2(state.asset_drag.pos[0], state.asset_drag.pos[1]));
     state.asset_drag.pos = [drag_pos.x, drag_pos.y];
     let in_canvas = full_rect.contains(drag_pos);
 
@@ -7924,84 +8716,94 @@ pub fn handle_canvas_asset_drag(
             return;
         }
     } else {
-
-    // Translucent crosshair at the proposed drop point.
-    let painter = ui.painter_at(full_rect);
-    painter.circle_stroke(
-        drag_pos,
-        18.0,
-        Stroke::new(1.5, Color32::from_rgb(255, 220, 80)),
-    );
-    painter.line_segment(
-        [
-            Pos2::new(drag_pos.x - 24.0, drag_pos.y),
-            Pos2::new(drag_pos.x + 24.0, drag_pos.y),
-        ],
-        Stroke::new(1.0, Color32::from_rgba_premultiplied(255, 220, 80, 180)),
-    );
-    painter.line_segment(
-        [
-            Pos2::new(drag_pos.x, drag_pos.y - 24.0),
-            Pos2::new(drag_pos.x, drag_pos.y + 24.0),
-        ],
-        Stroke::new(1.0, Color32::from_rgba_premultiplied(255, 220, 80, 180)),
-    );
-
-    // Floating thumbnail card next to the cursor.
-    let card_w = 180.0_f32;
-    let card_h = 56.0_f32;
-    let anchor = drag_pos + egui::vec2(20.0, 16.0);
-    let card_rect = Rect::from_min_size(anchor, Vec2::new(card_w, card_h));
-    painter.rect_filled(
-        card_rect,
-        Rounding::same(6.0),
-        Color32::from_rgba_premultiplied(20, 20, 30, 230),
-    );
-    painter.rect_stroke(
-        card_rect,
-        Rounding::same(6.0),
-        Stroke::new(1.5, Color32::from_rgb(255, 200, 50)),
-    );
-    let thumb_size = Vec2::splat(48.0);
-    let thumb_rect = Rect::from_min_size(card_rect.min + egui::vec2(4.0, 4.0), thumb_size);
-    if let Some(thumb) = &state.asset_drag.thumbnail {
-        let uri = format!("file://{}", thumb.display());
-        let img = egui::Image::from_uri(uri)
-            .fit_to_exact_size(thumb_size)
-            .maintain_aspect_ratio(false)
-            .rounding(Rounding::same(3.0))
-            .tint(Color32::from_white_alpha(220));
-        img.paint_at(ui, thumb_rect);
-    } else {
-        painter.rect_filled(thumb_rect, Rounding::same(3.0), Color32::from_rgb(44, 42, 28));
-        painter.text(
-            thumb_rect.center(),
-            egui::Align2::CENTER_CENTER,
-            "\u{1F3AC}",
-            egui::FontId::proportional(24.0),
-            Color32::from_rgb(255, 200, 50),
+        // Translucent crosshair at the proposed drop point.
+        let painter = ui.painter_at(full_rect);
+        painter.circle_stroke(
+            drag_pos,
+            18.0,
+            Stroke::new(1.5, Color32::from_rgb(255, 220, 80)),
         );
-    }
-    let label = if state.asset_drag.label.is_empty() {
-        crate::i18n::t("Drop on canvas").to_string()
-    } else {
-        state.asset_drag.label.clone()
-    };
-    let text_anchor = thumb_rect.right_top() + egui::vec2(6.0, 4.0);
-    painter.text(
-        text_anchor,
-        egui::Align2::LEFT_TOP,
-        label,
-        egui::FontId::proportional(11.0),
-        Color32::from_rgb(220, 220, 240),
-    );
-    painter.text(
-        text_anchor + egui::vec2(0.0, 18.0),
-        egui::Align2::LEFT_TOP,
-        crate::i18n::t("drop here to place at cursor"),
-        egui::FontId::proportional(9.0),
-        Color32::from_rgb(160, 160, 180),
-    );
+        painter.line_segment(
+            [
+                Pos2::new(drag_pos.x - 24.0, drag_pos.y),
+                Pos2::new(drag_pos.x + 24.0, drag_pos.y),
+            ],
+            Stroke::new(1.0, Color32::from_rgba_premultiplied(255, 220, 80, 180)),
+        );
+        painter.line_segment(
+            [
+                Pos2::new(drag_pos.x, drag_pos.y - 24.0),
+                Pos2::new(drag_pos.x, drag_pos.y + 24.0),
+            ],
+            Stroke::new(1.0, Color32::from_rgba_premultiplied(255, 220, 80, 180)),
+        );
+
+        // Floating thumbnail card next to the cursor.
+        let card_w = 180.0_f32;
+        let card_h = 56.0_f32;
+        let anchor = drag_pos + egui::vec2(20.0, 16.0);
+        let card_rect = Rect::from_min_size(anchor, Vec2::new(card_w, card_h));
+        painter.rect_filled(
+            card_rect,
+            Rounding::same(6.0),
+            Color32::from_rgba_premultiplied(20, 20, 30, 230),
+        );
+        painter.rect_stroke(
+            card_rect,
+            Rounding::same(6.0),
+            Stroke::new(1.5, Color32::from_rgb(255, 200, 50)),
+        );
+        let thumb_size = Vec2::splat(48.0);
+        let thumb_rect = Rect::from_min_size(card_rect.min + egui::vec2(4.0, 4.0), thumb_size);
+        if let Some(thumb) = &state.asset_drag.thumbnail {
+            let uri = format!("file://{}", thumb.display());
+            let img = egui::Image::from_uri(uri)
+                .fit_to_exact_size(thumb_size)
+                .maintain_aspect_ratio(false)
+                .rounding(Rounding::same(3.0))
+                .tint(Color32::from_white_alpha(220));
+            img.paint_at(ui, thumb_rect);
+        } else {
+            painter.rect_filled(
+                thumb_rect,
+                Rounding::same(3.0),
+                Color32::from_rgb(44, 42, 28),
+            );
+            let icon = match state.asset_drag.kind {
+                crate::state::AssetDragKind::Clip | crate::state::AssetDragKind::Video => "VID",
+                crate::state::AssetDragKind::Sound => "SND",
+                crate::state::AssetDragKind::Image => "IMG",
+                crate::state::AssetDragKind::Particle => "FX",
+                crate::state::AssetDragKind::None => "?",
+            };
+            painter.text(
+                thumb_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                icon,
+                egui::FontId::proportional(22.0),
+                Color32::from_rgb(255, 200, 50),
+            );
+        }
+        let label = if state.asset_drag.label.is_empty() {
+            crate::i18n::t("Drop on canvas").to_string()
+        } else {
+            state.asset_drag.label.clone()
+        };
+        let text_anchor = thumb_rect.right_top() + egui::vec2(6.0, 4.0);
+        painter.text(
+            text_anchor,
+            egui::Align2::LEFT_TOP,
+            label,
+            egui::FontId::proportional(11.0),
+            Color32::from_rgb(220, 220, 240),
+        );
+        painter.text(
+            text_anchor + egui::vec2(0.0, 18.0),
+            egui::Align2::LEFT_TOP,
+            crate::i18n::t("drop here to place at cursor"),
+            egui::FontId::proportional(9.0),
+            Color32::from_rgb(160, 160, 180),
+        );
     }
 
     // ── Accept drop on release ──
@@ -8011,14 +8813,23 @@ pub fn handle_canvas_asset_drag(
         return;
     }
     if mouse_released && in_canvas {
-        let world = state
-            .canvas_viewport
-            .screen_to_world([drag_pos.x - full_rect.min.x, drag_pos.y - full_rect.min.y], viewport_size);
+        if state.asset_drag.pending_web_image_url.is_some() {
+            state.status = crate::i18n::t(
+                "Image is still downloading. Drag again when the thumbnail is ready.",
+            )
+            .into();
+            state.clear_asset_drag();
+            return;
+        }
+        let world = state.canvas_viewport.screen_to_world(
+            [drag_pos.x - full_rect.min.x, drag_pos.y - full_rect.min.y],
+            viewport_size,
+        );
         let asset_path = state.asset_drag.dragging.clone().unwrap();
         let asset_label = state.asset_drag.label.clone();
         let kind = state.asset_drag.kind;
         match kind {
-            crate::state::AssetDragKind::Clip | crate::state::AssetDragKind::Video => {
+            crate::state::AssetDragKind::Clip => {
                 // Server-only stubs: download the full `.mp4` first;
                 // `ClipDownloaded` places the actor at the drop point.
                 if crate::panels::try_spawn_lazy_clip_download(
@@ -8038,29 +8849,72 @@ pub fn handle_canvas_asset_drag(
                     [world.x, world.y],
                 );
             }
+            crate::state::AssetDragKind::Video => {
+                if crate::panels::try_spawn_lazy_server_asset_download(
+                    state,
+                    &asset_path,
+                    kind,
+                    crate::jobs::ServerAssetDropTarget::CanvasAt {
+                        world_x: world.x,
+                        world_y: world.y,
+                    },
+                ) {
+                    state.clear_asset_drag();
+                    return;
+                }
+                crate::panels::add_actor_from_video_at_canvas(
+                    state,
+                    &asset_path,
+                    [world.x, world.y],
+                );
+            }
             crate::state::AssetDragKind::Sound
             | crate::state::AssetDragKind::Image
             | crate::state::AssetDragKind::Particle => {
+                if crate::panels::try_spawn_lazy_server_asset_download(
+                    state,
+                    &asset_path,
+                    kind,
+                    crate::jobs::ServerAssetDropTarget::CanvasAt {
+                        world_x: world.x,
+                        world_y: world.y,
+                    },
+                ) {
+                    state.clear_asset_drag();
+                    return;
+                }
                 // Build a temporary LibraryAsset out of the drag payload —
                 // the asset card already populated the path / label /
                 // thumbnail, and the helper picks the right scene element
                 // for the drag kind.
-                let id = asset_path.file_stem()
+                let id = asset_path
+                    .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("asset")
                     .to_string();
                 let asset = crate::state::LibraryAsset {
                     id: id.clone(),
                     path: asset_path.clone(),
-                    label: if asset_label.is_empty() { id } else { asset_label },
+                    label: if asset_label.is_empty() {
+                        id
+                    } else {
+                        asset_label
+                    },
                     thumbnail: state.asset_drag.thumbnail.clone(),
+                    downloaded: state.asset_drag.downloaded,
+                    server_id: state.asset_drag.server_id.clone(),
+                    duration_secs: state.asset_drag.duration_secs,
+                    width: state.asset_drag.width,
+                    height: state.asset_drag.height,
                 };
                 crate::panels::add_library_asset_at_playhead(state, &asset, kind);
                 // For images / particles, snap their normalised position
                 // so they spawn under the cursor rather than the frame
                 // centre default.
-                if matches!(kind, crate::state::AssetDragKind::Image
-                    | crate::state::AssetDragKind::Particle) {
+                if matches!(
+                    kind,
+                    crate::state::AssetDragKind::Image | crate::state::AssetDragKind::Particle
+                ) {
                     // Convert the world-pixel drop point back to
                     // normalised `pos` coords. Mirrors the inverse of
                     // `draw_canvas_overlays`'s
@@ -8100,7 +8954,6 @@ pub fn handle_canvas_asset_drag(
     }
 }
 
-
 // ─── SKELETON-POINT CANVAS OVERLAY ───────────────────────────────────
 //
 // The standalone "Skeleton Editor" floating window has been retired —
@@ -8116,9 +8969,7 @@ pub fn handle_canvas_asset_drag(
 /// for. Returns the source-clip context for the active selection
 /// (actor or video overlay) so the canvas overlay can resolve / draw
 /// the matching template.
-fn active_skeleton_ctx(
-    state: &EditorState,
-) -> Option<crate::skeleton_editor::SourceClipCtx> {
+fn active_skeleton_ctx(state: &EditorState) -> Option<crate::skeleton_editor::SourceClipCtx> {
     match state.selection {
         Selection::Actor(i) => crate::skeleton_editor::SourceClipCtx::from_actor(state, i),
         Selection::Overlay(i) => {
@@ -8143,9 +8994,13 @@ fn skeleton_host_screen_rect(
             // Reuse the overlay AABB and convert it to screen.
             let (mn, mx) = overlay_world_aabb(state, i, state.playhead)?;
             let center = [(mn[0] + mx[0]) * 0.5, (mn[1] + mx[1]) * 0.5];
-            let center_screen = state
-                .canvas_viewport
-                .world_to_screen(WorldPos { x: center[0], y: center[1] }, viewport_size);
+            let center_screen = state.canvas_viewport.world_to_screen(
+                WorldPos {
+                    x: center[0],
+                    y: center[1],
+                },
+                viewport_size,
+            );
             let zoom = state.canvas_viewport.zoom.max(0.0001);
             let half_w = (mx[0] - mn[0]) * 0.5 * zoom;
             let half_h = (mx[1] - mn[1]) * 0.5 * zoom;
@@ -8170,8 +9025,12 @@ fn draw_canvas_skeleton_overlay(
     state: &EditorState,
     viewport_size: [f32; 2],
 ) {
-    let Some(ctx) = active_skeleton_ctx(state) else { return; };
-    let Some(tmpl_idx) = state.skeleton_editor.template_idx else { return; };
+    let Some(ctx) = active_skeleton_ctx(state) else {
+        return;
+    };
+    let Some(tmpl_idx) = state.skeleton_editor.template_idx else {
+        return;
+    };
     if state
         .skeleton_editor
         .clip_path
@@ -8188,7 +9047,9 @@ fn draw_canvas_skeleton_overlay(
     let Some(host_rect) = skeleton_host_screen_rect(state, full_rect, viewport_size) else {
         return;
     };
-    let Some(template) = state.scene.skeleton_templates.get(tmpl_idx) else { return; };
+    let Some(template) = state.scene.skeleton_templates.get(tmpl_idx) else {
+        return;
+    };
 
     let clip_t = ctx.clip_local_time(state.playhead);
     let dragging = state.skeleton_editor.dragging_point.clone();
@@ -8204,8 +9065,7 @@ fn draw_canvas_skeleton_overlay(
         let cx = host_rect.min.x + ps.x * host_rect.width();
         let cy = host_rect.min.y + ps.y * host_rect.height();
         let size = (host_rect.width() * 0.22).clamp(40.0, 240.0);
-        let img_rect =
-            egui::Rect::from_center_size(Pos2::new(cx, cy), Vec2::splat(size));
+        let img_rect = egui::Rect::from_center_size(Pos2::new(cx, cy), Vec2::splat(size));
         let uri = format!("file://{}", img_path.display());
         let img = egui::Image::from_uri(uri)
             .fit_to_exact_size(Vec2::splat(size))
@@ -8248,7 +9108,10 @@ fn draw_canvas_skeleton_overlay(
         // Diamond indicator if there's a kf within ~one frame of `t`.
         let fps = state.skeleton_editor.fps.max(1.0);
         let kf_proximity = 1.0 / fps * 0.6;
-        let has_kf = point.track.iter().any(|kf| (kf.t - clip_t).abs() < kf_proximity);
+        let has_kf = point
+            .track
+            .iter()
+            .any(|kf| (kf.t - clip_t).abs() < kf_proximity);
         if has_kf {
             painter.text(
                 Pos2::new(pos.x, pos.y - radius - 4.0),
@@ -8333,13 +9196,9 @@ fn handle_canvas_skeleton_input(
     if let Some(name) = state.skeleton_editor.dragging_point.clone() {
         if primary_down {
             if let Some(pos) = pointer_pos {
-                let nx = ((pos.x - host_rect.min.x) / host_rect.width().max(1.0))
-                    .clamp(0.0, 1.0);
-                let ny = ((pos.y - host_rect.min.y) / host_rect.height().max(1.0))
-                    .clamp(0.0, 1.0);
-                crate::skeleton_editor::place_point_at_clip_time(
-                    state, &name, nx, ny, clip_t,
-                );
+                let nx = ((pos.x - host_rect.min.x) / host_rect.width().max(1.0)).clamp(0.0, 1.0);
+                let ny = ((pos.y - host_rect.min.y) / host_rect.height().max(1.0)).clamp(0.0, 1.0);
+                crate::skeleton_editor::place_point_at_clip_time(state, &name, nx, ny, clip_t);
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
             }
             return true;
@@ -8356,13 +9215,9 @@ fn handle_canvas_skeleton_input(
             state.skeleton_editor.selected_point = Some(name.clone());
             state.skeleton_editor.dragging_point = Some(name.clone());
             if let Some(pos) = pointer_pos {
-                let nx = ((pos.x - host_rect.min.x) / host_rect.width().max(1.0))
-                    .clamp(0.0, 1.0);
-                let ny = ((pos.y - host_rect.min.y) / host_rect.height().max(1.0))
-                    .clamp(0.0, 1.0);
-                crate::skeleton_editor::place_point_at_clip_time(
-                    state, &name, nx, ny, clip_t,
-                );
+                let nx = ((pos.x - host_rect.min.x) / host_rect.width().max(1.0)).clamp(0.0, 1.0);
+                let ny = ((pos.y - host_rect.min.y) / host_rect.height().max(1.0)).clamp(0.0, 1.0);
+                crate::skeleton_editor::place_point_at_clip_time(state, &name, nx, ny, clip_t);
             }
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
             return true;
@@ -8375,13 +9230,11 @@ fn handle_canvas_skeleton_input(
             if let Some(pos) = pointer_pos {
                 if host_rect.contains(pos) {
                     state.skeleton_editor.dragging_point = Some(name.clone());
-                    let nx = ((pos.x - host_rect.min.x) / host_rect.width().max(1.0))
-                        .clamp(0.0, 1.0);
-                    let ny = ((pos.y - host_rect.min.y) / host_rect.height().max(1.0))
-                        .clamp(0.0, 1.0);
-                    crate::skeleton_editor::place_point_at_clip_time(
-                        state, &name, nx, ny, clip_t,
-                    );
+                    let nx =
+                        ((pos.x - host_rect.min.x) / host_rect.width().max(1.0)).clamp(0.0, 1.0);
+                    let ny =
+                        ((pos.y - host_rect.min.y) / host_rect.height().max(1.0)).clamp(0.0, 1.0);
+                    crate::skeleton_editor::place_point_at_clip_time(state, &name, nx, ny, clip_t);
                     ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
                     return true;
                 }
@@ -8399,13 +9252,11 @@ fn handle_canvas_skeleton_input(
         if let Some(name) = state.skeleton_editor.selected_point.clone() {
             if let Some(pos) = pointer_pos {
                 if host_rect.contains(pos) {
-                    let nx = ((pos.x - host_rect.min.x) / host_rect.width().max(1.0))
-                        .clamp(0.0, 1.0);
-                    let ny = ((pos.y - host_rect.min.y) / host_rect.height().max(1.0))
-                        .clamp(0.0, 1.0);
-                    crate::skeleton_editor::place_point_at_clip_time(
-                        state, &name, nx, ny, clip_t,
-                    );
+                    let nx =
+                        ((pos.x - host_rect.min.x) / host_rect.width().max(1.0)).clamp(0.0, 1.0);
+                    let ny =
+                        ((pos.y - host_rect.min.y) / host_rect.height().max(1.0)).clamp(0.0, 1.0);
+                    crate::skeleton_editor::place_point_at_clip_time(state, &name, nx, ny, clip_t);
                     return true;
                 }
             }
@@ -8453,6 +9304,7 @@ mod transform_hierarchy_tests {
             transition_duration: 0.35,
             speed: 1.0,
             animated_params: std::collections::BTreeSet::new(),
+            mellstroy_footage: Default::default(),
             mute_audio: false,
         }
     }
@@ -8460,12 +9312,24 @@ mod transform_hierarchy_tests {
     fn canvas_layout(id: &str, pos: WorldPos, scale: f32, rotation_deg: f32) -> CanvasLayout {
         CanvasLayout {
             element_id: id.to_string(),
-            keyframes: vec![Keyframe::new(0.0, CanvasTransform { pos, width: 500.0, scale, rotation_deg, opacity: 1.0 })],
+            keyframes: vec![Keyframe::new(
+                0.0,
+                CanvasTransform {
+                    pos,
+                    width: 500.0,
+                    scale,
+                    rotation_deg,
+                    opacity: 1.0,
+                },
+            )],
         }
     }
 
     fn assert_close(actual: f32, expected: f32) {
-        assert!((actual - expected).abs() < 1.0e-3, "actual={actual}, expected={expected}");
+        assert!(
+            (actual - expected).abs() < 1.0e-3,
+            "actual={actual}, expected={expected}"
+        );
     }
 
     #[test]

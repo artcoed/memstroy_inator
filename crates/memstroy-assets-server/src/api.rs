@@ -6,24 +6,26 @@
 //! "trust the network" — it's expected to live next to the editor on
 //! a developer machine, not on the public internet.
 
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
     body::Body,
-    extract::{Path, Query, State},
-    http::{header, HeaderValue, StatusCode},
+    extract::{DefaultBodyLimit, Multipart, Path, Query, State},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Json, Response},
     routing::{get, post},
     Router,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tokio::io::AsyncWriteExt;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::warn;
 
-use crate::ingest;
 use crate::model::{AssetKind, AssetSummary};
-use crate::store::AssetStore;
+use crate::store::{ensure_asset_derivatives, AssetStore};
 
 // ---------------------------------------------------------------------------
 // Embedded placeholder assets
@@ -45,27 +47,6 @@ const FALLBACK_IMAGE: &[u8] = include_bytes!("../assets/fallback.jpg");
 
 /// 1-second silent WAV used for missing sound assets.
 const FALLBACK_SOUND: &[u8] = include_bytes!("../assets/fallback.wav");
-
-fn fallback_entry(id: &str, kind: AssetKind) -> crate::model::AssetEntry {
-    use std::path::PathBuf;
-    let (ext, size) = match kind {
-        AssetKind::Sound => ("wav", FALLBACK_SOUND.len() as u64),
-        AssetKind::Image => ("jpg", FALLBACK_IMAGE.len() as u64),
-        AssetKind::Particle => ("json", 0),
-        AssetKind::Text => ("txt", 0),
-        AssetKind::Clip | AssetKind::Video => ("mp4", FALLBACK_VIDEO.len() as u64),
-    };
-    crate::model::AssetEntry {
-        id: id.to_string(),
-        kind,
-        label: id.to_string(),
-        description: String::new(),
-        path: PathBuf::from(format!("placeholder/{}.{}", id, ext)),
-        thumbnail: None,
-        size_bytes: size,
-        tags: Vec::new(),
-    }
-}
 
 fn fallback_download_response(id: &str, kind: AssetKind) -> Response {
     let (bytes, mime, ext): (&'static [u8], &'static str, &'static str) = match kind {
@@ -131,18 +112,15 @@ pub fn router(store: AssetStore) -> Router {
 
     Router::new()
         .route("/api/health", get(health))
-        .route("/api/test-metadata", post(test_metadata))
-        .route("/api/cleanup", post(cleanup_old_files))
         .route("/api/assets", get(list_assets))
         .route("/api/assets/:id", get(get_asset))
         .route("/api/assets/:id/preview", get(get_preview))
         .route("/api/assets/:id/download", get(get_download))
         .route("/api/assets/:id/text", get(get_text))
-        .route("/api/ingest/tg", post(post_ingest_tg))
+        .route("/api/admin/assets", post(post_admin_asset))
         .with_state(store)
         .layer(cors)
-        // Limit request body size to 10MB to prevent OOM
-        .layer(axum::extract::DefaultBodyLimit::max(10 * 1024 * 1024))
+        .layer(DefaultBodyLimit::disable())
 }
 
 // ---------------------------------------------------------------------------
@@ -176,19 +154,14 @@ struct ListQuery {
 }
 
 const DEFAULT_LIMIT: u64 = 24;
-// Reduced from 5000 to 500 for memory-constrained environments (500MB RAM).
-// Large responses can cause OOM on small servers. Clients should paginate
-// through the catalogue instead of requesting everything at once.
-const MAX_LIMIT: u64 = 500;
-
-// Maximum file size to load into memory at once (50MB).
-// Files larger than this will be streamed chunk-by-chunk.
-const MAX_IN_MEMORY_SIZE: u64 = 50 * 1024 * 1024;
+const MAX_LIMIT: u64 = 5000;
 
 #[derive(Debug, Serialize)]
 struct ListResponse {
     total: u64,
     offset: u64,
+    limit: u64,
+    has_more: bool,
     items: Vec<AssetSummary>,
 }
 
@@ -197,17 +170,17 @@ async fn list_assets(
     Query(q): Query<ListQuery>,
 ) -> Result<Json<ListResponse>, ApiError> {
     let kinds = parse_kind_list(q.kind.as_deref());
-    let limit = q
-        .limit
-        .unwrap_or(DEFAULT_LIMIT)
-        .clamp(1, MAX_LIMIT);
+    let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
 
     let (total, page) = store.filtered(&kinds, q.q.as_deref(), q.offset, limit);
-    let items = page.iter().map(AssetSummary::from_entry).collect();
+    let items: Vec<AssetSummary> = page.iter().map(AssetSummary::from_entry).collect();
+    let has_more = q.offset.saturating_add(items.len() as u64) < total;
 
     Ok(Json(ListResponse {
         total,
         offset: q.offset,
+        limit,
+        has_more,
         items,
     }))
 }
@@ -227,11 +200,7 @@ async fn get_asset(
     State(store): State<AssetStore>,
     Path(id): Path<String>,
 ) -> Result<Json<crate::model::AssetEntry>, ApiError> {
-    Ok(Json(
-        store
-            .get(&id)
-            .unwrap_or_else(|| fallback_entry(&id, AssetKind::Clip)),
-    ))
+    store.get(&id).map(Json).ok_or(ApiError::NotFound)
 }
 
 // ---------------------------------------------------------------------------
@@ -265,7 +234,10 @@ async fn get_preview(
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, mime.as_ref())
-        .header(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=300"))
+        .header(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=300"),
+        )
         .body(body)
         .expect("valid response"))
 }
@@ -301,27 +273,14 @@ async fn get_download(
     let disposition = format!("attachment; filename=\"{}\"", filename);
 
     let file_size = metadata.len();
-
-    // For small files, load into memory for better performance
-    // For large files, stream to avoid OOM
-    let body = if file_size <= MAX_IN_MEMORY_SIZE {
-        match tokio::fs::read(&entry.path).await {
-            Ok(bytes) => Body::from(bytes),
-            Err(e) => {
-                warn!(path = %entry.path.display(), error = %e, "asset read failed; serving placeholder");
-                return Ok(fallback_download_response(&entry.id, entry.kind));
-            }
+    let body = match tokio::fs::File::open(&entry.path).await {
+        Ok(file) => {
+            let stream = tokio_util::io::ReaderStream::new(file);
+            Body::from_stream(stream)
         }
-    } else {
-        match tokio::fs::File::open(&entry.path).await {
-            Ok(file) => {
-                let stream = tokio_util::io::ReaderStream::new(file);
-                Body::from_stream(stream)
-            }
-            Err(e) => {
-                warn!(path = %entry.path.display(), error = %e, "asset open failed; serving placeholder");
-                return Ok(fallback_download_response(&entry.id, entry.kind));
-            }
+        Err(e) => {
+            warn!(path = %entry.path.display(), error = %e, "asset open failed; serving placeholder");
+            return Ok(fallback_download_response(&entry.id, entry.kind));
         }
     };
 
@@ -358,7 +317,6 @@ async fn get_text(
         return Err(ApiError::NotFound);
     }
 
-    // Check file size before loading
     let metadata = match tokio::fs::metadata(&entry.path).await {
         Ok(m) => m,
         Err(e) => {
@@ -367,11 +325,15 @@ async fn get_text(
         }
     };
 
-    // Limit text file size to prevent OOM (10MB max for text files)
-    const MAX_TEXT_SIZE: u64 = 10 * 1024 * 1024;
+    const MAX_TEXT_SIZE: u64 = 25 * 1024 * 1024;
     if metadata.len() > MAX_TEXT_SIZE {
         return Err(ApiError::BadRequest(
-            format!("Text file too large: {} bytes (max {})", metadata.len(), MAX_TEXT_SIZE).into()
+            format!(
+                "Text file too large: {} bytes (max {})",
+                metadata.len(),
+                MAX_TEXT_SIZE
+            )
+            .into(),
         ));
     }
 
@@ -393,139 +355,282 @@ async fn get_text(
 }
 
 // ---------------------------------------------------------------------------
-// /api/ingest/tg
+// /api/admin/assets
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
-struct TgIngestRequest {
-    channel: String,
-    #[serde(default = "default_ingest_limit")]
-    limit: u32,
+#[derive(Debug, Serialize)]
+struct AdminAssetResponse {
+    created: bool,
+    asset: AssetSummary,
 }
 
-fn default_ingest_limit() -> u32 {
-    // Limited to 10 clips to prevent excessive downloads and disk usage.
-    // Users can run multiple smaller ingests if needed.
-    10
+#[derive(Debug)]
+struct UploadedFile {
+    tmp_path: PathBuf,
+    file_name: String,
 }
 
-async fn post_ingest_tg(
+async fn post_admin_asset(
     State(store): State<AssetStore>,
-    Json(body): Json<TgIngestRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let channel = body.channel.trim().to_string();
-    if channel.is_empty() {
-        return Err(ApiError::BadRequest("channel must not be empty".into()));
-    }
-    // Limit to maximum 10 clips per request
-    let limit = body.limit.max(1).min(10);
-    ingest::spawn_tg_ingest(store, channel.clone(), limit);
-    Ok(Json(json!({
-        "started": true,
-        "channel": channel,
-        "limit": limit,
-    })))
-}
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> Result<Json<AdminAssetResponse>, ApiError> {
+    check_admin_token(&headers)?;
 
-// Test endpoint to verify metadata creation works
-async fn test_metadata(State(store): State<AssetStore>) -> Result<Json<serde_json::Value>, ApiError> {
     let root = store.root();
-    let clips_dir = root.join("clips");
-    let test_id = "test123";
-    let test_txt = clips_dir.join(format!("{}.txt", test_id));
-    let test_content = "Test metadata content";
-    
-    match tokio::fs::write(&test_txt, test_content.as_bytes()).await {
-        Ok(_) => {
-            // Verify file exists
-            let exists = test_txt.exists();
-            let content = tokio::fs::read_to_string(&test_txt).await.unwrap_or_default();
-            
-            // Reindex to pick up the test file
-            let _ = store.index_dir(&root);
-            
-            Ok(Json(json!({
-                "success": true,
-                "test_file": test_txt.display().to_string(),
-                "exists": exists,
-                "content": content,
-                "clips_dir": clips_dir.display().to_string(),
-            })))
-        }
-        Err(e) => Ok(Json(json!({
-            "success": false,
-            "error": e.to_string(),
-            "clips_dir": clips_dir.display().to_string(),
-        })))
+    if root.as_os_str().is_empty() {
+        return Err(ApiError::BadRequest("asset root is not configured".into()));
     }
-}
 
-// Manual cleanup endpoint to delete all clips and free disk space
-async fn cleanup_old_files(State(store): State<AssetStore>) -> Result<Json<serde_json::Value>, ApiError> {
-    let root = store.root();
-    let clips_dir = root.join("clips");
-    let thumbs_dir = clips_dir.join("thumbs");
-    
-    let mut deleted_files = 0u64;
-    let mut freed_bytes = 0u64;
-    
-    // Delete all files in clips/ directory
-    if clips_dir.exists() {
-        let mut entries = tokio::fs::read_dir(&clips_dir).await.map_err(|e| {
-            ApiError::BadRequest(format!("Failed to read clips directory: {}", e).into())
-        })?;
-        
-        while let Some(entry) = entries.next_entry().await.map_err(|e| {
-            ApiError::BadRequest(format!("Failed to read directory entry: {}", e).into())
-        })? {
-            let path = entry.path();
-            if path.is_file() {
-                if let Ok(metadata) = tokio::fs::metadata(&path).await {
-                    freed_bytes += metadata.len();
+    let tmp_dir = root.join(".tmp");
+    tokio::fs::create_dir_all(&tmp_dir)
+        .await
+        .map_err(|e| ApiError::BadRequest(format!("create temp dir: {e}").into()))?;
+
+    let mut kind: Option<AssetKind> = None;
+    let mut id: Option<String> = None;
+    let mut label: Option<String> = None;
+    let mut description = String::new();
+    let mut tags: Vec<String> = Vec::new();
+    let mut asset: Option<UploadedFile> = None;
+    let mut thumbnail: Option<UploadedFile> = None;
+
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(ApiError::from_multipart)?
+    {
+        let name = field.name().unwrap_or("").to_string();
+        match name.as_str() {
+            "asset" | "file" => {
+                asset = Some(save_upload_field(&tmp_dir, &mut field).await?);
+            }
+            "thumbnail" | "preview" => {
+                thumbnail = Some(save_upload_field(&tmp_dir, &mut field).await?);
+            }
+            "kind" => {
+                let raw = field.text().await.map_err(ApiError::from_multipart)?;
+                kind = AssetKind::parse_token(&raw);
+                if kind.is_none() {
+                    return Err(ApiError::BadRequest(
+                        format!("unsupported kind: {raw}").into(),
+                    ));
                 }
-                if let Err(e) = tokio::fs::remove_file(&path).await {
-                    warn!(path = %path.display(), error = %e, "failed to delete file");
-                } else {
-                    deleted_files += 1;
-                }
+            }
+            "id" => id = non_empty(field.text().await.map_err(ApiError::from_multipart)?),
+            "label" => label = non_empty(field.text().await.map_err(ApiError::from_multipart)?),
+            "description" => description = field.text().await.map_err(ApiError::from_multipart)?,
+            "tags" => {
+                tags = field
+                    .text()
+                    .await
+                    .map_err(ApiError::from_multipart)?
+                    .split(|c: char| c == ',' || c == '\n' || c == '\r')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
+            _ => {
+                let _ = field.bytes().await;
             }
         }
     }
-    
-    // Delete all thumbnails
-    if thumbs_dir.exists() {
-        let mut entries = tokio::fs::read_dir(&thumbs_dir).await.map_err(|e| {
-            ApiError::BadRequest(format!("Failed to read thumbs directory: {}", e).into())
-        })?;
-        
-        while let Some(entry) = entries.next_entry().await.map_err(|e| {
-            ApiError::BadRequest(format!("Failed to read directory entry: {}", e).into())
-        })? {
-            let path = entry.path();
-            if path.is_file() {
-                if let Ok(metadata) = tokio::fs::metadata(&path).await {
-                    freed_bytes += metadata.len();
-                }
-                if let Err(e) = tokio::fs::remove_file(&path).await {
-                    warn!(path = %path.display(), error = %e, "failed to delete thumbnail");
-                } else {
-                    deleted_files += 1;
-                }
+
+    let kind = kind.ok_or_else(|| ApiError::BadRequest("kind is required".into()))?;
+    let asset = asset.ok_or_else(|| ApiError::BadRequest("asset file is required".into()))?;
+    let ext = extension_from_name(&asset.file_name)
+        .ok_or_else(|| ApiError::BadRequest("asset file must have an extension".into()))?;
+    if !kind
+        .primary_extensions()
+        .iter()
+        .any(|allowed| *allowed == ext)
+    {
+        cleanup_tmp(Some(&asset), thumbnail.as_ref()).await;
+        return Err(ApiError::BadRequest(
+            format!("extension .{ext} is not valid for kind {kind:?}").into(),
+        ));
+    }
+
+    let stem_hint = id
+        .as_deref()
+        .or_else(|| {
+            FsPath::new(&asset.file_name)
+                .file_stem()
+                .and_then(|s| s.to_str())
+        })
+        .unwrap_or("asset");
+    let stem = unique_stem(&root.join(kind.subdir()), &sanitize_stem(stem_hint), &ext).await;
+    let dest_dir = root.join(kind.subdir());
+    tokio::fs::create_dir_all(&dest_dir)
+        .await
+        .map_err(|e| ApiError::BadRequest(format!("create destination dir: {e}").into()))?;
+    let dest = dest_dir.join(format!("{stem}.{ext}"));
+
+    tokio::fs::rename(&asset.tmp_path, &dest)
+        .await
+        .map_err(|e| ApiError::BadRequest(format!("persist asset: {e}").into()))?;
+
+    if let Some(label) = label {
+        write_sidecar(&dest.with_extension("label"), &label).await?;
+    }
+    write_sidecar(&dest.with_extension("txt"), &description).await?;
+    if !tags.is_empty() {
+        write_sidecar(&dest.with_extension("tags"), &tags.join("\n")).await?;
+    }
+
+    if let Some(thumbnail) = thumbnail {
+        if let Some(thumb_ext) = extension_from_name(&thumbnail.file_name) {
+            if matches!(thumb_ext.as_str(), "png" | "jpg" | "jpeg" | "webp") {
+                let thumb_dest = dest_dir.join(format!("{stem}.thumb.{thumb_ext}"));
+                tokio::fs::rename(&thumbnail.tmp_path, &thumb_dest)
+                    .await
+                    .map_err(|e| ApiError::BadRequest(format!("persist thumbnail: {e}").into()))?;
+            } else {
+                cleanup_tmp(None, Some(&thumbnail)).await;
             }
         }
     }
-    
-    // Reindex after cleanup
-    let _ = store.index_dir(&root);
-    
-    Ok(Json(json!({
-        "success": true,
-        "deleted_files": deleted_files,
-        "freed_bytes": freed_bytes,
-        "freed_mb": freed_bytes / 1024 / 1024,
-    })))
+
+    if let Err(e) = ensure_asset_derivatives(&dest, kind) {
+        warn!(
+            path = %dest.display(),
+            error = %e,
+            "uploaded asset derivative generation failed"
+        );
+    }
+
+    store
+        .index_dir(&root)
+        .map_err(|e| ApiError::BadRequest(format!("reindex after upload: {e}").into()))?;
+    let entry = store.get(&stem).ok_or_else(|| {
+        ApiError::BadRequest(format!("uploaded asset {stem} was not indexed").into())
+    })?;
+
+    Ok(Json(AdminAssetResponse {
+        created: true,
+        asset: AssetSummary::from_entry(&entry),
+    }))
 }
 
+async fn save_upload_field(
+    tmp_dir: &FsPath,
+    field: &mut axum::extract::multipart::Field<'_>,
+) -> Result<UploadedFile, ApiError> {
+    let file_name = field
+        .file_name()
+        .map(sanitize_filename)
+        .unwrap_or_else(|| "asset.bin".to_string());
+    let tmp_path = tmp_dir.join(format!("upload-{}.tmp", monotonic_stamp()));
+    let mut out = tokio::fs::File::create(&tmp_path)
+        .await
+        .map_err(|e| ApiError::BadRequest(format!("create upload temp file: {e}").into()))?;
+    while let Some(chunk) = field.chunk().await.map_err(ApiError::from_multipart)? {
+        out.write_all(&chunk)
+            .await
+            .map_err(|e| ApiError::BadRequest(format!("write upload chunk: {e}").into()))?;
+    }
+    out.flush()
+        .await
+        .map_err(|e| ApiError::BadRequest(format!("flush upload: {e}").into()))?;
+    Ok(UploadedFile {
+        tmp_path,
+        file_name,
+    })
+}
+
+fn check_admin_token(headers: &HeaderMap) -> Result<(), ApiError> {
+    let Ok(expected) = std::env::var("ADMIN_TOKEN") else {
+        return Ok(());
+    };
+    let expected = expected.trim();
+    if expected.is_empty() {
+        return Ok(());
+    }
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(str::trim);
+    let x_token = headers
+        .get("x-admin-token")
+        .and_then(|h| h.to_str().ok())
+        .map(str::trim);
+    if bearer == Some(expected) || x_token == Some(expected) {
+        Ok(())
+    } else {
+        Err(ApiError::Unauthorized)
+    }
+}
+
+async fn write_sidecar(path: &FsPath, body: &str) -> Result<(), ApiError> {
+    tokio::fs::write(path, body.as_bytes())
+        .await
+        .map_err(|e| ApiError::BadRequest(format!("write {}: {e}", path.display()).into()))
+}
+
+async fn cleanup_tmp(asset: Option<&UploadedFile>, thumbnail: Option<&UploadedFile>) {
+    if let Some(asset) = asset {
+        let _ = tokio::fs::remove_file(&asset.tmp_path).await;
+    }
+    if let Some(thumbnail) = thumbnail {
+        let _ = tokio::fs::remove_file(&thumbnail.tmp_path).await;
+    }
+}
+
+async fn unique_stem(dir: &FsPath, requested: &str, ext: &str) -> String {
+    let base = if requested.is_empty() {
+        "asset"
+    } else {
+        requested
+    };
+    let mut stem = base.to_string();
+    let mut n = 1u32;
+    while dir.join(format!("{stem}.{ext}")).exists() {
+        stem = format!("{base}-{n}");
+        n += 1;
+    }
+    stem
+}
+
+fn extension_from_name(name: &str) -> Option<String> {
+    FsPath::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+}
+
+fn sanitize_stem(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len().min(80));
+    for ch in raw.chars().take(80) {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            out.push(ch);
+        } else if ch.is_whitespace() {
+            out.push('_');
+        }
+    }
+    let trimmed = out.trim_matches('_').to_string();
+    if trimmed.is_empty() {
+        "asset".to_string()
+    } else {
+        trimmed
+    }
+}
+
+fn non_empty(raw: String) -> Option<String> {
+    let trimmed = raw.trim().to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+fn monotonic_stamp() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+}
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -534,6 +639,7 @@ async fn cleanup_old_files(State(store): State<AssetStore>) -> Result<Json<serde
 #[derive(Debug)]
 enum ApiError {
     NotFound,
+    Unauthorized,
     BadRequest(Arc<str>),
 }
 
@@ -546,9 +652,12 @@ impl From<String> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         match self {
-            ApiError::NotFound => (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "error": "not_found" })),
+            ApiError::NotFound => {
+                (StatusCode::NOT_FOUND, Json(json!({ "error": "not_found" }))).into_response()
+            }
+            ApiError::Unauthorized => (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "unauthorized" })),
             )
                 .into_response(),
             ApiError::BadRequest(msg) => (
@@ -557,5 +666,11 @@ impl IntoResponse for ApiError {
             )
                 .into_response(),
         }
+    }
+}
+
+impl ApiError {
+    fn from_multipart(e: axum::extract::multipart::MultipartError) -> Self {
+        ApiError::BadRequest(e.to_string().into())
     }
 }

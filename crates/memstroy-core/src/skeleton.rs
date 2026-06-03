@@ -43,7 +43,9 @@ pub struct SkeletonTemplate {
     pub points: BTreeMap<String, SkeletonPoint>,
 }
 
-fn default_fps() -> f32 { 30.0 }
+fn default_fps() -> f32 {
+    30.0
+}
 
 impl Default for SkeletonTemplate {
     fn default() -> Self {
@@ -69,7 +71,9 @@ pub struct SkeletonPoint {
     pub track: Vec<Keyframe<PointState>>,
 }
 
-fn default_point_color() -> [u8; 3] { [255, 100, 100] }
+fn default_point_color() -> [u8; 3] {
+    [255, 100, 100]
+}
 
 impl Default for SkeletonPoint {
     fn default() -> Self {
@@ -96,11 +100,18 @@ pub struct PointState {
     pub rotation_deg: f32,
 }
 
-fn one() -> f32 { 1.0 }
+fn one() -> f32 {
+    1.0
+}
 
 impl Default for PointState {
     fn default() -> Self {
-        Self { x: 0.5, y: 0.5, scale: 1.0, rotation_deg: 0.0 }
+        Self {
+            x: 0.5,
+            y: 0.5,
+            scale: 1.0,
+            rotation_deg: 0.0,
+        }
     }
 }
 
@@ -177,10 +188,12 @@ impl SkeletonTemplate {
     /// Add a new named point to this skeleton.
     pub fn add_point(&mut self, name: impl Into<String>) -> &mut SkeletonPoint {
         let name = name.into();
-        self.points.entry(name.clone()).or_insert_with(|| SkeletonPoint {
-            name,
-            ..Default::default()
-        })
+        self.points
+            .entry(name.clone())
+            .or_insert_with(|| SkeletonPoint {
+                name,
+                ..Default::default()
+            })
     }
 
     /// Remove a point by name. Returns the removed point if it existed.
@@ -200,17 +213,33 @@ impl SkeletonTemplate {
     }
 
     /// Set a keyframe for a point at time `t`. Inserts or updates.
-    pub fn set_point_keyframe(&mut self, point_name: &str, t: f32, state: PointState, easing: Easing) {
+    pub fn set_point_keyframe(
+        &mut self,
+        point_name: &str,
+        t: f32,
+        state: PointState,
+        easing: Easing,
+    ) {
         let point = self.points.get_mut(point_name);
-        let Some(point) = point else { return; };
+        let Some(point) = point else {
+            return;
+        };
 
         // Check if there's already a keyframe close to this time
         let threshold = 0.01;
-        if let Some(existing) = point.track.iter_mut().find(|kf| (kf.t - t).abs() < threshold) {
+        if let Some(existing) = point
+            .track
+            .iter_mut()
+            .find(|kf| (kf.t - t).abs() < threshold)
+        {
             existing.value = state;
             existing.easing = easing;
         } else {
-            point.track.push(Keyframe { t, value: state, easing });
+            point.track.push(Keyframe {
+                t,
+                value: state,
+                easing,
+            });
             point.track.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap());
         }
     }
@@ -218,10 +247,16 @@ impl SkeletonTemplate {
     /// Remove the keyframe nearest to time `t` for a point.
     pub fn remove_point_keyframe(&mut self, point_name: &str, t: f32) -> bool {
         let point = self.points.get_mut(point_name);
-        let Some(point) = point else { return false; };
+        let Some(point) = point else {
+            return false;
+        };
 
         let threshold = 0.05;
-        if let Some(idx) = point.track.iter().position(|kf| (kf.t - t).abs() < threshold) {
+        if let Some(idx) = point
+            .track
+            .iter()
+            .position(|kf| (kf.t - t).abs() < threshold)
+        {
             point.track.remove(idx);
             true
         } else {
@@ -229,8 +264,6 @@ impl SkeletonTemplate {
         }
     }
 }
-
-
 
 // ─── ATTACHMENT RESOLVER ─────────────────────────────────────────────
 
@@ -261,7 +294,9 @@ pub fn resolve_skeleton_attachment(
     // Find the matching template
     let template = templates.iter().find(|tmpl| {
         tmpl.name == attachment.skeleton_id
-            || tmpl.source_clip.file_stem()
+            || tmpl
+                .source_clip
+                .file_stem()
                 .and_then(|s| s.to_str())
                 .map(|s| s == attachment.skeleton_id)
                 .unwrap_or(false)
@@ -280,7 +315,12 @@ pub fn resolve_skeleton_attachment(
         0.0
     };
 
-    Some(ResolvedAttachment { x, y, scale, rotation_deg })
+    Some(ResolvedAttachment {
+        x,
+        y,
+        scale,
+        rotation_deg,
+    })
 }
 
 /// Convenience: resolve all skeleton attachments for an actor at time `t`.
@@ -290,9 +330,9 @@ pub fn resolve_actor_skeleton_attachments(
     templates: &[SkeletonTemplate],
     t: f32,
 ) -> Vec<(usize, ResolvedAttachment)> {
-    actor_skeleton_attachments.iter().enumerate()
-        .filter_map(|(i, att)| {
-            resolve_skeleton_attachment(att, templates, t).map(|r| (i, r))
-        })
+    actor_skeleton_attachments
+        .iter()
+        .enumerate()
+        .filter_map(|(i, att)| resolve_skeleton_attachment(att, templates, t).map(|r| (i, r)))
         .collect()
 }

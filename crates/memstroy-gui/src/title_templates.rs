@@ -1,6 +1,6 @@
 //! Pre-made meme text templates with styled animations.
 
-use memstroy_core::{TextOverlay, TextStyle, OverlayState, Keyframe};
+use memstroy_core::{Keyframe, OverlayState, TextOverlay, TextStyle};
 
 pub struct TitleTemplate {
     pub name: &'static str,
@@ -17,7 +17,7 @@ pub struct TitleTemplate {
 pub const TEMPLATES: &[TitleTemplate] = &[
     TitleTemplate {
         name: "Impact (top)",
-        icon: "\u{1F4A5}",
+        icon: "!",
         description: "Classic meme top text \u{2014} bold white with black outline",
         default_text: "WHEN YOU SEE",
         style: || TextStyle {
@@ -29,15 +29,50 @@ pub const TEMPLATES: &[TitleTemplate] = &[
             bold: true,
             ..Default::default()
         },
-        layout: |dur| vec![
-            Keyframe::new(0.0, OverlayState { pos: [0.5, 0.1], scale: 1.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 0.0, flip_x_anim: 1.0, flip_y_anim: 1.0 }),
-            Keyframe::new(0.2, OverlayState { pos: [0.5, 0.1], scale: 1.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 1.0, flip_x_anim: 1.0, flip_y_anim: 1.0 }),
-            Keyframe::new(dur, OverlayState { pos: [0.5, 0.1], scale: 1.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 1.0, flip_x_anim: 1.0, flip_y_anim: 1.0 }),
-        ],
+        layout: |dur| {
+            vec![
+                Keyframe::new(
+                    0.0,
+                    OverlayState {
+                        pos: [0.5, 0.1],
+                        scale: 1.0,
+                        scale_y: 1.0,
+                        rotation_deg: 0.0,
+                        opacity: 0.0,
+                        flip_x_anim: 1.0,
+                        flip_y_anim: 1.0,
+                    },
+                ),
+                Keyframe::new(
+                    0.2,
+                    OverlayState {
+                        pos: [0.5, 0.1],
+                        scale: 1.0,
+                        scale_y: 1.0,
+                        rotation_deg: 0.0,
+                        opacity: 1.0,
+                        flip_x_anim: 1.0,
+                        flip_y_anim: 1.0,
+                    },
+                ),
+                Keyframe::new(
+                    dur,
+                    OverlayState {
+                        pos: [0.5, 0.1],
+                        scale: 1.0,
+                        scale_y: 1.0,
+                        rotation_deg: 0.0,
+                        opacity: 1.0,
+                        flip_x_anim: 1.0,
+                        flip_y_anim: 1.0,
+                    },
+                ),
+            ]
+        },
     },
     TitleTemplate {
         name: "Impact (bottom)",
-        icon: "\u{1F4A5}",
+        icon: "!",
         description: "Classic meme bottom text",
         default_text: "BUT THEN...",
         style: || TextStyle {
@@ -49,15 +84,50 @@ pub const TEMPLATES: &[TitleTemplate] = &[
             bold: true,
             ..Default::default()
         },
-        layout: |dur| vec![
-            Keyframe::new(0.0, OverlayState { pos: [0.5, 0.9], scale: 1.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 0.0, flip_x_anim: 1.0, flip_y_anim: 1.0 }),
-            Keyframe::new(0.2, OverlayState { pos: [0.5, 0.9], scale: 1.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 1.0, flip_x_anim: 1.0, flip_y_anim: 1.0 }),
-            Keyframe::new(dur, OverlayState { pos: [0.5, 0.9], scale: 1.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 1.0, flip_x_anim: 1.0, flip_y_anim: 1.0 }),
-        ],
+        layout: |dur| {
+            vec![
+                Keyframe::new(
+                    0.0,
+                    OverlayState {
+                        pos: [0.5, 0.9],
+                        scale: 1.0,
+                        scale_y: 1.0,
+                        rotation_deg: 0.0,
+                        opacity: 0.0,
+                        flip_x_anim: 1.0,
+                        flip_y_anim: 1.0,
+                    },
+                ),
+                Keyframe::new(
+                    0.2,
+                    OverlayState {
+                        pos: [0.5, 0.9],
+                        scale: 1.0,
+                        scale_y: 1.0,
+                        rotation_deg: 0.0,
+                        opacity: 1.0,
+                        flip_x_anim: 1.0,
+                        flip_y_anim: 1.0,
+                    },
+                ),
+                Keyframe::new(
+                    dur,
+                    OverlayState {
+                        pos: [0.5, 0.9],
+                        scale: 1.0,
+                        scale_y: 1.0,
+                        rotation_deg: 0.0,
+                        opacity: 1.0,
+                        flip_x_anim: 1.0,
+                        flip_y_anim: 1.0,
+                    },
+                ),
+            ]
+        },
     },
     TitleTemplate {
         name: "Subtitle Box",
-        icon: "\u{1F4AC}",
+        icon: "T",
         description: "Modern subtitle with white box background",
         default_text: "Subtitle text",
         style: || TextStyle {
@@ -67,14 +137,38 @@ pub const TEMPLATES: &[TitleTemplate] = &[
             box_padding: 16.0,
             ..Default::default()
         },
-        layout: |dur| vec![
-            Keyframe::new(0.0, OverlayState { pos: [0.5, 0.85], scale: 1.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 1.0, flip_x_anim: 1.0, flip_y_anim: 1.0 }),
-            Keyframe::new(dur, OverlayState { pos: [0.5, 0.85], scale: 1.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 1.0, flip_x_anim: 1.0, flip_y_anim: 1.0 }),
-        ],
+        layout: |dur| {
+            vec![
+                Keyframe::new(
+                    0.0,
+                    OverlayState {
+                        pos: [0.5, 0.85],
+                        scale: 1.0,
+                        scale_y: 1.0,
+                        rotation_deg: 0.0,
+                        opacity: 1.0,
+                        flip_x_anim: 1.0,
+                        flip_y_anim: 1.0,
+                    },
+                ),
+                Keyframe::new(
+                    dur,
+                    OverlayState {
+                        pos: [0.5, 0.85],
+                        scale: 1.0,
+                        scale_y: 1.0,
+                        rotation_deg: 0.0,
+                        opacity: 1.0,
+                        flip_x_anim: 1.0,
+                        flip_y_anim: 1.0,
+                    },
+                ),
+            ]
+        },
     },
     TitleTemplate {
         name: "Pop In",
-        icon: "\u{1F3AF}",
+        icon: "◎",
         description: "Animated pop-in entry \u{2014} scale from 0 to overshoot to 1",
         default_text: "POP!",
         style: || TextStyle {
@@ -86,12 +180,58 @@ pub const TEMPLATES: &[TitleTemplate] = &[
             bold: true,
             ..Default::default()
         },
-        layout: |dur| vec![
-            Keyframe::new(0.0, OverlayState { pos: [0.5, 0.5], scale: 0.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 0.0, flip_x_anim: 1.0, flip_y_anim: 1.0 }),
-            Keyframe::new(0.15, OverlayState { pos: [0.5, 0.5], scale: 1.3, scale_y: 1.0, rotation_deg: 5.0, opacity: 1.0, flip_x_anim: 1.0, flip_y_anim: 1.0 }),
-            Keyframe::new(0.25, OverlayState { pos: [0.5, 0.5], scale: 1.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 1.0, flip_x_anim: 1.0, flip_y_anim: 1.0 }),
-            Keyframe::new(dur, OverlayState { pos: [0.5, 0.5], scale: 1.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 1.0, flip_x_anim: 1.0, flip_y_anim: 1.0 }),
-        ],
+        layout: |dur| {
+            vec![
+                Keyframe::new(
+                    0.0,
+                    OverlayState {
+                        pos: [0.5, 0.5],
+                        scale: 0.0,
+                        scale_y: 1.0,
+                        rotation_deg: 0.0,
+                        opacity: 0.0,
+                        flip_x_anim: 1.0,
+                        flip_y_anim: 1.0,
+                    },
+                ),
+                Keyframe::new(
+                    0.15,
+                    OverlayState {
+                        pos: [0.5, 0.5],
+                        scale: 1.3,
+                        scale_y: 1.0,
+                        rotation_deg: 5.0,
+                        opacity: 1.0,
+                        flip_x_anim: 1.0,
+                        flip_y_anim: 1.0,
+                    },
+                ),
+                Keyframe::new(
+                    0.25,
+                    OverlayState {
+                        pos: [0.5, 0.5],
+                        scale: 1.0,
+                        scale_y: 1.0,
+                        rotation_deg: 0.0,
+                        opacity: 1.0,
+                        flip_x_anim: 1.0,
+                        flip_y_anim: 1.0,
+                    },
+                ),
+                Keyframe::new(
+                    dur,
+                    OverlayState {
+                        pos: [0.5, 0.5],
+                        scale: 1.0,
+                        scale_y: 1.0,
+                        rotation_deg: 0.0,
+                        opacity: 1.0,
+                        flip_x_anim: 1.0,
+                        flip_y_anim: 1.0,
+                    },
+                ),
+            ]
+        },
     },
     TitleTemplate {
         name: "Slide Up",
@@ -105,15 +245,50 @@ pub const TEMPLATES: &[TitleTemplate] = &[
             box_padding: 12.0,
             ..Default::default()
         },
-        layout: |dur| vec![
-            Keyframe::new(0.0, OverlayState { pos: [0.5, 1.2], scale: 1.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 0.0, flip_x_anim: 1.0, flip_y_anim: 1.0 }),
-            Keyframe::new(0.4, OverlayState { pos: [0.5, 0.7], scale: 1.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 1.0, flip_x_anim: 1.0, flip_y_anim: 1.0 }),
-            Keyframe::new(dur, OverlayState { pos: [0.5, 0.7], scale: 1.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 1.0, flip_x_anim: 1.0, flip_y_anim: 1.0 }),
-        ],
+        layout: |dur| {
+            vec![
+                Keyframe::new(
+                    0.0,
+                    OverlayState {
+                        pos: [0.5, 1.2],
+                        scale: 1.0,
+                        scale_y: 1.0,
+                        rotation_deg: 0.0,
+                        opacity: 0.0,
+                        flip_x_anim: 1.0,
+                        flip_y_anim: 1.0,
+                    },
+                ),
+                Keyframe::new(
+                    0.4,
+                    OverlayState {
+                        pos: [0.5, 0.7],
+                        scale: 1.0,
+                        scale_y: 1.0,
+                        rotation_deg: 0.0,
+                        opacity: 1.0,
+                        flip_x_anim: 1.0,
+                        flip_y_anim: 1.0,
+                    },
+                ),
+                Keyframe::new(
+                    dur,
+                    OverlayState {
+                        pos: [0.5, 0.7],
+                        scale: 1.0,
+                        scale_y: 1.0,
+                        rotation_deg: 0.0,
+                        opacity: 1.0,
+                        flip_x_anim: 1.0,
+                        flip_y_anim: 1.0,
+                    },
+                ),
+            ]
+        },
     },
     TitleTemplate {
         name: "Tilt Pop",
-        icon: "\u{1F525}",
+        icon: "▲",
         description: "Tilted, bouncy meme caption",
         default_text: "\u{0418}\u{041C}\u{0411}\u{0410}!!!",
         style: || TextStyle {
@@ -125,12 +300,58 @@ pub const TEMPLATES: &[TitleTemplate] = &[
             bold: true,
             ..Default::default()
         },
-        layout: |dur| vec![
-            Keyframe::new(0.0, OverlayState { pos: [0.5, 0.3], scale: 0.0, scale_y: 1.0, rotation_deg: -15.0, opacity: 0.0, flip_x_anim: 1.0, flip_y_anim: 1.0 }),
-            Keyframe::new(0.2, OverlayState { pos: [0.5, 0.3], scale: 1.2, scale_y: 1.0, rotation_deg: -8.0, opacity: 1.0, flip_x_anim: 1.0, flip_y_anim: 1.0 }),
-            Keyframe::new(0.4, OverlayState { pos: [0.5, 0.3], scale: 1.0, scale_y: 1.0, rotation_deg: -8.0, opacity: 1.0, flip_x_anim: 1.0, flip_y_anim: 1.0 }),
-            Keyframe::new(dur, OverlayState { pos: [0.5, 0.3], scale: 1.0, scale_y: 1.0, rotation_deg: -8.0, opacity: 1.0, flip_x_anim: 1.0, flip_y_anim: 1.0 }),
-        ],
+        layout: |dur| {
+            vec![
+                Keyframe::new(
+                    0.0,
+                    OverlayState {
+                        pos: [0.5, 0.3],
+                        scale: 0.0,
+                        scale_y: 1.0,
+                        rotation_deg: -15.0,
+                        opacity: 0.0,
+                        flip_x_anim: 1.0,
+                        flip_y_anim: 1.0,
+                    },
+                ),
+                Keyframe::new(
+                    0.2,
+                    OverlayState {
+                        pos: [0.5, 0.3],
+                        scale: 1.2,
+                        scale_y: 1.0,
+                        rotation_deg: -8.0,
+                        opacity: 1.0,
+                        flip_x_anim: 1.0,
+                        flip_y_anim: 1.0,
+                    },
+                ),
+                Keyframe::new(
+                    0.4,
+                    OverlayState {
+                        pos: [0.5, 0.3],
+                        scale: 1.0,
+                        scale_y: 1.0,
+                        rotation_deg: -8.0,
+                        opacity: 1.0,
+                        flip_x_anim: 1.0,
+                        flip_y_anim: 1.0,
+                    },
+                ),
+                Keyframe::new(
+                    dur,
+                    OverlayState {
+                        pos: [0.5, 0.3],
+                        scale: 1.0,
+                        scale_y: 1.0,
+                        rotation_deg: -8.0,
+                        opacity: 1.0,
+                        flip_x_anim: 1.0,
+                        flip_y_anim: 1.0,
+                    },
+                ),
+            ]
+        },
     },
 ];
 

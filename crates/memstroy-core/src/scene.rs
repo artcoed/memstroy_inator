@@ -18,14 +18,14 @@ use crate::skeleton::{SkeletonAttachment, SkeletonTemplate};
 // the kf at playhead and auto-marks the param as animated).
 
 pub mod param_ids {
-    pub const POS_X: &str       = "pos_x";
-    pub const POS_Y: &str       = "pos_y";
-    pub const SCALE: &str       = "scale";
-    pub const SCALE_Y: &str     = "scale_y";
-    pub const ROTATION: &str    = "rotation";
-    pub const OPACITY: &str     = "opacity";
-    pub const FLIP_X: &str      = "flip_x";
-    pub const FLIP_Y: &str      = "flip_y";
+    pub const POS_X: &str = "pos_x";
+    pub const POS_Y: &str = "pos_y";
+    pub const SCALE: &str = "scale";
+    pub const SCALE_Y: &str = "scale_y";
+    pub const ROTATION: &str = "rotation";
+    pub const OPACITY: &str = "opacity";
+    pub const FLIP_X: &str = "flip_x";
+    pub const FLIP_Y: &str = "flip_y";
 
     /// Effect-stack parameter ids are encoded as `fx_<index>_<sub>` where
     /// `<sub>` is one of: intensity, p0, p1 (effect-specific). The inspector
@@ -109,7 +109,9 @@ pub struct CanvasLayout {
 /// element positions were decoupled from the live render frame
 /// (`migrate_decouple_render_frame`). Older scenes loaded from disk
 /// are upgraded in place via `Scene::upgrade_legacy`.
-fn default_format_version() -> u32 { 2 }
+fn default_format_version() -> u32 {
+    2
+}
 
 impl Default for Scene {
     fn default() -> Self {
@@ -208,9 +210,8 @@ impl Scene {
                 frame_tl_y + norm[1] * world_h,
             ]
         };
-        let new_norm = |world_xy: [f32; 2]| -> [f32; 2] {
-            [world_xy[0] / out_w, world_xy[1] / out_h]
-        };
+        let new_norm =
+            |world_xy: [f32; 2]| -> [f32; 2] { [world_xy[0] / out_w, world_xy[1] / out_h] };
 
         for actor in &mut self.actors {
             let t_in = actor.t_in.unwrap_or(0.0);
@@ -222,22 +223,20 @@ impl Scene {
 
         for ov in &mut self.overlays {
             match ov {
-                Overlay::Text(o) => migrate_overlay_layout_pos(
-                    &mut o.layout, o.t_in, &old_world, &new_norm,
-                ),
-                Overlay::Image(o) => migrate_overlay_layout_pos(
-                    &mut o.layout, o.t_in, &old_world, &new_norm,
-                ),
-                Overlay::Video(o) => migrate_overlay_layout_pos(
-                    &mut o.layout, o.t_in, &old_world, &new_norm,
-                ),
+                Overlay::Text(o) => {
+                    migrate_overlay_layout_pos(&mut o.layout, o.t_in, &old_world, &new_norm)
+                }
+                Overlay::Image(o) => {
+                    migrate_overlay_layout_pos(&mut o.layout, o.t_in, &old_world, &new_norm)
+                }
+                Overlay::Video(o) => {
+                    migrate_overlay_layout_pos(&mut o.layout, o.t_in, &old_world, &new_norm)
+                }
             }
         }
 
         for e in &mut self.effect_layers {
-            migrate_overlay_layout_pos(
-                &mut e.layout, e.t_in, &old_world, &new_norm,
-            );
+            migrate_overlay_layout_pos(&mut e.layout, e.t_in, &old_world, &new_norm);
         }
 
         self.format_version = 2;
@@ -258,7 +257,6 @@ fn migrate_overlay_layout_pos<F, G>(
         kf.value.pos = new_norm(old_world(scene_t, kf.value.pos));
     }
 }
-
 
 impl Scene {
     pub fn element_parent_id(&self, element_id: &str) -> Option<&str> {
@@ -295,9 +293,7 @@ impl Scene {
                     Overlay::Image(o) => (&o.id, o.parent_id.as_deref()),
                     Overlay::Video(o) => (&o.id, o.parent_id.as_deref()),
                 };
-                if child_parent == Some(parent.as_str())
-                    && !ids.iter().any(|id| id == child_id)
-                {
+                if child_parent == Some(parent.as_str()) && !ids.iter().any(|id| id == child_id) {
                     ids.push(child_id.clone());
                 }
             }
@@ -369,7 +365,8 @@ impl Scene {
             };
             live.insert(id.clone());
         }
-        self.canvas_layouts.retain(|cl| live.contains(&cl.element_id));
+        self.canvas_layouts
+            .retain(|cl| live.contains(&cl.element_id));
     }
 
     /// Collect all element IDs in the scene (actors + overlays).
@@ -405,7 +402,9 @@ impl Scene {
 
 fn varies(values: impl IntoIterator<Item = f32>) -> bool {
     let mut iter = values.into_iter();
-    let Some(first) = iter.next() else { return false };
+    let Some(first) = iter.next() else {
+        return false;
+    };
     iter.any(|v| (v - first).abs() > 1.0e-4)
 }
 
@@ -420,22 +419,46 @@ fn backfill_actor(a: &mut Actor) {
         }
     };
     let v = &a.layout;
-    mark(&mut a.animated_params, POS_X,
-         varies(v.iter().map(|kf| kf.value.pos[0])));
-    mark(&mut a.animated_params, POS_Y,
-         varies(v.iter().map(|kf| kf.value.pos[1])));
-    mark(&mut a.animated_params, SCALE,
-         varies(v.iter().map(|kf| kf.value.scale)));
-    mark(&mut a.animated_params, SCALE_Y,
-         varies(v.iter().map(|kf| kf.value.scale_y)));
-    mark(&mut a.animated_params, ROTATION,
-         varies(v.iter().map(|kf| kf.value.rotation_deg)));
-    mark(&mut a.animated_params, OPACITY,
-         varies(v.iter().map(|kf| kf.value.opacity)));
-    mark(&mut a.animated_params, FLIP_X,
-         varies(v.iter().map(|kf| kf.value.flip_x_anim)));
-    mark(&mut a.animated_params, FLIP_Y,
-         varies(v.iter().map(|kf| kf.value.flip_y_anim)));
+    mark(
+        &mut a.animated_params,
+        POS_X,
+        varies(v.iter().map(|kf| kf.value.pos[0])),
+    );
+    mark(
+        &mut a.animated_params,
+        POS_Y,
+        varies(v.iter().map(|kf| kf.value.pos[1])),
+    );
+    mark(
+        &mut a.animated_params,
+        SCALE,
+        varies(v.iter().map(|kf| kf.value.scale)),
+    );
+    mark(
+        &mut a.animated_params,
+        SCALE_Y,
+        varies(v.iter().map(|kf| kf.value.scale_y)),
+    );
+    mark(
+        &mut a.animated_params,
+        ROTATION,
+        varies(v.iter().map(|kf| kf.value.rotation_deg)),
+    );
+    mark(
+        &mut a.animated_params,
+        OPACITY,
+        varies(v.iter().map(|kf| kf.value.opacity)),
+    );
+    mark(
+        &mut a.animated_params,
+        FLIP_X,
+        varies(v.iter().map(|kf| kf.value.flip_x_anim)),
+    );
+    mark(
+        &mut a.animated_params,
+        FLIP_Y,
+        varies(v.iter().map(|kf| kf.value.flip_y_anim)),
+    );
 }
 
 fn backfill_overlay_image(o: &mut ImageOverlay) {
@@ -466,14 +489,26 @@ fn backfill_render_frame(rf: &mut crate::canvas::RenderFrame) {
     // is stored as the inverse of `zoom` in the inspector, but the
     // animation flag is on the underlying zoom value — that's the
     // field the keyframes actually carry.
-    mark(&mut rf.animated_params, POS_X,
-         varies(v.iter().map(|kf| kf.value.pos.x)));
-    mark(&mut rf.animated_params, POS_Y,
-         varies(v.iter().map(|kf| kf.value.pos.y)));
-    mark(&mut rf.animated_params, ROTATION,
-         varies(v.iter().map(|kf| kf.value.rotation_deg)));
-    mark(&mut rf.animated_params, SCALE,
-         varies(v.iter().map(|kf| kf.value.zoom)));
+    mark(
+        &mut rf.animated_params,
+        POS_X,
+        varies(v.iter().map(|kf| kf.value.pos.x)),
+    );
+    mark(
+        &mut rf.animated_params,
+        POS_Y,
+        varies(v.iter().map(|kf| kf.value.pos.y)),
+    );
+    mark(
+        &mut rf.animated_params,
+        ROTATION,
+        varies(v.iter().map(|kf| kf.value.rotation_deg)),
+    );
+    mark(
+        &mut rf.animated_params,
+        SCALE,
+        varies(v.iter().map(|kf| kf.value.zoom)),
+    );
 }
 
 fn backfill_overlay_layout(layout: &[Keyframe<OverlayState>], set: &mut BTreeSet<String>) {
@@ -486,14 +521,34 @@ fn backfill_overlay_layout(layout: &[Keyframe<OverlayState>], set: &mut BTreeSet
             s.insert(id.to_string());
         }
     };
-    mark(set, POS_X,    varies(layout.iter().map(|kf| kf.value.pos[0])));
-    mark(set, POS_Y,    varies(layout.iter().map(|kf| kf.value.pos[1])));
-    mark(set, SCALE,    varies(layout.iter().map(|kf| kf.value.scale)));
-    mark(set, SCALE_Y,  varies(layout.iter().map(|kf| kf.value.scale_y)));
-    mark(set, ROTATION, varies(layout.iter().map(|kf| kf.value.rotation_deg)));
-    mark(set, OPACITY,  varies(layout.iter().map(|kf| kf.value.opacity)));
-    mark(set, FLIP_X,   varies(layout.iter().map(|kf| kf.value.flip_x_anim)));
-    mark(set, FLIP_Y,   varies(layout.iter().map(|kf| kf.value.flip_y_anim)));
+    mark(set, POS_X, varies(layout.iter().map(|kf| kf.value.pos[0])));
+    mark(set, POS_Y, varies(layout.iter().map(|kf| kf.value.pos[1])));
+    mark(set, SCALE, varies(layout.iter().map(|kf| kf.value.scale)));
+    mark(
+        set,
+        SCALE_Y,
+        varies(layout.iter().map(|kf| kf.value.scale_y)),
+    );
+    mark(
+        set,
+        ROTATION,
+        varies(layout.iter().map(|kf| kf.value.rotation_deg)),
+    );
+    mark(
+        set,
+        OPACITY,
+        varies(layout.iter().map(|kf| kf.value.opacity)),
+    );
+    mark(
+        set,
+        FLIP_X,
+        varies(layout.iter().map(|kf| kf.value.flip_x_anim)),
+    );
+    mark(
+        set,
+        FLIP_Y,
+        varies(layout.iter().map(|kf| kf.value.flip_y_anim)),
+    );
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -541,9 +596,19 @@ pub struct Background {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MediaSource {
-    Image { path: PathBuf },
-    Video { path: PathBuf, #[serde(default)] r#loop: bool, #[serde(default)] start_at: f32 },
-    SolidColor { color: [u8; 3] },
+    Image {
+        path: PathBuf,
+    },
+    Video {
+        path: PathBuf,
+        #[serde(default)]
+        r#loop: bool,
+        #[serde(default)]
+        start_at: f32,
+    },
+    SolidColor {
+        color: [u8; 3],
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -587,7 +652,11 @@ pub struct CameraState {
 
 impl Default for CameraState {
     fn default() -> Self {
-        Self { zoom: 1.0, center: [0.5, 0.5], rotation_deg: 0.0 }
+        Self {
+            zoom: 1.0,
+            center: [0.5, 0.5],
+            rotation_deg: 0.0,
+        }
     }
 }
 
@@ -599,6 +668,26 @@ impl crate::keyframe::Lerp for CameraState {
             rotation_deg: self.rotation_deg.lerp(&other.rotation_deg, t),
         }
     }
+}
+
+/// Editor-side grouping metadata for Mellstroy footage sequences.
+///
+/// This is intentionally lightweight and serializable with defaults so
+/// old `.memstroy` projects continue to load with the feature disabled.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MellstroyFootage {
+    /// Show sequence controls for this video element in the layer panel.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Shared id for timeline segments that should move as one sequence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence_id: Option<String>,
+    /// Placeholder segment waiting for a Mellstroy clip/library drop.
+    #[serde(default)]
+    pub slot: bool,
+    /// Short frozen-frame segment created from a sequence edge.
+    #[serde(default)]
+    pub edge_frame: bool,
 }
 
 /// A "Mellstroy" actor: a chroma-keyed source clip plus animation tracks.
@@ -693,6 +782,11 @@ pub struct Actor {
     /// absolute scene coordinates (the default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
+    /// **Mellstroy footage sequence controls**: when enabled, the GUI
+    /// exposes plus handles on the timeline clip edges so adjacent
+    /// footage/still-frame segments can be authored as a linked sequence.
+    #[serde(default)]
+    pub mellstroy_footage: MellstroyFootage,
     /// **Mute embedded audio**: when true, the actor's embedded audio
     /// stream (if any) is NOT automatically mixed into the output.
     /// Defaults to `false` (audio plays). Set to `true` when the user
@@ -702,8 +796,12 @@ pub struct Actor {
     pub mute_audio: bool,
 }
 
-fn default_true() -> bool { true }
-fn default_transition_duration() -> f32 { 0.3 }
+fn default_true() -> bool {
+    true
+}
+fn default_transition_duration() -> f32 {
+    0.3
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct ActorState {
@@ -732,7 +830,9 @@ pub struct ActorState {
     pub flip_y_anim: f32,
 }
 
-fn one() -> f32 { 1.0 }
+fn one() -> f32 {
+    1.0
+}
 
 impl Default for ActorState {
     fn default() -> Self {
@@ -818,9 +918,15 @@ pub struct ColorCorrection {
     pub animated_params: BTreeSet<String>,
 }
 
-fn default_lift() -> [f32; 3] { [0.0, 0.0, 0.0] }
-fn default_gamma() -> [f32; 3] { [1.0, 1.0, 1.0] }
-fn default_gain() -> [f32; 3] { [1.0, 1.0, 1.0] }
+fn default_lift() -> [f32; 3] {
+    [0.0, 0.0, 0.0]
+}
+fn default_gamma() -> [f32; 3] {
+    [1.0, 1.0, 1.0]
+}
+fn default_gain() -> [f32; 3] {
+    [1.0, 1.0, 1.0]
+}
 
 /// Master + per-channel tone curves. Each curve is a list of `[input, output]`
 /// control points in 0..1, sorted by input. The endpoints (`x=0` and `x=1`)
@@ -837,7 +943,9 @@ pub struct ToneCurves {
     pub blue: Vec<[f32; 2]>,
 }
 
-fn identity_curve() -> Vec<[f32; 2]> { vec![[0.0, 0.0], [1.0, 1.0]] }
+fn identity_curve() -> Vec<[f32; 2]> {
+    vec![[0.0, 0.0], [1.0, 1.0]]
+}
 
 impl Default for ToneCurves {
     fn default() -> Self {
@@ -862,14 +970,24 @@ impl ToneCurves {
     /// Sample a curve at `x` in 0..1 using piecewise-linear interpolation
     /// across its control points. Out-of-range x clamps to the endpoint y.
     pub fn sample(curve: &[[f32; 2]], x: f32) -> f32 {
-        if curve.is_empty() { return x; }
-        if curve.len() == 1 { return curve[0][1]; }
-        if x <= curve[0][0] { return curve[0][1]; }
-        if x >= curve[curve.len() - 1][0] { return curve[curve.len() - 1][1]; }
+        if curve.is_empty() {
+            return x;
+        }
+        if curve.len() == 1 {
+            return curve[0][1];
+        }
+        if x <= curve[0][0] {
+            return curve[0][1];
+        }
+        if x >= curve[curve.len() - 1][0] {
+            return curve[curve.len() - 1][1];
+        }
         for w in curve.windows(2) {
             if x >= w[0][0] && x <= w[1][0] {
                 let span = w[1][0] - w[0][0];
-                if span < 1e-6 { return w[0][1]; }
+                if span < 1e-6 {
+                    return w[0][1];
+                }
                 let t = (x - w[0][0]) / span;
                 return w[0][1] + (w[1][1] - w[0][1]) * t;
             }
@@ -880,8 +998,10 @@ impl ToneCurves {
 
 fn is_identity_curve(c: &[[f32; 2]]) -> bool {
     c.len() == 2
-        && (c[0][0] - 0.0).abs() < 1e-4 && (c[0][1] - 0.0).abs() < 1e-4
-        && (c[1][0] - 1.0).abs() < 1e-4 && (c[1][1] - 1.0).abs() < 1e-4
+        && (c[0][0] - 0.0).abs() < 1e-4
+        && (c[0][1] - 0.0).abs() < 1e-4
+        && (c[1][0] - 1.0).abs() < 1e-4
+        && (c[1][1] - 1.0).abs() < 1e-4
 }
 
 impl Default for ColorCorrection {
@@ -910,7 +1030,9 @@ impl ColorCorrection {
         if !self.animated_params.contains(key) {
             return fallback;
         }
-        let Some(kfs) = self.kfs.get(key) else { return fallback; };
+        let Some(kfs) = self.kfs.get(key) else {
+            return fallback;
+        };
         if kfs.is_empty() {
             return fallback;
         }
@@ -924,7 +1046,7 @@ impl ColorCorrection {
     pub fn sampled_at(&self, t_local: f32) -> Self {
         let mut out = self.clone();
         out.brightness = self.sample_param_at(t_local, "brightness", self.brightness);
-        out.contrast   = self.sample_param_at(t_local, "contrast",   self.contrast);
+        out.contrast = self.sample_param_at(t_local, "contrast", self.contrast);
         out.saturation = self.sample_param_at(t_local, "saturation", self.saturation);
         out.temperature = self.sample_param_at(t_local, "temperature", self.temperature);
         out
@@ -984,7 +1106,10 @@ impl ChromaKeyParams {
 
     /// Save these chroma settings as JSON next to the source clip so they
     /// follow the asset across projects.
-    pub fn save_alongside_clip(&self, clip_path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    pub fn save_alongside_clip(
+        &self,
+        clip_path: &std::path::Path,
+    ) -> std::io::Result<std::path::PathBuf> {
         let path = Self::sidecar_path(clip_path);
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
@@ -1074,7 +1199,9 @@ pub struct TextOverlay {
     pub parent_id: Option<String>,
 }
 
-fn default_text_z() -> i32 { 100 }
+fn default_text_z() -> i32 {
+    100
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1107,7 +1234,9 @@ pub enum TextBoxKind {
 }
 
 impl Default for TextBoxKind {
-    fn default() -> Self { TextBoxKind::Solid }
+    fn default() -> Self {
+        TextBoxKind::Solid
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1169,7 +1298,9 @@ pub struct TextStyle {
     pub box_outline_width: f32,
 }
 
-fn default_font() -> String { "DejaVuSans".into() }
+fn default_font() -> String {
+    "DejaVuSans".into()
+}
 
 impl Default for TextStyle {
     fn default() -> Self {
@@ -1198,7 +1329,12 @@ impl Default for TextStyle {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum TextAlign { Left, #[default] Center, Right }
+pub enum TextAlign {
+    Left,
+    #[default]
+    Center,
+    Right,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageOverlay {
@@ -1502,6 +1638,25 @@ impl Default for AudioTrack {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::Actor;
+
+    #[test]
+    fn actor_without_mellstroy_footage_metadata_loads_with_feature_off() {
+        let actor: Actor = serde_json::from_value(serde_json::json!({
+            "id": "legacy_actor",
+            "source": "clip.mp4"
+        }))
+        .expect("legacy actor json should deserialize");
+
+        assert!(!actor.mellstroy_footage.enabled);
+        assert!(actor.mellstroy_footage.sequence_id.is_none());
+        assert!(!actor.mellstroy_footage.slot);
+        assert!(!actor.mellstroy_footage.edge_frame);
+    }
+}
+
 impl AudioTrack {
     /// Sample the volume at clip-local time `t_local`. When
     /// `"volume" ∈ animated_params` and `volume_kfs` has at least one
@@ -1550,8 +1705,8 @@ impl AudioTrack {
     pub fn low_pass_at(&self, t_local: f32) -> Option<u32> {
         let static_hz = self.low_pass_hz?;
         if self.animated_params.contains("low_pass") && !self.low_pass_kfs.is_empty() {
-            let v = crate::keyframe::sample(&self.low_pass_kfs, t_local)
-                .unwrap_or(static_hz as f32);
+            let v =
+                crate::keyframe::sample(&self.low_pass_kfs, t_local).unwrap_or(static_hz as f32);
             Some(v.clamp(20.0, 22000.0) as u32)
         } else {
             Some(static_hz)
@@ -1563,8 +1718,8 @@ impl AudioTrack {
     pub fn high_pass_at(&self, t_local: f32) -> Option<u32> {
         let static_hz = self.high_pass_hz?;
         if self.animated_params.contains("high_pass") && !self.high_pass_kfs.is_empty() {
-            let v = crate::keyframe::sample(&self.high_pass_kfs, t_local)
-                .unwrap_or(static_hz as f32);
+            let v =
+                crate::keyframe::sample(&self.high_pass_kfs, t_local).unwrap_or(static_hz as f32);
             Some(v.clamp(20.0, 22000.0) as u32)
         } else {
             Some(static_hz)

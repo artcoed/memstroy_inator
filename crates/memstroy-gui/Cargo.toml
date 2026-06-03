@@ -99,7 +99,6 @@ obfstr = { version = "0.4", optional = true }
 # the file stem ("ARIALBD"). `ttf-parser` is already transitively
 # present in the egui graph, so the binary cost is essentially zero.
 ttf-parser = "0.25"
-
 # Font byte-stream validator. Used by `system_fonts::ensure_font_loaded`
 # to reject malformed TTFs *before* they reach `ctx.set_fonts(...)`.
 # egui's text layout uses ab_glyph internally; pre-flighting with the
@@ -111,6 +110,9 @@ ab_glyph = "0.2"
 # Portable SIMD (AVX2 / SSE / NEON) for the chroma-key + colour-correction
 # pipeline. Auto-detects the best instruction set at runtime via `wide`.
 wide = "0.7"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 # `winresource` programmatically generates and links a Win32
 # VS_VERSIONINFO resource into the produced `.exe`, populating the

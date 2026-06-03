@@ -9,18 +9,16 @@ use tracing::{debug, info, warn};
 
 use crate::model::TgPost;
 
-static TELESCO_FILE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"https://cdn\d*\.telesco\.pe/file/[^\s"'<>\\]+"#).unwrap()
-});
+static TELESCO_FILE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"https://cdn\d*\.telesco\.pe/file/[^\s"'<>\\]+"#).unwrap());
 
 static TG_CDN_FILE_RE: LazyLock<Regex> = LazyLock::new(|| {
     // Telegram preview occasionally serves files from telegram-cdn* domains.
     Regex::new(r#"https://[^\s"'<>\\]*telegram-cdn[^\s"'<>\\]*"#).unwrap()
 });
 
-static OG_VIDEO_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"property="og:video(?::url)?"\s+content="([^"]+)""#).unwrap()
-});
+static OG_VIDEO_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"property="og:video(?::url)?"\s+content="([^"]+)""#).unwrap());
 
 fn is_likely_image_cdn_url(url: &str) -> bool {
     let lower = url.to_lowercase();
@@ -88,8 +86,7 @@ pub async fn enrich_post_videos(client: &reqwest::Client, post: &mut TgPost) -> 
     Ok(())
 }
 
-const USER_AGENT: &str =
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) \
+const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) \
      Chrome/124.0 Safari/537.36";
 
 /// HTTP client used by the scraper. Configured for resilient long
@@ -143,7 +140,9 @@ pub fn parse_posts(html: &str) -> Vec<TgPost> {
 
     let mut out = Vec::new();
     for node in doc.select(&msg_sel) {
-        let Some(data_post) = node.value().attr("data-post") else { continue };
+        let Some(data_post) = node.value().attr("data-post") else {
+            continue;
+        };
         let id = data_post
             .rsplit('/')
             .next()
@@ -157,14 +156,14 @@ pub fn parse_posts(html: &str) -> Vec<TgPost> {
             .unwrap_or_default();
 
         let mut videos: Vec<String> = Vec::new();
-        
+
         // Try to find video src from <video src="..."> tags
         for v in node.select(&video_sel) {
             if let Some(src) = v.value().attr("src") {
                 videos.push(src.to_string());
             }
         }
-        
+
         // Also try to find video URLs from background-image in video player wrappers
         // Telegram sometimes embeds video URLs in data attributes or as background thumbnails
         let video_player_sel = Selector::parse(".tgme_widget_message_video_player").unwrap();
@@ -178,7 +177,7 @@ pub fn parse_posts(html: &str) -> Vec<TgPost> {
                 }
             }
         }
-        
+
         merge_video_urls(&mut videos, extract_cdn_video_urls(&node.html()));
         for layer in node.select(&grouped_sel) {
             merge_video_urls(&mut videos, extract_cdn_video_urls(&layer.html()));

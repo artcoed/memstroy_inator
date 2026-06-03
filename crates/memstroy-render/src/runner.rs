@@ -9,12 +9,63 @@ use tracing::{info, warn};
 
 use crate::plan::{build_plan, FfmpegPlan};
 
-/// Locate ffmpeg: env var `MEMSTROY_FFMPEG`, then PATH.
+/// Locate ffmpeg: env var `MEMSTROY_FFMPEG`, bundled copy next to the
+/// installed executable, then PATH.
 pub fn ffmpeg_binary() -> PathBuf {
     if let Ok(p) = std::env::var("MEMSTROY_FFMPEG") {
         return PathBuf::from(p);
     }
+    if let Some(p) = bundled_tool(if cfg!(windows) {
+        "ffmpeg.exe"
+    } else {
+        "ffmpeg"
+    }) {
+        return p;
+    }
     PathBuf::from("ffmpeg")
+}
+
+/// Locate ffprobe using the same rules as [`ffmpeg_binary`].
+///
+/// On Windows the extension matters: looking for a sibling named
+/// `ffprobe` misses the bundled `ffprobe.exe`, so keep this in one
+/// helper and let GUI preview/duration code share it.
+pub fn ffprobe_binary() -> PathBuf {
+    if let Ok(p) = std::env::var("MEMSTROY_FFPROBE") {
+        return PathBuf::from(p);
+    }
+    let name = if cfg!(windows) {
+        "ffprobe.exe"
+    } else {
+        "ffprobe"
+    };
+    if let Some(p) = bundled_tool(name) {
+        return p;
+    }
+    let mut sibling = ffmpeg_binary();
+    sibling.set_file_name(name);
+    if sibling.is_file() {
+        return sibling;
+    }
+    PathBuf::from(name)
+}
+
+fn bundled_tool(name: &str) -> Option<PathBuf> {
+    const MIN_REAL_FFMPEG_TOOL_SIZE: u64 = 1_000_000;
+    let exe = std::env::current_exe().ok()?;
+    let exe_dir = exe.parent()?;
+    [
+        exe_dir.join(name),
+        exe_dir.join("bin").join(name),
+        exe_dir.join("ffmpeg").join("bin").join(name),
+    ]
+    .into_iter()
+    .find(|p| {
+        p.is_file()
+            && p.metadata()
+                .map(|m| m.len() >= MIN_REAL_FFMPEG_TOOL_SIZE)
+                .unwrap_or(false)
+    })
 }
 
 /// Render `scene` into `output_path`. Switches between the CPU
@@ -154,8 +205,14 @@ async fn render_preview_frame_filtergraph(
     let mut cleaned: Vec<String> = Vec::with_capacity(args.len());
     let mut skip_next = false;
     for a in args.drain(..) {
-        if skip_next { skip_next = false; continue; }
-        if drops.iter().any(|d| *d == a) { skip_next = true; continue; }
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if drops.iter().any(|d| *d == a) {
+            skip_next = true;
+            continue;
+        }
         cleaned.push(a);
     }
     // The output path was the last arg in the plan. Replace it with
@@ -231,7 +288,9 @@ async fn run_args<F: FnMut(&str)>(args: &[String], on_log: &mut F) -> Result<()>
     // up every render on Windows. No-op on other platforms.
     crate::proc::hide_console_tokio(&mut cmd);
 
-    let mut child = cmd.spawn().with_context(|| format!("spawn {}", bin.display()))?;
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("spawn {}", bin.display()))?;
 
     // Keep BOTH a head and a sliding tail of stderr so the error we
     // surface includes the actual ffmpeg complaint regardless of
@@ -335,8 +394,7 @@ fn format_diagnostic_log(head: &[String], tail: &std::collections::VecDeque<Stri
             || s.contains("stream specifier")
             || s.contains("matches no streams")
     };
-    let (errors, rest): (Vec<&str>, Vec<&str>) =
-        combined.iter().copied().partition(is_error_line);
+    let (errors, rest): (Vec<&str>, Vec<&str>) = combined.iter().copied().partition(is_error_line);
 
     let mut all: Vec<&str> = Vec::with_capacity(errors.len() + rest.len());
     all.extend(errors);

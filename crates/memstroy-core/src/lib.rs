@@ -9,29 +9,29 @@
 //!
 //! The format is round-trippable as YAML (preferred) or JSON.
 
-pub mod scene;
-pub mod easing;
-pub mod keyframe;
-pub mod anchor;
 pub mod ai_pipeline;
+pub mod anchor;
 pub mod canvas;
-pub mod skeleton;
-pub mod scripting;
+pub mod easing;
 pub mod effects;
+pub mod keyframe;
 pub mod layout_sample;
 pub mod parent_transform;
+pub mod scene;
+pub mod scripting;
+pub mod skeleton;
 
-pub use scene::*;
+pub use ai_pipeline::*;
+pub use anchor::*;
+pub use canvas::*;
+pub use easing::*;
+pub use effects::*;
+pub use keyframe::*;
 pub use layout_sample::*;
 pub use parent_transform::*;
-pub use easing::*;
-pub use keyframe::*;
-pub use anchor::*;
-pub use ai_pipeline::*;
-pub use canvas::*;
-pub use skeleton::*;
+pub use scene::*;
 pub use scripting::*;
-pub use effects::*;
+pub use skeleton::*;
 
 use std::path::Path;
 use thiserror::Error;
@@ -61,12 +61,11 @@ impl Scene {
             // See `EditorState::save_memstroy` for the writer side.
             Some("memstroy") => {
                 let bundle: serde_json::Value = serde_json::from_str(&raw)?;
-                let scene_value = bundle
-                    .get("scene")
-                    .cloned()
-                    .ok_or_else(|| SceneError::UnknownFormat(
+                let scene_value = bundle.get("scene").cloned().ok_or_else(|| {
+                    SceneError::UnknownFormat(
                         ".memstroy file missing required \"scene\" key".into(),
-                    ))?;
+                    )
+                })?;
                 serde_json::from_value(scene_value)?
             }
             other => return Err(SceneError::UnknownFormat(other.unwrap_or("").into())),
@@ -117,9 +116,15 @@ mod tests_roundtrip {
     fn empty_animated_params_not_serialised() {
         let scene = Scene::default();
         let yaml = serde_yaml::to_string(&scene).unwrap();
-        assert!(!yaml.contains("animated_params"),
-            "default scene should not write animated_params (got:\n{})", yaml);
-        assert!(!yaml.contains("param_kfs"),
-            "default scene should not write effect param_kfs (got:\n{})", yaml);
+        assert!(
+            !yaml.contains("animated_params"),
+            "default scene should not write animated_params (got:\n{})",
+            yaml
+        );
+        assert!(
+            !yaml.contains("param_kfs"),
+            "default scene should not write effect param_kfs (got:\n{})",
+            yaml
+        );
     }
 }

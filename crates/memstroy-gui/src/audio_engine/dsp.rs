@@ -306,7 +306,7 @@ pub struct Stereo<S: Source<Item = f32>> {
     /// Equal-power pan gain for L and R.
     left: f32,
     right: f32,
-    fade_in_samples: u64, // 0 = no fade-in
+    fade_in_samples: u64,  // 0 = no fade-in
     fade_out_samples: u64, // 0 = no fade-out
     total_samples: u64,    // 0 = unknown total; fade-out is then disabled
     /// Cached frame buffer (one input frame's worth of samples, mixed
@@ -362,8 +362,7 @@ impl<S: Source<Item = f32>> Stereo<S> {
             let fade_start = self.total_samples - self.fade_out_samples;
             if pos >= fade_start {
                 let into_fade = pos - fade_start;
-                let g_out =
-                    1.0 - (into_fade as f32 / self.fade_out_samples as f32).clamp(0.0, 1.0);
+                let g_out = 1.0 - (into_fade as f32 / self.fade_out_samples as f32).clamp(0.0, 1.0);
                 g *= g_out;
             }
         }

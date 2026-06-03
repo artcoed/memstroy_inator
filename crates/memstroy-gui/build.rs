@@ -148,10 +148,8 @@ fn embed_windows_version_info() {
     // VS_VERSIONINFO encodes FILEVERSION / PRODUCTVERSION as a
     // packed u64: high-to-low 16-bit fields are major / minor /
     // patch / build. See `WindowsResource::set_version_info`.
-    let packed: u64 = ((major as u64) << 48)
-        | ((minor as u64) << 32)
-        | ((patch as u64) << 16)
-        | (build as u64);
+    let packed: u64 =
+        ((major as u64) << 48) | ((minor as u64) << 32) | ((patch as u64) << 16) | (build as u64);
 
     let pkg_version = env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".to_string());
 
@@ -183,8 +181,7 @@ fn embed_windows_version_info() {
     // If the .ico ever goes missing we surface a `cargo:warning=`
     // and continue — same best-effort policy as the VS_VERSIONINFO
     // block above.
-    let manifest_dir = env::var("CARGO_MANIFEST_DIR")
-        .expect("CARGO_MANIFEST_DIR is set by cargo");
+    let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by cargo");
     let icon_path = Path::new(&manifest_dir)
         .join("..")
         .join("..")

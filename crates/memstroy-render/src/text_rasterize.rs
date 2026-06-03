@@ -87,8 +87,8 @@ pub fn rasterize_text_overlay(
                 style.font,
             )
         })?;
-    let font_bytes = std::fs::read(&font_path)
-        .with_context(|| format!("read font {}", font_path.display()))?;
+    let font_bytes =
+        std::fs::read(&font_path).with_context(|| format!("read font {}", font_path.display()))?;
     let font = FontVec::try_from_vec(font_bytes)
         .with_context(|| format!("parse font {}", font_path.display()))?;
 
@@ -247,7 +247,10 @@ pub fn rasterize_text_overlay(
         // Plate border (any non-Wrap, non-OutlineOnly variant — Wrap
         // and OutlineOnly already handle borders themselves).
         if style.box_outline_width > 0.0
-            && !matches!(style.box_kind, TextBoxKind::OutlineOnly | TextBoxKind::Wrap | TextBoxKind::FitText)
+            && !matches!(
+                style.box_kind,
+                TextBoxKind::OutlineOnly | TextBoxKind::Wrap | TextBoxKind::FitText
+            )
         {
             let border_rgb = style.box_outline_color.unwrap_or([0, 0, 0]);
             let border_color = Rgba([border_rgb[0], border_rgb[1], border_rgb[2], box_alpha]);
@@ -346,7 +349,11 @@ pub fn rasterize_text_overlay(
         .collect();
     let png_path = temp_dir.join(format!(
         "memstroy_text_{}_{}.png",
-        if safe_id.is_empty() { "anon" } else { safe_id.as_str() },
+        if safe_id.is_empty() {
+            "anon"
+        } else {
+            safe_id.as_str()
+        },
         stamp,
     ));
     img.save(&png_path)
@@ -439,10 +446,8 @@ fn draw_text_block(
             if let Some(prev) = prev_glyph {
                 pen_x += scaled.kern(prev, glyph_id);
             }
-            let glyph = glyph_id.with_scale_and_position(
-                scale,
-                ab_glyph::point(pen_x + dx, baseline_y + dy),
-            );
+            let glyph = glyph_id
+                .with_scale_and_position(scale, ab_glyph::point(pen_x + dx, baseline_y + dy));
             if let Some(outlined) = font.outline_glyph(glyph) {
                 let bb = outlined.px_bounds();
                 outlined.draw(|x, y, c| {

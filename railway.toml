@@ -5,7 +5,7 @@
 # - PORT is injected by Railway; main.rs honours it.
 # - ASSETS_ROOT defaults to /data/assets which expects a mounted Volume.
 #   Mount one named "assets" with a mount path of /data so the asset
-#   tree (and scraped Telegram catalogue) survives redeploys.
+#   tree survives redeploys.
 
 [build]
 builder = "nixpacks"

@@ -152,6 +152,61 @@ for bin in memstroy-gui memstroy; do
     cp -p "${src}" "${BUNDLE_DIR}/bin/"
 done
 
+# ─── Bundled FFmpeg ──────────────────────────────────────────────────
+resolve_required_tool() {
+    local tool_name="$1"
+    local env_path="${2:-}"
+    local repo_candidate="${ROOT_DIR}/tools/ffmpeg/bin/${tool_name}"
+
+    if [[ -n "${env_path}" && -x "${env_path}" ]]; then
+        printf '%s\n' "${env_path}"
+        return 0
+    fi
+    if [[ -x "${repo_candidate}" ]]; then
+        printf '%s\n' "${repo_candidate}"
+        return 0
+    fi
+    if command -v "${tool_name}" >/dev/null 2>&1; then
+        command -v "${tool_name}"
+        return 0
+    fi
+
+    echo "missing ${tool_name}; install FFmpeg on the build machine, set MEMSTROY_FFMPEG/MEMSTROY_FFPROBE, or place binaries in tools/ffmpeg/bin" >&2
+    exit 1
+}
+
+validate_real_ffmpeg_tool() {
+    local tool_path="$1"
+    local tool_name="$2"
+    local size
+
+    size="$(wc -c < "${tool_path}" | tr -d '[:space:]')"
+    if [[ "${size}" -lt 1048576 ]]; then
+        echo "error: ${tool_name} resolved to a tiny launcher/shim (${size} bytes): ${tool_path}" >&2
+        echo "       Install/copy a real static FFmpeg binary or set MEMSTROY_FFMPEG/MEMSTROY_FFPROBE." >&2
+        exit 1
+    fi
+    if ! "${tool_path}" -version >/dev/null 2>&1; then
+        echo "error: ${tool_name} failed '-version' check: ${tool_path}" >&2
+        exit 1
+    fi
+}
+
+FFMPEG_SRC="$(resolve_required_tool ffmpeg "${MEMSTROY_FFMPEG:-}")"
+if [[ -n "${MEMSTROY_FFPROBE:-}" ]]; then
+    FFPROBE_SRC="$(resolve_required_tool ffprobe "${MEMSTROY_FFPROBE}")"
+elif [[ -x "$(dirname "${FFMPEG_SRC}")/ffprobe" ]]; then
+    FFPROBE_SRC="$(dirname "${FFMPEG_SRC}")/ffprobe"
+else
+    FFPROBE_SRC="$(resolve_required_tool ffprobe)"
+fi
+validate_real_ffmpeg_tool "${FFMPEG_SRC}" ffmpeg
+validate_real_ffmpeg_tool "${FFPROBE_SRC}" ffprobe
+cp -p "${FFMPEG_SRC}" "${BUNDLE_DIR}/bin/ffmpeg"
+cp -p "${FFPROBE_SRC}" "${BUNDLE_DIR}/bin/ffprobe"
+echo "    bundled   : bin/ffmpeg"
+echo "    bundled   : bin/ffprobe"
+
 # ─── AI background-removal model (U²-Netp) ───────────────────────────
 MODEL_SRC="${ROOT_DIR}/assets/models/u2netp.onnx"
 if [[ ! -f "${MODEL_SRC}" ]]; then

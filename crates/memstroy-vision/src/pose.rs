@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use memstroy_core::{AnchorSample, AnchorTrack, Keypoint};
 use tokio::io::AsyncReadExt;
@@ -16,10 +16,23 @@ use tracing::info;
 
 /// COCO-17 keypoint names in standard YOLO-pose output order.
 const COCO_KEYPOINTS: &[&str] = &[
-    "nose", "left_eye", "right_eye", "left_ear", "right_ear",
-    "left_shoulder", "right_shoulder", "left_elbow", "right_elbow",
-    "left_wrist", "right_wrist", "left_hip", "right_hip",
-    "left_knee", "right_knee", "left_ankle", "right_ankle",
+    "nose",
+    "left_eye",
+    "right_eye",
+    "left_ear",
+    "right_ear",
+    "left_shoulder",
+    "right_shoulder",
+    "left_elbow",
+    "right_elbow",
+    "left_wrist",
+    "right_wrist",
+    "left_hip",
+    "right_hip",
+    "left_knee",
+    "right_knee",
+    "left_ankle",
+    "right_ankle",
 ];
 
 // ─── TRAIT ───────────────────────────────────────────────────────────
@@ -38,7 +51,9 @@ impl PoseEstimator for StubPoseEstimator {
     async fn estimate(&self, _video: &Path, _target_fps: f32) -> Result<AnchorTrack> {
         Ok(AnchorTrack::default())
     }
-    fn id(&self) -> &'static str { "stub" }
+    fn id(&self) -> &'static str {
+        "stub"
+    }
 }
 
 // ─── ONNX IMPLEMENTATION ────────────────────────────────────────────
@@ -52,11 +67,21 @@ pub struct OnnxPoseEstimator {
 
 impl OnnxPoseEstimator {
     pub fn new(model_path: PathBuf) -> Self {
-        Self { model_path, input_size: 640, conf_threshold: 0.25 }
+        Self {
+            model_path,
+            input_size: 640,
+            conf_threshold: 0.25,
+        }
     }
 
-    pub fn with_input_size(mut self, size: u32) -> Self { self.input_size = size; self }
-    pub fn with_confidence(mut self, conf: f32) -> Self { self.conf_threshold = conf; self }
+    pub fn with_input_size(mut self, size: u32) -> Self {
+        self.input_size = size;
+        self
+    }
+    pub fn with_confidence(mut self, conf: f32) -> Self {
+        self.conf_threshold = conf;
+        self
+    }
 }
 
 #[async_trait]
@@ -81,9 +106,15 @@ impl PoseEstimator for OnnxPoseEstimator {
             .args(["-hide_banner", "-loglevel", "error", "-i"])
             .arg(video.as_os_str())
             .args([
-                "-vf", &format!("select=not(mod(n\\,{}))", sample_every),
-                "-vsync", "vfr",
-                "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
+                "-vf",
+                &format!("select=not(mod(n\\,{}))", sample_every),
+                "-vsync",
+                "vfr",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+                "-",
             ])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -109,14 +140,28 @@ impl PoseEstimator for OnnxPoseEstimator {
         let conf_threshold = self.conf_threshold;
 
         let samples = tokio::task::spawn_blocking(move || -> Result<Vec<AnchorSample>> {
-            run_onnx_inference(&model_path, &all_frames, vid_w, vid_h, input_size, conf_threshold, effective_fps)
-        }).await??;
+            run_onnx_inference(
+                &model_path,
+                &all_frames,
+                vid_w,
+                vid_h,
+                input_size,
+                conf_threshold,
+                effective_fps,
+            )
+        })
+        .await??;
 
         info!(samples = samples.len(), "pose estimation complete");
-        Ok(AnchorTrack { fps: effective_fps, samples })
+        Ok(AnchorTrack {
+            fps: effective_fps,
+            samples,
+        })
     }
 
-    fn id(&self) -> &'static str { "onnx-yolo-pose" }
+    fn id(&self) -> &'static str {
+        "onnx-yolo-pose"
+    }
 }
 
 /// Blocking ONNX inference over all frames.
@@ -131,8 +176,8 @@ fn run_onnx_inference(
 ) -> Result<Vec<AnchorSample>> {
     use ort::session::builder::GraphOptimizationLevel;
 
-    let builder = ort::session::Session::builder()
-        .map_err(|e| anyhow!("ort session builder: {}", e))?;
+    let builder =
+        ort::session::Session::builder().map_err(|e| anyhow!("ort session builder: {}", e))?;
     let mut builder = builder
         .with_optimization_level(GraphOptimizationLevel::Level3)
         .unwrap_or_else(|e| e.recover());
@@ -165,15 +210,19 @@ fn run_onnx_inference(
         let input_tensor = ort::value::Tensor::from_array(([1usize, 3, size, size], input_data))
             .map_err(|e| anyhow!("create tensor: {}", e))?;
 
-        let outputs = session.run(ort::inputs![input_tensor])
+        let outputs = session
+            .run(ort::inputs![input_tensor])
             .map_err(|e| anyhow!("inference: {}", e))?;
 
         // Parse output [1, 56, N]
         let output_value = &outputs[0];
-        let (shape, data) = output_value.try_extract_tensor::<f32>()
+        let (shape, data) = output_value
+            .try_extract_tensor::<f32>()
             .map_err(|e| anyhow!("extract tensor: {}", e))?;
 
-        if shape.len() < 3 { continue; }
+        if shape.len() < 3 {
+            continue;
+        }
 
         let num_features = shape[1] as usize;
         let num_dets = shape[2] as usize;
@@ -189,7 +238,9 @@ fn run_onnx_inference(
             }
         }
 
-        let Some(det) = best_det else { continue; };
+        let Some(det) = best_det else {
+            continue;
+        };
 
         // Extract keypoints
         let mut points = BTreeMap::new();
@@ -197,34 +248,48 @@ fn run_onnx_inference(
             let row_x = 5 + kp_idx * 3;
             let row_y = 5 + kp_idx * 3 + 1;
             let row_c = 5 + kp_idx * 3 + 2;
-            if row_c >= num_features { break; }
+            if row_c >= num_features {
+                break;
+            }
 
             let kp_x = data[row_x * num_dets + det];
             let kp_y = data[row_y * num_dets + det];
             let kp_conf = data[row_c * num_dets + det];
 
-            points.insert(name.to_string(), Keypoint {
-                x: (kp_x / input_size as f32).clamp(0.0, 1.0),
-                y: (kp_y / input_size as f32).clamp(0.0, 1.0),
-                confidence: kp_conf.clamp(0.0, 1.0),
-            });
+            points.insert(
+                name.to_string(),
+                Keypoint {
+                    x: (kp_x / input_size as f32).clamp(0.0, 1.0),
+                    y: (kp_y / input_size as f32).clamp(0.0, 1.0),
+                    confidence: kp_conf.clamp(0.0, 1.0),
+                },
+            );
         }
 
         // Synthesize head & body_center
-        if let (Some(&n), Some(&le), Some(&re)) =
-            (points.get("nose"), points.get("left_eye"), points.get("right_eye"))
-        {
-            points.insert("head".to_string(), Keypoint {
-                x: (n.x + le.x + re.x) / 3.0,
-                y: (n.y + le.y + re.y) / 3.0,
-                confidence: (n.confidence + le.confidence + re.confidence) / 3.0,
-            });
+        if let (Some(&n), Some(&le), Some(&re)) = (
+            points.get("nose"),
+            points.get("left_eye"),
+            points.get("right_eye"),
+        ) {
+            points.insert(
+                "head".to_string(),
+                Keypoint {
+                    x: (n.x + le.x + re.x) / 3.0,
+                    y: (n.y + le.y + re.y) / 3.0,
+                    confidence: (n.confidence + le.confidence + re.confidence) / 3.0,
+                },
+            );
         }
         if let (Some(&lh), Some(&rh)) = (points.get("left_hip"), points.get("right_hip")) {
-            points.insert("body_center".to_string(), Keypoint {
-                x: (lh.x + rh.x) / 2.0, y: (lh.y + rh.y) / 2.0,
-                confidence: (lh.confidence + rh.confidence) / 2.0,
-            });
+            points.insert(
+                "body_center".to_string(),
+                Keypoint {
+                    x: (lh.x + rh.x) / 2.0,
+                    y: (lh.y + rh.y) / 2.0,
+                    confidence: (lh.confidence + rh.confidence) / 2.0,
+                },
+            );
         }
 
         samples.push(AnchorSample { t, points });
@@ -237,10 +302,20 @@ fn run_onnx_inference(
 
 async fn probe_video(path: &Path) -> Result<(u32, u32, f32)> {
     let output = Command::new("ffprobe")
-        .args(["-v", "error", "-select_streams", "v:0",
-               "-show_entries", "stream=width,height,r_frame_rate", "-of", "csv=p=0"])
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height,r_frame_rate",
+            "-of",
+            "csv=p=0",
+        ])
         .arg(path.as_os_str())
-        .output().await.context("ffprobe")?;
+        .output()
+        .await
+        .context("ffprobe")?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let parts: Vec<&str> = stdout.trim().split(',').collect();
@@ -251,7 +326,8 @@ async fn probe_video(path: &Path) -> Result<(u32, u32, f32)> {
     let h: u32 = parts[1].parse().context("height")?;
     let fps_parts: Vec<&str> = parts[2].split('/').collect();
     let fps = if fps_parts.len() == 2 {
-        fps_parts[0].parse::<f32>().unwrap_or(30.0) / fps_parts[1].parse::<f32>().unwrap_or(1.0).max(1.0)
+        fps_parts[0].parse::<f32>().unwrap_or(30.0)
+            / fps_parts[1].parse::<f32>().unwrap_or(1.0).max(1.0)
     } else {
         parts[2].parse().unwrap_or(30.0)
     };
@@ -266,7 +342,9 @@ fn resize_rgb(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<u8>
             let sx = dx * sw / dw;
             let si = (sy * sw + sx) * 3;
             let di = (dy * dw + dx) * 3;
-            dst[di] = src[si]; dst[di+1] = src[si+1]; dst[di+2] = src[si+2];
+            dst[di] = src[si];
+            dst[di + 1] = src[si + 1];
+            dst[di + 2] = src[si + 2];
         }
     }
     dst
@@ -282,5 +360,7 @@ pub fn save_anchor_track(video_path: &Path, track: &AnchorTrack) -> Result<PathB
 /// Load previously saved AnchorTrack.
 pub fn load_anchor_track(video_path: &Path) -> Option<AnchorTrack> {
     let p = video_path.with_extension("anchors.json");
-    std::fs::read_to_string(&p).ok().and_then(|s| serde_json::from_str(&s).ok())
+    std::fs::read_to_string(&p)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
 }

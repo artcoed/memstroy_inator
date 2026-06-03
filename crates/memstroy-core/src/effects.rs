@@ -45,8 +45,12 @@ pub struct Effect {
     pub animated_params: std::collections::BTreeSet<String>,
 }
 
-fn default_true() -> bool { true }
-fn default_one() -> f32 { 1.0 }
+fn default_true() -> bool {
+    true
+}
+fn default_one() -> f32 {
+    1.0
+}
 
 impl Default for Effect {
     fn default() -> Self {
@@ -118,7 +122,12 @@ pub enum EffectKind {
     /// rectangle is therefore `[left .. 1.0 - right]` × `[top .. 1.0 - bottom]`.
     /// Acts as a Photoshop-style "Crop" tool when applied to images
     /// AND a coarse-grained mask when applied to videos / actors.
-    Crop { left: f32, top: f32, right: f32, bottom: f32 },
+    Crop {
+        left: f32,
+        top: f32,
+        right: f32,
+        bottom: f32,
+    },
     /// **Free-form mask**: keeps pixels INSIDE `shape` (or outside when
     /// `invert` is set), zeroing the alpha of the rest. The shape
     /// coordinates live in the element's own UV space (0..1 mapped to
@@ -180,8 +189,12 @@ pub enum EffectKind {
     },
 }
 
-fn default_color_key_similarity() -> f32 { 0.18 }
-fn default_color_key_blend() -> f32 { 0.10 }
+fn default_color_key_similarity() -> f32 {
+    0.18
+}
+fn default_color_key_blend() -> f32 {
+    0.10
+}
 
 /// A 2D mask shape in element-local UV coordinates (0..1 spans the
 /// bounding box). All `EffectKind::Mask` shapes round-trip through the
@@ -191,7 +204,12 @@ fn default_color_key_blend() -> f32 { 0.10 }
 #[serde(tag = "shape", rename_all = "snake_case")]
 pub enum MaskShape {
     /// Axis-aligned rectangle, edges in UV.
-    Rect { left: f32, top: f32, right: f32, bottom: f32 },
+    Rect {
+        left: f32,
+        top: f32,
+        right: f32,
+        bottom: f32,
+    },
     /// Ellipse with centre and radii in UV. `rx`, `ry` are radii (not
     /// diameters); a circle is `rx == ry`.
     Ellipse { cx: f32, cy: f32, rx: f32, ry: f32 },
@@ -207,21 +225,34 @@ impl MaskShape {
     /// inspector dropdown. Subsequently overwritten by the canvas
     /// mask tool when the user actually paints a shape.
     pub fn rect_full() -> Self {
-        Self::Rect { left: 0.1, top: 0.1, right: 0.9, bottom: 0.9 }
+        Self::Rect {
+            left: 0.1,
+            top: 0.1,
+            right: 0.9,
+            bottom: 0.9,
+        }
     }
 
     /// Default ellipse centred on the element.
     pub fn ellipse_full() -> Self {
-        Self::Ellipse { cx: 0.5, cy: 0.5, rx: 0.4, ry: 0.4 }
+        Self::Ellipse {
+            cx: 0.5,
+            cy: 0.5,
+            rx: 0.4,
+            ry: 0.4,
+        }
     }
 
     /// Test whether a UV point falls inside this shape.
     /// `(0,0)` is the top-left of the element, `(1,1)` is the bottom-right.
     pub fn contains_uv(&self, u: f32, v: f32) -> bool {
         match self {
-            MaskShape::Rect { left, top, right, bottom } => {
-                u >= *left && u <= *right && v >= *top && v <= *bottom
-            }
+            MaskShape::Rect {
+                left,
+                top,
+                right,
+                bottom,
+            } => u >= *left && u <= *right && v >= *top && v <= *bottom,
             MaskShape::Ellipse { cx, cy, rx, ry } => {
                 let rx = rx.max(1e-6);
                 let ry = ry.max(1e-6);
@@ -240,7 +271,12 @@ impl MaskShape {
     ///   `alpha = clamp(margin / feather + 0.5, 0, 1)`
     pub fn signed_margin_uv(&self, u: f32, v: f32) -> f32 {
         match self {
-            MaskShape::Rect { left, top, right, bottom } => {
+            MaskShape::Rect {
+                left,
+                top,
+                right,
+                bottom,
+            } => {
                 let dx = (u - *left).min(*right - u);
                 let dy = (v - *top).min(*bottom - v);
                 dx.min(dy)
@@ -259,7 +295,11 @@ impl MaskShape {
             MaskShape::Polygon { points } => {
                 let inside = point_in_polygon(u, v, points);
                 let d = polygon_min_edge_dist(u, v, points);
-                if inside { d } else { -d }
+                if inside {
+                    d
+                } else {
+                    -d
+                }
             }
         }
     }
@@ -267,7 +307,9 @@ impl MaskShape {
 
 #[inline]
 fn point_in_polygon(u: f32, v: f32, pts: &[[f32; 2]]) -> bool {
-    if pts.len() < 3 { return false; }
+    if pts.len() < 3 {
+        return false;
+    }
     let mut inside = false;
     let n = pts.len();
     let mut j = n - 1;
@@ -286,14 +328,18 @@ fn point_in_polygon(u: f32, v: f32, pts: &[[f32; 2]]) -> bool {
 
 #[inline]
 fn polygon_min_edge_dist(u: f32, v: f32, pts: &[[f32; 2]]) -> f32 {
-    if pts.len() < 2 { return 1.0; }
+    if pts.len() < 2 {
+        return 1.0;
+    }
     let mut best = f32::MAX;
     let n = pts.len();
     for i in 0..n {
         let a = pts[i];
         let b = pts[(i + 1) % n];
         let d = point_to_segment_dist(u, v, a, b);
-        if d < best { best = d; }
+        if d < best {
+            best = d;
+        }
     }
     best
 }
@@ -368,29 +414,81 @@ impl Effect {
 
     /// Convenience constructors for the most-used presets. Used by the
     /// inspector "+ Effect" menu so the user gets sane starting values.
-    pub fn blur() -> Self { Self::new(EffectKind::Blur { radius: 6.0 }) }
-    pub fn sharpen() -> Self { Self::new(EffectKind::Sharpen { amount: 0.6 }) }
-    pub fn grayscale() -> Self { Self::new(EffectKind::Grayscale) }
-    pub fn sepia() -> Self { Self::new(EffectKind::Sepia) }
-    pub fn invert() -> Self { Self::new(EffectKind::Invert) }
-    pub fn hue_shift() -> Self { Self::new(EffectKind::HueShift { degrees: 60.0 }) }
-    pub fn vignette() -> Self { Self::new(EffectKind::Vignette { strength: 0.6 }) }
-    pub fn pixelate() -> Self { Self::new(EffectKind::Pixelate { block_size: 12.0 }) }
-    pub fn posterize() -> Self { Self::new(EffectKind::Posterize { levels: 6 }) }
-    pub fn glow() -> Self { Self::new(EffectKind::Glow { radius: 12.0, intensity: 0.6 }) }
-    pub fn brightness() -> Self { Self::new(EffectKind::Brightness { amount: 0.2 }) }
-    pub fn contrast() -> Self { Self::new(EffectKind::Contrast { amount: 0.3 }) }
-    pub fn saturation() -> Self { Self::new(EffectKind::Saturation { amount: 0.4 }) }
-    pub fn edge_detect() -> Self { Self::new(EffectKind::EdgeDetect { threshold: 0.2 }) }
-    pub fn mirror_h() -> Self { Self::new(EffectKind::MirrorH) }
-    pub fn mirror_v() -> Self { Self::new(EffectKind::MirrorV) }
-    pub fn chromatic_aberration() -> Self { Self::new(EffectKind::ChromaticAberration { offset: 4.0 }) }
-    pub fn noise() -> Self { Self::new(EffectKind::Noise { amount: 0.15 }) }
-    pub fn wave() -> Self { Self::new(EffectKind::Wave { amplitude: 6.0, wavelength: 60.0 }) }
-    pub fn old_film() -> Self { Self::new(EffectKind::OldFilm) }
-    pub fn vhs() -> Self { Self::new(EffectKind::Vhs) }
-    pub fn glitch() -> Self { Self::new(EffectKind::Glitch { strength: 0.5 }) }
-    pub fn bloom() -> Self { Self::new(EffectKind::Bloom { radius: 18.0 }) }
+    pub fn blur() -> Self {
+        Self::new(EffectKind::Blur { radius: 6.0 })
+    }
+    pub fn sharpen() -> Self {
+        Self::new(EffectKind::Sharpen { amount: 0.6 })
+    }
+    pub fn grayscale() -> Self {
+        Self::new(EffectKind::Grayscale)
+    }
+    pub fn sepia() -> Self {
+        Self::new(EffectKind::Sepia)
+    }
+    pub fn invert() -> Self {
+        Self::new(EffectKind::Invert)
+    }
+    pub fn hue_shift() -> Self {
+        Self::new(EffectKind::HueShift { degrees: 60.0 })
+    }
+    pub fn vignette() -> Self {
+        Self::new(EffectKind::Vignette { strength: 0.6 })
+    }
+    pub fn pixelate() -> Self {
+        Self::new(EffectKind::Pixelate { block_size: 12.0 })
+    }
+    pub fn posterize() -> Self {
+        Self::new(EffectKind::Posterize { levels: 6 })
+    }
+    pub fn glow() -> Self {
+        Self::new(EffectKind::Glow {
+            radius: 12.0,
+            intensity: 0.6,
+        })
+    }
+    pub fn brightness() -> Self {
+        Self::new(EffectKind::Brightness { amount: 0.2 })
+    }
+    pub fn contrast() -> Self {
+        Self::new(EffectKind::Contrast { amount: 0.3 })
+    }
+    pub fn saturation() -> Self {
+        Self::new(EffectKind::Saturation { amount: 0.4 })
+    }
+    pub fn edge_detect() -> Self {
+        Self::new(EffectKind::EdgeDetect { threshold: 0.2 })
+    }
+    pub fn mirror_h() -> Self {
+        Self::new(EffectKind::MirrorH)
+    }
+    pub fn mirror_v() -> Self {
+        Self::new(EffectKind::MirrorV)
+    }
+    pub fn chromatic_aberration() -> Self {
+        Self::new(EffectKind::ChromaticAberration { offset: 4.0 })
+    }
+    pub fn noise() -> Self {
+        Self::new(EffectKind::Noise { amount: 0.15 })
+    }
+    pub fn wave() -> Self {
+        Self::new(EffectKind::Wave {
+            amplitude: 6.0,
+            wavelength: 60.0,
+        })
+    }
+    pub fn old_film() -> Self {
+        Self::new(EffectKind::OldFilm)
+    }
+    pub fn vhs() -> Self {
+        Self::new(EffectKind::Vhs)
+    }
+    pub fn glitch() -> Self {
+        Self::new(EffectKind::Glitch { strength: 0.5 })
+    }
+    pub fn bloom() -> Self {
+        Self::new(EffectKind::Bloom { radius: 18.0 })
+    }
     pub fn crop() -> Self {
         Self::new(EffectKind::Crop {
             left: 0.0,
@@ -419,9 +517,7 @@ impl Effect {
     pub fn mask_freehand() -> Self {
         // Default to a tiny diamond-ish shape so the effect renders
         // *something* immediately even before the user paints.
-        let pts = vec![
-            [0.5, 0.15], [0.85, 0.5], [0.5, 0.85], [0.15, 0.5],
-        ];
+        let pts = vec![[0.5, 0.15], [0.85, 0.5], [0.5, 0.85], [0.15, 0.5]];
         Self::new(EffectKind::Mask {
             shape: MaskShape::Polygon { points: pts },
             feather: 0.0,
@@ -460,7 +556,9 @@ impl Effect {
         if !self.animated_params.contains(key) {
             return fallback;
         }
-        let Some(kfs) = self.param_kfs.get(key) else { return fallback; };
+        let Some(kfs) = self.param_kfs.get(key) else {
+            return fallback;
+        };
         if kfs.is_empty() {
             return fallback;
         }
@@ -493,10 +591,7 @@ impl Effect {
                 block_size: self.sample_param_at(t_local, "p0", *block_size),
             },
             K::Posterize { levels } => K::Posterize {
-                levels: (self
-                    .sample_param_at(t_local, "p0", *levels as f32)
-                    as u32)
-                    .max(2),
+                levels: (self.sample_param_at(t_local, "p0", *levels as f32) as u32).max(2),
             },
             K::Glow { radius, intensity } => K::Glow {
                 radius: self.sample_param_at(t_local, "p0", *radius),
@@ -520,7 +615,10 @@ impl Effect {
             K::Noise { amount } => K::Noise {
                 amount: self.sample_param_at(t_local, "p0", *amount),
             },
-            K::Wave { amplitude, wavelength } => K::Wave {
+            K::Wave {
+                amplitude,
+                wavelength,
+            } => K::Wave {
                 amplitude: self.sample_param_at(t_local, "p0", *amplitude),
                 wavelength: self.sample_param_at(t_local, "p1", *wavelength),
             },
@@ -530,11 +628,18 @@ impl Effect {
             K::Bloom { radius } => K::Bloom {
                 radius: self.sample_param_at(t_local, "p0", *radius),
             },
-            K::Crop { left, top, right, bottom } => K::Crop {
+            K::Crop {
+                left,
+                top,
+                right,
+                bottom,
+            } => K::Crop {
                 left: self.sample_param_at(t_local, "p0", *left).clamp(0.0, 0.49),
                 top: self.sample_param_at(t_local, "p1", *top).clamp(0.0, 0.49),
                 right: self.sample_param_at(t_local, "p2", *right).clamp(0.0, 0.49),
-                bottom: self.sample_param_at(t_local, "p3", *bottom).clamp(0.0, 0.49),
+                bottom: self
+                    .sample_param_at(t_local, "p3", *bottom)
+                    .clamp(0.0, 0.49),
             },
             // Mask shape geometry has historically not been animated
             // (the geometry was never sampled from `param_kfs`), but
@@ -543,13 +648,30 @@ impl Effect {
             // ("rect_left" / "ellipse_cx" / …). Polygon stays static
             // — keyframing a `Vec<[f32;2]>` of varying length needs a
             // typed kf track, which is a future extension.
-            K::Mask { shape, feather, invert } => {
+            K::Mask {
+                shape,
+                feather,
+                invert,
+            } => {
                 let new_shape = match shape {
-                    MaskShape::Rect { left, top, right, bottom } => MaskShape::Rect {
-                        left:   self.sample_param_at(t_local, "rect_left",   *left).clamp(0.0, 1.0),
-                        top:    self.sample_param_at(t_local, "rect_top",    *top).clamp(0.0, 1.0),
-                        right:  self.sample_param_at(t_local, "rect_right",  *right).clamp(0.0, 1.0),
-                        bottom: self.sample_param_at(t_local, "rect_bottom", *bottom).clamp(0.0, 1.0),
+                    MaskShape::Rect {
+                        left,
+                        top,
+                        right,
+                        bottom,
+                    } => MaskShape::Rect {
+                        left: self
+                            .sample_param_at(t_local, "rect_left", *left)
+                            .clamp(0.0, 1.0),
+                        top: self
+                            .sample_param_at(t_local, "rect_top", *top)
+                            .clamp(0.0, 1.0),
+                        right: self
+                            .sample_param_at(t_local, "rect_right", *right)
+                            .clamp(0.0, 1.0),
+                        bottom: self
+                            .sample_param_at(t_local, "rect_bottom", *bottom)
+                            .clamp(0.0, 1.0),
                     },
                     MaskShape::Ellipse { cx, cy, rx, ry } => MaskShape::Ellipse {
                         cx: self.sample_param_at(t_local, "ellipse_cx", *cx),
@@ -563,20 +685,31 @@ impl Effect {
                 };
                 K::Mask {
                     shape: new_shape,
-                    feather: self.sample_param_at(t_local, "p0", *feather).clamp(0.0, 0.5),
+                    feather: self
+                        .sample_param_at(t_local, "p0", *feather)
+                        .clamp(0.0, 0.5),
                     invert: *invert,
                 }
             }
-            K::ColorKey { color, similarity, blend, spill, invert } => K::ColorKey {
+            K::ColorKey {
+                color,
+                similarity,
+                blend,
+                spill,
+                invert,
+            } => K::ColorKey {
                 color: *color,
-                similarity: self.sample_param_at(t_local, "p0", *similarity).clamp(0.0, 1.0),
+                similarity: self
+                    .sample_param_at(t_local, "p0", *similarity)
+                    .clamp(0.0, 1.0),
                 blend: self.sample_param_at(t_local, "p1", *blend).clamp(0.0, 1.0),
                 spill: self.sample_param_at(t_local, "p2", *spill).clamp(0.0, 1.0),
                 invert: *invert,
             },
             // Kinds without numeric parameters pass through unchanged.
-            K::Grayscale | K::Sepia | K::Invert | K::MirrorH | K::MirrorV
-                | K::OldFilm | K::Vhs => self.kind.clone(),
+            K::Grayscale | K::Sepia | K::Invert | K::MirrorH | K::MirrorV | K::OldFilm | K::Vhs => {
+                self.kind.clone()
+            }
         };
         out
     }

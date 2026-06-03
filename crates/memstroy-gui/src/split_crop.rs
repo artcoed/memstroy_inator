@@ -31,12 +31,7 @@ pub fn actor_source_window_cap(
 /// manual trims untouched.
 pub fn reconcile_actor_t_out_for_source(actor: &mut Actor, source_duration: f32) {
     let t_in = actor.t_in.unwrap_or(0.0);
-    let cap = actor_source_window_cap(
-        t_in,
-        actor.source_start,
-        actor.speed,
-        source_duration,
-    );
+    let cap = actor_source_window_cap(t_in, actor.source_start, actor.speed, source_duration);
     let Some(cur) = actor.t_out else {
         actor.t_out = Some(cap);
         return;
@@ -137,7 +132,11 @@ pub fn duplicate_canvas_layout_for_split(
         }
     }
     scene.canvas_layouts.push(right_cl);
-    if let Some(left) = scene.canvas_layouts.iter_mut().find(|cl| cl.element_id == from_id) {
+    if let Some(left) = scene
+        .canvas_layouts
+        .iter_mut()
+        .find(|cl| cl.element_id == from_id)
+    {
         left.keyframes.retain(|kf| kf.t <= cut_t + EPS);
     }
 }
@@ -180,12 +179,7 @@ fn crop_modifiers_local(modifiers: &mut Vec<TrackModifier>, local_cut: f32, righ
     }
 }
 
-pub fn crop_actor_timeline(
-    actor: &mut Actor,
-    cut_t: f32,
-    original_t_in: f32,
-    right_half: bool,
-) {
+pub fn crop_actor_timeline(actor: &mut Actor, cut_t: f32, original_t_in: f32, right_half: bool) {
     // Actor `layout` is sampled at scene time, so its split partitions
     // keyframes by absolute `kf.t` with no rebase.
     if right_half {
@@ -275,7 +269,7 @@ pub fn crop_overlay_timeline(
         Overlay::Video(v) => {
             if right_half {
                 v.t_in = cut_t;
-                v.source_start = v.source_start + local_cut;
+                v.source_start = v.source_start + local_cut * v.speed.max(0.0001);
             } else {
                 v.t_out = cut_t;
             }
@@ -310,9 +304,13 @@ pub fn finish_actor_split(
 
     // Snapshot layout at the cut point BEFORE we crop, so a half that
     // ends up with zero keyframes can still inherit the transform.
-    let left_layout_sample = scene.actors.get(left_idx)
+    let left_layout_sample = scene
+        .actors
+        .get(left_idx)
         .and_then(|a| keyframe::sample(&a.layout, cut_left));
-    let right_layout_sample = scene.actors.get(right_idx)
+    let right_layout_sample = scene
+        .actors
+        .get(right_idx)
         .and_then(|a| keyframe::sample(&a.layout, cut_right));
 
     if let Some(a) = scene.actors.get_mut(left_idx) {
@@ -404,10 +402,7 @@ pub fn finish_overlay_split(
             Overlay::Video(v) => &mut v.layout,
         };
         if layout.is_empty() {
-            layout.push(Keyframe::new(
-                0.0,
-                left_layout_sample.unwrap_or_default(),
-            ));
+            layout.push(Keyframe::new(0.0, left_layout_sample.unwrap_or_default()));
         }
     }
     if let Some(ov) = scene.overlays.get_mut(right_idx) {
@@ -417,10 +412,7 @@ pub fn finish_overlay_split(
             Overlay::Video(v) => &mut v.layout,
         };
         if layout.is_empty() {
-            layout.push(Keyframe::new(
-                0.0,
-                right_layout_sample.unwrap_or_default(),
-            ));
+            layout.push(Keyframe::new(0.0, right_layout_sample.unwrap_or_default()));
         }
     }
 
@@ -432,8 +424,8 @@ pub fn finish_overlay_split(
 mod tests {
     use super::*;
     use memstroy_core::{
-        keyframe::TrackModifier,
-        ActorState, ImageOverlay, Overlay, OverlayState, Transition, VideoOverlay,
+        keyframe::TrackModifier, ActorState, ImageOverlay, Overlay, OverlayState, Transition,
+        VideoOverlay,
     };
     use serde_json::json;
 
@@ -581,10 +573,7 @@ mod tests {
 
         crop_actor_timeline(&mut a, 5.0, 0.0, false);
 
-        assert_kf_times(
-            a.effects[0].param_kfs.get("amount").unwrap(),
-            &[0.0, 3.0],
-        );
+        assert_kf_times(a.effects[0].param_kfs.get("amount").unwrap(), &[0.0, 3.0]);
         assert_kf_times(
             a.color_correction.kfs.get("brightness").unwrap(),
             &[0.0, 4.0],
@@ -613,15 +602,9 @@ mod tests {
         crop_actor_timeline(&mut a, 5.0, 0.0, true);
 
         // {5, 8} survive (3 dropped), rebased to {0, 3}.
-        assert_kf_times(
-            a.effects[0].param_kfs.get("amount").unwrap(),
-            &[0.0, 3.0],
-        );
+        assert_kf_times(a.effects[0].param_kfs.get("amount").unwrap(), &[0.0, 3.0]);
         // CC: {8} survives, rebased to {3}.
-        assert_kf_times(
-            a.color_correction.kfs.get("brightness").unwrap(),
-            &[3.0],
-        );
+        assert_kf_times(a.color_correction.kfs.get("brightness").unwrap(), &[3.0]);
         // Layout is scene-time so no rebase: keep {8}.
         assert_eq!(a.layout.len(), 1);
         assert!(approx(a.layout[0].t, 8.0));
@@ -657,7 +640,10 @@ mod tests {
         let mut left = a.clone();
         crop_actor_timeline(&mut left, 5.0, 2.0, false);
         // local_cut = 3 → keep {0, 3}.
-        assert_kf_times(left.effects[0].param_kfs.get("amount").unwrap(), &[0.0, 3.0]);
+        assert_kf_times(
+            left.effects[0].param_kfs.get("amount").unwrap(),
+            &[0.0, 3.0],
+        );
 
         let mut right = a;
         crop_actor_timeline(&mut right, 5.0, 2.0, true);
@@ -714,7 +700,8 @@ mod tests {
                 Keyframe::new(8.0, OverlayState::default()),
             ];
             let mut eff = memstroy_core::Effect::default();
-            eff.param_kfs.insert("op".to_string(), kfs_f32(&[0.0, 4.0, 8.0]));
+            eff.param_kfs
+                .insert("op".to_string(), kfs_f32(&[0.0, 4.0, 8.0]));
             im.effects.push(eff);
         }
 
@@ -727,10 +714,7 @@ mod tests {
                 assert_eq!(im.layout.len(), 2);
                 assert!(approx(im.layout[0].t, 0.0));
                 assert!(approx(im.layout[1].t, 4.0));
-                assert_kf_times(
-                    im.effects[0].param_kfs.get("op").unwrap(),
-                    &[0.0, 4.0],
-                );
+                assert_kf_times(im.effects[0].param_kfs.get("op").unwrap(), &[0.0, 4.0]);
             }
             _ => panic!("expected Image overlay"),
         }
@@ -746,7 +730,8 @@ mod tests {
                 Keyframe::new(8.0, OverlayState::default()),
             ];
             let mut eff = memstroy_core::Effect::default();
-            eff.param_kfs.insert("op".to_string(), kfs_f32(&[0.0, 4.0, 8.0]));
+            eff.param_kfs
+                .insert("op".to_string(), kfs_f32(&[0.0, 4.0, 8.0]));
             im.effects.push(eff);
         }
 
@@ -760,10 +745,7 @@ mod tests {
                 assert_eq!(im.layout.len(), 1);
                 assert!(approx(im.layout[0].t, 3.0));
                 // Effect param: same logic.
-                assert_kf_times(
-                    im.effects[0].param_kfs.get("op").unwrap(),
-                    &[3.0],
-                );
+                assert_kf_times(im.effects[0].param_kfs.get("op").unwrap(), &[3.0]);
             }
             _ => panic!("expected Image overlay"),
         }
@@ -776,7 +758,8 @@ mod tests {
         let mut ov = mk_video_overlay(4.0, 14.0, 10.0);
         if let Overlay::Video(v) = &mut ov {
             let mut eff = memstroy_core::Effect::default();
-            eff.param_kfs.insert("amount".to_string(), kfs_f32(&[0.0, 5.0, 9.0]));
+            eff.param_kfs
+                .insert("amount".to_string(), kfs_f32(&[0.0, 5.0, 9.0]));
             v.effects.push(eff);
         }
 
@@ -793,9 +776,27 @@ mod tests {
                 );
                 // Effect kfs: {9} survives (5 dropped, 0 dropped),
                 // rebased to {3}.
-                assert_kf_times(
-                    v.effects[0].param_kfs.get("amount").unwrap(),
-                    &[3.0],
+                assert_kf_times(v.effects[0].param_kfs.get("amount").unwrap(), &[3.0]);
+            }
+            _ => panic!("expected Video overlay"),
+        }
+    }
+
+    #[test]
+    fn crop_overlay_timeline_video_split_scales_source_start_by_speed() {
+        let mut ov = mk_video_overlay(4.0, 14.0, 10.0);
+        if let Overlay::Video(v) = &mut ov {
+            v.speed = 2.0;
+        }
+
+        crop_overlay_timeline(&mut ov, 10.0, 4.0, true);
+
+        match ov {
+            Overlay::Video(v) => {
+                assert!(
+                    approx(v.source_start, 22.0),
+                    "source_start should advance by local_cut * speed (6 * 2), got {}",
+                    v.source_start,
                 );
             }
             _ => panic!("expected Video overlay"),

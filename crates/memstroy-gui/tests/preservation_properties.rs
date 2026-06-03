@@ -34,46 +34,44 @@ fn test_preservation_local_only_clips_continue_to_appear() {
     let tmp = TempDir::new().expect("Failed to create temp directory");
     let clips_dir = tmp.path().join("clips");
     let thumbs_dir = clips_dir.join("thumbs");
-    
+
     std::fs::create_dir_all(&clips_dir).expect("Failed to create clips directory");
     std::fs::create_dir_all(&thumbs_dir).expect("Failed to create thumbs directory");
-    
+
     // Create 3 local clips with different configurations
     let test_clips = vec![
-        ("local_clip_1", "Description for local clip 1", true),  // Downloaded
-        ("local_clip_2", "Description for local clip 2", true),  // Downloaded
+        ("local_clip_1", "Description for local clip 1", true), // Downloaded
+        ("local_clip_2", "Description for local clip 2", true), // Downloaded
         ("local_clip_3", "Description for local clip 3", false), // Metadata only
     ];
-    
+
     for (clip_id, description, has_mp4) in &test_clips {
         // Create .txt file with description
         let txt_path = clips_dir.join(format!("{}.txt", clip_id));
-        std::fs::write(&txt_path, description)
-            .expect("Failed to write txt file");
-        
+        std::fs::write(&txt_path, description).expect("Failed to write txt file");
+
         // Create thumbnail
         let thumb_path = thumbs_dir.join(format!("{}.jpg", clip_id));
         std::fs::write(&thumb_path, b"fake thumbnail bytes")
             .expect("Failed to write thumbnail file");
-        
+
         // Optionally create .mp4 file (for downloaded clips)
         if *has_mp4 {
             let mp4_path = clips_dir.join(format!("{}.mp4", clip_id));
-            std::fs::write(&mp4_path, b"fake mp4 bytes")
-                .expect("Failed to write mp4 file");
+            std::fs::write(&mp4_path, b"fake mp4 bytes").expect("Failed to write mp4 file");
         }
     }
-    
+
     // ── Observation: Verify metadata files exist ──
     // On UNFIXED code, reload_library() scans the local filesystem and loads
     // clips based on metadata presence (.txt or thumbnail files).
     // This test verifies that the local scanning mechanism works correctly.
-    
+
     for (clip_id, description, has_mp4) in &test_clips {
         let txt_path = clips_dir.join(format!("{}.txt", clip_id));
         let thumb_path = thumbs_dir.join(format!("{}.jpg", clip_id));
         let mp4_path = clips_dir.join(format!("{}.mp4", clip_id));
-        
+
         // Verify metadata files exist
         assert!(
             txt_path.exists(),
@@ -85,24 +83,24 @@ fn test_preservation_local_only_clips_continue_to_appear() {
             "Thumbnail should exist for local clip {}",
             clip_id
         );
-        
+
         // Verify description content
-        let desc_content = std::fs::read_to_string(&txt_path)
-            .expect("Failed to read description");
+        let desc_content = std::fs::read_to_string(&txt_path).expect("Failed to read description");
         assert_eq!(
             desc_content, *description,
             "Description content should match for clip {}",
             clip_id
         );
-        
+
         // Verify mp4 file existence matches expectation
         assert_eq!(
-            mp4_path.exists(), *has_mp4,
+            mp4_path.exists(),
+            *has_mp4,
             "MP4 file existence should match for clip {}",
             clip_id
         );
     }
-    
+
     // ── Property: Local clips SHALL appear in library with same behavior as before ──
     // This property asserts that for all clips where NOT isBugCondition(clip)
     // (i.e., local clips with metadata files), they SHALL appear in the library
@@ -145,7 +143,7 @@ fn test_preservation_manual_refresh_workflow_unchanged() {
     // The fix for the bug (automatic server metadata fetch on app launch) should
     // NOT modify the manual refresh code path. This test verifies that the manual
     // refresh workflow remains unchanged.
-    
+
     // ── Property: Manual refresh SHALL continue to call spawn_refresh() without changes ──
     // Since we can't call spawn_refresh() directly without the full app context,
     // we document the expected behavior:
@@ -158,48 +156,46 @@ fn test_preservation_manual_refresh_workflow_unchanged() {
     // This property asserts that the manual refresh workflow is preserved.
     // The fix should only add automatic server metadata fetch to reload_library(),
     // not modify the manual refresh code path.
-    
+
     // For this test, we verify that the manual refresh workflow is independent
     // by checking that it's a separate function in a separate file.
     // This is a structural property that ensures the fix won't accidentally
     // modify the manual refresh behavior.
-    
+
     // Verify that spawn_refresh exists in jobs.rs (structural check)
     let jobs_rs_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("src")
         .join("jobs.rs");
-    
+
     assert!(
         jobs_rs_path.exists(),
         "jobs.rs should exist (contains spawn_refresh function)"
     );
-    
-    let jobs_content = std::fs::read_to_string(&jobs_rs_path)
-        .expect("Failed to read jobs.rs");
-    
+
+    let jobs_content = std::fs::read_to_string(&jobs_rs_path).expect("Failed to read jobs.rs");
+
     assert!(
         jobs_content.contains("spawn_refresh"),
         "jobs.rs should contain spawn_refresh function"
     );
-    
+
     // Verify that reload_library exists in state.rs (structural check)
     let state_rs_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("src")
         .join("state.rs");
-    
+
     assert!(
         state_rs_path.exists(),
         "state.rs should exist (contains reload_library function)"
     );
-    
-    let state_content = std::fs::read_to_string(&state_rs_path)
-        .expect("Failed to read state.rs");
-    
+
+    let state_content = std::fs::read_to_string(&state_rs_path).expect("Failed to read state.rs");
+
     assert!(
         state_content.contains("reload_library"),
         "state.rs should contain reload_library function"
     );
-    
+
     // ── Property Assertion ──
     // The manual refresh workflow (spawn_refresh in jobs.rs) is structurally
     // separate from the library reload workflow (reload_library in state.rs).
@@ -237,7 +233,7 @@ fn test_preservation_lazy_download_workflow_unchanged() {
     // The fix for the bug (automatic server metadata fetch on app launch) should
     // NOT modify the lazy download code path. This test verifies that the lazy
     // download workflow remains unchanged.
-    
+
     // ── Property: Lazy download SHALL continue to work for server-only clips ──
     // Since we can't call spawn_clip_download() directly without the full app context,
     // we document the expected behavior:
@@ -251,28 +247,27 @@ fn test_preservation_lazy_download_workflow_unchanged() {
     // This property asserts that the lazy download workflow is preserved.
     // The fix should only add automatic server metadata fetch to reload_library(),
     // not modify the lazy download code path.
-    
+
     // For this test, we verify that the lazy download workflow is independent
     // by checking that it's a separate function in jobs.rs.
-    
+
     // Verify that spawn_clip_download exists in jobs.rs (structural check)
     let jobs_rs_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("src")
         .join("jobs.rs");
-    
+
     assert!(
         jobs_rs_path.exists(),
         "jobs.rs should exist (contains spawn_lazy_download function)"
     );
-    
-    let jobs_content = std::fs::read_to_string(&jobs_rs_path)
-        .expect("Failed to read jobs.rs");
-    
+
+    let jobs_content = std::fs::read_to_string(&jobs_rs_path).expect("Failed to read jobs.rs");
+
     assert!(
         jobs_content.contains("spawn_clip_download") || jobs_content.contains("lazy") || jobs_content.contains("ClipDownloaded"),
         "jobs.rs should contain lazy download functionality (spawn_clip_download or ClipDownloaded event)"
     );
-    
+
     // ── Property Assertion ──
     // The lazy download workflow (spawn_clip_download in jobs.rs) is structurally
     // separate from the library reload workflow (reload_library in state.rs).
@@ -303,70 +298,89 @@ fn test_preservation_local_cache_priority() {
     let tmp = TempDir::new().expect("Failed to create temp directory");
     let clips_dir = tmp.path().join("clips");
     let thumbs_dir = clips_dir.join("thumbs");
-    
+
     std::fs::create_dir_all(&clips_dir).expect("Failed to create clips directory");
     std::fs::create_dir_all(&thumbs_dir).expect("Failed to create thumbs directory");
-    
+
     // Create clips with different cache states
     let test_scenarios = vec![
         // (clip_id, has_txt, has_thumb, has_mp4, description)
         ("cached_clip_1", true, true, true, "Fully cached clip"),
-        ("cached_clip_2", true, true, false, "Metadata cached, video not downloaded"),
-        ("cached_clip_3", true, false, true, "Has txt and mp4, no thumbnail"),
-        ("cached_clip_4", false, true, true, "Has thumbnail and mp4, no txt"),
+        (
+            "cached_clip_2",
+            true,
+            true,
+            false,
+            "Metadata cached, video not downloaded",
+        ),
+        (
+            "cached_clip_3",
+            true,
+            false,
+            true,
+            "Has txt and mp4, no thumbnail",
+        ),
+        (
+            "cached_clip_4",
+            false,
+            true,
+            true,
+            "Has thumbnail and mp4, no txt",
+        ),
     ];
-    
+
     for (clip_id, has_txt, has_thumb, has_mp4, description) in &test_scenarios {
         // Create .txt file if specified
         if *has_txt {
             let txt_path = clips_dir.join(format!("{}.txt", clip_id));
-            std::fs::write(&txt_path, description)
-                .expect("Failed to write txt file");
+            std::fs::write(&txt_path, description).expect("Failed to write txt file");
         }
-        
+
         // Create thumbnail if specified
         if *has_thumb {
             let thumb_path = thumbs_dir.join(format!("{}.jpg", clip_id));
             std::fs::write(&thumb_path, b"fake thumbnail bytes")
                 .expect("Failed to write thumbnail file");
         }
-        
+
         // Create .mp4 file if specified
         if *has_mp4 {
             let mp4_path = clips_dir.join(format!("{}.mp4", clip_id));
-            std::fs::write(&mp4_path, b"fake mp4 bytes")
-                .expect("Failed to write mp4 file");
+            std::fs::write(&mp4_path, b"fake mp4 bytes").expect("Failed to write mp4 file");
         }
     }
-    
+
     // ── Observation: Verify local cache files exist ──
     // On UNFIXED code, reload_library() only scans the local filesystem.
     // It loads clips based on metadata presence (.txt or thumbnail files).
     // When local metadata exists, no server request is made.
-    
+
     for (clip_id, has_txt, has_thumb, has_mp4, _description) in &test_scenarios {
         let txt_path = clips_dir.join(format!("{}.txt", clip_id));
         let thumb_path = thumbs_dir.join(format!("{}.jpg", clip_id));
         let mp4_path = clips_dir.join(format!("{}.mp4", clip_id));
-        
+
         // Verify file existence matches expectations
         assert_eq!(
-            txt_path.exists(), *has_txt,
+            txt_path.exists(),
+            *has_txt,
             "TXT file existence should match for clip {}",
             clip_id
         );
         assert_eq!(
-            thumb_path.exists(), *has_thumb,
+            thumb_path.exists(),
+            *has_thumb,
             "Thumbnail existence should match for clip {}",
             clip_id
         );
         assert_eq!(
-            mp4_path.exists(), *has_mp4,
+            mp4_path.exists(),
+            *has_mp4,
             "MP4 file existence should match for clip {}",
             clip_id
         );
     }
-    
+
     // ── Property: For clips with local cache, SHALL use local files and NOT fetch from server ──
     // This property asserts that when local metadata files exist, reload_library()
     // should use them directly without making server requests.
@@ -403,88 +417,167 @@ fn test_preservation_multiple_local_clip_configurations() {
     let tmp = TempDir::new().expect("Failed to create temp directory");
     let clips_dir = tmp.path().join("clips");
     let thumbs_dir = clips_dir.join("thumbs");
-    
+
     std::fs::create_dir_all(&clips_dir).expect("Failed to create clips directory");
     std::fs::create_dir_all(&thumbs_dir).expect("Failed to create thumbs directory");
-    
+
     // Generate test cases with different configurations
     // This simulates property-based testing by testing many scenarios
     let test_cases = vec![
         // Format: (clip_id, has_txt, has_jpg_thumb, has_png_thumb, has_mp4, description)
-        ("clip_001", true, true, false, true, "Clip with txt, jpg thumb, and mp4"),
-        ("clip_002", true, false, true, true, "Clip with txt, png thumb, and mp4"),
-        ("clip_003", true, true, false, false, "Clip with txt and jpg thumb, no mp4"),
-        ("clip_004", true, false, true, false, "Clip with txt and png thumb, no mp4"),
-        ("clip_005", false, true, false, true, "Clip with jpg thumb and mp4, no txt"),
-        ("clip_006", false, false, true, true, "Clip with png thumb and mp4, no txt"),
-        ("clip_007", true, false, false, true, "Clip with txt and mp4, no thumb"),
-        ("clip_008", true, true, true, true, "Clip with txt, both thumbs, and mp4"),
+        (
+            "clip_001",
+            true,
+            true,
+            false,
+            true,
+            "Clip with txt, jpg thumb, and mp4",
+        ),
+        (
+            "clip_002",
+            true,
+            false,
+            true,
+            true,
+            "Clip with txt, png thumb, and mp4",
+        ),
+        (
+            "clip_003",
+            true,
+            true,
+            false,
+            false,
+            "Clip with txt and jpg thumb, no mp4",
+        ),
+        (
+            "clip_004",
+            true,
+            false,
+            true,
+            false,
+            "Clip with txt and png thumb, no mp4",
+        ),
+        (
+            "clip_005",
+            false,
+            true,
+            false,
+            true,
+            "Clip with jpg thumb and mp4, no txt",
+        ),
+        (
+            "clip_006",
+            false,
+            false,
+            true,
+            true,
+            "Clip with png thumb and mp4, no txt",
+        ),
+        (
+            "clip_007",
+            true,
+            false,
+            false,
+            true,
+            "Clip with txt and mp4, no thumb",
+        ),
+        (
+            "clip_008",
+            true,
+            true,
+            true,
+            true,
+            "Clip with txt, both thumbs, and mp4",
+        ),
         ("clip_009", true, false, false, false, "Clip with only txt"),
-        ("clip_010", false, true, false, false, "Clip with only jpg thumb"),
-        ("clip_011", false, false, true, false, "Clip with only png thumb"),
-        ("clip_012", false, false, false, true, "Clip with only mp4 (legacy)"),
+        (
+            "clip_010",
+            false,
+            true,
+            false,
+            false,
+            "Clip with only jpg thumb",
+        ),
+        (
+            "clip_011",
+            false,
+            false,
+            true,
+            false,
+            "Clip with only png thumb",
+        ),
+        (
+            "clip_012",
+            false,
+            false,
+            false,
+            true,
+            "Clip with only mp4 (legacy)",
+        ),
     ];
-    
+
     for (clip_id, has_txt, has_jpg_thumb, has_png_thumb, has_mp4, description) in &test_cases {
         // Create .txt file if specified
         if *has_txt {
             let txt_path = clips_dir.join(format!("{}.txt", clip_id));
-            std::fs::write(&txt_path, description)
-                .expect("Failed to write txt file");
+            std::fs::write(&txt_path, description).expect("Failed to write txt file");
         }
-        
+
         // Create jpg thumbnail if specified
         if *has_jpg_thumb {
             let thumb_path = thumbs_dir.join(format!("{}.jpg", clip_id));
             std::fs::write(&thumb_path, b"fake jpg thumbnail bytes")
                 .expect("Failed to write jpg thumbnail file");
         }
-        
+
         // Create png thumbnail if specified
         if *has_png_thumb {
             let thumb_path = thumbs_dir.join(format!("{}.png", clip_id));
             std::fs::write(&thumb_path, b"fake png thumbnail bytes")
                 .expect("Failed to write png thumbnail file");
         }
-        
+
         // Create .mp4 file if specified
         if *has_mp4 {
             let mp4_path = clips_dir.join(format!("{}.mp4", clip_id));
-            std::fs::write(&mp4_path, b"fake mp4 bytes")
-                .expect("Failed to write mp4 file");
+            std::fs::write(&mp4_path, b"fake mp4 bytes").expect("Failed to write mp4 file");
         }
     }
-    
+
     // ── Observation: Verify all files were created correctly ──
     for (clip_id, has_txt, has_jpg_thumb, has_png_thumb, has_mp4, _description) in &test_cases {
         let txt_path = clips_dir.join(format!("{}.txt", clip_id));
         let jpg_thumb_path = thumbs_dir.join(format!("{}.jpg", clip_id));
         let png_thumb_path = thumbs_dir.join(format!("{}.png", clip_id));
         let mp4_path = clips_dir.join(format!("{}.mp4", clip_id));
-        
+
         // Verify file existence matches expectations
         assert_eq!(
-            txt_path.exists(), *has_txt,
+            txt_path.exists(),
+            *has_txt,
             "TXT file existence should match for clip {}",
             clip_id
         );
         assert_eq!(
-            jpg_thumb_path.exists(), *has_jpg_thumb,
+            jpg_thumb_path.exists(),
+            *has_jpg_thumb,
             "JPG thumbnail existence should match for clip {}",
             clip_id
         );
         assert_eq!(
-            png_thumb_path.exists(), *has_png_thumb,
+            png_thumb_path.exists(),
+            *has_png_thumb,
             "PNG thumbnail existence should match for clip {}",
             clip_id
         );
         assert_eq!(
-            mp4_path.exists(), *has_mp4,
+            mp4_path.exists(),
+            *has_mp4,
             "MP4 file existence should match for clip {}",
             clip_id
         );
     }
-    
+
     // ── Property: All local clip configurations SHALL be loaded correctly ──
     // This property asserts that reload_library() correctly handles all possible
     // combinations of local files:
@@ -522,31 +615,30 @@ fn test_preservation_filesystem_change_detection() {
     //
     // The fix for the bug (automatic server metadata fetch on app launch) should
     // NOT modify the filesystem change detection mechanism.
-    
+
     // ── Property: Filesystem change detection SHALL continue to pick up new local files ──
     // Since we can't call auto_rescan_local_library_if_due() directly without the
     // full app context, we verify the structural property:
-    
+
     // Verify that auto_rescan_local_library_if_due exists in state.rs
     let state_rs_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("src")
         .join("state.rs");
-    
+
     assert!(
         state_rs_path.exists(),
         "state.rs should exist (contains auto_rescan_local_library_if_due function)"
     );
-    
-    let state_content = std::fs::read_to_string(&state_rs_path)
-        .expect("Failed to read state.rs");
-    
+
+    let state_content = std::fs::read_to_string(&state_rs_path).expect("Failed to read state.rs");
+
     assert!(
-        state_content.contains("auto_rescan_local_library_if_due") 
-            || state_content.contains("rescan") 
+        state_content.contains("auto_rescan_local_library_if_due")
+            || state_content.contains("rescan")
             || state_content.contains("reload_library"),
         "state.rs should contain filesystem change detection or library reload functionality"
     );
-    
+
     // ── Property Assertion ──
     // The filesystem change detection mechanism is part of the library reload
     // workflow. The fix should preserve this mechanism so that new local files

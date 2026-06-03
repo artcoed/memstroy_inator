@@ -21,10 +21,9 @@
 //!   over `GET /api/assets`,
 //! * streams thumbnails and full asset bodies on demand so the editor
 //!   can keep its working set tiny,
-//! * accepts ingest requests (e.g. "scrape this Telegram channel and
-//!   add the new clips to my library") via `POST /api/ingest/tg`,
-//!   delegating to the `memstroy-tg` crate and re-indexing in the
-//!   background when the import is done.
+//! * accepts admin upload requests via `POST /api/admin/assets`,
+//!   persists the files and sidecar metadata under the configured
+//!   asset root, and refreshes the index immediately.
 //!
 //! There is no authentication. The server is meant to be reachable
 //! only from the developer's own LAN (or `localhost` next to the GUI).
@@ -39,7 +38,6 @@
 #![warn(rust_2018_idioms)]
 
 pub mod api;
-pub mod ingest;
 pub mod model;
 pub mod store;
 
@@ -63,11 +61,6 @@ pub fn router(store: AssetStore) -> axum::Router {
 /// not propagate them so the caller can decide whether to keep
 /// running.
 ///
-/// For memory-constrained environments (500MB RAM), the server is
-/// configured with:
-/// - Limited concurrent connections (10 max)
-/// - Request body size limit (10MB)
-/// - File streaming for large assets
 pub fn start(addr: SocketAddr, store: AssetStore) -> JoinHandle<()> {
     let app = router(store);
     tokio::spawn(async move {
@@ -82,7 +75,7 @@ pub fn start(addr: SocketAddr, store: AssetStore) -> JoinHandle<()> {
             .local_addr()
             .map(|a| a.to_string())
             .unwrap_or_else(|_| addr.to_string());
-        tracing::info!(addr = %local, "memstroy-assets-server listening (low-memory mode)");
+        tracing::info!(addr = %local, "memstroy-assets-server listening");
         if let Err(e) = axum::serve(listener, app).await {
             tracing::error!(error = %e, "assets server crashed");
         }

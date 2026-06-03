@@ -5,7 +5,9 @@ use std::sync::mpsc::Sender;
 
 use egui::{Color32, Pos2, Rect, RichText, Rounding, Sense, Stroke, Vec2};
 use image::{Rgba, RgbaImage};
-use memstroy_core::{CanvasLayout, CanvasTransform, Effect, EffectKind, Keyframe, MaskShape, Overlay, WorldPos};
+use memstroy_core::{
+    CanvasLayout, CanvasTransform, Effect, EffectKind, Keyframe, MaskShape, Overlay, WorldPos,
+};
 
 use crate::jobs::{
     spawn_ai_background_remove, spawn_web_image_download, spawn_web_image_search, JobEvent,
@@ -15,7 +17,7 @@ use crate::state::{CanvasMarquee, EditorState, LibraryAsset, LibraryTab, MaskToo
 use crate::web_image_search::WebImageHit;
 
 /// How many preview cards the carousel shows at once.
-pub const CAROUSEL_PAGE_SIZE: usize = 4;
+pub const CAROUSEL_PAGE_SIZE: usize = 8;
 
 /// Minimum world-pixel size for a committed selection frame.
 pub const MIN_FRAME_WORLD_PX: f32 = 8.0;
@@ -27,9 +29,7 @@ pub const RMB_MIN_TRAVEL_PX: f32 = 5.0;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum CanvasImageSearchMode {
     /// RMB drag — image is cover-fitted inside the rectangle.
-    SelectionFrame {
-        rect: ([f32; 2], [f32; 2]),
-    },
+    SelectionFrame { rect: ([f32; 2], [f32; 2]) },
     /// Single RMB click — search popup only, no selection frame.
     PopupOnly,
 }
@@ -173,7 +173,10 @@ pub fn inspector_web_image_tools(ui: &mut egui::Ui, state: &mut EditorState, ove
             arm_brush = true;
         }
         if ui
-            .add_enabled(!ai_busy, egui::Button::new(crate::i18n::t("Apply AI cutout")))
+            .add_enabled(
+                !ai_busy,
+                egui::Button::new(crate::i18n::t("Apply AI cutout")),
+            )
             .on_hover_text(crate::i18n::t(
                 "Remove background using AI (draw a brush selection first).",
             ))
@@ -226,6 +229,101 @@ impl CanvasImageSearchSession {
     }
 }
 
+fn compact_text(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+    let mut out = trimmed
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    out.push('…');
+    out
+}
+
+fn placed_overlay_world_aabb(
+    state: &EditorState,
+    overlay_idx: usize,
+    t: f32,
+) -> Option<([f32; 2], [f32; 2])> {
+    let Overlay::Image(img) = state.scene.overlays.get(overlay_idx)? else {
+        return None;
+    };
+    let (src_w, src_h) = image_dimensions(&img.source)?;
+    let sample_t = if t >= img.t_in && t <= img.t_out {
+        t - img.t_in
+    } else if t < img.t_in {
+        0.0
+    } else {
+        (img.t_out - img.t_in).max(0.0)
+    };
+    let ov_state =
+        memstroy_core::sample_overlay_layout(&img.layout, &img.animated_params, sample_t);
+    let mod_delta = if t >= img.t_in && t <= img.t_out {
+        memstroy_core::keyframe::evaluate_modifiers(&img.modifiers, sample_t)
+    } else {
+        memstroy_core::keyframe::ModifierDelta::default()
+    };
+
+    let center = if state.canvas_drag.preview_element_id.as_deref() == Some(img.id.as_str()) {
+        state
+            .canvas_drag
+            .preview_world_center
+            .map(|c| WorldPos { x: c[0], y: c[1] })
+    } else {
+        None
+    }
+    .or_else(|| {
+        state
+            .scene
+            .canvas_layouts
+            .iter()
+            .find(|cl| cl.element_id == img.id)
+            .and_then(|cl| memstroy_core::keyframe::sample(&cl.keyframes, t))
+            .map(|transform| transform.pos)
+    })
+    .unwrap_or_else(|| {
+        let [rw, rh] = state.scene.render_frame.resolution;
+        WorldPos {
+            x: ov_state.pos[0] * rw as f32,
+            y: ov_state.pos[1] * rh as f32,
+        }
+    });
+
+    let mut crop = (0.0_f32, 0.0_f32, 0.0_f32, 0.0_f32);
+    for effect in &img.effects {
+        if let EffectKind::Crop {
+            left,
+            top,
+            right,
+            bottom,
+        } = &effect.kind
+        {
+            crop = (
+                (*left).max(0.0),
+                (*top).max(0.0),
+                (*right).max(0.0),
+                (*bottom).max(0.0),
+            );
+        }
+    }
+    let crop_w = (1.0 - crop.0 - crop.2).max(0.02);
+    let crop_h = (1.0 - crop.1 - crop.3).max(0.02);
+    let width = src_w as f32 * ov_state.scale * ov_state.flip_x_anim.abs().max(0.02) * crop_w;
+    let height = src_h as f32
+        * ov_state.scale
+        * ov_state.scale_y
+        * ov_state.flip_y_anim.abs().max(0.02)
+        * crop_h;
+    let center_x = center.x + mod_delta.dx;
+    let center_y = center.y + mod_delta.dy;
+    Some((
+        [center_x - width * 0.5, center_y - height * 0.5],
+        [center_x + width * 0.5, center_y + height * 0.5],
+    ))
+}
+
 /// Paint the committed selection frame and the live RMB draft rectangle.
 pub fn draw_selection_frames(
     painter: &egui::Painter,
@@ -248,12 +346,24 @@ pub fn draw_selection_frames(
         );
     }
     if let Some(session) = &state.canvas_image_search {
-        if let Some(rect) = session.selection_rect() {
+        let live_rect = session
+            .placed_overlay
+            .and_then(|idx| placed_overlay_world_aabb(state, idx, state.playhead))
+            .or_else(|| session.selection_rect());
+        if let Some(rect) = live_rect {
             let marquee = CanvasMarquee {
                 start: rect.0,
                 end: rect.1,
             };
-            paint_world_rect_outline(painter, full_rect, state, viewport_size, &marquee, STROKE, 1.5);
+            paint_world_rect_outline(
+                painter,
+                full_rect,
+                state,
+                viewport_size,
+                &marquee,
+                STROKE,
+                1.5,
+            );
         }
         paint_placement_marker(
             painter,
@@ -288,11 +398,17 @@ fn paint_placement_marker(
     );
     painter.circle_stroke(center, R, Stroke::new(2.0, Color32::WHITE));
     painter.line_segment(
-        [Pos2::new(center.x - R - 4.0, center.y), Pos2::new(center.x + R + 4.0, center.y)],
+        [
+            Pos2::new(center.x - R - 4.0, center.y),
+            Pos2::new(center.x + R + 4.0, center.y),
+        ],
         Stroke::new(1.0, Color32::from_rgb(100, 180, 255)),
     );
     painter.line_segment(
-        [Pos2::new(center.x, center.y - R - 4.0), Pos2::new(center.x, center.y + R + 4.0)],
+        [
+            Pos2::new(center.x, center.y - R - 4.0),
+            Pos2::new(center.x, center.y + R + 4.0),
+        ],
         Stroke::new(1.0, Color32::from_rgb(100, 180, 255)),
     );
 }
@@ -424,9 +540,7 @@ pub fn on_overlays_removed(state: &mut EditorState, removed_indices: &[usize]) {
         }
     }
 
-    for sel in [
-        &mut state.selection,
-    ] {
+    for sel in [&mut state.selection] {
         if let Selection::Overlay(i) = sel {
             let shift = removed.iter().filter(|&&r| r < *i).count();
             if removed.contains(i) {
@@ -473,10 +587,6 @@ pub fn cancel_canvas_image_search(state: &mut EditorState) {
 /// Empty-canvas click while a web-image search session is active: hide the
 /// popup or end the session without deleting a placed image.
 pub fn on_canvas_empty_click(state: &mut EditorState) {
-    if canvas_search_ui_visible(state) {
-        hide_canvas_search_ui(state);
-        return;
-    }
     if state.canvas_image_search.is_some() {
         dismiss_session(state, false);
     }
@@ -503,20 +613,19 @@ pub fn show_canvas_search_ui(
         },
         viewport_size,
     );
-    let anchor_screen = Pos2::new(
-        full_rect.min.x + screen[0],
-        full_rect.min.y + screen[1],
-    );
+    let anchor_screen = Pos2::new(full_rect.min.x + screen[0], full_rect.min.y + screen[1]);
     let default_screen = [screen[0], screen[1]];
 
     let window_id = egui::Id::new("canvas_image_search_popup");
     let pointer_down = ctx.input(|i| i.pointer.primary_down());
-    let mut window = egui::Window::new(crate::i18n::t("Image search"))
+    let mut window = egui::Window::new(crate::i18n::t("Resource search"))
         .id(window_id)
         .collapsible(false)
-        .resizable(false)
+        .resizable(true)
         .title_bar(true)
-        .max_width(420.0);
+        .default_size(Vec2::new(460.0, 420.0))
+        .min_size(Vec2::new(320.0, 260.0))
+        .max_size(Vec2::new(920.0, 980.0));
 
     if let Some([x, y]) = state
         .canvas_image_search
@@ -532,15 +641,11 @@ pub fn show_canvas_search_ui(
     }
 
     if let Some(inner) = window.show(ctx, |ui| {
-        ui.set_max_width(420.0);
         draw_popup_body(ui, state, &tx, default_screen);
     }) {
         let top_left = inner.response.rect.left_top();
         if let Some(s) = state.canvas_image_search.as_mut() {
-            s.ui_screen_pos = Some([
-                top_left.x - full_rect.min.x,
-                top_left.y - full_rect.min.y,
-            ]);
+            s.ui_screen_pos = Some([top_left.x - full_rect.min.x, top_left.y - full_rect.min.y]);
         }
     }
 }
@@ -561,6 +666,7 @@ fn draw_popup_body(
     let mut carousel_next_local = false;
     let mut carousel_next_fetch = false;
     let mut download_idx = None::<usize>;
+    let mut carousel_page_size = CAROUSEL_PAGE_SIZE;
 
     {
         let session = match state.canvas_image_search.as_mut() {
@@ -575,9 +681,15 @@ fn draw_popup_body(
             .inner_margin(egui::Margin::same(8.0))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(crate::i18n::t("Search resources"))
+                            .size(11.0)
+                            .strong()
+                            .color(Color32::from_rgb(210, 220, 230)),
+                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
-                            .small_button("\u{2716}")
+                            .small_button("X")
                             .on_hover_text(crate::i18n::t("Delete frame and image"))
                             .clicked()
                         {
@@ -585,8 +697,13 @@ fn draw_popup_body(
                             placed_idx = session.placed_overlay;
                         }
                         if ui
-                            .button(crate::i18n::t("Apply"))
-                            .on_hover_text(crate::i18n::t("Close search and keep the frame"))
+                            .add_sized(
+                                [84.0, 24.0],
+                                egui::Button::new(
+                                    RichText::new(crate::i18n::t("Apply")).size(11.0),
+                                ),
+                            )
+                            .on_hover_text(crate::i18n::t("Close search and keep the image"))
                             .clicked()
                         {
                             apply_ui = true;
@@ -597,8 +714,8 @@ fn draw_popup_body(
                 ui.horizontal(|ui| {
                     let te = ui.add(
                         egui::TextEdit::singleline(&mut session.query)
-                            .hint_text(crate::i18n::t("Search images…"))
-                            .desired_width(220.0),
+                            .hint_text(crate::i18n::t("Search resources…"))
+                            .desired_width((ui.available_width() - 112.0).max(140.0)),
                     );
                     if session.focus_input {
                         te.request_focus();
@@ -607,7 +724,13 @@ fn draw_popup_body(
                     if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         kick_search_now = true;
                     }
-                    if ui.button("\u{1F50D}").clicked() {
+                    if ui
+                        .add_sized(
+                            [78.0, 24.0],
+                            egui::Button::new(RichText::new(crate::i18n::t("Search")).size(11.0)),
+                        )
+                        .clicked()
+                    {
                         kick_search_now = true;
                     }
                 });
@@ -694,15 +817,26 @@ fn draw_popup_body(
 
                 let start = session.carousel_start;
                 let total = session.results.len();
-                let can_prev = start >= CAROUSEL_PAGE_SIZE;
-                let end = (start + CAROUSEL_PAGE_SIZE).min(total);
+                let thumb = 72.0;
+                let controls_w = 64.0;
+                carousel_page_size = (((ui.available_width() - controls_w) / (thumb + 10.0))
+                    .floor()
+                    .max(2.0) as usize)
+                    .min(CAROUSEL_PAGE_SIZE);
+                let can_prev = start >= carousel_page_size;
+                let end = (start + carousel_page_size).min(total);
                 let has_next_local = end < total;
                 let has_next_remote = session.next_offset.is_some();
                 let need_fetch = !has_next_local && has_next_remote && !session.searching;
 
                 ui.horizontal(|ui| {
                     if ui
-                        .add_enabled(can_prev, egui::Button::new("\u{25C0}"))
+                        .add_enabled(
+                            can_prev,
+                            egui::Button::new(RichText::new("<").size(16.0))
+                                .min_size(Vec2::new(32.0, thumb)),
+                        )
+                        .on_hover_text(crate::i18n::t("Previous results"))
                         .clicked()
                     {
                         carousel_prev = true;
@@ -710,34 +844,56 @@ fn draw_popup_body(
 
                     for idx in start..end {
                         let hit = session.results.get(idx).cloned();
-                        let Some(hit) = hit else { continue; };
-                        let thumb = 72.0;
+                        let Some(hit) = hit else {
+                            continue;
+                        };
                         let size = Vec2::splat(thumb);
-                        let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
-                        ui.painter().rect_filled(
-                            rect,
-                            Rounding::same(4.0),
-                            Color32::from_rgb(18, 18, 14),
-                        );
-                        let img = egui::Image::from_uri(hit.thumbnail_url.clone())
-                            .fit_to_exact_size(size)
-                            .maintain_aspect_ratio(true)
-                            .rounding(Rounding::same(4.0));
-                        img.paint_at(ui, rect);
-                        if hit.downloading {
+                        ui.vertical(|ui| {
+                            let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
                             ui.painter().rect_filled(
                                 rect,
                                 Rounding::same(4.0),
-                                Color32::from_rgba_premultiplied(0, 0, 0, 140),
+                                Color32::from_rgb(18, 18, 14),
                             );
-                        }
-                        if resp.clicked() && !hit.downloading {
-                            download_idx = Some(idx);
-                        }
+                            let img = egui::Image::from_uri(hit.thumbnail_url.clone())
+                                .fit_to_exact_size(size)
+                                .maintain_aspect_ratio(true)
+                                .rounding(Rounding::same(4.0));
+                            img.paint_at(ui, rect);
+                            if hit.downloading {
+                                ui.painter().rect_filled(
+                                    rect,
+                                    Rounding::same(4.0),
+                                    Color32::from_rgba_premultiplied(0, 0, 0, 140),
+                                );
+                            }
+                            if resp.clicked() && !hit.downloading {
+                                download_idx = Some(idx);
+                            }
+                            let title = if hit.title.trim().is_empty() {
+                                crate::i18n::t("(untitled)").to_string()
+                            } else {
+                                compact_text(&hit.title, 34)
+                            };
+                            ui.add_sized(
+                                [thumb, 24.0],
+                                egui::Label::new(
+                                    RichText::new(title)
+                                        .size(9.0)
+                                        .color(Color32::from_rgb(210, 210, 200)),
+                                )
+                                .truncate(),
+                            );
+                        });
                     }
 
                     if ui
-                        .add_enabled(has_next_local || has_next_remote, egui::Button::new("\u{25B6}"))
+                        .add_enabled(
+                            has_next_local || has_next_remote,
+                            egui::Button::new(RichText::new(">").size(16.0))
+                                .min_size(Vec2::new(32.0, thumb)),
+                        )
+                        .on_hover_text(crate::i18n::t("Next results"))
                         .clicked()
                     {
                         if has_next_local {
@@ -760,7 +916,8 @@ fn draw_popup_body(
         return;
     }
     if apply_ui {
-        hide_canvas_search_ui(state);
+        state.canvas_image_search = None;
+        return;
     }
     if kick_search_now || re_search_transparent {
         kick_canvas_search(state, tx, false);
@@ -770,12 +927,12 @@ fn draw_popup_body(
     }
     if carousel_prev {
         if let Some(s) = state.canvas_image_search.as_mut() {
-            s.carousel_start = s.carousel_start.saturating_sub(CAROUSEL_PAGE_SIZE);
+            s.carousel_start = s.carousel_start.saturating_sub(carousel_page_size);
         }
     }
     if carousel_next_local {
         if let Some(s) = state.canvas_image_search.as_mut() {
-            s.carousel_start += CAROUSEL_PAGE_SIZE;
+            s.carousel_start += carousel_page_size;
         }
     }
     if strip_settings_changed {
@@ -804,6 +961,18 @@ fn draw_popup_body(
 }
 
 pub fn kick_canvas_search(state: &mut EditorState, tx: &Sender<JobEvent>, append: bool) {
+    let local_hits = if append {
+        Vec::new()
+    } else {
+        local_resource_hits(
+            state,
+            state
+                .canvas_image_search
+                .as_ref()
+                .map(|s| s.query.as_str())
+                .unwrap_or(""),
+        )
+    };
     let session = match state.canvas_image_search.as_mut() {
         Some(s) => s,
         None => return,
@@ -836,18 +1005,15 @@ pub fn kick_canvas_search(state: &mut EditorState, tx: &Sender<JobEvent>, append
     if !append {
         session.last_sent_query = q.clone();
         session.results.clear();
+        session.results.extend(local_hits);
         session.carousel_start = 0;
         session.next_offset = None;
         session.page_count = 0;
-        session.status = format!(
-            "{} \"{}\"…",
-            crate::i18n::t("\u{1F50D} Searching for"),
-            q
-        );
+        session.status = format!("{} \"{}\"…", crate::i18n::t("Searching for"), q);
     } else {
         session.status = format!(
             "{} {}…",
-            crate::i18n::t("\u{2B07} Loading page"),
+            crate::i18n::t("Loading page"),
             session.page_count + 1
         );
     }
@@ -864,6 +1030,40 @@ pub fn kick_canvas_search(state: &mut EditorState, tx: &Sender<JobEvent>, append
             transparent_only: transparent,
         },
     );
+}
+
+fn local_resource_hits(state: &EditorState, query: &str) -> Vec<WebImageHit> {
+    let q = query.trim().to_lowercase();
+    state
+        .library
+        .images
+        .iter()
+        .filter(|asset| {
+            q.is_empty()
+                || asset.id.to_lowercase().contains(&q)
+                || asset.label.to_lowercase().contains(&q)
+        })
+        .take(CAROUSEL_PAGE_SIZE)
+        .map(|asset| {
+            let thumb = asset
+                .thumbnail
+                .as_ref()
+                .unwrap_or(&asset.path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let uri = format!("file:///{}", thumb);
+            let mut hit = WebImageHit::new(
+                uri.clone(),
+                uri,
+                asset.label.clone(),
+                crate::i18n::t("local resource").to_string(),
+                0,
+                0,
+            );
+            hit.local_path = Some(asset.path.clone());
+            hit
+        })
+        .collect()
 }
 
 fn kick_canvas_download(state: &mut EditorState, tx: &Sender<JobEvent>, hit_idx: usize) {
@@ -884,6 +1084,27 @@ fn kick_canvas_download(state: &mut EditorState, tx: &Sender<JobEvent>, hit_idx:
 
     let hit = session.results[hit_idx].clone();
     state.library_tab = LibraryTab::Images;
+
+    if let Some(local) = hit.local_path.clone() {
+        session.results[hit_idx].downloading = false;
+        let asset = LibraryAsset {
+            id: local
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("local_resource")
+                .to_string(),
+            path: local.clone(),
+            label: hit.title.clone(),
+            thumbnail: Some(local),
+            downloaded: true,
+            server_id: None,
+            duration_secs: None,
+            width: None,
+            height: None,
+        };
+        ingest_canvas_download_result(state, &hit.image_url, &Ok(asset));
+        return;
+    }
 
     let Some(handle) = handle else {
         session.results[hit_idx].downloading = false;
@@ -929,23 +1150,27 @@ pub fn ingest_canvas_search_result(
                         da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
                     });
                 }
-                session.results = hits;
+                let mut local = session
+                    .results
+                    .iter()
+                    .filter(|h| h.local_path.is_some())
+                    .cloned()
+                    .collect::<Vec<_>>();
+                local.extend(hits);
+                session.results = local;
             } else {
                 session.results.extend(hits);
             }
             session.next_offset = next_offset.filter(|&o| o != page_offset);
             if !is_first {
                 session.page_count += 1;
-                session.carousel_start = session
-                    .results
-                    .len()
-                    .saturating_sub(CAROUSEL_PAGE_SIZE);
+                session.carousel_start = session.results.len().saturating_sub(CAROUSEL_PAGE_SIZE);
             }
             let n = session.results.len();
             session.status = if n == 0 {
-                crate::i18n::t("\u{1F50D} No results.").to_string()
+                crate::i18n::t("No results.").to_string()
             } else {
-                format!("{} {}.", crate::i18n::t("\u{2705} Got"), n)
+                format!("{} {}.", crate::i18n::t("Got"), n)
             };
         }
         Err(e) => {
@@ -953,7 +1178,7 @@ pub fn ingest_canvas_search_result(
                 session.results.clear();
             }
             session.next_offset = None;
-            session.status = format!("\u{274C} {}", e);
+            session.status = format!("Error: {}", e);
         }
     }
 }
@@ -995,7 +1220,10 @@ pub fn ingest_canvas_download_result(
     let Some(session_ref) = state.canvas_image_search.as_ref() else {
         return;
     };
-    let rect = session_ref.selection_rect();
+    let rect = session_ref
+        .placed_overlay
+        .and_then(|idx| placed_overlay_world_aabb(state, idx, state.playhead))
+        .or_else(|| session_ref.selection_rect());
     let popup_anchor = session_ref.ui_anchor_world;
     let popup_only = matches!(session_ref.mode, CanvasImageSearchMode::PopupOnly);
     let existing = session_ref.placed_overlay;
@@ -1003,12 +1231,13 @@ pub fn ingest_canvas_download_result(
     let strip_settings = CheckerboardStripSettings::from_session(session_ref);
 
     let mut asset = asset.clone();
+    if let Some(session) = state.canvas_image_search.as_mut() {
+        // Keep the raw downloaded file for every re-strip pass. Slider
+        // edits must reprocess the original image, not the last
+        // already-stripped output.
+        session.strip_source_path = Some(asset.path.clone());
+    }
     if strip_checker {
-        if let Some(session) = state.canvas_image_search.as_mut() {
-            // Always track the latest download's raw file — re-strip must
-            // not keep reusing the first image placed in this session.
-            session.strip_source_path = Some(asset.path.clone());
-        }
         match strip_fake_checkerboard(&asset.path, strip_settings) {
             Ok(out_path) => {
                 asset.path = out_path;
@@ -1053,13 +1282,21 @@ fn image_dimensions(path: &Path) -> Option<(u32, u32)> {
 }
 
 fn replace_overlay_image(state: &mut EditorState, idx: usize, asset: LibraryAsset) {
+    let old_path = state.scene.overlays.get(idx).and_then(|ov| match ov {
+        Overlay::Image(im) => Some(im.source.clone()),
+        _ => None,
+    });
     state.mutate_state(|s| {
         if let Some(Overlay::Image(im)) = s.scene.overlays.get_mut(idx) {
             im.source = asset.path.clone();
-            im.effects.retain(|e| !matches!(e.kind, EffectKind::Crop { .. }));
+            im.effects
+                .retain(|e| !matches!(e.kind, EffectKind::Crop { .. }));
         }
     });
     if let Ok(mut map) = state.image_textures.lock() {
+        if let Some(path) = old_path {
+            map.remove(&path);
+        }
         map.remove(&asset.path);
     }
 }
@@ -1103,7 +1340,8 @@ pub fn fit_overlay_to_selection_rect(
             kf.value.scale = scale;
             kf.value.scale_y = 1.0;
         }
-        im.effects.retain(|e| !matches!(e.kind, EffectKind::Crop { .. }));
+        im.effects
+            .retain(|e| !matches!(e.kind, EffectKind::Crop { .. }));
         im.effects.push(Effect::new(EffectKind::Crop {
             left: crop_l,
             top: crop_t,
@@ -1195,7 +1433,8 @@ pub fn place_overlay_at_world_point(
                 kf.value.scale = 1.0;
                 kf.value.scale_y = 1.0;
             }
-            im.effects.retain(|e| !matches!(e.kind, EffectKind::Crop { .. }));
+            im.effects
+                .retain(|e| !matches!(e.kind, EffectKind::Crop { .. }));
         }
     });
     state.selection = Selection::Overlay(overlay_idx);
@@ -1222,7 +1461,10 @@ pub(crate) fn sync_overlay_canvas_world_center(
 }
 
 /// Re-run checkerboard removal on an already placed web-search image.
-pub fn reapply_checkerboard_strip(state: &mut EditorState, overlay_idx: usize) -> Result<(), String> {
+pub fn reapply_checkerboard_strip(
+    state: &mut EditorState,
+    overlay_idx: usize,
+) -> Result<(), String> {
     let settings = state
         .canvas_image_search
         .as_ref()
@@ -1233,6 +1475,16 @@ pub fn reapply_checkerboard_strip(state: &mut EditorState, overlay_idx: usize) -
         .as_ref()
         .and_then(|s| s.strip_source_path.clone())
         .filter(|p| p.is_file())
+        .or_else(|| {
+            state
+                .scene
+                .overlays
+                .get(overlay_idx)
+                .and_then(|ov| match ov {
+                    Overlay::Image(im) if im.source.is_file() => Some(im.source.clone()),
+                    _ => None,
+                })
+        })
         .ok_or_else(|| crate::i18n::t("Image file not ready yet.").to_string())?;
 
     let out_path = strip_fake_checkerboard(&source, settings)?;
@@ -1249,17 +1501,34 @@ pub fn reapply_checkerboard_strip(state: &mut EditorState, overlay_idx: usize) -
             .unwrap_or("image")
             .to_string(),
         thumbnail: None,
+        downloaded: true,
+        server_id: None,
+        duration_secs: None,
+        width: None,
+        height: None,
     };
     replace_overlay_image(state, overlay_idx, asset);
-    if let Some(session) = state.canvas_image_search.as_ref() {
-        if let Some(rect) = session.selection_rect() {
-            if let Some(dims) = image_dimensions(&out_path) {
-                fit_overlay_to_selection_rect(state, overlay_idx, rect, dims);
-            }
-        } else if matches!(session.mode, CanvasImageSearchMode::PopupOnly) {
-            if let Some(dims) = image_dimensions(&out_path) {
-                place_overlay_at_world_point(state, overlay_idx, session.ui_anchor_world, dims);
-            }
+    let (live_rect, popup_only, popup_anchor) = state
+        .canvas_image_search
+        .as_ref()
+        .map(|session| {
+            (
+                session
+                    .placed_overlay
+                    .and_then(|idx| placed_overlay_world_aabb(state, idx, state.playhead))
+                    .or_else(|| session.selection_rect()),
+                matches!(session.mode, CanvasImageSearchMode::PopupOnly),
+                session.ui_anchor_world,
+            )
+        })
+        .unwrap_or((None, false, [0.0, 0.0]));
+    if let Some(rect) = live_rect {
+        if let Some(dims) = image_dimensions(&out_path) {
+            fit_overlay_to_selection_rect(state, overlay_idx, rect, dims);
+        }
+    } else if popup_only {
+        if let Some(dims) = image_dimensions(&out_path) {
+            place_overlay_at_world_point(state, overlay_idx, popup_anchor, dims);
         }
     }
     if let Some(s) = state.canvas_image_search.as_mut() {
@@ -1289,18 +1558,15 @@ fn kick_ai_background_remove(state: &mut EditorState, tx: &Sender<JobEvent>, ove
             return;
         }
     };
-    let mask_polygon = state
-        .scene
-        .overlays
-        .get(overlay_idx)
-        .and_then(|o| match o {
-            Overlay::Image(im) => extract_overlay_mask_polygon(im),
-            _ => None,
-        });
+    let mask_polygon = state.scene.overlays.get(overlay_idx).and_then(|o| match o {
+        Overlay::Image(im) => extract_overlay_mask_polygon(im),
+        _ => None,
+    });
     if mask_polygon.as_ref().map(|p| p.len()).unwrap_or(0) < 3 {
         set_status(
             state,
-            crate::i18n::t("Draw a brush selection around the subject first (Brush select).").into(),
+            crate::i18n::t("Draw a brush selection around the subject first (Brush select).")
+                .into(),
         );
         return;
     }
@@ -1320,14 +1586,7 @@ fn kick_ai_background_remove(state: &mut EditorState, tx: &Sender<JobEvent>, ove
         s.status = crate::i18n::t("Removing background…").into();
     }
     state.status = crate::i18n::t("Removing background…").into();
-    spawn_ai_background_remove(
-        &handle,
-        tx.clone(),
-        overlay_idx,
-        path,
-        model,
-        mask_polygon,
-    );
+    spawn_ai_background_remove(&handle, tx.clone(), overlay_idx, path, model, mask_polygon);
 }
 
 pub fn ingest_ai_bg_remove_result(
@@ -1338,7 +1597,7 @@ pub fn ingest_ai_bg_remove_result(
 ) {
     let status = match &result {
         Ok(()) => crate::i18n::t("Background removed.").into(),
-        Err(e) => format!("\u{274C} {}", e),
+        Err(e) => format!("Error: {}", e),
     };
     if let Some(session) = state.canvas_image_search.as_mut() {
         session.ai_removing = false;
@@ -1351,7 +1610,8 @@ pub fn ingest_ai_bg_remove_result(
         }
         state.mutate_state(|s| {
             if let Some(Overlay::Image(im)) = s.scene.overlays.get_mut(overlay_idx) {
-                im.effects.retain(|e| !matches!(e.kind, EffectKind::Mask { .. }));
+                im.effects
+                    .retain(|e| !matches!(e.kind, EffectKind::Mask { .. }));
             }
         });
     }
@@ -1407,18 +1667,16 @@ fn strip_checkerboard_in_place(rgba: &mut RgbaImage, settings: CheckerboardStrip
         return;
     }
     let (c1, c2) = detect_checker_colors(rgba);
-    let Some(c1) = c1 else { return; };
+    let Some(c1) = c1 else {
+        return;
+    };
 
     // Only remove checker colours connected to the image border — avoids
     // punching holes through light subject pixels in the interior.
     flood_checker_colors_from_edges(rgba, c1, c2, settings.color_tolerance);
 
     if settings.edge_flood {
-        flood_light_neutral_from_edges(
-            rgba,
-            settings.edge_brightness,
-            settings.neutral_tolerance,
-        );
+        flood_light_neutral_from_edges(rgba, settings.edge_brightness, settings.neutral_tolerance);
     }
 }
 
@@ -1493,33 +1751,56 @@ fn flood_checker_colors_from_edges(
 
 fn detect_checker_colors(rgba: &RgbaImage) -> (Option<[u8; 3]>, Option<[u8; 3]>) {
     let (w, h) = rgba.dimensions();
-    let strip = 12u32.min(w / 4).min(h / 4).max(2);
-    let mut samples: Vec<[u8; 3]> = Vec::new();
+    let strip = 18u32.min(w / 3).min(h / 3).max(2);
+    let mut bins: std::collections::HashMap<[u8; 3], u32> = std::collections::HashMap::new();
+    let mut add_sample = |p: image::Rgba<u8>| {
+        if p[3] <= 200 {
+            return;
+        }
+        let rgb = [p[0], p[1], p[2]];
+        let bright = (rgb[0] as u16 + rgb[1] as u16 + rgb[2] as u16) / 3;
+        let neutral = rgb[0].abs_diff(rgb[1]) <= 38 && rgb[1].abs_diff(rgb[2]) <= 38;
+        if bright < 135 || !neutral {
+            return;
+        }
+        let key = [rgb[0] & 0xF0, rgb[1] & 0xF0, rgb[2] & 0xF0];
+        *bins.entry(key).or_insert(0) += 1;
+    };
     for y in 0..strip {
         for x in 0..w {
-            let p = rgba.get_pixel(x, y);
-            if p[3] > 200 {
-                samples.push([p[0], p[1], p[2]]);
-            }
+            add_sample(*rgba.get_pixel(x, y));
         }
     }
     for y in h.saturating_sub(strip)..h {
         for x in 0..w {
-            let p = rgba.get_pixel(x, y);
-            if p[3] > 200 {
-                samples.push([p[0], p[1], p[2]]);
-            }
+            add_sample(*rgba.get_pixel(x, y));
         }
     }
-    if samples.len() < 8 {
+    for x in 0..strip {
+        for y in 0..h {
+            add_sample(*rgba.get_pixel(x, y));
+        }
+    }
+    for x in w.saturating_sub(strip)..w {
+        for y in 0..h {
+            add_sample(*rgba.get_pixel(x, y));
+        }
+    }
+    if bins.is_empty() {
         return (None, None);
     }
-    samples.sort_by_key(|c| c[0] as u16 + c[1] as u16 + c[2] as u16);
-    let mid = samples.len() / 2;
-    let c1 = samples[mid];
+    let mut ranked: Vec<([u8; 3], u32)> = bins.into_iter().collect();
+    ranked.sort_by(|a, b| {
+        b.1.cmp(&a.1).then_with(|| {
+            let ba = a.0[0] as u16 + a.0[1] as u16 + a.0[2] as u16;
+            let bb = b.0[0] as u16 + b.0[1] as u16 + b.0[2] as u16;
+            bb.cmp(&ba)
+        })
+    });
+    let c1 = ranked[0].0;
     let mut c2 = None;
-    for c in &samples {
-        if color_dist(*c, c1) > 18.0 {
+    for (c, count) in ranked.iter().skip(1) {
+        if *count >= 4 && color_dist(*c, c1) > 18.0 {
             c2 = Some(*c);
             break;
         }
@@ -1532,9 +1813,7 @@ fn detect_checker_colors(rgba: &RgbaImage) -> (Option<[u8; 3]>, Option<[u8; 3]>)
 }
 
 fn color_near(a: [u8; 3], b: [u8; 3], tol: u8) -> bool {
-    a[0].abs_diff(b[0]) <= tol
-        && a[1].abs_diff(b[1]) <= tol
-        && a[2].abs_diff(b[2]) <= tol
+    a[0].abs_diff(b[0]) <= tol && a[1].abs_diff(b[1]) <= tol && a[2].abs_diff(b[2]) <= tol
 }
 
 fn color_dist(a: [u8; 3], b: [u8; 3]) -> f32 {
@@ -1549,24 +1828,26 @@ fn flood_light_neutral_from_edges(rgba: &mut RgbaImage, min_brightness: u8, tol:
     let mut queue: std::collections::VecDeque<(u32, u32)> = std::collections::VecDeque::new();
     let mut visited = vec![false; (w * h) as usize];
 
-    let seed = |x: u32, y: u32, q: &mut std::collections::VecDeque<(u32, u32)>, vis: &mut [bool]| {
-        let i = (y * w + x) as usize;
-        if vis[i] {
-            return;
-        }
-        let p = rgba.get_pixel(x, y);
-        if p[3] < 8 {
-            return;
-        }
-        let bright = (p[0] as u16 + p[1] as u16 + p[2] as u16) / 3;
-        let neutral = p[0].abs_diff(p[1]) <= tol
-            && p[1].abs_diff(p[2]) <= tol
-            && bright >= min_brightness as u16;
-        if neutral || (p[0] > min_brightness && p[1] > min_brightness && p[2] > min_brightness) {
-            vis[i] = true;
-            q.push_back((x, y));
-        }
-    };
+    let seed =
+        |x: u32, y: u32, q: &mut std::collections::VecDeque<(u32, u32)>, vis: &mut [bool]| {
+            let i = (y * w + x) as usize;
+            if vis[i] {
+                return;
+            }
+            let p = rgba.get_pixel(x, y);
+            if p[3] < 8 {
+                return;
+            }
+            let bright = (p[0] as u16 + p[1] as u16 + p[2] as u16) / 3;
+            let neutral = p[0].abs_diff(p[1]) <= tol
+                && p[1].abs_diff(p[2]) <= tol
+                && bright >= min_brightness as u16;
+            if neutral || (p[0] > min_brightness && p[1] > min_brightness && p[2] > min_brightness)
+            {
+                vis[i] = true;
+                q.push_back((x, y));
+            }
+        };
 
     for x in 0..w {
         seed(x, 0, &mut queue, &mut visited);
@@ -1607,6 +1888,5 @@ fn flood_light_neutral_from_edges(rgba: &mut RgbaImage, min_brightness: u8, tol:
 
 /// True when RMB selection-frame gesture is active (blocks canvas pan).
 pub fn rmb_gesture_active(state: &EditorState) -> bool {
-    state.canvas_image_search_draft.is_some()
-        || state.canvas_image_search_rmb_pending.is_some()
+    state.canvas_image_search_draft.is_some() || state.canvas_image_search_rmb_pending.is_some()
 }

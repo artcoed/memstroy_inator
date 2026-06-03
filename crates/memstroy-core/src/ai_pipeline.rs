@@ -257,17 +257,23 @@ impl MontageOutput {
                 chroma_key: if cp.chroma_key {
                     crate::ChromaKeyParams::default()
                 } else {
-                    crate::ChromaKeyParams { similarity: 0.0, ..Default::default() }
+                    crate::ChromaKeyParams {
+                        similarity: 0.0,
+                        ..Default::default()
+                    }
                 },
-                layout: vec![crate::Keyframe::new(0.0, crate::ActorState {
-                    pos: cp.position,
-                    scale: cp.scale,
-                    scale_y: 1.0,
-                    rotation_deg: 0.0,
-                    opacity: 1.0,
-                    flip_x_anim: 1.0,
-                    flip_y_anim: 1.0,
-                })],
+                layout: vec![crate::Keyframe::new(
+                    0.0,
+                    crate::ActorState {
+                        pos: cp.position,
+                        scale: cp.scale,
+                        scale_y: 1.0,
+                        rotation_deg: 0.0,
+                        opacity: 1.0,
+                        flip_x_anim: 1.0,
+                        flip_y_anim: 1.0,
+                    },
+                )],
                 t_in: Some(cp.timeline_start),
                 t_out: Some(cp.timeline_start + cp.duration),
                 source_start: cp.source_offset,
@@ -286,6 +292,7 @@ impl MontageOutput {
                 animated_params: Default::default(),
                 z_order: 0,
                 parent_id: None,
+                mellstroy_footage: Default::default(),
                 mute_audio: false,
             };
             scene.actors.push(actor);
@@ -295,17 +302,24 @@ impl MontageOutput {
         for anim in &self.animations {
             if anim.clip_index < scene.actors.len() {
                 let actor = &mut scene.actors[anim.clip_index];
-                actor.layout = anim.keyframes.iter().map(|kf| {
-                    crate::Keyframe::new(kf.t, crate::ActorState {
-                        pos: kf.position,
-                        scale: kf.scale,
-                        scale_y: 1.0,
-                        rotation_deg: kf.rotation_deg,
-                        opacity: kf.opacity,
-                        flip_x_anim: 1.0,
-                        flip_y_anim: 1.0,
+                actor.layout = anim
+                    .keyframes
+                    .iter()
+                    .map(|kf| {
+                        crate::Keyframe::new(
+                            kf.t,
+                            crate::ActorState {
+                                pos: kf.position,
+                                scale: kf.scale,
+                                scale_y: 1.0,
+                                rotation_deg: kf.rotation_deg,
+                                opacity: kf.opacity,
+                                flip_x_anim: 1.0,
+                                flip_y_anim: 1.0,
+                            },
+                        )
                     })
-                }).collect();
+                    .collect();
             }
         }
 
@@ -319,18 +333,25 @@ impl MontageOutput {
                 style: crate::TextStyle {
                     font_size: tp.font_size,
                     color: tp.color,
-                    box_color: if tp.box_background { Some([255, 255, 255]) } else { None },
+                    box_color: if tp.box_background {
+                        Some([255, 255, 255])
+                    } else {
+                        None
+                    },
                     ..Default::default()
                 },
-                layout: vec![crate::Keyframe::new(0.0, crate::OverlayState {
-                    pos: tp.position,
-                    scale: 1.0,
-                    scale_y: 1.0,
-                    rotation_deg: 0.0,
-                    opacity: 1.0,
-                    flip_x_anim: 1.0,
-                    flip_y_anim: 1.0,
-                })],
+                layout: vec![crate::Keyframe::new(
+                    0.0,
+                    crate::OverlayState {
+                        pos: tp.position,
+                        scale: 1.0,
+                        scale_y: 1.0,
+                        rotation_deg: 0.0,
+                        opacity: 1.0,
+                        flip_x_anim: 1.0,
+                        flip_y_anim: 1.0,
+                    },
+                )],
                 modifiers: Vec::new(),
                 skeleton_attachment: None,
                 z_index: 100,

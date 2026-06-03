@@ -113,8 +113,16 @@ impl UndoStack {
         Some(snap.scene)
     }
 
-    pub fn can_undo(&self) -> bool { !self.undo.is_empty() }
-    pub fn can_redo(&self) -> bool { !self.redo.is_empty() }
-    pub fn undo_count(&self) -> usize { self.undo.len() }
-    pub fn redo_count(&self) -> usize { self.redo.len() }
+    pub fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
+    }
+    pub fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
+    }
+    pub fn undo_count(&self) -> usize {
+        self.undo.len()
+    }
+    pub fn redo_count(&self) -> usize {
+        self.redo.len()
+    }
 }

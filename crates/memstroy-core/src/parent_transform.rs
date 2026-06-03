@@ -3,7 +3,9 @@
 
 use crate::canvas::WorldPos;
 use crate::keyframe::{self, TrackModifier};
-use crate::layout_sample::{sample_actor_layout, sample_overlay_layout, sample_render_frame_layout};
+use crate::layout_sample::{
+    sample_actor_layout, sample_overlay_layout, sample_render_frame_layout,
+};
 use crate::{Overlay, OverlayState, Scene};
 
 #[inline]
@@ -233,11 +235,7 @@ fn overlay_state_at_local(overlay: &Overlay, local_t: f32) -> OverlayState {
 }
 
 /// World-pixel centre of an element, including parent position inheritance.
-pub fn element_world_pos(
-    scene: &Scene,
-    element_id: &str,
-    scene_t: f32,
-) -> WorldPos {
+pub fn element_world_pos(scene: &Scene, element_id: &str, scene_t: f32) -> WorldPos {
     let [rw, rh] = scene.render_frame.resolution;
     let world_w = rw as f32;
     let world_h = rh as f32;
@@ -247,8 +245,7 @@ pub fn element_world_pos(
         .iter()
         .find(|cl| cl.element_id == element_id)
     {
-        keyframe::sample(&cl.keyframes, scene_t)
-            .map(|transform| transform.pos)
+        keyframe::sample(&cl.keyframes, scene_t).map(|transform| transform.pos)
     } else {
         None
     };

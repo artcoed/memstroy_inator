@@ -36,7 +36,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use image::{Rgba, RgbaImage};
 use tracing::info;
@@ -76,7 +76,9 @@ impl BackgroundRemover for StubBackgroundRemover {
             .to_rgba8();
         Ok(img)
     }
-    fn id(&self) -> &'static str { "stub" }
+    fn id(&self) -> &'static str {
+        "stub"
+    }
 }
 
 // ─── ONNX IMPLEMENTATION ────────────────────────────────────────────
@@ -143,11 +145,17 @@ impl BackgroundRemover for U2NetpBgRemover {
         })
         .await??;
 
-        info!(w = rgba.width(), h = rgba.height(), "background removal complete");
+        info!(
+            w = rgba.width(),
+            h = rgba.height(),
+            "background removal complete"
+        );
         Ok(rgba)
     }
 
-    fn id(&self) -> &'static str { "u2netp" }
+    fn id(&self) -> &'static str {
+        "u2netp"
+    }
 }
 
 /// Convenience: run `remover` on `input`, encode the resulting RGBA
@@ -181,8 +189,8 @@ fn run_u2netp(
     // Same session-builder dance as `pose.rs` — `with_optimization_level`
     // returns a `Result` whose error type carries the partially-built
     // builder via `.recover()` so we can never lose it.
-    let builder = ort::session::Session::builder()
-        .map_err(|e| anyhow!("ort session builder: {}", e))?;
+    let builder =
+        ort::session::Session::builder().map_err(|e| anyhow!("ort session builder: {}", e))?;
     let mut builder = builder
         .with_optimization_level(GraphOptimizationLevel::Level3)
         .unwrap_or_else(|e| e.recover());
@@ -200,18 +208,16 @@ fn run_u2netp(
         for x in 0..INPUT_SIZE {
             let src = (y * INPUT_SIZE + x) * 3;
             let pix = y * INPUT_SIZE + x;
-            input_data[pix]             = (resized[src    ] as f32 / 255.0 - MEAN[0]) / STD[0];
-            input_data[plane + pix]     = (resized[src + 1] as f32 / 255.0 - MEAN[1]) / STD[1];
+            input_data[pix] = (resized[src] as f32 / 255.0 - MEAN[0]) / STD[0];
+            input_data[plane + pix] = (resized[src + 1] as f32 / 255.0 - MEAN[1]) / STD[1];
             input_data[2 * plane + pix] = (resized[src + 2] as f32 / 255.0 - MEAN[2]) / STD[2];
         }
     }
 
     // 3. Run inference.
-    let input_tensor = ort::value::Tensor::from_array((
-        [1usize, 3, INPUT_SIZE, INPUT_SIZE],
-        input_data,
-    ))
-    .map_err(|e| anyhow!("create tensor: {}", e))?;
+    let input_tensor =
+        ort::value::Tensor::from_array(([1usize, 3, INPUT_SIZE, INPUT_SIZE], input_data))
+            .map_err(|e| anyhow!("create tensor: {}", e))?;
 
     let outputs = session
         .run(ort::inputs![input_tensor])
@@ -229,7 +235,9 @@ fn run_u2netp(
     if total < plane {
         return Err(anyhow!(
             "u2netp output has {} elements, expected at least {} (shape {:?})",
-            total, plane, shape
+            total,
+            plane,
+            shape
         ));
     }
     let mask_raw: Vec<f32> = data.iter().take(plane).copied().collect();
@@ -237,8 +245,12 @@ fn run_u2netp(
     // 5. Min-max normalize per the U²-Net paper post-processing recipe.
     let (mut mn, mut mx) = (f32::INFINITY, f32::NEG_INFINITY);
     for &v in &mask_raw {
-        if v < mn { mn = v; }
-        if v > mx { mx = v; }
+        if v < mn {
+            mn = v;
+        }
+        if v > mx {
+            mx = v;
+        }
     }
     let range = (mx - mn).max(1e-6);
     let mask_norm: Vec<f32> = mask_raw
@@ -247,13 +259,8 @@ fn run_u2netp(
         .collect();
 
     // 6. Resize mask back to the source resolution.
-    let mask_full = resize_mask_bilinear(
-        &mask_norm,
-        INPUT_SIZE,
-        INPUT_SIZE,
-        w as usize,
-        h as usize,
-    );
+    let mask_full =
+        resize_mask_bilinear(&mask_norm, INPUT_SIZE, INPUT_SIZE, w as usize, h as usize);
 
     // 7. Compose RGBA. We write into the raw buffer and build the
     //    `RgbaImage` once at the end — much faster than `put_pixel`.
@@ -308,9 +315,9 @@ fn resize_rgb_bilinear(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -
                 let p01 = src[(y1 * sw + x0) * 3 + c] as f32;
                 let p11 = src[(y1 * sw + x1) * 3 + c] as f32;
                 let v = p00 * (1.0 - wx) * (1.0 - wy)
-                      + p10 * wx * (1.0 - wy)
-                      + p01 * (1.0 - wx) * wy
-                      + p11 * wx * wy;
+                    + p10 * wx * (1.0 - wy)
+                    + p01 * (1.0 - wx) * wy
+                    + p11 * wx * wy;
                 dst[di + c] = v.round().clamp(0.0, 255.0) as u8;
             }
         }
@@ -343,9 +350,9 @@ fn resize_mask_bilinear(src: &[f32], sw: usize, sh: usize, dw: usize, dh: usize)
             let p01 = src[y1 * sw + x0];
             let p11 = src[y1 * sw + x1];
             dst[dy * dw + dx] = p00 * (1.0 - wx) * (1.0 - wy)
-                              + p10 * wx * (1.0 - wy)
-                              + p01 * (1.0 - wx) * wy
-                              + p11 * wx * wy;
+                + p10 * wx * (1.0 - wy)
+                + p01 * (1.0 - wx) * wy
+                + p11 * wx * wy;
         }
     }
     dst
@@ -361,14 +368,18 @@ mod tests {
     fn rgb_resize_preserves_constant_image() {
         let src = vec![17u8; 4 * 4 * 3];
         let out = resize_rgb_bilinear(&src, 4, 4, 8, 8);
-        for &b in &out { assert_eq!(b, 17); }
+        for &b in &out {
+            assert_eq!(b, 17);
+        }
     }
 
     #[test]
     fn mask_resize_preserves_constant_field() {
         let src = vec![0.42f32; 8 * 8];
         let out = resize_mask_bilinear(&src, 8, 8, 16, 16);
-        for v in out { assert!((v - 0.42).abs() < 1e-5); }
+        for v in out {
+            assert!((v - 0.42).abs() < 1e-5);
+        }
     }
 
     #[tokio::test]

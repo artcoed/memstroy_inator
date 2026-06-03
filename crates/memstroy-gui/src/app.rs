@@ -3,14 +3,14 @@
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
-use egui::{Color32, RichText, ViewportCommand, Rounding, Stroke, Vec2};
+use egui::{Color32, RichText, Rounding, Stroke, Vec2, ViewportCommand};
 use memstroy_core::Scene;
 use tokio::runtime::Runtime;
 
+use crate::audio_engine::AudioEngine;
 use crate::jobs::{spawn_refresh, spawn_render, JobEvent};
 use crate::panels;
 use crate::state::{EditorState, SceneExitAction, Selection};
-use crate::audio_engine::AudioEngine;
 
 pub struct App {
     rt: Option<Runtime>,
@@ -85,6 +85,104 @@ pub struct App {
     force_app_close: bool,
 }
 
+fn audio_actor_overlap(
+    scene: &Scene,
+    actor: &memstroy_core::Actor,
+    audio: &memstroy_core::AudioTrack,
+) -> f32 {
+    let actor_start = actor.t_in.unwrap_or(0.0);
+    let actor_end = actor.t_out.unwrap_or(scene.output.duration);
+    let audio_start = audio.t_in;
+    let audio_end = audio.t_out.unwrap_or(scene.output.duration);
+    (actor_end.min(audio_end) - actor_start.max(audio_start)).max(0.0)
+}
+
+fn audio_actor_gap(
+    scene: &Scene,
+    actor: &memstroy_core::Actor,
+    audio: &memstroy_core::AudioTrack,
+) -> f32 {
+    let actor_start = actor.t_in.unwrap_or(0.0);
+    let actor_end = actor.t_out.unwrap_or(scene.output.duration);
+    let audio_start = audio.t_in;
+    let audio_end = audio.t_out.unwrap_or(scene.output.duration);
+    if audio_end < actor_start {
+        actor_start - audio_end
+    } else if actor_end < audio_start {
+        audio_start - actor_end
+    } else {
+        0.0
+    }
+}
+
+fn audio_actor_score(
+    scene: &Scene,
+    actor: &memstroy_core::Actor,
+    audio: &memstroy_core::AudioTrack,
+) -> f32 {
+    let actor_start = actor.t_in.unwrap_or(0.0);
+    let source_penalty = if actor.source == audio.source {
+        0.0
+    } else {
+        10_000.0
+    };
+    let overlap_penalty = if audio_actor_overlap(scene, actor, audio) > 0.0 {
+        0.0
+    } else {
+        1_000.0 + audio_actor_gap(scene, actor, audio)
+    };
+    source_penalty
+        + overlap_penalty
+        + (actor_start - audio.t_in).abs()
+        + (actor.source_start - audio.source_start).abs() * 2.0
+}
+
+fn best_audio_actor_by_id(
+    scene: &Scene,
+    actor_id: &str,
+    audio: &memstroy_core::AudioTrack,
+) -> Option<usize> {
+    scene
+        .actors
+        .iter()
+        .enumerate()
+        .filter(|(_, actor)| actor.id == actor_id)
+        .min_by(|(_, a), (_, b)| {
+            audio_actor_score(scene, a, audio).total_cmp(&audio_actor_score(scene, b, audio))
+        })
+        .map(|(idx, _)| idx)
+}
+
+fn infer_actor_for_audio_in_scene(scene: &Scene, audio_idx: usize) -> Option<usize> {
+    let audio = scene.audio.get(audio_idx)?;
+    if audio.deleted {
+        return None;
+    }
+
+    if let Some(parent_id) = audio.parent_actor.as_deref() {
+        if let Some(idx) = best_audio_actor_by_id(scene, parent_id, audio) {
+            return Some(idx);
+        }
+    }
+
+    if let Some(actor_id) = audio.id.strip_suffix("_audio") {
+        if let Some(idx) = best_audio_actor_by_id(scene, actor_id, audio) {
+            return Some(idx);
+        }
+    }
+
+    scene
+        .actors
+        .iter()
+        .enumerate()
+        .filter(|(_, actor)| actor.source == audio.source)
+        .filter(|(_, actor)| audio_actor_overlap(scene, actor, audio) > 0.0)
+        .min_by(|(_, a), (_, b)| {
+            audio_actor_score(scene, a, audio).total_cmp(&audio_actor_score(scene, b, audio))
+        })
+        .map(|(idx, _)| idx)
+}
+
 impl App {
     pub fn new(rt: Runtime) -> Self {
         let (tx, rx) = channel();
@@ -96,6 +194,25 @@ impl App {
         // App keeps its own Sender for the existing job spawners.
         state.image_fx_tx = Some(tx.clone());
         state.reload_library();
+        {
+            let videos_dir = state.videos_dir();
+            let assets_root = state.assets_root.clone();
+            let tx_scan = tx.clone();
+            rt.spawn(async move {
+                let generated = crate::jobs::generate_video_library_thumbnails(&videos_dir).await;
+                if generated == 0 {
+                    return;
+                }
+                let snap = tokio::task::spawn_blocking(move || {
+                    EditorState::scan_library_snapshot(assets_root)
+                })
+                .await
+                .ok();
+                if let Some(snap) = snap {
+                    let _ = tx_scan.send(JobEvent::LibraryScanned(snap));
+                }
+            });
+        }
 
         // ── Auto-bootstrap the local memstroy-assets-server ──
         // The Library panel's "Refresh" / shared-asset endpoints expect
@@ -126,11 +243,9 @@ impl App {
         } else {
             #[cfg(feature = "local-server")]
             Self::spawn_local_assets_server(rt.handle(), &state);
-            
+
             #[cfg(not(feature = "local-server"))]
-            tracing::info!(
-                "local-server feature disabled: skipping in-process assets-server"
-            );
+            tracing::info!("local-server feature disabled: skipping in-process assets-server");
         }
 
         // Construct the audio engine and immediately apply the master
@@ -168,12 +283,17 @@ impl App {
         }
     }
 
-    /// If the active tab has edits, queue `action` and return false.
+    /// If the active tab has edits, queue destructive exit actions and
+    /// return false. Switching/opening scenes is intentionally immediate:
+    /// autosave keeps recovery coverage, and the workflow often jumps
+    /// between projects to copy/paste fragments.
     fn request_scene_exit(&mut self, action: SceneExitAction) -> bool {
         if self.pending_scene_exit.is_some() {
             return false;
         }
-        if self.state.active_tab_is_dirty() {
+        let prompt_for_unsaved =
+            matches!(action, SceneExitAction::Quit | SceneExitAction::CloseTab(_));
+        if prompt_for_unsaved && self.state.active_tab_is_dirty() {
             self.pending_scene_exit = Some(action);
             false
         } else {
@@ -218,16 +338,10 @@ impl App {
                 ));
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui
-                        .button(crate::i18n::t("Save"))
-                        .clicked()
-                    {
+                    if ui.button(crate::i18n::t("Save")).clicked() {
                         save_and_proceed = true;
                     }
-                    if ui
-                        .button(crate::i18n::t("Don't save"))
-                        .clicked()
-                    {
+                    if ui.button(crate::i18n::t("Don't save")).clicked() {
                         discard_and_proceed = true;
                     }
                     if ui.button(crate::i18n::t("Cancel")).clicked() {
@@ -271,10 +385,7 @@ impl App {
     /// builds (via `scripts/package-client.ps1`) disable this feature to
     /// avoid pulling in the heavy `memstroy-assets-server` dependency tree.
     #[cfg(feature = "local-server")]
-    fn spawn_local_assets_server(
-        handle: &tokio::runtime::Handle,
-        state: &EditorState,
-    ) {
+    fn spawn_local_assets_server(handle: &tokio::runtime::Handle, state: &EditorState) {
         // Parse `host:port` out of `state.server_url`. We accept either
         // `http://host:port` or just `host:port`.
         let raw = state.server_url.trim();
@@ -351,12 +462,9 @@ impl App {
                         // users who flip `MEMSTROY_RENDER_BACKEND=ffmpeg`.
                         if let Some(p) = parse_compositor_percent(&line) {
                             rp.progress = (p / 100.0).clamp(0.0, 1.0);
-                        } else if let Some((cur, total)) =
-                            parse_compositor_frame(&line)
-                        {
+                        } else if let Some((cur, total)) = parse_compositor_frame(&line) {
                             if total > 0 {
-                                rp.progress = (cur as f32 / total as f32)
-                                    .clamp(0.0, 1.0);
+                                rp.progress = (cur as f32 / total as f32).clamp(0.0, 1.0);
                             }
                         } else if let Some(time_progress) = parse_ffmpeg_time(&line) {
                             let total = self.state.scene.output.duration;
@@ -365,15 +473,30 @@ impl App {
                             }
                         } else if let Some(frame_num) = parse_ffmpeg_frame(&line) {
                             let total_frames = (self.state.scene.output.duration
-                                * self.state.scene.output.fps as f32) as u32;
+                                * self.state.scene.output.fps as f32)
+                                as u32;
                             if total_frames > 0 {
-                                rp.progress = (frame_num as f32 / total_frames as f32).clamp(0.0, 1.0);
+                                rp.progress =
+                                    (frame_num as f32 / total_frames as f32).clamp(0.0, 1.0);
                             }
                         }
                     }
                 }
+                JobEvent::RenderOutputChosen(Some(path)) => {
+                    self.start_render_to_path(path);
+                }
+                JobEvent::RenderOutputChosen(None) => {
+                    if self
+                        .state
+                        .status
+                        .contains(crate::i18n::t("Choosing export path"))
+                    {
+                        self.state.status.clear();
+                    }
+                }
                 JobEvent::RenderFinished(Ok(p)) => {
-                    self.state.status = format!("{} {}", crate::i18n::t("\u{2705} Rendered:"), p.display());
+                    self.state.status =
+                        format!("{} {}", crate::i18n::t("\u{2705} Rendered:"), p.display());
                     if let Some(rp) = self.state.render_progress.as_mut() {
                         rp.done = true;
                         rp.progress = 1.0;
@@ -389,7 +512,8 @@ impl App {
                     }
                 }
                 JobEvent::RenderFinished(Err(e)) => {
-                    self.state.status = format!("{} {}", crate::i18n::t("\u{274C} Render failed:"), e);
+                    self.state.status =
+                        format!("{} {}", crate::i18n::t("\u{274C} Render failed:"), e);
                     if let Some(rp) = self.state.render_progress.as_mut() {
                         rp.done = true;
                         rp.error = Some(e);
@@ -399,12 +523,12 @@ impl App {
                     }
                 }
                 JobEvent::RefreshProgress(msg) => {
-                    self.state.status = format!("\u{1F504} {}", msg);
+                    self.state.status = format!("↻ {}", msg);
                 }
                 JobEvent::RefreshLibraryReloaded(msg) => {
                     // Debounce rescans so metadata batches don't stall
                     // the UI thread on every single clip.
-                    self.state.status = format!("\u{1F504} {}", msg);
+                    self.state.status = format!("↻ {}", msg);
                     self.state.library_reload_pending = true;
                     self.library_reload_debounce_until =
                         Some(std::time::Instant::now() + std::time::Duration::from_millis(350));
@@ -416,9 +540,11 @@ impl App {
                         Some(std::time::Instant::now() + std::time::Duration::from_millis(350));
                     self.state.status = format!(
                         "{} {} {}, {} {}",
-                        crate::i18n::t("\u{1F389} Refresh done!"),
-                        summary.new_clips, crate::i18n::t("new clips,"),
-                        summary.total_clips, crate::i18n::t("total in library"),
+                        crate::i18n::t("Refresh done!"),
+                        summary.new_clips,
+                        crate::i18n::t("new clips,"),
+                        summary.total_clips,
+                        crate::i18n::t("total in library"),
                     );
                     if summary.failed > 0 {
                         self.state.status.push_str(&format!(
@@ -430,78 +556,78 @@ impl App {
                 }
                 JobEvent::RefreshFinished(Err(e)) => {
                     self.state.refreshing = false;
-                    self.state.status = format!("{} {}", crate::i18n::t("\u{274C} Refresh failed:"), e);
+                    self.state.status =
+                        format!("{} {}", crate::i18n::t("\u{274C} Refresh failed:"), e);
                 }
                 JobEvent::WebSearchFinished {
                     page_offset,
                     target,
                     result,
-                } => {
-                    match target {
-                        crate::jobs::WebSearchTarget::Panel => {
-                            self.state.web_image_search.searching = false;
-                            match result {
-                                Ok((mut hits, next_offset)) => {
-                                    let n = hits.len();
-                                    let is_first_page = page_offset == 0;
+                } => match target {
+                    crate::jobs::WebSearchTarget::Panel => {
+                        self.state.web_image_search.searching = false;
+                        match result {
+                            Ok((mut hits, next_offset)) => {
+                                let n = hits.len();
+                                let is_first_page = page_offset == 0;
+                                if is_first_page {
+                                    self.state.web_image_search.results = hits;
+                                } else {
+                                    let cap = crate::web_image_search::MAX_TOTAL_RESULTS;
+                                    let cur = self.state.web_image_search.results.len();
+                                    if cur < cap {
+                                        let take = (cap - cur).min(hits.len());
+                                        if take < hits.len() {
+                                            hits.truncate(take);
+                                        }
+                                        self.state.web_image_search.results.extend(hits);
+                                    }
+                                }
+                                self.state.web_image_search.next_offset =
+                                    next_offset.filter(|&o| o != page_offset);
+                                if !is_first_page {
+                                    self.state.web_image_search.page_count += 1;
+                                }
+                                self.state.web_image_search.status = if n == 0 {
                                     if is_first_page {
-                                        self.state.web_image_search.results = hits;
+                                        crate::i18n::t("No results.").to_string()
                                     } else {
-                                        let cap = crate::web_image_search::MAX_TOTAL_RESULTS;
-                                        let cur = self.state.web_image_search.results.len();
-                                        if cur < cap {
-                                            let take = (cap - cur).min(hits.len());
-                                            if take < hits.len() {
-                                                hits.truncate(take);
-                                            }
-                                            self.state
-                                                .web_image_search
-                                                .results
-                                                .extend(hits);
-                                        }
+                                        crate::i18n::t("(no more results)").to_string()
                                     }
-                                    self.state.web_image_search.next_offset = next_offset
-                                        .filter(|&o| o != page_offset);
-                                    if !is_first_page {
-                                        self.state.web_image_search.page_count += 1;
-                                    }
-                                    self.state.web_image_search.status = if n == 0 {
-                                        if is_first_page {
-                                            crate::i18n::t("\u{1F50D} No results.").to_string()
-                                        } else {
-                                            crate::i18n::t("(no more results)").to_string()
-                                        }
-                                    } else if is_first_page {
-                                        format!("{} {} {}.", crate::i18n::t("\u{2705} Got"), n, crate::i18n::t("result(s)"))
-                                    } else {
-                                        format!(
-                                            "{} +{} ({} {})",
-                                            crate::i18n::t("\u{2795}"),
-                                            n,
-                                            crate::i18n::t("total"),
-                                            self.state.web_image_search.results.len()
-                                        )
-                                    };
+                                } else if is_first_page {
+                                    format!(
+                                        "{} {} {}.",
+                                        crate::i18n::t("Got"),
+                                        n,
+                                        crate::i18n::t("result(s)")
+                                    )
+                                } else {
+                                    format!(
+                                        "{} +{} ({} {})",
+                                        "+",
+                                        n,
+                                        crate::i18n::t("total"),
+                                        self.state.web_image_search.results.len()
+                                    )
+                                };
+                            }
+                            Err(e) => {
+                                if page_offset == 0 {
+                                    self.state.web_image_search.results.clear();
                                 }
-                                Err(e) => {
-                                    if page_offset == 0 {
-                                        self.state.web_image_search.results.clear();
-                                    }
-                                    self.state.web_image_search.next_offset = None;
-                                    self.state.web_image_search.status =
-                                        format!("\u{274C} {}", e);
-                                }
+                                self.state.web_image_search.next_offset = None;
+                                self.state.web_image_search.status = format!("Error: {}", e);
                             }
                         }
-                        crate::jobs::WebSearchTarget::Canvas => {
-                            crate::canvas_image_search::ingest_canvas_search_result(
-                                &mut self.state,
-                                page_offset,
-                                result,
-                            );
-                        }
                     }
-                }
+                    crate::jobs::WebSearchTarget::Canvas => {
+                        crate::canvas_image_search::ingest_canvas_search_result(
+                            &mut self.state,
+                            page_offset,
+                            result,
+                        );
+                    }
+                },
                 JobEvent::WebImageDownloaded {
                     request_id: _,
                     image_url,
@@ -536,6 +662,11 @@ impl App {
                                     path: asset.path.clone(),
                                     label: asset.label.clone(),
                                     thumbnail: asset.thumbnail.clone(),
+                                    downloaded: true,
+                                    server_id: None,
+                                    duration_secs: None,
+                                    width: None,
+                                    height: None,
                                 };
                                 if !self
                                     .state
@@ -576,42 +707,62 @@ impl App {
                                 path: asset.path.clone(),
                                 label: asset.label.clone(),
                                 thumbnail: asset.thumbnail.clone(),
+                                downloaded: true,
+                                server_id: None,
+                                duration_secs: None,
+                                width: None,
+                                height: None,
                             };
                             // Only add if not already present (avoid dupes
                             // if the auto-rescan raced us).
-                            if !self.state.library.images.iter().any(|a| a.path == new_lib_asset.path) {
+                            if !self
+                                .state
+                                .library
+                                .images
+                                .iter()
+                                .any(|a| a.path == new_lib_asset.path)
+                            {
                                 self.state.library.images.push(new_lib_asset);
                                 self.state.library.images.sort_by(|a, b| {
-                                    a.label.to_ascii_lowercase().cmp(&b.label.to_ascii_lowercase())
+                                    a.label
+                                        .to_ascii_lowercase()
+                                        .cmp(&b.label.to_ascii_lowercase())
                                 });
                             }
                             // Bump the fingerprint so the periodic rescan
                             // doesn't immediately trigger a full rebuild.
                             self.state.library_dir_fingerprint =
                                 self.state.compute_library_dir_fingerprint();
-                            self.state.last_library_rescan =
-                                Some(std::time::Instant::now());
+                            self.state.last_library_rescan = Some(std::time::Instant::now());
 
-                            self.state.web_image_search.status = format!(
-                                "{} \u{2192} {}",
-                                crate::i18n::t("\u{2705} Saved"),
-                                asset.label,
-                            );
+                            if self.state.asset_drag.pending_web_image_url.as_deref()
+                                == Some(image_url.as_str())
+                            {
+                                self.state.asset_drag.dragging = Some(asset.path.clone());
+                                self.state.asset_drag.pending_web_image_url = None;
+                                self.state.asset_drag.kind = crate::state::AssetDragKind::Image;
+                                self.state.asset_drag.label = asset.label.clone();
+                                self.state.asset_drag.thumbnail =
+                                    asset.thumbnail.clone().or_else(|| Some(asset.path.clone()));
+                                self.state.asset_drag.server_id = None;
+                                self.state.asset_drag.downloaded = true;
+                                self.state.asset_drag.duration_secs = None;
+                                self.state.asset_drag.width = None;
+                                self.state.asset_drag.height = None;
+                            }
+
+                            self.state.web_image_search.status =
+                                format!("{} -> {}", crate::i18n::t("Saved"), asset.label);
                             if place_on_canvas {
-                                let _idx =
-                                    self.state.add_image_overlay_at_playhead(&asset);
-                                self.state.library_tab =
-                                    crate::state::LibraryTab::Images;
-                                self.state.status = format!(
-                                    "{} \u{2192} {}",
-                                    crate::i18n::t("\u{1F310} Web image"),
-                                    asset.label,
-                                );
+                                let _idx = self.state.add_image_overlay_at_playhead(&asset);
+                                self.state.library_tab = crate::state::LibraryTab::Images;
+                                self.state.status =
+                                    format!("{} -> {}", crate::i18n::t("Web image"), asset.label,);
                             }
                         }
                         Err(e) => {
                             self.state.web_image_search.status =
-                                format!("{} {}", crate::i18n::t("\u{274C} Download failed:"), e);
+                                format!("{} {}", crate::i18n::t("Download failed:"), e);
                         }
                     }
                 }
@@ -630,8 +781,43 @@ impl App {
                 JobEvent::ImageFxReady(result) => {
                     self.handle_image_fx_ready(ctx, result);
                 }
-                JobEvent::ClipDownloaded { server_id, result, drop_target } => {
+                JobEvent::ClipDownloaded {
+                    server_id,
+                    result,
+                    drop_target,
+                } => {
                     self.handle_clip_downloaded(server_id, result, drop_target);
+                }
+                JobEvent::ServerAssetsPageLoaded {
+                    tab,
+                    query,
+                    offset: _,
+                    limit: _,
+                    result,
+                } => match result {
+                    Ok(page) => {
+                        let count = page.items.len();
+                        self.state.ingest_server_assets_page(tab, &query, page);
+                        self.state.status = if count == 0 {
+                            crate::i18n::t("No more server assets.").into()
+                        } else {
+                            format!("{} {}", crate::i18n::t("Loaded server assets:"), count)
+                        };
+                    }
+                    Err(e) => {
+                        self.state
+                            .set_server_assets_page_error(tab, &query, e.clone());
+                        self.state.status =
+                            format!("{} {}", crate::i18n::t("Server assets failed:"), e);
+                    }
+                },
+                JobEvent::ServerAssetDownloaded {
+                    server_id,
+                    kind,
+                    result,
+                    drop_target,
+                } => {
+                    self.handle_server_asset_downloaded(server_id, kind, result, drop_target);
                 }
                 JobEvent::VideoDurationProbed {
                     actor_id,
@@ -643,7 +829,6 @@ impl App {
                 JobEvent::LibraryScanned(snap) => {
                     self.library_reload_in_progress = false;
                     self.state.apply_library_snapshot(snap);
-                    self.state.fetch_server_clips_metadata();
                 }
                 JobEvent::LibraryReloadAborted => {
                     self.library_reload_in_progress = false;
@@ -685,8 +870,7 @@ impl App {
                 // next frame(s) to retry. flush_deferred_clip_placements
                 // will pick it up once is_usable_local_video flips to
                 // true (or drop it after the 10-second deadline).
-                let deadline = std::time::Instant::now()
-                    + std::time::Duration::from_secs(10);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
                 self.state.deferred_clip_placements.push((
                     path.clone(),
                     drop_target,
@@ -736,13 +920,137 @@ impl App {
                 );
             }
             ClipDropTarget::TimelineAt { t } => {
-                crate::panels::add_actor_from_clip_at_time(
-                    &mut self.state,
-                    &pb,
-                    t,
-                );
+                crate::panels::add_actor_from_clip_at_time(&mut self.state, &pb, t);
+            }
+            ClipDropTarget::SequenceSlot { actor_id } => {
+                if let Some(idx) = self
+                    .state
+                    .scene
+                    .actors
+                    .iter()
+                    .position(|actor| actor.id == actor_id)
+                {
+                    let _ = crate::panels::fill_footage_sequence_slot(&mut self.state, idx, &pb);
+                } else {
+                    self.state.status = crate::i18n::t("Footage slot disappeared.").into();
+                }
             }
             ClipDropTarget::None => {}
+        }
+    }
+
+    fn handle_server_asset_downloaded(
+        &mut self,
+        server_id: String,
+        kind: crate::state::AssetDragKind,
+        result: Result<std::path::PathBuf, String>,
+        drop_target: crate::jobs::ServerAssetDropTarget,
+    ) {
+        match result {
+            Ok(path) => {
+                self.state.pending_clip_downloads.remove(&path);
+                self.state
+                    .mark_server_asset_downloaded(kind, &server_id, path.clone());
+                self.place_server_asset_drop_target(&path, kind, drop_target);
+                self.invalidate_preview_for_path(&path);
+                self.state.status = format!(
+                    "{} {}",
+                    crate::i18n::t("Server asset downloaded:"),
+                    server_id
+                );
+            }
+            Err(e) => {
+                self.state.pending_clip_downloads.retain(|p| {
+                    p.file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(|stem| stem != crate::jobs::sanitise_id(&server_id))
+                        .unwrap_or(true)
+                });
+                self.state.status = format!(
+                    "{} {}: {}",
+                    crate::i18n::t("Server asset download failed:"),
+                    server_id,
+                    e
+                );
+            }
+        }
+    }
+
+    fn place_server_asset_drop_target(
+        &mut self,
+        path: &std::path::Path,
+        kind: crate::state::AssetDragKind,
+        drop_target: crate::jobs::ServerAssetDropTarget,
+    ) {
+        let path = path.to_path_buf();
+        match drop_target {
+            crate::jobs::ServerAssetDropTarget::CanvasAt { world_x, world_y } => match kind {
+                crate::state::AssetDragKind::Video => {
+                    crate::panels::add_actor_from_video_at_canvas(
+                        &mut self.state,
+                        &path,
+                        [world_x, world_y],
+                    );
+                }
+                crate::state::AssetDragKind::Image | crate::state::AssetDragKind::Particle => {
+                    let asset = library_asset_from_download(&path, kind);
+                    crate::panels::add_library_asset_at_playhead(&mut self.state, &asset, kind);
+                    position_last_overlay_at_world(&mut self.state, [world_x, world_y]);
+                }
+                crate::state::AssetDragKind::Sound => {
+                    let asset = library_asset_from_download(&path, kind);
+                    crate::panels::add_library_asset_at_playhead(&mut self.state, &asset, kind);
+                }
+                _ => {}
+            },
+            crate::jobs::ServerAssetDropTarget::TimelineAt { t, track_idx } => {
+                let saved_t = self.state.playhead;
+                self.state.playhead = t;
+                match kind {
+                    crate::state::AssetDragKind::Video => {
+                        if let Some(new_idx) =
+                            crate::panels::add_actor_from_video_at_time(&mut self.state, &path, t)
+                        {
+                            if let Some(track_idx) = track_idx {
+                                self.state
+                                    .actor_track_assignments
+                                    .insert(new_idx, track_idx);
+                            }
+                        }
+                    }
+                    crate::state::AssetDragKind::Image
+                    | crate::state::AssetDragKind::Particle
+                    | crate::state::AssetDragKind::Sound => {
+                        let asset = library_asset_from_download(&path, kind);
+                        crate::panels::add_library_asset_at_playhead(&mut self.state, &asset, kind);
+                        if let Some(track_idx) = track_idx {
+                            match (kind, self.state.selection) {
+                                (
+                                    crate::state::AssetDragKind::Image
+                                    | crate::state::AssetDragKind::Particle,
+                                    crate::state::Selection::Overlay(new_idx),
+                                ) => {
+                                    self.state
+                                        .overlay_track_assignments
+                                        .insert(new_idx, track_idx);
+                                }
+                                (
+                                    crate::state::AssetDragKind::Sound,
+                                    crate::state::Selection::Audio(new_idx),
+                                ) => {
+                                    self.state
+                                        .audio_track_assignments
+                                        .insert(new_idx, track_idx);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                self.state.playhead = saved_t;
+            }
+            crate::jobs::ServerAssetDropTarget::None => {}
         }
     }
 
@@ -795,8 +1103,7 @@ impl App {
             }
             if idx < self.state.frame_caches.len() {
                 let source = actor.source.clone();
-                self.state.frame_caches[idx] =
-                    crate::video_cache::FrameCache::new(source, idx);
+                self.state.frame_caches[idx] = crate::video_cache::FrameCache::new(source, idx);
             }
             if idx < self.frame_extract_results.len() {
                 if let Ok(mut slot) = self.frame_extract_results[idx].lock() {
@@ -849,8 +1156,7 @@ impl App {
     fn schedule_library_reload(&mut self) {
         self.state.library_reload_pending = true;
         const DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(350);
-        self.library_reload_debounce_until =
-            Some(std::time::Instant::now() + DEBOUNCE);
+        self.library_reload_debounce_until = Some(std::time::Instant::now() + DEBOUNCE);
     }
 
     fn flush_pending_library_reload(&mut self) {
@@ -920,8 +1226,7 @@ impl App {
                         .unwrap_or("anon"),
                     result.sig,
                 );
-                let texture =
-                    ctx.load_texture(name, color_image, egui::TextureOptions::LINEAR);
+                let texture = ctx.load_texture(name, color_image, egui::TextureOptions::LINEAR);
                 let slot = crate::image_fx_cache::ImageFxSlot {
                     texture,
                     size: [baked.width, baked.height],
@@ -1010,11 +1315,9 @@ impl App {
 
                                 if is_editing {
                                     let resp = ui.add(
-                                        egui::TextEdit::singleline(
-                                            &mut self.state.editing_tab_buf,
-                                        )
-                                        .desired_width(120.0)
-                                        .font(egui::TextStyle::Body),
+                                        egui::TextEdit::singleline(&mut self.state.editing_tab_buf)
+                                            .desired_width(120.0)
+                                            .font(egui::TextStyle::Body),
                                     );
                                     resp.request_focus();
                                     let lost_focus = resp.lost_focus();
@@ -1025,10 +1328,8 @@ impl App {
                                     if escape_pressed {
                                         commit_rename = Some((usize::MAX, String::new()));
                                     } else if enter_pressed || lost_focus {
-                                        commit_rename = Some((
-                                            i,
-                                            self.state.editing_tab_buf.clone(),
-                                        ));
+                                        commit_rename =
+                                            Some((i, self.state.editing_tab_buf.clone()));
                                     }
                                 } else {
                                     let label = if dirty {
@@ -1056,13 +1357,11 @@ impl App {
                                 // last tab resets it to a fresh "Untitled" so
                                 // the user always has a working scene.
                                 let close_btn = egui::Button::new(
-                                    RichText::new("\u{00D7}")
-                                        .size(13.0)
-                                        .color(if is_active {
-                                            Color32::from_rgb(220, 220, 240)
-                                        } else {
-                                            Color32::from_rgb(120, 120, 140)
-                                        }),
+                                    RichText::new("\u{00D7}").size(13.0).color(if is_active {
+                                        Color32::from_rgb(220, 220, 240)
+                                    } else {
+                                        Color32::from_rgb(120, 120, 140)
+                                    }),
                                 )
                                 .frame(false)
                                 .min_size(Vec2::new(16.0, 16.0));
@@ -1070,7 +1369,9 @@ impl App {
                                 let close_resp = if num_tabs > 1 {
                                     close_resp.on_hover_text(crate::i18n::t("Close tab"))
                                 } else {
-                                    close_resp.on_hover_text(crate::i18n::t("Reset to a fresh untitled scene"))
+                                    close_resp.on_hover_text(crate::i18n::t(
+                                        "Reset to a fresh untitled scene",
+                                    ))
                                 };
                                 if close_resp.clicked() {
                                     close_tab = Some(i);
@@ -1105,7 +1406,11 @@ impl App {
             .rounding(Rounding::same(7.0))
             .stroke(Stroke::new(1.0, Color32::from_rgb(120, 100, 40)))
             .min_size(Vec2::new(26.0, 22.0));
-            if ui.add(plus_btn).on_hover_text(crate::i18n::t("New scene tab")).clicked() {
+            if ui
+                .add(plus_btn)
+                .on_hover_text(crate::i18n::t("New scene tab"))
+                .clicked()
+            {
                 self.request_scene_exit(SceneExitAction::NewTab);
             }
         });
@@ -1115,9 +1420,7 @@ impl App {
             self.state.editing_tab_buf = name;
         }
         if let Some((idx, new_name)) = commit_rename {
-            if idx != usize::MAX
-                && idx < self.state.scene_tabs.len()
-                && !new_name.trim().is_empty()
+            if idx != usize::MAX && idx < self.state.scene_tabs.len() && !new_name.trim().is_empty()
             {
                 self.state.scene_tabs[idx].name = new_name.trim().to_string();
             }
@@ -1132,15 +1435,89 @@ impl App {
         }
     }
 
+    fn load_autosave_entry(&mut self, entry: &crate::autosave::AutosaveEntry) {
+        let is_memstroy = entry
+            .scene_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.eq_ignore_ascii_case("memstroy"))
+            .unwrap_or(false);
+        let load_result = if is_memstroy {
+            self.state
+                .load_memstroy(&entry.scene_path)
+                .map_err(|e| e.to_string())
+        } else {
+            Scene::load(&entry.scene_path).map_err(|e| e.to_string())
+        };
+
+        match load_result {
+            Ok(scene) => {
+                self.state.scene = scene;
+                // Restore the original project path when autosave metadata
+                // knows it, so Save after recovery targets the user's file.
+                self.state.scene_path = entry.meta.as_ref().and_then(|m| m.original_path.clone());
+                self.state.status = crate::i18n::t("\u{2705} Recovered scene loaded.").into();
+
+                if self.state.active_tab < self.state.scene_tabs.len() {
+                    let idx = self.state.active_tab;
+                    let tab_name = entry
+                        .meta
+                        .as_ref()
+                        .map(|m| m.name.clone())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| self.state.scene_tabs[idx].name.clone());
+                    self.state.scene_tabs[idx].name = tab_name;
+                    self.state.scene_tabs[idx].path = self.state.scene_path.clone();
+                    self.state.scene_tabs[idx].scene = self.state.scene.clone();
+                }
+                self.state.frame_caches.clear();
+                self.state.selection = Selection::None;
+                self.state.canvas_selection.clear();
+                self.state.playhead = 0.0;
+            }
+            Err(e) => {
+                self.state.status = format!("{} {e}", crate::i18n::t("\u{274C} Recovery failed:"));
+            }
+        }
+    }
+
     fn menu(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         use crate::i18n::t;
         egui::menu::bar(ui, |ui| {
-            ui.menu_button(RichText::new(t("\u{1F4C1} File")).strong(), |ui| {
-                if ui.button(t("\u{2728} New scene")).clicked() {
+            ui.menu_button(RichText::new(t("File")).strong(), |ui| {
+                let row_height = 20.0;
+                let menu_row = |ui: &mut egui::Ui, icon: &str, text: String| -> bool {
+                    let width = 220.0;
+                    let (rect, resp) =
+                        ui.allocate_exact_size(egui::vec2(width, row_height), egui::Sense::click());
+                    let visuals = ui.style().interact(&resp);
+                    if resp.hovered() {
+                        ui.painter().rect_filled(rect, 3.0, visuals.bg_fill);
+                    }
+                    let icon_pos = egui::pos2(rect.left() + 9.0, rect.center().y);
+                    let text_pos = egui::pos2(rect.left() + 34.0, rect.center().y);
+                    ui.painter().text(
+                        icon_pos,
+                        egui::Align2::LEFT_CENTER,
+                        icon,
+                        egui::FontId::monospace(12.0),
+                        Color32::from_rgb(190, 190, 205),
+                    );
+                    ui.painter().text(
+                        text_pos,
+                        egui::Align2::LEFT_CENTER,
+                        text,
+                        egui::FontId::proportional(12.0),
+                        visuals.text_color(),
+                    );
+                    resp.clicked()
+                };
+
+                if menu_row(ui, "+", t("New scene").to_string()) {
                     self.request_scene_exit(SceneExitAction::NewScene);
                     ui.close_menu();
                 }
-                if ui.button(t("\u{1F4C2} Open scene...")).clicked() {
+                if menu_row(ui, "O", t("Open scene...").to_string()) {
                     if let Some(path) = rfd::FileDialog::new()
                         .add_filter(t("Memstroy Project"), &["memstroy"])
                         .add_filter(t("Scene"), &["yaml", "yml", "json"])
@@ -1151,162 +1528,81 @@ impl App {
                             .and_then(|e| e.to_str())
                             .map(|s| s.eq_ignore_ascii_case("memstroy"))
                             .unwrap_or(false);
-                        self.request_scene_exit(SceneExitAction::OpenScene {
-                            path,
-                            is_memstroy,
-                        });
+                        self.request_scene_exit(SceneExitAction::OpenScene { path, is_memstroy });
                     }
                     ui.close_menu();
                 }
-                if ui.button(t("\u{1F4BE} Save scene")).clicked() {
+                if menu_row(ui, "S", t("Save scene").to_string()) {
                     self.save_scene();
                     ui.close_menu();
                 }
-                if ui.button(t("\u{1F4BE} Save scene as...")).clicked() {
+                if menu_row(ui, "S+", t("Save scene as...").to_string()) {
                     self.save_as();
                     ui.close_menu();
                 }
                 ui.separator();
 
-                // ── Autosaves submenu ─────────────────────────────
-                // Replaces the old single "open last autosave" entry.
-                // Every per-project autosave slot the manager has on
-                // disk shows up here as one row, sorted newest-first.
-                // Each row carries the original project name + age so
-                // the user can pick a specific recovery point instead
-                // of being limited to "the most recent one across all
-                // projects".
+                // Autosaves are flattened into the File menu. A nested
+                // submenu here is easy to leave open accidentally while
+                // moving the pointer across the top bar.
                 let autosave_entries = crate::autosave::list_entries();
-                ui.menu_button(t("\u{1F504} Open autosave"), |ui| {
-                    if autosave_entries.is_empty() {
-                        ui.add_enabled(
-                            false,
-                            egui::Button::new(t("(no autosaves yet)")),
-                        );
-                    } else {
-                        // Cap the visible list so the menu doesn't grow
-                        // unboundedly when long-running editors pile up
-                        // dozens of slots.
-                        const MAX_ROWS: usize = 8;
-                        for entry in autosave_entries.iter().take(MAX_ROWS) {
-                            let display_name = entry
-                                .meta
-                                .as_ref()
-                                .map(|m| {
-                                    if !m.name.is_empty() {
-                                        m.name.clone()
-                                    } else if let Some(p) = m.original_path.as_ref() {
-                                        p.file_stem()
-                                            .and_then(|s| s.to_str())
-                                            .unwrap_or("Scene")
-                                            .to_string()
-                                    } else {
-                                        t("Untitled").to_string()
-                                    }
-                                })
-                                .unwrap_or_else(|| {
-                                    entry
-                                        .scene_path
-                                        .file_stem()
+                if autosave_entries.is_empty() {
+                    let _ = menu_row(ui, "R", t("Open autosave (none)").to_string());
+                } else {
+                    ui.add_space(2.0);
+                    ui.label(
+                        RichText::new(t("Open autosave"))
+                            .size(11.0)
+                            .color(Color32::from_rgb(160, 160, 176)),
+                    );
+                    const MAX_AUTOSAVE_ROWS: usize = 8;
+                    for entry in autosave_entries.iter().take(MAX_AUTOSAVE_ROWS) {
+                        let display_name = entry
+                            .meta
+                            .as_ref()
+                            .map(|m| {
+                                if !m.name.is_empty() {
+                                    m.name.clone()
+                                } else if let Some(p) = m.original_path.as_ref() {
+                                    p.file_stem()
                                         .and_then(|s| s.to_str())
                                         .unwrap_or("Scene")
                                         .to_string()
-                                });
-                            let age = crate::autosave::format_age(entry.mtime);
-                            let label = format!("{display_name}  ·  {age}");
-                            let hover = if let Some(orig) = entry
-                                .meta
-                                .as_ref()
-                                .and_then(|m| m.original_path.as_ref())
-                            {
-                                format!(
-                                    "{}\n{}",
-                                    orig.display(),
-                                    entry.scene_path.display()
-                                )
-                            } else {
-                                entry.scene_path.display().to_string()
-                            };
-                            if ui.button(label).on_hover_text(hover).clicked() {
-                                let is_memstroy = entry.scene_path
-                                    .extension()
-                                    .and_then(|e| e.to_str())
-                                    .map(|s| s.eq_ignore_ascii_case("memstroy"))
-                                    .unwrap_or(false);
-                                let load_result = if is_memstroy {
-                                    self.state.load_memstroy(&entry.scene_path)
-                                        .map_err(|e| e.to_string())
                                 } else {
-                                    Scene::load(&entry.scene_path)
-                                        .map_err(|e| e.to_string())
-                                };
-                                match load_result {
-                                    Ok(scene) => {
-                                        self.state.scene = scene;
-                                        // Restore the original project
-                                        // path when the metadata
-                                        // recorded one, so saving
-                                        // straight after recovery
-                                        // overwrites the same file the
-                                        // user was working on.
-                                        self.state.scene_path = entry
-                                            .meta
-                                            .as_ref()
-                                            .and_then(|m| m.original_path.clone());
-                                        self.state.status = t(
-                                            "\u{2705} Recovered scene loaded.",
-                                        )
-                                        .into();
-                                        if self.state.active_tab
-                                            < self.state.scene_tabs.len()
-                                        {
-                                            let idx = self.state.active_tab;
-                                            let tab_name = entry
-                                                .meta
-                                                .as_ref()
-                                                .map(|m| m.name.clone())
-                                                .filter(|s| !s.is_empty())
-                                                .unwrap_or_else(|| {
-                                                    self.state.scene_tabs[idx]
-                                                        .name
-                                                        .clone()
-                                                });
-                                            self.state.scene_tabs[idx].name = tab_name;
-                                            self.state.scene_tabs[idx].path =
-                                                self.state.scene_path.clone();
-                                            self.state.scene_tabs[idx].scene =
-                                                self.state.scene.clone();
-                                        }
-                                    }
-                                    Err(e) => {
-                                        self.state.status = format!(
-                                            "{} {e}",
-                                            t("\u{274C} Recovery failed:")
-                                        );
-                                    }
+                                    t("Untitled").to_string()
                                 }
-                                ui.close_menu();
-                            }
+                            })
+                            .unwrap_or_else(|| {
+                                entry
+                                    .scene_path
+                                    .file_stem()
+                                    .and_then(|s| s.to_str())
+                                    .unwrap_or("Scene")
+                                    .to_string()
+                            });
+                        let age = crate::autosave::format_age(entry.mtime);
+                        let label = format!("{display_name}  -  {age}");
+                        if menu_row(ui, "R", label) {
+                            self.load_autosave_entry(entry);
+                            ui.close_menu();
                         }
                     }
-                });
+                }
                 ui.separator();
-                if ui.button(t("\u{2699} Settings...")).clicked() {
+                if menu_row(ui, "EX", t("Export").to_string()) {
+                    self.run_render();
+                    ui.close_menu();
+                }
+                ui.separator();
+                if menu_row(ui, "*", t("Settings...").to_string()) {
                     self.state.settings_open = true;
                     ui.close_menu();
                 }
                 ui.separator();
-                if ui.button(t("\u{1F6AA} Exit")).clicked() {
+                if menu_row(ui, "X", t("Exit").to_string()) {
                     if self.request_scene_exit(SceneExitAction::Quit) {
                         ctx.send_viewport_cmd(ViewportCommand::Close);
                     }
-                    ui.close_menu();
-                }
-            });
-
-            ui.menu_button(RichText::new(t("\u{1F3AC} Render")).strong(), |ui| {
-                if ui.button(t("\u{1F3A5} Render full clip...")).clicked() {
-                    self.run_render();
                     ui.close_menu();
                 }
             });
@@ -1315,15 +1611,9 @@ impl App {
             // Single home for every floating-window toggle in the
             // editor. Adding new floating windows should only need a
             // checkbox here.
-            ui.menu_button(RichText::new(t("\u{1F441} View")).strong(), |ui| {
-                ui.checkbox(
-                    &mut self.state.web_image_search_open,
-                    t("\u{1F310} Web Image Search"),
-                );
-                ui.checkbox(
-                    &mut self.state.curve_editor_open,
-                    t("\u{1F4C8} Curve Editor"),
-                );
+            ui.menu_button(RichText::new(t("View")).strong(), |ui| {
+                ui.checkbox(&mut self.state.web_image_search_open, t("Web Image Search"));
+                ui.checkbox(&mut self.state.curve_editor_open, t("Curve Editor"));
                 // Skeleton editor used to live as a floating window
                 // here. It now belongs to the inspector for any video
                 // layer element (actor / video overlay), so the menu
@@ -1334,7 +1624,11 @@ impl App {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if self.state.refreshing {
                     ui.spinner();
-                    ui.label(RichText::new(t("refreshing...")).color(Color32::from_rgb(255, 200, 50)).size(11.0));
+                    ui.label(
+                        RichText::new(t("refreshing..."))
+                            .color(Color32::from_rgb(255, 200, 50))
+                            .size(11.0),
+                    );
                 }
                 // The render progress bar that used to live here was
                 // removed per user request — the dedicated render
@@ -1402,25 +1696,24 @@ impl App {
         // text widget see the chord natively.
         if ctrl && !typing {
             // Ctrl+Z = Undo (NOT Shift+Z, which is redo).
-            if !modifiers.shift && ctx.input_mut(|i| {
-                i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z)
-            }) {
+            if !modifiers.shift
+                && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z))
+            {
                 self.state.undo();
             }
             // Ctrl+Shift+Z or Ctrl+Y = Redo
             let redo_z = ctx.input_mut(|i| {
-                i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::Z)
+                i.consume_key(
+                    egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                    egui::Key::Z,
+                )
             });
-            let redo_y = ctx.input_mut(|i| {
-                i.consume_key(egui::Modifiers::COMMAND, egui::Key::Y)
-            });
+            let redo_y = ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Y));
             if redo_z || redo_y {
                 self.state.redo();
             }
             // Ctrl+D = duplicate
-            if ctx.input_mut(|i| {
-                i.consume_key(egui::Modifiers::COMMAND, egui::Key::D)
-            }) {
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::D)) {
                 self.duplicate_selected();
             }
         }
@@ -1504,19 +1797,13 @@ impl App {
         }
         let chord_copy = ctrl
             && !modifiers.shift
-            && ctx.input_mut(|i| {
-                i.consume_key(egui::Modifiers::COMMAND, egui::Key::C)
-            });
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::C));
         let chord_cut = ctrl
             && !modifiers.shift
-            && ctx.input_mut(|i| {
-                i.consume_key(egui::Modifiers::COMMAND, egui::Key::X)
-            });
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::X));
         let chord_paste = ctrl
             && !modifiers.shift
-            && ctx.input_mut(|i| {
-                i.consume_key(egui::Modifiers::COMMAND, egui::Key::V)
-            });
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::V));
 
         // ── Path C: V-key RELEASE fallback ─────────────────────────
         //
@@ -1564,15 +1851,13 @@ impl App {
         // the second drained Paste arrive in the same frame, the
         // freshly-incremented skip would consume Release 1 and the
         // image-only paste would silently disappear.
-        let matched_releases =
-            self.pending_v_release_skips.min(v_release_count);
+        let matched_releases = self.pending_v_release_skips.min(v_release_count);
         self.pending_v_release_skips -= matched_releases;
         let unmatched_v_releases = v_release_count - matched_releases;
         let release_paste = unmatched_v_releases > 0;
 
         if drained.pasted {
-            self.pending_v_release_skips =
-                self.pending_v_release_skips.saturating_add(1);
+            self.pending_v_release_skips = self.pending_v_release_skips.saturating_add(1);
         }
 
         // Suppress double-fire when both the synthetic Event::Copy
@@ -1582,13 +1867,28 @@ impl App {
         let do_paste = drained.pasted || chord_paste || release_paste;
 
         if do_copy || do_cut {
-            let n = self.state.copy_selection_to_clipboard();
+            let copying_keyframes = !self.state.selected_keyframes.is_empty();
+            let n = if copying_keyframes {
+                self.state.copy_selected_keyframes_to_clipboard()
+            } else {
+                self.state.copy_selection_to_clipboard()
+            };
             if n > 0 {
                 self.state.status = format!(
                     "{} {} {}",
-                    crate::i18n::t("\u{1F4CB} Copied"),
+                    crate::i18n::t("Copied"),
                     n,
-                    if n == 1 { crate::i18n::t("item to clipboard") } else { crate::i18n::t("items to clipboard") }
+                    if copying_keyframes {
+                        if n == 1 {
+                            crate::i18n::t("keyframe to clipboard")
+                        } else {
+                            crate::i18n::t("keyframes to clipboard")
+                        }
+                    } else if n == 1 {
+                        crate::i18n::t("item to clipboard")
+                    } else {
+                        crate::i18n::t("items to clipboard")
+                    }
                 );
                 // Remember when this copy happened so the next Ctrl+V
                 // knows to prefer our in-app clipboard over an OS
@@ -1597,8 +1897,7 @@ impl App {
                 // canvas selection, expects Ctrl+V to duplicate the
                 // canvas selection, not paste the older browser
                 // image" workflow.
-                self.last_internal_copy_at =
-                    Some(std::time::Instant::now());
+                self.last_internal_copy_at = Some(std::time::Instant::now());
 
                 if do_cut {
                     // Ctrl+X = copy + delete primary / multi-selection.
@@ -1628,21 +1927,40 @@ impl App {
                     .unwrap_or(false);
 
             let mut handled = false;
+            if !self.state.keyframe_clipboard.is_empty() {
+                let n = self.state.paste_keyframes_from_clipboard();
+                if n > 0 {
+                    self.state.status = format!(
+                        "{} {} {}",
+                        crate::i18n::t("Pasted"),
+                        n,
+                        if n == 1 {
+                            crate::i18n::t("keyframe at the playhead")
+                        } else {
+                            crate::i18n::t("keyframes at the playhead")
+                        },
+                    );
+                    handled = true;
+                }
+            }
             if prefer_internal {
                 let n = self.state.paste_clipboard();
                 if n > 0 {
                     self.state.status = format!(
                         "{} {} {}",
-                        crate::i18n::t("\u{1F4CB} Pasted"),
+                        crate::i18n::t("Pasted"),
                         n,
-                        if n == 1 { crate::i18n::t("item at the playhead") } else { crate::i18n::t("items at the playhead") },
+                        if n == 1 {
+                            crate::i18n::t("item at the playhead")
+                        } else {
+                            crate::i18n::t("items at the playhead")
+                        },
                     );
                     handled = true;
                 }
             }
             if !handled {
-                let pasted_image =
-                    self.try_paste_image_from_system_clipboard();
+                let pasted_image = self.try_paste_image_from_system_clipboard();
                 if pasted_image {
                     handled = true;
                 }
@@ -1656,16 +1974,19 @@ impl App {
                 if n > 0 {
                     self.state.status = format!(
                         "{} {} {}",
-                        crate::i18n::t("\u{1F4CB} Pasted"),
+                        crate::i18n::t("Pasted"),
                         n,
-                        if n == 1 { crate::i18n::t("item at the playhead") } else { crate::i18n::t("items at the playhead") },
+                        if n == 1 {
+                            crate::i18n::t("item at the playhead")
+                        } else {
+                            crate::i18n::t("items at the playhead")
+                        },
                     );
                     handled = true;
                 }
             }
             if !handled {
-                self.state.status =
-                    crate::i18n::t("\u{1F4CB} Clipboard is empty").into();
+                self.state.status = crate::i18n::t("Clipboard is empty").into();
             }
         }
 
@@ -1679,6 +2000,24 @@ impl App {
         // End. The window has been retired and replaced by an
         // inspector section that does not steal those keys, so the
         // gate is no longer needed.)
+
+        let step_left =
+            ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft));
+        let step_right =
+            ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight));
+        if step_left || step_right {
+            let fps = self.state.scene.output.fps.max(1) as f32;
+            let dt = 1.0 / fps;
+            let dir = if step_right { 1.0 } else { -1.0 };
+            self.state.playing = false;
+            self.state.playhead =
+                (self.state.playhead + dir * dt).clamp(0.0, self.state.scene.output.duration);
+            self.state.status = format!(
+                "{} {}",
+                crate::i18n::t("Frame"),
+                (self.state.playhead * fps).round() as i64
+            );
+        }
 
         ctx.input(|i| {
             // Space = Play/Pause
@@ -1700,8 +2039,7 @@ impl App {
             // from under the user when they meant to delete a kf.
             if !ctrl
                 && self.state.selected_keyframes.is_empty()
-                && (i.key_pressed(egui::Key::Delete)
-                    || i.key_pressed(egui::Key::Backspace))
+                && (i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace))
             {
                 self.delete_selected();
             }
@@ -1711,8 +2049,11 @@ impl App {
             // back to the default transform mode without hunting for
             // the toolbar button.
             if i.key_pressed(egui::Key::Escape) {
-                if crate::canvas_image_search::canvas_search_ui_visible(&self.state) {
-                    crate::canvas_image_search::hide_canvas_search_ui(&mut self.state);
+                if self.state.canvas_image_search.is_some()
+                    || self.state.canvas_image_search_draft.is_some()
+                    || self.state.canvas_image_search_rmb_pending.is_some()
+                {
+                    crate::canvas_image_search::cancel_canvas_image_search(&mut self.state);
                 } else if !self.state.canvas_selection.is_empty() {
                     self.state.canvas_selection.clear();
                 }
@@ -1733,8 +2074,7 @@ impl App {
                         self.state.canvas_drag.mode,
                         crate::state::CanvasDragMode::DrawMask { .. }
                     ) {
-                        self.state.canvas_drag.mode =
-                            crate::state::CanvasDragMode::None;
+                        self.state.canvas_drag.mode = crate::state::CanvasDragMode::None;
                     }
                     self.state.status = crate::i18n::t("Mask tool cancelled").into();
                 }
@@ -1784,7 +2124,8 @@ impl App {
         {
             Ok(a) => a,
             Err(err) => {
-                self.state.status = format!("{} {}", crate::i18n::t("Clipboard image save failed:"), err);
+                self.state.status =
+                    format!("{} {}", crate::i18n::t("Clipboard image save failed:"), err);
                 return true; // we tried; don't fall through to internal paste
             }
         };
@@ -1792,8 +2133,10 @@ impl App {
         self.state.library_tab = crate::state::LibraryTab::Images;
         self.state.status = format!(
             "{} \u{2192} {} ({}\u{00D7}{})",
-            crate::i18n::t("\u{1F4CB} Pasted clipboard image"),
-            asset.label, width, height
+            crate::i18n::t("Pasted clipboard image"),
+            asset.label,
+            width,
+            height
         );
         true
     }
@@ -1804,8 +2147,8 @@ impl App {
     /// selected, the panel clears and asks the user to pick one.
     fn draw_curve_editor_body(&mut self, ui: &mut egui::Ui) {
         use crate::curve_editor::{
-            curve_editor_panel, CurveEditorTarget, PROP_OPACITY, PROP_POS_X,
-            PROP_POS_Y, PROP_ROTATION, PROP_SCALE,
+            curve_editor_panel, CurveEditorTarget, PROP_OPACITY, PROP_POS_X, PROP_POS_Y,
+            PROP_ROTATION, PROP_SCALE,
         };
         use crate::i18n::t;
 
@@ -1892,8 +2235,8 @@ impl App {
                         .position(|cl| cl.element_id == actor_id);
                     let clip_start = scene.actors[i].t_in.unwrap_or(0.0);
                     let clip_end = scene.actors[i].t_out.unwrap_or(duration);
-                    let canvas_layout = canvas_idx
-                        .map(|idx| &mut scene.canvas_layouts[idx].keyframes);
+                    let canvas_layout =
+                        canvas_idx.map(|idx| &mut scene.canvas_layouts[idx].keyframes);
                     let a = &mut scene.actors[i];
                     let target = CurveEditorTarget::Actor {
                         layout: &mut a.layout,
@@ -1921,55 +2264,54 @@ impl App {
                     let actor_t_in = a.t_in.unwrap_or(0.0);
                     let t_local = (playhead - actor_t_in).max(0.0);
                     for (fx_idx, eff) in a.effects.iter_mut().enumerate() {
-                            let kind_label = eff.kind.label().to_string();
-                            let animated_keys: Vec<String> =
-                                eff.animated_params.iter().cloned().collect();
-                            for key in animated_keys {
-                                let param_label_owned = format!(
-                                    "{} {}",
-                                    kind_label,
-                                    match key.as_str() {
-                                        "intensity" => "Intensity",
-                                        "p0" => "Param",
-                                        "p1" => "Param 2",
-                                        "p2" => "Param 3",
-                                        "p3" => "Param 4",
-                                        other => other,
-                                    }
-                                );
-                                let static_val =
-                                    crate::curve_editor::effect_param_static_value(eff, &key);
-                                let range =
-                                    crate::curve_editor::effect_param_value_range(&key);
-                                let kfs = eff.param_kfs.entry(key.clone()).or_default();
-                                ui.add_space(6.0);
-                                ui.separator();
-                                let target = CurveEditorTarget::EffectParam {
-                                    kfs,
-                                    animated_params: &mut eff.animated_params,
-                                    param_id: &key,
-                                    param_label: &param_label_owned,
-                                    param_color: crate::curve_editor::effect_param_color(fx_idx),
-                                    value_range: range,
-                                    static_value: static_val,
-                                    t_local,
-                                };
-                                curve_editor_panel(
-                                    ui,
-                                    target,
-                                    duration,
-                                    &mut self.state.curve_editor_property,
-                                    playhead,
-                                    &mut self.state.curve_editor_marquee,
-                                    &mut self.state.curve_editor_selected,
-                                    &mut self.state.curve_editor_multi_drag,
-                                    &mut self.state.curve_editor_multi_drag_delta,
-                                    &mut self.state.curve_editor_pan_offset,
-                                    &mut self.state.curve_editor_zoom,
-                                    &mut self.state.curve_editor_panning,
-                                );
-                            }
+                        let kind_label = eff.kind.label().to_string();
+                        let animated_keys: Vec<String> =
+                            eff.animated_params.iter().cloned().collect();
+                        for key in animated_keys {
+                            let param_label_owned = format!(
+                                "{} {}",
+                                kind_label,
+                                match key.as_str() {
+                                    "intensity" => "Intensity",
+                                    "p0" => "Param",
+                                    "p1" => "Param 2",
+                                    "p2" => "Param 3",
+                                    "p3" => "Param 4",
+                                    other => other,
+                                }
+                            );
+                            let static_val =
+                                crate::curve_editor::effect_param_static_value(eff, &key);
+                            let range = crate::curve_editor::effect_param_value_range(&key);
+                            let kfs = eff.param_kfs.entry(key.clone()).or_default();
+                            ui.add_space(6.0);
+                            ui.separator();
+                            let target = CurveEditorTarget::EffectParam {
+                                kfs,
+                                animated_params: &mut eff.animated_params,
+                                param_id: &key,
+                                param_label: &param_label_owned,
+                                param_color: crate::curve_editor::effect_param_color(fx_idx),
+                                value_range: range,
+                                static_value: static_val,
+                                t_local,
+                            };
+                            curve_editor_panel(
+                                ui,
+                                target,
+                                duration,
+                                &mut self.state.curve_editor_property,
+                                playhead,
+                                &mut self.state.curve_editor_marquee,
+                                &mut self.state.curve_editor_selected,
+                                &mut self.state.curve_editor_multi_drag,
+                                &mut self.state.curve_editor_multi_drag_delta,
+                                &mut self.state.curve_editor_pan_offset,
+                                &mut self.state.curve_editor_zoom,
+                                &mut self.state.curve_editor_panning,
+                            );
                         }
+                    }
                 }
             }
             TargetKind::Overlay => {
@@ -1985,109 +2327,99 @@ impl App {
                         .canvas_layouts
                         .iter()
                         .position(|cl| cl.element_id == ov_id);
-                    let canvas_layout = canvas_idx
-                        .map(|idx| &mut scene.canvas_layouts[idx].keyframes);
+                    let canvas_layout =
+                        canvas_idx.map(|idx| &mut scene.canvas_layouts[idx].keyframes);
                     let ov = &mut scene.overlays[i];
                     let (layout, animated, t_in, t_out) = match ov {
-                            memstroy_core::Overlay::Text(o) => (
-                                &mut o.layout,
-                                &mut o.animated_params,
-                                o.t_in,
-                                o.t_out,
-                            ),
-                            memstroy_core::Overlay::Image(o) => (
-                                &mut o.layout,
-                                &mut o.animated_params,
-                                o.t_in,
-                                o.t_out,
-                            ),
-                            memstroy_core::Overlay::Video(o) => (
-                                &mut o.layout,
-                                &mut o.animated_params,
-                                o.t_in,
-                                o.t_out,
-                            ),
-                        };
-                        let clip_duration = (t_out - t_in).max(0.0);
-                        let target = CurveEditorTarget::Overlay {
-                            layout,
-                            animated_params: animated,
-                            t_in,
-                            clip_duration,
-                            canvas_layout,
-                        };
-                        curve_editor_panel(
-                            ui,
-                            target,
-                            duration,
-                            &mut self.state.curve_editor_property,
-                            playhead,
-                            &mut self.state.curve_editor_marquee,
-                            &mut self.state.curve_editor_selected,
-                            &mut self.state.curve_editor_multi_drag,
-                            &mut self.state.curve_editor_multi_drag_delta,
-                            &mut self.state.curve_editor_pan_offset,
-                            &mut self.state.curve_editor_zoom,
-                            &mut self.state.curve_editor_panning,
-                        );
-                        // Effect animated params for overlay.
-                        let overlay_t_in = t_in;
-                        let t_local = (playhead - overlay_t_in).max(0.0);
-                        let effects: &mut Vec<memstroy_core::Effect> = match ov {
-                            memstroy_core::Overlay::Text(o) => &mut o.effects,
-                            memstroy_core::Overlay::Image(o) => &mut o.effects,
-                            memstroy_core::Overlay::Video(o) => &mut o.effects,
-                        };
-                        for (fx_idx, eff) in effects.iter_mut().enumerate() {
-                            let kind_label = eff.kind.label().to_string();
-                            let animated_keys: Vec<String> =
-                                eff.animated_params.iter().cloned().collect();
-                            for key in animated_keys {
-                                let param_label_owned = format!(
-                                    "{} {}",
-                                    kind_label,
-                                    match key.as_str() {
-                                        "intensity" => "Intensity",
-                                        "p0" => "Param",
-                                        "p1" => "Param 2",
-                                        "p2" => "Param 3",
-                                        "p3" => "Param 4",
-                                        other => other,
-                                    }
-                                );
-                                let static_val =
-                                    crate::curve_editor::effect_param_static_value(eff, &key);
-                                let range =
-                                    crate::curve_editor::effect_param_value_range(&key);
-                                let kfs = eff.param_kfs.entry(key.clone()).or_default();
-                                ui.add_space(6.0);
-                                ui.separator();
-                                let target = CurveEditorTarget::EffectParam {
-                                    kfs,
-                                    animated_params: &mut eff.animated_params,
-                                    param_id: &key,
-                                    param_label: &param_label_owned,
-                                    param_color: crate::curve_editor::effect_param_color(fx_idx),
-                                    value_range: range,
-                                    static_value: static_val,
-                                    t_local,
-                                };
-                                curve_editor_panel(
-                                    ui,
-                                    target,
-                                    duration,
-                                    &mut self.state.curve_editor_property,
-                                    playhead,
-                                    &mut self.state.curve_editor_marquee,
-                                    &mut self.state.curve_editor_selected,
-                                    &mut self.state.curve_editor_multi_drag,
-                                    &mut self.state.curve_editor_multi_drag_delta,
-                                    &mut self.state.curve_editor_pan_offset,
-                                    &mut self.state.curve_editor_zoom,
-                                    &mut self.state.curve_editor_panning,
-                                );
-                            }
+                        memstroy_core::Overlay::Text(o) => {
+                            (&mut o.layout, &mut o.animated_params, o.t_in, o.t_out)
                         }
+                        memstroy_core::Overlay::Image(o) => {
+                            (&mut o.layout, &mut o.animated_params, o.t_in, o.t_out)
+                        }
+                        memstroy_core::Overlay::Video(o) => {
+                            (&mut o.layout, &mut o.animated_params, o.t_in, o.t_out)
+                        }
+                    };
+                    let clip_duration = (t_out - t_in).max(0.0);
+                    let target = CurveEditorTarget::Overlay {
+                        layout,
+                        animated_params: animated,
+                        t_in,
+                        clip_duration,
+                        canvas_layout,
+                    };
+                    curve_editor_panel(
+                        ui,
+                        target,
+                        duration,
+                        &mut self.state.curve_editor_property,
+                        playhead,
+                        &mut self.state.curve_editor_marquee,
+                        &mut self.state.curve_editor_selected,
+                        &mut self.state.curve_editor_multi_drag,
+                        &mut self.state.curve_editor_multi_drag_delta,
+                        &mut self.state.curve_editor_pan_offset,
+                        &mut self.state.curve_editor_zoom,
+                        &mut self.state.curve_editor_panning,
+                    );
+                    // Effect animated params for overlay.
+                    let overlay_t_in = t_in;
+                    let t_local = (playhead - overlay_t_in).max(0.0);
+                    let effects: &mut Vec<memstroy_core::Effect> = match ov {
+                        memstroy_core::Overlay::Text(o) => &mut o.effects,
+                        memstroy_core::Overlay::Image(o) => &mut o.effects,
+                        memstroy_core::Overlay::Video(o) => &mut o.effects,
+                    };
+                    for (fx_idx, eff) in effects.iter_mut().enumerate() {
+                        let kind_label = eff.kind.label().to_string();
+                        let animated_keys: Vec<String> =
+                            eff.animated_params.iter().cloned().collect();
+                        for key in animated_keys {
+                            let param_label_owned = format!(
+                                "{} {}",
+                                kind_label,
+                                match key.as_str() {
+                                    "intensity" => "Intensity",
+                                    "p0" => "Param",
+                                    "p1" => "Param 2",
+                                    "p2" => "Param 3",
+                                    "p3" => "Param 4",
+                                    other => other,
+                                }
+                            );
+                            let static_val =
+                                crate::curve_editor::effect_param_static_value(eff, &key);
+                            let range = crate::curve_editor::effect_param_value_range(&key);
+                            let kfs = eff.param_kfs.entry(key.clone()).or_default();
+                            ui.add_space(6.0);
+                            ui.separator();
+                            let target = CurveEditorTarget::EffectParam {
+                                kfs,
+                                animated_params: &mut eff.animated_params,
+                                param_id: &key,
+                                param_label: &param_label_owned,
+                                param_color: crate::curve_editor::effect_param_color(fx_idx),
+                                value_range: range,
+                                static_value: static_val,
+                                t_local,
+                            };
+                            curve_editor_panel(
+                                ui,
+                                target,
+                                duration,
+                                &mut self.state.curve_editor_property,
+                                playhead,
+                                &mut self.state.curve_editor_marquee,
+                                &mut self.state.curve_editor_selected,
+                                &mut self.state.curve_editor_multi_drag,
+                                &mut self.state.curve_editor_multi_drag_delta,
+                                &mut self.state.curve_editor_pan_offset,
+                                &mut self.state.curve_editor_zoom,
+                                &mut self.state.curve_editor_panning,
+                            );
+                        }
+                    }
                 }
             }
             TargetKind::Audio => {
@@ -2127,33 +2459,32 @@ impl App {
                         self.state.curve_editor_property = audio_prop;
                         ui.add_space(2.0);
                         let t_local = (playhead - audio.t_in).max(0.0);
-                        let (kfs, label, color, range, static_v, param_id) =
-                            match audio_prop {
-                                AUDIO_SPEED => (
-                                    &mut audio.speed_kfs,
-                                    crate::i18n::t("Speed"),
-                                    Color32::from_rgb(255, 180, 80),
-                                    (0.05_f32, 16.0_f32),
-                                    audio.speed,
-                                    "speed",
-                                ),
-                                AUDIO_PAN => (
-                                    &mut audio.pan_kfs,
-                                    crate::i18n::t("Pan"),
-                                    Color32::from_rgb(180, 220, 255),
-                                    (-1.0_f32, 1.0_f32),
-                                    audio.pan,
-                                    "pan",
-                                ),
-                                _ => (
-                                    &mut audio.volume_kfs,
-                                    crate::i18n::t("Volume"),
-                                    Color32::from_rgb(120, 220, 160),
-                                    (0.0_f32, 4.0_f32),
-                                    audio.volume,
-                                    "volume",
-                                ),
-                            };
+                        let (kfs, label, color, range, static_v, param_id) = match audio_prop {
+                            AUDIO_SPEED => (
+                                &mut audio.speed_kfs,
+                                crate::i18n::t("Speed"),
+                                Color32::from_rgb(255, 180, 80),
+                                (0.05_f32, 16.0_f32),
+                                audio.speed,
+                                "speed",
+                            ),
+                            AUDIO_PAN => (
+                                &mut audio.pan_kfs,
+                                crate::i18n::t("Pan"),
+                                Color32::from_rgb(180, 220, 255),
+                                (-1.0_f32, 1.0_f32),
+                                audio.pan,
+                                "pan",
+                            ),
+                            _ => (
+                                &mut audio.volume_kfs,
+                                crate::i18n::t("Volume"),
+                                Color32::from_rgb(120, 220, 160),
+                                (0.0_f32, 4.0_f32),
+                                audio.volume,
+                                "volume",
+                            ),
+                        };
                         let target = CurveEditorTarget::Audio {
                             kfs,
                             animated_params: &mut audio.animated_params,
@@ -2211,45 +2542,7 @@ impl App {
     /// 1) id convention `<actor_id>_audio`, then
     /// 2) same source file + overlapping time window (best score).
     fn infer_actor_for_audio_track(&self, audio_idx: usize) -> Option<usize> {
-        let Some(audio) = self.state.scene.audio.get(audio_idx) else { return None; };
-        if let Some(parent_id) = audio.parent_actor.as_deref() {
-            if let Some(ai) = self.state.scene.actors.iter().position(|a| a.id == parent_id) {
-                return Some(ai);
-            }
-        }
-
-        if let Some(actor_id) = audio.id.strip_suffix("_audio") {
-            if let Some(ai) = self
-                .state
-                .scene
-                .actors
-                .iter()
-                .position(|a| a.id == actor_id && a.source == audio.source)
-            {
-                return Some(ai);
-            }
-        }
-
-        let scene_end = self.state.scene.output.duration.max(audio.t_in);
-        let au_in = audio.t_in;
-        let au_out = audio.t_out.unwrap_or(scene_end);
-        let mut best: Option<(usize, f32)> = None;
-        for (ai, actor) in self.state.scene.actors.iter().enumerate() {
-            if actor.source != audio.source {
-                continue;
-            }
-            let a_in = actor.t_in.unwrap_or(0.0);
-            let a_out = actor.t_out.unwrap_or(scene_end);
-            if !(au_in < a_out && a_in < au_out) {
-                continue;
-            }
-            let score = (a_in - au_in).abs() + (actor.source_start - audio.source_start).abs();
-            match best {
-                Some((_, best_score)) if score >= best_score => {}
-                _ => best = Some((ai, score)),
-            }
-        }
-        best.map(|(ai, _)| ai)
+        infer_actor_for_audio_in_scene(&self.state.scene, audio_idx)
     }
 
     /// Mark audio row as deleted and mute the corresponding actor's
@@ -2268,6 +2561,25 @@ impl App {
     }
 
     fn delete_selected(&mut self) {
+        if let Some(track_idx) = self.state.selected_track {
+            if self.state.track_is_empty(track_idx) {
+                self.state.mutate_state(|s| {
+                    let _ = s.delete_empty_track(track_idx);
+                });
+                self.state.selection = Selection::None;
+                self.state.canvas_selection.clear();
+                self.state.status = crate::i18n::t("Layer deleted.").into();
+                return;
+            }
+            let n = self.state.select_track_contents(track_idx);
+            if n > 0 {
+                self.state.selected_track = None;
+                self.state.status =
+                    crate::i18n::t("Layer contains elements; selected them instead.").into();
+                return;
+            }
+        }
+
         // ── Multi-select delete ──
         //
         // When `canvas_selection` holds more than one element, delete
@@ -2294,9 +2606,7 @@ impl App {
         if !multi_targets.is_empty() {
             // Single undo entry for the whole batch.
             self.state.last_drag_group = None;
-            self.state
-                .undo
-                .push_full(self.state.build_undo_snapshot());
+            self.state.undo.push_full(self.state.build_undo_snapshot());
 
             // Bucket selections by kind, then delete in descending
             // index order. Keep the helper-driven cascade behaviour
@@ -2335,11 +2645,10 @@ impl App {
             // double-cleanup (and the index-shift drift that comes
             // with it) drop those audio indices BEFORE we run the
             // audio loop.
-            let actor_ids_being_deleted: std::collections::HashSet<String> =
-                actor_idxs
-                    .iter()
-                    .filter_map(|i| self.state.scene.actors.get(*i).map(|a| a.id.clone()))
-                    .collect();
+            let actor_ids_being_deleted: std::collections::HashSet<String> = actor_idxs
+                .iter()
+                .filter_map(|i| self.state.scene.actors.get(*i).map(|a| a.id.clone()))
+                .collect();
             audio_idxs.retain(|aui| {
                 let parent = self
                     .state
@@ -2361,24 +2670,18 @@ impl App {
                 if i >= self.state.scene.actors.len() {
                     continue;
                 }
-                let subtree =
-                    self.state.scene.collect_element_subtree_ids(&self.state.scene.actors[i].id);
+                let subtree = self
+                    .state
+                    .scene
+                    .collect_element_subtree_ids(&self.state.scene.actors[i].id);
                 for id in subtree {
-                    if let Some(ai) = self
-                        .state
-                        .scene
-                        .actors
-                        .iter()
-                        .position(|a| a.id == id)
-                    {
+                    if let Some(ai) = self.state.scene.actors.iter().position(|a| a.id == id) {
                         family_actor_idxs.push(ai);
                     }
-                    if let Some(oi) = self.state.scene.overlays.iter().position(|ov| {
-                        match ov {
-                            memstroy_core::Overlay::Text(o) => o.id == *id,
-                            memstroy_core::Overlay::Image(o) => o.id == *id,
-                            memstroy_core::Overlay::Video(o) => o.id == *id,
-                        }
+                    if let Some(oi) = self.state.scene.overlays.iter().position(|ov| match ov {
+                        memstroy_core::Overlay::Text(o) => o.id == *id,
+                        memstroy_core::Overlay::Image(o) => o.id == *id,
+                        memstroy_core::Overlay::Video(o) => o.id == *id,
                     }) {
                         family_overlay_idxs.push(oi);
                     }
@@ -2398,21 +2701,13 @@ impl App {
                 };
                 let subtree = self.state.scene.collect_element_subtree_ids(&root_id);
                 for id in subtree {
-                    if let Some(ai) = self
-                        .state
-                        .scene
-                        .actors
-                        .iter()
-                        .position(|a| a.id == id)
-                    {
+                    if let Some(ai) = self.state.scene.actors.iter().position(|a| a.id == id) {
                         family_actor_idxs.push(ai);
                     }
-                    if let Some(oi) = self.state.scene.overlays.iter().position(|ov| {
-                        match ov {
-                            memstroy_core::Overlay::Text(o) => o.id == *id,
-                            memstroy_core::Overlay::Image(o) => o.id == *id,
-                            memstroy_core::Overlay::Video(o) => o.id == *id,
-                        }
+                    if let Some(oi) = self.state.scene.overlays.iter().position(|ov| match ov {
+                        memstroy_core::Overlay::Text(o) => o.id == *id,
+                        memstroy_core::Overlay::Image(o) => o.id == *id,
+                        memstroy_core::Overlay::Video(o) => o.id == *id,
                     }) {
                         family_overlay_idxs.push(oi);
                     }
@@ -2427,11 +2722,7 @@ impl App {
                 std::collections::HashSet::new();
             for &i in &family_actor_idxs {
                 if let Some(a) = self.state.scene.actors.get(i) {
-                    layout_ids.extend(
-                        self.state
-                            .scene
-                            .collect_element_subtree_ids(&a.id),
-                    );
+                    layout_ids.extend(self.state.scene.collect_element_subtree_ids(&a.id));
                 }
             }
             for &i in &family_overlay_idxs {
@@ -2455,10 +2746,8 @@ impl App {
                     continue;
                 }
                 let actor_id = self.state.scene.actors[i].id.clone();
-                let _removed_audio = crate::panels::remove_audio_bound_to_actor(
-                    &mut self.state,
-                    &actor_id,
-                );
+                let _removed_audio =
+                    crate::panels::remove_audio_bound_to_actor(&mut self.state, &actor_id);
                 self.state.scene.actors.remove(i);
                 if i < self.state.frame_caches.len() {
                     self.state.frame_caches.remove(i);
@@ -2481,10 +2770,7 @@ impl App {
                     i,
                 );
             }
-            crate::canvas_image_search::on_overlays_removed(
-                &mut self.state,
-                &family_overlay_idxs,
-            );
+            crate::canvas_image_search::on_overlays_removed(&mut self.state, &family_overlay_idxs);
             for i in audio_idxs.into_iter().rev() {
                 if i >= self.state.scene.audio.len() {
                     continue;
@@ -2501,8 +2787,7 @@ impl App {
             self.state.selection = Selection::None;
             self.state.canvas_selection.clear();
             self.state.multi_select.clear();
-            self.state.status =
-                crate::i18n::t("\u{1F5D1} Selected layers deleted.").into();
+            self.state.status = crate::i18n::t("Selected layers deleted.").into();
             return;
         }
 
@@ -2512,23 +2797,15 @@ impl App {
                 let subtree = self.state.scene.collect_element_subtree_ids(&actor_id);
                 let mut actor_idxs: Vec<usize> = subtree
                     .iter()
-                    .filter_map(|id| {
-                        self.state
-                            .scene
-                            .actors
-                            .iter()
-                            .position(|a| &a.id == id)
-                    })
+                    .filter_map(|id| self.state.scene.actors.iter().position(|a| &a.id == id))
                     .collect();
                 let mut overlay_idxs: Vec<usize> = subtree
                     .iter()
                     .filter_map(|id| {
-                        self.state.scene.overlays.iter().position(|ov| {
-                            match ov {
-                                memstroy_core::Overlay::Text(o) => &o.id == id,
-                                memstroy_core::Overlay::Image(o) => &o.id == id,
-                                memstroy_core::Overlay::Video(o) => &o.id == id,
-                            }
+                        self.state.scene.overlays.iter().position(|ov| match ov {
+                            memstroy_core::Overlay::Text(o) => &o.id == id,
+                            memstroy_core::Overlay::Image(o) => &o.id == id,
+                            memstroy_core::Overlay::Video(o) => &o.id == id,
                         })
                     })
                     .collect();
@@ -2577,7 +2854,7 @@ impl App {
                 self.state.selection = Selection::None;
                 self.state.canvas_selection.clear();
                 self.state.multi_select.clear();
-                self.state.status = crate::i18n::t("\u{1F5D1} Actor deleted.").into();
+                self.state.status = crate::i18n::t("Actor deleted.").into();
             }
             Selection::Overlay(i) if i < self.state.scene.overlays.len() => {
                 let root_id = match &self.state.scene.overlays[i] {
@@ -2589,24 +2866,16 @@ impl App {
                 let mut overlay_idxs: Vec<usize> = subtree
                     .iter()
                     .filter_map(|id| {
-                        self.state.scene.overlays.iter().position(|ov| {
-                            match ov {
-                                memstroy_core::Overlay::Text(o) => &o.id == id,
-                                memstroy_core::Overlay::Image(o) => &o.id == id,
-                                memstroy_core::Overlay::Video(o) => &o.id == id,
-                            }
+                        self.state.scene.overlays.iter().position(|ov| match ov {
+                            memstroy_core::Overlay::Text(o) => &o.id == id,
+                            memstroy_core::Overlay::Image(o) => &o.id == id,
+                            memstroy_core::Overlay::Video(o) => &o.id == id,
                         })
                     })
                     .collect();
                 let mut actor_idxs: Vec<usize> = subtree
                     .iter()
-                    .filter_map(|id| {
-                        self.state
-                            .scene
-                            .actors
-                            .iter()
-                            .position(|a| &a.id == id)
-                    })
+                    .filter_map(|id| self.state.scene.actors.iter().position(|a| &a.id == id))
                     .collect();
                 overlay_idxs.sort_unstable();
                 overlay_idxs.dedup();
@@ -2650,28 +2919,27 @@ impl App {
                         self.frame_extract_results.remove(idx);
                     }
                 }
-                crate::canvas_image_search::on_overlays_removed(
-                    &mut self.state,
-                    &overlay_idxs,
-                );
+                crate::canvas_image_search::on_overlays_removed(&mut self.state, &overlay_idxs);
                 self.state.selection = Selection::None;
                 self.state.canvas_selection.clear();
                 self.state.multi_select.clear();
-                self.state.status = crate::i18n::t("\u{1F5D1} Overlay deleted.").into();
+                self.state.status = crate::i18n::t("Overlay deleted.").into();
             }
             Selection::Background(i) if i < self.state.scene.backgrounds.len() => {
-                self.state.mutate(|s| { s.backgrounds.remove(i); });
+                self.state.mutate(|s| {
+                    s.backgrounds.remove(i);
+                });
                 self.state.selection = Selection::None;
                 self.state.canvas_selection.clear();
                 self.state.multi_select.clear();
-                self.state.status = crate::i18n::t("\u{1F5D1} Background deleted.").into();
+                self.state.status = crate::i18n::t("Background deleted.").into();
             }
             Selection::Audio(i) if i < self.state.scene.audio.len() => {
                 // Skip if already deleted
                 if self.state.scene.audio[i].deleted {
                     return;
                 }
-                
+
                 // Cascade audio → parent actor: deleting a sound that
                 // is bound to a video clip via `parent_actor` removes
                 // the parent clip too, which then removes every
@@ -2682,8 +2950,12 @@ impl App {
                 // above already handles the video→audio direction).
                 let parent_actor_id = self.state.scene.audio[i].parent_actor.clone();
                 if let Some(parent_id) = parent_actor_id {
-                    if let Some(actor_idx) =
-                        self.state.scene.actors.iter().position(|a| a.id == parent_id)
+                    if let Some(actor_idx) = self
+                        .state
+                        .scene
+                        .actors
+                        .iter()
+                        .position(|a| a.id == parent_id)
                     {
                         // Re-target the selection at the parent and
                         // recurse — the existing actor branch already
@@ -2712,7 +2984,7 @@ impl App {
                 self.state.selection = Selection::None;
                 self.state.canvas_selection.clear();
                 self.state.multi_select.clear();
-                self.state.status = crate::i18n::t("\u{1F5D1} Audio deleted.").into();
+                self.state.status = crate::i18n::t("Audio deleted.").into();
             }
             _ => {}
         }
@@ -2724,9 +2996,11 @@ impl App {
                 let mut dup = self.state.scene.actors[i].clone();
                 dup.id = format!("{}_copy", dup.id);
                 let new_idx = self.state.scene.actors.len();
-                self.state.mutate(move |s| { s.actors.push(dup); });
+                self.state.mutate(move |s| {
+                    s.actors.push(dup);
+                });
                 self.state.selection = Selection::Actor(new_idx);
-                self.state.status = crate::i18n::t("\u{1F4CB} Actor duplicated.").into();
+                self.state.status = crate::i18n::t("Actor duplicated.").into();
             }
             Selection::Overlay(i) if i < self.state.scene.overlays.len() => {
                 let mut dup = self.state.scene.overlays[i].clone();
@@ -2736,17 +3010,21 @@ impl App {
                     memstroy_core::Overlay::Video(v) => v.id = format!("{}_copy", v.id),
                 }
                 let new_idx = self.state.scene.overlays.len();
-                self.state.mutate(move |s| { s.overlays.push(dup); });
+                self.state.mutate(move |s| {
+                    s.overlays.push(dup);
+                });
                 self.state.selection = Selection::Overlay(new_idx);
-                self.state.status = crate::i18n::t("\u{1F4CB} Overlay duplicated.").into();
+                self.state.status = crate::i18n::t("Overlay duplicated.").into();
             }
             Selection::Background(i) if i < self.state.scene.backgrounds.len() => {
                 let mut dup = self.state.scene.backgrounds[i].clone();
                 dup.id = format!("{}_copy", dup.id);
                 let new_idx = self.state.scene.backgrounds.len();
-                self.state.mutate(move |s| { s.backgrounds.push(dup); });
+                self.state.mutate(move |s| {
+                    s.backgrounds.push(dup);
+                });
                 self.state.selection = Selection::Background(new_idx);
-                self.state.status = crate::i18n::t("\u{1F4CB} Background duplicated.").into();
+                self.state.status = crate::i18n::t("Background duplicated.").into();
             }
             _ => {}
         }
@@ -2807,10 +3085,8 @@ impl App {
             return false;
         }
         let mut right = bg.clone();
-        right.id = crate::panels::unique_background_id_in_scene(
-            &self.state.scene.backgrounds,
-            &right.id,
-        );
+        right.id =
+            crate::panels::unique_background_id_in_scene(&self.state.scene.backgrounds, &right.id);
         right.start = t;
         right.duration = end - t;
         let left_dur = t - start;
@@ -2855,7 +3131,7 @@ impl App {
         let right_id = right.id.clone();
         right.t_in = Some(t);
         right.t_out = Some(end);
-        right.source_start = a.source_start + (t - start);
+        right.source_start = a.source_start + (t - start) * a.speed.max(0.0001);
         let original_lane = self.state.actor_track_assignments.get(&i).copied();
         self.state.mutate(move |s| {
             s.actors[i].t_out = Some(t);
@@ -2864,9 +3140,7 @@ impl App {
         crate::split_crop::finish_actor_split(&mut self.state.scene, i, i + 1, t, t);
         let pivot = i + 1;
         let mut shifted: std::collections::HashMap<usize, usize> =
-            std::collections::HashMap::with_capacity(
-                self.state.actor_track_assignments.len() + 1,
-            );
+            std::collections::HashMap::with_capacity(self.state.actor_track_assignments.len() + 1);
         for (k, v) in self.state.actor_track_assignments.iter() {
             let new_k = if *k >= pivot { *k + 1 } else { *k };
             shifted.insert(new_k, *v);
@@ -2890,7 +3164,8 @@ impl App {
             right_source,
         );
         if pivot <= self.frame_extract_results.len() {
-            self.frame_extract_results.insert(pivot, std::sync::Arc::new(std::sync::Mutex::new(None)));
+            self.frame_extract_results
+                .insert(pivot, std::sync::Arc::new(std::sync::Mutex::new(None)));
         }
 
         Some((pivot, right_id))
@@ -2972,26 +3247,18 @@ impl App {
         let mut right = ov.clone();
         match &mut right {
             memstroy_core::Overlay::Text(txt) => {
-                txt.id = crate::panels::unique_overlay_id_in_scene(
-                    &self.state.scene.overlays,
-                    &txt.id,
-                );
+                txt.id =
+                    crate::panels::unique_overlay_id_in_scene(&self.state.scene.overlays, &txt.id);
             }
             memstroy_core::Overlay::Image(im) => {
-                im.id = crate::panels::unique_overlay_id_in_scene(
-                    &self.state.scene.overlays,
-                    &im.id,
-                );
+                im.id =
+                    crate::panels::unique_overlay_id_in_scene(&self.state.scene.overlays, &im.id);
             }
             memstroy_core::Overlay::Video(v) => {
-                v.id = crate::panels::unique_overlay_id_in_scene(
-                    &self.state.scene.overlays,
-                    &v.id,
-                );
+                v.id = crate::panels::unique_overlay_id_in_scene(&self.state.scene.overlays, &v.id);
             }
         }
-        let original_overlay_lane =
-            self.state.overlay_track_assignments.get(&i).copied();
+        let original_overlay_lane = self.state.overlay_track_assignments.get(&i).copied();
         self.state.mutate(move |s| {
             match &mut s.overlays[i] {
                 memstroy_core::Overlay::Text(txt) => txt.t_out = t,
@@ -3025,12 +3292,7 @@ impl App {
     /// original's `parent_actor` value. Returns the right-half
     /// audio's index, or `None` when `t` lies outside the audio's
     /// playable window.
-    fn split_audio_at(
-        &mut self,
-        i: usize,
-        t: f32,
-        right_parent: Option<String>,
-    ) -> Option<usize> {
+    fn split_audio_at(&mut self, i: usize, t: f32, right_parent: Option<String>) -> Option<usize> {
         if i >= self.state.scene.audio.len() {
             return None;
         }
@@ -3043,13 +3305,10 @@ impl App {
             return None;
         }
         let mut right = au.clone();
-        right.id = crate::panels::unique_audio_id_in_scene(
-            &self.state.scene.audio,
-            &au.id,
-        );
+        right.id = crate::panels::unique_audio_id_in_scene(&self.state.scene.audio, &au.id);
         right.t_in = t;
         right.t_out = Some(end);
-        right.source_start = au.source_start + (t - start).max(0.0);
+        right.source_start = au.source_start + (t - start).max(0.0) * au.speed.max(0.0001);
         if let Some(rp) = right_parent {
             right.parent_actor = Some(rp);
         }
@@ -3076,13 +3335,20 @@ impl App {
         // exists (round-robin fallback was being used), compute what
         // lane the timeline draws this audio on RIGHT NOW so both
         // split halves end up on the same lane.
-        let original_lane = self.state.audio_track_assignments.get(&i).copied()
+        let original_lane = self
+            .state
+            .audio_track_assignments
+            .get(&i)
+            .copied()
             .unwrap_or_else(|| {
                 let audio_tracks: Vec<usize> = (0..self.state.tracks.len())
                     .filter(|ti| self.state.tracks[*ti].kind == crate::state::TrackKind::Audio)
                     .collect();
-                if audio_tracks.is_empty() { 0 }
-                else { audio_tracks[i % audio_tracks.len()] }
+                if audio_tracks.is_empty() {
+                    0
+                } else {
+                    audio_tracks[i % audio_tracks.len()]
+                }
             });
         let local_split_left = local_split;
         self.state.mutate(move |s| {
@@ -3104,10 +3370,7 @@ impl App {
             s.audio.insert(i + 1, right);
         });
         let pivot = i + 1;
-        crate::panels::shift_assignments_for_insert(
-            &mut self.state.audio_track_assignments,
-            pivot,
-        );
+        crate::panels::shift_assignments_for_insert(&mut self.state.audio_track_assignments, pivot);
         // Ensure BOTH halves have explicit assignments to the same
         // lane. Without an explicit assignment for the LEFT half, the
         // round-robin fallback in the timeline draw might place it on
@@ -3115,15 +3378,17 @@ impl App {
         // for the RIGHT half — and the user would see the audio jump
         // between lanes after split.
         self.state.audio_track_assignments.insert(i, original_lane);
-        self.state.audio_track_assignments.insert(pivot, original_lane);
+        self.state
+            .audio_track_assignments
+            .insert(pivot, original_lane);
         if pivot <= self.state.audio_waveforms.len() {
-            self.state.audio_waveforms.insert(pivot, crate::state::AudioWaveform::default());
+            self.state
+                .audio_waveforms
+                .insert(pivot, crate::state::AudioWaveform::default());
         }
         if pivot <= self.waveform_extract_results.len() {
-            self.waveform_extract_results.insert(
-                pivot,
-                std::sync::Arc::new(std::sync::Mutex::new(None)),
-            );
+            self.waveform_extract_results
+                .insert(pivot, std::sync::Arc::new(std::sync::Mutex::new(None)));
         }
         Some(pivot)
     }
@@ -3218,7 +3483,7 @@ impl App {
                     s.backgrounds[i].duration = next_end - start;
                     s.backgrounds.remove(i + 1);
                 });
-                self.state.status = crate::i18n::t("\u{1F517} Backgrounds merged.").into();
+                self.state.status = crate::i18n::t("Backgrounds merged.").into();
             }
             Selection::Actor(i) if i + 1 < self.state.scene.actors.len() => {
                 let next = self.state.scene.actors[i + 1].clone();
@@ -3231,10 +3496,12 @@ impl App {
                             s.actors[i].layout.push(kf.clone());
                         }
                     }
-                    s.actors[i].layout.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap());
+                    s.actors[i]
+                        .layout
+                        .sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap());
                     s.actors.remove(i + 1);
                 });
-                self.state.status = crate::i18n::t("\u{1F517} Actors merged.").into();
+                self.state.status = crate::i18n::t("Actors merged.").into();
             }
             Selection::Overlay(i) if i + 1 < self.state.scene.overlays.len() => {
                 let next_end = match &self.state.scene.overlays[i + 1] {
@@ -3250,10 +3517,12 @@ impl App {
                     }
                     s.overlays.remove(i + 1);
                 });
-                self.state.status = crate::i18n::t("\u{1F517} Overlays merged.").into();
+                self.state.status = crate::i18n::t("Overlays merged.").into();
             }
             _ => {
-                self.state.status = crate::i18n::t("\u{26A0} Select an element with a next sibling to merge.").into();
+                self.state.status =
+                    crate::i18n::t("\u{26A0} Select an element with a next sibling to merge.")
+                        .into();
             }
         }
     }
@@ -3269,7 +3538,9 @@ impl App {
 
         // Ensure audio_waveforms vec is sized to match audio tracks
         while self.state.audio_waveforms.len() < num_audio {
-            self.state.audio_waveforms.push(crate::state::AudioWaveform::default());
+            self.state
+                .audio_waveforms
+                .push(crate::state::AudioWaveform::default());
         }
 
         let mut started = 0usize;
@@ -3301,13 +3572,12 @@ impl App {
             let slot_clone = result_slot.clone();
 
             self.rt.as_ref().unwrap().spawn(async move {
-                let peaks =
-                    tokio::task::spawn_blocking(move || {
-                        crate::state::AudioWaveform::extract_peaks(&source_clone, 512)
-                    })
-                    .await
-                    .ok()
-                    .flatten();
+                let peaks = tokio::task::spawn_blocking(move || {
+                    crate::state::AudioWaveform::extract_peaks(&source_clone, 512)
+                })
+                .await
+                .ok()
+                .flatten();
                 if let Ok(mut slot) = slot_clone.lock() {
                     *slot = Some(peaks);
                 }
@@ -3321,15 +3591,15 @@ impl App {
             // Use the existing pattern: store slots in a parallel vec.
             if self.waveform_extract_results.len() <= audio_idx {
                 while self.waveform_extract_results.len() <= audio_idx {
-                    self.waveform_extract_results.push(Arc::new(Mutex::new(None)));
+                    self.waveform_extract_results
+                        .push(Arc::new(Mutex::new(None)));
                 }
             }
             self.waveform_extract_results[audio_idx] = result_slot;
         }
 
         if started > 0 {
-            self.state.status =
-                crate::i18n::t("\u{1F3B5} Extracting audio waveforms...").into();
+            self.state.status = crate::i18n::t("Extracting audio waveforms...").into();
         }
     }
 
@@ -3406,7 +3676,9 @@ impl App {
         while self.state.frame_caches.len() < num_actors {
             let idx = self.state.frame_caches.len();
             let source = self.state.scene.actors[idx].source.clone();
-            self.state.frame_caches.push(crate::video_cache::FrameCache::new(source, idx));
+            self.state
+                .frame_caches
+                .push(crate::video_cache::FrameCache::new(source, idx));
         }
         while self.frame_extract_results.len() < num_actors {
             self.frame_extract_results.push(Arc::new(Mutex::new(None)));
@@ -3470,7 +3742,7 @@ impl App {
             });
         }
 
-        self.state.status = crate::i18n::t("\u{1F3AC} Extracting preview frames...").into();
+        self.state.status = crate::i18n::t("Extracting preview frames...").into();
     }
 
     /// Poll for frame extraction completion across all actors.
@@ -3512,27 +3784,21 @@ impl App {
 
             match outcome {
                 Ok((duration, frame_count, cache_dir)) => {
-                    let actor_t_in = self.state.scene.actors[actor_idx]
-                        .t_in
-                        .unwrap_or(0.0);
-                    let local_for_anim =
-                        (self.state.playhead - actor_t_in).max(0.0);
+                    let actor_t_in = self.state.scene.actors[actor_idx].t_in.unwrap_or(0.0);
+                    let local_for_anim = (self.state.playhead - actor_t_in).max(0.0);
                     let path = self.state.scene.actors[actor_idx].source.clone();
                     let cur_out = self.state.scene.actors[actor_idx].t_out;
                     let ck = self.state.scene.actors[actor_idx].chroma_key.clone();
                     let cc = self.state.scene.actors[actor_idx]
                         .color_correction
                         .sampled_at(local_for_anim);
-                    let effects: Vec<memstroy_core::Effect> = self.state.scene.actors
-                        [actor_idx]
+                    let effects: Vec<memstroy_core::Effect> = self.state.scene.actors[actor_idx]
                         .effects
                         .iter()
                         .map(|e| e.sampled_at(local_for_anim))
                         .collect();
 
-                    self.state
-                        .video_duration_cache
-                        .insert(path, duration);
+                    self.state.video_duration_cache.insert(path, duration);
                     let before = cur_out;
                     crate::split_crop::reconcile_actor_t_out_for_source(
                         &mut self.state.scene.actors[actor_idx],
@@ -3586,7 +3852,10 @@ impl App {
                     Ok(()) => {
                         self.state.status = crate::i18n::t("\u{2705} Saved (.memstroy).").into();
                     }
-                    Err(e) => self.state.status = format!("{} {e}", crate::i18n::t("\u{274C} Save failed:")),
+                    Err(e) => {
+                        self.state.status =
+                            format!("{} {e}", crate::i18n::t("\u{274C} Save failed:"))
+                    }
                 }
             } else {
                 match self.state.scene.save(&path) {
@@ -3596,7 +3865,10 @@ impl App {
                         let layout_path = path.with_extension("layout.json");
                         self.state.save_layout(&layout_path);
                     }
-                    Err(e) => self.state.status = format!("{} {e}", crate::i18n::t("\u{274C} Save failed:")),
+                    Err(e) => {
+                        self.state.status =
+                            format!("{} {e}", crate::i18n::t("\u{274C} Save failed:"))
+                    }
                 }
             }
         } else {
@@ -3621,9 +3893,7 @@ impl App {
                 .map(|s| s.eq_ignore_ascii_case("memstroy"))
                 .unwrap_or(false);
             let result = if is_memstroy {
-                self.state
-                    .save_memstroy(&path)
-                    .map_err(|e| e.to_string())
+                self.state.save_memstroy(&path).map_err(|e| e.to_string())
             } else {
                 self.state
                     .scene
@@ -3645,24 +3915,32 @@ impl App {
                             .unwrap_or(crate::i18n::t("Scene"))
                             .to_string();
                         self.state.scene_tabs[self.state.active_tab].name = name;
-                        self.state.scene_tabs[self.state.active_tab].path =
-                            Some(path.clone());
+                        self.state.scene_tabs[self.state.active_tab].path = Some(path.clone());
                         self.state.sync_scene_to_tab();
                     }
                     self.state.mark_active_tab_saved();
                 }
-                Err(e) => self.state.status = format!("{} {e}", crate::i18n::t("\u{274C} Save failed:")),
+                Err(e) => {
+                    self.state.status = format!("{} {e}", crate::i18n::t("\u{274C} Save failed:"))
+                }
             }
         }
     }
 
     fn run_render(&mut self) {
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("MP4", &["mp4"])
-            .save_file()
-        else {
-            return;
-        };
+        let tx = self.tx.clone();
+        self.state.status = crate::i18n::t("Choosing export path...").into();
+        self.rt.as_ref().unwrap().spawn(async move {
+            let picked = rfd::AsyncFileDialog::new()
+                .add_filter("MP4", &["mp4"])
+                .save_file()
+                .await
+                .map(|file| file.path().to_path_buf());
+            let _ = tx.send(JobEvent::RenderOutputChosen(picked));
+        });
+    }
+
+    fn start_render_to_path(&mut self, path: std::path::PathBuf) {
         self.state.render_progress = Some(crate::state::RenderProgress {
             started: std::time::Instant::now(),
             last_log: String::new(),
@@ -3683,6 +3961,7 @@ impl App {
         // normalised `[0..1]` layout drift off-frame in the export.
         let mut scene_for_render = self.state.scene.clone();
         scene_for_render.output.resolution = scene_for_render.render_frame.resolution;
+        scene_for_render.output.duration = scene_timeline_end(&scene_for_render).max(0.05);
         // Stamp `z_order` on every actor and overlay from the editor's
         // timeline-track assignments. Without this the renderer falls
         // back to its legacy ordering (text-behind-actors → actors →
@@ -3698,10 +3977,7 @@ impl App {
             self.state.assets_root.clone(),
             path,
         );
-        self.state.status = format!(
-            "\u{1F3A5} {}",
-            crate::i18n::t("Rendering..."),
-        );
+        self.state.status = format!("▶ {}", crate::i18n::t("Exporting..."),);
     }
 
     fn run_refresh(&mut self) {
@@ -3710,12 +3986,11 @@ impl App {
         }
         if crate::state::LIBRARY_LOCAL_ONLY {
             self.state.reload_library();
-            self.state.status =
-                crate::i18n::t("\u{1F504} Local library refreshed.").into();
+            self.state.status = crate::i18n::t("Local library refreshed.").into();
             return;
         }
         self.state.refreshing = true;
-        self.state.status = crate::i18n::t("\u{1F504} Refreshing clips via assets-server...").into();
+        self.state.status = crate::i18n::t("Refreshing clips via assets-server...").into();
         spawn_refresh(
             self.rt.as_ref().unwrap().handle(),
             self.tx.clone(),
@@ -3762,7 +4037,7 @@ impl App {
         } else if rp.done {
             format!("\u{2705} {}", crate::i18n::t("Render complete"))
         } else {
-            format!("\u{1F3AC} {}", crate::i18n::t("Rendering..."))
+            format!("▶ {}", crate::i18n::t("Rendering..."))
         };
 
         egui::Window::new(title)
@@ -3807,7 +4082,11 @@ impl App {
                 } else if progress >= 0.05 && progress < 0.999 {
                     let total = elapsed_secs / progress.max(0.001);
                     let remaining = (total - elapsed_secs).max(0.0);
-                    format!(" \u{2014} {} {}", crate::i18n::t("ETA"), format_elapsed(remaining))
+                    format!(
+                        " \u{2014} {} {}",
+                        crate::i18n::t("ETA"),
+                        format_elapsed(remaining)
+                    )
                 } else {
                     String::new()
                 };
@@ -3862,10 +4141,7 @@ impl App {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let can_close = rp.done || rp.error.is_some();
                     if ui
-                        .add_enabled(
-                            can_close,
-                            egui::Button::new(crate::i18n::t("Close")),
-                        )
+                        .add_enabled(can_close, egui::Button::new(crate::i18n::t("Close")))
                         .clicked()
                     {
                         dismiss = true;
@@ -3935,7 +4211,7 @@ impl App {
                 self.state.last_autosave = Some(std::time::Instant::now());
                 self.state.autosave_toast_until =
                     Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
-                self.state.status = crate::i18n::t("\u{1F4BE} Auto-saved").into();
+                self.state.status = crate::i18n::t("Auto-saved").into();
             }
             Err(e) => {
                 self.state.status = format!("{} {e}", crate::i18n::t("\u{26A0} Autosave failed:"));
@@ -3978,14 +4254,18 @@ impl App {
                 ui.label(crate::i18n::t("Restore the auto-saved scene?"));
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    let yes = egui::Button::new(RichText::new(crate::i18n::t("Yes, restore")).color(Color32::WHITE))
-                        .fill(Color32::from_rgb(60, 160, 80));
+                    let yes = egui::Button::new(
+                        RichText::new(crate::i18n::t("Yes, restore")).color(Color32::WHITE),
+                    )
+                    .fill(Color32::from_rgb(60, 160, 80));
                     if ui.add(yes).clicked() {
                         decision = Some("yes");
                         close = true;
                     }
-                    let no = egui::Button::new(RichText::new(crate::i18n::t("No, discard")).color(Color32::WHITE))
-                        .fill(Color32::from_rgb(200, 60, 60));
+                    let no = egui::Button::new(
+                        RichText::new(crate::i18n::t("No, discard")).color(Color32::WHITE),
+                    )
+                    .fill(Color32::from_rgb(200, 60, 60));
                     if ui.add(no).clicked() {
                         decision = Some("no");
                         close = true;
@@ -4013,10 +4293,12 @@ impl App {
                         Ok(scene) => {
                             self.state.scene = scene;
                             self.state.scene_path = None;
-                            self.state.status = crate::i18n::t("\u{2705} Recovered scene loaded.").into();
+                            self.state.status =
+                                crate::i18n::t("\u{2705} Recovered scene loaded.").into();
                         }
                         Err(e) => {
-                            self.state.status = format!("{} {e}", crate::i18n::t("\u{274C} Recovery failed:"));
+                            self.state.status =
+                                format!("{} {e}", crate::i18n::t("\u{274C} Recovery failed:"));
                         }
                     }
                 } else {
@@ -4024,17 +4306,19 @@ impl App {
                         Ok(scene) => {
                             self.state.scene = scene;
                             self.state.scene_path = None;
-                            self.state.status = crate::i18n::t("\u{2705} Recovered scene loaded.").into();
+                            self.state.status =
+                                crate::i18n::t("\u{2705} Recovered scene loaded.").into();
                         }
                         Err(e) => {
-                            self.state.status = format!("{} {e}", crate::i18n::t("\u{274C} Recovery failed:"));
+                            self.state.status =
+                                format!("{} {e}", crate::i18n::t("\u{274C} Recovery failed:"));
                         }
                     }
                 }
-            },
+            }
             Some("no") => {
                 let _ = std::fs::remove_file(&autosave_path);
-                self.state.status = crate::i18n::t("\u{1F5D1} Recovery discarded.").into();
+                self.state.status = crate::i18n::t("Recovery discarded.").into();
             }
             Some("later") => {
                 self.state.status = crate::i18n::t("Recovery postponed.").into();
@@ -4098,9 +4382,7 @@ impl App {
                                     ui.horizontal(|ui| {
                                         ui.label(RichText::new(tpl.icon).size(22.0));
                                         ui.vertical(|ui| {
-                                            ui.label(
-                                                RichText::new(tpl.name).strong().size(13.0),
-                                            );
+                                            ui.label(RichText::new(tpl.name).strong().size(13.0));
                                             ui.label(
                                                 RichText::new(tpl.description)
                                                     .size(10.0)
@@ -4134,19 +4416,96 @@ impl App {
             if idx < templates.len() {
                 let tpl: &'static crate::title_templates::TitleTemplate = &templates[idx];
                 let t_in = playhead;
-                let t_out = (t_in + 3.0).min(scene_dur.max(t_in + 0.1));
+                let t_out = (t_in + 1.0).min(scene_dur.max(t_in + 0.1)).max(t_in + 0.1);
                 let mut new_idx_out: usize = 0;
                 self.state.mutate(|scene| {
-                    new_idx_out = crate::title_templates::add_template_to_scene(
-                        scene, tpl, t_in, t_out,
-                    );
+                    new_idx_out =
+                        crate::title_templates::add_template_to_scene(scene, tpl, t_in, t_out);
                 });
                 self.state.selection = Selection::Overlay(new_idx_out);
-                self.state.status = format!("{} {}", crate::i18n::t("\u{2728} Added title:"), tpl.name);
+                self.state.status =
+                    format!("{} {}", crate::i18n::t("\u{2728} Added title:"), tpl.name);
                 self.state.title_picker_open = false;
             }
         }
     }
+}
+
+pub(crate) fn scene_timeline_end(scene: &Scene) -> f32 {
+    let mut max_end = 0.0_f32;
+    for actor in &scene.actors {
+        max_end = max_end.max(actor.t_out.unwrap_or(scene.output.duration));
+    }
+    for bg in &scene.backgrounds {
+        max_end = max_end.max(bg.start + bg.duration);
+    }
+    for ov in &scene.overlays {
+        let end = match ov {
+            memstroy_core::Overlay::Text(t) => t.t_out,
+            memstroy_core::Overlay::Image(i) => i.t_out,
+            memstroy_core::Overlay::Video(v) => v.t_out,
+        };
+        max_end = max_end.max(end);
+    }
+    for audio in &scene.audio {
+        if audio.deleted {
+            continue;
+        }
+        max_end = max_end.max(audio.t_out.unwrap_or(scene.output.duration));
+    }
+    max_end
+}
+
+fn library_asset_from_download(
+    path: &std::path::Path,
+    kind: crate::state::AssetDragKind,
+) -> crate::state::LibraryAsset {
+    let id = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("server_asset")
+        .to_string();
+    let thumbnail = if matches!(
+        kind,
+        crate::state::AssetDragKind::Image | crate::state::AssetDragKind::Particle
+    ) {
+        Some(path.to_path_buf())
+    } else {
+        None
+    };
+    crate::state::LibraryAsset {
+        id: id.clone(),
+        path: path.to_path_buf(),
+        label: id,
+        thumbnail,
+        downloaded: true,
+        server_id: None,
+        duration_secs: None,
+        width: None,
+        height: None,
+    }
+}
+
+fn position_last_overlay_at_world(state: &mut EditorState, world: [f32; 2]) {
+    let rf = &state.scene.render_frame;
+    let [rw, rh] = rf.resolution;
+    let world_w = (rw as f32).max(1.0);
+    let world_h = (rh as f32).max(1.0);
+    if let Some(last) = state.scene.overlays.last_mut() {
+        let layout = match last {
+            memstroy_core::Overlay::Image(im) => &mut im.layout,
+            memstroy_core::Overlay::Video(v) => &mut v.layout,
+            memstroy_core::Overlay::Text(t) => &mut t.layout,
+        };
+        if let Some(kf) = layout.first_mut() {
+            kf.value.pos = [
+                crate::editor_limits::clamp_pos_norm(world[0] / world_w),
+                crate::editor_limits::clamp_pos_norm(world[1] / world_h),
+            ];
+        }
+    }
+    let overlay_idx = state.scene.overlays.len().saturating_sub(1);
+    crate::canvas_image_search::sync_overlay_canvas_world_center(state, overlay_idx, world);
 }
 
 /// Parse ffmpeg time output like "time=00:00:04.00" and return seconds.
@@ -4262,10 +4621,7 @@ struct ClipboardDrain {
 /// widget can process them natively. We still report which kinds
 /// were observed so the chord-fallback path stays consistent, but
 /// no events are removed.
-fn swallow_clipboard_events(
-    ctx: &egui::Context,
-    let_text_widget_handle: bool,
-) -> ClipboardDrain {
+fn swallow_clipboard_events(ctx: &egui::Context, let_text_widget_handle: bool) -> ClipboardDrain {
     let mut out = ClipboardDrain::default();
     ctx.input_mut(|input| {
         input.events.retain(|ev| match ev {
@@ -4338,15 +4694,21 @@ impl eframe::App for App {
 
         // Auto-start frame extraction for actors that have source files
         if !self.state.scene.actors.is_empty() {
-            let needs_extraction = self.state.scene.actors.iter().enumerate().any(|(i, actor)| {
-                EditorState::is_usable_local_video(&actor.source)
-                    && self
-                        .state
-                        .frame_caches
-                        .get(i)
-                        .map(|fc| fc.failed || (!fc.is_ready() && !fc.extracting))
-                        .unwrap_or(true)
-            });
+            let needs_extraction = self
+                .state
+                .scene
+                .actors
+                .iter()
+                .enumerate()
+                .any(|(i, actor)| {
+                    EditorState::is_usable_local_video(&actor.source)
+                        && self
+                            .state
+                            .frame_caches
+                            .get(i)
+                            .map(|fc| fc.failed || (!fc.is_ready() && !fc.extracting))
+                            .unwrap_or(true)
+                });
             if needs_extraction {
                 self.start_frame_extraction();
             }
@@ -4359,9 +4721,11 @@ impl eframe::App for App {
             let needs_wf = self.state.scene.audio.iter().enumerate().any(|(i, au)| {
                 !au.deleted
                     && au.source.exists()
-                    && self.state.audio_waveforms.get(i).is_none_or(|wf| {
-                        !wf.ready && !wf.extracting && !wf.failed
-                    })
+                    && self
+                        .state
+                        .audio_waveforms
+                        .get(i)
+                        .is_none_or(|wf| !wf.ready && !wf.extracting && !wf.failed)
             });
             if needs_wf {
                 self.start_waveform_extraction();
@@ -4424,9 +4788,7 @@ impl eframe::App for App {
         // Note: `frame_start_scene` is captured above, before shortcuts.
 
         let any_pointer_down = ctx.input(|i| {
-            i.pointer.primary_down()
-                || i.pointer.secondary_down()
-                || i.pointer.middle_down()
+            i.pointer.primary_down() || i.pointer.secondary_down() || i.pointer.middle_down()
         });
 
         // Play/pause: advance playhead
@@ -4452,8 +4814,7 @@ impl eframe::App for App {
             // playhead stops at the end (and playback is paused) instead of
             // restarting; when ON it wraps to 0 (or to the loop region start
             // handled above).
-            if self.state.playhead >= self.state.scene.output.duration
-                || self.state.playhead < 0.0
+            if self.state.playhead >= self.state.scene.output.duration || self.state.playhead < 0.0
             {
                 if self.state.loop_mode {
                     self.state.playhead = 0.0;
@@ -4483,7 +4844,11 @@ impl eframe::App for App {
 
         // Top menu bar
         egui::TopBottomPanel::top("menu")
-            .frame(egui::Frame::none().fill(Color32::from_rgb(30, 28, 20)).inner_margin(6.0))
+            .frame(
+                egui::Frame::none()
+                    .fill(Color32::from_rgb(30, 28, 20))
+                    .inner_margin(6.0),
+            )
             .show(ctx, |ui| self.menu(ctx, ui));
 
         // ── Tab bar for multiple scenes ──
@@ -4563,9 +4928,7 @@ impl eframe::App for App {
         // hover position to None on the same frame the OS drop event
         // arrives, which would mis-route the file to the canvas. The
         // latest_pos snapshot survives the gap.
-        let drop_pointer = ctx.input(|i| {
-            i.pointer.latest_pos().or_else(|| i.pointer.hover_pos())
-        });
+        let drop_pointer = ctx.input(|i| i.pointer.latest_pos().or_else(|| i.pointer.hover_pos()));
         let lib_rect = self.state.library_panel_rect;
         let pointer_in_library = match (drop_pointer, lib_rect) {
             (Some(p), Some(r)) => r.contains(p),
@@ -4573,18 +4936,18 @@ impl eframe::App for App {
         };
         if !dropped_files.is_empty() {
             for file in &dropped_files {
-                let Some(path) = &file.path else { continue; };
+                let Some(path) = &file.path else {
+                    continue;
+                };
                 let ext = path
                     .extension()
                     .and_then(|e| e.to_str())
                     .unwrap_or("")
                     .to_lowercase();
-                let is_video = ["mp4", "mov", "webm", "avi", "mkv", "m4v"]
-                    .contains(&ext.as_str());
-                let is_image =
-                    ["jpg", "jpeg", "png", "webp", "gif"].contains(&ext.as_str());
-                let is_audio = ["mp3", "wav", "ogg", "flac", "aac", "m4a", "opus"]
-                    .contains(&ext.as_str());
+                let is_video = ["mp4", "mov", "webm", "avi", "mkv", "m4v"].contains(&ext.as_str());
+                let is_image = ["jpg", "jpeg", "png", "webp", "gif"].contains(&ext.as_str());
+                let is_audio =
+                    ["mp3", "wav", "ogg", "flac", "aac", "m4a", "opus"].contains(&ext.as_str());
                 if !(is_video || is_image || is_audio) {
                     continue;
                 }
@@ -4600,8 +4963,7 @@ impl eframe::App for App {
                     // library panel — otherwise images dropped on the
                     // canvas always go into Images.
                     if pointer_in_library
-                        && self.state.library_tab
-                            == crate::state::LibraryTab::Particles
+                        && self.state.library_tab == crate::state::LibraryTab::Particles
                     {
                         self.state.particles_dir()
                     } else {
@@ -4611,8 +4973,12 @@ impl eframe::App for App {
                     self.state.sounds_dir()
                 };
                 if let Err(err) = std::fs::create_dir_all(&dest_dir) {
-                    self.state.status =
-                        format!("{} {}: {}", crate::i18n::t("Couldn't create"), dest_dir.display(), err);
+                    self.state.status = format!(
+                        "{} {}: {}",
+                        crate::i18n::t("Couldn't create"),
+                        dest_dir.display(),
+                        err
+                    );
                     continue;
                 }
                 let file_name = path
@@ -4663,19 +5029,21 @@ impl eframe::App for App {
                         }
                     }
                 };
-                if !copied_ok { continue; }
+                if !copied_ok {
+                    continue;
+                }
 
-                // Refresh the library so the new file shows up on the
-                // panel. Switch the visible tab to the matching kind
-                // when the drop landed on the library panel itself
-                // (otherwise leave the user where they are).
-                self.state.reload_library();
+                // Refresh the library through the same background path
+                // used by external file drops. That path generates
+                // missing video thumbnails before the scan, so OS-dropped
+                // videos get preview images just like files copied into
+                // assets/videos directly.
+                self.schedule_library_reload();
                 if pointer_in_library {
                     self.state.library_tab = if is_video {
                         crate::state::LibraryTab::Videos
                     } else if is_image
-                        && self.state.library_tab
-                            != crate::state::LibraryTab::Particles
+                        && self.state.library_tab != crate::state::LibraryTab::Particles
                     {
                         crate::state::LibraryTab::Images
                     } else if is_audio {
@@ -4697,23 +5065,15 @@ impl eframe::App for App {
                 //    add the (now-library-resident) copy to the scene
                 //    on its own brand-new / first-empty layer.
                 if is_video {
-                    // `add_actor_from_clip` creates a matching AudioTrack
-                    // and pre-loads any per-clip chroma/skeleton sidecars.
-                    crate::panels::add_actor_from_clip(&mut self.state, &dest);
-                    // Pin the freshly added actor onto the first empty
-                    // video lane (or a newly-inserted one) so canvas
-                    // drops always create a clean layer instead of
-                    // stacking on top of whatever was already on V1.
-                    if let Some(new_idx) =
-                        self.state.scene.actors.len().checked_sub(1)
-                    {
-                        let t = self.state.playhead;
-                        let lane = self.state.pick_or_create_empty_video_lane_at(t);
-                        self.state.actor_track_assignments.insert(new_idx, lane);
-                    }
+                    // User-imported videos are regular video elements:
+                    // they get audio/chroma sidecars, but not Mellstroy
+                    // footage sequence controls by default.
+                    crate::panels::add_actor_from_video_asset(&mut self.state, &dest);
                 } else if is_image {
                     let t_in = self.state.playhead;
-                    let t_out = (t_in + 3.0).min(self.state.scene.output.duration).max(t_in + 0.1);
+                    let t_out = (t_in + 1.0)
+                        .min(self.state.scene.output.duration.max(t_in + 0.1))
+                        .max(t_in + 0.1);
                     let id_base = dest
                         .file_stem()
                         .and_then(|s| s.to_str())
@@ -4722,8 +5082,7 @@ impl eframe::App for App {
                     let source = dest.clone();
                     let mut placed_id = id_base.clone();
                     self.state.mutate_state(|s| {
-                        placed_id =
-                            crate::state::unique_overlay_id(&s.scene.overlays, &id_base);
+                        placed_id = crate::state::unique_overlay_id(&s.scene.overlays, &id_base);
                         let lane = s.pick_or_create_empty_video_lane_for_range(t_in, t_out);
                         let new_idx = s.scene.overlays.len();
                         s.scene.overlays.push(memstroy_core::Overlay::Image(
@@ -4755,7 +5114,9 @@ impl eframe::App for App {
                         crate::i18n::t("saved to library")
                     );
                 } else if is_audio {
-                    let id = dest.file_stem().and_then(|s| s.to_str())
+                    let id = dest
+                        .file_stem()
+                        .and_then(|s| s.to_str())
                         .map(|s| s.to_string())
                         .unwrap_or_else(|| format!("audio_{}", self.state.scene.audio.len() + 1));
                     self.state.scene.audio.push(memstroy_core::AudioTrack {
@@ -4765,7 +5126,12 @@ impl eframe::App for App {
                         ..Default::default()
                     });
                     self.state.selection = Selection::Audio(self.state.scene.audio.len() - 1);
-                    self.state.status = format!("{} {} ({})", crate::i18n::t("Dropped audio:"), id, crate::i18n::t("saved to library"));
+                    self.state.status = format!(
+                        "{} {} ({})",
+                        crate::i18n::t("Dropped audio:"),
+                        id,
+                        crate::i18n::t("saved to library")
+                    );
                 }
             }
         }
@@ -4791,10 +5157,25 @@ impl eframe::App for App {
         // including every actor unconditionally is safe.
         let build_sources = |state: &EditorState| -> Vec<crate::audio_engine::AudioSourceSpec> {
             let mut out = Vec::new();
-            let mut seen: std::collections::HashSet<std::path::PathBuf> =
-                std::collections::HashSet::new();
+            let resolve_audio_path = |path: &std::path::PathBuf| {
+                if path.is_absolute() {
+                    path.clone()
+                } else {
+                    state.assets_root.join(path)
+                }
+            };
+            let explicit_actor_audio: std::collections::HashSet<usize> = state
+                .scene
+                .audio
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| !a.deleted)
+                .filter_map(|(idx, _)| infer_actor_for_audio_in_scene(&state.scene, idx))
+                .collect();
             for a in &state.scene.audio {
-                if a.deleted { continue; }
+                if a.deleted {
+                    continue;
+                }
                 // Sample every animatable field at the playhead's
                 // clip-local time so a freshly-built sink reflects the
                 // user's animated values at the current moment. The
@@ -4803,7 +5184,7 @@ impl eframe::App for App {
                 // `signature()` between frames and rebuilding.
                 let t_local = (state.playhead - a.t_in).max(0.0);
                 out.push(crate::audio_engine::AudioSourceSpec {
-                    path: a.source.clone(),
+                    path: resolve_audio_path(&a.source),
                     t_in: a.t_in,
                     t_out: a.t_out,
                     source_start: a.source_start,
@@ -4818,22 +5199,33 @@ impl eframe::App for App {
                     mute: a.mute,
                     reverb: a.reverb_at(t_local),
                 });
-                seen.insert(a.source.clone());
             }
-            for actor in &state.scene.actors {
-                if !actor.visible { continue; }
+            for (actor_idx, actor) in state.scene.actors.iter().enumerate() {
+                if !actor.visible {
+                    continue;
+                }
                 // Honour explicit user intent: if the actor's embedded audio
                 // was muted (e.g. because the user deleted/unlinked+deleted
                 // its audio row), do not auto-mix the fallback source.
-                if actor.mute_audio { continue; }
-                if seen.contains(&actor.source) { continue; }
+                if actor.mute_audio {
+                    continue;
+                }
+                // An explicit row bound to this actor is the source of
+                // truth for that clip's audio, including mute/volume and
+                // split windows. Do not dedupe by source path: after a
+                // split or copy, multiple actor clips can legitimately
+                // use the same file and must each schedule their own
+                // audio window.
+                if explicit_actor_audio.contains(&actor_idx) {
+                    continue;
+                }
                 out.push(crate::audio_engine::AudioSourceSpec {
-                    path: actor.source.clone(),
+                    path: resolve_audio_path(&actor.source),
                     t_in: actor.t_in.unwrap_or(0.0),
                     t_out: actor.t_out,
                     source_start: actor.source_start,
                     volume: 1.0,
-                    speed: 1.0,
+                    speed: actor.speed,
                     ..Default::default()
                 });
             }
@@ -4854,17 +5246,21 @@ impl eframe::App for App {
 
         // Detect a seek (playhead jumped further than a sane frame's worth).
         let dt = ctx.input(|i| i.stable_dt).min(0.1);
-        let expected_step = if self.state.playing { dt * self.state.playback_speed.abs() } else { 0.0 };
+        let expected_step = if self.state.playing {
+            dt * self.state.playback_speed.abs()
+        } else {
+            0.0
+        };
         let actual_delta = self.state.playhead - self.prev_playhead;
-        let seeked = (actual_delta - expected_step).abs() > 0.15
-            || actual_delta < -0.05;
+        let seeked = (actual_delta - expected_step).abs() > 0.15 || actual_delta < -0.05;
 
         if self.state.playing && !self.was_playing {
             // Transition: paused → playing. Start playback at the current playhead.
             let sources = build_sources(&self.state);
             self.prev_audio_source_count = sources.len();
             self.prev_audio_signature = signature_of(&sources);
-            self.audio_engine.play_sources(&sources, self.state.playhead);
+            self.audio_engine
+                .play_sources(&sources, self.state.playhead);
         } else if !self.state.playing && self.was_playing {
             // Transition: playing → paused.
             self.audio_engine.pause();
@@ -4873,7 +5269,8 @@ impl eframe::App for App {
             let sources = build_sources(&self.state);
             self.prev_audio_source_count = sources.len();
             self.prev_audio_signature = signature_of(&sources);
-            self.audio_engine.play_sources(&sources, self.state.playhead);
+            self.audio_engine
+                .play_sources(&sources, self.state.playhead);
         } else if self.state.playing {
             // Live mid-playback rebuild: any time a spec field changes
             // (slider edits, kf track edits, mute toggle, …) the new
@@ -4890,7 +5287,8 @@ impl eframe::App for App {
             if count_changed || params_changed {
                 self.prev_audio_source_count = sources.len();
                 self.prev_audio_signature = new_sig;
-                self.audio_engine.play_sources(&sources, self.state.playhead);
+                self.audio_engine
+                    .play_sources(&sources, self.state.playhead);
             }
         }
 
@@ -5019,7 +5417,10 @@ impl eframe::App for App {
                 // per second, which is the dominant cost with 6+ actors.
                 // The visual difference between 30fps and 60fps preview
                 // is negligible for editing purposes.
-                let ready_count = self.state.frame_caches.iter()
+                let ready_count = self
+                    .state
+                    .frame_caches
+                    .iter()
                     .filter(|fc| fc.is_ready())
                     .count();
                 let interval_ms = if ready_count >= 5 { 33 } else { 16 };
@@ -5055,9 +5456,7 @@ impl eframe::App for App {
         // recursive Float fields make that fragile.
         let released_this_frame = ctx.input(|i| i.pointer.any_released());
         let any_pointer_still_down = ctx.input(|i| {
-            i.pointer.primary_down()
-                || i.pointer.secondary_down()
-                || i.pointer.middle_down()
+            i.pointer.primary_down() || i.pointer.secondary_down() || i.pointer.middle_down()
         });
         let mut release_block_handled_undo = false;
         if released_this_frame && !any_pointer_still_down {
@@ -5066,14 +5465,11 @@ impl eframe::App for App {
                 release_block_handled_undo = true;
                 if !mutate_drag_handled {
                     let pre_yaml = serde_yaml::to_string(&pre.scene).unwrap_or_default();
-                    let cur_yaml =
-                        serde_yaml::to_string(&self.state.scene).unwrap_or_default();
+                    let cur_yaml = serde_yaml::to_string(&self.state.scene).unwrap_or_default();
                     let assignments_changed = pre.actor_track_assignments
                         != self.state.actor_track_assignments
-                        || pre.overlay_track_assignments
-                            != self.state.overlay_track_assignments
-                        || pre.audio_track_assignments
-                            != self.state.audio_track_assignments;
+                        || pre.overlay_track_assignments != self.state.overlay_track_assignments
+                        || pre.audio_track_assignments != self.state.audio_track_assignments;
                     if pre_yaml != cur_yaml || assignments_changed {
                         self.state.undo.push_full(pre);
                     }
@@ -5104,16 +5500,13 @@ impl eframe::App for App {
             && self.state.pre_press_scene.is_none()
             && !self.state.frame_undo_fallback_suppressed
         {
-            let pre_yaml =
-                serde_yaml::to_string(&frame_start_scene.scene).unwrap_or_default();
-            let cur_yaml =
-                serde_yaml::to_string(&self.state.scene).unwrap_or_default();
+            let pre_yaml = serde_yaml::to_string(&frame_start_scene.scene).unwrap_or_default();
+            let cur_yaml = serde_yaml::to_string(&self.state.scene).unwrap_or_default();
             let assignments_changed = frame_start_scene.actor_track_assignments
                 != self.state.actor_track_assignments
                 || frame_start_scene.overlay_track_assignments
                     != self.state.overlay_track_assignments
-                || frame_start_scene.audio_track_assignments
-                    != self.state.audio_track_assignments;
+                || frame_start_scene.audio_track_assignments != self.state.audio_track_assignments;
             if pre_yaml != cur_yaml || assignments_changed {
                 self.state.undo.push_full(frame_start_scene);
             }
@@ -5136,20 +5529,26 @@ impl eframe::App for App {
                     .resizable(false)
                     .collapsible(false)
                     .anchor(egui::Align2::CENTER_TOP, [0.0, 50.0])
-                    .frame(egui::Frame::popup(&ctx.style())
-                        .fill(Color32::from_rgb(40, 38, 26))
-                        .inner_margin(egui::Margin::same(16.0)))
+                    .frame(
+                        egui::Frame::popup(&ctx.style())
+                            .fill(Color32::from_rgb(40, 38, 26))
+                            .inner_margin(egui::Margin::same(16.0)),
+                    )
                     .show(ctx, |ui| {
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new("📢").size(18.0));
-                            ui.label(RichText::new("Следите за обновлениями и жалуйтесь на баги в telegram: ")
+                            ui.label(RichText::new("!").size(18.0));
+                            ui.label(
+                                RichText::new(
+                                    "Следите за обновлениями и жалуйтесь на баги в telegram: ",
+                                )
                                 .size(13.0)
-                                .color(Color32::from_rgb(220, 220, 220)));
+                                .color(Color32::from_rgb(220, 220, 220)),
+                            );
                             ui.hyperlink_to(
                                 RichText::new("https://t.me/memstroy_inator")
                                     .size(13.0)
                                     .color(Color32::from_rgb(255, 242, 0)),
-                                "https://t.me/memstroy_inator"
+                                "https://t.me/memstroy_inator",
                             );
                         });
                     });

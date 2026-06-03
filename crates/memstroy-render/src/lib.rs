@@ -15,19 +15,19 @@
 //! The built command is also exposed via [`build_plan`] so the GUI
 //! can show it for debugging.
 
-pub mod plan;
-pub mod filtergraph;
-pub mod runner;
-pub mod fonts;
-pub mod text_rasterize;
-pub mod proc;
 pub mod compositor;
 mod expr;
+pub mod filtergraph;
+pub mod fonts;
+pub mod plan;
+pub mod proc;
+pub mod runner;
+pub mod text_rasterize;
 
-pub use plan::*;
+pub use compositor::{render_preview_frame_cpu, render_scene_cpu};
 pub use filtergraph::*;
-pub use runner::*;
 pub use fonts::*;
-pub use text_rasterize::*;
+pub use plan::*;
 pub use proc::*;
-pub use compositor::{render_scene_cpu, render_preview_frame_cpu};
+pub use runner::*;
+pub use text_rasterize::*;

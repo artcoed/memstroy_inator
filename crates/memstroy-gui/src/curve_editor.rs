@@ -17,9 +17,7 @@
 use std::collections::BTreeSet;
 
 use egui::{Color32, Pos2, Rect, Rounding, Sense, Stroke, Vec2};
-use memstroy_core::{
-    param_ids, ActorState, Easing, Keyframe, OverlayState, RenderFrameState,
-};
+use memstroy_core::{param_ids, ActorState, Easing, Keyframe, OverlayState, RenderFrameState};
 
 /// Property indices for the curve editor (transform parameters).
 pub const PROP_SCALE: usize = 0;
@@ -99,8 +97,7 @@ pub enum CurveEditorTarget<'a> {
     },
 }
 
-const PROPERTY_NAMES: &[&str] =
-    &["Scale", "Pos X", "Pos Y", "Opacity", "Rotation"];
+const PROPERTY_NAMES: &[&str] = &["Scale", "Pos X", "Pos Y", "Opacity", "Rotation"];
 
 /// Map a transform-property slot to the param-id used in
 /// `animated_params`.
@@ -270,10 +267,7 @@ fn easing_picker(ui: &mut egui::Ui, current: Easing) -> Option<Easing> {
                 Easing::Cubic,
                 Easing::Step,
             ] {
-                if ui
-                    .selectable_label(current == e, easing_label(e))
-                    .clicked()
-                {
+                if ui.selectable_label(current == e, easing_label(e)).clicked() {
                     picked = Some(e);
                 }
             }
@@ -290,6 +284,69 @@ fn easing_label(e: Easing) -> &'static str {
         Easing::Cubic => crate::i18n::t("Cubic"),
         Easing::Step => crate::i18n::t("Step (hold)"),
     }
+}
+
+fn easing_presets() -> [Easing; 6] {
+    [
+        Easing::Linear,
+        Easing::EaseIn,
+        Easing::EaseOut,
+        Easing::EaseInOut,
+        Easing::Cubic,
+        Easing::Step,
+    ]
+}
+
+fn easing_icon_button(ui: &mut egui::Ui, easing: Easing, selected: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(38.0, 24.0), Sense::click());
+    let fill = if selected {
+        Color32::from_rgb(58, 50, 22)
+    } else if resp.hovered() {
+        Color32::from_rgb(34, 32, 22)
+    } else {
+        Color32::from_rgb(22, 21, 14)
+    };
+    ui.painter().rect_filled(rect, Rounding::same(4.0), fill);
+    ui.painter().rect_stroke(
+        rect,
+        Rounding::same(4.0),
+        Stroke::new(
+            if selected { 1.5 } else { 1.0 },
+            if selected {
+                Color32::from_rgb(255, 210, 80)
+            } else {
+                Color32::from_rgb(70, 68, 45)
+            },
+        ),
+    );
+
+    let plot = rect.shrink2(Vec2::new(6.0, 5.0));
+    let mut prev = Pos2::new(plot.min.x, plot.max.y);
+    let samples = 18;
+    for i in 1..=samples {
+        let x = i as f32 / samples as f32;
+        let y = easing.apply(x);
+        let p = Pos2::new(
+            plot.min.x + x * plot.width(),
+            plot.max.y - y * plot.height(),
+        );
+        if matches!(easing, Easing::Step) && i == samples / 2 {
+            let mid = Pos2::new(p.x, prev.y);
+            ui.painter().line_segment(
+                [prev, mid],
+                Stroke::new(1.4, Color32::from_rgb(220, 230, 255)),
+            );
+            ui.painter()
+                .line_segment([mid, p], Stroke::new(1.4, Color32::from_rgb(220, 230, 255)));
+        } else {
+            ui.painter().line_segment(
+                [prev, p],
+                Stroke::new(1.4, Color32::from_rgb(220, 230, 255)),
+            );
+        }
+        prev = p;
+    }
+    resp
 }
 
 /// Draw the curve editor panel for the given target.
@@ -397,7 +454,10 @@ pub fn curve_editor_panel(
                 panning,
             );
         }
-        CurveEditorTarget::RenderFrame { layout, animated_params } => {
+        CurveEditorTarget::RenderFrame {
+            layout,
+            animated_params,
+        } => {
             let seed_t = playhead.clamp(0.0, duration);
             let mut no_canvas: Option<&mut Vec<Keyframe<memstroy_core::CanvasTransform>>> = None;
             transform_curve_editor::<RenderFrameState>(
@@ -762,7 +822,13 @@ fn actor_curve_rekey(
 ) {
     let canvas = canvas_slot.as_mut().map(|cl| &mut **cl);
     crate::kf_anim::curve_rekey_actor_param(
-        layout, canvas, animated_params, param_id, old_t, new_t, value,
+        layout,
+        canvas,
+        animated_params,
+        param_id,
+        old_t,
+        new_t,
+        value,
     );
 }
 
@@ -800,7 +866,13 @@ fn overlay_curve_rekey(
 ) {
     let canvas = canvas_slot.as_mut().map(|cl| &mut **cl);
     crate::kf_anim::curve_rekey_overlay_param(
-        layout, canvas, animated_params, param_id, old_t, new_t, value,
+        layout,
+        canvas,
+        animated_params,
+        param_id,
+        old_t,
+        new_t,
+        value,
     );
 }
 
@@ -835,7 +907,12 @@ fn render_frame_curve_rekey(
     value: f32,
 ) {
     memstroy_core::rekey_render_frame_param_keyframe(
-        layout, animated_params, param_id, old_t, new_t, value,
+        layout,
+        animated_params,
+        param_id,
+        old_t,
+        new_t,
+        value,
     );
 }
 
@@ -965,9 +1042,10 @@ fn transform_curve_editor<T>(
         // Only show properties that are flagged as animated.
         // If none are animated, show all as a fallback so the user
         // can still pick one to start animating.
-        let any_animated = PROPERTY_NAMES.iter().enumerate().any(|(i, _)| {
-            animated_params.contains(prop_to_param_id(i))
-        });
+        let any_animated = PROPERTY_NAMES
+            .iter()
+            .enumerate()
+            .any(|(i, _)| animated_params.contains(prop_to_param_id(i)));
         for (i, name) in PROPERTY_NAMES.iter().enumerate() {
             let param_id = prop_to_param_id(i);
             let is_animated = animated_params.contains(param_id);
@@ -1036,9 +1114,10 @@ fn transform_curve_editor<T>(
     ui.add_space(4.0);
 
     // ── Check if any parameters are animated ──
-    let any_animated = PROPERTY_NAMES.iter().enumerate().any(|(i, _)| {
-        animated_params.contains(prop_to_param_id(i))
-    });
+    let any_animated = PROPERTY_NAMES
+        .iter()
+        .enumerate()
+        .any(|(i, _)| animated_params.contains(prop_to_param_id(i)));
 
     if !any_animated {
         // Defensive: the early-return above already covers this path,
@@ -1055,8 +1134,7 @@ fn transform_curve_editor<T>(
     let param_id = prop_to_param_id(prop);
     let param_points: Vec<ParamCurvePoint> = {
         let canvas_slice = canvas_slot.as_ref().map(|cl| cl.as_slice());
-        let change_times =
-            param_change_times(keyframes, animated_params, canvas_slice, param_id);
+        let change_times = param_change_times(keyframes, animated_params, canvas_slice, param_id);
         change_times
             .iter()
             .map(|&t| {
@@ -1080,13 +1158,7 @@ fn transform_curve_editor<T>(
                             (v, kf.easing)
                         } else {
                             (
-                                sample_param(
-                                    keyframes,
-                                    canvas_slice,
-                                    animated_params,
-                                    param_id,
-                                    t,
-                                ),
+                                sample_param(keyframes, canvas_slice, animated_params, param_id, t),
                                 Easing::Linear,
                             )
                         }
@@ -1125,13 +1197,9 @@ fn transform_curve_editor<T>(
                 headline_easing = Some((nearest_source, next));
             }
             ui.label(
-                egui::RichText::new(format!(
-                    "kf #{} @ {:.2}s",
-                    nearest_pi + 1,
-                    nearest_t,
-                ))
-                .size(10.0)
-                .color(Color32::from_rgb(120, 120, 140)),
+                egui::RichText::new(format!("kf #{} @ {:.2}s", nearest_pi + 1, nearest_t,))
+                    .size(10.0)
+                    .color(Color32::from_rgb(120, 120, 140)),
             );
         });
         if let Some((source, next)) = headline_easing {
@@ -1142,11 +1210,11 @@ fn transform_curve_editor<T>(
                     }
                 }
                 ParamKeyframeSource::Canvas(i) => {
-                if let Some(cl) = canvas_slot.as_mut().map(|v| &mut **v) {
-                    if let Some(kf) = cl.get_mut(i) {
-                        kf.easing = next;
+                    if let Some(cl) = canvas_slot.as_mut().map(|v| &mut **v) {
+                        if let Some(kf) = cl.get_mut(i) {
+                            kf.easing = next;
+                        }
                     }
-                }
                 }
             }
         }
@@ -1165,7 +1233,11 @@ fn transform_curve_editor<T>(
 
     let painter = ui.painter_at(graph_rect);
 
-    painter.rect_filled(graph_rect, Rounding::same(4.0), Color32::from_rgb(16, 15, 8));
+    painter.rect_filled(
+        graph_rect,
+        Rounding::same(4.0),
+        Color32::from_rgb(16, 15, 8),
+    );
     painter.rect_stroke(
         graph_rect,
         Rounding::same(4.0),
@@ -1180,7 +1252,9 @@ fn transform_curve_editor<T>(
 
     // Handle mouse wheel zoom
     let scroll_delta = ui.input(|i| i.smooth_scroll_delta.y);
-    if scroll_delta.abs() > 0.1 && graph_rect.contains(ui.input(|i| i.pointer.hover_pos().unwrap_or_default())) {
+    if scroll_delta.abs() > 0.1
+        && graph_rect.contains(ui.input(|i| i.pointer.hover_pos().unwrap_or_default()))
+    {
         let zoom_factor = 1.0 + scroll_delta * 0.001;
         *zoom = (*zoom * zoom_factor).clamp(0.1, 10.0);
     }
@@ -1188,11 +1262,13 @@ fn transform_curve_editor<T>(
     // Handle RMB panning
     let rmb_down = ui.input(|i| i.pointer.secondary_down());
     let rmb_pressed = ui.input(|i| i.pointer.secondary_pressed());
-    
-    if rmb_pressed && graph_rect.contains(ui.input(|i| i.pointer.press_origin().unwrap_or_default())) {
+
+    if rmb_pressed
+        && graph_rect.contains(ui.input(|i| i.pointer.press_origin().unwrap_or_default()))
+    {
         *panning = true;
     }
-    
+
     if *panning {
         if rmb_down {
             let delta = ui.input(|i| i.pointer.delta());
@@ -1200,7 +1276,7 @@ fn transform_curve_editor<T>(
             let (val_min_base, val_max_base) = property_range(prop);
             let time_span = duration.max(0.1) / *zoom;
             let value_span = (val_max_base - val_min_base) / *zoom;
-            
+
             pan_offset.x -= delta.x * time_span / graph_width;
             pan_offset.y += delta.y * value_span / graph_height;
         } else {
@@ -1254,10 +1330,13 @@ fn transform_curve_editor<T>(
     }
 
     let curve_color = property_color(prop);
+    let segment_id = ui.make_persistent_id(("curve_segment", active_param_id));
+    let mut selected_segment = ui.data(|d| d.get_temp::<usize>(segment_id));
+    let mut easing_change: Option<(crate::kf_anim::ParamKeyframeSource, Easing)> = None;
 
     // Draw curve segments between consecutive breakpoints for this param only.
     if param_points.len() >= 2 {
-        for pair in param_points.windows(2) {
+        for (seg_idx, pair) in param_points.windows(2).enumerate() {
             let a = &pair[0];
             let b = &pair[1];
             let easing = b.easing;
@@ -1265,6 +1344,22 @@ fn transform_curve_editor<T>(
             let ya = value_to_graph_y(a.value, val_min, val_max, inner_rect);
             let xb = time_to_graph_x(b.t, time_min, time_max, inner_rect);
             let yb = value_to_graph_y(b.value, val_min, val_max, inner_rect);
+            let is_segment_selected = selected_segment == Some(seg_idx);
+            let hit_rect = Rect::from_min_max(
+                Pos2::new(xa.min(xb), ya.min(yb)),
+                Pos2::new(xa.max(xb), ya.max(yb)),
+            )
+            .expand(8.0);
+            let seg_resp = ui.interact(
+                hit_rect,
+                ui.make_persistent_id(("curve_segment_hit", active_param_id, seg_idx)),
+                Sense::click(),
+            );
+            if seg_resp.clicked() {
+                selected_segment = Some(seg_idx);
+                ui.data_mut(|d| d.insert_temp(segment_id, seg_idx));
+                ce_selected.clear();
+            }
 
             let num_samples = 24;
             let mut prev_point = Pos2::new(xa, ya);
@@ -1276,7 +1371,14 @@ fn transform_curve_editor<T>(
                 let cur_point = Pos2::new(px, py);
                 painter.line_segment(
                     [prev_point, cur_point],
-                    Stroke::new(1.5, curve_color),
+                    Stroke::new(
+                        if is_segment_selected { 3.0 } else { 1.5 },
+                        if is_segment_selected {
+                            Color32::from_rgb(255, 230, 80)
+                        } else {
+                            curve_color
+                        },
+                    ),
                 );
                 prev_point = cur_point;
             }
@@ -1292,6 +1394,21 @@ fn transform_curve_editor<T>(
         );
     }
 
+    if let Some(seg_idx) = selected_segment {
+        if let Some(right) = param_points.get(seg_idx + 1) {
+            ui.horizontal(|ui| {
+                for easing in easing_presets() {
+                    if easing_icon_button(ui, easing, right.easing == easing)
+                        .on_hover_text(easing_label(easing))
+                        .clicked()
+                    {
+                        easing_change = Some((right.source, easing));
+                    }
+                }
+            });
+        }
+    }
+
     // Draw keyframe diamonds (draggable).
     // Only keyframes RELEVANT to the selected property get full-size
     // interactive diamonds. Irrelevant kfs (where the selected property
@@ -1303,7 +1420,6 @@ fn transform_curve_editor<T>(
     let mut drag_from_t: Option<f32> = None;
     let mut click_idx: Option<usize> = None;
     let mut delete_at_t: Option<f32> = None;
-    let mut easing_change: Option<(crate::kf_anim::ParamKeyframeSource, Easing)> = None;
     let ctrl_held = ui.input(|i| i.modifiers.ctrl || i.modifiers.mac_cmd);
     let shift_held = ui.input(|i| i.modifiers.shift);
 
@@ -1316,7 +1432,10 @@ fn transform_curve_editor<T>(
         let is_ce_selected = ce_selected.contains(&pi);
 
         let display_center = if is_ce_selected && *ce_multi_drag {
-            Pos2::new(center.x + ce_multi_drag_delta.x, center.y + ce_multi_drag_delta.y)
+            Pos2::new(
+                center.x + ce_multi_drag_delta.x,
+                center.y + ce_multi_drag_delta.y,
+            )
         } else {
             center
         };
@@ -1508,10 +1627,9 @@ fn transform_curve_editor<T>(
 
     if response.double_clicked() {
         if let Some(pos) = response.interact_pointer_pos() {
-            let new_t = graph_x_to_time(pos.x, time_min, time_max, inner_rect)
-                .clamp(0.0, time_max);
-            let new_v = graph_y_to_value(pos.y, val_min, val_max, inner_rect)
-                .clamp(val_min, val_max);
+            let new_t = graph_x_to_time(pos.x, time_min, time_max, inner_rect).clamp(0.0, time_max);
+            let new_v =
+                graph_y_to_value(pos.y, val_min, val_max, inner_rect).clamp(val_min, val_max);
             animated_params.insert(param_id.to_string());
             author_param(
                 keyframes,
@@ -1547,10 +1665,7 @@ fn transform_curve_editor<T>(
                         .contains(p)
                     });
                     if !on_diamond {
-                        *marquee = Some(crate::state::CurveEditorMarquee {
-                            start: p,
-                            end: p,
-                        });
+                        *marquee = Some(crate::state::CurveEditorMarquee { start: p, end: p });
                     }
                 }
             }
@@ -1643,7 +1758,11 @@ fn scalar_curve_editor(
     );
 
     let painter = ui.painter_at(graph_rect);
-    painter.rect_filled(graph_rect, Rounding::same(4.0), Color32::from_rgb(16, 15, 8));
+    painter.rect_filled(
+        graph_rect,
+        Rounding::same(4.0),
+        Color32::from_rgb(16, 15, 8),
+    );
     painter.rect_stroke(
         graph_rect,
         Rounding::same(4.0),
@@ -1658,7 +1777,9 @@ fn scalar_curve_editor(
 
     // Handle mouse wheel zoom
     let scroll_delta = ui.input(|i| i.smooth_scroll_delta.y);
-    if scroll_delta.abs() > 0.1 && graph_rect.contains(ui.input(|i| i.pointer.hover_pos().unwrap_or_default())) {
+    if scroll_delta.abs() > 0.1
+        && graph_rect.contains(ui.input(|i| i.pointer.hover_pos().unwrap_or_default()))
+    {
         let zoom_factor = 1.0 + scroll_delta * 0.001;
         *zoom = (*zoom * zoom_factor).clamp(0.1, 10.0);
     }
@@ -1666,11 +1787,13 @@ fn scalar_curve_editor(
     // Handle RMB panning
     let rmb_down = ui.input(|i| i.pointer.secondary_down());
     let rmb_pressed = ui.input(|i| i.pointer.secondary_pressed());
-    
-    if rmb_pressed && graph_rect.contains(ui.input(|i| i.pointer.press_origin().unwrap_or_default())) {
+
+    if rmb_pressed
+        && graph_rect.contains(ui.input(|i| i.pointer.press_origin().unwrap_or_default()))
+    {
         *panning = true;
     }
-    
+
     if *panning {
         if rmb_down {
             let delta = ui.input(|i| i.pointer.delta());
@@ -1678,7 +1801,7 @@ fn scalar_curve_editor(
             let (val_min_base, val_max_base) = value_range;
             let time_span = duration.max(0.1) / *zoom;
             let value_span = (val_max_base - val_min_base) / *zoom;
-            
+
             pan_offset.x -= delta.x * time_span / graph_width;
             pan_offset.y += delta.y * value_span / graph_height;
         } else {
@@ -1690,10 +1813,10 @@ fn scalar_curve_editor(
     let (val_min_base, val_max_base) = value_range;
     let time_center = duration * 0.5 + pan_offset.x;
     let value_center = (val_min_base + val_max_base) * 0.5 + pan_offset.y;
-    
+
     let time_span = duration.max(0.1) / *zoom;
     let value_span = (val_max_base - val_min_base) / *zoom;
-    
+
     let time_min = (time_center - time_span * 0.5).max(0.0);
     let time_max = time_center + time_span * 0.5;
     let val_min = value_center - value_span * 0.5;
@@ -1713,13 +1836,33 @@ fn scalar_curve_editor(
         );
     }
 
+    let segment_id = ui.make_persistent_id(("scalar_curve_segment", param_id));
+    let mut selected_segment = ui.data(|d| d.get_temp::<usize>(segment_id));
+    let mut easing_change: Option<(usize, Easing)> = None;
+
     if kfs.len() >= 2 {
-        for pair in kfs.windows(2) {
+        for (seg_idx, pair) in kfs.windows(2).enumerate() {
             let (a, b) = (&pair[0], &pair[1]);
             let xa = time_to_graph_x(a.t, time_min, time_max, inner_rect);
             let ya = value_to_graph_y(a.value, val_min, val_max, inner_rect);
             let xb = time_to_graph_x(b.t, time_min, time_max, inner_rect);
             let yb = value_to_graph_y(b.value, val_min, val_max, inner_rect);
+            let is_segment_selected = selected_segment == Some(seg_idx);
+            let hit_rect = Rect::from_min_max(
+                Pos2::new(xa.min(xb), ya.min(yb)),
+                Pos2::new(xa.max(xb), ya.max(yb)),
+            )
+            .expand(8.0);
+            let seg_resp = ui.interact(
+                hit_rect,
+                ui.make_persistent_id(("scalar_curve_segment_hit", param_id, seg_idx)),
+                Sense::click(),
+            );
+            if seg_resp.clicked() {
+                selected_segment = Some(seg_idx);
+                ui.data_mut(|d| d.insert_temp(segment_id, seg_idx));
+                ce_selected.clear();
+            }
 
             let num_samples = 24;
             let mut prev_point = Pos2::new(xa, ya);
@@ -1731,10 +1874,32 @@ fn scalar_curve_editor(
                 let cur_point = Pos2::new(px, py);
                 painter.line_segment(
                     [prev_point, cur_point],
-                    Stroke::new(1.5, color),
+                    Stroke::new(
+                        if is_segment_selected { 3.0 } else { 1.5 },
+                        if is_segment_selected {
+                            Color32::from_rgb(255, 230, 80)
+                        } else {
+                            color
+                        },
+                    ),
                 );
                 prev_point = cur_point;
             }
+        }
+    }
+
+    if let Some(seg_idx) = selected_segment {
+        if let Some(right) = kfs.get(seg_idx + 1) {
+            ui.horizontal(|ui| {
+                for easing in easing_presets() {
+                    if easing_icon_button(ui, easing, right.easing == easing)
+                        .on_hover_text(easing_label(easing))
+                        .clicked()
+                    {
+                        easing_change = Some((seg_idx + 1, easing));
+                    }
+                }
+            });
         }
     }
 
@@ -1742,7 +1907,6 @@ fn scalar_curve_editor(
     let mut drag_idx: Option<usize> = None;
     let mut click_idx: Option<usize> = None;
     let mut delete_idx: Option<usize> = None;
-    let mut easing_change: Option<(usize, Easing)> = None;
     let ctrl_held = ui.input(|i| i.modifiers.ctrl || i.modifiers.mac_cmd);
     let shift_held = ui.input(|i| i.modifiers.shift);
 
@@ -1755,7 +1919,10 @@ fn scalar_curve_editor(
 
         // Apply multi-drag offset for display.
         let display_center = if is_ce_selected && *ce_multi_drag {
-            Pos2::new(center.x + ce_multi_drag_delta.x, center.y + ce_multi_drag_delta.y)
+            Pos2::new(
+                center.x + ce_multi_drag_delta.x,
+                center.y + ce_multi_drag_delta.y,
+            )
         } else {
             center
         };
@@ -1783,8 +1950,7 @@ fn scalar_curve_editor(
             Stroke::new(1.0, stroke_color),
         ));
 
-        let diamond_rect =
-            Rect::from_center_size(display_center, Vec2::splat(diamond_size * 2.5));
+        let diamond_rect = Rect::from_center_size(display_center, Vec2::splat(diamond_size * 2.5));
         let id = ui.make_persistent_id(("audio_curve_kf", ki));
         let kf_resp = ui.interact(diamond_rect, id, Sense::click_and_drag());
 
@@ -1890,20 +2056,18 @@ fn scalar_curve_editor(
     }
     if let Some(ki) = drag_idx {
         if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
-            let new_t = graph_x_to_time(pos.x, time_min, time_max, inner_rect)
-                .clamp(0.0, time_max);
-            let new_v = graph_y_to_value(pos.y, val_min, val_max, inner_rect)
-                .clamp(val_min, val_max);
+            let new_t = graph_x_to_time(pos.x, time_min, time_max, inner_rect).clamp(0.0, time_max);
+            let new_v =
+                graph_y_to_value(pos.y, val_min, val_max, inner_rect).clamp(val_min, val_max);
             kfs[ki].t = new_t;
             kfs[ki].value = new_v;
         }
     }
     if response.double_clicked() {
         if let Some(pos) = response.interact_pointer_pos() {
-            let new_t = graph_x_to_time(pos.x, time_min, time_max, inner_rect)
-                .clamp(0.0, time_max);
-            let new_v = graph_y_to_value(pos.y, val_min, val_max, inner_rect)
-                .clamp(val_min, val_max);
+            let new_t = graph_x_to_time(pos.x, time_min, time_max, inner_rect).clamp(0.0, time_max);
+            let new_v =
+                graph_y_to_value(pos.y, val_min, val_max, inner_rect).clamp(val_min, val_max);
             // Seed the very first kf with the static value at t=0 so
             // the curve has a sensible starting point.
             if kfs.is_empty() {
@@ -1938,10 +2102,7 @@ fn scalar_curve_editor(
                         }
                     }
                     if !on_diamond {
-                        *marquee = Some(crate::state::CurveEditorMarquee {
-                            start: p,
-                            end: p,
-                        });
+                        *marquee = Some(crate::state::CurveEditorMarquee { start: p, end: p });
                     }
                 }
             }
@@ -2070,7 +2231,6 @@ fn draw_grid(painter: &egui::Painter, rect: Rect, t_min: f32, t_max: f32, v_min:
         t += step;
     }
 }
-
 
 // ─── Effect-param helpers for the curve editor ───────────────────────
 

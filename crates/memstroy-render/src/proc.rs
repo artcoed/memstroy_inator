@@ -62,23 +62,17 @@ pub fn hide_console_tokio(cmd: &mut tokio::process::Command) -> &mut tokio::proc
     cmd
 }
 
-
 // ─── ffprobe-based audio stream detection ─────────────────────────────
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Locate ffprobe alongside the configured ffmpeg binary, falling back
 /// to a bare `ffprobe` on `PATH`. Mirrors the lookup pattern several
 /// other crates use (frame_snapshot, video_cache, state) so an
 /// `MEMSTROY_FFMPEG=/opt/ffmpeg/bin/ffmpeg` override automatically
 /// picks up `/opt/ffmpeg/bin/ffprobe` next to it.
-pub fn ffprobe_binary() -> PathBuf {
-    let mut p = crate::runner::ffmpeg_binary();
-    p.set_file_name(if cfg!(windows) { "ffprobe.exe" } else { "ffprobe" });
-    if !p.exists() {
-        return PathBuf::from("ffprobe");
-    }
-    p
+fn ffprobe_binary() -> std::path::PathBuf {
+    crate::runner::ffprobe_binary()
 }
 
 /// Return `true` when `path` is confirmed to contain at least one
@@ -119,11 +113,33 @@ pub fn probe_has_audio_stream(path: &Path) -> bool {
             // audio streams (the "silent video" case the GUI's
             // auto-AudioTrack logic doesn't filter for).
             let stdout = String::from_utf8_lossy(&out.stdout);
-            stdout.lines().any(|line| line.trim() == "audio")
+            ffprobe_stdout_has_audio_stream(&stdout)
         }
         // Probe failure (binary missing, file not found, etc.) — be
         // optimistic. Render-time errors are still surfaced through
         // ffmpeg's own stderr if the assumption was wrong.
         _ => true,
+    }
+}
+
+fn ffprobe_stdout_has_audio_stream(stdout: &str) -> bool {
+    stdout.lines().any(|line| {
+        line.split(',')
+            .any(|field| field.trim().eq_ignore_ascii_case("audio"))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ffprobe_stdout_has_audio_stream;
+
+    #[test]
+    fn ffprobe_csv_audio_with_trailing_field_counts_as_audio() {
+        assert!(ffprobe_stdout_has_audio_stream("audio,\n"));
+    }
+
+    #[test]
+    fn ffprobe_empty_audio_selection_counts_as_silent() {
+        assert!(!ffprobe_stdout_has_audio_stream(""));
     }
 }

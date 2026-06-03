@@ -238,7 +238,9 @@ impl ImageFxCache {
     /// "in progress, fall back to the raw image" without a second
     /// round-trip through the cache.
     pub fn try_claim_in_flight(&self, path: &Path, sig: u64) -> bool {
-        let Ok(mut g) = self.inner.lock() else { return false };
+        let Ok(mut g) = self.inner.lock() else {
+            return false;
+        };
         let key = (path.to_path_buf(), sig);
         if g.in_flight.contains(&key) {
             return false;
@@ -341,12 +343,8 @@ impl ImageFxCache {
         if let Some(prev) = g.decoded.remove(path) {
             g.decoded_bytes = g.decoded_bytes.saturating_sub(prev.bytes);
         }
-        let stale_keys: Vec<(PathBuf, u64)> = g
-            .baked
-            .keys()
-            .filter(|(p, _)| p == path)
-            .cloned()
-            .collect();
+        let stale_keys: Vec<(PathBuf, u64)> =
+            g.baked.keys().filter(|(p, _)| p == path).cloned().collect();
         for k in stale_keys {
             if let Some(prev) = g.baked.remove(&k) {
                 g.baked_bytes = g.baked_bytes.saturating_sub(prev.bytes);

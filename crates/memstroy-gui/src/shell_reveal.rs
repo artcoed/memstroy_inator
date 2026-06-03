@@ -74,10 +74,10 @@ fn resolve_existing_file(path: &Path) -> Result<PathBuf, String> {
 #[cfg(target_os = "windows")]
 fn reveal_existing_file(path: &Path) -> Result<(), String> {
     let abs = resolve_existing_file(path)?;
-    if reveal_via_shell_api(&abs).is_ok() {
+    if explorer_select(&abs).is_ok() {
         return Ok(());
     }
-    explorer_select(&abs)
+    reveal_via_shell_api(&abs)
 }
 
 #[cfg(target_os = "windows")]
@@ -147,8 +147,8 @@ fn reveal_via_shell_api(path: &Path) -> Result<(), String> {
 
 #[cfg(target_os = "windows")]
 fn explorer_select(path: &Path) -> Result<(), String> {
-    let path_str = path.to_string_lossy();
-    let arg = format!("/select,\"{path_str}\"");
+    let abs = strip_verbatim_prefix(path);
+    let arg = format!("/select,{}", abs.display());
     std::process::Command::new("explorer.exe")
         .arg(arg)
         .spawn()

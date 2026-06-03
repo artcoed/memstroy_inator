@@ -7,10 +7,10 @@
 //! backwards from the most recent post until the channel start, parses
 //! each message and exposes the result.
 
+pub mod download;
 pub mod model;
 pub mod scrape;
-pub mod download;
 
+pub use download::*;
 pub use model::*;
 pub use scrape::*;
-pub use download::*;

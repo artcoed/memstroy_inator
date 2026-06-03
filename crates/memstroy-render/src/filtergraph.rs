@@ -1,4 +1,4 @@
-﻿use std::path::{Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use memstroy_core::*;
@@ -45,6 +45,88 @@ fn chromakey_filter(ck: &ChromaKeyParams) -> Option<String> {
         sim = sim,
         blend = blend,
     ))
+}
+
+fn audio_actor_overlap(scene: &Scene, actor: &Actor, audio: &AudioTrack) -> f32 {
+    let actor_start = actor.t_in.unwrap_or(0.0);
+    let actor_end = actor.t_out.unwrap_or(scene.output.duration);
+    let audio_start = audio.t_in;
+    let audio_end = audio.t_out.unwrap_or(scene.output.duration);
+    (actor_end.min(audio_end) - actor_start.max(audio_start)).max(0.0)
+}
+
+fn audio_actor_gap(scene: &Scene, actor: &Actor, audio: &AudioTrack) -> f32 {
+    let actor_start = actor.t_in.unwrap_or(0.0);
+    let actor_end = actor.t_out.unwrap_or(scene.output.duration);
+    let audio_start = audio.t_in;
+    let audio_end = audio.t_out.unwrap_or(scene.output.duration);
+    if audio_end < actor_start {
+        actor_start - audio_end
+    } else if actor_end < audio_start {
+        audio_start - actor_end
+    } else {
+        0.0
+    }
+}
+
+fn audio_actor_score(scene: &Scene, actor: &Actor, audio: &AudioTrack) -> f32 {
+    let actor_start = actor.t_in.unwrap_or(0.0);
+    let source_penalty = if actor.source == audio.source {
+        0.0
+    } else {
+        10_000.0
+    };
+    let overlap_penalty = if audio_actor_overlap(scene, actor, audio) > 0.0 {
+        0.0
+    } else {
+        1_000.0 + audio_actor_gap(scene, actor, audio)
+    };
+    source_penalty
+        + overlap_penalty
+        + (actor_start - audio.t_in).abs()
+        + (actor.source_start - audio.source_start).abs() * 2.0
+}
+
+fn best_audio_actor_by_id(scene: &Scene, actor_id: &str, audio: &AudioTrack) -> Option<usize> {
+    scene
+        .actors
+        .iter()
+        .enumerate()
+        .filter(|(_, actor)| actor.id == actor_id)
+        .min_by(|(_, a), (_, b)| {
+            audio_actor_score(scene, a, audio).total_cmp(&audio_actor_score(scene, b, audio))
+        })
+        .map(|(idx, _)| idx)
+}
+
+fn infer_actor_for_audio_in_scene(scene: &Scene, audio_idx: usize) -> Option<usize> {
+    let audio = scene.audio.get(audio_idx)?;
+    if audio.deleted {
+        return None;
+    }
+
+    if let Some(parent_id) = audio.parent_actor.as_deref() {
+        if let Some(idx) = best_audio_actor_by_id(scene, parent_id, audio) {
+            return Some(idx);
+        }
+    }
+
+    if let Some(actor_id) = audio.id.strip_suffix("_audio") {
+        if let Some(idx) = best_audio_actor_by_id(scene, actor_id, audio) {
+            return Some(idx);
+        }
+    }
+
+    scene
+        .actors
+        .iter()
+        .enumerate()
+        .filter(|(_, actor)| actor.source == audio.source)
+        .filter(|(_, actor)| audio_actor_overlap(scene, actor, audio) > 0.0)
+        .min_by(|(_, a), (_, b)| {
+            audio_actor_score(scene, a, audio).total_cmp(&audio_actor_score(scene, b, audio))
+        })
+        .map(|(idx, _)| idx)
 }
 
 /// Translates a [`Scene`] into an FFmpeg `filter_complex` graph.
@@ -98,7 +180,15 @@ impl<'a> FilterGraphBuilder<'a> {
         }
     }
 
-    pub fn finish(self) -> (String, Vec<FfmpegInput>, String, Option<String>, Vec<PathBuf>) {
+    pub fn finish(
+        self,
+    ) -> (
+        String,
+        Vec<FfmpegInput>,
+        String,
+        Option<String>,
+        Vec<PathBuf>,
+    ) {
         let map_video = self.cursor.clone();
         // Join with a bare `;` (no trailing `\n`) so the
         // filter_complex string we hand to `Command::args` is a
@@ -108,7 +198,13 @@ impl<'a> FilterGraphBuilder<'a> {
         // tail-line buffer in `runner.rs` only keeps the last few
         // lines of stderr, so a graph that spans 200 newlines used
         // to push the actual error message off the visible window.
-        (self.chunks.join(";"), self.inputs, map_video, self.map_audio, self.mask_assets)
+        (
+            self.chunks.join(";"),
+            self.inputs,
+            map_video,
+            self.map_audio,
+            self.mask_assets,
+        )
     }
 
     pub fn build(&mut self) -> Result<()> {
@@ -149,11 +245,10 @@ impl<'a> FilterGraphBuilder<'a> {
     /// emit ordering is preserved (text overlays sorted by `z_index`,
     /// scene index for tiebreak).
     ///
-    /// Falls back to the legacy 3-phase ordering (text-behind-actors
-    /// → actors → image/video/text-on-top) when ALL elements have
-    /// `z_order == 0`, which is the case for scenes saved before the
-    /// `z_order` field was introduced or scripts that don't populate
-    /// it.
+    /// Falls back to a canvas-compatible default ordering when ALL
+    /// elements have `z_order == 0`, which is the case for scenes saved
+    /// before the `z_order` field was introduced or scripts that don't
+    /// populate it.
     fn emit_z_ordered_elements(&mut self) -> Result<()> {
         let [w, h] = self.scene.output.resolution;
 
@@ -188,14 +283,16 @@ impl<'a> FilterGraphBuilder<'a> {
                 };
                 (z, z2)
             } else {
-                // Legacy fallback: text with `behind_actors=true` goes
-                // BELOW actors; everything else (image / video / text
-                // with `behind_actors=false`) goes ABOVE actors. Within
-                // each band, sort by `z_index` (text only) ascending.
+                // Fallback without GUI-stamped z_order: text with
+                // `behind_actors=true` goes below actors, normal text
+                // remains above actors, and image/video overlays sit below
+                // actors. This matches the canvas default used for images
+                // dropped as a background layer and prevents them from
+                // covering clips in render/extract.
                 match ov {
                     Overlay::Text(t) if t.behind_actors => (0, t.z_index),
                     Overlay::Text(t) => (200, t.z_index),
-                    _ => (200, 100),
+                    Overlay::Image(_) | Overlay::Video(_) => (50, 100),
                 }
             };
             items.push((primary, secondary, idx, 1, idx));
@@ -205,11 +302,7 @@ impl<'a> FilterGraphBuilder<'a> {
         // (text z_index), then stable scene-order tiebreak. Ties between
         // actors and overlays at the same z_order resolve by scene index
         // — same shape the preview's `frame_snapshot` uses.
-        items.sort_by(|a, b| {
-            a.0.cmp(&b.0)
-                .then(a.1.cmp(&b.1))
-                .then(a.4.cmp(&b.4))
-        });
+        items.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.4.cmp(&b.4)));
 
         for (_p, _s, _i, kind, idx) in items {
             if kind == 0 {
@@ -256,17 +349,14 @@ impl<'a> FilterGraphBuilder<'a> {
                 continue;
             }
             if matches!(eff.kind, EffectKind::Mask { .. }) {
-                tracing::warn!(
-                    "Mask effects on the render frame are not supported; skipping",
-                );
+                tracing::warn!("Mask effects on the render frame are not supported; skipping",);
                 continue;
             }
-            if let Some(snippet) = crate::expr::effect_animated_filter_chain(
-                eff,
-                0.0,
-                scene_dur,
-                |kind, intensity| effect_to_filter(kind, intensity),
-            ) {
+            if let Some(snippet) =
+                crate::expr::effect_animated_filter_chain(eff, 0.0, scene_dur, |kind, intensity| {
+                    effect_to_filter(kind, intensity)
+                })
+            {
                 snippets.push(snippet);
             }
         }
@@ -329,7 +419,11 @@ impl<'a> FilterGraphBuilder<'a> {
     }
 
     fn resolve(&self, p: &Path) -> PathBuf {
-        if p.is_absolute() { p.to_path_buf() } else { self.assets_root.join(p) }
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            self.assets_root.join(p)
+        }
     }
 
     fn add_input(&mut self, inp: FfmpegInput) -> usize {
@@ -442,7 +536,12 @@ impl<'a> FilterGraphBuilder<'a> {
                     w = w, h = h
                 ),
             };
-            self.chunks.push(format!("[{idx}:v]{fit},setsar=1,format=yuva420p{out}", idx = idx, fit = fit, out = scaled));
+            self.chunks.push(format!(
+                "[{idx}:v]{fit},setsar=1,format=yuva420p{out}",
+                idx = idx,
+                fit = fit,
+                out = scaled
+            ));
 
             // Transitions: Cut, Snap, Fade, Slide*
             let composed = self.alloc_label("bgstack");
@@ -455,10 +554,7 @@ impl<'a> FilterGraphBuilder<'a> {
                 Transition::Snap => {
                     // Snap: 2-frame white flash at the start of this segment.
                     // We fade in extremely fast (1 frame ≈ 0.017s @ 60fps).
-                    format!(
-                        "fade=t=in:st={a}:d=0.033:alpha=1",
-                        a = bg.start
-                    )
+                    format!("fade=t=in:st={a}:d=0.033:alpha=1", a = bg.start)
                 }
                 _ => String::new(),
             };
@@ -535,10 +631,13 @@ impl<'a> FilterGraphBuilder<'a> {
                 let flash_dur = 0.033; // ~2 frames at 60fps
                 self.chunks.push(format!(
                     "color=c=0xFFFFFF:s={w}x{h}:r={fps}:d={fd}[{fl}raw]",
-                    w = w, h = h, fps = self.scene.output.fps,
-                    fd = flash_dur, fl = &flash[1..flash.len()-1]
+                    w = w,
+                    h = h,
+                    fps = self.scene.output.fps,
+                    fd = flash_dur,
+                    fl = &flash[1..flash.len() - 1]
                 ));
-                let raw_label = format!("[{}raw]", &flash[1..flash.len()-1]);
+                let raw_label = format!("[{}raw]", &flash[1..flash.len() - 1]);
                 let after_flash = self.alloc_label("postflash");
                 self.chunks.push(format!(
                     "{composed}{raw}overlay=enable='between(t,{a},{b})':eof_action=pass{out}",
@@ -586,7 +685,11 @@ impl<'a> FilterGraphBuilder<'a> {
                 path: path.clone(),
                 kind: InputKind::Video,
                 r#loop: actor.loop_source,
-                seek: if actor.source_start > 0.0 { Some(actor.source_start) } else { None },
+                seek: if actor.source_start > 0.0 {
+                    Some(actor.source_start)
+                } else {
+                    None
+                },
                 t: None,
             });
 
@@ -636,16 +739,13 @@ impl<'a> FilterGraphBuilder<'a> {
             // hits EOF before its `enable=` window opens.
             //
             // Audio handles the same problem with the analogous
-            // `atrim → asetpts → adelay → apad → atrim` chain in
-            // `emit_audio`, which is why the user's bug report said
-            // "звук был" while the picture froze on the first clip.
+            // `atrim → asetpts → adelay → asetpts` chain plus a
+            // scene-length silent bed in `emit_audio`, which is why
+            // the user's bug report said "звук был" while the
+            // picture froze on the first clip.
             let scene_dur = self.scene.output.duration;
-            let align_filters = time_align_filters(
-                t_in_clip,
-                t_out_clip,
-                scene_dur,
-                actor.loop_source,
-            );
+            let align_filters =
+                time_align_filters(t_in_clip, t_out_clip, scene_dur, actor.loop_source);
             let alpha_part = alpha_filter_for(&xform);
             let scale_part = format!(
                 "scale=w='max(2,iw*({sx}))':h='max(2,ih*({sy}))':eval=frame",
@@ -660,8 +760,11 @@ impl<'a> FilterGraphBuilder<'a> {
             // Pre-scale CC sits with the source's native pixel data —
             // matching the preview where `apply_effects_cpu` also runs
             // before the on-canvas resize.
-            let cc_filters =
-                crate::expr::color_correction_filters(&actor.color_correction, t_in_clip, actor.t_out);
+            let cc_filters = crate::expr::color_correction_filters(
+                &actor.color_correction,
+                t_in_clip,
+                actor.t_out,
+            );
             let actor_label = self.alloc_label("actor");
 
             if effects_have_mask(&actor.effects) {
@@ -680,11 +783,7 @@ impl<'a> FilterGraphBuilder<'a> {
                 // raw input straight into `format=yuva420p`.
                 let ck_part = chromakey_filter(&actor.chroma_key);
                 let mut prefix = match &ck_part {
-                    Some(ck) => format!(
-                        "[{idx}:v]{ck},format=yuva420p",
-                        idx = idx,
-                        ck = ck,
-                    ),
+                    Some(ck) => format!("[{idx}:v]{ck},format=yuva420p", idx = idx, ck = ck,),
                     None => format!("[{idx}:v]format=yuva420p", idx = idx),
                 };
                 if want_hflip {
@@ -698,10 +797,17 @@ impl<'a> FilterGraphBuilder<'a> {
                     prefix.push_str(cc);
                 }
                 let pre_label = self.alloc_label("actorPre");
-                self.chunks.push(format!("{prefix}{pre_label}", prefix = prefix, pre_label = pre_label));
-                let after_fx = self.apply_effect_stack(pre_label, &actor.effects, t_in_clip, t_out_clip)?;
+                self.chunks.push(format!(
+                    "{prefix}{pre_label}",
+                    prefix = prefix,
+                    pre_label = pre_label
+                ));
+                let after_fx =
+                    self.apply_effect_stack(pre_label, &actor.effects, t_in_clip, t_out_clip)?;
                 let mut tail_filters: Vec<String> = Vec::new();
-                if let Some(s) = speed_part { tail_filters.push(s); }
+                if let Some(s) = speed_part {
+                    tail_filters.push(s);
+                }
                 // Speed is in source-time, so we apply it BEFORE the
                 // align chain. Once `align_filters` runs, the
                 // stream's PTS axis is scene-time and the geq alpha
@@ -736,11 +842,7 @@ impl<'a> FilterGraphBuilder<'a> {
                 // "Result too large".
                 let ck_part = chromakey_filter(&actor.chroma_key);
                 let mut chain = match &ck_part {
-                    Some(ck) => format!(
-                        "[{idx}:v]{ck},format=yuva420p",
-                        idx = idx,
-                        ck = ck,
-                    ),
+                    Some(ck) => format!("[{idx}:v]{ck},format=yuva420p", idx = idx, ck = ck,),
                     None => format!("[{idx}:v]format=yuva420p", idx = idx),
                 };
                 if want_hflip {
@@ -784,7 +886,8 @@ impl<'a> FilterGraphBuilder<'a> {
                     chain.push(',');
                     chain.push_str(a);
                 }
-                self.chunks.push(format!("{chain}{out}", chain = chain, out = actor_label));
+                self.chunks
+                    .push(format!("{chain}{out}", chain = chain, out = actor_label));
             }
 
             let composed = self.alloc_label("stack");
@@ -818,17 +921,20 @@ impl<'a> FilterGraphBuilder<'a> {
     /// or fall back to the actor's center position.
     fn emit_attachments(&mut self, actor: &Actor, w: u32, h: u32) -> Result<()> {
         // Try to load anchor track
-        let track = actor.anchors.as_ref().and_then(|p| {
-            let resolved = self.resolve(p);
-            load_anchor_track(&resolved)
-                .or_else(|| {
+        let track = actor
+            .anchors
+            .as_ref()
+            .and_then(|p| {
+                let resolved = self.resolve(p);
+                load_anchor_track(&resolved).or_else(|| {
                     // Also try loading from actor source path
                     load_anchor_track(&self.resolve(&actor.source))
                 })
-        }).or_else(|| {
-            // Fallback: try to load from actor source .anchors.json
-            load_anchor_track(&self.resolve(&actor.source))
-        });
+            })
+            .or_else(|| {
+                // Fallback: try to load from actor source .anchors.json
+                load_anchor_track(&self.resolve(&actor.source))
+            });
 
         for attachment in &actor.attachments {
             let prop_path = self.resolve(&attachment.asset);
@@ -873,7 +979,8 @@ impl<'a> FilterGraphBuilder<'a> {
                 s = prop_scale,
             );
             let prop_label = self.alloc_label("prop");
-            self.chunks.push(format!("{chain}{out}", chain = chain, out = prop_label));
+            self.chunks
+                .push(format!("{chain}{out}", chain = chain, out = prop_label));
 
             // Overlay prop on top of current composite
             let enable = match (actor.t_in, actor.t_out) {
@@ -918,7 +1025,11 @@ impl<'a> FilterGraphBuilder<'a> {
     fn emit_overlays_filtered(&mut self, under_actors: bool) -> Result<()> {
         let [w, h] = self.scene.output.resolution;
         // Collect indices with their effective z and a stable scene-order tie.
-        let mut indexed: Vec<(usize, i32)> = self.scene.overlays.iter().enumerate()
+        let mut indexed: Vec<(usize, i32)> = self
+            .scene
+            .overlays
+            .iter()
+            .enumerate()
             .filter(|(_, ov)| {
                 match ov {
                     Overlay::Text(t) => t.behind_actors == under_actors,
@@ -1121,11 +1232,17 @@ impl<'a> FilterGraphBuilder<'a> {
                 "0x{:02X}{:02X}{:02X}@{:.3}",
                 box_color[0], box_color[1], box_color[2], opacity,
             );
-            params.push_str(&format!(":box=1:boxcolor={}:boxborderw={}", bc, style.box_padding));
+            params.push_str(&format!(
+                ":box=1:boxcolor={}:boxborderw={}",
+                bc, style.box_padding
+            ));
         }
         if let Some(o) = style.outline {
             let oc = format!("0x{:02X}{:02X}{:02X}", o[0], o[1], o[2]);
-            params.push_str(&format!(":bordercolor={}:borderw={}", oc, style.outline_width));
+            params.push_str(&format!(
+                ":bordercolor={}:borderw={}",
+                oc, style.outline_width
+            ));
         }
         match style.align {
             TextAlign::Center => params.push_str(":text_align=center"),
@@ -1211,8 +1328,12 @@ impl<'a> FilterGraphBuilder<'a> {
                 prefix.push(',');
                 prefix.push_str(c);
             }
-            if xform.hflip { prefix.push_str(",hflip"); }
-            if xform.vflip { prefix.push_str(",vflip"); }
+            if xform.hflip {
+                prefix.push_str(",hflip");
+            }
+            if xform.vflip {
+                prefix.push_str(",vflip");
+            }
             self.chunks.push(format!(
                 "{prefix}{pre_label}",
                 prefix = prefix,
@@ -1246,8 +1367,12 @@ impl<'a> FilterGraphBuilder<'a> {
                 chain.push(',');
                 chain.push_str(c);
             }
-            if xform.hflip { chain.push_str(",hflip"); }
-            if xform.vflip { chain.push_str(",vflip"); }
+            if xform.hflip {
+                chain.push_str(",hflip");
+            }
+            if xform.vflip {
+                chain.push_str(",vflip");
+            }
             // Apply the user-defined effect stack before the layout scale,
             // matching the actor pipeline so e.g. blur / hue shift work in
             // the image's native pixel space (before the on-canvas resize).
@@ -1275,7 +1400,8 @@ impl<'a> FilterGraphBuilder<'a> {
                 chain.push(',');
                 chain.push_str(a);
             }
-            self.chunks.push(format!("{chain}{out}", chain = chain, out = img_label));
+            self.chunks
+                .push(format!("{chain}{out}", chain = chain, out = img_label));
         }
         let next = self.alloc_label("imgstack");
         self.chunks.push(format!(
@@ -1298,7 +1424,11 @@ impl<'a> FilterGraphBuilder<'a> {
             path,
             kind: InputKind::Video,
             r#loop: ov.loop_source,
-            seek: if ov.source_start > 0.0 { Some(ov.source_start) } else { None },
+            seek: if ov.source_start > 0.0 {
+                Some(ov.source_start)
+            } else {
+                None
+            },
             t: None,
         });
         let xform = crate::expr::build_element_transform(
@@ -1345,14 +1475,27 @@ impl<'a> FilterGraphBuilder<'a> {
         if effects_have_mask(&ov.effects) {
             // Multi-stream layout for masks — see `emit_actors`.
             let mut prefix = format!("[{idx}:v]format=yuva420p", idx = idx);
-            if let Some(c) = &chroma_part { prefix.push(','); prefix.push_str(c); }
-            if xform.hflip { prefix.push_str(",hflip"); }
-            if xform.vflip { prefix.push_str(",vflip"); }
+            if let Some(c) = &chroma_part {
+                prefix.push(',');
+                prefix.push_str(c);
+            }
+            if xform.hflip {
+                prefix.push_str(",hflip");
+            }
+            if xform.vflip {
+                prefix.push_str(",vflip");
+            }
             let pre_label = self.alloc_label("vidPre");
-            self.chunks.push(format!("{prefix}{pre_label}", prefix = prefix, pre_label = pre_label));
+            self.chunks.push(format!(
+                "{prefix}{pre_label}",
+                prefix = prefix,
+                pre_label = pre_label
+            ));
             let after_fx = self.apply_effect_stack(pre_label, &ov.effects, ov.t_in, ov.t_out)?;
             let mut tail: Vec<String> = Vec::new();
-            if let Some(s) = speed_part { tail.push(s); }
+            if let Some(s) = speed_part {
+                tail.push(s);
+            }
             // Speed is in source-time, so it must run BEFORE the
             // align chain. Once aligned the stream's PTS axis is
             // scene-time and the geq below evaluates `T` on the
@@ -1376,9 +1519,16 @@ impl<'a> FilterGraphBuilder<'a> {
             ));
         } else {
             let mut chain = format!("[{idx}:v]format=yuva420p", idx = idx);
-            if let Some(c) = &chroma_part { chain.push(','); chain.push_str(c); }
-            if xform.hflip { chain.push_str(",hflip"); }
-            if xform.vflip { chain.push_str(",vflip"); }
+            if let Some(c) = &chroma_part {
+                chain.push(',');
+                chain.push_str(c);
+            }
+            if xform.hflip {
+                chain.push_str(",hflip");
+            }
+            if xform.vflip {
+                chain.push_str(",vflip");
+            }
             // Apply the user-defined effect stack — same convention as
             // images / actors so the export matches what the canvas previews.
             for snippet in effect_stack_filters(&ov.effects, ov.t_in, ov.t_out) {
@@ -1409,7 +1559,8 @@ impl<'a> FilterGraphBuilder<'a> {
                 chain.push(',');
                 chain.push_str(a);
             }
-            self.chunks.push(format!("{chain}{out}", chain = chain, out = v_label));
+            self.chunks
+                .push(format!("{chain}{out}", chain = chain, out = v_label));
         }
         let next = self.alloc_label("vidstack");
         self.chunks.push(format!(
@@ -1481,7 +1632,12 @@ impl<'a> FilterGraphBuilder<'a> {
                 let span = (b.t - a.t).max(1e-6);
                 expr = format!(
                     "if(lt(t,{tb}),{v0}+({v1}-{v0})*((t-{ta})/{span}),{else_})",
-                    tb = b.t, v0 = v0, v1 = v1, ta = a.t, span = span, else_ = expr
+                    tb = b.t,
+                    v0 = v0,
+                    v1 = v1,
+                    ta = a.t,
+                    span = span,
+                    else_ = expr
                 );
             }
             expr
@@ -1501,15 +1657,25 @@ impl<'a> FilterGraphBuilder<'a> {
         // crop_w = W / zoom, crop_h = H / zoom, clamped to source dims
         // crop_x = cx*W - crop_w/2, crop_y = cy*H - crop_h/2
 
-        let crop_w = format!("min(iw,max(2,floor({w}/({zoom})/2)*2))", w = w, zoom = zoom_expr);
-        let crop_h = format!("min(ih,max(2,floor({h}/({zoom})/2)*2))", h = h, zoom = zoom_expr);
+        let crop_w = format!(
+            "min(iw,max(2,floor({w}/({zoom})/2)*2))",
+            w = w,
+            zoom = zoom_expr
+        );
+        let crop_h = format!(
+            "min(ih,max(2,floor({h}/({zoom})/2)*2))",
+            h = h,
+            zoom = zoom_expr
+        );
         let crop_x = format!(
             "max(0,min(iw-({cw}), floor(({cx})*iw-({cw})/2)))",
-            cw = crop_w, cx = cx_expr,
+            cw = crop_w,
+            cx = cx_expr,
         );
         let crop_y = format!(
             "max(0,min(ih-({ch}), floor(({cy})*ih-({ch})/2)))",
-            ch = crop_h, cy = cy_expr,
+            ch = crop_h,
+            cy = cy_expr,
         );
 
         let cam_label = self.alloc_label("cam");
@@ -1543,16 +1709,26 @@ impl<'a> FilterGraphBuilder<'a> {
             self.chunks.push(format!(
                 "{rot}crop=w='{cw}':h='{ch}':x='{cx}':y='{cy}',scale={w}:{h}{out}",
                 rot = rot_label,
-                cw = crop_w, ch = crop_h, cx = crop_x, cy = crop_y,
-                w = w, h = h, out = cam_label,
+                cw = crop_w,
+                ch = crop_h,
+                cx = crop_x,
+                cy = crop_y,
+                w = w,
+                h = h,
+                out = cam_label,
             ));
         } else {
             // No rotation: just crop + scale
             self.chunks.push(format!(
                 "{cur}crop=w='{cw}':h='{ch}':x='{cx}':y='{cy}',scale={w}:{h}{out}",
                 cur = self.cursor,
-                cw = crop_w, ch = crop_h, cx = crop_x, cy = crop_y,
-                w = w, h = h, out = cam_label,
+                cw = crop_w,
+                ch = crop_h,
+                cx = crop_x,
+                cy = crop_y,
+                w = w,
+                h = h,
+                out = cam_label,
             ));
         }
 
@@ -1594,7 +1770,12 @@ impl<'a> FilterGraphBuilder<'a> {
                 let span = (b.t - a.t).max(1e-6);
                 expr = format!(
                     "if(lt(t,{tb}),{v0}+({v1}-{v0})*((t-{ta})/{span}),{else_})",
-                    tb = b.t, v0 = v0, v1 = v1, ta = a.t, span = span, else_ = expr
+                    tb = b.t,
+                    v0 = v0,
+                    v1 = v1,
+                    ta = a.t,
+                    span = span,
+                    else_ = expr
                 );
             }
             expr
@@ -1641,18 +1822,23 @@ impl<'a> FilterGraphBuilder<'a> {
         //   4. Scale the cropped region back to `W×H`.
         let crop_w = format!(
             "min(iw,max(2,floor({w}/({zoom})/2)*2))",
-            w = w, zoom = zoom_expr,
+            w = w,
+            zoom = zoom_expr,
         );
         let crop_h = format!(
             "min(ih,max(2,floor({h}/({zoom})/2)*2))",
-            h = h, zoom = zoom_expr,
+            h = h,
+            zoom = zoom_expr,
         );
         let crop_x = format!("max(0,(iw-({cw}))/2)", cw = crop_w);
         let crop_y = format!("max(0,(ih-({ch}))/2)", ch = crop_h);
 
         let cam_label = self.alloc_label("rfcam");
 
-        let has_rotation = rf.layout.iter().any(|kf| kf.value.rotation_deg.abs() > 0.01);
+        let has_rotation = rf
+            .layout
+            .iter()
+            .any(|kf| kf.value.rotation_deg.abs() > 0.01);
         if has_rotation {
             // Pad → rotate → crop → scale. Sign flip: `-rotation_deg`
             // un-rotates the world so the rf rectangle becomes axis-
@@ -1676,13 +1862,20 @@ impl<'a> FilterGraphBuilder<'a> {
             let rot_label = self.alloc_label("rfrot");
             self.chunks.push(format!(
                 "{pad}rotate='{rad}':ow=iw:oh=ih:c=none{out}",
-                pad = pad_label, rad = rot_rad, out = rot_label,
+                pad = pad_label,
+                rad = rot_rad,
+                out = rot_label,
             ));
             self.chunks.push(format!(
                 "{rot}crop=w='{cw}':h='{ch}':x='{cx}':y='{cy}',scale={w}:{h}{out}",
                 rot = rot_label,
-                cw = crop_w, ch = crop_h, cx = crop_x, cy = crop_y,
-                w = w, h = h, out = cam_label,
+                cw = crop_w,
+                ch = crop_h,
+                cx = crop_x,
+                cy = crop_y,
+                w = w,
+                h = h,
+                out = cam_label,
             ));
         } else {
             // No rotation → no need to pad; cropping a centred region
@@ -1690,8 +1883,13 @@ impl<'a> FilterGraphBuilder<'a> {
             self.chunks.push(format!(
                 "{cur}crop=w='{cw}':h='{ch}':x='{cx}':y='{cy}',scale={w}:{h}{out}",
                 cur = self.cursor,
-                cw = crop_w, ch = crop_h, cx = crop_x, cy = crop_y,
-                w = w, h = h, out = cam_label,
+                cw = crop_w,
+                ch = crop_h,
+                cx = crop_x,
+                cy = crop_y,
+                w = w,
+                h = h,
+                out = cam_label,
             ));
         }
 
@@ -1830,18 +2028,12 @@ impl<'a> FilterGraphBuilder<'a> {
         /// Returns an empty `Vec` when `clip_dur` collapses to zero
         /// (the caller falls back to the static path so we still
         /// emit a meaningful filter).
-        fn audio_segments(
-            kfs: &[memstroy_core::Keyframe<f32>],
-            clip_dur: f32,
-        ) -> Vec<(f32, f32)> {
+        fn audio_segments(kfs: &[memstroy_core::Keyframe<f32>], clip_dur: f32) -> Vec<(f32, f32)> {
             const MIN_POINTS: usize = 8;
             if clip_dur <= 1e-3 {
                 return Vec::new();
             }
-            let mut times: Vec<f32> = kfs
-                .iter()
-                .map(|kf| kf.t.clamp(0.0, clip_dur))
-                .collect();
+            let mut times: Vec<f32> = kfs.iter().map(|kf| kf.t.clamp(0.0, clip_dur)).collect();
             times.push(0.0);
             times.push(clip_dur);
             times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -1856,13 +2048,8 @@ impl<'a> FilterGraphBuilder<'a> {
                 times.dedup_by(|a, b| (*a - *b).abs() < 1e-4);
             }
             if times.len() > MAX_AUDIO_SEGMENTS + 1 {
-                let stride = ((times.len() - 1) as f32 / MAX_AUDIO_SEGMENTS as f32)
-                    .ceil() as usize;
-                let mut sub: Vec<f32> = times
-                    .iter()
-                    .step_by(stride.max(1))
-                    .copied()
-                    .collect();
+                let stride = ((times.len() - 1) as f32 / MAX_AUDIO_SEGMENTS as f32).ceil() as usize;
+                let mut sub: Vec<f32> = times.iter().step_by(stride.max(1)).copied().collect();
                 if sub.last().map_or(true, |&l| l < clip_dur - 1e-4) {
                     sub.push(clip_dur);
                 }
@@ -1909,7 +2096,9 @@ impl<'a> FilterGraphBuilder<'a> {
             static_hz: Option<u32>,
             clip_dur: f32,
         ) -> AudioCutoffEnv {
-            let Some(hz) = static_hz else { return AudioCutoffEnv::Disabled };
+            let Some(hz) = static_hz else {
+                return AudioCutoffEnv::Disabled;
+            };
             if !tr.animated_params.contains(param_id) || kfs.len() < 2 {
                 return AudioCutoffEnv::Static(hz);
             }
@@ -1923,8 +2112,14 @@ impl<'a> FilterGraphBuilder<'a> {
         let scene_dur = self.scene.output.duration.max(1.0 / 60.0);
 
         let mut jobs: Vec<AudioJob> = Vec::new();
-        let mut seen: std::collections::HashSet<std::path::PathBuf> =
-            std::collections::HashSet::new();
+        let explicit_actor_audio: std::collections::HashSet<usize> = self
+            .scene
+            .audio
+            .iter()
+            .enumerate()
+            .filter(|(_, tr)| !tr.deleted)
+            .filter_map(|(idx, _)| infer_actor_for_audio_in_scene(self.scene, idx))
+            .collect();
         for tr in &self.scene.audio {
             // Skip deleted audio tracks (marked as deleted instead of
             // removed from the array to prevent index shifts in the UI).
@@ -1932,7 +2127,6 @@ impl<'a> FilterGraphBuilder<'a> {
                 continue;
             }
             let path = self.resolve(&tr.source);
-            seen.insert(path.clone());
             let t_in = tr.t_in;
             let t_out = tr.t_out.unwrap_or(scene_dur);
             let clip_dur = (t_out.max(t_in) - t_in).max(1.0 / 60.0);
@@ -1943,8 +2137,7 @@ impl<'a> FilterGraphBuilder<'a> {
             // value changes, so animating it across a single export
             // pass would diverge from the preview anyway.
             let mid = clip_dur * 0.5;
-            let rate = (tr.speed_at(mid)
-                * 2.0_f32.powf(tr.pitch_at(mid) / 12.0)).max(0.05);
+            let rate = (tr.speed_at(mid) * 2.0_f32.powf(tr.pitch_at(mid) / 12.0)).max(0.05);
             jobs.push(AudioJob {
                 id: tr.id.as_str(),
                 source: path,
@@ -1955,20 +2148,8 @@ impl<'a> FilterGraphBuilder<'a> {
                 fade_in: tr.fade_in,
                 fade_out: tr.fade_out,
                 rate,
-                volume_env: build_audio_env(
-                    tr,
-                    "volume",
-                    &tr.volume_kfs,
-                    tr.volume,
-                    clip_dur,
-                ),
-                pan_env: build_audio_env(
-                    tr,
-                    "pan",
-                    &tr.pan_kfs,
-                    tr.pan,
-                    clip_dur,
-                ),
+                volume_env: build_audio_env(tr, "volume", &tr.volume_kfs, tr.volume, clip_dur),
+                pan_env: build_audio_env(tr, "pan", &tr.pan_kfs, tr.pan, clip_dur),
                 low_pass_env: build_cutoff_env(
                     tr,
                     "low_pass",
@@ -1983,28 +2164,27 @@ impl<'a> FilterGraphBuilder<'a> {
                     tr.high_pass_hz,
                     clip_dur,
                 ),
-                reverb_env: build_audio_env(
-                    tr,
-                    "reverb",
-                    &tr.reverb_kfs,
-                    tr.reverb,
-                    clip_dur,
-                ),
+                reverb_env: build_audio_env(tr, "reverb", &tr.reverb_kfs, tr.reverb, clip_dur),
                 track: Some(tr),
             });
         }
-        for actor in &self.scene.actors {
-            if !actor.visible { continue; }
+        for (actor_idx, actor) in self.scene.actors.iter().enumerate() {
+            if !actor.visible {
+                continue;
+            }
             // Skip actors whose embedded audio has been explicitly muted.
             // This honours the user's intent when they delete the auto-
             // generated audio track or toggle the "mute audio" inspector
             // checkbox — without this check the renderer would still mix
             // the actor's soundtrack even after the user removed it from
             // the timeline.
-            if actor.mute_audio { continue; }
+            if actor.mute_audio {
+                continue;
+            }
             let path = self.resolve(&actor.source);
-            if seen.contains(&path) { continue; }
-            seen.insert(path.clone());
+            if explicit_actor_audio.contains(&actor_idx) {
+                continue;
+            }
             let t_in = actor.t_in.unwrap_or(0.0);
             let t_out = actor.t_out.unwrap_or(scene_dur);
             jobs.push(AudioJob {
@@ -2016,7 +2196,7 @@ impl<'a> FilterGraphBuilder<'a> {
                 mute: false,
                 fade_in: 0.0,
                 fade_out: 0.0,
-                rate: 1.0,
+                rate: actor.speed.max(0.05),
                 volume_env: AudioEnv::Static(1.0),
                 pan_env: AudioEnv::Static(0.0),
                 low_pass_env: AudioCutoffEnv::Disabled,
@@ -2069,13 +2249,15 @@ impl<'a> FilterGraphBuilder<'a> {
         //      preview).
         //   7. `adelay={t_in_ms}|...` to position on the scene
         //      timeline.
-        //   8. `apad=whole_dur={scene_dur}` so the per-track chain
-        //      always reaches the end of the scene with silence;
-        //      this guarantees the AAC encoder receives at least one
-        //      frame to flush even when all sources end early.
+        //   8. `asetpts=PTS-STARTPTS` after delay so amix aligns the
+        //      leading-silence stream at scene zero instead of using
+        //      shifted packet timestamps.
         //   9. `atrim=duration={scene_dur}` + `asetpts=PTS-STARTPTS`
         //      caps the chain at the scene length so no track over-
         //      shoots `-t` and trips the muxer.
+        //  10. A scene-length `anullsrc` silent bed is mixed with the
+        //      real tracks so the AAC encoder receives a full-duration
+        //      bus even when all sources end early.
         //
         // After the mix we apply one more `aformat` to nail the bus
         // to the AAC encoder's expected layout (the `-ac 2 -ar 44100`
@@ -2132,7 +2314,7 @@ impl<'a> FilterGraphBuilder<'a> {
                 path,
                 kind: InputKind::Audio,
                 r#loop: false,
-                seek: if job.source_start > 0.0 { Some(job.source_start) } else { None },
+                seek: None,
                 t: None,
             });
 
@@ -2160,6 +2342,10 @@ impl<'a> FilterGraphBuilder<'a> {
                 sr = SR,
                 ch = LAYOUT,
             ));
+            if job.source_start > 0.0 {
+                filters.push(format!("atrim=start={:.6}", job.source_start));
+                filters.push("asetpts=PTS-STARTPTS".into());
+            }
             // Speed + pitch (resample). After `asetrate` the nominal
             // sample rate changes, so we MUST `aresample={SR}` again
             // to restore the bus rate before `amix` sees the stream.
@@ -2201,16 +2387,11 @@ impl<'a> FilterGraphBuilder<'a> {
                 AudioCutoffEnv::Animated { segments } => {
                     for (a, b) in segments {
                         let mid = ((a + b) * 0.5).max(*a);
-                        let v = job
-                            .track
-                            .and_then(|t| t.high_pass_at(mid))
-                            .unwrap_or(0);
+                        let v = job.track.and_then(|t| t.high_pass_at(mid)).unwrap_or(0);
                         if v == 0 {
                             continue;
                         }
-                        filters.push(format!(
-                            "highpass=f={v}:enable='between(t,{a:.4},{b:.4})'",
-                        ));
+                        filters.push(format!("highpass=f={v}:enable='between(t,{a:.4},{b:.4})'",));
                     }
                 }
             }
@@ -2224,16 +2405,11 @@ impl<'a> FilterGraphBuilder<'a> {
                 AudioCutoffEnv::Animated { segments } => {
                     for (a, b) in segments {
                         let mid = ((a + b) * 0.5).max(*a);
-                        let v = job
-                            .track
-                            .and_then(|t| t.low_pass_at(mid))
-                            .unwrap_or(0);
+                        let v = job.track.and_then(|t| t.low_pass_at(mid)).unwrap_or(0);
                         if v == 0 {
                             continue;
                         }
-                        filters.push(format!(
-                            "lowpass=f={v}:enable='between(t,{a:.4},{b:.4})'",
-                        ));
+                        filters.push(format!("lowpass=f={v}:enable='between(t,{a:.4},{b:.4})'",));
                     }
                 }
             }
@@ -2253,19 +2429,13 @@ impl<'a> FilterGraphBuilder<'a> {
                     if *v > 1e-3 {
                         let mix = v.clamp(0.0, 1.0);
                         let decay = (mix * 0.55).min(0.7);
-                        filters.push(format!(
-                            "aecho=1.0:{:.6}:120:{:.6}",
-                            mix, decay
-                        ));
+                        filters.push(format!("aecho=1.0:{:.6}:120:{:.6}", mix, decay));
                     }
                 }
                 AudioEnv::Animated { segments } => {
                     for (a, b) in segments {
                         let mid = ((a + b) * 0.5).max(*a);
-                        let v = job
-                            .track
-                            .map(|t| t.reverb_at(mid))
-                            .unwrap_or(0.0);
+                        let v = job.track.map(|t| t.reverb_at(mid)).unwrap_or(0.0);
                         if v <= 1e-3 {
                             continue;
                         }
@@ -2282,20 +2452,14 @@ impl<'a> FilterGraphBuilder<'a> {
             if job.fade_in > 0.0 {
                 let fi = job.fade_in.min(clip_dur);
                 if fi > 0.0 {
-                    filters.push(format!(
-                        "afade=t=in:st=0:d={:.6}:curve=tri",
-                        fi
-                    ));
+                    filters.push(format!("afade=t=in:st=0:d={:.6}:curve=tri", fi));
                 }
             }
             if job.fade_out > 0.0 {
                 let fo = job.fade_out.min(clip_dur);
                 if fo > 0.0 {
                     let st = (clip_dur - fo).max(0.0);
-                    filters.push(format!(
-                        "afade=t=out:st={:.6}:d={:.6}:curve=tri",
-                        st, fo
-                    ));
+                    filters.push(format!("afade=t=out:st={:.6}:d={:.6}:curve=tri", st, fo));
                 }
             }
 
@@ -2334,14 +2498,9 @@ impl<'a> FilterGraphBuilder<'a> {
                 AudioEnv::Animated { segments } => {
                     for (a, b) in segments {
                         let mid = ((a + b) * 0.5).max(*a);
-                        let v = job
-                            .track
-                            .map(|t| t.pan_at(mid))
-                            .unwrap_or(0.0);
+                        let v = job.track.map(|t| t.pan_at(mid)).unwrap_or(0.0);
                         let Some(f) = pan_filter(v) else { continue };
-                        filters.push(format!(
-                            "{f}:enable='between(t,{a:.4},{b:.4})'",
-                        ));
+                        filters.push(format!("{f}:enable='between(t,{a:.4},{b:.4})'",));
                     }
                 }
             }
@@ -2367,20 +2526,17 @@ impl<'a> FilterGraphBuilder<'a> {
                     AudioEnv::Animated { segments } => {
                         for (a, b) in segments {
                             let mid = ((a + b) * 0.5).max(*a);
-                            let v = job
-                                .track
-                                .map(|t| t.volume_at(mid).max(0.0))
-                                .unwrap_or(1.0);
+                            let v = job.track.map(|t| t.volume_at(mid).max(0.0)).unwrap_or(1.0);
                             // Even unity segments still need to emit a
                             // filter when *other* segments aren't unity,
                             // so the chain length matches the segment
                             // count and `enable=` covers the whole
                             // clip. Use `volume=1.0:enable=...` rather
                             // than skipping.
-                            filters.push(format!(
-                                "volume={:.6}:enable='between(t,{a:.4},{b:.4})'",
-                                v,
-                            ));
+                            filters
+                                .push(
+                                    format!("volume={:.6}:enable='between(t,{a:.4},{b:.4})'", v,),
+                                );
                         }
                     }
                 }
@@ -2391,8 +2547,13 @@ impl<'a> FilterGraphBuilder<'a> {
                 // even when the input layout disagrees with the per-
                 // channel list — robust against odd source layouts.
                 filters.push(format!("adelay={d}:all=1", d = delay_ms));
+                // `adelay` offsets packet timestamps too. Reset here
+                // so `amix` sees a scene-zero stream whose leading
+                // silence carries the timeline offset; otherwise split
+                // clips can be aligned late in the export even though
+                // their preview sink starts at the right source time.
+                filters.push("asetpts=PTS-STARTPTS".into());
             }
-            filters.push(format!("apad=whole_dur={:.6}", scene_dur));
             filters.push(format!("atrim=duration={:.6}", scene_dur));
             filters.push("asetpts=PTS-STARTPTS".into());
 
@@ -2413,43 +2574,44 @@ impl<'a> FilterGraphBuilder<'a> {
             return Ok(());
         }
 
+        let silence = self.alloc_label("asilence");
+        self.chunks.push(format!(
+            "anullsrc=channel_layout={ch}:sample_rate={sr}:d={dur:.6}{out}",
+            ch = LAYOUT,
+            sr = SR,
+            dur = scene_dur,
+            out = silence,
+        ));
+
+        let mut mix_inputs = Vec::with_capacity(audio_labels.len() + 1);
+        mix_inputs.push(silence);
+        mix_inputs.extend(audio_labels);
+
         let mix = self.alloc_label("amix");
-        if audio_labels.len() == 1 {
-            // Single-track fast path: skip amix entirely and just
-            // re-pin the format. amix=inputs=1 also works but adds a
-            // pointless mix node and a normalize coefficient.
-            self.chunks.push(format!(
-                "{src}aformat=sample_fmts={fmt}:sample_rates={sr}:channel_layouts={ch}{out}",
-                src = audio_labels[0],
-                fmt = FMT,
-                sr = SR,
-                ch = LAYOUT,
-                out = mix,
-            ));
-        } else {
-            let inputs = audio_labels.join("");
-            let mixed = self.alloc_label("amixraw");
-            // `dropout_transition=0` keeps each input at full gain
-            // even after another input EOFs (with our apad above no
-            // input EOFs early anyway, but this stays safe in case a
-            // future change removes the pad). `normalize=0` matches
-            // the GUI preview's mixer where each track's static
-            // volume is preserved verbatim.
-            self.chunks.push(format!(
-                "{inputs}amix=inputs={n}:duration=longest:dropout_transition=0:normalize=0{out}",
-                inputs = inputs,
-                n = audio_labels.len(),
-                out = mixed,
-            ));
-            self.chunks.push(format!(
-                "{src}aformat=sample_fmts={fmt}:sample_rates={sr}:channel_layouts={ch}{out}",
-                src = mixed,
-                fmt = FMT,
-                sr = SR,
-                ch = LAYOUT,
-                out = mix,
-            ));
-        }
+        let inputs = mix_inputs.join("");
+        let mixed = self.alloc_label("amixraw");
+        // `dropout_transition=0` keeps each input at full gain after
+        // shorter clips EOF. The explicit silent bed is scene-length,
+        // so the post-mix bus always reaches the requested duration
+        // even when the real audio tracks are short or delayed.
+        // `normalize=0` matches the GUI preview's mixer where each
+        // track's static volume is preserved verbatim.
+        self.chunks.push(format!(
+            "{inputs}amix=inputs={n}:duration=longest:dropout_transition=0:normalize=0{out}",
+            inputs = inputs,
+            n = mix_inputs.len(),
+            out = mixed,
+        ));
+        self.chunks.push(format!(
+            "{src}atrim=duration={dur:.6},asetpts=PTS-STARTPTS,\
+             aformat=sample_fmts={fmt}:sample_rates={sr}:channel_layouts={ch}{out}",
+            src = mixed,
+            dur = scene_dur,
+            fmt = FMT,
+            sr = SR,
+            ch = LAYOUT,
+            out = mix,
+        ));
         self.map_audio = Some(mix);
         Ok(())
     }
@@ -2488,22 +2650,30 @@ impl<'a> FilterGraphBuilder<'a> {
     ) -> Result<String> {
         let mut buffer: Vec<String> = Vec::new();
         for eff in effects {
-            if !eff.enabled { continue; }
+            if !eff.enabled {
+                continue;
+            }
             // Mask carries no per-parameter keyframes the renderer
             // honours, so it stays on the static intensity path.
             // Animated mask intensity is not modelled either; the
             // `:001` clamp matches the historical fast path.
             let i_static = eff.intensity.clamp(0.0, 1.0);
-            if let EffectKind::Mask { shape, feather, invert } = &eff.kind {
-                if i_static <= 0.001 { continue; }
+            if let EffectKind::Mask {
+                shape,
+                feather,
+                invert,
+            } = &eff.kind
+            {
+                if i_static <= 0.001 {
+                    continue;
+                }
                 current = self.flush_effect_buffer(current, &mut buffer);
                 current = self.emit_mask_alphamerge(current, shape, *feather, *invert, i_static)?;
-            } else if let Some(snippet) = crate::expr::effect_animated_filter_chain(
-                eff,
-                t_in,
-                t_out,
-                |kind, intensity| effect_to_filter(kind, intensity),
-            ) {
+            } else if let Some(snippet) =
+                crate::expr::effect_animated_filter_chain(eff, t_in, t_out, |kind, intensity| {
+                    effect_to_filter(kind, intensity)
+                })
+            {
                 buffer.push(snippet);
             }
         }
@@ -2515,7 +2685,9 @@ impl<'a> FilterGraphBuilder<'a> {
     /// to `current`. Returns either the unchanged `current` (when the
     /// buffer is empty) or the label of the new output stream.
     fn flush_effect_buffer(&mut self, current: String, buffer: &mut Vec<String>) -> String {
-        if buffer.is_empty() { return current; }
+        if buffer.is_empty() {
+            return current;
+        }
         let next = self.alloc_label("fxchain");
         self.chunks.push(format!(
             "{cur}{joined}{out}",
@@ -2604,17 +2776,24 @@ impl<'a> FilterGraphBuilder<'a> {
         let main_b = self.alloc_label("maskMainB");
         self.chunks.push(format!(
             "{cur}format=yuva420p,fps={fps},setpts=PTS-STARTPTS,setsar=1,split=2{a}{b}",
-            cur = current, fps = fps, a = main_a, b = main_b,
+            cur = current,
+            fps = fps,
+            a = main_a,
+            b = main_b,
         ));
         let main_alpha = self.alloc_label("maskMainAlpha");
         self.chunks.push(format!(
             "{a}alphaextract,format=gray,fps={fps},setpts=PTS-STARTPTS,setsar=1{aout}",
-            a = main_a, fps = fps, aout = main_alpha,
+            a = main_a,
+            fps = fps,
+            aout = main_alpha,
         ));
         let mask_raw = self.alloc_label("maskRaw");
         self.chunks.push(format!(
             "[{idx}:v]format=gray,fps={fps},setpts=PTS-STARTPTS,setsar=1{m}",
-            idx = mask_idx, fps = fps, m = mask_raw,
+            idx = mask_idx,
+            fps = fps,
+            m = mask_raw,
         ));
         // scale2ref pre-stage: produces a resized (but timing-naive)
         // mask plus a passthrough of the reference. We immediately
@@ -2626,17 +2805,24 @@ impl<'a> FilterGraphBuilder<'a> {
         let main_bp_pre = self.alloc_label("maskMainBpRaw");
         self.chunks.push(format!(
             "{m}{b}scale2ref=w=main_w:h=main_h{ms_pre}{bp_pre}",
-            m = mask_raw, b = main_b, ms_pre = mask_scaled_pre, bp_pre = main_bp_pre,
+            m = mask_raw,
+            b = main_b,
+            ms_pre = mask_scaled_pre,
+            bp_pre = main_bp_pre,
         ));
         let mask_scaled = self.alloc_label("maskScaled");
         self.chunks.push(format!(
             "{ms_pre}format=gray,fps={fps},setpts=PTS-STARTPTS,setsar=1{ms}",
-            ms_pre = mask_scaled_pre, fps = fps, ms = mask_scaled,
+            ms_pre = mask_scaled_pre,
+            fps = fps,
+            ms = mask_scaled,
         ));
         let main_bp = self.alloc_label("maskMainBp");
         self.chunks.push(format!(
             "{bp_pre}fps={fps},setpts=PTS-STARTPTS,setsar=1{bp}",
-            bp_pre = main_bp_pre, fps = fps, bp = main_bp,
+            bp_pre = main_bp_pre,
+            fps = fps,
+            bp = main_bp,
         ));
         let combined = self.alloc_label("maskCombined");
         // `shortest=0:repeatlast=1` tells framesync to keep the still
@@ -2646,12 +2832,16 @@ impl<'a> FilterGraphBuilder<'a> {
         // emit a single frame and then silently shut down the chain.
         self.chunks.push(format!(
             "{ma}{ms}blend=all_mode=multiply:all_opacity=1:shortest=0:repeatlast=1{c}",
-            ma = main_alpha, ms = mask_scaled, c = combined,
+            ma = main_alpha,
+            ms = mask_scaled,
+            c = combined,
         ));
         let masked = self.alloc_label("masked");
         self.chunks.push(format!(
             "{bp}{c}alphamerge{out}",
-            bp = main_bp, c = combined, out = masked,
+            bp = main_bp,
+            c = combined,
+            out = masked,
         ));
         Ok(masked)
     }
@@ -2683,11 +2873,17 @@ impl<'a> FilterGraphBuilder<'a> {
                 let u = (x as f32 + 0.5) * inv_dim;
                 let margin = shape.signed_margin_uv(u, v);
                 let mut keep = if hard_edge {
-                    if margin >= 0.0 { 1.0 } else { 0.0 }
+                    if margin >= 0.0 {
+                        1.0
+                    } else {
+                        0.0
+                    }
                 } else {
                     (margin / f + 0.5).clamp(0.0, 1.0)
                 };
-                if invert { keep = 1.0 - keep; }
+                if invert {
+                    keep = 1.0 - keep;
+                }
                 // Same intensity blend as `apply_mask_alpha`:
                 // i = 0  → keep_eff = 1.0 (mask is a no-op),
                 // i = 1  → keep_eff = keep.
@@ -2735,8 +2931,8 @@ impl<'a> FilterGraphBuilder<'a> {
 ///   opens at `t=4` the decoder is at EOF and the overlay activates
 ///   with nothing left to draw. Audio looked fine because
 ///   `emit_audio` already wraps each track in
-///   `atrim+asetpts+adelay+apad+atrim`, but the video stream had no
-///   counterpart.
+///   `atrim+asetpts+adelay+asetpts` plus a scene-length silent bed,
+///   but the video stream had no counterpart.
 ///
 /// This is the user-visible bug "two clips on the same layer — only
 /// the first draws, the second never appears even though its audio
@@ -2774,12 +2970,7 @@ impl<'a> FilterGraphBuilder<'a> {
 /// (`setpts=PTS/{speed}`) *before* this chain, so the post-speed
 /// stream's PTS rate already matches scene-time and `trim` consumes
 /// exactly the right amount of post-processed source.
-fn time_align_filters(
-    t_in: f32,
-    t_out: f32,
-    scene_dur: f32,
-    _loop_source: bool,
-) -> Vec<String> {
+fn time_align_filters(t_in: f32, t_out: f32, scene_dur: f32, _loop_source: bool) -> Vec<String> {
     let clip_dur = (t_out - t_in).max(1.0 / 60.0);
     let mut out = Vec::with_capacity(4);
     // Cap the post-speed stream at the clip's visible duration. For
@@ -2799,17 +2990,11 @@ fn time_align_filters(
         // until scene-time `t_in`, exactly like the canvas preview
         // (which never paints elements outside their `[t_in, t_out]`
         // window).
-        out.push(format!(
-            "tpad=start_duration={:.6}:color=black@0.0",
-            t_in,
-        ));
+        out.push(format!("tpad=start_duration={:.6}:color=black@0.0", t_in,));
     }
     let tail = (scene_dur - t_out).max(0.0);
     if tail > 1.0e-3 {
-        out.push(format!(
-            "tpad=stop_duration={:.6}:color=black@0.0",
-            tail,
-        ));
+        out.push(format!("tpad=stop_duration={:.6}:color=black@0.0", tail,));
     }
     out
 }
@@ -2897,7 +3082,11 @@ fn alpha_filter_for(xform: &crate::expr::ElementTransform) -> Option<String> {
 /// and scale (multiplier). Returns `(x_expr, y_expr, scale_x_expr,
 /// scale_y_expr)`. The Y axis scale is `scale * scale_y` (where `scale_y`
 /// defaults to 1.0 for proportional scaling).
-fn position_and_scale_expr<S>(layout: &[Keyframe<S>], w: u32, h: u32) -> (String, String, String, String)
+fn position_and_scale_expr<S>(
+    layout: &[Keyframe<S>],
+    w: u32,
+    h: u32,
+) -> (String, String, String, String)
 where
     S: PositionedState,
 {
@@ -2962,14 +3151,26 @@ trait PositionedState {
     fn scale_y(&self) -> f32;
 }
 impl PositionedState for ActorState {
-    fn pos(&self) -> [f32; 2] { self.pos }
-    fn scale(&self) -> f32 { self.scale }
-    fn scale_y(&self) -> f32 { self.scale_y }
+    fn pos(&self) -> [f32; 2] {
+        self.pos
+    }
+    fn scale(&self) -> f32 {
+        self.scale
+    }
+    fn scale_y(&self) -> f32 {
+        self.scale_y
+    }
 }
 impl PositionedState for OverlayState {
-    fn pos(&self) -> [f32; 2] { self.pos }
-    fn scale(&self) -> f32 { self.scale }
-    fn scale_y(&self) -> f32 { self.scale_y }
+    fn pos(&self) -> [f32; 2] {
+        self.pos
+    }
+    fn scale(&self) -> f32 {
+        self.scale
+    }
+    fn scale_y(&self) -> f32 {
+        self.scale_y
+    }
 }
 
 /// Escape a user string for use inside a `drawtext=text='...'` arg.
@@ -3017,9 +3218,7 @@ fn build_anchor_position_expr(
     let points: Vec<(f32, f32, f32)> = track
         .samples
         .iter()
-        .filter_map(|s| {
-            s.points.get(anchor_name).map(|kp| (s.t, kp.x, kp.y))
-        })
+        .filter_map(|s| s.points.get(anchor_name).map(|kp| (s.t, kp.x, kp.y)))
         .collect();
 
     if points.is_empty() {
@@ -3058,28 +3257,40 @@ fn build_anchor_position_expr(
         let dx = (ax - 0.5) * w as f32;
         let dy = (ay - 0.5) * h as f32;
         return (
-            format!("({}+{}*{}+{})-w/2", actor_x_expr, dx, actor_scale_expr, offset[0]),
-            format!("({}+{}*{}+{})-h/2", actor_y_expr, dy, actor_scale_expr, offset[1]),
+            format!(
+                "({}+{}*{}+{})-w/2",
+                actor_x_expr, dx, actor_scale_expr, offset[0]
+            ),
+            format!(
+                "({}+{}*{}+{})-h/2",
+                actor_y_expr, dy, actor_scale_expr, offset[1]
+            ),
         );
     }
 
     // Build piecewise expression for anchor offset from center
-    let build_piecewise = |sampled: &[&(f32, f32, f32)], getter: &dyn Fn(&(f32, f32, f32)) -> f32| -> String {
-        let last_val = getter(sampled.last().unwrap());
-        let mut expr = format!("{}", last_val);
-        for window in sampled.windows(2).rev() {
-            let (t0, ..) = window[0];
-            let (t1, ..) = window[1];
-            let v0 = getter(window[0]);
-            let v1 = getter(window[1]);
-            let span = (t1 - t0).max(1e-6);
-            expr = format!(
-                "if(lt(t,{}),{}+({})*((t-{})/{})  ,{})",
-                t1, v0, v1 - v0, t0, span, expr
-            );
-        }
-        expr
-    };
+    let build_piecewise =
+        |sampled: &[&(f32, f32, f32)], getter: &dyn Fn(&(f32, f32, f32)) -> f32| -> String {
+            let last_val = getter(sampled.last().unwrap());
+            let mut expr = format!("{}", last_val);
+            for window in sampled.windows(2).rev() {
+                let (t0, ..) = window[0];
+                let (t1, ..) = window[1];
+                let v0 = getter(window[0]);
+                let v1 = getter(window[1]);
+                let span = (t1 - t0).max(1e-6);
+                expr = format!(
+                    "if(lt(t,{}),{}+({})*((t-{})/{})  ,{})",
+                    t1,
+                    v0,
+                    v1 - v0,
+                    t0,
+                    span,
+                    expr
+                );
+            }
+            expr
+        };
 
     // anchor_x values (normalised 0..1, we want delta from 0.5 * scene_width)
     let ax_expr = build_piecewise(&sampled, &|p| (p.1 - 0.5) * w as f32);
@@ -3098,8 +3309,6 @@ fn build_anchor_position_expr(
     (prop_x, prop_y)
 }
 
-
-
 // ─── EFFECT STACK FILTERS ────────────────────────────────────────────
 //
 // Translate the per-element effect stack (`Vec<Effect>`) into a list of
@@ -3116,13 +3325,14 @@ fn build_anchor_position_expr(
 fn effect_stack_filters(effects: &[Effect], t_in: f32, t_out: f32) -> Vec<String> {
     let mut out = Vec::with_capacity(effects.len());
     for eff in effects {
-        if !eff.enabled { continue; }
-        if let Some(s) = crate::expr::effect_animated_filter_chain(
-            eff,
-            t_in,
-            t_out,
-            |kind, intensity| effect_to_filter(kind, intensity),
-        ) {
+        if !eff.enabled {
+            continue;
+        }
+        if let Some(s) =
+            crate::expr::effect_animated_filter_chain(eff, t_in, t_out, |kind, intensity| {
+                effect_to_filter(kind, intensity)
+            })
+        {
             out.push(s);
         }
     }

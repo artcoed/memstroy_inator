@@ -16,7 +16,7 @@
 
 use std::path::Path;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use memstroy_core::*;
 use tracing::info;
 
@@ -286,7 +286,11 @@ impl PreviewCompositor {
         // Create render target texture
         let target_tex = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("preview_target"),
-            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -305,9 +309,11 @@ impl PreviewCompositor {
             a: 1.0,
         };
 
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("preview_enc"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("preview_enc"),
+            });
 
         // Clear pass
         {
@@ -343,9 +349,7 @@ impl PreviewCompositor {
             // Frame cache uses format: <cache_dir>/frame_XXXXX.jpg
             // The cache dir is typically at: <assets_root>/.frame_cache/<actor_idx>/
             // For robustness, we also try the source path with .frames/ suffix
-            let cache_dir = assets_root
-                .join(".frame_cache")
-                .join(&actor.id);
+            let cache_dir = assets_root.join(".frame_cache").join(&actor.id);
 
             // Calculate frame index (assuming 30fps extraction)
             let frame_idx = (local_t * 30.0).round() as u32;
@@ -429,7 +433,11 @@ impl PreviewCompositor {
                     rows_per_image: Some(h),
                 },
             },
-            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
         );
 
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -460,7 +468,11 @@ impl PreviewCompositor {
         drop(mapped);
         output_buffer.unmap();
 
-        Ok(PreviewFrame { width: w, height: h, pixels })
+        Ok(PreviewFrame {
+            width: w,
+            height: h,
+            pixels,
+        })
     }
 
     /// Composite multiple actors onto the render target in order.
@@ -483,7 +495,11 @@ impl PreviewCompositor {
         // Create render target
         let target_tex = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("composite_target"),
-            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -501,9 +517,11 @@ impl PreviewCompositor {
             a: 1.0,
         };
 
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("composite_enc"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("composite_enc"),
+            });
 
         // Clear pass
         {
@@ -530,9 +548,7 @@ impl PreviewCompositor {
                 continue;
             };
 
-            let cache_dir = assets_root
-                .join(".frame_cache")
-                .join(actor_id);
+            let cache_dir = assets_root.join(".frame_cache").join(actor_id);
 
             // Calculate frame index (assuming 30fps extraction)
             let frame_idx = (params.local_time * 30.0).round() as u32;
@@ -546,10 +562,7 @@ impl PreviewCompositor {
             let actor_texture = self.create_texture_from_rgba(&pixels, img_w, img_h);
             let bind_group = self.create_tex_bind_group(&actor_texture);
 
-            let use_chroma = params
-                .chroma_key
-                .as_ref()
-                .is_some_and(|ck| ck.is_active());
+            let use_chroma = params.chroma_key.as_ref().is_some_and(|ck| ck.is_active());
 
             // TODO: push constants for transform
             // params.layout contains position/scale/rotation that should be
@@ -608,7 +621,11 @@ impl PreviewCompositor {
                     rows_per_image: Some(h),
                 },
             },
-            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
         );
 
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -635,7 +652,11 @@ impl PreviewCompositor {
         drop(mapped);
         output_buffer.unmap();
 
-        Ok(PreviewFrame { width: w, height: h, pixels: output_pixels })
+        Ok(PreviewFrame {
+            width: w,
+            height: h,
+            pixels: output_pixels,
+        })
     }
 
     /// Upload a `PreviewFrame` to an egui `ColorImage`.

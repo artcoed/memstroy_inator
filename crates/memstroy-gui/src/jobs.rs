@@ -40,6 +40,7 @@ use tracing::{info, warn};
 pub enum JobEvent {
     Status(String),
     RenderLog(String),
+    RenderOutputChosen(Option<PathBuf>),
     RenderFinished(Result<PathBuf, String>),
     RefreshProgress(String),
     /// Mid-refresh signal: the worker has just downloaded one or more
@@ -61,13 +62,7 @@ pub enum JobEvent {
         page_offset: u32,
         /// Which UI initiated the search — panel grid vs canvas popup.
         target: WebSearchTarget,
-        result: Result<
-            (
-                Vec<crate::web_image_search::WebImageHit>,
-                Option<u32>,
-            ),
-            String,
-        >,
+        result: Result<(Vec<crate::web_image_search::WebImageHit>, Option<u32>), String>,
     },
     /// A web image download for the row identified by `request_id` has
     /// completed. `image_url` is repeated so the panel can match the
@@ -104,6 +99,24 @@ pub enum JobEvent {
         result: Result<PathBuf, String>,
         drop_target: ClipDropTarget,
     },
+    /// One paginated page from the assets-server catalogue finished
+    /// loading. The UI merges these summaries into the active library
+    /// tab without doing a full filesystem rescan.
+    ServerAssetsPageLoaded {
+        tab: crate::state::LibraryTab,
+        query: String,
+        offset: u64,
+        limit: u64,
+        result: Result<ServerAssetsPage, String>,
+    },
+    /// A generic server-backed asset (image/sound/video) finished
+    /// downloading after the user dropped its preview.
+    ServerAssetDownloaded {
+        server_id: String,
+        kind: crate::state::AssetDragKind,
+        result: Result<PathBuf, String>,
+        drop_target: ServerAssetDropTarget,
+    },
     /// Background ffprobe finished for a clip placed on the timeline.
     VideoDurationProbed {
         actor_id: String,
@@ -127,14 +140,24 @@ pub enum WebSearchTarget {
     Canvas,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum ClipDropTarget {
     /// Drop on canvas at world position.
     CanvasAt { world_x: f32, world_y: f32 },
     /// Drop on timeline at scene-time.
     TimelineAt { t: f32 },
+    /// Fill an existing Mellstroy-footage sequence slot after download.
+    SequenceSlot { actor_id: String },
     /// Just download into the cache; don't auto-place.
+    None,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub enum ServerAssetDropTarget {
+    CanvasAt { world_x: f32, world_y: f32 },
+    TimelineAt { t: f32, track_idx: Option<usize> },
     None,
 }
 
@@ -263,9 +286,9 @@ pub fn spawn_refresh(
         let progress = |s: String| {
             let _ = tx.send(JobEvent::RefreshProgress(s));
         };
-        
+
         info!("spawn_refresh: clips_dir = {}", clips_dir.display());
-        
+
         // The GUI may have been configured with a wildcard bind URL
         // (e.g. `http://0.0.0.0:8765`) — that is a valid bind address
         // for the server but `connect(2)` to it fails on Windows with
@@ -276,7 +299,10 @@ pub fn spawn_refresh(
             .trim_end_matches('/')
             .to_string();
 
-        progress(format!("Asking {} to ingest @{} (limit {})", server, channel, limit));
+        progress(format!(
+            "Asking {} to ingest @{} (limit {})",
+            server, channel, limit
+        ));
 
         let client = match reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
@@ -329,14 +355,10 @@ pub fn spawn_refresh(
         let _ = tokio::fs::create_dir_all(&thumbs_dir).await;
 
         // 3. Poll server for clips. Start immediately without delay.
-        let list_url = format!(
-            "{}/api/assets?kind=clip&limit={}",
-            server,
-            limit
-        );
+        let list_url = format!("{}/api/assets?kind=clip&limit={}", server, limit);
 
         progress("Fetching clip list from server...".into());
-        
+
         let mut new_count = 0usize;
         let failed = 0usize;
         let mut downloaded_ids: std::collections::HashSet<String> =
@@ -346,10 +368,10 @@ pub fn spawn_refresh(
         let max_wait = Duration::from_secs(30);
         let poll_interval = Duration::from_millis(500); // Poll every 500ms for faster response
         let started = std::time::Instant::now();
-        
+
         let listing: ListResponse = loop {
             progress("Fetching clip list from server...".into());
-            
+
             match client.get(&list_url).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     match resp.json::<ListResponse>().await {
@@ -503,20 +525,186 @@ pub fn spawn_refresh(
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerAssetSummary {
     pub id: String,
+    #[serde(default)]
+    pub kind: String,
     #[allow(dead_code)]
+    #[serde(default)]
     pub label: String,
     /// Free-form description (cleaned Telegram caption for clips, or
     /// the contents of a `<id>.txt` sidecar for any other kind). The
     /// server already truncates this to 240 chars in `AssetSummary`.
     #[serde(default)]
     pub description: String,
+    #[serde(default)]
+    pub preview_url: Option<String>,
+    #[serde(default)]
+    pub file_name: String,
+    #[serde(default)]
+    pub extension: String,
+    #[serde(default)]
+    pub duration_secs: Option<f32>,
+    #[serde(default)]
+    pub width: Option<u32>,
+    #[serde(default)]
+    pub height: Option<u32>,
+    #[serde(skip)]
+    pub local_preview: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ListResponse {
     #[allow(dead_code)]
     pub total: u64,
+    #[serde(default)]
+    pub offset: u64,
+    #[serde(default)]
+    pub limit: u64,
+    #[serde(default)]
+    pub has_more: bool,
     pub items: Vec<ServerAssetSummary>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ServerAssetsPage {
+    pub total: u64,
+    pub offset: u64,
+    pub limit: u64,
+    pub has_more: bool,
+    pub items: Vec<ServerAssetSummary>,
+}
+
+pub fn spawn_server_assets_page(
+    rt: &Handle,
+    tx: Sender<JobEvent>,
+    server_url: String,
+    tab: crate::state::LibraryTab,
+    kind_token: &'static str,
+    query: String,
+    offset: u64,
+    limit: u64,
+    preview_cache_root: PathBuf,
+) {
+    rt.spawn(async move {
+        let result = fetch_server_assets_page(
+            server_url,
+            kind_token,
+            query.clone(),
+            offset,
+            limit,
+            preview_cache_root,
+        )
+        .await;
+        let _ = tx.send(JobEvent::ServerAssetsPageLoaded {
+            tab,
+            query,
+            offset,
+            limit,
+            result,
+        });
+    });
+}
+
+async fn fetch_server_assets_page(
+    server_url: String,
+    kind_token: &'static str,
+    query: String,
+    offset: u64,
+    limit: u64,
+    preview_cache_root: PathBuf,
+) -> Result<ServerAssetsPage, String> {
+    let server = crate::state::rewrite_server_url_for_client(&server_url)
+        .trim_end_matches('/')
+        .to_string();
+    if server.is_empty() {
+        return Err("assets-server URL is empty".into());
+    }
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(12))
+        .build()
+        .map_err(|e| format!("HTTP client init: {e}"))?;
+    let mut url = format!(
+        "{}/api/assets?kind={}&offset={}&limit={}",
+        server, kind_token, offset, limit
+    );
+    let query = query.trim();
+    if !query.is_empty() {
+        url.push_str("&q=");
+        url.push_str(&url_query_encode(query));
+    }
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("server unavailable: {e}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        let snippet: String = body.chars().take(180).collect();
+        return Err(format!("server list HTTP {status}: {snippet}"));
+    }
+    let mut list: ListResponse = resp
+        .json()
+        .await
+        .map_err(|e| format!("server list parse failed: {e}"))?;
+
+    let preview_dir = preview_cache_root.join(kind_token);
+    let _ = tokio::fs::create_dir_all(&preview_dir).await;
+    for item in &mut list.items {
+        let Some(preview_url) = item.preview_url.clone() else {
+            continue;
+        };
+        let safe_id = sanitise_id(&item.id);
+        let target = preview_dir.join(format!("{safe_id}.jpg"));
+        if target.exists() {
+            item.local_preview = Some(target);
+            continue;
+        }
+        let full_url = if preview_url.starts_with("http://") || preview_url.starts_with("https://")
+        {
+            preview_url
+        } else {
+            format!("{}{}", server, preview_url)
+        };
+        match download_thumbnail(&client, &full_url, &target).await {
+            Ok(()) => item.local_preview = Some(target),
+            Err(e) => {
+                warn!(
+                    id = %item.id,
+                    error = %e,
+                    "server preview download failed"
+                );
+            }
+        }
+    }
+
+    let limit = if list.limit == 0 { limit } else { list.limit };
+    let has_more = if list.limit == 0 {
+        offset.saturating_add(list.items.len() as u64) < list.total
+    } else {
+        list.has_more
+    };
+    Ok(ServerAssetsPage {
+        total: list.total,
+        offset: list.offset,
+        limit,
+        has_more,
+        items: list.items,
+    })
+}
+
+fn url_query_encode(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for b in raw.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(char::from(b))
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 /// Locate a local thumbnail for a clip stem, mirroring server-side
@@ -555,9 +743,7 @@ fn is_valid_image_bytes(bytes: &[u8]) -> bool {
     if bytes.len() >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF {
         return true;
     }
-    if bytes.len() >= 8
-        && bytes[0..8] == [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
-    {
+    if bytes.len() >= 8 && bytes[0..8] == [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A] {
         return true;
     }
     bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP"
@@ -604,10 +790,7 @@ async fn download_response_to_file(
         return Err(format!("unexpected content-type={ct}: {snippet}"));
     }
 
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| format!("read error: {e}"))?;
+    let bytes = resp.bytes().await.map_err(|e| format!("read error: {e}"))?;
     if let Some(cl) = content_len {
         if cl != bytes.len() as u64 {
             return Err(format!(
@@ -636,9 +819,15 @@ async fn download_response_to_file(
     tokio::fs::write(&tmp, &bytes)
         .await
         .map_err(|e| format!("write error: {e}"))?;
-    tokio::fs::rename(&tmp, target)
-        .await
-        .map_err(|e| format!("rename error: {e}"))
+    match tokio::fs::rename(&tmp, target).await {
+        Ok(()) => Ok(()),
+        Err(first_err) => {
+            let _ = tokio::fs::remove_file(target).await;
+            tokio::fs::rename(&tmp, target)
+                .await
+                .map_err(|e| format!("rename error: {e}; first attempt: {first_err}"))
+        }
+    }
 }
 
 /// HTTP GET → file. Buffers the whole body in memory because the
@@ -651,7 +840,12 @@ pub async fn download_file(
 ) -> Result<(), String> {
     // Guard against HTML/error pages or truncated bodies saved as `.mp4`.
     // The GUI's `is_usable_local_video` uses the same 4KB threshold.
-    download_response_to_file(client, url, target, 4097, false).await
+    download_response_to_file(client, url, target, 4097, false).await?;
+    if !crate::state::EditorState::is_usable_local_video(target) {
+        let _ = tokio::fs::remove_file(target).await;
+        return Err("download is not a valid video file".into());
+    }
+    Ok(())
 }
 
 /// Download a preview JPEG/PNG/WebP from the assets server. Thumbnails
@@ -669,7 +863,13 @@ pub async fn download_thumbnail(
 /// the server already restricts ids to a sane character class).
 pub fn sanitise_id(id: &str) -> String {
     id.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -709,7 +909,8 @@ pub fn spawn_clip_download(
         if let Some(parent) = local_path.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
         }
-        let result = download_file(&client, &url, &local_path).await
+        let result = download_file(&client, &url, &local_path)
+            .await
             .map(|_| local_path.clone());
         if result.is_ok() {
             if let Some(clips_dir) = local_path.parent() {
@@ -725,9 +926,74 @@ pub fn spawn_clip_download(
     });
 }
 
+pub fn spawn_server_asset_download(
+    rt: &Handle,
+    tx: Sender<JobEvent>,
+    server_url: String,
+    server_id: String,
+    kind: crate::state::AssetDragKind,
+    local_path: PathBuf,
+    drop_target: ServerAssetDropTarget,
+) {
+    rt.spawn(async move {
+        let server = crate::state::rewrite_server_url_for_client(&server_url)
+            .trim_end_matches('/')
+            .to_string();
+        let client = match reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(60))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = tx.send(JobEvent::ServerAssetDownloaded {
+                    server_id,
+                    kind,
+                    result: Err(format!("HTTP client init: {e}")),
+                    drop_target,
+                });
+                return;
+            }
+        };
+        let url = format!("{}/api/assets/{}/download", server, server_id);
+        if let Some(parent) = local_path.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        let result = match kind {
+            crate::state::AssetDragKind::Image | crate::state::AssetDragKind::Particle => {
+                download_response_to_file(&client, &url, &local_path, 64, true).await
+            }
+            crate::state::AssetDragKind::Video | crate::state::AssetDragKind::Clip => {
+                download_file(&client, &url, &local_path).await
+            }
+            crate::state::AssetDragKind::Sound => {
+                download_response_to_file(&client, &url, &local_path, 128, false).await
+            }
+            crate::state::AssetDragKind::None => Err("no asset kind for download".into()),
+        }
+        .map(|_| local_path.clone());
+
+        if result.is_ok() && matches!(kind, crate::state::AssetDragKind::Video) {
+            if let Some(videos_dir) = local_path.parent() {
+                let _ = generate_video_library_thumbnails(videos_dir).await;
+            }
+        }
+
+        let _ = tx.send(JobEvent::ServerAssetDownloaded {
+            server_id,
+            kind,
+            result,
+            drop_target,
+        });
+    });
+}
+
 /// For every `*.mp4` file in `clips_dir` without a matching
 /// `thumbs/<stem>.jpg`, run a quick ffmpeg pass to extract a frame.
-pub(crate) async fn generate_thumbnails(clips_dir: &std::path::Path, thumbs_dir: &std::path::Path) -> usize {
+pub(crate) async fn generate_thumbnails(
+    clips_dir: &std::path::Path,
+    thumbs_dir: &std::path::Path,
+) -> usize {
     let bin = ffmpeg_binary();
     let ffmpeg_ok = {
         let mut cmd = std::process::Command::new(&bin);
@@ -749,13 +1015,17 @@ pub(crate) async fn generate_thumbnails(clips_dir: &std::path::Path, thumbs_dir:
     let mut generated = 0usize;
     for entry in entries.flatten() {
         let p = entry.path();
-        if !p.is_file() { continue; }
+        if !p.is_file() {
+            continue;
+        }
         let ext = p
             .extension()
             .and_then(|s| s.to_str())
             .map(str::to_ascii_lowercase)
             .unwrap_or_default();
-        if ext != "mp4" { continue; }
+        if ext != "mp4" {
+            continue;
+        }
         let stem = match p.file_stem().and_then(|s| s.to_str()) {
             Some(s) => s.to_string(),
             None => continue,
@@ -768,12 +1038,20 @@ pub(crate) async fn generate_thumbnails(clips_dir: &std::path::Path, thumbs_dir:
         let result = {
             let mut cmd = tokio::process::Command::new(&bin);
             cmd.args([
-                "-y", "-hide_banner", "-loglevel", "error",
-                "-ss", "0.5",
-                "-i", &p.to_string_lossy(),
-                "-frames:v", "1",
-                "-vf", "scale=120:-1",
-                "-q:v", "6",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-ss",
+                "0.5",
+                "-i",
+                &p.to_string_lossy(),
+                "-frames:v",
+                "1",
+                "-vf",
+                "scale=120:-1",
+                "-q:v",
+                "6",
             ])
             .arg(&thumb)
             .stdout(std::process::Stdio::null())
@@ -789,16 +1067,25 @@ pub(crate) async fn generate_thumbnails(clips_dir: &std::path::Path, thumbs_dir:
                 // Some clips fail at ss=0.5 (very short). Retry from 0.
                 let mut cmd = tokio::process::Command::new(&bin);
                 cmd.args([
-                    "-y", "-hide_banner", "-loglevel", "error",
-                    "-i", &p.to_string_lossy(),
-                    "-frames:v", "1",
-                    "-vf", "scale=120:-1",
-                    "-q:v", "6",
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-i",
+                    &p.to_string_lossy(),
+                    "-frames:v",
+                    "1",
+                    "-vf",
+                    "scale=120:-1",
+                    "-q:v",
+                    "6",
                 ])
                 .arg(&thumb)
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null());
-                if memstroy_render::hide_console_tokio(&mut cmd).status().await
+                if memstroy_render::hide_console_tokio(&mut cmd)
+                    .status()
+                    .await
                     .map(|s| s.success())
                     .unwrap_or(false)
                 {
@@ -893,8 +1180,6 @@ pub(crate) async fn generate_video_library_thumbnails(videos_dir: &std::path::Pa
     }
     generated
 }
-
-
 
 // ─────────────────────────────────────────────────────────────────────
 // Web image search & download (DuckDuckGo backend)
@@ -1097,7 +1382,10 @@ fn extract_vqd(html: &str) -> Option<String> {
     while let Some(rel) = find_subslice(&bytes[search_from..], needle) {
         let pos = search_from + rel;
         let prev = if pos == 0 { b'?' } else { bytes[pos - 1] };
-        if matches!(prev, b'&' | b'?' | b',' | b'(' | b' ' | b'\n' | b'\t' | b';') {
+        if matches!(
+            prev,
+            b'&' | b'?' | b',' | b'(' | b' ' | b'\n' | b'\t' | b';'
+        ) {
             let rest = &html[pos + needle.len()..];
             let end = rest
                 .as_bytes()
@@ -1126,7 +1414,10 @@ fn parse_ddg_results(v: &serde_json::Value) -> Vec<WebImageHit> {
         None => return Vec::new(),
     };
     let mut hits = Vec::with_capacity(arr.len().min(crate::web_image_search::MAX_RESULTS_PER_PAGE));
-    for entry in arr.iter().take(crate::web_image_search::MAX_RESULTS_PER_PAGE) {
+    for entry in arr
+        .iter()
+        .take(crate::web_image_search::MAX_RESULTS_PER_PAGE)
+    {
         let image = entry
             .get("image")
             .and_then(|s| s.as_str())
@@ -1147,14 +1438,8 @@ fn parse_ddg_results(v: &serde_json::Value) -> Vec<WebImageHit> {
             .and_then(|s| s.as_str())
             .unwrap_or("")
             .to_string();
-        let width = entry
-            .get("width")
-            .and_then(|n| n.as_u64())
-            .unwrap_or(0) as u32;
-        let height = entry
-            .get("height")
-            .and_then(|n| n.as_u64())
-            .unwrap_or(0) as u32;
+        let width = entry.get("width").and_then(|n| n.as_u64()).unwrap_or(0) as u32;
+        let height = entry.get("height").and_then(|n| n.as_u64()).unwrap_or(0) as u32;
         if image.is_empty() {
             continue;
         }
@@ -1259,7 +1544,7 @@ async fn run_web_image_download(
     // If decoding fails the image is unusable downstream, so we'd
     // rather fail loudly than save junk into the library.
     if let Err(e) = image::load_from_memory(&bytes) {
-        return Err(format!("Decoded image failed: {e}"))
+        return Err(format!("Decoded image failed: {e}"));
     }
 
     tokio::fs::create_dir_all(dest_dir)
@@ -1304,11 +1589,21 @@ async fn run_web_image_download(
         path: path.clone(),
         label,
         thumbnail: Some(path),
+        downloaded: true,
+        server_id: None,
+        duration_secs: None,
+        width: None,
+        height: None,
     })
 }
 
 fn ext_from_mime(mime: &str) -> Option<&'static str> {
-    let m = mime.split(';').next().unwrap_or(mime).trim().to_ascii_lowercase();
+    let m = mime
+        .split(';')
+        .next()
+        .unwrap_or(mime)
+        .trim()
+        .to_ascii_lowercase();
     match m.as_str() {
         "image/png" => Some("png"),
         "image/jpeg" | "image/jpg" => Some("jpg"),
@@ -1386,10 +1681,7 @@ async fn run_ai_background_remove(
     use memstroy_vision::bgremove::{BackgroundRemover, U2NetpBgRemover};
 
     let remover = U2NetpBgRemover::new(model_path.to_path_buf());
-    let mut rgba = remover
-        .remove(path)
-        .await
-        .map_err(|e| e.to_string())?;
+    let mut rgba = remover.remove(path).await.map_err(|e| e.to_string())?;
 
     if let Some(poly) = mask_polygon_uv {
         apply_uv_polygon_gate(&mut rgba, poly);
@@ -1431,8 +1723,8 @@ fn point_in_polygon(x: f32, y: f32, poly: &[[f32; 2]]) -> bool {
         let yi = poly[i][1];
         let xj = poly[j][0];
         let yj = poly[j][1];
-        let intersect = ((yi > y) != (yj > y))
-            && (x < (xj - xi) * (y - yi) / (yj - yi).max(1e-6) + xi);
+        let intersect =
+            ((yi > y) != (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi).max(1e-6) + xi);
         if intersect {
             inside = !inside;
         }

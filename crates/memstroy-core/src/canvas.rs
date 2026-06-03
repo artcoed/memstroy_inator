@@ -61,7 +61,9 @@ pub struct CanvasTransform {
     pub opacity: f32,
 }
 
-fn one() -> f32 { 1.0 }
+fn one() -> f32 {
+    1.0
+}
 
 impl Default for CanvasTransform {
     fn default() -> Self {
@@ -199,10 +201,7 @@ impl EditorViewport {
     pub fn world_to_screen(&self, world: WorldPos, viewport_size: [f32; 2]) -> [f32; 2] {
         let dx = (world.x - self.center.x) * self.zoom;
         let dy = (world.y - self.center.y) * self.zoom;
-        [
-            viewport_size[0] * 0.5 + dx,
-            viewport_size[1] * 0.5 + dy,
-        ]
+        [viewport_size[0] * 0.5 + dx, viewport_size[1] * 0.5 + dy]
     }
 
     /// Convert a screen-pixel position (relative to viewport top-left)
@@ -218,10 +217,7 @@ impl EditorViewport {
 
     /// Size of the visible world area in world pixels.
     pub fn visible_world_size(&self, viewport_size: [f32; 2]) -> [f32; 2] {
-        [
-            viewport_size[0] / self.zoom,
-            viewport_size[1] / self.zoom,
-        ]
+        [viewport_size[0] / self.zoom, viewport_size[1] / self.zoom]
     }
 
     /// Pan the viewport by a screen-pixel delta.
@@ -241,7 +237,12 @@ impl EditorViewport {
     }
 
     /// Fit the render frame into the viewport with some padding.
-    pub fn fit_render_frame(&mut self, frame_center: WorldPos, frame_resolution: [u32; 2], viewport_size: [f32; 2]) {
+    pub fn fit_render_frame(
+        &mut self,
+        frame_center: WorldPos,
+        frame_resolution: [u32; 2],
+        viewport_size: [f32; 2],
+    ) {
         self.center = frame_center;
         let aspect_x = viewport_size[0] / frame_resolution[0] as f32;
         let aspect_y = viewport_size[1] / frame_resolution[1] as f32;
@@ -262,7 +263,11 @@ pub fn normalized_to_world(norm: [f32; 2], rect_center: WorldPos, rect_size: [f3
 }
 
 /// Convert world pixels back to normalised coordinates relative to a rect.
-pub fn world_to_normalized(world: WorldPos, rect_center: WorldPos, rect_size: [f32; 2]) -> [f32; 2] {
+pub fn world_to_normalized(
+    world: WorldPos,
+    rect_center: WorldPos,
+    rect_size: [f32; 2],
+) -> [f32; 2] {
     [
         0.5 + (world.x - rect_center.x) / rect_size[0],
         0.5 + (world.y - rect_center.y) / rect_size[1],

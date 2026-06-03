@@ -92,7 +92,6 @@ use std::path::PathBuf;
 
 use crate::*;
 
-
 // ─── ERROR TYPE ──────────────────────────────────────────────────────
 
 /// Errors produced during script parsing or execution.
@@ -119,10 +118,16 @@ pub struct ScriptResult {
 }
 
 impl ScriptResult {
-    pub fn ok() -> Self { Self { messages: Vec::new(), errors: Vec::new() } }
-    pub fn is_ok(&self) -> bool { self.errors.is_empty() }
+    pub fn ok() -> Self {
+        Self {
+            messages: Vec::new(),
+            errors: Vec::new(),
+        }
+    }
+    pub fn is_ok(&self) -> bool {
+        self.errors.is_empty()
+    }
 }
-
 
 // ─── INTERPRETER ─────────────────────────────────────────────────────
 
@@ -151,7 +156,9 @@ pub fn execute_script(script: &str, scene: &mut Scene) -> ScriptResult {
 
 fn execute_line(line: &str, scene: &mut Scene, messages: &mut Vec<String>) -> Result<(), String> {
     let tokens = tokenize(line);
-    if tokens.is_empty() { return Ok(()); }
+    if tokens.is_empty() {
+        return Ok(());
+    }
 
     let cmd = tokens[0].as_str();
     let args = &tokens[1..];
@@ -198,13 +205,17 @@ fn execute_line(line: &str, scene: &mut Scene, messages: &mut Vec<String>) -> Re
                 animated_params: Default::default(),
                 z_order: 0,
                 parent_id: None,
+                mellstroy_footage: Default::default(),
                 mute_audio: false,
             };
             scene.actors.push(actor);
         }
         "remove_actor" => {
             let id = get_arg(args, 0, "id")?;
-            let pos = scene.actors.iter().position(|a| a.id == id)
+            let pos = scene
+                .actors
+                .iter()
+                .position(|a| a.id == id)
                 .ok_or_else(|| format!("actor '{}' not found", id))?;
             scene.actors.remove(pos);
         }
@@ -224,26 +235,38 @@ fn execute_line(line: &str, scene: &mut Scene, messages: &mut Vec<String>) -> Re
             if let Some(kf) = actor.layout.first_mut() {
                 kf.value.pos = [x, y];
             } else {
-                actor.layout.push(Keyframe::new(0.0, ActorState { pos: [x, y], ..Default::default() }));
+                actor.layout.push(Keyframe::new(
+                    0.0,
+                    ActorState {
+                        pos: [x, y],
+                        ..Default::default()
+                    },
+                ));
             }
         }
         "set_actor_scale" => {
             let id = get_arg(args, 0, "id")?;
             let s = parse_f32(args, 1, "scale")?;
             let actor = find_actor_mut(scene, id)?;
-            if let Some(kf) = actor.layout.first_mut() { kf.value.scale = s; }
+            if let Some(kf) = actor.layout.first_mut() {
+                kf.value.scale = s;
+            }
         }
         "set_actor_rotation" => {
             let id = get_arg(args, 0, "id")?;
             let r = parse_f32(args, 1, "degrees")?;
             let actor = find_actor_mut(scene, id)?;
-            if let Some(kf) = actor.layout.first_mut() { kf.value.rotation_deg = r; }
+            if let Some(kf) = actor.layout.first_mut() {
+                kf.value.rotation_deg = r;
+            }
         }
         "set_actor_opacity" => {
             let id = get_arg(args, 0, "id")?;
             let o = parse_f32(args, 1, "opacity")?;
             let actor = find_actor_mut(scene, id)?;
-            if let Some(kf) = actor.layout.first_mut() { kf.value.opacity = o; }
+            if let Some(kf) = actor.layout.first_mut() {
+                kf.value.opacity = o;
+            }
         }
         "set_actor_visible" => {
             let id = get_arg(args, 0, "id")?;
@@ -265,7 +288,10 @@ fn execute_line(line: &str, scene: &mut Scene, messages: &mut Vec<String>) -> Re
         "add_solid_bg" => cmd_add_solid_bg(args, scene)?,
         "remove_background" => {
             let id = get_arg(args, 0, "id")?;
-            let pos = scene.backgrounds.iter().position(|b| b.id == id)
+            let pos = scene
+                .backgrounds
+                .iter()
+                .position(|b| b.id == id)
                 .ok_or_else(|| format!("background '{}' not found", id))?;
             scene.backgrounds.remove(pos);
         }
@@ -288,7 +314,10 @@ fn execute_line(line: &str, scene: &mut Scene, messages: &mut Vec<String>) -> Re
         "add_audio" => cmd_add_audio(args, scene)?,
         "remove_audio" => {
             let id = get_arg(args, 0, "id")?;
-            let pos = scene.audio.iter().position(|a| a.id == id)
+            let pos = scene
+                .audio
+                .iter()
+                .position(|a| a.id == id)
                 .ok_or_else(|| format!("audio '{}' not found", id))?;
             scene.audio.remove(pos);
         }
@@ -311,9 +340,21 @@ fn execute_line(line: &str, scene: &mut Scene, messages: &mut Vec<String>) -> Re
             let mut out = String::from("Overlays:\n");
             for ov in &scene.overlays {
                 let desc = match ov {
-                    Overlay::Text(t) => format!("  TEXT '{}' | {:.2}..{:.2}", t.text, t.t_in, t.t_out),
-                    Overlay::Image(i) => format!("  IMG {} | {:.2}..{:.2}", i.source.display(), i.t_in, i.t_out),
-                    Overlay::Video(v) => format!("  VID {} | {:.2}..{:.2}", v.source.display(), v.t_in, v.t_out),
+                    Overlay::Text(t) => {
+                        format!("  TEXT '{}' | {:.2}..{:.2}", t.text, t.t_in, t.t_out)
+                    }
+                    Overlay::Image(i) => format!(
+                        "  IMG {} | {:.2}..{:.2}",
+                        i.source.display(),
+                        i.t_in,
+                        i.t_out
+                    ),
+                    Overlay::Video(v) => format!(
+                        "  VID {} | {:.2}..{:.2}",
+                        v.source.display(),
+                        v.t_in,
+                        v.t_out
+                    ),
                 };
                 out.push_str(&desc);
                 out.push('\n');
@@ -323,14 +364,26 @@ fn execute_line(line: &str, scene: &mut Scene, messages: &mut Vec<String>) -> Re
         "list_backgrounds" => {
             let mut out = String::from("Backgrounds:\n");
             for bg in &scene.backgrounds {
-                out.push_str(&format!("  {} | {:.2}..{:.2} | {:?}\n", bg.id, bg.start, bg.start + bg.duration, bg.fit));
+                out.push_str(&format!(
+                    "  {} | {:.2}..{:.2} | {:?}\n",
+                    bg.id,
+                    bg.start,
+                    bg.start + bg.duration,
+                    bg.fit
+                ));
             }
             messages.push(out);
         }
         "list_audio" => {
             let mut out = String::from("Audio:\n");
             for a in &scene.audio {
-                out.push_str(&format!("  {} | src={} | {:.2}..{:.2}\n", a.id, a.source.display(), a.t_in, a.t_out.unwrap_or(scene.output.duration)));
+                out.push_str(&format!(
+                    "  {} | src={} | {:.2}..{:.2}\n",
+                    a.id,
+                    a.source.display(),
+                    a.t_in,
+                    a.t_out.unwrap_or(scene.output.duration)
+                ));
             }
             messages.push(out);
         }
@@ -353,7 +406,6 @@ fn execute_line(line: &str, scene: &mut Scene, messages: &mut Vec<String>) -> Re
     Ok(())
 }
 
-
 // ─── COMMAND IMPLEMENTATIONS ─────────────────────────────────────────
 
 fn cmd_add_actor_keyframe(args: &[String], scene: &mut Scene) -> Result<(), String> {
@@ -368,7 +420,15 @@ fn cmd_add_actor_keyframe(args: &[String], scene: &mut Scene) -> Result<(), Stri
     let actor = find_actor_mut(scene, id)?;
     let kf = Keyframe {
         t,
-        value: ActorState { pos: [x, y], scale, scale_y: 1.0, rotation_deg: rot, opacity, flip_x_anim: 1.0, flip_y_anim: 1.0 },
+        value: ActorState {
+            pos: [x, y],
+            scale,
+            scale_y: 1.0,
+            rotation_deg: rot,
+            opacity,
+            flip_x_anim: 1.0,
+            flip_y_anim: 1.0,
+        },
         easing,
     };
     actor.layout.push(kf);
@@ -381,17 +441,24 @@ fn cmd_set_actor_world_pos(args: &[String], scene: &mut Scene) -> Result<(), Str
     let wx = parse_f32(args, 1, "world_x")?;
     let wy = parse_f32(args, 2, "world_y")?;
     // Find or create canvas_layout entry
-    if let Some(cl) = scene.canvas_layouts.iter_mut().find(|cl| cl.element_id == id) {
+    if let Some(cl) = scene
+        .canvas_layouts
+        .iter_mut()
+        .find(|cl| cl.element_id == id)
+    {
         if let Some(kf) = cl.keyframes.first_mut() {
             kf.value.pos = WorldPos { x: wx, y: wy };
         }
     } else {
         scene.canvas_layouts.push(CanvasLayout {
             element_id: id.to_string(),
-            keyframes: vec![Keyframe::new(0.0, CanvasTransform {
-                pos: WorldPos { x: wx, y: wy },
-                ..Default::default()
-            })],
+            keyframes: vec![Keyframe::new(
+                0.0,
+                CanvasTransform {
+                    pos: WorldPos { x: wx, y: wy },
+                    ..Default::default()
+                },
+            )],
         });
     }
     Ok(())
@@ -414,8 +481,16 @@ fn cmd_add_canvas_keyframe(args: &[String], scene: &mut Scene) -> Result<(), Str
         rotation_deg: rot,
         opacity,
     };
-    let kf = Keyframe { t, value: transform, easing };
-    if let Some(cl) = scene.canvas_layouts.iter_mut().find(|cl| cl.element_id == id) {
+    let kf = Keyframe {
+        t,
+        value: transform,
+        easing,
+    };
+    if let Some(cl) = scene
+        .canvas_layouts
+        .iter_mut()
+        .find(|cl| cl.element_id == id)
+    {
         cl.keyframes.push(kf);
         cl.keyframes.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap());
     } else {
@@ -500,15 +575,18 @@ fn cmd_add_video_overlay(args: &[String], scene: &mut Scene) -> Result<(), Strin
 
 fn cmd_remove_overlay(args: &[String], scene: &mut Scene) -> Result<(), String> {
     let id = get_arg(args, 0, "id")?;
-    let pos = scene.overlays.iter().position(|ov| match ov {
-        Overlay::Text(t) => t.id == id,
-        Overlay::Image(i) => i.id == id,
-        Overlay::Video(v) => v.id == id,
-    }).ok_or_else(|| format!("overlay '{}' not found", id))?;
+    let pos = scene
+        .overlays
+        .iter()
+        .position(|ov| match ov {
+            Overlay::Text(t) => t.id == id,
+            Overlay::Image(i) => i.id == id,
+            Overlay::Video(v) => v.id == id,
+        })
+        .ok_or_else(|| format!("overlay '{}' not found", id))?;
     scene.overlays.remove(pos);
     Ok(())
 }
-
 
 fn cmd_set_overlay_pos(args: &[String], scene: &mut Scene) -> Result<(), String> {
     let id = get_arg(args, 0, "id")?;
@@ -516,9 +594,21 @@ fn cmd_set_overlay_pos(args: &[String], scene: &mut Scene) -> Result<(), String>
     let y = parse_f32(args, 2, "y")?;
     let ov = find_overlay_mut(scene, id)?;
     match ov {
-        Overlay::Text(t) => { if let Some(kf) = t.layout.first_mut() { kf.value.pos = [x, y]; } }
-        Overlay::Image(i) => { if let Some(kf) = i.layout.first_mut() { kf.value.pos = [x, y]; } }
-        Overlay::Video(v) => { if let Some(kf) = v.layout.first_mut() { kf.value.pos = [x, y]; } }
+        Overlay::Text(t) => {
+            if let Some(kf) = t.layout.first_mut() {
+                kf.value.pos = [x, y];
+            }
+        }
+        Overlay::Image(i) => {
+            if let Some(kf) = i.layout.first_mut() {
+                kf.value.pos = [x, y];
+            }
+        }
+        Overlay::Video(v) => {
+            if let Some(kf) = v.layout.first_mut() {
+                kf.value.pos = [x, y];
+            }
+        }
     }
     Ok(())
 }
@@ -528,9 +618,21 @@ fn cmd_set_overlay_scale(args: &[String], scene: &mut Scene) -> Result<(), Strin
     let s = parse_f32(args, 1, "scale")?;
     let ov = find_overlay_mut(scene, id)?;
     match ov {
-        Overlay::Text(t) => { if let Some(kf) = t.layout.first_mut() { kf.value.scale = s; } }
-        Overlay::Image(i) => { if let Some(kf) = i.layout.first_mut() { kf.value.scale = s; } }
-        Overlay::Video(v) => { if let Some(kf) = v.layout.first_mut() { kf.value.scale = s; } }
+        Overlay::Text(t) => {
+            if let Some(kf) = t.layout.first_mut() {
+                kf.value.scale = s;
+            }
+        }
+        Overlay::Image(i) => {
+            if let Some(kf) = i.layout.first_mut() {
+                kf.value.scale = s;
+            }
+        }
+        Overlay::Video(v) => {
+            if let Some(kf) = v.layout.first_mut() {
+                kf.value.scale = s;
+            }
+        }
     }
     Ok(())
 }
@@ -540,7 +642,9 @@ fn cmd_set_text_content(args: &[String], scene: &mut Scene) -> Result<(), String
     let text = get_arg(args, 1, "text")?;
     let ov = find_overlay_mut(scene, id)?;
     match ov {
-        Overlay::Text(t) => { t.text = text.to_string(); }
+        Overlay::Text(t) => {
+            t.text = text.to_string();
+        }
         _ => return Err(format!("'{}' is not a text overlay", id)),
     }
     Ok(())
@@ -551,11 +655,21 @@ fn cmd_add_background(args: &[String], scene: &mut Scene) -> Result<(), String> 
     let src = get_arg(args, 1, "source_path")?;
     let start = parse_f32(args, 2, "start")?;
     let duration = parse_f32(args, 3, "duration")?;
-    let ext = PathBuf::from(src).extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    let ext = PathBuf::from(src)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
     let source = if ["jpg", "jpeg", "png", "webp"].contains(&ext.as_str()) {
-        MediaSource::Image { path: PathBuf::from(src) }
+        MediaSource::Image {
+            path: PathBuf::from(src),
+        }
     } else {
-        MediaSource::Video { path: PathBuf::from(src), r#loop: true, start_at: 0.0 }
+        MediaSource::Video {
+            path: PathBuf::from(src),
+            r#loop: true,
+            start_at: 0.0,
+        }
     };
     scene.backgrounds.push(Background {
         id: id.to_string(),
@@ -596,7 +710,10 @@ fn cmd_set_bg_fit(args: &[String], scene: &mut Scene) -> Result<(), String> {
         "original" => Fit::Original,
         _ => return Err(format!("unknown fit: '{}'", fit_str)),
     };
-    let bg = scene.backgrounds.iter_mut().find(|b| b.id == id)
+    let bg = scene
+        .backgrounds
+        .iter_mut()
+        .find(|b| b.id == id)
         .ok_or_else(|| format!("background '{}' not found", id))?;
     bg.fit = fit;
     Ok(())
@@ -606,7 +723,10 @@ fn cmd_set_bg_transition(args: &[String], scene: &mut Scene) -> Result<(), Strin
     let id = get_arg(args, 0, "id")?;
     let tr_str = get_arg(args, 1, "transition")?;
     let tr = parse_transition(tr_str)?;
-    let bg = scene.backgrounds.iter_mut().find(|b| b.id == id)
+    let bg = scene
+        .backgrounds
+        .iter_mut()
+        .find(|b| b.id == id)
         .ok_or_else(|| format!("background '{}' not found", id))?;
     bg.transition = tr;
     Ok(())
@@ -621,11 +741,18 @@ fn cmd_add_render_frame_kf(args: &[String], scene: &mut Scene) -> Result<(), Str
     let easing = parse_easing_opt(args, 5);
     let kf = Keyframe {
         t,
-        value: RenderFrameState { pos: WorldPos { x: wx, y: wy }, zoom, rotation_deg: rot },
+        value: RenderFrameState {
+            pos: WorldPos { x: wx, y: wy },
+            zoom,
+            rotation_deg: rot,
+        },
         easing,
     };
     scene.render_frame.layout.push(kf);
-    scene.render_frame.layout.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap());
+    scene
+        .render_frame
+        .layout
+        .sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap());
     Ok(())
 }
 
@@ -633,8 +760,16 @@ fn cmd_add_audio(args: &[String], scene: &mut Scene) -> Result<(), String> {
     let id = get_arg(args, 0, "id")?;
     let src = get_arg(args, 1, "source_path")?;
     let t_in = parse_f32(args, 2, "t_in")?;
-    let t_out = if args.len() > 3 { Some(parse_f32(args, 3, "t_out")?) } else { None };
-    let volume = if args.len() > 4 { parse_f32(args, 4, "volume")? } else { 1.0 };
+    let t_out = if args.len() > 3 {
+        Some(parse_f32(args, 3, "t_out")?)
+    } else {
+        None
+    };
+    let volume = if args.len() > 4 {
+        parse_f32(args, 4, "volume")?
+    } else {
+        1.0
+    };
     scene.audio.push(AudioTrack {
         id: id.to_string(),
         source: PathBuf::from(src),
@@ -650,8 +785,16 @@ fn cmd_attach_skeleton(args: &[String], scene: &mut Scene) -> Result<(), String>
     let actor_id = get_arg(args, 0, "actor_id")?;
     let skel_name = get_arg(args, 1, "skeleton_name")?;
     let point_name = get_arg(args, 2, "point_name")?;
-    let scale = if args.len() > 3 { parse_f32(args, 3, "scale")? } else { 1.0 };
-    let follow = if args.len() > 4 { args[4] == "true" } else { false };
+    let scale = if args.len() > 3 {
+        parse_f32(args, 3, "scale")?
+    } else {
+        1.0
+    };
+    let follow = if args.len() > 4 {
+        args[4] == "true"
+    } else {
+        false
+    };
     let actor = find_actor_mut(scene, actor_id)?;
     actor.skeleton_attachments.push(SkeletonAttachment {
         skeleton_id: skel_name.to_string(),
@@ -662,7 +805,6 @@ fn cmd_attach_skeleton(args: &[String], scene: &mut Scene) -> Result<(), String>
     });
     Ok(())
 }
-
 
 // ─── HELPERS ─────────────────────────────────────────────────────────
 
@@ -699,16 +841,20 @@ fn get_arg<'a>(args: &'a [String], idx: usize, name: &str) -> Result<&'a str, St
 
 fn parse_f32(args: &[String], idx: usize, name: &str) -> Result<f32, String> {
     let s = get_arg(args, idx, name)?;
-    s.parse::<f32>().map_err(|_| format!("'{}' is not a valid number for {}", s, name))
+    s.parse::<f32>()
+        .map_err(|_| format!("'{}' is not a valid number for {}", s, name))
 }
 
 fn parse_u32(args: &[String], idx: usize, name: &str) -> Result<u32, String> {
     let s = get_arg(args, idx, name)?;
-    s.parse::<u32>().map_err(|_| format!("'{}' is not a valid integer for {}", s, name))
+    s.parse::<u32>()
+        .map_err(|_| format!("'{}' is not a valid integer for {}", s, name))
 }
 
 fn parse_easing_opt(args: &[String], idx: usize) -> Easing {
-    args.get(idx).map(|s| parse_easing(s)).unwrap_or(Easing::Linear)
+    args.get(idx)
+        .map(|s| parse_easing(s))
+        .unwrap_or(Easing::Linear)
 }
 
 fn parse_easing(s: &str) -> Easing {
@@ -737,16 +883,23 @@ fn parse_transition(s: &str) -> Result<Transition, String> {
 }
 
 fn find_actor_mut<'a>(scene: &'a mut Scene, id: &str) -> Result<&'a mut Actor, String> {
-    scene.actors.iter_mut().find(|a| a.id == id)
+    scene
+        .actors
+        .iter_mut()
+        .find(|a| a.id == id)
         .ok_or_else(|| format!("actor '{}' not found", id))
 }
 
 fn find_overlay_mut<'a>(scene: &'a mut Scene, id: &str) -> Result<&'a mut Overlay, String> {
-    scene.overlays.iter_mut().find(|ov| match ov {
-        Overlay::Text(t) => t.id == id,
-        Overlay::Image(i) => i.id == id,
-        Overlay::Video(v) => v.id == id,
-    }).ok_or_else(|| format!("overlay '{}' not found", id))
+    scene
+        .overlays
+        .iter_mut()
+        .find(|ov| match ov {
+            Overlay::Text(t) => t.id == id,
+            Overlay::Image(i) => i.id == id,
+            Overlay::Video(v) => v.id == id,
+        })
+        .ok_or_else(|| format!("overlay '{}' not found", id))
 }
 
 // ─── CONTEXT EXPORT FOR AI ───────────────────────────────────────────
@@ -758,16 +911,20 @@ pub fn export_scene_context(scene: &Scene) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "# Scene Context\nresolution: {}x{}\nfps: {}\nduration: {:.1}s\n\n",
-        scene.output.resolution[0], scene.output.resolution[1],
-        scene.output.fps, scene.output.duration
+        scene.output.resolution[0],
+        scene.output.resolution[1],
+        scene.output.fps,
+        scene.output.duration
     ));
     if !scene.actors.is_empty() {
         out.push_str("## Actors\n");
         for a in &scene.actors {
             out.push_str(&format!(
                 "- id={} src={} t={:.2}..{:.2} visible={}\n",
-                a.id, a.source.display(),
-                a.t_in.unwrap_or(0.0), a.t_out.unwrap_or(scene.output.duration),
+                a.id,
+                a.source.display(),
+                a.t_in.unwrap_or(0.0),
+                a.t_out.unwrap_or(scene.output.duration),
                 a.visible
             ));
         }
@@ -777,9 +934,24 @@ pub fn export_scene_context(scene: &Scene) -> String {
         out.push_str("## Overlays\n");
         for ov in &scene.overlays {
             let line = match ov {
-                Overlay::Text(t) => format!("- TEXT id={} \"{}\" t={:.2}..{:.2}\n", t.id, t.text, t.t_in, t.t_out),
-                Overlay::Image(i) => format!("- IMG id={} src={} t={:.2}..{:.2}\n", i.id, i.source.display(), i.t_in, i.t_out),
-                Overlay::Video(v) => format!("- VID id={} src={} t={:.2}..{:.2}\n", v.id, v.source.display(), v.t_in, v.t_out),
+                Overlay::Text(t) => format!(
+                    "- TEXT id={} \"{}\" t={:.2}..{:.2}\n",
+                    t.id, t.text, t.t_in, t.t_out
+                ),
+                Overlay::Image(i) => format!(
+                    "- IMG id={} src={} t={:.2}..{:.2}\n",
+                    i.id,
+                    i.source.display(),
+                    i.t_in,
+                    i.t_out
+                ),
+                Overlay::Video(v) => format!(
+                    "- VID id={} src={} t={:.2}..{:.2}\n",
+                    v.id,
+                    v.source.display(),
+                    v.t_in,
+                    v.t_out
+                ),
             };
             out.push_str(&line);
         }
@@ -788,14 +960,26 @@ pub fn export_scene_context(scene: &Scene) -> String {
     if !scene.backgrounds.is_empty() {
         out.push_str("## Backgrounds\n");
         for bg in &scene.backgrounds {
-            out.push_str(&format!("- id={} t={:.2}..{:.2} fit={:?}\n", bg.id, bg.start, bg.start + bg.duration, bg.fit));
+            out.push_str(&format!(
+                "- id={} t={:.2}..{:.2} fit={:?}\n",
+                bg.id,
+                bg.start,
+                bg.start + bg.duration,
+                bg.fit
+            ));
         }
         out.push('\n');
     }
     if !scene.audio.is_empty() {
         out.push_str("## Audio\n");
         for a in &scene.audio {
-            out.push_str(&format!("- id={} src={} t={:.2}..{:.2}\n", a.id, a.source.display(), a.t_in, a.t_out.unwrap_or(scene.output.duration)));
+            out.push_str(&format!(
+                "- id={} src={} t={:.2}..{:.2}\n",
+                a.id,
+                a.source.display(),
+                a.t_in,
+                a.t_out.unwrap_or(scene.output.duration)
+            ));
         }
         out.push('\n');
     }
@@ -803,7 +987,12 @@ pub fn export_scene_context(scene: &Scene) -> String {
         out.push_str("## Skeleton Templates\n");
         for tmpl in &scene.skeleton_templates {
             let points: Vec<&str> = tmpl.points.keys().map(|s| s.as_str()).collect();
-            out.push_str(&format!("- name={} clip={} points=[{}]\n", tmpl.name, tmpl.source_clip.display(), points.join(", ")));
+            out.push_str(&format!(
+                "- name={} clip={} points=[{}]\n",
+                tmpl.name,
+                tmpl.source_clip.display(),
+                points.join(", ")
+            ));
         }
         out.push('\n');
     }

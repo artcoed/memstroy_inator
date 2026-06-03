@@ -72,9 +72,7 @@ impl AssetKind {
     /// treated as a sidecar (description, tags, thumbnail, …).
     pub fn primary_extensions(self) -> &'static [&'static str] {
         match self {
-            AssetKind::Clip | AssetKind::Video => {
-                &["mp4", "webm", "mov", "mkv", "m4v", "avi"]
-            }
+            AssetKind::Clip | AssetKind::Video => &["mp4", "webm", "mov", "mkv", "m4v", "avi"],
             AssetKind::Image => &["png", "jpg", "jpeg", "webp", "gif", "bmp", "tiff"],
             AssetKind::Sound => &["wav", "mp3", "ogg", "flac", "aac", "m4a", "opus"],
             AssetKind::Particle => &["json", "yaml", "yml", "ron", "pex", "particle"],
@@ -104,9 +102,37 @@ pub struct AssetEntry {
     pub thumbnail: Option<PathBuf>,
     /// Size of the primary asset file in bytes.
     pub size_bytes: u64,
+    /// Original file name as stored in the volume.
+    #[serde(default)]
+    pub file_name: String,
+    /// Lowercase file extension of the primary asset.
+    #[serde(default)]
+    pub extension: String,
+    /// Media duration in seconds when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_secs: Option<f32>,
+    /// Pixel width for visual media when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    /// Pixel height for visual media when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
     /// Tags from the `<stem>.tags` sidecar (one tag per line, or
     /// comma-separated).
     pub tags: Vec<String>,
+}
+
+/// Small sidecar persisted as `<stem>.meta.json` next to the primary
+/// asset. The server generates it with ffprobe when possible and keeps
+/// listing responses cheap by reading the JSON during indexing.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AssetMediaMeta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_secs: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
 }
 
 /// Trimmed representation returned by the listing endpoint. Mostly
@@ -125,6 +151,11 @@ pub struct AssetSummary {
     /// generic icon.
     pub preview_url: Option<String>,
     pub size_bytes: u64,
+    pub file_name: String,
+    pub extension: String,
+    pub duration_secs: Option<f32>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
     pub tags: Vec<String>,
 }
 
@@ -146,6 +177,11 @@ impl AssetSummary {
             description,
             preview_url,
             size_bytes: entry.size_bytes,
+            file_name: entry.file_name.clone(),
+            extension: entry.extension.clone(),
+            duration_secs: entry.duration_secs,
+            width: entry.width,
+            height: entry.height,
             tags: entry.tags.clone(),
         }
     }

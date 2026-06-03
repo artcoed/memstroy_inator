@@ -13,13 +13,10 @@
 //!
 //! Two modes:
 //!
-//! - **Full frame** (default — no canvas selection, no primary
-//!   selection): every visible layer at `t` is composited onto a
-//!   transparent canvas (no scene background fill).
-//! - **Subset** (when `state.canvas_selection` is non-empty, or when
-//!   `state.selection` points at a single element): only the listed
-//!   layers are composited and the canvas is sized to their world
-//!   bounding box, also transparent.
+//! - **Full frame**: every visible layer at `t` is composited like the
+//!   rendered frame. The toolbar action always captures the render area;
+//!   regular canvas/layer selection is ignored so clips do not vanish
+//!   from the screenshot when a few image layers happen to be selected.
 //!
 //! In both modes the resulting RGBA is saved as
 //! `assets/images/frame_<unix-millis>.png` and a fresh
@@ -62,9 +59,9 @@ use std::path::Path;
 
 use image::{Rgba, RgbaImage};
 use memstroy_core::{
-    canvas::WorldPos, effects::Effect, keyframe, ChromaKeyParams, ColorCorrection,
-    Fit, ImageOverlay, MediaSource, Overlay, RenderFrame, RenderFrameState, Scene,
-    TextOverlay, VideoOverlay,
+    canvas::WorldPos, effects::Effect, keyframe, ChromaKeyParams, ColorCorrection, Fit,
+    ImageOverlay, MediaSource, Overlay, RenderFrame, RenderFrameState, Scene, TextOverlay,
+    VideoOverlay,
 };
 
 use crate::image_effects;
@@ -80,18 +77,18 @@ pub fn extract_frame_to_image_layer(state: &mut EditorState) -> Result<usize, St
 
     // ── Decide which layers to capture ───────────────────────────
     //
-    // 1. Multi-selection on the canvas wins (Ctrl+click / marquee),
-    //    merged with the primary timeline selection when it is a
-    //    paintable layer (so clip + image both export even if only
-    //    the image was added to canvas_selection).
-    // 2. Otherwise the primary selection alone.
-    // 3. Otherwise the WHOLE frame.
-    // Audio / camera / render-frame never paint pixels — skip them.
-    // Audio-only falls back to the linked actor or full frame.
+    // Always capture the WHOLE render frame. The plain inspector /
+    // timeline selection is intentionally ignored here: leaving one
+    // element selected should not make the toolbar action crop a
+    // seemingly random fragment instead of baking the current frame.
     let (subset, full_frame) = resolve_extract_subset(state);
 
     // ── Compose ──────────────────────────────────────────────────
-    let summary = compose_frame(state, &subset, full_frame, t);
+    let summary = if full_frame {
+        compose_full_frame_via_render_compositor(state, t)?
+    } else {
+        compose_frame(state, &subset, full_frame, t)
+    };
     let img = summary.image;
     let w = img.width();
     let h = img.height();
@@ -109,25 +106,41 @@ pub fn extract_frame_to_image_layer(state: &mut EditorState) -> Result<usize, St
         format!(
             "{} '{}' ({}\u{00D7}{}).",
             crate::i18n::t("\u{1F4F8} Frame extracted as image layer"),
-            asset.id, w, h
+            asset.id,
+            w,
+            h
         )
     } else {
         format!(
             "{} '{}' ({}\u{00D7}{}).",
             crate::i18n::t("\u{1F4F8} Selected layers extracted as image layer"),
-            asset.id, w, h
+            asset.id,
+            w,
+            h
         )
     };
     if summary.skipped_text > 0 || summary.skipped_video > 0 || summary.skipped_image_bg > 0 {
         status.push_str(crate::i18n::t(" Skipped:"));
         if summary.skipped_text > 0 {
-            status.push_str(&format!(" {}{}", summary.skipped_text, crate::i18n::t(" text")));
+            status.push_str(&format!(
+                " {}{}",
+                summary.skipped_text,
+                crate::i18n::t(" text")
+            ));
         }
         if summary.skipped_video > 0 {
-            status.push_str(&format!(" {}{}", summary.skipped_video, crate::i18n::t(" video overlay")));
+            status.push_str(&format!(
+                " {}{}",
+                summary.skipped_video,
+                crate::i18n::t(" video overlay")
+            ));
         }
         if summary.skipped_image_bg > 0 {
-            status.push_str(&format!(" {}{}", summary.skipped_image_bg, crate::i18n::t(" image background")));
+            status.push_str(&format!(
+                " {}{}",
+                summary.skipped_image_bg,
+                crate::i18n::t(" image background")
+            ));
         }
         status.push('.');
     }
@@ -135,49 +148,14 @@ pub fn extract_frame_to_image_layer(state: &mut EditorState) -> Result<usize, St
     Ok(idx)
 }
 
-/// Layers that produce visible pixels in [`compose_frame`].
-fn selection_is_paintable(sel: Selection) -> bool {
-    matches!(
-        sel,
-        Selection::Actor(_) | Selection::Overlay(_) | Selection::Background(_)
-    )
-}
-
 /// Build the extract subset and whether to capture the full frame.
-fn resolve_extract_subset(state: &EditorState) -> (Vec<Selection>, bool) {
-    let mut subset: Vec<Selection> = if !state.canvas_selection.is_empty() {
-        state
-            .canvas_selection
-            .iter()
-            .copied()
-            .filter(|s| selection_is_paintable(*s))
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    if selection_is_paintable(state.selection) && !subset.contains(&state.selection) {
-        subset.push(state.selection);
-    }
-
-    if subset.is_empty() {
-        if let Selection::Audio(ai) = state.selection {
-            if let Some(parent_id) = state
-                .scene
-                .audio
-                .get(ai)
-                .and_then(|a| a.parent_actor.clone())
-            {
-                if let Some(actor_idx) = state.scene.actors.iter().position(|a| a.id == parent_id)
-                {
-                    return (vec![Selection::Actor(actor_idx)], false);
-                }
-            }
-        }
-        return (Vec::new(), true);
-    }
-
-    (subset, false)
+///
+/// The timeline toolbar button is a render-frame snapshot, not a
+/// "selected layers only" command. Keeping this as a function makes the
+/// call-site explicit and leaves room for a separate selected-subset
+/// action later without reintroducing selection bleed into this button.
+fn resolve_extract_subset(_state: &EditorState) -> (Vec<Selection>, bool) {
+    (Vec::new(), true)
 }
 
 // ─── COMPOSITOR ────────────────────────────────────────────────────
@@ -227,6 +205,38 @@ struct CompositeSummary {
     skipped_image_bg: u32,
 }
 
+fn compose_full_frame_via_render_compositor(
+    state: &EditorState,
+    t: f32,
+) -> Result<CompositeSummary, String> {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let out_path = std::env::temp_dir().join(format!(
+        "memstroy_extract_frame_{}_{}.png",
+        std::process::id(),
+        millis
+    ));
+
+    let mut scene_for_extract = state.scene.clone();
+    scene_for_extract.output.resolution = scene_for_extract.render_frame.resolution;
+    scene_for_extract.output.duration =
+        crate::app::scene_timeline_end(&scene_for_extract).max(0.05);
+    crate::jobs::populate_render_z_order(state, &mut scene_for_extract);
+
+    memstroy_render::render_preview_frame_cpu(&scene_for_extract, &state.assets_root, t, &out_path)
+        .map_err(|e| format!("{} {}", crate::i18n::t("Extract image:"), e))?;
+    let image = image::open(&out_path)
+        .map_err(|e| format!("{} {}", crate::i18n::t("Extract image:"), e))?
+        .to_rgba8();
+    let _ = std::fs::remove_file(&out_path);
+    Ok(CompositeSummary {
+        image,
+        ..Default::default()
+    })
+}
+
 fn compose_frame(
     state: &mut EditorState,
     subset: &[Selection],
@@ -260,16 +270,17 @@ fn compose_frame(
 
     // ── Pass 1: backgrounds ──────────────────────────────────────
     //
-    // Only paint a background when the user explicitly selected it.
-    // Full-frame extract stays transparent so "Extract as image"
-    // produces a PNG with alpha, not the scene's solid backdrop.
-    let bg_iter: Vec<usize> = subset
-        .iter()
-        .filter_map(|s| match s {
-            Selection::Background(i) => Some(*i),
-            _ => None,
-        })
-        .collect();
+    let bg_iter: Vec<usize> = if full_frame {
+        (0..scene_clone.backgrounds.len()).collect()
+    } else {
+        subset
+            .iter()
+            .filter_map(|s| match s {
+                Selection::Background(i) => Some(*i),
+                _ => None,
+            })
+            .collect()
+    };
     for i in bg_iter {
         let bg = match scene_clone.backgrounds.get(i) {
             Some(b) => b,
@@ -287,10 +298,20 @@ fn compose_frame(
                     summary.skipped_image_bg += 1;
                 }
             }
-            MediaSource::Video { path, r#loop, start_at } => {
+            MediaSource::Video {
+                path,
+                r#loop,
+                start_at,
+            } => {
                 let local = (t - bg.start).max(0.0) + *start_at;
                 if !paint_video_background(
-                    &mut canvas, path, local, *r#loop, bg.fit, rw_full, rh_full,
+                    &mut canvas,
+                    path,
+                    local,
+                    *r#loop,
+                    bg.fit,
+                    rw_full,
+                    rh_full,
                 ) {
                     summary.skipped_image_bg += 1;
                 }
@@ -340,11 +361,7 @@ fn compose_frame(
         if !actor.visible {
             continue;
         }
-        let track = state
-            .actor_track_assignments
-            .get(&ai)
-            .copied()
-            .unwrap_or(0);
+        let track = state.actor_track_assignments.get(&ai).copied().unwrap_or(0);
         // Actors live in the "above behind-actors-text" band. We
         // bucket them at 1 so behind-actors texts stay below.
         ops.push((1, track_key(track), ai, PaintOp::Actor(ai)));
@@ -401,14 +418,27 @@ fn compose_frame(
                         );
                     }
                     Overlay::Text(txt) => {
-                        if !paint_text_overlay(state, &mut canvas, &txt, &rf_state, rw_full, rh_full, t)
-                        {
+                        if !paint_text_overlay(
+                            state,
+                            &mut canvas,
+                            &txt,
+                            &rf_state,
+                            rw_full,
+                            rh_full,
+                            t,
+                        ) {
                             summary.skipped_text += 1;
                         }
                     }
                     Overlay::Video(vid) => {
                         if !paint_video_overlay(
-                            state, &mut canvas, &vid, &rf_state, rw_full, rh_full, t,
+                            state,
+                            &mut canvas,
+                            &vid,
+                            &rf_state,
+                            rw_full,
+                            rh_full,
+                            t,
                         ) {
                             summary.skipped_video += 1;
                         }
@@ -416,7 +446,16 @@ fn compose_frame(
                 }
             }
             PaintOp::Actor(ai) => {
-                paint_actor(state, &scene_clone, ai, &rf_state, rw_full, rh_full, t, &mut canvas);
+                paint_actor(
+                    state,
+                    &scene_clone,
+                    ai,
+                    &rf_state,
+                    rw_full,
+                    rh_full,
+                    t,
+                    &mut canvas,
+                );
             }
         }
     }
@@ -426,7 +465,15 @@ fn compose_frame(
     // Effect layers operate on the already-composited canvas within
     // their bounding box. Applied after all content layers.
     if !scene_clone.effect_layers.is_empty() {
-        apply_snapshot_effect_layers(state, &scene_clone, &rf_state, rw_full, rh_full, t, &mut canvas);
+        apply_snapshot_effect_layers(
+            state,
+            &scene_clone,
+            &rf_state,
+            rw_full,
+            rh_full,
+            t,
+            &mut canvas,
+        );
     }
 
     summary.image = if let Some((mn, mx)) = subset_crop_bbox {
@@ -459,12 +506,7 @@ fn crop_canvas_to_world_bbox(
     let mut max_x = f32::NEG_INFINITY;
     let mut max_y = f32::NEG_INFINITY;
     for c in corners {
-        let (ox, oy) = world_to_output(
-            WorldPos { x: c[0], y: c[1] },
-            rf_state,
-            rw,
-            rh,
-        );
+        let (ox, oy) = world_to_output(WorldPos { x: c[0], y: c[1] }, rf_state, rw, rh);
         min_x = min_x.min(ox);
         min_y = min_y.min(oy);
         max_x = max_x.max(ox);
@@ -531,11 +573,8 @@ fn paint_image_overlay(
         return;
     }
     let sample_t = t - img_ov.t_in;
-    let mut ov_state = memstroy_core::sample_overlay_layout(
-        &img_ov.layout,
-        &img_ov.animated_params,
-        sample_t,
-    );
+    let mut ov_state =
+        memstroy_core::sample_overlay_layout(&img_ov.layout, &img_ov.animated_params, sample_t);
 
     // Animation modifiers (wobble / shake / pulse / spin) — additive
     // on top of the eased keyframe sample, exactly like the canvas.
@@ -569,8 +608,12 @@ fn paint_image_overlay(
     // Apply crop by extracting a sub-image. This gives the snapshot
     // a true cropped picture (mirroring the export path), instead of
     // the canvas trick of shrinking the screen rect with UV insets.
-    let (crop_left, crop_top, crop_right, crop_bottom) =
-        (crop.0.max(0.0), crop.1.max(0.0), crop.2.max(0.0), crop.3.max(0.0));
+    let (crop_left, crop_top, crop_right, crop_bottom) = (
+        crop.0.max(0.0),
+        crop.1.max(0.0),
+        crop.2.max(0.0),
+        crop.3.max(0.0),
+    );
     let l_px = (crop_left * src_w as f32).round() as u32;
     let t_px = (crop_top * src_h as f32).round() as u32;
     let r_px = ((1.0 - crop_right) * src_w as f32).round() as u32;
@@ -594,12 +637,7 @@ fn paint_image_overlay(
     };
 
     // World position matches `canvas_preview::get_element_world_pos`.
-    let world_pos = crate::canvas_preview::get_element_world_pos(
-        state,
-        &img_ov.id,
-        &[],
-        t,
-    );
+    let world_pos = crate::canvas_preview::get_element_world_pos(state, &img_ov.id, &[], t);
     let world_pos = WorldPos {
         x: world_pos.x + mod_delta.dx,
         y: world_pos.y + mod_delta.dy,
@@ -692,11 +730,10 @@ fn paint_actor(
     // live preview's texture handle.
     let speed = actor.speed.max(1.0e-4);
     let local_t = (t - t_in) * speed + actor.source_start;
-    let (mut frame_buf, src_w, src_h) =
-        match load_actor_frame_rgba(state, actor_idx, local_t) {
-            Some(t) => t,
-            None => return,
-        };
+    let (mut frame_buf, src_w, src_h) = match load_actor_frame_rgba(state, actor_idx, local_t) {
+        Some(t) => t,
+        None => return,
+    };
 
     // Apply chroma key + colour correction + effect stack at the
     // actor's local-for-anim time (same time canvas_preview uses).
@@ -721,12 +758,8 @@ fn paint_actor(
         None => return,
     };
 
-    let world_pos = crate::canvas_preview::get_element_world_pos(
-        state,
-        &actor.id,
-        &actor.layout,
-        t,
-    );
+    let world_pos =
+        crate::canvas_preview::get_element_world_pos(state, &actor.id, &actor.layout, t);
     let world_pos_with_mod = WorldPos {
         x: world_pos.x + mod_delta.dx,
         y: world_pos.y + mod_delta.dy,
@@ -735,9 +768,7 @@ fn paint_actor(
 
     if let Some(pid) = actor.parent_id.as_ref() {
         let mut visited = vec![actor.id.clone()];
-        if let Some(pxf) =
-            memstroy_core::resolve_parent_transform(scene, pid, t, &mut visited)
-        {
+        if let Some(pxf) = memstroy_core::resolve_parent_transform(scene, pid, t, &mut visited) {
             memstroy_core::apply_parent_inheritance_actor(
                 &mut actor_state.rotation_deg,
                 &mut actor_state.scale,
@@ -761,8 +792,7 @@ fn paint_actor(
 
     // Output dims: source-pixel × scale × zoom.
     let out_w = (src_w as f32) * actor_state.scale * abs_fx * rf_state.zoom;
-    let out_h =
-        (src_h as f32) * actor_state.scale * actor_state.scale_y * abs_fy * rf_state.zoom;
+    let out_h = (src_h as f32) * actor_state.scale * actor_state.scale_y * abs_fy * rf_state.zoom;
     let rotation_rad = (actor_state.rotation_deg - rf_state.rotation_deg).to_radians();
 
     paint_layer_rgba(
@@ -796,8 +826,8 @@ fn load_actor_frame_rgba(
     // Try the fast path first: pre-extracted frame cache.
     if let Some(fc) = state.frame_caches.get(actor_idx) {
         if fc.is_ready() && fc.frame_count > 0 {
-            let frame_index = ((local_t * fc.fps).floor() as usize)
-                .clamp(0, fc.frame_count.saturating_sub(1));
+            let frame_index =
+                ((local_t * fc.fps).floor() as usize).clamp(0, fc.frame_count.saturating_sub(1));
             // FrameCache writes 1-based 6-digit frame names: `000001.jpg`.
             let path = fc.cache_dir.join(format!("{:06}.jpg", frame_index + 1));
             if let Ok(img) = image::open(&path) {
@@ -898,11 +928,8 @@ fn apply_snapshot_effect_layers(
             continue;
         }
         let sample_t = t - fx_ov.t_in;
-        let mut ov_state = memstroy_core::sample_overlay_layout(
-            &fx_ov.layout,
-            &fx_ov.animated_params,
-            sample_t,
-        );
+        let mut ov_state =
+            memstroy_core::sample_overlay_layout(&fx_ov.layout, &fx_ov.animated_params, sample_t);
         let mod_delta = keyframe::evaluate_modifiers(&fx_ov.modifiers, sample_t);
         ov_state.scale = (ov_state.scale + mod_delta.d_scale).max(0.001);
         ov_state.rotation_deg += mod_delta.d_rotation_deg;
@@ -1090,12 +1117,9 @@ fn paint_layer_rgba(
             if out_a < 1.0e-3 {
                 continue;
             }
-            let out_r =
-                (sample[0] as f32 * src_a_n * 255.0 + p[0] as f32 * dst_a * inv_n) / out_a;
-            let out_g =
-                (sample[1] as f32 * src_a_n * 255.0 + p[1] as f32 * dst_a * inv_n) / out_a;
-            let out_b =
-                (sample[2] as f32 * src_a_n * 255.0 + p[2] as f32 * dst_a * inv_n) / out_a;
+            let out_r = (sample[0] as f32 * src_a_n * 255.0 + p[0] as f32 * dst_a * inv_n) / out_a;
+            let out_g = (sample[1] as f32 * src_a_n * 255.0 + p[1] as f32 * dst_a * inv_n) / out_a;
+            let out_b = (sample[2] as f32 * src_a_n * 255.0 + p[2] as f32 * dst_a * inv_n) / out_a;
             *p = Rgba([
                 out_r.clamp(0.0, 255.0) as u8,
                 out_g.clamp(0.0, 255.0) as u8,
@@ -1136,8 +1160,7 @@ fn sample_bilinear(img: &RgbaImage, x: f32, y: f32) -> [u8; 4] {
     let w01 = (1.0 - fx) * fy;
     let w11 = fx * fy;
     let blend = |i: usize| -> u8 {
-        (p00[i] * w00 + p10[i] * w10 + p01[i] * w01 + p11[i] * w11)
-            .clamp(0.0, 255.0) as u8
+        (p00[i] * w00 + p10[i] * w10 + p01[i] * w01 + p11[i] * w11).clamp(0.0, 255.0) as u8
     };
     [blend(0), blend(1), blend(2), blend(3)]
 }
@@ -1148,13 +1171,7 @@ fn sample_bilinear(img: &RgbaImage, x: f32, y: f32) -> [u8; 4] {
 /// canvas using the supplied `fit` mode. Returns `false` when the
 /// file can't be decoded (so the caller can record the skip in the
 /// status message).
-fn paint_image_background(
-    canvas: &mut RgbaImage,
-    path: &Path,
-    fit: Fit,
-    rw: u32,
-    rh: u32,
-) -> bool {
+fn paint_image_background(canvas: &mut RgbaImage, path: &Path, fit: Fit, rw: u32, rh: u32) -> bool {
     let layer = match image::open(path) {
         Ok(img) => img.to_rgba8(),
         Err(_) => return false,
@@ -1336,11 +1353,8 @@ fn paint_video_overlay(
         return true;
     }
     let sample_t = t - vid.t_in;
-    let mut ov_state = memstroy_core::sample_overlay_layout(
-        &vid.layout,
-        &vid.animated_params,
-        sample_t,
-    );
+    let mut ov_state =
+        memstroy_core::sample_overlay_layout(&vid.layout, &vid.animated_params, sample_t);
     let mod_delta = keyframe::evaluate_modifiers(&vid.modifiers, sample_t);
     ov_state.scale = (ov_state.scale + mod_delta.d_scale).max(0.001);
     ov_state.rotation_deg += mod_delta.d_rotation_deg;
@@ -1359,24 +1373,23 @@ fn paint_video_overlay(
     } else {
         raw_seek.max(0.0)
     };
-    let (mut frame_buf, src_w, src_h) =
-        match extract_video_frame_sync(&vid.source, seek) {
-            Some(f) => f,
-            None => return false,
-        };
+    let (mut frame_buf, src_w, src_h) = match extract_video_frame_sync(&vid.source, seek) {
+        Some(f) => f,
+        None => return false,
+    };
 
     // Apply chroma key + effect stack only when the user has actually
     // set them — bypassing the per-pixel CPU loop entirely on a plain
     // overlay matches the image-overlay path's "no-op when None" rule
     // and avoids a needless premultiplied round-trip.
-    let baked_effects: Vec<Effect> =
-        vid.effects.iter().map(|e| e.sampled_at(sample_t)).collect();
+    let baked_effects: Vec<Effect> = vid.effects.iter().map(|e| e.sampled_at(sample_t)).collect();
     if vid.chroma_key.is_some() || !baked_effects.is_empty() {
-        let ck = vid.chroma_key.clone().unwrap_or_else(ChromaKeyParams::default);
+        let ck = vid
+            .chroma_key
+            .clone()
+            .unwrap_or_else(ChromaKeyParams::default);
         let cc = ColorCorrection::default();
-        apply_actor_processing(
-            &mut frame_buf, src_w, src_h, &ck, &cc, &baked_effects,
-        );
+        apply_actor_processing(&mut frame_buf, src_w, src_h, &ck, &cc, &baked_effects);
     }
 
     let layer = match RgbaImage::from_raw(src_w, src_h, frame_buf) {
@@ -1384,12 +1397,7 @@ fn paint_video_overlay(
         None => return false,
     };
 
-    let world_pos = crate::canvas_preview::get_element_world_pos(
-        state,
-        &vid.id,
-        &[],
-        t,
-    );
+    let world_pos = crate::canvas_preview::get_element_world_pos(state, &vid.id, &[], t);
     let world_pos = WorldPos {
         x: world_pos.x + mod_delta.dx,
         y: world_pos.y + mod_delta.dy,
@@ -1399,8 +1407,7 @@ fn paint_video_overlay(
     let abs_fx = ov_state.flip_x_anim.abs().max(0.02);
     let abs_fy = ov_state.flip_y_anim.abs().max(0.02);
     let out_w = (src_w as f32) * ov_state.scale * abs_fx * rf_state.zoom;
-    let out_h =
-        (src_h as f32) * ov_state.scale * ov_state.scale_y * abs_fy * rf_state.zoom;
+    let out_h = (src_h as f32) * ov_state.scale * ov_state.scale_y * abs_fy * rf_state.zoom;
     let rotation_rad = (ov_state.rotation_deg - rf_state.rotation_deg).to_radians();
     let flip_x = ov_state.flip_x_anim < 0.0;
     let flip_y = ov_state.flip_y_anim < 0.0;
@@ -1426,18 +1433,16 @@ fn paint_video_overlay(
 /// ffprobe. Returns `None` when ffprobe isn't on `PATH` or the
 /// probe fails.
 fn probe_video_duration_sync(path: &Path) -> Option<f32> {
-    let ffmpeg = memstroy_render::ffmpeg_binary();
-    let mut ffprobe = ffmpeg.clone();
-    ffprobe.set_file_name("ffprobe");
-    if !ffprobe.exists() {
-        ffprobe = std::path::PathBuf::from("ffprobe");
-    }
+    let ffprobe = memstroy_render::ffprobe_binary();
     let out = {
         let mut cmd = std::process::Command::new(&ffprobe);
         cmd.args([
-            "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
         ])
         .arg(path);
         memstroy_render::hide_console_std(&mut cmd).output().ok()?
@@ -1460,8 +1465,8 @@ fn extract_video_frame_sync(path: &Path, time_secs: f32) -> Option<(Vec<u8>, u32
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let pid = std::process::id();
-    let out_path = std::env::temp_dir()
-        .join(format!("memstroy_snapshot_frame_{}_{}.png", pid, stamp));
+    let out_path =
+        std::env::temp_dir().join(format!("memstroy_snapshot_frame_{}_{}.png", pid, stamp));
 
     // `-ss` AFTER `-i` performs an accurate decode-up-to seek instead
     // of the demuxer's keyframe-based fast seek — we want the exact
@@ -1528,9 +1533,7 @@ fn composite_fit_image(canvas: &mut RgbaImage, layer: &RgbaImage, fit: Fit, rw: 
     };
     let cx = rw as f32 * 0.5;
     let cy = rh as f32 * 0.5;
-    paint_layer_rgba(
-        canvas, layer, cx, cy, out_w, out_h, 0.0, false, false, 1.0,
-    );
+    paint_layer_rgba(canvas, layer, cx, cy, out_w, out_h, 0.0, false, false, 1.0);
 }
 
 // Suppress unused-import warning when `Path` only appears in the

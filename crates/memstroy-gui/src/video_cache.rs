@@ -246,8 +246,8 @@ impl FrameCache {
             return;
         }
         self.poll_processed_preload();
-        let frame_index = ((t * self.fps).floor() as usize)
-            .clamp(0, self.frame_count.saturating_sub(1));
+        let frame_index =
+            ((t * self.fps).floor() as usize).clamp(0, self.frame_count.saturating_sub(1));
         let params_hash = hash_effect_params(ck, cc, effects);
         if self.processed_params_hash != params_hash {
             self.processed_buffer.clear();
@@ -292,8 +292,8 @@ impl FrameCache {
 
         self.poll_preload();
 
-        let frame_index = ((t * self.fps).floor() as usize)
-            .clamp(0, self.frame_count.saturating_sub(1));
+        let frame_index =
+            ((t * self.fps).floor() as usize).clamp(0, self.frame_count.saturating_sub(1));
 
         let img = self.resolve_frame_image(frame_index)?;
         self.note_frame_displayed(frame_index);
@@ -310,8 +310,8 @@ impl FrameCache {
 
         self.poll_preload();
 
-        let frame_index = ((t * self.fps).floor() as usize)
-            .clamp(0, self.frame_count.saturating_sub(1));
+        let frame_index =
+            ((t * self.fps).floor() as usize).clamp(0, self.frame_count.saturating_sub(1));
 
         let image = match self.resolve_frame_image(frame_index) {
             Some(img) => img,
@@ -330,9 +330,7 @@ impl FrameCache {
         // time — this is the dominant cost when the playhead isn't advancing
         // (e.g., paused, or before the next video frame is due) and avoids
         // playback lag with multiple actors / overlays on screen.
-        if self.texture.is_some()
-            && self.texture_uploaded_frame == Some(frame_index)
-        {
+        if self.texture.is_some() && self.texture_uploaded_frame == Some(frame_index) {
             self.note_frame_displayed(frame_index);
             return self.texture.as_ref();
         }
@@ -494,9 +492,11 @@ impl FrameCache {
         effects: &[memstroy_core::Effect],
         ctx: &egui::Context,
     ) -> Option<&TextureHandle> {
-        if !self.ready || self.frame_count == 0 { return None; }
-        let frame_index = ((t * self.fps).floor() as usize)
-            .clamp(0, self.frame_count.saturating_sub(1));
+        if !self.ready || self.frame_count == 0 {
+            return None;
+        }
+        let frame_index =
+            ((t * self.fps).floor() as usize).clamp(0, self.frame_count.saturating_sub(1));
         let params_hash = hash_effect_params(ck, cc, effects);
         let new_key = (frame_index, params_hash);
 
@@ -811,11 +811,7 @@ impl FrameCache {
             if result.params_hash == self.processed_params_hash {
                 let display = self.last_displayed_frame;
                 let covers = display == usize::MAX
-                    || self.preload_covers_frame(
-                        result.start,
-                        result.frames.len(),
-                        display,
-                    );
+                    || self.preload_covers_frame(result.start, result.frames.len(), display);
                 if covers {
                     self.processed_buffer_start = result.start;
                     self.processed_buffer = result.frames;
@@ -829,7 +825,6 @@ impl FrameCache {
         }
     }
 }
-
 
 // ─── EFFECT CACHING HELPERS ──────────────────────────────────────────
 
@@ -856,7 +851,12 @@ fn hash_effect_params(
     for v in cc.lift.iter().chain(cc.gamma.iter()).chain(cc.gain.iter()) {
         bits(*v).hash(&mut h);
     }
-    for curve in [&cc.curves.master, &cc.curves.red, &cc.curves.green, &cc.curves.blue] {
+    for curve in [
+        &cc.curves.master,
+        &cc.curves.red,
+        &cc.curves.green,
+        &cc.curves.blue,
+    ] {
         (curve.len() as u32).hash(&mut h);
         for p in curve {
             bits(p[0]).hash(&mut h);
@@ -881,35 +881,57 @@ fn hash_effect_kind<H: std::hash::Hasher>(kind: &memstroy_core::EffectKind, h: &
     match kind {
         K::Blur { radius } => bits(*radius).hash(h),
         K::Sharpen { amount } => bits(*amount).hash(h),
-        K::Grayscale | K::Sepia | K::Invert | K::MirrorH | K::MirrorV
-            | K::OldFilm | K::Vhs => {}
+        K::Grayscale | K::Sepia | K::Invert | K::MirrorH | K::MirrorV | K::OldFilm | K::Vhs => {}
         K::HueShift { degrees } => bits(*degrees).hash(h),
         K::Vignette { strength } => bits(*strength).hash(h),
         K::Pixelate { block_size } => bits(*block_size).hash(h),
         K::Posterize { levels } => levels.hash(h),
         K::Glow { radius, intensity } => {
-            bits(*radius).hash(h); bits(*intensity).hash(h);
+            bits(*radius).hash(h);
+            bits(*intensity).hash(h);
         }
-        K::Brightness { amount } | K::Contrast { amount }
-            | K::Saturation { amount } | K::Glitch { strength: amount }
-            | K::Noise { amount } | K::EdgeDetect { threshold: amount } => bits(*amount).hash(h),
+        K::Brightness { amount }
+        | K::Contrast { amount }
+        | K::Saturation { amount }
+        | K::Glitch { strength: amount }
+        | K::Noise { amount }
+        | K::EdgeDetect { threshold: amount } => bits(*amount).hash(h),
         K::ChromaticAberration { offset } => bits(*offset).hash(h),
-        K::Wave { amplitude, wavelength } => {
-            bits(*amplitude).hash(h); bits(*wavelength).hash(h);
+        K::Wave {
+            amplitude,
+            wavelength,
+        } => {
+            bits(*amplitude).hash(h);
+            bits(*wavelength).hash(h);
         }
         K::Bloom { radius } => bits(*radius).hash(h),
-        K::Crop { left, top, right, bottom } => {
+        K::Crop {
+            left,
+            top,
+            right,
+            bottom,
+        } => {
             bits(*left).hash(h);
             bits(*top).hash(h);
             bits(*right).hash(h);
             bits(*bottom).hash(h);
         }
-        K::Mask { shape, feather, invert } => {
+        K::Mask {
+            shape,
+            feather,
+            invert,
+        } => {
             bits(*feather).hash(h);
             invert.hash(h);
             hash_mask_shape(shape, h);
         }
-        K::ColorKey { color, similarity, blend, spill, invert } => {
+        K::ColorKey {
+            color,
+            similarity,
+            blend,
+            spill,
+            invert,
+        } => {
             color.hash(h);
             bits(*similarity).hash(h);
             bits(*blend).hash(h);
@@ -924,7 +946,12 @@ fn hash_mask_shape<H: std::hash::Hasher>(shape: &memstroy_core::MaskShape, h: &m
     use std::hash::Hash;
     std::mem::discriminant(shape).hash(h);
     match shape {
-        M::Rect { left, top, right, bottom } => {
+        M::Rect {
+            left,
+            top,
+            right,
+            bottom,
+        } => {
             bits(*left).hash(h);
             bits(*top).hash(h);
             bits(*right).hash(h);
@@ -947,7 +974,9 @@ fn hash_mask_shape<H: std::hash::Hasher>(shape: &memstroy_core::MaskShape, h: &m
 }
 
 #[inline]
-fn bits(f: f32) -> u32 { (f * 10_000.0).round() as i32 as u32 }
+fn bits(f: f32) -> u32 {
+    (f * 10_000.0).round() as i32 as u32
+}
 
 /// Downscale a ColorImage to a target maximum dimension while preserving
 /// aspect ratio. Used to keep the CPU chromakey/CC fast during playback.
@@ -1031,9 +1060,21 @@ pub(crate) fn apply_effects_cpu_scalar(
     // helper uses, so dialing the slider all the way down disables the
     // key on both surfaces consistently instead of crashing the
     // export with `Result too large`.
-    let similarity = if ck.similarity.is_finite() { ck.similarity.clamp(0.0, 1.0) } else { 0.0 };
-    let blend = if ck.blend.is_finite() { ck.blend.clamp(0.0, 1.0) } else { 0.0 };
-    let spill = if ck.spill.is_finite() { ck.spill.clamp(0.0, 1.0) } else { 0.0 };
+    let similarity = if ck.similarity.is_finite() {
+        ck.similarity.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let blend = if ck.blend.is_finite() {
+        ck.blend.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let spill = if ck.spill.is_finite() {
+        ck.spill.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
     let chroma_active = similarity >= 1.0e-5;
     let (key_cb, key_cr) = rgb_to_cbcr_bt601(ck.key_color);
     let dist_norm = 255.0 * std::f32::consts::SQRT_2;
@@ -1077,7 +1118,7 @@ pub(crate) fn apply_effects_cpu_scalar(
             1.0
         } else {
             let cb = -0.169 * r - 0.331 * g + 0.500 * b + 128.0;
-            let cr =  0.500 * r - 0.419 * g - 0.081 * b + 128.0;
+            let cr = 0.500 * r - 0.419 * g - 0.081 * b + 128.0;
             let du = cb - key_cb;
             let dv = cr - key_cr;
             let diff = (du * du + dv * dv).sqrt() / dist_norm;
@@ -1098,18 +1139,18 @@ pub(crate) fn apply_effects_cpu_scalar(
 
         // Brightness / contrast / saturation / temperature
         or_ = (or_ + cc.brightness * 255.0).clamp(0.0, 255.0);
-        og  = (og  + cc.brightness * 255.0).clamp(0.0, 255.0);
-        ob  = (ob  + cc.brightness * 255.0).clamp(0.0, 255.0);
+        og = (og + cc.brightness * 255.0).clamp(0.0, 255.0);
+        ob = (ob + cc.brightness * 255.0).clamp(0.0, 255.0);
         or_ = ((or_ - 128.0) * cc.contrast + 128.0).clamp(0.0, 255.0);
-        og  = ((og  - 128.0) * cc.contrast + 128.0).clamp(0.0, 255.0);
-        ob  = ((ob  - 128.0) * cc.contrast + 128.0).clamp(0.0, 255.0);
+        og = ((og - 128.0) * cc.contrast + 128.0).clamp(0.0, 255.0);
+        ob = ((ob - 128.0) * cc.contrast + 128.0).clamp(0.0, 255.0);
         let gray = 0.299 * or_ + 0.587 * og + 0.114 * ob;
         or_ = (gray + (or_ - gray) * cc.saturation).clamp(0.0, 255.0);
-        og  = (gray + (og  - gray) * cc.saturation).clamp(0.0, 255.0);
-        ob  = (gray + (ob  - gray) * cc.saturation).clamp(0.0, 255.0);
+        og = (gray + (og - gray) * cc.saturation).clamp(0.0, 255.0);
+        ob = (gray + (ob - gray) * cc.saturation).clamp(0.0, 255.0);
         if cc.temperature != 0.0 {
             or_ = (or_ + cc.temperature * 30.0).clamp(0.0, 255.0);
-            ob  = (ob  - cc.temperature * 30.0).clamp(0.0, 255.0);
+            ob = (ob - cc.temperature * 30.0).clamp(0.0, 255.0);
         }
 
         // ── DaVinci-style lift / gain / gamma per channel ──
@@ -1131,18 +1172,18 @@ pub(crate) fn apply_effects_cpu_scalar(
             ng = ng.powf(inv_gamma[1]);
             nb = nb.powf(inv_gamma[2]);
             or_ = (nr * 255.0).clamp(0.0, 255.0);
-            og  = (ng * 255.0).clamp(0.0, 255.0);
-            ob  = (nb * 255.0).clamp(0.0, 255.0);
+            og = (ng * 255.0).clamp(0.0, 255.0);
+            ob = (nb * 255.0).clamp(0.0, 255.0);
         }
 
         // ── Tone curves: master first, then per-channel ──
         if curves_active {
             or_ = lut_master[or_ as usize] as f32;
-            og  = lut_master[og  as usize] as f32;
-            ob  = lut_master[ob  as usize] as f32;
+            og = lut_master[og as usize] as f32;
+            ob = lut_master[ob as usize] as f32;
             or_ = lut_r[or_ as usize] as f32;
-            og  = lut_g[og  as usize] as f32;
-            ob  = lut_b[ob  as usize] as f32;
+            og = lut_g[og as usize] as f32;
+            ob = lut_b[ob as usize] as f32;
         }
 
         let a = (alpha * 255.0).clamp(0.0, 255.0) as u8;
@@ -1325,12 +1366,8 @@ pub(crate) fn apply_effects_cpu_simd(
         let a_a = alpha.to_array();
         for j in 0..8 {
             let a = (a_a[j] * 255.0).clamp(0.0, 255.0) as u8;
-            out.pixels[i + j] = egui::Color32::from_rgba_unmultiplied(
-                r_a[j] as u8,
-                g_a[j] as u8,
-                b_a[j] as u8,
-                a,
-            );
+            out.pixels[i + j] =
+                egui::Color32::from_rgba_unmultiplied(r_a[j] as u8, g_a[j] as u8, b_a[j] as u8, a);
         }
     }
 
@@ -1459,7 +1496,7 @@ pub(crate) fn rgb_to_cbcr_bt601(rgb: [u8; 3]) -> (f32, f32) {
     let g = rgb[1] as f32;
     let b = rgb[2] as f32;
     let cb = -0.169 * r - 0.331 * g + 0.500 * b + 128.0;
-    let cr =  0.500 * r - 0.419 * g - 0.081 * b + 128.0;
+    let cr = 0.500 * r - 0.419 * g - 0.081 * b + 128.0;
     (cb, cr)
 }
 
@@ -1476,7 +1513,6 @@ fn build_curve_lut(curve: &[[f32; 2]]) -> [u8; 256] {
     lut
 }
 
-
 // ─── EFFECT STACK (CPU PREVIEW) ──────────────────────────────────────
 //
 // Generic per-element post-process stack applied AFTER chroma-key and
@@ -1489,19 +1525,20 @@ fn build_curve_lut(curve: &[[f32; 2]]) -> [u8; 256] {
 
 /// Apply the user's effect stack to a preview frame in declared order.
 /// Disabled / zero-intensity entries are skipped.
-pub fn apply_effect_stack_cpu(
-    img: &ColorImage,
-    effects: &[memstroy_core::Effect],
-) -> ColorImage {
+pub fn apply_effect_stack_cpu(img: &ColorImage, effects: &[memstroy_core::Effect]) -> ColorImage {
     // Fast path: skip the clone when there's nothing to do
     if effects.is_empty() {
         return img.clone();
     }
     let mut current = img.clone();
     for eff in effects {
-        if !eff.enabled { continue; }
+        if !eff.enabled {
+            continue;
+        }
         let intensity = eff.intensity.clamp(0.0, 1.0);
-        if intensity <= 0.001 { continue; }
+        if intensity <= 0.001 {
+            continue;
+        }
         current = apply_single_effect(&current, &eff.kind, intensity);
     }
     current
@@ -1523,7 +1560,10 @@ fn apply_single_effect(
         K::Vignette { strength } => vignette(img, (*strength * intensity).clamp(0.0, 1.0)),
         K::Pixelate { block_size } => pixelate(img, ((*block_size).max(1.0)) as i32, intensity),
         K::Posterize { levels } => posterize(img, *levels, intensity),
-        K::Glow { radius, intensity: i2 } => glow(img, *radius, *i2 * intensity),
+        K::Glow {
+            radius,
+            intensity: i2,
+        } => glow(img, *radius, *i2 * intensity),
         K::Brightness { amount } => brightness(img, *amount * intensity),
         K::Contrast { amount } => contrast(img, *amount * intensity),
         K::Saturation { amount } => saturation(img, *amount * intensity),
@@ -1532,32 +1572,46 @@ fn apply_single_effect(
         K::MirrorV => mix_pixels(img, &mirror_v(img), intensity),
         K::ChromaticAberration { offset } => chromatic_aberration(img, *offset * intensity),
         K::Noise { amount } => noise(img, *amount * intensity),
-        K::Wave { amplitude, wavelength } => wave(img, *amplitude * intensity, *wavelength),
+        K::Wave {
+            amplitude,
+            wavelength,
+        } => wave(img, *amplitude * intensity, *wavelength),
         K::OldFilm => old_film(img, intensity),
         K::Vhs => vhs(img, intensity),
         K::Glitch { strength } => glitch(img, *strength * intensity),
         K::Bloom { radius } => bloom(img, *radius, intensity),
-        K::Crop { left, top, right, bottom } => crop_alpha(
+        K::Crop {
+            left,
+            top,
+            right,
+            bottom,
+        } => crop_alpha(
             img,
             (*left * intensity).clamp(0.0, 0.49),
             (*top * intensity).clamp(0.0, 0.49),
             (*right * intensity).clamp(0.0, 0.49),
             (*bottom * intensity).clamp(0.0, 0.49),
         ),
-        K::Mask { shape, feather, invert } => {
-            apply_mask_color_image(img, shape, *feather, *invert, intensity)
-        }
-        K::ColorKey { color, similarity, blend, spill, invert } => {
-            apply_color_key_color_image(
-                img,
-                *color,
-                *similarity,
-                *blend,
-                *spill,
-                *invert,
-                intensity,
-            )
-        }
+        K::Mask {
+            shape,
+            feather,
+            invert,
+        } => apply_mask_color_image(img, shape, *feather, *invert, intensity),
+        K::ColorKey {
+            color,
+            similarity,
+            blend,
+            spill,
+            invert,
+        } => apply_color_key_color_image(
+            img,
+            *color,
+            *similarity,
+            *blend,
+            *spill,
+            *invert,
+            intensity,
+        ),
     }
 }
 
@@ -1579,12 +1633,20 @@ fn apply_mask_color_image(
     let mut out = img.clone();
     let w = out.size[0];
     let h = out.size[1];
-    if w == 0 || h == 0 { return out; }
+    if w == 0 || h == 0 {
+        return out;
+    }
     let i = intensity.clamp(0.0, 1.0);
 
     // Fast path: hard-edge axis-aligned rectangle (no feather).
     // Just clear alpha outside the rect (or inside if invert).
-    if let memstroy_core::MaskShape::Rect { left, top, right, bottom } = shape {
+    if let memstroy_core::MaskShape::Rect {
+        left,
+        top,
+        right,
+        bottom,
+    } = shape
+    {
         if feather <= 1e-6 && i >= 0.999 {
             let lx = (left * w as f32) as i32;
             let ty = (top * h as f32) as i32;
@@ -1601,9 +1663,8 @@ fn apply_mask_color_image(
                         let idx = row + x as usize;
                         if idx < out.pixels.len() {
                             let p = out.pixels[idx];
-                            out.pixels[idx] = egui::Color32::from_rgba_unmultiplied(
-                                p.r(), p.g(), p.b(), 0,
-                            );
+                            out.pixels[idx] =
+                                egui::Color32::from_rgba_unmultiplied(p.r(), p.g(), p.b(), 0);
                         }
                     }
                 }
@@ -1620,20 +1681,18 @@ fn apply_mask_color_image(
         let row = y * w;
         for x in 0..w {
             let u = (x as f32 + 0.5) * inv_w;
-            let keep = crate::image_effects::sample_mask_alpha(
-                shape, u, v, feather, invert,
-            );
+            let keep = crate::image_effects::sample_mask_alpha(shape, u, v, feather, invert);
             // Skip pixels that don't change (keep == 1.0 and intensity full)
-            if keep >= 0.9999 && i >= 0.9999 { continue; }
+            if keep >= 0.9999 && i >= 0.9999 {
+                continue;
+            }
             let idx = row + x;
             if idx < out.pixels.len() {
                 let p = out.pixels[idx];
                 let orig = p.a() as f32;
                 let target = orig * keep;
                 let new_a = (orig + (target - orig) * i).clamp(0.0, 255.0) as u8;
-                out.pixels[idx] = egui::Color32::from_rgba_unmultiplied(
-                    p.r(), p.g(), p.b(), new_a,
-                );
+                out.pixels[idx] = egui::Color32::from_rgba_unmultiplied(p.r(), p.g(), p.b(), new_a);
             }
         }
     }
@@ -1659,14 +1718,24 @@ fn apply_color_key_color_image(
     let mut out = img.clone();
     let w = img.size[0];
     let h = img.size[1];
-    if w == 0 || h == 0 { return out; }
+    if w == 0 || h == 0 {
+        return out;
+    }
     let i = intensity.clamp(0.0, 1.0);
     // Mirror `chromakey_filter`'s "disabled below 1e-5" rule so a
     // dialed-down ColorKey effect renders identically on both
     // surfaces — the export pipeline emits a no-op `null` filter on
     // that threshold, so the preview must do nothing too.
-    let similarity = if similarity.is_finite() { similarity.clamp(0.0, 1.0) } else { 0.0 };
-    let blend = if blend.is_finite() { blend.clamp(0.0, 1.0) } else { 0.0 };
+    let similarity = if similarity.is_finite() {
+        similarity.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let blend = if blend.is_finite() {
+        blend.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
     if similarity < 1.0e-5 && !invert {
         // Disabled key — nothing to attenuate. Returning early keeps
         // the per-pixel loop's no-op path obvious.
@@ -1675,13 +1744,15 @@ fn apply_color_key_color_image(
     let (key_cb, key_cr) = rgb_to_cbcr_bt601(key_color);
     let dist_norm = 255.0 * std::f32::consts::SQRT_2;
     for px in 0..(w * h) {
-        if px >= out.pixels.len() { break; }
+        if px >= out.pixels.len() {
+            break;
+        }
         let p = out.pixels[px];
         let r = p.r() as f32;
         let g = p.g() as f32;
         let b = p.b() as f32;
         let cb = -0.169 * r - 0.331 * g + 0.500 * b + 128.0;
-        let cr =  0.500 * r - 0.419 * g - 0.081 * b + 128.0;
+        let cr = 0.500 * r - 0.419 * g - 0.081 * b + 128.0;
         let du = cb - key_cb;
         let dv = cr - key_cr;
         let diff = (du * du + dv * dv).sqrt() / dist_norm;
@@ -1692,7 +1763,9 @@ fn apply_color_key_color_image(
         } else {
             1.0
         };
-        if invert { alpha_keep = 1.0 - alpha_keep; }
+        if invert {
+            alpha_keep = 1.0 - alpha_keep;
+        }
         let orig = p.a() as f32;
         let target = orig * alpha_keep;
         let new_a = (orig + (target - orig) * i).clamp(0.0, 255.0) as u8;
@@ -1704,13 +1777,7 @@ fn apply_color_key_color_image(
 /// Apply a Crop effect by zeroing the alpha channel outside the visible
 /// rectangle. Cheap and faithful enough for the preview path; the
 /// ffmpeg export uses a real `crop` filter for full fidelity.
-fn crop_alpha(
-    img: &ColorImage,
-    left: f32,
-    top: f32,
-    right: f32,
-    bottom: f32,
-) -> ColorImage {
+fn crop_alpha(img: &ColorImage, left: f32, top: f32, right: f32, bottom: f32) -> ColorImage {
     let mut out = img.clone();
     let w = img.size[0];
     let h = img.size[1];
@@ -1727,9 +1794,7 @@ fn crop_alpha(
                 let idx = y * w + x;
                 if idx < out.pixels.len() {
                     let p = out.pixels[idx];
-                    out.pixels[idx] = egui::Color32::from_rgba_unmultiplied(
-                        p.r(), p.g(), p.b(), 0,
-                    );
+                    out.pixels[idx] = egui::Color32::from_rgba_unmultiplied(p.r(), p.g(), p.b(), 0);
                 }
             }
         }
@@ -1774,7 +1839,9 @@ fn grayscale(img: &ColorImage) -> ColorImage {
 fn sepia(img: &ColorImage) -> ColorImage {
     let mut out = img.clone();
     for px in out.pixels.iter_mut() {
-        let r = px.r() as f32; let g = px.g() as f32; let b = px.b() as f32;
+        let r = px.r() as f32;
+        let g = px.g() as f32;
+        let b = px.b() as f32;
         let nr = (0.393 * r + 0.769 * g + 0.189 * b).clamp(0.0, 255.0) as u8;
         let ng = (0.349 * r + 0.686 * g + 0.168 * b).clamp(0.0, 255.0) as u8;
         let nb = (0.272 * r + 0.534 * g + 0.131 * b).clamp(0.0, 255.0) as u8;
@@ -1786,7 +1853,8 @@ fn sepia(img: &ColorImage) -> ColorImage {
 fn invert(img: &ColorImage) -> ColorImage {
     let mut out = img.clone();
     for px in out.pixels.iter_mut() {
-        *px = egui::Color32::from_rgba_unmultiplied(255 - px.r(), 255 - px.g(), 255 - px.b(), px.a());
+        *px =
+            egui::Color32::from_rgba_unmultiplied(255 - px.r(), 255 - px.g(), 255 - px.b(), px.a());
     }
     out
 }
@@ -1822,7 +1890,9 @@ fn saturation(img: &ColorImage, amount: f32) -> ColorImage {
     let factor = (1.0 + amount).max(0.0);
     let mut out = img.clone();
     for px in out.pixels.iter_mut() {
-        let r = px.r() as f32; let g = px.g() as f32; let b = px.b() as f32;
+        let r = px.r() as f32;
+        let g = px.g() as f32;
+        let b = px.b() as f32;
         let gray = 0.299 * r + 0.587 * g + 0.114 * b;
         let nr = (gray + (r - gray) * factor).clamp(0.0, 255.0) as u8;
         let ng = (gray + (g - gray) * factor).clamp(0.0, 255.0) as u8;
@@ -1848,7 +1918,9 @@ fn hue_shift(img: &ColorImage, degrees: f32) -> ColorImage {
     let m21 = 0.072 - 0.072 * c - 0.283 * s;
     let m22 = 0.072 + 0.928 * c + 0.072 * s;
     for px in out.pixels.iter_mut() {
-        let r = px.r() as f32; let g = px.g() as f32; let b = px.b() as f32;
+        let r = px.r() as f32;
+        let g = px.g() as f32;
+        let b = px.b() as f32;
         let nr = (m00 * r + m10 * g + m20 * b).clamp(0.0, 255.0) as u8;
         let ng = (m01 * r + m11 * g + m21 * b).clamp(0.0, 255.0) as u8;
         let nb = (m02 * r + m12 * g + m22 * b).clamp(0.0, 255.0) as u8;
@@ -1892,9 +1964,13 @@ fn pixelate(img: &ColorImage, block: i32, intensity: f32) -> ColorImage {
             // Sample one pixel per block (top-left).
             let p = img.pixels[by * w + bx];
             for dy in 0..(block as usize) {
-                if by + dy >= h { break; }
+                if by + dy >= h {
+                    break;
+                }
                 for dx in 0..(block as usize) {
-                    if bx + dx >= w { break; }
+                    if bx + dx >= w {
+                        break;
+                    }
                     pixelated.pixels[(by + dy) * w + (bx + dx)] = p;
                 }
             }
@@ -1917,7 +1993,9 @@ fn posterize(img: &ColorImage, levels: u32, intensity: f32) -> ColorImage {
 }
 
 fn box_blur(img: &ColorImage, radius: i32) -> ColorImage {
-    if radius <= 0 { return img.clone(); }
+    if radius <= 0 {
+        return img.clone();
+    }
     // Two-pass separable box blur — cheap and good enough for preview.
     let pass1 = blur_pass(img, radius, true);
     blur_pass(&pass1, radius, false)
@@ -1928,18 +2006,31 @@ fn blur_pass(img: &ColorImage, radius: i32, horizontal: bool) -> ColorImage {
     let mut out = img.clone();
     for y in 0..h {
         for x in 0..w {
-            let mut r = 0u32; let mut g = 0u32; let mut b = 0u32; let mut a = 0u32;
+            let mut r = 0u32;
+            let mut g = 0u32;
+            let mut b = 0u32;
+            let mut a = 0u32;
             let mut count = 0u32;
             for k in -radius..=radius {
                 let (sx, sy) = if horizontal { (x + k, y) } else { (x, y + k) };
-                if sx < 0 || sy < 0 || sx >= w || sy >= h { continue; }
+                if sx < 0 || sy < 0 || sx >= w || sy >= h {
+                    continue;
+                }
                 let p = img.pixels[(sy * w + sx) as usize];
-                r += p.r() as u32; g += p.g() as u32; b += p.b() as u32; a += p.a() as u32;
+                r += p.r() as u32;
+                g += p.g() as u32;
+                b += p.b() as u32;
+                a += p.a() as u32;
                 count += 1;
             }
-            if count == 0 { continue; }
+            if count == 0 {
+                continue;
+            }
             out.pixels[(y * w + x) as usize] = egui::Color32::from_rgba_unmultiplied(
-                (r / count) as u8, (g / count) as u8, (b / count) as u8, (a / count) as u8,
+                (r / count) as u8,
+                (g / count) as u8,
+                (b / count) as u8,
+                (a / count) as u8,
             );
         }
     }
@@ -1947,7 +2038,9 @@ fn blur_pass(img: &ColorImage, radius: i32, horizontal: bool) -> ColorImage {
 }
 
 fn sharpen(img: &ColorImage, amount: f32) -> ColorImage {
-    if amount <= 0.001 { return img.clone(); }
+    if amount <= 0.001 {
+        return img.clone();
+    }
     let blurred = box_blur(img, 2);
     let mut out = img.clone();
     for i in 0..out.pixels.len() {
@@ -1962,7 +2055,9 @@ fn sharpen(img: &ColorImage, amount: f32) -> ColorImage {
 }
 
 fn glow(img: &ColorImage, radius: f32, intensity: f32) -> ColorImage {
-    if intensity <= 0.001 || radius <= 0.5 { return img.clone(); }
+    if intensity <= 0.001 || radius <= 0.5 {
+        return img.clone();
+    }
     let blurred = box_blur(img, radius.round() as i32);
     // Additive blend of the blurred copy on top of the original.
     let mut out = img.clone();
@@ -2013,9 +2108,13 @@ fn edge_detect(img: &ColorImage, threshold: f32, intensity: f32) -> ColorImage {
         for x in 0..w {
             // Sobel approximation.
             let gx = -lum(x - 1, y - 1) - 2.0 * lum(x - 1, y) - lum(x - 1, y + 1)
-                   +  lum(x + 1, y - 1) + 2.0 * lum(x + 1, y) + lum(x + 1, y + 1);
+                + lum(x + 1, y - 1)
+                + 2.0 * lum(x + 1, y)
+                + lum(x + 1, y + 1);
             let gy = -lum(x - 1, y - 1) - 2.0 * lum(x, y - 1) - lum(x + 1, y - 1)
-                   +  lum(x - 1, y + 1) + 2.0 * lum(x, y + 1) + lum(x + 1, y + 1);
+                + lum(x - 1, y + 1)
+                + 2.0 * lum(x, y + 1)
+                + lum(x + 1, y + 1);
             let mag = (gx * gx + gy * gy).sqrt();
             let v = if mag > cutoff { 255 } else { 0 };
             let alpha = img.pixels[(y * w + x) as usize].a();
@@ -2050,7 +2149,9 @@ fn mirror_v(img: &ColorImage) -> ColorImage {
 
 fn chromatic_aberration(img: &ColorImage, offset: f32) -> ColorImage {
     let off = offset.round() as i32;
-    if off == 0 { return img.clone(); }
+    if off == 0 {
+        return img.clone();
+    }
     let (w, h) = (img.size[0] as i32, img.size[1] as i32);
     let mut out = img.clone();
     let sample = |x: i32, y: i32| -> egui::Color32 {
@@ -2064,9 +2165,8 @@ fn chromatic_aberration(img: &ColorImage, offset: f32) -> ColorImage {
             let pr = sample(x - off, y);
             let pg = sample(x, y);
             let pb = sample(x + off, y);
-            out.pixels[(y * w + x) as usize] = egui::Color32::from_rgba_unmultiplied(
-                pr.r(), pg.g(), pb.b(), pg.a(),
-            );
+            out.pixels[(y * w + x) as usize] =
+                egui::Color32::from_rgba_unmultiplied(pr.r(), pg.g(), pb.b(), pg.a());
         }
     }
     out
@@ -2133,7 +2233,9 @@ fn vhs(img: &ColorImage, intensity: f32) -> ColorImage {
 }
 
 fn glitch(img: &ColorImage, strength: f32) -> ColorImage {
-    if strength <= 0.001 { return img.clone(); }
+    if strength <= 0.001 {
+        return img.clone();
+    }
     let (w, h) = (img.size[0], img.size[1]);
     let mut out = img.clone();
     // Slice the image into ~12 horizontal bands and shift each by a
@@ -2157,7 +2259,6 @@ fn glitch(img: &ColorImage, strength: f32) -> ColorImage {
     out
 }
 
-
 // ─── EXTRACTION HELPER ───────────────────────────────────────────────
 
 /// Synchronously extract frames for a clip via `ffmpeg` and `ffprobe`.
@@ -2179,15 +2280,7 @@ pub fn extract_frames_blocking_with_scale(
     on_done: impl FnOnce(Result<(f32, usize, PathBuf), ()>) + Send + 'static,
 ) {
     let ffmpeg = memstroy_render::ffmpeg_binary();
-    let ffprobe = {
-        let mut p = ffmpeg.clone();
-        p.set_file_name("ffprobe");
-        if !p.exists() {
-            PathBuf::from("ffprobe")
-        } else {
-            p
-        }
-    };
+    let ffprobe = memstroy_render::ffprobe_binary();
 
     let cache_dir = std::env::temp_dir().join(format!(
         "memstroy_frames_{}",
@@ -2241,9 +2334,7 @@ pub fn extract_frames_blocking_with_scale(
             let frame_count = std::fs::read_dir(&cache_dir)
                 .map(|rd| {
                     rd.filter_map(|e| e.ok())
-                        .filter(|e| {
-                            e.path().extension().and_then(|s| s.to_str()) == Some("jpg")
-                        })
+                        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("jpg"))
                         .count()
                 })
                 .unwrap_or(0);
@@ -2298,7 +2389,10 @@ mod tests {
                 pixels.push(c);
             }
         }
-        ColorImage { size: [w, h], pixels }
+        ColorImage {
+            size: [w, h],
+            pixels,
+        }
     }
 
     /// Ensure chroma-key + colour-correction finishes a 480p frame in
@@ -2389,7 +2483,10 @@ mod tests {
                 pixels.push(c);
             }
         }
-        let img = ColorImage { size: [100, 100], pixels };
+        let img = ColorImage {
+            size: [100, 100],
+            pixels,
+        };
 
         let ck = memstroy_core::ChromaKeyParams {
             enabled: true,

@@ -1,4 +1,4 @@
-use image::{Rgb, Rgba, RgbaImage, RgbImage};
+use image::{Rgb, RgbImage, Rgba, RgbaImage};
 use memstroy_core::ChromaKeyParams;
 
 /// Apply HSV-based chroma keying to a single RGB frame, producing RGBA
@@ -10,7 +10,9 @@ pub struct HsvChromaKey {
 }
 
 impl HsvChromaKey {
-    pub fn new(params: ChromaKeyParams) -> Self { Self { params } }
+    pub fn new(params: ChromaKeyParams) -> Self {
+        Self { params }
+    }
 
     pub fn apply(&self, src: &RgbImage) -> RgbaImage {
         let (w, h) = src.dimensions();
@@ -33,9 +35,7 @@ impl HsvChromaKey {
             // Inside core: fully transparent.
             if dh < hue_tol_deg && ds < sv_tol && dv < sv_tol {
                 alpha = 0.0;
-            } else if dh < hue_tol_deg + 360.0 * blend
-                && ds < sv_tol + blend
-                && dv < sv_tol + blend
+            } else if dh < hue_tol_deg + 360.0 * blend && ds < sv_tol + blend && dv < sv_tol + blend
             {
                 // Soft edge: linearly fade alpha based on distance.
                 let edge = ((dh - hue_tol_deg) / (360.0 * blend + f32::EPSILON))

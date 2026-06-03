@@ -76,7 +76,11 @@ pub fn sample_overlay(
 /// when the element was dropped on the free canvas (which authors world-
 /// pixel keyframes). Without this, inspector edits touch `actor.layout`
 /// only and the preview keeps reading the stale canvas row.
-pub fn sync_actor_transform_to_canvas(scene: &mut memstroy_core::Scene, actor_idx: usize, scene_t: f32) {
+pub fn sync_actor_transform_to_canvas(
+    scene: &mut memstroy_core::Scene,
+    actor_idx: usize,
+    scene_t: f32,
+) {
     use memstroy_core::param_ids;
 
     if actor_idx >= scene.actors.len() {
@@ -91,11 +95,7 @@ pub fn sync_actor_transform_to_canvas(scene: &mut memstroy_core::Scene, actor_id
     {
         return;
     }
-    let st = sample_actor(
-        &scene.actors[actor_idx].layout,
-        &animated,
-        scene_t,
-    );
+    let st = sample_actor(&scene.actors[actor_idx].layout, &animated, scene_t);
     let [rw, rh] = scene.render_frame.resolution;
     let world_w = rw as f32;
     let world_h = rh as f32;
@@ -294,18 +294,14 @@ pub fn write_render_frame_param<F>(
     F: Fn(&mut memstroy_core::RenderFrameState),
 {
     if layout.is_empty() {
-        layout.push(Keyframe::new(
-            t,
-            memstroy_core::RenderFrameState::default(),
-        ));
+        layout.push(Keyframe::new(t, memstroy_core::RenderFrameState::default()));
     }
     if auto_animate_on_canvas_drag && t > 1.0e-3 {
         animated_params.insert(param_id.to_string());
     }
     let is_animated = animated_params.contains(param_id);
     if is_animated {
-        let seed =
-            memstroy_core::sample_render_frame_layout(layout, animated_params, t);
+        let seed = memstroy_core::sample_render_frame_layout(layout, animated_params, t);
         let idx = upsert_index(layout, t, seed);
         if let Some(kf) = layout.get_mut(idx) {
             f(&mut kf.value);
@@ -382,8 +378,7 @@ pub fn animated_toggle(
     let _ = salt; // reserved for future per-instance ids
     let on = animated_params.contains(param_id);
 
-    let (rect, resp) =
-        ui.allocate_exact_size(egui::Vec2::splat(14.0), egui::Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(egui::Vec2::splat(14.0), egui::Sense::click());
     let center = rect.center();
     let half = 5.0_f32;
     let pts = vec![
@@ -418,7 +413,9 @@ pub fn animated_toggle(
     let resp = resp.on_hover_text(if on {
         crate::i18n::t("Animated — click to lock to a single static value")
     } else {
-        crate::i18n::t("Static — click to make this parameter animatable (changes will create keyframes)")
+        crate::i18n::t(
+            "Static — click to make this parameter animatable (changes will create keyframes)",
+        )
     });
     if resp.clicked() {
         if on {
@@ -526,7 +523,7 @@ pub fn enable_overlay_param_animation(
 
 // ─── Per-param change times (timeline + curve editor parity) ─────────
 
-pub const KF_TIME_EPS: f32 = 1.0e-3;
+pub const KF_TIME_EPS: f32 = 1.0 / 120.0;
 
 /// Merge two sorted time lists, deduplicating within [`KF_TIME_EPS`].
 pub fn merge_param_times(mut a: Vec<f32>, b: Vec<f32>) -> Vec<f32> {
@@ -841,7 +838,10 @@ pub fn rekey_canvas_param_keyframe(
         delete_canvas_param_keyframe_at(canvas, param_id, old_t);
     }
     author_canvas_param_keyframe(canvas, animated_params, param_id, new_t, value);
-    if let Some(kf) = canvas.iter_mut().find(|k| (k.t - new_t).abs() < KF_TIME_EPS) {
+    if let Some(kf) = canvas
+        .iter_mut()
+        .find(|k| (k.t - new_t).abs() < KF_TIME_EPS)
+    {
         kf.easing = old_easing;
     }
 }
@@ -895,7 +895,12 @@ pub fn curve_rekey_actor_param(
         }
     }
     memstroy_core::rekey_actor_param_keyframe(
-        layout, animated_params, param_id, old_t, new_t, value,
+        layout,
+        animated_params,
+        param_id,
+        old_t,
+        new_t,
+        value,
     );
 }
 
@@ -948,7 +953,12 @@ pub fn curve_rekey_overlay_param(
         }
     }
     memstroy_core::rekey_overlay_param_keyframe(
-        layout, animated_params, param_id, old_t, new_t, value,
+        layout,
+        animated_params,
+        param_id,
+        old_t,
+        new_t,
+        value,
     );
 }
 
@@ -1008,31 +1018,29 @@ pub enum SelectedLayer {
 /// Recognised audio param ids. The strings match
 /// `AudioTrack::animated_params` membership.
 pub mod audio_param_ids {
-    pub const VOLUME: &str    = "volume";
-    pub const SPEED: &str     = "speed";
-    pub const PITCH: &str     = "pitch";
-    pub const PAN: &str       = "pan";
-    pub const LOW_PASS: &str  = "low_pass";
+    pub const VOLUME: &str = "volume";
+    pub const SPEED: &str = "speed";
+    pub const PITCH: &str = "pitch";
+    pub const PAN: &str = "pan";
+    pub const LOW_PASS: &str = "low_pass";
     pub const HIGH_PASS: &str = "high_pass";
-    pub const REVERB: &str    = "reverb";
+    pub const REVERB: &str = "reverb";
 
     /// All audio params in inspector / timeline display order.
-    pub const ALL: &[&str] = &[
-        VOLUME, SPEED, PITCH, PAN, LOW_PASS, HIGH_PASS, REVERB,
-    ];
+    pub const ALL: &[&str] = &[VOLUME, SPEED, PITCH, PAN, LOW_PASS, HIGH_PASS, REVERB];
 
     /// Human-readable label for an audio param id. Returns the id back
     /// as a fallback for unknown / future ids.
     pub fn label(id: &str) -> &'static str {
         match id {
-            VOLUME    => crate::i18n::t("Volume"),
-            SPEED     => crate::i18n::t("Speed"),
-            PITCH     => crate::i18n::t("Pitch"),
-            PAN       => crate::i18n::t("Pan"),
-            LOW_PASS  => crate::i18n::t("Low-pass"),
+            VOLUME => crate::i18n::t("Volume"),
+            SPEED => crate::i18n::t("Speed"),
+            PITCH => crate::i18n::t("Pitch"),
+            PAN => crate::i18n::t("Pan"),
+            LOW_PASS => crate::i18n::t("Low-pass"),
             HIGH_PASS => crate::i18n::t("High-pass"),
-            REVERB    => crate::i18n::t("Reverb"),
-            _         => crate::i18n::t("param"),
+            REVERB => crate::i18n::t("Reverb"),
+            _ => crate::i18n::t("param"),
         }
     }
 }
@@ -1048,13 +1056,13 @@ pub fn audio_param_kfs_mut<'a>(
 ) -> Option<&'a mut Vec<memstroy_core::Keyframe<f32>>> {
     use audio_param_ids as p;
     match param_id {
-        p::VOLUME    => Some(&mut audio.volume_kfs),
-        p::SPEED     => Some(&mut audio.speed_kfs),
-        p::PITCH     => Some(&mut audio.pitch_kfs),
-        p::PAN       => Some(&mut audio.pan_kfs),
-        p::LOW_PASS  => Some(&mut audio.low_pass_kfs),
+        p::VOLUME => Some(&mut audio.volume_kfs),
+        p::SPEED => Some(&mut audio.speed_kfs),
+        p::PITCH => Some(&mut audio.pitch_kfs),
+        p::PAN => Some(&mut audio.pan_kfs),
+        p::LOW_PASS => Some(&mut audio.low_pass_kfs),
         p::HIGH_PASS => Some(&mut audio.high_pass_kfs),
-        p::REVERB    => Some(&mut audio.reverb_kfs),
+        p::REVERB => Some(&mut audio.reverb_kfs),
         _ => None,
     }
 }
@@ -1075,13 +1083,13 @@ pub fn audio_param_kfs<'a>(
 ) -> Option<&'a Vec<memstroy_core::Keyframe<f32>>> {
     use audio_param_ids as p;
     match param_id {
-        p::VOLUME    => Some(&audio.volume_kfs),
-        p::SPEED     => Some(&audio.speed_kfs),
-        p::PITCH     => Some(&audio.pitch_kfs),
-        p::PAN       => Some(&audio.pan_kfs),
-        p::LOW_PASS  => Some(&audio.low_pass_kfs),
+        p::VOLUME => Some(&audio.volume_kfs),
+        p::SPEED => Some(&audio.speed_kfs),
+        p::PITCH => Some(&audio.pitch_kfs),
+        p::PAN => Some(&audio.pan_kfs),
+        p::LOW_PASS => Some(&audio.low_pass_kfs),
         p::HIGH_PASS => Some(&audio.high_pass_kfs),
-        p::REVERB    => Some(&audio.reverb_kfs),
+        p::REVERB => Some(&audio.reverb_kfs),
         _ => None,
     }
 }
@@ -1184,12 +1192,8 @@ pub fn keyframe_strip(
     );
 
     let dur = duration.max(1.0e-3);
-    let time_to_x = |t: f32| -> f32 {
-        rect.min.x + (t / dur).clamp(0.0, 1.0) * rect.width()
-    };
-    let x_to_time = |x: f32| -> f32 {
-        ((x - rect.min.x) / rect.width()).clamp(0.0, 1.0) * dur
-    };
+    let time_to_x = |t: f32| -> f32 { rect.min.x + (t / dur).clamp(0.0, 1.0) * rect.width() };
+    let x_to_time = |x: f32| -> f32 { ((x - rect.min.x) / rect.width()).clamp(0.0, 1.0) * dur };
 
     // Playhead tick.
     if let Some(ph) = playhead_local {
@@ -1226,10 +1230,8 @@ pub fn keyframe_strip(
             memstroy_core::Easing::Cubic => egui::Color32::from_rgb(255, 160, 200),
         };
 
-        let hit = egui::Rect::from_center_size(
-            egui::pos2(x, cy),
-            egui::Vec2::new(half * 2.5, row_h),
-        );
+        let hit =
+            egui::Rect::from_center_size(egui::pos2(x, cy), egui::Vec2::new(half * 2.5, row_h));
         let id = ui.id().with(("kf_strip", &salt, i));
         let resp = ui.interact(hit, id, egui::Sense::click_and_drag());
         ui.painter().add(egui::Shape::convex_polygon(
@@ -1284,10 +1286,7 @@ pub fn keyframe_strip(
                 ("Cubic", memstroy_core::Easing::Cubic),
             ] {
                 let selected = *easing == value;
-                if ui
-                    .selectable_label(selected, label)
-                    .clicked()
-                {
+                if ui.selectable_label(selected, label).clicked() {
                     out.easing_changed = Some((i, value));
                     ui.close_menu();
                 }
@@ -1329,10 +1328,7 @@ pub fn apply_strip_to_f32_kfs(
             acted_t.get_or_insert(kfs[idx].t);
         }
     }
-    acted_t.and_then(|t| {
-        kfs.iter()
-            .position(|k| (k.t - t).abs() < 1.0e-3)
-    })
+    acted_t.and_then(|t| kfs.iter().position(|k| (k.t - t).abs() < 1.0e-3))
 }
 
 /// Same as [`apply_strip_to_f32_kfs`] but for any `Vec<Keyframe<T>>`.

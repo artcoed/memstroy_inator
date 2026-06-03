@@ -116,11 +116,12 @@ fn ru_lookup(key: &str) -> Option<&'static str> {
             "В сцене есть несохранённые изменения. Сохранить перед выходом?",
         "Don't save" => "Не сохранять",
 
-        // Render menu
-        "Render" => "Рендер",
-        "\u{1F3AC} Render" => "\u{1F3AC} Рендер",
-        "Render full clip..." => "Рендер ролика…",
-        "\u{1F3A5} Render full clip..." => "\u{1F3A5} Рендер ролика…",
+        // Export menu
+        "Render" => "Экспорт",
+        "Export" => "Экспорт",
+        "\u{1F3AC} Render" => "\u{1F3AC} Экспорт",
+        "Render full clip..." => "Экспорт ролика…",
+        "\u{1F3A5} Render full clip..." => "\u{1F3A5} Экспорт ролика…",
 
         // Tools menu was removed; the entries that used to live there
         // (Skeleton Constructor, Web Image Search) are now reachable
@@ -138,6 +139,9 @@ fn ru_lookup(key: &str) -> Option<&'static str> {
         "Web Image Search" => "Поиск картинок",
         "\u{1F310} Web Image Search" => "\u{1F310} Поиск картинок",
         "Search images..." => "Поиск картинок…",
+        "Resource search" => "Поиск ресурсов",
+        "Search resources…" => "Поиск ресурсов…",
+        "local resource" => "локальный ресурс",
         "Found" => "Найдено",
         "Type a query and press Enter. Click a result to drop it on the canvas at the playhead, or drag it onto the canvas / timeline." =>
             "Введите запрос и нажмите Enter. Кликните по результату, чтобы добавить картинку на холст в позиции плейхеда, или перетащите её на холст / таймлайн.",
@@ -173,6 +177,10 @@ fn ru_lookup(key: &str) -> Option<&'static str> {
         "Step (instant)" => "Мгновенный",
         "Cubic" => "Кубический",
         "Delete keyframe" => "Удалить кейфрейм",
+        "keyframe to clipboard" => "кейфрейм в буфере",
+        "keyframes to clipboard" => "кейфреймов в буфере",
+        "keyframe at the playhead" => "кейфрейм в позиции плейхеда",
+        "keyframes at the playhead" => "кейфреймов в позиции плейхеда",
         "Overlay" => "Слой",
         "Pos X" => "Поз. X",
         "Pos Y" => "Поз. Y",
@@ -209,6 +217,8 @@ fn ru_lookup(key: &str) -> Option<&'static str> {
             "Кликайте по холсту, чтобы расставить новые вершины; клик рядом с первой или двойной клик закрывает контур.",
         "Click on the canvas to pick a colour to mask out (works on actors and image overlays)." =>
             "Кликните по холсту, чтобы выбрать цвет для маскирования (работает с актёрами и картинками-наложениями).",
+        "Draw" => "Кисть",
+        "Eraser" => "Ластик",
         "Drag a continuous trail across the canvas to redraw this polygon." =>
             "Протяните курсором по холсту, чтобы перерисовать полигон одним движением.",
         "freehand" => "от руки",
@@ -291,6 +301,12 @@ fn ru_lookup(key: &str) -> Option<&'static str> {
         "VHS" => "VHS",
         "Grayscale" => "Чёрно-белое",
         "Sepia" => "Сепия",
+        "Hue" => "Тон",
+        "Edge" => "Контур",
+        "Wave" => "Волна",
+        "Chromatic" => "Хром.",
+        "Mirror H" => "Зерк. H",
+        "Mirror V" => "Зерк. V",
         // ── Geometry rotate / mirror buttons ────────────────────
         "\u{21BA} -90\u{00B0}" => "\u{21BA} -90\u{00B0}",
         "\u{21BB} +90\u{00B0}" => "\u{21BB} +90\u{00B0}",
@@ -450,6 +466,13 @@ fn ru_lookup(key: &str) -> Option<&'static str> {
             "Переключить горизонт. отражение для всех выбранных",
         "Visible" => "Видимо",
         "Source" => "Источник",
+        "Duration" => "Длительность",
+        "Size" => "Размер",
+        "Mellstroy footage" => "Меллстрой футаж",
+        "Show sequence handles on this video clip in the layer panel" =>
+            "Показать ручки последовательности для этого видео в панели слоёв",
+        "Footage slot" => "Слот футажа",
+        "Edge frame" => "Крайний кадр",
         "Color correction" => "Цветокоррекция",
         "Color Correction" => "Цветокоррекция",
         "Brightness" => "Яркость",
@@ -621,6 +644,11 @@ fn ru_lookup(key: &str) -> Option<&'static str> {
 
         // ── Timeline / playback ────────────────────────────────
         "Timeline" => "Таймлайн",
+        "Layer deleted." => "Слой удалён.",
+        "Layer contains elements; selected them instead." =>
+            "В слое есть элементы; они выделены вместо удаления слоя.",
+        "Selected empty layer:" => "Выделен пустой слой:",
+        "Selected layer:" => "Выделен слой:",
         "Play" => "Воспроизвести",
         "Pause" => "Пауза",
         "Play (Space)" => "Воспроизвести (Space)",
@@ -716,14 +744,24 @@ fn ru_lookup(key: &str) -> Option<&'static str> {
         "server" => "сервер",
 
         // ── Misc / status messages ─────────────────────────────
+        "Refresh done!" => "Обновление выполнено!",
         "\u{1F389} Refresh done!" => "\u{1F389} Обновление выполнено!",
         "\u{2705} Saved." => "\u{2705} Сохранено.",
         "\u{2705} Saved (.memstroy)." => "\u{2705} Сохранено (.memstroy).",
         "\u{2705} Scene loaded." => "\u{2705} Сцена загружена.",
         "\u{2728} New scene created." => "\u{2728} Новая сцена создана.",
+        "Auto-saved" => "Автосохранено",
         "\u{1F4BE} Auto-saved" => "\u{1F4BE} Автосохранено",
 
         // Actor / overlay / audio actions
+        "Selected layers deleted." => "Выбранные слои удалены.",
+        "Actor deleted." => "Актёр удалён.",
+        "Overlay deleted." => "Слой удалён.",
+        "Background deleted." => "Фон удалён.",
+        "Audio deleted." => "Аудио удалено.",
+        "Actor duplicated." => "Актёр продублирован.",
+        "Overlay duplicated." => "Слой продублирован.",
+        "Background duplicated." => "Фон продублирован.",
         "\u{1F5D1} Actor deleted." => "\u{1F5D1} Актёр удалён.",
         "\u{1F5D1} Overlay deleted." => "\u{1F5D1} Слой удалён.",
         "\u{1F5D1} Background deleted." => "\u{1F5D1} Фон удалён.",
@@ -734,6 +772,9 @@ fn ru_lookup(key: &str) -> Option<&'static str> {
         "\u{2702} Actor split at playhead." => "\u{2702} Актёр разрезан.",
         "\u{2702} Overlay split at playhead." => "\u{2702} Слой разрезан.",
         "\u{2702} Background split at playhead." => "\u{2702} Фон разрезан.",
+        "Actors merged." => "Актёры объединены.",
+        "Overlays merged." => "Слои объединены.",
+        "Backgrounds merged." => "Фоны объединены.",
         "\u{1F517} Actors merged." => "\u{1F517} Актёры объединены.",
         "\u{1F517} Overlays merged." => "\u{1F517} Слои объединены.",
         "\u{1F517} Backgrounds merged." => "\u{1F517} Фоны объединены.",
@@ -744,13 +785,17 @@ fn ru_lookup(key: &str) -> Option<&'static str> {
             "\u{26A0} Выберите элемент со следующим соседом для объединения.",
 
         // ── Render / refresh / web search status (app.rs) ──────
-        "\u{2705} Rendered:" => "\u{2705} Отрендерено:",
-        "\u{274C} Render failed:" => "\u{274C} Ошибка рендера:",
-        "Render failed" => "Ошибка рендера",
-        "Render complete" => "Рендер завершён",
-        "Rendering..." => "Идёт рендер…",
+        "\u{2705} Rendered:" => "\u{2705} Экспортировано:",
+        "\u{274C} Render failed:" => "\u{274C} Ошибка экспорта:",
+        "Render failed" => "Ошибка экспорта",
+        "Render complete" => "Экспорт завершён",
+        "Rendering..." => "Идёт экспорт…",
+        "Exporting..." => "Идёт экспорт…",
         "Elapsed" => "Прошло",
         "ETA" => "осталось",
+        "Refreshing clips via assets-server..." =>
+            "Обновляем клипы через сервер ассетов…",
+        "Local library refreshed." => "Локальная библиотека обновлена.",
         "\u{1F3A5} Rendering at 1080x1920..." => "\u{1F3A5} Рендер 1080x1920…",
         "\u{1F504} Refreshing clips via assets-server..." =>
             "\u{1F504} Обновляем клипы через сервер ассетов…",
@@ -758,6 +803,7 @@ fn ru_lookup(key: &str) -> Option<&'static str> {
         "new clips," => "новых клипов,",
         "total in library" => "всего в библиотеке",
         "failed" => "не удалось",
+        "No results." => "Ничего не найдено.",
         "\u{1F50D} No results." => "\u{1F50D} Ничего не найдено.",
         "(no more results)" => "(больше результатов нет)",
         "\u{2705} Got" => "\u{2705} Получено",
@@ -765,20 +811,25 @@ fn ru_lookup(key: &str) -> Option<&'static str> {
         "\u{2795}" => "\u{2795}",
         "total" => "всего",
         "\u{2705} Saved" => "\u{2705} Сохранено",
+        "Web image" => "Картинка из веба",
         "\u{1F310} Web image" => "\u{1F310} Картинка из веба",
         "\u{274C} Download failed:" => "\u{274C} Ошибка загрузки:",
         "\u{274C} Open failed:" => "\u{274C} Не удалось открыть:",
 
         // ── Clipboard / playback shortcuts (app.rs) ────────────
+        "Copied" => "Скопировано",
         "\u{1F4CB} Copied" => "\u{1F4CB} Скопировано",
         "item to clipboard" => "элемент в буфер обмена",
         "items to clipboard" => "элементов в буфер обмена",
+        "Pasted" => "Вставлено",
         "\u{1F4CB} Pasted" => "\u{1F4CB} Вставлено",
         "item at the playhead" => "элемент в позиции воспроизведения",
         "items at the playhead" => "элементов в позиции воспроизведения",
+        "Clipboard is empty" => "Буфер обмена пуст",
         "\u{1F4CB} Clipboard is empty" => "\u{1F4CB} Буфер обмена пуст",
         "Mask tool cancelled" => "Инструмент маски отменён",
         "Clipboard image save failed:" => "Не удалось сохранить картинку из буфера:",
+        "Pasted clipboard image" => "Вставлена картинка из буфера",
         "\u{1F4CB} Pasted clipboard image" => "\u{1F4CB} Вставлена картинка из буфера",
 
         // ── Save / save-as / autosave / recovery (app.rs) ──────
@@ -786,6 +837,7 @@ fn ru_lookup(key: &str) -> Option<&'static str> {
         "\u{26A0} Autosave failed:" => "\u{26A0} Автосохранение не удалось:",
         "\u{2705} Recovered scene loaded." => "\u{2705} Восстановленная сцена загружена.",
         "\u{274C} Recovery failed:" => "\u{274C} Восстановление не удалось:",
+        "Recovery discarded." => "Восстановление отменено.",
         "\u{1F5D1} Recovery discarded." => "\u{1F5D1} Восстановление отменено.",
         "Recovery postponed." => "Восстановление отложено.",
         "Memstroy Project" => "Проект Memstroy",
@@ -802,8 +854,12 @@ fn ru_lookup(key: &str) -> Option<&'static str> {
         "saved to library" => "сохранено в библиотеку",
 
         // ── Frame / waveform extraction (app.rs) ───────────────
+        "Extracting audio waveforms..." =>
+            "Извлекаем аудио-волны…",
         "\u{1F3B5} Extracting audio waveforms..." =>
             "\u{1F3B5} Извлекаем аудио-волны…",
+        "Extracting preview frames..." =>
+            "Извлекаем кадры превью…",
         "\u{1F3AC} Extracting preview frames..." =>
             "\u{1F3AC} Извлекаем кадры превью…",
         "\u{2705} Preview ready" => "\u{2705} Превью готово",
@@ -813,6 +869,7 @@ fn ru_lookup(key: &str) -> Option<&'static str> {
         "frames" => "кадров",
 
         // ── Web Image Search (web_image_search.rs) ─────────────
+        "Searching for" => "Поиск:",
         "\u{1F50D} Searching for" => "\u{1F50D} Поиск:",
         "\u{2B07} Loading page" => "\u{2B07} Загружаем страницу",
         "Tokio runtime missing" => "Tokio runtime недоступен",
@@ -834,6 +891,8 @@ fn ru_lookup(key: &str) -> Option<&'static str> {
             "Пипетка: не удалось определить область актёра.",
         "Eyedropper: click on the actor's image." =>
             "Пипетка: кликните по изображению актёра.",
+        "Eyedropper: click on the selected image." =>
+            "Пипетка: кликните по выбранному изображению.",
         "Eyedropper: frame not yet decoded — try again in a moment." =>
             "Пипетка: кадр ещё не декодирован — попробуйте чуть позже.",
         "Eyedropper: overlay must be an image (text / video not supported here)." =>
@@ -911,7 +970,6 @@ fn ru_lookup(key: &str) -> Option<&'static str> {
         "Skeleton template created." => "Шаблон скелета создан.",
         "Skeleton saved:" => "Скелет сохранён:",
         "Save failed:" => "Не удалось сохранить:",
-        "Extracting preview frames..." => "Извлекаем кадры превью…",
         "Frame" => "Кадр",
         "First frame" => "Первый кадр",
         "Previous frame" => "Предыдущий кадр",
@@ -1107,6 +1165,24 @@ fn ru_lookup(key: &str) -> Option<&'static str> {
         "Audio lane" => "Аудио-дорожка",
         "Drop here" => "Бросьте сюда",
         "asset" => "ассет",
+        "Loading server assets..." => "Загрузка ресурсов с сервера…",
+        "Offline:" => "Оффлайн:",
+        "All server assets loaded." => "Все серверные ресурсы загружены.",
+        "No more server assets." => "Больше серверных ресурсов нет.",
+        "Loaded server assets:" => "Загружено ресурсов с сервера:",
+        "Server assets failed:" => "Ошибка ресурсов сервера:",
+        "Server asset downloaded:" => "Серверный ресурс скачан:",
+        "Server asset download failed:" => "Ошибка скачивания серверного ресурса:",
+        "Background worker not ready" => "Фоновый воркер не готов",
+        "Cannot download asset: background worker not ready" =>
+            "Не удалось скачать ресурс: фоновый воркер не готов",
+        "Downloading server asset..." => "Скачивание ресурса с сервера…",
+        "Downloads on drop" => "Скачается при переносе",
+        "Footage sequence" => "Последовательность футажей",
+        "Insert a short frozen segment from this clip edge" =>
+            "Вставить короткий замороженный фрагмент из края этого клипа",
+        "Insert empty space that can be filled by a Mellstroy clip drop" =>
+            "Вставить пустое место, куда можно бросить клип с Меллстроем",
 
         // Audio / kf_anim labels
         "Pitch" => "Высота",

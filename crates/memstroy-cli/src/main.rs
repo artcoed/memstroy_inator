@@ -11,14 +11,14 @@
 
 use std::path::PathBuf;
 
-use anyhow::Result;
 #[cfg(feature = "telegram")]
 use anyhow::Context;
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 use memstroy_core::Scene;
+use memstroy_render::{render_preview_frame, render_scene};
 #[cfg(feature = "telegram")]
 use memstroy_tg::{download_videos, fetch_all, ChannelCatalog};
-use memstroy_render::{render_preview_frame, render_scene};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -115,18 +115,52 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         #[cfg(feature = "telegram")]
-        Cmd::Download { channel, out, filter, max_pages, overwrite, concurrency, catalog_only } => {
-            run_download(channel, out, filter, max_pages, overwrite, concurrency, catalog_only).await
+        Cmd::Download {
+            channel,
+            out,
+            filter,
+            max_pages,
+            overwrite,
+            concurrency,
+            catalog_only,
+        } => {
+            run_download(
+                channel,
+                out,
+                filter,
+                max_pages,
+                overwrite,
+                concurrency,
+                catalog_only,
+            )
+            .await
         }
-        Cmd::Chroma { input, output, similarity, blend } => {
-            run_chroma(input, output, similarity, blend).await
-        }
-        Cmd::RemoveBg { input, output, model, threshold } => {
+        Cmd::Chroma {
+            input,
+            output,
+            similarity,
+            blend,
+        } => run_chroma(input, output, similarity, blend).await,
+        Cmd::RemoveBg {
+            input,
+            output,
+            model,
+            threshold,
+        } => {
             let model = model.unwrap_or_else(memstroy_vision::resolve_u2netp_model_path);
             run_remove_bg(input, output, model, threshold).await
         }
-        Cmd::Render { scene, output, assets } => run_render(scene, output, assets).await,
-        Cmd::Preview { scene, output, t, assets } => run_preview(scene, output, t, assets).await,
+        Cmd::Render {
+            scene,
+            output,
+            assets,
+        } => run_render(scene, output, assets).await,
+        Cmd::Preview {
+            scene,
+            output,
+            t,
+            assets,
+        } => run_preview(scene, output, t, assets).await,
         Cmd::New { path } => run_new(path),
     }
 }
@@ -162,7 +196,9 @@ async fn run_download(
     }
     info!(total, kept = posts.len(), "scrape done");
 
-    tokio::fs::create_dir_all(&out).await.context("mkdir output")?;
+    tokio::fs::create_dir_all(&out)
+        .await
+        .context("mkdir output")?;
     let catalog = ChannelCatalog {
         channel: channel.clone(),
         fetched_at: chrono::Utc::now().to_rfc3339(),
@@ -189,13 +225,20 @@ async fn run_chroma(input: PathBuf, output: PathBuf, similarity: f32, blend: f32
         similarity, blend, 0.3
     );
     let status = tokio::process::Command::new(bin)
-        .args([
-            "-y",
-            "-hide_banner",
-            "-i",
-        ])
+        .args(["-y", "-hide_banner", "-i"])
         .arg(&input)
-        .args(["-vf", &filter, "-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p", "-b:v", "0", "-crf", "30"])
+        .args([
+            "-vf",
+            &filter,
+            "-c:v",
+            "libvpx-vp9",
+            "-pix_fmt",
+            "yuva420p",
+            "-b:v",
+            "0",
+            "-crf",
+            "30",
+        ])
         .arg(&output)
         .status()
         .await?;
@@ -211,7 +254,9 @@ async fn run_remove_bg(
     model: PathBuf,
     threshold: Option<f32>,
 ) -> Result<()> {
-    use memstroy_vision::bgremove::{remove_background_to_file, BackgroundRemover, U2NetpBgRemover};
+    use memstroy_vision::bgremove::{
+        remove_background_to_file, BackgroundRemover, U2NetpBgRemover,
+    };
 
     let mut remover = U2NetpBgRemover::new(model.clone());
     if let Some(t) = threshold {
@@ -257,7 +302,9 @@ fn starter_scene() -> Scene {
     use memstroy_core::*;
     let bg = Background {
         id: "bg1".into(),
-        source: MediaSource::SolidColor { color: [240, 240, 240] },
+        source: MediaSource::SolidColor {
+            color: [240, 240, 240],
+        },
         start: 0.0,
         duration: 8.0,
         fit: Fit::Cover,
@@ -269,7 +316,18 @@ fn starter_scene() -> Scene {
         t_in: 0.5,
         t_out: 7.5,
         style: TextStyle::default(),
-        layout: vec![Keyframe::new(0.0, OverlayState { pos: [0.5, 0.15], scale: 1.0, scale_y: 1.0, rotation_deg: 0.0, opacity: 1.0, flip_x_anim: 1.0, flip_y_anim: 1.0 })],
+        layout: vec![Keyframe::new(
+            0.0,
+            OverlayState {
+                pos: [0.5, 0.15],
+                scale: 1.0,
+                scale_y: 1.0,
+                rotation_deg: 0.0,
+                opacity: 1.0,
+                flip_x_anim: 1.0,
+                flip_y_anim: 1.0,
+            },
+        )],
         modifiers: Vec::new(),
         skeleton_attachment: None,
         z_index: 100,

@@ -37,7 +37,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use egui::{Color32, ColorImage, TextureHandle, TextureOptions};
-use memstroy_core::{Overlay, OverlayState, effects::Effect, keyframe};
+use memstroy_core::{effects::Effect, keyframe, Overlay, OverlayState};
 
 use crate::state::EditorState;
 
@@ -157,17 +157,17 @@ pub fn collect_contributors(
         }
         // Sample the overlay's local state
         let local_t = (t - im.t_in).max(0.0);
-        let ov_state: OverlayState = memstroy_core::sample_overlay_layout(
-            &im.layout,
-            &im.animated_params,
-            local_t,
-        );
+        let ov_state: OverlayState =
+            memstroy_core::sample_overlay_layout(&im.layout, &im.animated_params, local_t);
         // World position (legacy normalised → world pixels)
         let center_x = ov_state.pos[0] * world_w;
         let center_y = ov_state.pos[1] * world_h;
 
         // Read source PNG dimensions from the texture cache if loaded
-        let (sw, sh) = state.image_textures.lock().ok()
+        let (sw, sh) = state
+            .image_textures
+            .lock()
+            .ok()
             .and_then(|m| match m.get(&im.source) {
                 Some(crate::state::ImageTextureSlot::Loaded { size, .. }) => {
                     Some((size[0] as f32, size[1] as f32))
@@ -181,8 +181,11 @@ pub fn collect_contributors(
         let mn = [center_x - w * 0.5, center_y - h * 0.5];
         let mx = [center_x + w * 0.5, center_y + h * 0.5];
         // Intersection test with FX bbox
-        if mn[0] >= fx_bbox_max[0] || mx[0] <= fx_bbox_min[0]
-            || mn[1] >= fx_bbox_max[1] || mx[1] <= fx_bbox_min[1] {
+        if mn[0] >= fx_bbox_max[0]
+            || mx[0] <= fx_bbox_min[0]
+            || mn[1] >= fx_bbox_max[1]
+            || mx[1] <= fx_bbox_min[1]
+        {
             continue;
         }
         out.push((idx, im.source.clone(), [center_x, center_y], w, h));
@@ -252,33 +255,45 @@ pub fn bake_fx_preview(
         let local_cy = (pos[1] - fx_bbox_min[1]) * scale;
         let dest_w = (w * scale) as i32;
         let dest_h = (h * scale) as i32;
-        if dest_w < 1 || dest_h < 1 { continue; }
+        if dest_w < 1 || dest_h < 1 {
+            continue;
+        }
         let dest_x0 = (local_cx - (dest_w as f32) * 0.5) as i32;
         let dest_y0 = (local_cy - (dest_h as f32) * 0.5) as i32;
 
         // Bilinear-resample blit from src → dest with alpha blending
         for dy in 0..dest_h {
             let y_dest = dest_y0 + dy;
-            if y_dest < 0 || y_dest >= buf_h as i32 { continue; }
+            if y_dest < 0 || y_dest >= buf_h as i32 {
+                continue;
+            }
             // Source v coordinate (0..1) maps to source pixels
             let v_src = (dy as f32 / dest_h.max(1) as f32) * src_h as f32;
             let sy = (v_src as i32).clamp(0, src_h as i32 - 1) as usize;
             for dx in 0..dest_w {
                 let x_dest = dest_x0 + dx;
-                if x_dest < 0 || x_dest >= buf_w as i32 { continue; }
+                if x_dest < 0 || x_dest >= buf_w as i32 {
+                    continue;
+                }
                 let u_src = (dx as f32 / dest_w.max(1) as f32) * src_w as f32;
                 let sx = (u_src as i32).clamp(0, src_w as i32 - 1) as usize;
 
                 let src_idx = (sy * src_w as usize + sx) * 4;
-                if src_idx + 3 >= src_rgba.len() { continue; }
+                if src_idx + 3 >= src_rgba.len() {
+                    continue;
+                }
                 let sr = src_rgba[src_idx];
                 let sg = src_rgba[src_idx + 1];
                 let sb = src_rgba[src_idx + 2];
                 let sa = src_rgba[src_idx + 3];
-                if sa == 0 { continue; }
+                if sa == 0 {
+                    continue;
+                }
 
                 let dest_idx = (y_dest as usize * buf_w as usize + x_dest as usize) * 4;
-                if dest_idx + 3 >= rgba.len() { continue; }
+                if dest_idx + 3 >= rgba.len() {
+                    continue;
+                }
                 // Standard alpha-over composite
                 let dr = rgba[dest_idx];
                 let dg = rgba[dest_idx + 1];
@@ -287,7 +302,9 @@ pub fn bake_fx_preview(
                 let sa_f = sa as f32 / 255.0;
                 let da_f = da as f32 / 255.0;
                 let out_a = sa_f + da_f * (1.0 - sa_f);
-                if out_a < 1e-6 { continue; }
+                if out_a < 1e-6 {
+                    continue;
+                }
                 let out_r = (sr as f32 * sa_f + dr as f32 * da_f * (1.0 - sa_f)) / out_a;
                 let out_g = (sg as f32 * sa_f + dg as f32 * da_f * (1.0 - sa_f)) / out_a;
                 let out_b = (sb as f32 * sa_f + db as f32 * da_f * (1.0 - sa_f)) / out_a;
@@ -303,7 +320,8 @@ pub fn bake_fx_preview(
     let _ = crate::image_effects::apply_effect_stack(&mut rgba, buf_w, buf_h, effects, 0.0);
 
     // Convert to ColorImage
-    let pixels: Vec<Color32> = rgba.chunks_exact(4)
+    let pixels: Vec<Color32> = rgba
+        .chunks_exact(4)
         .map(|c| Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]))
         .collect();
     Some(ColorImage {
@@ -336,7 +354,8 @@ pub fn ensure_fx_preview(
     }
 
     // Check if effects are actually active
-    let active_effects: Vec<Effect> = effects.iter()
+    let active_effects: Vec<Effect> = effects
+        .iter()
         .filter(|e| e.enabled && e.intensity > 0.001)
         .cloned()
         .collect();
@@ -345,7 +364,8 @@ pub fn ensure_fx_preview(
     }
 
     // Build signature
-    let lower: Vec<(PathBuf, [f32; 2], f32, f32)> = contributors.iter()
+    let lower: Vec<(PathBuf, [f32; 2], f32, f32)> = contributors
+        .iter()
         .map(|(_, p, pos, w, h)| (p.clone(), *pos, *w, *h))
         .collect();
     let sig = composition_signature(

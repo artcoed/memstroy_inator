@@ -108,11 +108,7 @@ impl EditorSettings {
         match serde_json::to_string_pretty(self) {
             Ok(text) => {
                 if let Err(e) = std::fs::write(&path, text) {
-                    tracing::warn!(
-                        "Failed to write settings to {}: {}",
-                        path.display(),
-                        e
-                    );
+                    tracing::warn!("Failed to write settings to {}: {}", path.display(), e);
                 }
             }
             Err(e) => {
@@ -230,18 +226,42 @@ pub fn show_settings_dialog(
                 ui.label(egui::RichText::new(label).size(13.0).strong());
             });
             ui.horizontal(|ui| {
-                if ui.button(egui::RichText::new(" \u{2212} ").size(14.0)).on_hover_text(i18n::t("Decrease scale")).clicked() {
-                    let cur = if state.settings.ui_scale < 0.01 { 1.0_f32 } else { state.settings.ui_scale };
+                if ui
+                    .button(egui::RichText::new(" \u{2212} ").size(14.0))
+                    .on_hover_text(i18n::t("Decrease scale"))
+                    .clicked()
+                {
+                    let cur = if state.settings.ui_scale < 0.01 {
+                        1.0_f32
+                    } else {
+                        state.settings.ui_scale
+                    };
                     state.settings.ui_scale = (cur - 0.1).max(0.5);
                 }
-                if ui.button(egui::RichText::new(" + ").size(14.0)).on_hover_text(i18n::t("Increase scale")).clicked() {
-                    let cur = if state.settings.ui_scale < 0.01 { 1.0_f32 } else { state.settings.ui_scale };
+                if ui
+                    .button(egui::RichText::new(" + ").size(14.0))
+                    .on_hover_text(i18n::t("Increase scale"))
+                    .clicked()
+                {
+                    let cur = if state.settings.ui_scale < 0.01 {
+                        1.0_f32
+                    } else {
+                        state.settings.ui_scale
+                    };
                     state.settings.ui_scale = (cur + 0.1).min(3.0);
                 }
-                if ui.button(egui::RichText::new("Auto").size(11.0)).on_hover_text(i18n::t("Reset to system default")).clicked() {
+                if ui
+                    .button(egui::RichText::new("Auto").size(11.0))
+                    .on_hover_text(i18n::t("Reset to system default"))
+                    .clicked()
+                {
                     state.settings.ui_scale = 0.0;
                 }
-                if ui.button(egui::RichText::new("100%").size(11.0)).on_hover_text(i18n::t("Set to 100%")).clicked() {
+                if ui
+                    .button(egui::RichText::new("100%").size(11.0))
+                    .on_hover_text(i18n::t("Set to 100%"))
+                    .clicked()
+                {
                     state.settings.ui_scale = 1.0;
                 }
             });
@@ -252,12 +272,10 @@ pub fn show_settings_dialog(
             ui.separator();
             ui.add_space(6.0);
             ui.label(
-                egui::RichText::new(i18n::t(
-                    "Restart not required — changes apply immediately.",
-                ))
-                .size(10.0)
-                .italics()
-                .color(egui::Color32::from_rgb(160, 160, 180)),
+                egui::RichText::new(i18n::t("Restart not required — changes apply immediately."))
+                    .size(10.0)
+                    .italics()
+                    .color(egui::Color32::from_rgb(160, 160, 180)),
             );
 
             ui.add_space(8.0);

@@ -13,7 +13,7 @@ use crate::param_ids;
 use crate::{ActorState, OverlayState, RenderFrameState};
 
 const EPS: f32 = 1.0e-4;
-const TIME_EPS: f32 = 1.0e-3;
+const TIME_EPS: f32 = 1.0 / 120.0;
 
 /// Keyframe times that matter for one scalar field (timeline diamonds,
 /// curve editor points). Omits `layout[0]` unless it starts a change
@@ -93,9 +93,11 @@ pub fn actor_param_timeline_times(
     animated_params: &BTreeSet<String>,
     param_id: &str,
 ) -> Vec<f32> {
-    param_timeline_times(layout, |s| actor_get(s, param_id), |i| {
-        other_actor_fields_changed_at(layout, animated_params, param_id, i)
-    })
+    param_timeline_times(
+        layout,
+        |s| actor_get(s, param_id),
+        |i| other_actor_fields_changed_at(layout, animated_params, param_id, i),
+    )
 }
 
 pub fn overlay_param_timeline_times(
@@ -103,9 +105,11 @@ pub fn overlay_param_timeline_times(
     animated_params: &BTreeSet<String>,
     param_id: &str,
 ) -> Vec<f32> {
-    param_timeline_times(layout, |s| overlay_get(s, param_id), |i| {
-        other_overlay_fields_changed_at(layout, animated_params, param_id, i)
-    })
+    param_timeline_times(
+        layout,
+        |s| overlay_get(s, param_id),
+        |i| other_overlay_fields_changed_at(layout, animated_params, param_id, i),
+    )
 }
 
 pub fn render_frame_param_timeline_times(
@@ -113,9 +117,11 @@ pub fn render_frame_param_timeline_times(
     animated_params: &BTreeSet<String>,
     param_id: &str,
 ) -> Vec<f32> {
-    param_timeline_times(layout, |s| rf_get(s, param_id), |i| {
-        other_rf_fields_changed_at(layout, animated_params, param_id, i)
-    })
+    param_timeline_times(
+        layout,
+        |s| rf_get(s, param_id),
+        |i| other_rf_fields_changed_at(layout, animated_params, param_id, i),
+    )
 }
 
 fn layout_index_at_time<T>(layout: &[Keyframe<T>], t: f32) -> usize {
@@ -172,10 +178,7 @@ fn sample_actor_field(
         let times = param_change_times(layout, &get);
         sample_scalar_track(layout, &times, t, &get, default)
     } else {
-        layout
-            .first()
-            .map(|kf| get(&kf.value))
-            .unwrap_or(default)
+        layout.first().map(|kf| get(&kf.value)).unwrap_or(default)
     }
 }
 
@@ -270,10 +273,7 @@ fn sample_overlay_field(
         let times = param_change_times(layout, &get);
         sample_scalar_track(layout, &times, t, &get, default)
     } else {
-        layout
-            .first()
-            .map(|kf| get(&kf.value))
-            .unwrap_or(default)
+        layout.first().map(|kf| get(&kf.value)).unwrap_or(default)
     }
 }
 
@@ -368,10 +368,7 @@ fn sample_rf_field(
         let times = param_change_times(layout, &get);
         sample_scalar_track(layout, &times, t, &get, default)
     } else {
-        layout
-            .first()
-            .map(|kf| get(&kf.value))
-            .unwrap_or(default)
+        layout.first().map(|kf| get(&kf.value)).unwrap_or(default)
     }
 }
 
@@ -642,7 +639,10 @@ pub fn clear_actor_param_animation(
 ) {
     let mut with_param = animated_params.clone();
     with_param.insert(param_id.to_string());
-    let static_val = actor_get(&sample_actor_layout(layout, &with_param, reference_t), param_id);
+    let static_val = actor_get(
+        &sample_actor_layout(layout, &with_param, reference_t),
+        param_id,
+    );
 
     let times = actor_param_timeline_times(layout, animated_params, param_id);
     let mut remove = Vec::new();
@@ -666,8 +666,10 @@ pub fn clear_overlay_param_animation(
 ) {
     let mut with_param = animated_params.clone();
     with_param.insert(param_id.to_string());
-    let static_val =
-        overlay_get(&sample_overlay_layout(layout, &with_param, reference_t), param_id);
+    let static_val = overlay_get(
+        &sample_overlay_layout(layout, &with_param, reference_t),
+        param_id,
+    );
 
     let times = overlay_param_timeline_times(layout, animated_params, param_id);
     let mut remove = Vec::new();
@@ -691,8 +693,10 @@ pub fn clear_render_frame_param_animation(
 ) {
     let mut with_param = animated_params.clone();
     with_param.insert(param_id.to_string());
-    let static_val =
-        rf_get(&sample_render_frame_layout(layout, &with_param, reference_t), param_id);
+    let static_val = rf_get(
+        &sample_render_frame_layout(layout, &with_param, reference_t),
+        param_id,
+    );
 
     let times = render_frame_param_timeline_times(layout, animated_params, param_id);
     let mut remove = Vec::new();
@@ -1006,7 +1010,10 @@ pub fn enable_overlay_param_animation(
 ) {
     let mut with_param = animated_params.clone();
     with_param.insert(param_id.to_string());
-    let value = overlay_get(&sample_overlay_layout(layout, &with_param, seed_t), param_id);
+    let value = overlay_get(
+        &sample_overlay_layout(layout, &with_param, seed_t),
+        param_id,
+    );
     upsert_overlay_param_keyframe(layout, &with_param, param_id, seed_t, value);
 }
 
@@ -1018,7 +1025,10 @@ pub fn enable_render_frame_param_animation(
 ) {
     let mut with_param = animated_params.clone();
     with_param.insert(param_id.to_string());
-    let value = rf_get(&sample_render_frame_layout(layout, &with_param, seed_t), param_id);
+    let value = rf_get(
+        &sample_render_frame_layout(layout, &with_param, seed_t),
+        param_id,
+    );
     upsert_render_frame_param_keyframe(layout, &with_param, param_id, seed_t, value);
 }
 
@@ -1097,27 +1107,39 @@ mod tests {
         animated.insert(param_ids::SCALE.to_string());
 
         let layout = vec![
-            Keyframe::new(0.0, ActorState {
-                opacity: 1.0,
-                scale: 1.0,
-                ..ActorState::default()
-            }),
-            Keyframe::new(1.0, ActorState {
-                opacity: 0.0,
-                scale: 1.0,
-                ..ActorState::default()
-            }),
-            Keyframe::new(5.0, ActorState {
-                opacity: 0.0,
-                scale: 2.0,
-                ..ActorState::default()
-            }),
+            Keyframe::new(
+                0.0,
+                ActorState {
+                    opacity: 1.0,
+                    scale: 1.0,
+                    ..ActorState::default()
+                },
+            ),
+            Keyframe::new(
+                1.0,
+                ActorState {
+                    opacity: 0.0,
+                    scale: 1.0,
+                    ..ActorState::default()
+                },
+            ),
+            Keyframe::new(
+                5.0,
+                ActorState {
+                    opacity: 0.0,
+                    scale: 2.0,
+                    ..ActorState::default()
+                },
+            ),
         ];
 
         // Between opacity kfs (0..1) opacity eases; scale stays 1 until t=5.
         let mid = sample_actor_layout(&layout, &animated, 0.5);
         assert!((mid.opacity - 0.5).abs() < 0.05, "opacity should ease 1→0");
-        assert!((mid.scale - 1.0).abs() < EPS, "scale should stay 1 until its kf at 5");
+        assert!(
+            (mid.scale - 1.0).abs() < EPS,
+            "scale should stay 1 until its kf at 5"
+        );
 
         // After opacity's last change (t=1) opacity holds; scale still 1 before t=5.
         let at3 = sample_actor_layout(&layout, &animated, 3.0);
@@ -1136,10 +1158,13 @@ mod tests {
     #[test]
     fn enable_at_playhead_drops_anchor_at_zero() {
         let mut animated = BTreeSet::new();
-        let mut layout = vec![Keyframe::new(0.0, ActorState {
-            opacity: 1.0,
-            ..ActorState::default()
-        })];
+        let mut layout = vec![Keyframe::new(
+            0.0,
+            ActorState {
+                opacity: 1.0,
+                ..ActorState::default()
+            },
+        )];
         animated.insert(param_ids::OPACITY.to_string());
         enable_actor_param_animation(&mut layout, &animated, param_ids::OPACITY, 3.0);
         let times = param_change_times(&layout, |s| s.opacity);
@@ -1152,15 +1177,21 @@ mod tests {
         let mut animated = BTreeSet::new();
         animated.insert(param_ids::SCALE.to_string());
         let mut layout = vec![
-            Keyframe::new(0.0, ActorState {
-                scale: 1.0,
-                ..ActorState::default()
-            }),
-            Keyframe::new(2.0, ActorState {
-                opacity: 0.5,
-                scale: 1.0,
-                ..ActorState::default()
-            }),
+            Keyframe::new(
+                0.0,
+                ActorState {
+                    scale: 1.0,
+                    ..ActorState::default()
+                },
+            ),
+            Keyframe::new(
+                2.0,
+                ActorState {
+                    opacity: 0.5,
+                    scale: 1.0,
+                    ..ActorState::default()
+                },
+            ),
         ];
         enable_actor_param_animation(&mut layout, &animated, param_ids::SCALE, 1.5);
         let scale_times = actor_param_timeline_times(&layout, &animated, param_ids::SCALE);
@@ -1172,32 +1203,43 @@ mod tests {
 
     #[test]
     fn disable_removes_param_keyframes() {
-        let animated: BTreeSet<String> =
-            std::iter::once(param_ids::OPACITY.to_string()).collect();
+        let animated: BTreeSet<String> = std::iter::once(param_ids::OPACITY.to_string()).collect();
         let mut layout = vec![
-            Keyframe::new(1.0, ActorState {
-                opacity: 1.0,
-                ..ActorState::default()
-            }),
-            Keyframe::new(4.0, ActorState {
-                opacity: 0.2,
-                ..ActorState::default()
-            }),
+            Keyframe::new(
+                1.0,
+                ActorState {
+                    opacity: 1.0,
+                    ..ActorState::default()
+                },
+            ),
+            Keyframe::new(
+                4.0,
+                ActorState {
+                    opacity: 0.2,
+                    ..ActorState::default()
+                },
+            ),
         ];
         clear_actor_param_animation(&mut layout, &BTreeSet::new(), param_ids::OPACITY, 2.0);
         assert!(param_change_times(&layout, |s| s.opacity).is_empty());
         let flat = sample_actor_layout(&layout, &BTreeSet::new(), 2.0).opacity;
-        assert!((flat - 0.55).abs() < 0.1, "flattened to value at t=2, got {flat}");
+        assert!(
+            (flat - 0.55).abs() < 0.1,
+            "flattened to value at t=2, got {flat}"
+        );
     }
 
     #[test]
     fn single_kf_behaves_as_constant() {
         let mut animated = BTreeSet::new();
         animated.insert(param_ids::OPACITY.to_string());
-        let layout = vec![Keyframe::new(2.0, ActorState {
-            opacity: 0.4,
-            ..ActorState::default()
-        })];
+        let layout = vec![Keyframe::new(
+            2.0,
+            ActorState {
+                opacity: 0.4,
+                ..ActorState::default()
+            },
+        )];
         for t in [0.0, 2.0, 10.0] {
             let s = sample_actor_layout(&layout, &animated, t);
             assert!((s.opacity - 0.4).abs() < EPS, "at t={t}");

@@ -126,7 +126,7 @@ impl TgPost {
 
     /// Extract the "useful" part of the post text: everything before
     /// the footer boilerplate (voting markers, chat links, boost links).
-    /// 
+    ///
     /// The typical structure is:
     /// ```
     /// [emoji]—Main description text
@@ -134,7 +134,7 @@ impl TgPost {
     /// Наш чатик— https://t.me/...
     /// Голосовать для продвижения канала—https://t.me/...?boost
     /// ```
-    /// 
+    ///
     /// We want to extract only the main description text.
     pub fn clean_description(&self) -> String {
         let text = &self.text;
@@ -199,11 +199,7 @@ impl TgPost {
 
         if cleaned.is_empty() {
             // Fallback: return first 60 chars of original text
-            text.chars()
-                .take(60)
-                .collect::<String>()
-                .trim()
-                .to_string()
+            text.chars().take(60).collect::<String>().trim().to_string()
         } else {
             cleaned.to_string()
         }

@@ -72,9 +72,10 @@ pub struct WebImageHit {
     pub width: u32,
     pub height: u32,
     /// Local path on disk once the image has been downloaded. Until
-    /// then drag-to-canvas is disabled for the row (we'd have nothing
-    /// to put in `state.asset_drag.dragging`). `Some` after a
-    /// successful download — set by the pump-events handler.
+    /// then dragging uses a visual-only pending payload so the cursor
+    /// position is visible without inserting a missing file into the
+    /// scene. `Some` after a successful download, set by the
+    /// pump-events handler.
     #[serde(default)]
     pub local_path: Option<PathBuf>,
     /// True while a download for this row is in flight. Cleared by
@@ -191,11 +192,7 @@ pub fn ingest_download_result(
 /// from `App::update` while `state.web_image_search_open` is true; the
 /// `&mut bool` lets egui's window close button toggle the field on
 /// the editor state.
-pub fn show_window(
-    ctx: &egui::Context,
-    state: &mut EditorState,
-    tx: &Sender<JobEvent>,
-) {
+pub fn show_window(ctx: &egui::Context, state: &mut EditorState, tx: &Sender<JobEvent>) {
     const MIN_PANEL_SIZE: Vec2 = Vec2::new(300.0, 280.0);
     const MAX_PANEL_SIZE: Vec2 = Vec2::new(1200.0, 1200.0);
 
@@ -209,74 +206,52 @@ pub fn show_window(
         .max(MIN_PANEL_SIZE)
         .min(MAX_PANEL_SIZE);
 
-    let mut window = egui::Window::new(format!("\u{1F310} {}", crate::i18n::t("Web Image Search")))
+    let mut window = egui::Window::new(crate::i18n::t("Web Image Search"))
         .id(window_id)
         .open(&mut open)
-        .fixed_size(window_size)
+        .default_size(window_size)
+        .min_size(MIN_PANEL_SIZE)
+        .max_size(MAX_PANEL_SIZE)
+        .resizable(true)
         .collapsible(true)
         .scroll(false);
-    
+
     if let Some(pos) = state.web_image_search.panel_pos {
         window = window.current_pos(pos);
     } else if let Some(pos) = ctx.memory(|m| m.area_rect(window_id).map(|r| r.left_top())) {
         window = window.current_pos(pos);
     }
-    
-    let margin_x = ctx.style().spacing.window_margin.left
-        + ctx.style().spacing.window_margin.right;
-    let body_max_w = (window_size.x - margin_x).max(280.0);
 
     let response = window.show(ctx, |ui| {
-            ui.set_width(body_max_w);
+        let body_max_w = ui.available_width().max(280.0).min(MAX_PANEL_SIZE.x);
 
-            // Claim the full window body for pointer hits so clicks on
-            // padding / gaps between widgets don't fall through to the
-            // timeline / layers panel underneath.
-            let block_rect = ui.max_rect();
-            ui.interact(
-                block_rect,
-                ui.id().with("web_image_search_pointer_block"),
-                Sense::click(),
-            );
+        // Claim the full window body for pointer hits so clicks on
+        // padding / gaps between widgets don't fall through to the
+        // timeline / layers panel underneath.
+        let block_rect = ui.max_rect();
+        ui.interact(
+            block_rect,
+            ui.id().with("web_image_search_pointer_block"),
+            Sense::click(),
+        );
 
-            window_body(ui, state, tx, body_max_w);
+        window_body(ui, state, tx, body_max_w);
+    });
 
-            let rect = ui.max_rect();
-            let side_radius = ui.style().interaction.resize_grab_radius_side + 6.0;
-            let edge_id = ui.id().with("web_image_search_manual_resize");
-            let left_rect = egui::Rect::from_min_max(rect.left_top(), rect.left_bottom()).expand(side_radius);
-            let right_rect = egui::Rect::from_min_max(rect.right_top(), rect.right_bottom()).expand(side_radius);
-            let left = ui.interact(left_rect, edge_id.with("left"), Sense::drag());
-            let right = ui.interact(right_rect, edge_id.with("right"), Sense::drag());
-            (left, right)
-        });
-    
     if let Some(inner_response) = response {
-        if let Some((left, right)) = inner_response.inner {
-            handle_panel_width_resize(
-                ctx,
-                state,
-                &left,
-                &right,
-                window_size,
-                inner_response.response.rect.left_top(),
-                MIN_PANEL_SIZE,
-                MAX_PANEL_SIZE,
-            );
-        }
-        if !state.web_image_search.panel_resizing {
-            state.web_image_search.panel_pos = Some(inner_response.response.rect.left_top());
-        }
+        let rect = inner_response.response.rect;
+        state.web_image_search.panel_pos = Some(rect.left_top());
     } else {
         state.web_image_search.panel_resizing = false;
         state.web_image_search.panel_resize_start_pointer = None;
         state.web_image_search.panel_resize_start_size = None;
         state.web_image_search.panel_resize_start_pos = None;
     }
-    
+
     state.web_image_search_open = open;
 }
 
+#[allow(dead_code)]
 fn handle_panel_width_resize(
     ctx: &egui::Context,
     state: &mut EditorState,
@@ -334,12 +309,7 @@ fn handle_panel_width_resize(
     }
 }
 
-fn window_body(
-    ui: &mut egui::Ui,
-    state: &mut EditorState,
-    tx: &Sender<JobEvent>,
-    body_w: f32,
-) {
+fn window_body(ui: &mut egui::Ui, state: &mut EditorState, tx: &Sender<JobEvent>, body_w: f32) {
     use crate::i18n::t;
 
     // ── Search bar ─────────────────────────────────────────────────
@@ -347,10 +317,10 @@ fn window_body(
         egui::vec2(body_w, 30.0),
         egui::Layout::left_to_right(egui::Align::Center),
         |ui| {
-            // Do NOT set_max_width(body_w) here — let the layout naturally constraint. 
-            // set_max_width in left_to_right layout with Align::Center can stretch the outer frame 
+            // Do NOT set_max_width(body_w) here — let the layout naturally constraint.
+            // set_max_width in left_to_right layout with Align::Center can stretch the outer frame
             // when children change (like text edit focus outline or spinner appearing).
-            
+
             let text_width = (body_w - 110.0).max(80.0);
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut state.web_image_search.query)
@@ -358,9 +328,8 @@ fn window_body(
                     .desired_width(text_width)
                     .clip_text(true),
             );
-            let enter = resp.lost_focus()
-                && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            let go = ui.button(format!("\u{1F50D} {}", t("Search"))).clicked() || enter;
+            let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let go = ui.button(t("Search")).clicked() || enter;
             if go {
                 kick_search(state, tx, /*append=*/ false);
                 // Refocus the box so the user can immediately edit the
@@ -372,7 +341,7 @@ fn window_body(
 
     // ── Status / hint line ─────────────────────────────────────────
     let status = &state.web_image_search.status;
-    let is_error = status.starts_with('\u{274C}');
+    let is_error = status.starts_with("Error:") || status.starts_with('\u{274C}');
     if is_error {
         // Error state — show prominently with a retry button
         ui.add_space(4.0);
@@ -395,15 +364,17 @@ fn window_body(
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
                 ui.set_max_width(body_w);
-                if ui.button(format!("\u{1F504} {}", t("Retry"))).clicked() {
+                if ui.button(t("Retry")).clicked() {
                     kick_search(state, tx, /*append=*/ false);
                 }
                 ui.add(
                     egui::Label::new(
-                        RichText::new(t("Check your internet connection or try a different query."))
-                            .size(10.0)
-                            .italics()
-                            .color(Color32::from_rgb(160, 160, 180)),
+                        RichText::new(t(
+                            "Check your internet connection or try a different query.",
+                        ))
+                        .size(10.0)
+                        .italics()
+                        .color(Color32::from_rgb(160, 160, 180)),
                     )
                     .wrap(),
                 );
@@ -415,11 +386,7 @@ fn window_body(
         } else if state.web_image_search.results.is_empty() {
             t("Type a query and press Enter. Click a result to add it to the project.").to_string()
         } else {
-            format!(
-                "{} {}",
-                t("Found"),
-                state.web_image_search.results.len(),
-            )
+            format!("{} {}", t("Found"), state.web_image_search.results.len(),)
         };
         ui.add(
             egui::Label::new(
@@ -442,7 +409,7 @@ fn window_body(
         .show(ui, |ui| {
             // Constrain the scroll area content to prevent expansion
             ui.set_max_width(body_w);
-            
+
             // When searching and no results yet, show a centered loading state
             if state.web_image_search.searching && state.web_image_search.results.is_empty() {
                 ui.add_space(40.0);
@@ -463,9 +430,10 @@ fn window_body(
                             RichText::new(t("This may take a few seconds."))
                                 .size(10.0)
                                 .italics()
-                            .color(Color32::from_rgb(140, 140, 160)),
-                    );
-                });
+                                .color(Color32::from_rgb(140, 140, 160)),
+                        );
+                    },
+                );
                 return;
             }
 
@@ -482,16 +450,10 @@ fn window_body(
                     egui::Layout::top_down(egui::Align::Center),
                     |ui| {
                         let next_pg = state.web_image_search.page_count + 1;
-                        let label = format!(
-                            "\u{2B07} {} (page {})",
-                            t("Load more"),
-                            next_pg + 1,
-                        );
+                        let label = format!("{} (page {})", t("Load more"), next_pg + 1);
                         if ui
                             .button(RichText::new(label).size(12.0))
-                            .on_hover_text(t(
-                                "Fetch the next page of results.",
-                            ))
+                            .on_hover_text(t("Fetch the next page of results."))
                             .clicked()
                         {
                             kick_search(state, tx, /*append=*/ true);
@@ -499,8 +461,7 @@ fn window_body(
                     },
                 );
                 ui.add_space(8.0);
-            } else if state.web_image_search.searching
-                && !state.web_image_search.results.is_empty()
+            } else if state.web_image_search.searching && !state.web_image_search.results.is_empty()
             {
                 ui.add_space(8.0);
                 ui.allocate_ui_with_layout(
@@ -551,8 +512,8 @@ fn results_grid(
     // the user reported.
     const VBAR_WIDTH: f32 = 16.0;
     const HORIZONTAL_MARGIN: f32 = 8.0;
-    let avail_w = (body_max_w.min(ui.available_width()) - VBAR_WIDTH - HORIZONTAL_MARGIN)
-        .max(140.0);
+    let avail_w =
+        (body_max_w.min(ui.available_width()) - VBAR_WIDTH - HORIZONTAL_MARGIN).max(140.0);
     let card_w = 150.0_f32;
     let card_h = 180.0_f32;
     let gap = 6.0_f32;
@@ -567,8 +528,8 @@ fn results_grid(
             egui::Layout::top_down(egui::Align::Center),
             |ui| {
                 ui.label(
-                    RichText::new("\u{1F50D}")
-                        .size(40.0)
+                    RichText::new("IMG")
+                        .size(22.0)
                         .color(Color32::from_rgb(62, 60, 42)),
                 );
                 ui.label(
@@ -628,6 +589,18 @@ fn draw_card(
     // mutate state freely. The row is small (~12 fields) so the clone
     // is essentially free.
     let hit = state.web_image_search.results[idx].clone();
+    let compact = |s: &str, max_chars: usize| -> String {
+        let trimmed = s.trim();
+        if trimmed.chars().count() <= max_chars {
+            return trimmed.to_string();
+        }
+        let mut out = trimmed
+            .chars()
+            .take(max_chars.saturating_sub(1))
+            .collect::<String>();
+        out.push('…');
+        out
+    };
 
     let frame = egui::Frame::none()
         .fill(Color32::from_rgb(32, 30, 18))
@@ -644,82 +617,85 @@ fn draw_card(
             },
         ));
 
-    let resp = frame.show(ui, |ui| {
-        ui.set_width(card_w);
-        ui.set_height(card_h);
-        ui.vertical(|ui| {
-            // Thumbnail box ─── fixed height, image stretched to fit.
-            let thumb_size = Vec2::new(card_w - 8.0, card_h - 60.0);
-            let (rect, _) = ui.allocate_exact_size(thumb_size, Sense::hover());
-            ui.painter().rect_filled(
-                rect,
-                Rounding::same(3.0),
-                Color32::from_rgb(22, 21, 12),
-            );
-            // Use the thumbnail URL as-is — egui_extras' image
-            // loaders fetch HTTPS resources transparently because
-            // `install_image_loaders` is called in `main.rs`.
-            let img = egui::Image::from_uri(hit.thumbnail_url.clone())
-                .fit_to_exact_size(thumb_size)
-                .maintain_aspect_ratio(true)
-                .rounding(Rounding::same(3.0));
-            img.paint_at(ui, rect);
+    let resp = frame
+        .show(ui, |ui| {
+            ui.set_width(card_w);
+            ui.set_height(card_h);
+            ui.vertical(|ui| {
+                // Thumbnail box ─── fixed height, image stretched to fit.
+                let thumb_size = Vec2::new(card_w - 8.0, card_h - 60.0);
+                let (rect, _) = ui.allocate_exact_size(thumb_size, Sense::hover());
+                ui.painter()
+                    .rect_filled(rect, Rounding::same(3.0), Color32::from_rgb(22, 21, 12));
+                // Use the thumbnail URL as-is — egui_extras' image
+                // loaders fetch HTTPS resources transparently because
+                // `install_image_loaders` is called in `main.rs`.
+                let img = egui::Image::from_uri(hit.thumbnail_url.clone())
+                    .fit_to_exact_size(thumb_size)
+                    .maintain_aspect_ratio(true)
+                    .rounding(Rounding::same(3.0));
+                img.paint_at(ui, rect);
 
-            if hit.downloading {
-                // Draw a translucent overlay + spinner-ish dot pattern
-                // so the user knows that row is busy.
-                ui.painter().rect_filled(
-                    rect,
-                    Rounding::same(3.0),
-                    Color32::from_rgba_premultiplied(0, 0, 0, 140),
-                );
-                ui.painter().text(
-                    rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "\u{2B6F}",
-                    egui::FontId::proportional(22.0),
-                    Color32::from_rgb(255, 220, 80),
-                );
-            } else if hit.local_path.is_some() {
-                // Tiny green dot in the corner to confirm the file
-                // is locally cached and drag-ready.
-                let dot = rect.right_top() + egui::vec2(-6.0, 6.0);
-                ui.painter().circle_filled(
-                    dot,
-                    3.0,
-                    Color32::from_rgb(120, 220, 120),
-                );
-            }
+                if hit.downloading {
+                    // Draw a translucent overlay + spinner-ish dot pattern
+                    // so the user knows that row is busy.
+                    ui.painter().rect_filled(
+                        rect,
+                        Rounding::same(3.0),
+                        Color32::from_rgba_premultiplied(0, 0, 0, 140),
+                    );
+                    ui.painter().text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "...",
+                        egui::FontId::proportional(18.0),
+                        Color32::from_rgb(255, 220, 80),
+                    );
+                } else if hit.local_path.is_some() {
+                    // Tiny green dot in the corner to confirm the file
+                    // is locally cached and drag-ready.
+                    let dot = rect.right_top() + egui::vec2(-6.0, 6.0);
+                    ui.painter()
+                        .circle_filled(dot, 3.0, Color32::from_rgb(120, 220, 120));
+                }
 
-            // Title (one line, ellipsised by egui automatically)
-            ui.label(
-                RichText::new(if hit.title.is_empty() { crate::i18n::t("(untitled)") } else { hit.title.as_str() })
-                    .size(10.5)
-                    .color(Color32::from_rgb(220, 220, 240))
-                    .strong(),
-            );
-            // Source / dimensions
-            let dim = format!("{}\u{00D7}{}", hit.width, hit.height);
-            let host = host_of(&hit.source_page);
-            ui.label(
-                RichText::new(format!("{}  \u{00B7}  {}", dim, host))
-                    .size(9.0)
-                    .color(Color32::from_rgb(140, 140, 160)),
-            );
-        });
-    }).response;
+                // Title (one line, ellipsised by egui automatically)
+                let title = if hit.title.trim().is_empty() {
+                    crate::i18n::t("(untitled)").to_string()
+                } else {
+                    compact(&hit.title, 42)
+                };
+                ui.add_sized(
+                    [card_w - 8.0, 18.0],
+                    egui::Label::new(
+                        RichText::new(title)
+                            .size(10.5)
+                            .color(Color32::from_rgb(220, 220, 240))
+                            .strong(),
+                    )
+                    .truncate(),
+                );
+                // Source / dimensions
+                let dim = format!("{}\u{00D7}{}", hit.width, hit.height);
+                let host = host_of(&hit.source_page);
+                ui.label(
+                    RichText::new(format!("{}  \u{00B7}  {}", dim, host))
+                        .size(9.0)
+                        .color(Color32::from_rgb(140, 140, 160)),
+                );
+            });
+        })
+        .response;
 
     let resp = resp.interact(Sense::click_and_drag());
 
     // Tooltips: errors live here so they stay out of the grid.
     if let Some(err) = &hit.last_error {
-        resp.clone().on_hover_text(format!("\u{26A0} {}", err));
+        resp.clone()
+            .on_hover_text(format!("{} {}", crate::i18n::t("Warning:"), err));
     } else {
-        resp.clone().on_hover_text(format!(
-            "{}\n{}",
-            hit.title,
-            hit.source_page,
-        ));
+        resp.clone()
+            .on_hover_text(format!("{}\n{}", hit.title, hit.source_page,));
     }
 
     // ── Click ⇒ download + place on canvas ──
@@ -734,6 +710,7 @@ fn draw_card(
     if resp.dragged() {
         if let Some(local) = hit.local_path.clone() {
             state.asset_drag.dragging = Some(local.clone());
+            state.asset_drag.pending_web_image_url = None;
             state.asset_drag.kind = AssetDragKind::Image;
             state.asset_drag.label = if hit.title.is_empty() {
                 crate::i18n::t("web image").to_string()
@@ -744,14 +721,26 @@ fn draw_card(
             if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
                 state.asset_drag.pos = [pos.x, pos.y];
             }
-        } else if !hit.downloading {
-            // Pre-fetch on drag-start so a re-attempt picks up the
-            // local file. We DON'T flip place_on_canvas here, because
-            // the canvas drop handler will commit the placement once
-            // the file lands.
-            kick_download(state, tx, idx, /*place_on_canvas=*/ false);
+        } else {
+            state.asset_drag.dragging = Some(PathBuf::from("__pending_web_image__"));
+            state.asset_drag.pending_web_image_url = Some(hit.image_url.clone());
+            state.asset_drag.kind = AssetDragKind::Image;
+            state.asset_drag.label = if hit.title.is_empty() {
+                crate::i18n::t("web image").to_string()
+            } else {
+                hit.title.clone()
+            };
+            state.asset_drag.thumbnail = None;
+            if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
+                state.asset_drag.pos = [pos.x, pos.y];
+            }
+            if !hit.downloading {
+                // Pre-fetch on drag-start. Until the real file lands,
+                // drop handlers keep this as a visual-only drag ghost.
+                kick_download(state, tx, idx, /*place_on_canvas=*/ false);
+            }
             state.web_image_search.status = format!(
-                "\u{2B6F} {} \u{2014} {}",
+                "{} - {}",
                 crate::i18n::t("Downloading"),
                 short_url(&hit.image_url),
             );
@@ -800,11 +789,11 @@ fn kick_search(state: &mut EditorState, tx: &Sender<JobEvent>, append: bool) {
         state.web_image_search.results.clear();
         state.web_image_search.next_offset = None;
         state.web_image_search.page_count = 0;
-        state.web_image_search.status = format!("{} \"{}\"...", crate::i18n::t("\u{1F50D} Searching for"), q);
+        state.web_image_search.status = format!("{} \"{}\"...", crate::i18n::t("Searching for"), q);
     } else {
         state.web_image_search.status = format!(
             "{} {}...",
-            crate::i18n::t("\u{2B07} Loading page"),
+            crate::i18n::t("Loading page"),
             state.web_image_search.page_count + 1,
         );
     }
@@ -851,11 +840,10 @@ fn kick_download(
     };
 
     let request_id = state.web_image_search.next_request_id;
-    state.web_image_search.next_request_id =
-        state.web_image_search.next_request_id.wrapping_add(1);
+    state.web_image_search.next_request_id = state.web_image_search.next_request_id.wrapping_add(1);
 
     state.web_image_search.status = format!(
-        "\u{2B6F} {} \u{2192} {}",
+        "{} -> {}",
         crate::i18n::t("Downloading"),
         short_url(&hit.image_url),
     );
@@ -875,7 +863,9 @@ fn kick_download(
 
 /// `https://example.com/foo/bar.jpg?baz=1` → `example.com`.
 fn host_of(url: &str) -> &str {
-    let s = url.trim_start_matches("http://").trim_start_matches("https://");
+    let s = url
+        .trim_start_matches("http://")
+        .trim_start_matches("https://");
     let end = s.find('/').unwrap_or(s.len());
     &s[..end]
 }

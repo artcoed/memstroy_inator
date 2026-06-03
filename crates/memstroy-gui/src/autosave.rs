@@ -178,8 +178,7 @@ pub fn list_entries() -> Vec<AutosaveEntry> {
                 .ok()
                 .or_else(|| {
                     meta.as_ref().map(|m| {
-                        std::time::UNIX_EPOCH
-                            + std::time::Duration::from_millis(m.saved_at_ms)
+                        std::time::UNIX_EPOCH + std::time::Duration::from_millis(m.saved_at_ms)
                     })
                 })
                 .unwrap_or(std::time::UNIX_EPOCH);

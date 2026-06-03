@@ -19,7 +19,7 @@ use memstroy_core::{
     canvas::WorldPos,
     keyframe::{ModifierKind, TrackModifier},
     Actor, ActorState, CanvasLayout, CanvasTransform, ChromaKeyParams, ColorCorrection, Easing,
-    ImageOverlay, Keyframe, Overlay, OutputSpec, OverlayState, RenderFrame, RenderFrameState,
+    ImageOverlay, Keyframe, OutputSpec, Overlay, OverlayState, RenderFrame, RenderFrameState,
     Scene,
 };
 
@@ -42,6 +42,7 @@ fn baseline_scene() -> Scene {
         render_frame: RenderFrame::default(),
         canvas_layouts: Vec::new(),
         skeleton_templates: Vec::new(),
+        effect_layers: Vec::new(),
     }
 }
 
@@ -69,12 +70,19 @@ fn baseline_actor(id: &str) -> Actor {
         speed: 1.0,
         animated_params: Default::default(),
         z_order: 0,
+        parent_id: None,
+        mellstroy_footage: Default::default(),
+        mute_audio: false,
     }
 }
 
 fn build_filter_graph(scene: &Scene) -> String {
-    let plan = build_plan(scene, &PathBuf::from("/tmp/out.mp4"), &PathBuf::from("/tmp/assets"))
-        .expect("plan");
+    let plan = build_plan(
+        scene,
+        &PathBuf::from("/tmp/out.mp4"),
+        &PathBuf::from("/tmp/assets"),
+    )
+    .expect("plan");
     plan.filter_complex
 }
 
@@ -111,7 +119,10 @@ fn canvas_layouts_world_pixel_position_is_honoured() {
         keyframes: vec![Keyframe::new(
             0.0,
             CanvasTransform {
-                pos: WorldPos { x: 1500.0, y: 800.0 },
+                pos: WorldPos {
+                    x: 1500.0,
+                    y: 800.0,
+                },
                 width: 500.0,
                 scale: 1.0,
                 rotation_deg: 0.0,
@@ -148,7 +159,10 @@ fn render_frame_motion_translates_legacy_positions() {
         Keyframe::new(
             2.0,
             RenderFrameState {
-                pos: WorldPos { x: 1200.0, y: 960.0 },
+                pos: WorldPos {
+                    x: 1200.0,
+                    y: 960.0,
+                },
                 zoom: 1.0,
                 rotation_deg: 0.0,
             },
@@ -175,11 +189,17 @@ fn step_easing_does_not_emit_linear_segment() {
     actor.layout = vec![
         Keyframe::new(
             0.0,
-            ActorState { pos: [0.5, 0.5], ..ActorState::default() },
+            ActorState {
+                pos: [0.5, 0.5],
+                ..ActorState::default()
+            },
         ),
         Keyframe {
             t: 1.0,
-            value: ActorState { pos: [0.9, 0.5], ..ActorState::default() },
+            value: ActorState {
+                pos: [0.9, 0.5],
+                ..ActorState::default()
+            },
             easing: Easing::Step,
         },
     ];
@@ -231,8 +251,20 @@ fn per_frame_rotation_emits_rotate_filter() {
     let mut scene = baseline_scene();
     let mut actor = baseline_actor("a1");
     actor.layout = vec![
-        Keyframe::new(0.0, ActorState { rotation_deg: 0.0, ..ActorState::default() }),
-        Keyframe::new(2.0, ActorState { rotation_deg: 90.0, ..ActorState::default() }),
+        Keyframe::new(
+            0.0,
+            ActorState {
+                rotation_deg: 0.0,
+                ..ActorState::default()
+            },
+        ),
+        Keyframe::new(
+            2.0,
+            ActorState {
+                rotation_deg: 90.0,
+                ..ActorState::default()
+            },
+        ),
     ];
     scene.actors.push(actor);
 
@@ -243,7 +275,10 @@ fn per_frame_rotation_emits_rotate_filter() {
     );
     // The hypot bounding box must be present so animated angles
     // don't clip the corners (rotw/roth are init-time only).
-    assert!(graph.contains("hypot(iw"), "rotate canvas not over-sized: {graph}");
+    assert!(
+        graph.contains("hypot(iw"),
+        "rotate canvas not over-sized: {graph}"
+    );
 }
 
 #[test]
@@ -254,7 +289,10 @@ fn static_opacity_emits_alpha_multiplier() {
     let mut actor = baseline_actor("a1");
     actor.layout = vec![Keyframe::new(
         0.0,
-        ActorState { opacity: 0.4, ..ActorState::default() },
+        ActorState {
+            opacity: 0.4,
+            ..ActorState::default()
+        },
     )];
     scene.actors.push(actor);
 
@@ -279,8 +317,20 @@ fn animated_opacity_emits_geq_alpha_filter() {
     let mut scene = baseline_scene();
     let mut actor = baseline_actor("a1");
     actor.layout = vec![
-        Keyframe::new(0.0, ActorState { opacity: 0.0, ..ActorState::default() }),
-        Keyframe::new(1.0, ActorState { opacity: 1.0, ..ActorState::default() }),
+        Keyframe::new(
+            0.0,
+            ActorState {
+                opacity: 0.0,
+                ..ActorState::default()
+            },
+        ),
+        Keyframe::new(
+            1.0,
+            ActorState {
+                opacity: 1.0,
+                ..ActorState::default()
+            },
+        ),
     ];
     scene.actors.push(actor);
 
@@ -415,10 +465,22 @@ fn color_correction_emits_eq_and_colorbalance() {
     scene.actors.push(actor);
 
     let graph = build_filter_graph(&scene);
-    assert!(graph.contains("eq=brightness=0.2000"), "missing eq.brightness: {graph}");
-    assert!(graph.contains("contrast=1.3000"), "missing eq.contrast: {graph}");
-    assert!(graph.contains("saturation=1.5000"), "missing eq.saturation: {graph}");
-    assert!(graph.contains("colorbalance="), "missing colorbalance: {graph}");
+    assert!(
+        graph.contains("eq=brightness=0.2000"),
+        "missing eq.brightness: {graph}"
+    );
+    assert!(
+        graph.contains("contrast=1.3000"),
+        "missing eq.contrast: {graph}"
+    );
+    assert!(
+        graph.contains("saturation=1.5000"),
+        "missing eq.saturation: {graph}"
+    );
+    assert!(
+        graph.contains("colorbalance="),
+        "missing colorbalance: {graph}"
+    );
 }
 
 #[test]
@@ -435,7 +497,13 @@ fn image_overlay_inherits_full_pipeline() {
         t_out: 2.0,
         layout: vec![
             Keyframe::new(0.0, OverlayState::default()),
-            Keyframe::new(2.0, OverlayState { rotation_deg: 45.0, ..OverlayState::default() }),
+            Keyframe::new(
+                2.0,
+                OverlayState {
+                    rotation_deg: 45.0,
+                    ..OverlayState::default()
+                },
+            ),
         ],
         modifiers: Vec::new(),
         skeleton_attachment: None,
@@ -443,6 +511,7 @@ fn image_overlay_inherits_full_pipeline() {
         animated_params: Default::default(),
         chroma_key: None,
         z_order: 0,
+        parent_id: None,
     }));
 
     let graph = build_filter_graph(&scene);
@@ -451,7 +520,6 @@ fn image_overlay_inherits_full_pipeline() {
         "image overlay rotation animation didn't emit rotate filter:\n{graph}",
     );
 }
-
 
 #[test]
 fn animated_rotation_quotes_angle_to_protect_internal_commas() {
@@ -470,7 +538,13 @@ fn animated_rotation_quotes_angle_to_protect_internal_commas() {
     let mut scene = baseline_scene();
     let mut actor = baseline_actor("a1");
     actor.layout = vec![
-        Keyframe::new(0.0, ActorState { rotation_deg: 0.0, ..ActorState::default() }),
+        Keyframe::new(
+            0.0,
+            ActorState {
+                rotation_deg: 0.0,
+                ..ActorState::default()
+            },
+        ),
         Keyframe::new(2.0, Easing::default().into_state_with_rot(45.0)),
     ];
     scene.actors.push(actor);
@@ -494,7 +568,10 @@ trait IntoActorStateExt {
 }
 impl IntoActorStateExt for Easing {
     fn into_state_with_rot(self, deg: f32) -> ActorState {
-        ActorState { rotation_deg: deg, ..ActorState::default() }
+        ActorState {
+            rotation_deg: deg,
+            ..ActorState::default()
+        }
     }
 }
 
@@ -525,8 +602,20 @@ fn overlay_layout_uses_clip_local_time_base() {
         t_in: 2.0,
         t_out: 5.0,
         layout: vec![
-            Keyframe::new(0.0, OverlayState { pos: [0.2, 0.5], ..OverlayState::default() }),
-            Keyframe::new(1.0, OverlayState { pos: [0.8, 0.5], ..OverlayState::default() }),
+            Keyframe::new(
+                0.0,
+                OverlayState {
+                    pos: [0.2, 0.5],
+                    ..OverlayState::default()
+                },
+            ),
+            Keyframe::new(
+                1.0,
+                OverlayState {
+                    pos: [0.8, 0.5],
+                    ..OverlayState::default()
+                },
+            ),
         ],
         modifiers: Vec::new(),
         skeleton_attachment: None,
@@ -534,6 +623,7 @@ fn overlay_layout_uses_clip_local_time_base() {
         animated_params: Default::default(),
         chroma_key: None,
         z_order: 0,
+        parent_id: None,
     }));
 
     let graph = build_filter_graph(&scene);
@@ -567,10 +657,7 @@ fn animated_effect_param_emits_per_segment_chain() {
     blur.animated_params.insert("p0".into());
     blur.param_kfs.insert(
         "p0".into(),
-        vec![
-            Keyframe::new(0.0, 2.0_f32),
-            Keyframe::new(1.0, 24.0_f32),
-        ],
+        vec![Keyframe::new(0.0, 2.0_f32), Keyframe::new(1.0, 24.0_f32)],
     );
     actor.effects.push(blur);
     scene.actors.push(actor);
@@ -717,8 +804,24 @@ fn skeleton_attachment_overrides_overlay_world_pos() {
         ..Default::default()
     };
     hat.track = vec![
-        Keyframe::new(0.0, PointState { x: 0.4, y: 0.2, scale: 1.0, rotation_deg: 0.0 }),
-        Keyframe::new(1.0, PointState { x: 0.6, y: 0.3, scale: 1.0, rotation_deg: 0.0 }),
+        Keyframe::new(
+            0.0,
+            PointState {
+                x: 0.4,
+                y: 0.2,
+                scale: 1.0,
+                rotation_deg: 0.0,
+            },
+        ),
+        Keyframe::new(
+            1.0,
+            PointState {
+                x: 0.6,
+                y: 0.3,
+                scale: 1.0,
+                rotation_deg: 0.0,
+            },
+        ),
     ];
     points.insert("hat".into(), hat);
     scene.skeleton_templates.push(SkeletonTemplate {
@@ -747,6 +850,7 @@ fn skeleton_attachment_overrides_overlay_world_pos() {
         animated_params: Default::default(),
         chroma_key: None,
         z_order: 0,
+        parent_id: None,
     }));
 
     let graph = build_filter_graph(&scene);
@@ -799,7 +903,12 @@ fn actor_skeleton_attachment_overrides_own_world_pos() {
     };
     hat.track = vec![Keyframe::new(
         0.0,
-        PointState { x: 0.25, y: 0.15, scale: 1.0, rotation_deg: 0.0 },
+        PointState {
+            x: 0.25,
+            y: 0.15,
+            scale: 1.0,
+            rotation_deg: 0.0,
+        },
     )];
     points.insert("hat".into(), hat);
     scene.skeleton_templates.push(SkeletonTemplate {
@@ -816,7 +925,6 @@ fn actor_skeleton_attachment_overrides_own_world_pos() {
         "actor-skeleton-attached follower didn't take its X from the skeleton point (0.25):\n{graph}",
     );
 }
-
 
 // ─── Audio pipeline regression tests ─────────────────────────────────
 //
@@ -878,6 +986,226 @@ fn audio_track(id: &str, t_in: f32) -> AudioTrack {
 }
 
 #[test]
+fn actor_fallback_audio_is_scheduled_per_clip_not_per_source_path() {
+    // The preview's `build_sources` schedules actor fallback audio for
+    // every visible actor clip. It only uses explicit AudioTrack rows
+    // to suppress fallback. The renderer used to add the first actor's
+    // path to its dedupe set, so two actor clips from the same source
+    // collapsed to one audio window in the export.
+    let shared = std::env::temp_dir().join("memstroy_render_test_shared_actor_audio.wav");
+    touch_audio_file(&shared);
+
+    let mut scene = baseline_scene();
+    scene.output.duration = 6.0;
+    let mut first = baseline_actor("first");
+    first.source = shared.clone();
+    first.t_in = Some(0.0);
+    first.t_out = Some(2.0);
+    scene.actors.push(first);
+
+    let mut second = baseline_actor("second");
+    second.source = shared.clone();
+    second.t_in = Some(3.0);
+    second.t_out = Some(5.0);
+    scene.actors.push(second);
+
+    let graph = build_filter_graph(&scene);
+
+    assert!(
+        graph.contains("amix=inputs=3:duration=longest:dropout_transition=0:normalize=0"),
+        "two actor clips plus the silent bed should produce three amix inputs:\n{graph}",
+    );
+    assert!(
+        graph.contains("adelay=3000:all=1,asetpts=PTS-STARTPTS"),
+        "second actor fallback audio was not delayed to its clip window:\n{graph}",
+    );
+
+    let _ = std::fs::remove_file(&shared);
+}
+
+#[test]
+fn explicit_audio_for_one_actor_does_not_suppress_same_source_actor_fallback() {
+    // Split/copy workflows can leave several actor clips pointing at the
+    // same media file while only some of them have explicit audio rows.
+    // Explicit rows should suppress fallback for their own parent actor,
+    // not for every actor that happens to share the source path.
+    let shared = std::env::temp_dir().join("memstroy_render_test_shared_actor_explicit.wav");
+    touch_audio_file(&shared);
+
+    let mut scene = baseline_scene();
+    scene.output.duration = 6.0;
+
+    let mut first = baseline_actor("first");
+    first.source = shared.clone();
+    first.t_in = Some(0.0);
+    first.t_out = Some(2.0);
+    scene.actors.push(first);
+
+    let mut second = baseline_actor("second");
+    second.source = shared.clone();
+    second.t_in = Some(3.0);
+    second.t_out = Some(5.0);
+    second.speed = 2.0;
+    scene.actors.push(second);
+
+    let mut explicit = audio_track("first_bound", 0.0);
+    explicit.source = shared.clone();
+    explicit.parent_actor = Some("first".into());
+    explicit.t_out = Some(2.0);
+    scene.audio.push(explicit);
+
+    let graph = build_filter_graph(&scene);
+
+    assert!(
+        graph.contains("amix=inputs=3:duration=longest:dropout_transition=0:normalize=0"),
+        "bound audio + actor fallback + silent bed should produce three amix inputs:\n{graph}",
+    );
+    assert!(
+        graph.contains("adelay=3000:all=1,asetpts=PTS-STARTPTS"),
+        "second actor fallback should still be delayed to its own timeline window:\n{graph}",
+    );
+    assert!(
+        graph.contains("asetrate=88200.000000"),
+        "second actor fallback should inherit actor.speed=2.0:\n{graph}",
+    );
+
+    let _ = std::fs::remove_file(&shared);
+}
+
+#[test]
+fn explicit_audio_for_duplicate_actor_id_matches_the_clip_window() {
+    // Old projects can contain split/copied clips that still share an
+    // actor id. A parent_actor link names the id, but the renderer must
+    // suppress fallback only for the clip whose timing/source_start
+    // matches that audio row.
+    let shared = std::env::temp_dir().join("memstroy_render_test_duplicate_actor_id.wav");
+    touch_audio_file(&shared);
+
+    let mut scene = baseline_scene();
+    scene.output.duration = 6.0;
+
+    let mut first = baseline_actor("clip");
+    first.source = shared.clone();
+    first.t_in = Some(0.0);
+    first.t_out = Some(2.0);
+    first.source_start = 0.0;
+    scene.actors.push(first);
+
+    let mut second = baseline_actor("clip");
+    second.source = shared.clone();
+    second.t_in = Some(3.0);
+    second.t_out = Some(5.0);
+    second.source_start = 3.0;
+    scene.actors.push(second);
+
+    let mut explicit = audio_track("clip_audio", 0.0);
+    explicit.source = shared.clone();
+    explicit.parent_actor = Some("clip".into());
+    explicit.t_out = Some(2.0);
+    explicit.source_start = 0.0;
+    scene.audio.push(explicit);
+
+    let graph = build_filter_graph(&scene);
+
+    assert!(
+        graph.contains("amix=inputs=3:duration=longest:dropout_transition=0:normalize=0"),
+        "explicit row should suppress only the matching duplicate-id clip while preserving the silent bed:\n{graph}",
+    );
+    assert!(
+        graph.contains("adelay=3000:all=1,asetpts=PTS-STARTPTS"),
+        "second duplicate-id clip should keep its own delayed fallback:\n{graph}",
+    );
+
+    let _ = std::fs::remove_file(&shared);
+}
+
+#[test]
+fn split_audio_from_same_source_keeps_independent_source_windows() {
+    let shared = std::env::temp_dir().join("memstroy_render_test_shared_split_audio.wav");
+    touch_audio_file(&shared);
+
+    let mut scene = baseline_scene();
+    scene.output.duration = 7.0;
+
+    let starts = [(0.0, 0.0), (2.326, 2.199), (2.769, 2.583)];
+    for (idx, (t_in, source_start)) in starts.into_iter().enumerate() {
+        let mut tr = audio_track(&format!("split_{idx}"), t_in);
+        tr.source = shared.clone();
+        tr.source_start = source_start;
+        tr.t_out = Some(if idx == 0 {
+            2.199
+        } else if idx == 1 {
+            2.709
+        } else {
+            6.594
+        });
+        scene.audio.push(tr);
+    }
+
+    let plan = build_plan(&scene, &PathBuf::from("out.mp4"), &PathBuf::from("."))
+        .expect("plan should build");
+    let graph = plan.filter_complex;
+
+    assert_eq!(
+        plan.inputs
+            .iter()
+            .filter(|input| input.path == shared)
+            .count(),
+        3,
+        "each split clip needs its own ffmpeg input/label",
+    );
+    assert!(
+        plan.inputs.iter().all(|input| input.seek.is_none()),
+        "audio source offsets must live in per-track atrim filters, not shared input seeks",
+    );
+    assert!(
+        graph.contains("atrim=start=2.199000")
+            && graph.contains("atrim=start=2.583000")
+            && graph.contains("adelay=2326:all=1,asetpts=PTS-STARTPTS")
+            && graph.contains("adelay=2769:all=1,asetpts=PTS-STARTPTS")
+            && graph.contains("anullsrc=channel_layout=stereo:sample_rate=44100:d=7.000000"),
+        "split source windows, timeline delay resets, or silent bed missing:\n{graph}",
+    );
+
+    let _ = std::fs::remove_file(shared);
+}
+
+#[test]
+fn muted_actor_does_not_render_embedded_fallback_audio() {
+    // Deleting the auto-generated audio row sets actor.mute_audio so
+    // preview stays silent for that actor. The CPU audio mux path
+    // missed this check and could resurrect the embedded soundtrack
+    // in the final MP4.
+    let shared = std::env::temp_dir().join("memstroy_render_test_muted_actor_audio.wav");
+    touch_audio_file(&shared);
+
+    let mut scene = baseline_scene();
+    let mut actor = baseline_actor("muted_actor");
+    actor.source = shared.clone();
+    actor.mute_audio = true;
+    scene.actors.push(actor);
+
+    let plan = build_plan(
+        &scene,
+        &PathBuf::from("/tmp/out.mp4"),
+        &PathBuf::from("/tmp/assets"),
+    )
+    .expect("plan");
+
+    assert!(
+        plan.map_audio.is_none(),
+        "muted actor should not create an exported fallback audio stream",
+    );
+    assert!(
+        !plan.filter_complex.contains("aresample=44100"),
+        "muted actor leaked an audio filter chain into the graph:\n{}",
+        plan.filter_complex,
+    );
+
+    let _ = std::fs::remove_file(&shared);
+}
+
+#[test]
 fn audio_chain_normalises_each_track_before_amix() {
     // Two tracks, mismatched rates in real life (48k + 44.1k) — the
     // graph must aresample + aformat each one to the bus rate so
@@ -903,39 +1231,48 @@ fn audio_chain_normalises_each_track_before_amix() {
     );
 
     // amix uses the safe variant: longest duration, no early
-    // dropouts (we apad the per-track chains anyway).
+    // dropouts, and includes one extra scene-length silent bed input.
     assert!(
-        graph.contains("amix=inputs=2:duration=longest:dropout_transition=0:normalize=0"),
+        graph.contains("amix=inputs=3:duration=longest:dropout_transition=0:normalize=0"),
         "amix not configured with the post-fix robust parameters:\n{graph}",
     );
 
-    // The per-track apad is what saves the AAC encoder from EOF
-    // before init when one source ends early.
+    // The silent bed is what saves the AAC encoder from EOF before
+    // init when one source ends early. Per-track apad used to be used
+    // here, but it interacted badly with delayed split clips.
     assert!(
-        graph.contains("apad=whole_dur="),
-        "per-track apad missing — AAC encoder may EOF before init:\n{graph}",
+        graph.contains("anullsrc=channel_layout=stereo:sample_rate=44100:d="),
+        "scene-length silent bed missing — AAC encoder may EOF before init:\n{graph}",
+    );
+    assert!(
+        !graph.contains("apad=whole_dur="),
+        "per-track apad should not be used; it truncates/delays split audio unexpectedly:\n{graph}",
     );
 
-    // adelay positions the second track at 1.5 s on the timeline.
+    // adelay positions the second track at 1.5 s on the timeline,
+    // and must reset PTS immediately so amix aligns the leading
+    // silence at scene zero.
     assert!(
-        graph.contains("adelay=1500:all=1"),
+        graph.contains("adelay=1500:all=1,asetpts=PTS-STARTPTS"),
         "adelay for t_in=1.5 not present (or wrong syntax):\n{graph}",
     );
 }
 
 #[test]
-fn audio_single_track_skips_amix_but_pins_format() {
-    // Single-track scenes don't need a mixer node — but they still
-    // need the final aformat lock so the AAC encoder knows what to
-    // expect. (Without it the `-c:a aac -ar 44100 -ac 2` flags rely
-    // on auto-conversion that historically broke the pipeline.)
+fn audio_single_track_mixes_with_silent_bed_and_pins_format() {
+    // Single-track scenes still use amix so the scene-length silent
+    // bed can keep the AAC bus alive through the full render.
     let mut scene = baseline_scene();
     scene.audio.push(audio_track("only", 0.0));
     let graph = build_filter_graph(&scene);
 
     assert!(
-        !graph.contains("amix="),
-        "single-track scene should not allocate an amix node:\n{graph}",
+        graph.contains("amix=inputs=2:duration=longest:dropout_transition=0:normalize=0"),
+        "single-track scene should mix the real track with the silent bed:\n{graph}",
+    );
+    assert!(
+        graph.contains("anullsrc=channel_layout=stereo:sample_rate=44100:d="),
+        "single-track scene missing the scene-length silent bed:\n{graph}",
     );
     assert!(
         graph.contains("aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo"),
@@ -987,8 +1324,6 @@ fn audio_fade_in_out_emit_afade_filters() {
         "fade_out didn't surface as an afade-out filter:\n{graph}",
     );
 }
-
-
 
 #[test]
 fn audio_track_with_no_audio_stream_is_skipped() {
@@ -1244,8 +1579,16 @@ fn audio_volume_keyframes_lower_to_per_segment_chain() {
     tr.volume = 0.5; // static fallback; should not appear as bare filter
     tr.animated_params.insert("volume".into());
     tr.volume_kfs = vec![
-        Keyframe { t: 0.0, value: 0.0_f32, easing: Easing::default() },
-        Keyframe { t: 2.0, value: 1.0_f32, easing: Easing::default() },
+        Keyframe {
+            t: 0.0,
+            value: 0.0_f32,
+            easing: Easing::default(),
+        },
+        Keyframe {
+            t: 2.0,
+            value: 1.0_f32,
+            easing: Easing::default(),
+        },
     ];
     scene.audio.push(tr);
     let graph = build_filter_graph(&scene);
@@ -1276,8 +1619,16 @@ fn audio_pan_keyframes_lower_to_per_segment_chain() {
     tr.t_out = Some(2.0);
     tr.animated_params.insert("pan".into());
     tr.pan_kfs = vec![
-        Keyframe { t: 0.0, value: -1.0_f32, easing: Easing::default() },
-        Keyframe { t: 2.0, value: 1.0_f32, easing: Easing::default() },
+        Keyframe {
+            t: 0.0,
+            value: -1.0_f32,
+            easing: Easing::default(),
+        },
+        Keyframe {
+            t: 2.0,
+            value: 1.0_f32,
+            easing: Easing::default(),
+        },
     ];
     scene.audio.push(tr);
     let graph = build_filter_graph(&scene);
@@ -1313,8 +1664,16 @@ fn audio_low_pass_keyframes_lower_to_per_segment_chain() {
     tr.low_pass_hz = Some(8000); // enables animation path
     tr.animated_params.insert("low_pass".into());
     tr.low_pass_kfs = vec![
-        Keyframe { t: 0.0, value: 1000.0_f32, easing: Easing::default() },
-        Keyframe { t: 2.0, value: 8000.0_f32, easing: Easing::default() },
+        Keyframe {
+            t: 0.0,
+            value: 1000.0_f32,
+            easing: Easing::default(),
+        },
+        Keyframe {
+            t: 2.0,
+            value: 8000.0_f32,
+            easing: Easing::default(),
+        },
     ];
     scene.audio.push(tr);
     let graph = build_filter_graph(&scene);
@@ -1346,8 +1705,16 @@ fn audio_low_pass_disabled_in_inspector_skips_animation() {
     tr.low_pass_hz = None;
     tr.animated_params.insert("low_pass".into());
     tr.low_pass_kfs = vec![
-        Keyframe { t: 0.0, value: 1000.0_f32, easing: Easing::default() },
-        Keyframe { t: 2.0, value: 8000.0_f32, easing: Easing::default() },
+        Keyframe {
+            t: 0.0,
+            value: 1000.0_f32,
+            easing: Easing::default(),
+        },
+        Keyframe {
+            t: 2.0,
+            value: 8000.0_f32,
+            easing: Easing::default(),
+        },
     ];
     scene.audio.push(tr);
     let graph = build_filter_graph(&scene);
@@ -1367,8 +1734,16 @@ fn audio_reverb_keyframes_lower_to_per_segment_chain() {
     tr.t_out = Some(2.0);
     tr.animated_params.insert("reverb".into());
     tr.reverb_kfs = vec![
-        Keyframe { t: 0.0, value: 0.0_f32, easing: Easing::default() },
-        Keyframe { t: 2.0, value: 0.8_f32, easing: Easing::default() },
+        Keyframe {
+            t: 0.0,
+            value: 0.0_f32,
+            easing: Easing::default(),
+        },
+        Keyframe {
+            t: 2.0,
+            value: 0.8_f32,
+            easing: Easing::default(),
+        },
     ];
     scene.audio.push(tr);
     let graph = build_filter_graph(&scene);
@@ -1397,8 +1772,16 @@ fn audio_mute_overrides_animated_volume() {
     tr.mute = true;
     tr.animated_params.insert("volume".into());
     tr.volume_kfs = vec![
-        Keyframe { t: 0.0, value: 0.5_f32, easing: Easing::default() },
-        Keyframe { t: 2.0, value: 1.0_f32, easing: Easing::default() },
+        Keyframe {
+            t: 0.0,
+            value: 0.5_f32,
+            easing: Easing::default(),
+        },
+        Keyframe {
+            t: 2.0,
+            value: 1.0_f32,
+            easing: Easing::default(),
+        },
     ];
     scene.audio.push(tr);
     let graph = build_filter_graph(&scene);
@@ -1413,10 +1796,7 @@ fn audio_mute_overrides_animated_volume() {
     // `volume=…` appears with an `:enable=between(t,` immediately
     // after, that means a per-segment filter was emitted alongside
     // the mute (a regression).
-    let segmented_volume = graph
-        .matches("volume=")
-        .count()
-        > 1
+    let segmented_volume = graph.matches("volume=").count() > 1
         || graph.contains("volume=0.500000:enable=")
         || graph.contains("volume=1.000000:enable=");
     assert!(
@@ -1424,7 +1804,6 @@ fn audio_mute_overrides_animated_volume() {
         "mute should suppress per-segment animated volume filters:\n{graph}",
     );
 }
-
 
 #[test]
 fn output_stream_is_normalised_to_yuv420p_cfr() {
@@ -1501,7 +1880,6 @@ fn scale_expression_is_clamped_against_zero_dimensions() {
     );
 }
 
-
 #[test]
 fn mask_alphamerge_pins_blend_inputs_to_common_axis() {
     // Pin the contract of `emit_mask_alphamerge`: every link feeding
@@ -1520,9 +1898,7 @@ fn mask_alphamerge_pins_blend_inputs_to_common_axis() {
     // produces a 0-byte mp4. The fix is purely defensive — adds
     // explicit per-link normalisation around the sub-graph so the
     // graph initialises cleanly on every supported ffmpeg.
-    use memstroy_core::{
-        Effect, EffectKind, ImageOverlay, MaskShape, OverlayState,
-    };
+    use memstroy_core::{Effect, EffectKind, ImageOverlay, MaskShape, OverlayState};
 
     let mut scene = baseline_scene();
     scene.overlays.push(Overlay::Image(ImageOverlay {
@@ -1543,6 +1919,7 @@ fn mask_alphamerge_pins_blend_inputs_to_common_axis() {
         animated_params: Default::default(),
         chroma_key: None,
         z_order: 0,
+        parent_id: None,
     }));
 
     let graph = build_filter_graph(&scene);
@@ -1593,8 +1970,6 @@ fn mask_alphamerge_pins_blend_inputs_to_common_axis() {
     );
 }
 
-
-
 // ─── PR #71: per-element z_order parity with preview canvas ────────
 //
 // User report (verbatim, translated): "In the preview the Mellstroy
@@ -1622,9 +1997,9 @@ fn image_overlay_with_lower_z_order_renders_below_actor() {
     // The renderer's new single-pass `emit_z_ordered_elements`
     // sorts ascending: image (`-2`) is emitted before actor (`-1`),
     // which means ffmpeg sees the image's `-i` first (input slot 0)
-    // and the actor's `-i` second (slot 1). The actor's chain is
-    // the only one that uses `chromakey=`, so checking which input
-    // index that filter binds to is enough to lock the order.
+    // and the actor's `-i` second (slot 1). The actor chain labels
+    // itself `[actor_*]`, so checking which input slot feeds that
+    // chain is enough to lock the order.
     let mut scene = baseline_scene();
     let mut actor = baseline_actor("hero");
     actor.z_order = -1; // top track
@@ -1642,20 +2017,20 @@ fn image_overlay_with_lower_z_order_renders_below_actor() {
         animated_params: Default::default(),
         chroma_key: None,
         z_order: -2, // bottom track
+        parent_id: None,
     }));
 
     let graph = build_filter_graph(&scene);
 
-    // The actor (chromakey'd input) must be slot 1, NOT slot 0 — slot
-    // 0 belongs to the lower-z_order image overlay that gets emitted
-    // first now.
+    // The actor must be slot 1, NOT slot 0 — slot 0 belongs to the
+    // lower-z_order image overlay that gets emitted first now.
     assert!(
-        graph.contains("[1:v]chromakey="),
-        "actor's chromakey filter is not bound to ffmpeg input slot 1 — \
+        graph.contains("[1:v]format=yuva420p") && graph.contains("[actor_"),
+        "actor chain is not bound to ffmpeg input slot 1 — \
          lower-z_order image should have claimed slot 0 first:\n{graph}",
     );
     assert!(
-        !graph.contains("[0:v]chromakey="),
+        graph.contains("[0:v]format=yuva420p") && graph.contains("[img_"),
         "actor was emitted FIRST (slot 0); the image with z_order=-2 \
          should have been emitted before it:\n{graph}",
     );
@@ -1687,30 +2062,31 @@ fn image_overlay_with_higher_z_order_renders_above_actor() {
         animated_params: Default::default(),
         chroma_key: None,
         z_order: -1, // top track
+        parent_id: None,
     }));
 
     let graph = build_filter_graph(&scene);
 
     // Actor emitted first → slot 0; image emitted second → slot 1.
     assert!(
-        graph.contains("[0:v]chromakey="),
+        graph.contains("[0:v]format=yuva420p") && graph.contains("[actor_"),
         "actor with z_order=-2 should be emitted FIRST (slot 0):\n{graph}",
     );
     assert!(
-        !graph.contains("[1:v]chromakey="),
-        "actor input must NOT be at slot 1; that slot belongs to the \
+        graph.contains("[1:v]format=yuva420p") && graph.contains("[img_"),
+        "input slot 1 should belong to the \
          higher-z_order image:\n{graph}",
     );
 }
 
 #[test]
-fn legacy_zero_z_order_keeps_old_actor_then_overlay_ordering() {
-    // Backward-compat lock: when no element has a non-zero z_order
-    // (the case for any project saved before the field existed, and
-    // for every scripting.rs-built scene), the renderer must NOT
-    // start interleaving — it has to keep the historical
-    // "actors first, image/video overlays second" order so old
-    // exports look identical.
+fn zero_z_order_keeps_image_overlay_below_actor_like_canvas_preview() {
+    // Saved GUI projects can contain all-zero scene z_order values while
+    // their layer assignments live in the .memstroy layout wrapper. If the
+    // renderer falls back to "actor first, image second", the image covers
+    // the clip in render/extract even though the canvas preview shows the
+    // clip on top. With no explicit z_order, image/video overlays should
+    // be treated as background media below actors.
     let mut scene = baseline_scene();
     scene.actors.push(baseline_actor("hero"));
     scene.overlays.push(Overlay::Image(ImageOverlay {
@@ -1725,17 +2101,22 @@ fn legacy_zero_z_order_keeps_old_actor_then_overlay_ordering() {
         animated_params: Default::default(),
         chroma_key: None,
         z_order: 0,
+        parent_id: None,
     }));
 
     let graph = build_filter_graph(&scene);
 
-    // Actor first → slot 0, image second → slot 1.
+    // Image first -> slot 0, actor second -> slot 1, so the actor is
+    // overlaid after the image and remains visible.
     assert!(
-        graph.contains("[0:v]chromakey="),
-        "legacy fallback should keep actor at slot 0:\n{graph}",
+        graph.contains("[0:v]format=yuva420p") && graph.contains("[img_"),
+        "zero-z fallback should emit image first as the background layer:\n{graph}",
+    );
+    assert!(
+        graph.contains("[1:v]format=yuva420p") && graph.contains("[actor_"),
+        "zero-z fallback should emit actor second so it draws on top:\n{graph}",
     );
 }
-
 
 #[test]
 fn empty_backgrounds_use_configured_color_not_chromakey_green() {
@@ -1826,10 +2207,11 @@ fn build_plan_keeps_scene_unchanged_when_resolutions_already_match() {
     scene.actors.push(baseline_actor("hero"));
 
     let graph = build_filter_graph(&scene);
-    assert!(graph.contains("*1080.0000)"), "expected matching out_w lowering: {graph}");
+    assert!(
+        graph.contains("*1080.0000)"),
+        "expected matching out_w lowering: {graph}"
+    );
 }
-
-
 
 // ─── Render-frame camera parity (rewrite) ──────────────────────────
 //
@@ -2038,8 +2420,6 @@ fn default_render_frame_skips_zoom_rotate_fast_path() {
     );
 }
 
-
-
 // ─── CPU compositor parity ─────────────────────────────────────────
 //
 // The new CPU pipeline (`compositor.rs`) is the canonical render path.
@@ -2060,10 +2440,7 @@ fn temp_out_path(name: &str) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    std::env::temp_dir().join(format!(
-        "memstroy-cputest-{}-{}-{}.png",
-        name, pid, nanos
-    ))
+    std::env::temp_dir().join(format!("memstroy-cputest-{}-{}-{}.png", name, pid, nanos))
 }
 
 #[test]
@@ -2099,8 +2476,7 @@ fn cpu_pipeline_paints_background_color_when_empty() {
     scene.output.background_color = [200, 100, 50];
 
     let out = temp_out_path("bgcolor");
-    render_preview_frame_cpu(&scene, Path::new("."), 0.0, &out)
-        .expect("CPU preview must succeed");
+    render_preview_frame_cpu(&scene, Path::new("."), 0.0, &out).expect("CPU preview must succeed");
 
     let img = image::open(&out).expect("decode preview").to_rgba8();
     let samples = [
@@ -2115,13 +2491,14 @@ fn cpu_pipeline_paints_background_color_when_empty() {
                 && (p[1] as i32 - 100).abs() < 5
                 && (p[2] as i32 - 50).abs() < 5,
             "background colour mismatch at ({},{}): {:?}",
-            x, y, p
+            x,
+            y,
+            p
         );
         assert_eq!(p[3], 255, "expected fully opaque");
     }
     let _ = std::fs::remove_file(&out);
 }
-
 
 #[test]
 fn cpu_pipeline_places_image_overlay_at_world_position() {
@@ -2191,14 +2568,12 @@ fn cpu_pipeline_places_image_overlay_at_world_position() {
         animated_params: Default::default(),
         chroma_key: None,
         z_order: 0,
+        parent_id: None,
     }));
 
-    let out_path = std::env::temp_dir().join(format!(
-        "memstroy-cputest-place-{}.png",
-        std::process::id()
-    ));
-    render_preview_frame_cpu(&scene, &tmp_dir, 0.0, &out_path)
-        .expect("CPU preview must succeed");
+    let out_path =
+        std::env::temp_dir().join(format!("memstroy-cputest-place-{}.png", std::process::id()));
+    render_preview_frame_cpu(&scene, &tmp_dir, 0.0, &out_path).expect("CPU preview must succeed");
     let img = image::open(&out_path).expect("decode preview").to_rgba8();
     assert_eq!(img.width(), 200);
     assert_eq!(img.height(), 200);
@@ -2270,7 +2645,10 @@ fn cpu_pipeline_honours_render_frame_pos_offset() {
     scene.render_frame.layout = vec![Keyframe {
         t: 0.0,
         value: RenderFrameState {
-            pos: WorldPos { x: 700.0, y: 1100.0 },
+            pos: WorldPos {
+                x: 700.0,
+                y: 1100.0,
+            },
             zoom: 1.0,
             rotation_deg: 0.0,
         },
@@ -2294,13 +2672,17 @@ fn cpu_pipeline_honours_render_frame_pos_offset() {
         animated_params: Default::default(),
         chroma_key: None,
         z_order: 0,
+        parent_id: None,
     }));
     scene.canvas_layouts.push(CanvasLayout {
         element_id: "blue1".into(),
         keyframes: vec![Keyframe {
             t: 0.0,
             value: CanvasTransform {
-                pos: WorldPos { x: 700.0, y: 1100.0 },
+                pos: WorldPos {
+                    x: 700.0,
+                    y: 1100.0,
+                },
                 width: 100.0,
                 scale: 1.0,
                 rotation_deg: 0.0,
@@ -2310,12 +2692,9 @@ fn cpu_pipeline_honours_render_frame_pos_offset() {
         }],
     });
 
-    let out_path = std::env::temp_dir().join(format!(
-        "memstroy-cputest-rfpos-{}.png",
-        std::process::id()
-    ));
-    render_preview_frame_cpu(&scene, &tmp_dir, 0.0, &out_path)
-        .expect("CPU preview must succeed");
+    let out_path =
+        std::env::temp_dir().join(format!("memstroy-cputest-rfpos-{}.png", std::process::id()));
+    render_preview_frame_cpu(&scene, &tmp_dir, 0.0, &out_path).expect("CPU preview must succeed");
     let img = image::open(&out_path).expect("decode").to_rgba8();
 
     // The blue 100×100 image should be centred at output (200, 200).
