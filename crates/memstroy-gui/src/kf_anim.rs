@@ -53,6 +53,16 @@ fn upsert_index<T: Clone + keyframe::Lerp>(
         .unwrap_or(0)
 }
 
+fn drop_redundant_static_anchor<T>(layout: &mut Vec<Keyframe<T>>, t: f32) {
+    if layout.len() == 1
+        && layout[0].t.abs() < KF_TIME_EPS
+        && t > KF_TIME_EPS
+        && layout[0].param_owners.is_empty()
+    {
+        layout.clear();
+    }
+}
+
 // ─── Sampled "current value" reads ───────────────────────────────────
 
 /// Sample an actor layout at time `t` with per-parameter tracks decoupled
@@ -113,10 +123,18 @@ pub fn sync_actor_transform_to_canvas(
         write_canvas_param(
             &mut cl.keyframes,
             &animated,
-            &[param_ids::POS_X, param_ids::POS_Y],
+            &[param_ids::POS_X],
             scene_t,
             |v| {
                 v.pos.x = world_x;
+            },
+        );
+        write_canvas_param(
+            &mut cl.keyframes,
+            &animated,
+            &[param_ids::POS_Y],
+            scene_t,
+            |v| {
                 v.pos.y = world_y;
             },
         );
@@ -185,10 +203,18 @@ pub fn sync_overlay_transform_to_canvas(
         write_canvas_param(
             &mut cl.keyframes,
             &animated,
-            &[param_ids::POS_X, param_ids::POS_Y],
+            &[param_ids::POS_X],
             scene_t,
             |v| {
                 v.pos.x = world_x;
+            },
+        );
+        write_canvas_param(
+            &mut cl.keyframes,
+            &animated,
+            &[param_ids::POS_Y],
+            scene_t,
+            |v| {
                 v.pos.y = world_y;
             },
         );
@@ -230,6 +256,7 @@ pub fn write_actor_param<F>(
     let is_animated = animated_params.contains(param_id);
     if is_animated {
         let seed = sample_actor(layout, animated_params, t);
+        drop_redundant_static_anchor(layout, t);
         let idx = upsert_index(layout, t, seed);
         if let Some(kf) = layout.get_mut(idx) {
             f(&mut kf.value);
@@ -262,9 +289,11 @@ pub fn write_overlay_param<F>(
     let is_animated = animated_params.contains(param_id);
     if is_animated {
         let seed = sample_overlay(layout, animated_params, t);
+        drop_redundant_static_anchor(layout, t);
         let idx = upsert_index(layout, t, seed);
         if let Some(kf) = layout.get_mut(idx) {
             f(&mut kf.value);
+            kf.mark_param_owner(param_id);
         }
     } else {
         for kf in layout.iter_mut() {
@@ -304,9 +333,11 @@ pub fn write_render_frame_param<F>(
     let is_animated = animated_params.contains(param_id);
     if is_animated {
         let seed = memstroy_core::sample_render_frame_layout(layout, animated_params, t);
+        drop_redundant_static_anchor(layout, t);
         let idx = upsert_index(layout, t, seed);
         if let Some(kf) = layout.get_mut(idx) {
             f(&mut kf.value);
+            kf.mark_param_owner(param_id);
         }
     } else {
         for kf in layout.iter_mut() {
@@ -341,10 +372,14 @@ pub fn write_canvas_param<F>(
         .iter()
         .any(|id| animated_params.contains(*id));
     if any_animated {
-        let seed = keyframe::sample(layout, t).unwrap_or_default();
+        let seed = memstroy_core::sample_canvas_layout(layout, t);
+        drop_redundant_static_anchor(layout, t);
         let idx = upsert_index(layout, t, seed);
         if let Some(kf) = layout.get_mut(idx) {
             f(&mut kf.value);
+            for param_id in relevant_param_ids {
+                kf.mark_param_owner(param_id);
+            }
         }
     } else {
         // Static: broadcast to every keyframe so the value stays
@@ -587,17 +622,7 @@ pub fn canvas_param_timeline_times(
     canvas: &[Keyframe<CanvasTransform>],
     param_id: &str,
 ) -> Vec<f32> {
-    memstroy_core::param_timeline_times_with_owners(
-        canvas,
-        |v| canvas_scalar_get(v, param_id),
-        |i| canvas_other_fields_changed_at(canvas, param_id, i),
-        |i| {
-            canvas
-                .get(i)
-                .map(|kf| kf.param_owners.is_empty() || kf.param_owners.contains(param_id))
-                .unwrap_or(false)
-        },
-    )
+    memstroy_core::canvas_param_timeline_times(canvas, param_id)
 }
 
 /// Per-param change times for an actor layout, merged with any matching
@@ -642,33 +667,10 @@ fn canvas_param_value_at(
     param_id: &str,
     t: f32,
 ) -> Option<f32> {
-    use memstroy_core::param_ids as p;
-    let times = canvas_param_timeline_times(canvas, param_id);
-    if times.is_empty() {
-        return None;
-    }
-    let sample_track = |get: fn(&CanvasTransform) -> f32| -> Option<f32> {
-        let track: Vec<Keyframe<f32>> = times
-            .iter()
-            .map(|&tm| {
-                let idx = layout_index_at_time(canvas, tm);
-                Keyframe {
-                    t: tm,
-                    value: get(&canvas[idx].value),
-                    easing: canvas[idx].easing,
-                    param_owners: Default::default(),
-                }
-            })
-            .collect();
-        memstroy_core::keyframe::sample(&track, t)
-    };
-    match param_id {
-        p::POS_X => sample_track(|v| v.pos.x),
-        p::POS_Y => sample_track(|v| v.pos.y),
-        p::SCALE => sample_track(|v| v.scale),
-        p::ROTATION => sample_track(|v| v.rotation_deg),
-        p::OPACITY => sample_track(|v| v.opacity),
-        _ => None,
+    if canvas_param_timeline_times(canvas, param_id).is_empty() {
+        None
+    } else {
+        Some(memstroy_core::sample_canvas_param_at(canvas, param_id, t))
     }
 }
 
@@ -724,16 +726,12 @@ pub fn canvas_param_track_active(canvas: &[Keyframe<CanvasTransform>], param_id:
     !canvas_param_timeline_times(canvas, param_id).is_empty()
 }
 
-fn canvas_scalar_get(v: &CanvasTransform, param_id: &str) -> f32 {
+fn canvas_param_supported(param_id: &str) -> bool {
     use memstroy_core::param_ids as p;
-    match param_id {
-        p::POS_X => v.pos.x,
-        p::POS_Y => v.pos.y,
-        p::SCALE => v.scale,
-        p::ROTATION => v.rotation_deg,
-        p::OPACITY => v.opacity,
-        _ => 0.0,
-    }
+    matches!(
+        param_id,
+        p::POS_X | p::POS_Y | p::SCALE | p::ROTATION | p::OPACITY
+    )
 }
 
 fn canvas_scalar_set(v: &mut CanvasTransform, param_id: &str, value: f32) {
@@ -817,11 +815,22 @@ pub fn delete_canvas_param_keyframe_at(
     let Some(i) = canvas.iter().position(|k| (k.t - at_t).abs() < KF_TIME_EPS) else {
         return;
     };
-    if canvas_other_fields_changed_at(canvas, param_id, i) {
+    if canvas[i].param_owners.contains(param_id) && canvas[i].param_owners.len() > 1 {
         if i > 0 {
-            let prev = canvas_scalar_get(&canvas[i - 1].value, param_id);
+            let prev = memstroy_core::sample_canvas_param_at(&canvas[..i], param_id, at_t);
             canvas_scalar_set(&mut canvas[i].value, param_id, prev);
         }
+        canvas[i].clear_param_owner(param_id);
+        prune_canvas_layout(canvas);
+        return;
+    }
+    if canvas_other_fields_changed_at(canvas, param_id, i) {
+        if i > 0 {
+            let prev = memstroy_core::sample_canvas_param_at(&canvas[..i], param_id, at_t);
+            canvas_scalar_set(&mut canvas[i].value, param_id, prev);
+        }
+        canvas[i].clear_param_owner(param_id);
+        prune_canvas_layout(canvas);
         return;
     }
     canvas.remove(i);
@@ -1369,5 +1378,175 @@ pub fn apply_strip_to_kfs<T>(
         if idx < kfs.len() {
             kfs[idx].easing = easing;
         }
+    }
+}
+
+fn prune_canvas_layout(layout: &mut Vec<Keyframe<CanvasTransform>>) {
+    if layout.is_empty() {
+        layout.push(Keyframe::new(0.0, CanvasTransform::default()));
+        return;
+    }
+    let mut keep_first = true;
+    layout.retain(|kf| {
+        if !kf.param_owners.is_empty() {
+            return true;
+        }
+        if keep_first {
+            keep_first = false;
+            return true;
+        }
+        false
+    });
+    if layout.is_empty() {
+        layout.push(Keyframe::new(0.0, CanvasTransform::default()));
+    }
+}
+
+fn clear_canvas_param_animation(
+    layout: &mut Vec<Keyframe<CanvasTransform>>,
+    param_id: &str,
+    reference_t: f32,
+) {
+    let static_val = memstroy_core::sample_canvas_param_at(layout, param_id, reference_t);
+    for kf in layout.iter_mut() {
+        canvas_scalar_set(&mut kf.value, param_id, static_val);
+        kf.clear_param_owner(param_id);
+    }
+    prune_canvas_layout(layout);
+}
+
+fn enable_canvas_param_animation(
+    layout: &mut Vec<Keyframe<CanvasTransform>>,
+    animated_params: &BTreeSet<String>,
+    param_id: &str,
+    seed_t: f32,
+) {
+    let value = memstroy_core::sample_canvas_param_at(layout, param_id, seed_t);
+    for kf in layout.iter_mut() {
+        canvas_scalar_set(&mut kf.value, param_id, value);
+    }
+    author_canvas_param_keyframe(layout, animated_params, param_id, seed_t, value);
+}
+
+pub fn reconcile_canvas_animated_params(
+    layout: &mut Vec<Keyframe<CanvasTransform>>,
+    animated_params: &BTreeSet<String>,
+    animated_before: &BTreeSet<String>,
+    scene_t: f32,
+) {
+    for pid in animated_before.iter() {
+        if !animated_params.contains(pid) && canvas_param_supported(pid) {
+            clear_canvas_param_animation(layout, pid, scene_t);
+        }
+    }
+    for pid in animated_params.iter() {
+        if !animated_before.contains(pid) && canvas_param_supported(pid) {
+            enable_canvas_param_animation(layout, animated_params, pid, scene_t);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use memstroy_core::{param_ids, CanvasTransform};
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn static_canvas_seed_does_not_claim_every_param() {
+        let canvas = vec![Keyframe::new(
+            0.0,
+            CanvasTransform {
+                pos: memstroy_core::WorldPos { x: 320.0, y: 180.0 },
+                ..Default::default()
+            },
+        )];
+
+        assert!(canvas_param_timeline_times(&canvas, param_ids::SCALE).is_empty());
+        assert!(canvas_param_timeline_times(&canvas, param_ids::ROTATION).is_empty());
+        assert!(canvas_param_timeline_times(&canvas, param_ids::POS_X).is_empty());
+    }
+
+    #[test]
+    fn animated_actor_write_replaces_default_anchor_with_playhead_key() {
+        let mut layout = vec![Keyframe::new(0.0, ActorState::default())];
+        let mut animated = BTreeSet::new();
+        animated.insert(param_ids::POS_X.to_string());
+
+        write_actor_param(
+            &mut layout,
+            &mut animated,
+            4.0,
+            param_ids::POS_X,
+            false,
+            |v| v.pos[0] = 0.75,
+        );
+
+        assert_eq!(layout.len(), 1);
+        assert!((layout[0].t - 4.0).abs() < KF_TIME_EPS);
+        assert!(layout[0].param_owners.contains(param_ids::POS_X));
+    }
+
+    #[test]
+    fn canvas_write_marks_only_relevant_param_owners() {
+        let mut canvas = vec![Keyframe::new(0.0, CanvasTransform::default())];
+        let animated = std::iter::once(param_ids::SCALE.to_string()).collect();
+
+        write_canvas_param(&mut canvas, &animated, &[param_ids::SCALE], 2.0, |v| {
+            v.scale = 1.4;
+        });
+
+        assert_eq!(
+            canvas_param_timeline_times(&canvas, param_ids::SCALE),
+            vec![2.0]
+        );
+        assert!(canvas_param_timeline_times(&canvas, param_ids::ROTATION).is_empty());
+    }
+
+    #[test]
+    fn enabling_canvas_pos_x_does_not_author_or_move_pos_y() {
+        let mut canvas = vec![Keyframe::new(
+            0.0,
+            CanvasTransform {
+                pos: memstroy_core::WorldPos { x: 320.0, y: 180.0 },
+                ..CanvasTransform::default()
+            },
+        )];
+        let before = BTreeSet::new();
+        let animated = std::iter::once(param_ids::POS_X.to_string()).collect();
+
+        reconcile_canvas_animated_params(&mut canvas, &animated, &before, 5.0);
+
+        assert_eq!(
+            canvas_param_timeline_times(&canvas, param_ids::POS_X),
+            vec![5.0]
+        );
+        assert!(canvas_param_timeline_times(&canvas, param_ids::POS_Y).is_empty());
+        assert!((memstroy_core::sample_canvas_layout(&canvas, 5.0).pos.y - 180.0).abs() < 1.0e-3);
+    }
+
+    #[test]
+    fn deleting_canvas_param_from_shared_keyframe_keeps_other_param_owner() {
+        let mut kf = Keyframe::new(
+            2.0,
+            CanvasTransform {
+                pos: memstroy_core::WorldPos { x: 100.0, y: 200.0 },
+                scale: 0.5,
+                ..CanvasTransform::default()
+            },
+        )
+        .with_param_owner(param_ids::POS_X);
+        kf.mark_param_owner(param_ids::SCALE);
+        let mut canvas = vec![Keyframe::new(0.0, CanvasTransform::default()), kf];
+
+        delete_canvas_param_keyframe_at(&mut canvas, param_ids::POS_X, 2.0);
+
+        assert!(canvas_param_timeline_times(&canvas, param_ids::POS_X).is_empty());
+        assert_eq!(
+            canvas_param_timeline_times(&canvas, param_ids::SCALE),
+            vec![2.0]
+        );
+        assert!(canvas[1].param_owners.contains(param_ids::SCALE));
+        assert!(!canvas[1].param_owners.contains(param_ids::POS_X));
     }
 }

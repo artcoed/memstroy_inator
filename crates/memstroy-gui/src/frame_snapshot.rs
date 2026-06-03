@@ -729,7 +729,11 @@ fn paint_actor(
     // snapshot path doesn't need a `&Context` and doesn't fight the
     // live preview's texture handle.
     let speed = actor.speed.max(1.0e-4);
-    let local_t = (t - t_in) * speed + actor.source_start;
+    let local_t = if actor.mellstroy_footage.edge_frame {
+        actor.source_start
+    } else {
+        (t - t_in) * speed + actor.source_start
+    };
     let (mut frame_buf, src_w, src_h) = match load_actor_frame_rgba(state, actor_idx, local_t) {
         Some(t) => t,
         None => return,

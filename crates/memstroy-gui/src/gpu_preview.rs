@@ -343,7 +343,11 @@ impl PreviewCompositor {
                 continue;
             }
 
-            let local_t = t - t_in + actor.source_start;
+            let local_t = if actor.mellstroy_footage.edge_frame {
+                actor.source_start
+            } else {
+                t - t_in + actor.source_start
+            };
 
             // Attempt to load the frame from the frame cache directory
             // Frame cache uses format: <cache_dir>/frame_XXXXX.jpg

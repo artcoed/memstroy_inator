@@ -164,6 +164,7 @@ pub fn library(ui: &mut egui::Ui, state: &mut EditorState, _request_refresh: imp
         // their local directories instead.
         if !crate::state::LIBRARY_LOCAL_ONLY {
             state.reset_server_page_for_tab(state.library_tab, state.library_search.clone());
+            state.last_auto_refresh = None;
         }
     }
     ui.add_space(2.0);
@@ -540,6 +541,30 @@ fn library_split_panel<L, G>(
 /// EditorState fields so the assets-server can be configured from
 /// outside (or via project settings) without surfacing infrastructure
 /// in the editor chrome.
+fn clip_matches_library_search(clip: &crate::state::LibraryClip, raw_query: &str) -> bool {
+    let query = raw_query.trim();
+    if query.is_empty() {
+        return true;
+    }
+    let query_lower = query.to_lowercase();
+    if clip
+        .server_query
+        .as_deref()
+        .map(|server_query| server_query.trim().to_lowercase() == query_lower)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    let description = clean_clip_text(&clip.description).to_lowercase();
+    let label = clip.label.to_lowercase();
+    let server_id = clip.server_id.as_deref().unwrap_or_default().to_lowercase();
+    description.contains(&query_lower)
+        || label.contains(&query_lower)
+        || server_id.contains(&query_lower)
+        || clip.id.to_string().contains(&query_lower)
+}
+
 fn library_clips_tab(ui: &mut egui::Ui, state: &mut EditorState) {
     // Reset per-frame thumbnail load budget for clip cards.
     let budget_id_init = egui::Id::new("library_thumb_budget");
@@ -549,8 +574,10 @@ fn library_clips_tab(ui: &mut egui::Ui, state: &mut EditorState) {
         d.insert_temp(preview_budget_id, 0u32);
     });
     let page_limit = server_page_limit(ui);
+    if !crate::state::LIBRARY_LOCAL_ONLY {
+        request_server_library_page_if_needed(state, LibraryTab::Clips, page_limit, false);
+    }
 
-    let search_lower = state.library_search.to_lowercase();
     let clip_count = state.library.mellstroy_clips.len();
     let display_count = state.display_count_for_tab(LibraryTab::Clips, clip_count);
 
@@ -660,16 +687,12 @@ fn library_clips_tab(ui: &mut egui::Ui, state: &mut EditorState) {
                 return;
             }
             // Build filtered indices once per frame
-            let filtered: Vec<usize> = if search_lower.is_empty() {
+            let filtered: Vec<usize> = if state.library_search.trim().is_empty() {
                 (0..state.library.mellstroy_clips.len()).collect()
             } else {
                 state.library.mellstroy_clips.iter()
                     .enumerate()
-                    .filter(|(_, c)| {
-                        let clean = clean_clip_text(&c.description).to_lowercase();
-                        clean.contains(&search_lower)
-                            || c.id.to_string().contains(&search_lower)
-                    })
+                    .filter(|(_, c)| clip_matches_library_search(c, &state.library_search))
                     .map(|(i, _)| i)
                     .collect()
             };
@@ -686,6 +709,28 @@ fn library_clips_tab(ui: &mut egui::Ui, state: &mut EditorState) {
             let cols = ((avail_w + spacing) / (cell_size + spacing)).floor().max(1.0) as usize;
             let row_h = cell_h + spacing;
             let n = filtered.len();
+            if n == 0 {
+                if state
+                    .server_page_state(LibraryTab::Clips)
+                    .map(|page| page.loading)
+                    .unwrap_or(false)
+                {
+                    draw_loading_grid_placeholders(
+                        ui,
+                        page_limit as usize,
+                        Color32::from_rgb(255, 200, 80),
+                        "VID",
+                    );
+                } else {
+                    ui.label(
+                        RichText::new(t("No matching clips yet — server search will keep loading as you scroll."))
+                            .italics()
+                            .color(COL_TEXT_DIM)
+                            .size(11.0),
+                    );
+                }
+                return;
+            }
             let n_rows = (n + cols - 1) / cols;
 
             // Reserve total scroll height
@@ -2995,13 +3040,18 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
         ui.add_space(4.0);
     }
 
-    let pos_before;
+    let mut position_value_edited = false;
+    let actor_id_for_canvas;
+    let animated_before_for_canvas;
+    let canvas_reconcile_t;
     {
         let a = &mut state.scene.actors[i];
 
         // Snapshot animated_params BEFORE the toggle widgets run so we can
         // detect newly-animated params and seed an initial keyframe.
         let animated_before = a.animated_params.clone();
+        animated_before_for_canvas = animated_before.clone();
+        actor_id_for_canvas = a.id.clone();
 
         ui.label(RichText::new(t("Position & Scale")).size(12.0).strong());
         ui.add_space(4.0);
@@ -3010,7 +3060,6 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
         // and never mutates `layout`. The widget below is bound to a temp
         // copy, and only `.changed()` triggers a write through `kf_anim`.
         let cur = crate::kf_anim::sample_actor(&a.layout, &a.animated_params, playhead);
-        pos_before = cur.pos;
 
         let kf_count = a.layout.len();
         if kf_count <= 1 {
@@ -3058,6 +3107,7 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
                     .speed(0.005),
             );
             if r.changed() {
+                position_value_edited = true;
                 crate::kf_anim::write_actor_param(
                     &mut a.layout,
                     &mut a.animated_params,
@@ -3080,6 +3130,7 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
                     .speed(0.005),
             );
             if r.changed() {
+                position_value_edited = true;
                 crate::kf_anim::write_actor_param(
                     &mut a.layout,
                     &mut a.animated_params,
@@ -3462,6 +3513,7 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
 
         let clip_start = a.t_in.unwrap_or(0.0);
         let clip_end = a.t_out.unwrap_or(state.scene.output.duration);
+        canvas_reconcile_t = playhead.clamp(clip_start, clip_end.max(clip_start));
         crate::kf_anim::reconcile_actor_animated_params(
             &mut a.layout,
             &a.animated_params,
@@ -3471,15 +3523,21 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
             clip_end,
         );
     }
-    let cur_after = crate::kf_anim::sample_actor(
-        &state.scene.actors[i].layout,
-        &state.scene.actors[i].animated_params,
-        playhead,
-    );
-    if (cur_after.pos[0] - pos_before[0]).abs() > 1.0e-5
-        || (cur_after.pos[1] - pos_before[1]).abs() > 1.0e-5
+    if let Some(cl) = state
+        .scene
+        .canvas_layouts
+        .iter_mut()
+        .find(|cl| cl.element_id == actor_id_for_canvas)
     {
-        crate::kf_anim::sync_actor_transform_to_canvas(&mut state.scene, i, playhead);
+        crate::kf_anim::reconcile_canvas_animated_params(
+            &mut cl.keyframes,
+            &state.scene.actors[i].animated_params,
+            &animated_before_for_canvas,
+            canvas_reconcile_t,
+        );
+    }
+    if position_value_edited {
+        crate::kf_anim::sync_actor_transform_to_canvas(&mut state.scene, i, canvas_reconcile_t);
     }
 }
 
@@ -6612,6 +6670,36 @@ fn attach_element_to_skeleton_point(
     }
 }
 
+fn reconcile_overlay_canvas_animated_params(
+    state: &mut EditorState,
+    overlay_idx: usize,
+    animated_before: &std::collections::BTreeSet<String>,
+    scene_t: f32,
+) {
+    let Some((element_id, animated_params)) =
+        state.scene.overlays.get(overlay_idx).map(|ov| match ov {
+            Overlay::Text(t) => (t.id.clone(), t.animated_params.clone()),
+            Overlay::Image(im) => (im.id.clone(), im.animated_params.clone()),
+            Overlay::Video(v) => (v.id.clone(), v.animated_params.clone()),
+        })
+    else {
+        return;
+    };
+    if let Some(cl) = state
+        .scene
+        .canvas_layouts
+        .iter_mut()
+        .find(|cl| cl.element_id == element_id)
+    {
+        crate::kf_anim::reconcile_canvas_animated_params(
+            &mut cl.keyframes,
+            &animated_params,
+            animated_before,
+            scene_t,
+        );
+    }
+}
+
 fn inspector_overlay(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
     let duration = state.scene.output.duration;
     let overlay_count = state.scene.overlays.len();
@@ -6654,18 +6742,37 @@ fn inspector_overlay(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
             ui.separator();
             ui.add_space(4.0);
 
+            let animated_before_for_canvas = match &state.scene.overlays[i] {
+                Overlay::Text(txt) => txt.animated_params.clone(),
+                _ => unreachable!(),
+            };
             // Re-borrow for the main text inspector
-            let pos_edited = {
+            let (pos_edited, overlay_scene_t) = {
                 let txt = match &mut state.scene.overlays[i] {
                     Overlay::Text(t) => t,
                     _ => unreachable!(),
                 };
+                let clip_dur = (txt.t_out - txt.t_in).max(0.0);
+                let local_t = (playhead - txt.t_in).clamp(0.0, clip_dur);
                 // Returns Option<TextAction> for backward compat — currently
                 // unused since the layer-order buttons were removed.
-                inspector_text_overlay(ui, txt, i, overlay_count, duration, playhead).1
+                (
+                    inspector_text_overlay(ui, txt, i, overlay_count, duration, playhead).1,
+                    txt.t_in + local_t,
+                )
             };
+            reconcile_overlay_canvas_animated_params(
+                state,
+                i,
+                &animated_before_for_canvas,
+                overlay_scene_t,
+            );
             if pos_edited {
-                crate::kf_anim::sync_overlay_transform_to_canvas(&mut state.scene, i, playhead);
+                crate::kf_anim::sync_overlay_transform_to_canvas(
+                    &mut state.scene,
+                    i,
+                    overlay_scene_t,
+                );
             }
         }
         1 => {
@@ -6701,26 +6808,43 @@ fn inspector_overlay(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
             // Trying to maintain two sources of truth (drag handles +
             // numeric fields) was the source of multiple "image keeps
             // jumping back to old t_in" bugs.
-            let pos_edited = {
+            let animated_before_for_canvas = match &state.scene.overlays[i] {
+                Overlay::Image(im) => im.animated_params.clone(),
+                _ => unreachable!(),
+            };
+            let (pos_edited, overlay_scene_t) = {
                 let im = match &mut state.scene.overlays[i] {
                     Overlay::Image(im) => im,
                     _ => unreachable!(),
                 };
                 let clip_dur = (im.t_out - im.t_in).max(0.0);
                 let local_t = (playhead - im.t_in).clamp(0.0, clip_dur);
-                inspector_overlay_state_widgets(
-                    ui,
-                    &mut im.layout,
-                    &mut im.animated_params,
-                    local_t,
-                    clip_dur,
-                    i,
-                    "img",
-                    state.kf_highlight.clone(),
+                (
+                    inspector_overlay_state_widgets(
+                        ui,
+                        &mut im.layout,
+                        &mut im.animated_params,
+                        local_t,
+                        clip_dur,
+                        i,
+                        "img",
+                        state.kf_highlight.clone(),
+                    ),
+                    im.t_in + local_t,
                 )
             };
+            reconcile_overlay_canvas_animated_params(
+                state,
+                i,
+                &animated_before_for_canvas,
+                overlay_scene_t,
+            );
             if pos_edited {
-                crate::kf_anim::sync_overlay_transform_to_canvas(&mut state.scene, i, playhead);
+                crate::kf_anim::sync_overlay_transform_to_canvas(
+                    &mut state.scene,
+                    i,
+                    overlay_scene_t,
+                );
             }
 
             let im = match &mut state.scene.overlays[i] {
@@ -6800,7 +6924,11 @@ fn inspector_overlay(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
                 ui.add_space(4.0);
             }
 
-            let (pos_edited, clip_dur, local_t) = {
+            let animated_before_for_canvas = match &state.scene.overlays[i] {
+                Overlay::Video(v) => v.animated_params.clone(),
+                _ => unreachable!(),
+            };
+            let (pos_edited, _clip_dur, local_t, overlay_scene_t) = {
                 let v = match &mut state.scene.overlays[i] {
                     Overlay::Video(v) => v,
                     _ => unreachable!(),
@@ -6891,10 +7019,20 @@ fn inspector_overlay(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
                     "vid",
                     state.kf_highlight.clone(),
                 );
-                (pos_edited, clip_dur, local_t)
+                (pos_edited, clip_dur, local_t, v.t_in + local_t)
             };
+            reconcile_overlay_canvas_animated_params(
+                state,
+                i,
+                &animated_before_for_canvas,
+                overlay_scene_t,
+            );
             if pos_edited {
-                crate::kf_anim::sync_overlay_transform_to_canvas(&mut state.scene, i, playhead);
+                crate::kf_anim::sync_overlay_transform_to_canvas(
+                    &mut state.scene,
+                    i,
+                    overlay_scene_t,
+                );
             }
             let v = match &mut state.scene.overlays[i] {
                 Overlay::Video(v) => v,
@@ -7645,7 +7783,7 @@ fn inspector_overlay_state_widgets(
 
     let animated_before = animated_params.clone();
     let cur = crate::kf_anim::sample_overlay(layout, animated_params, local_playhead);
-    let pos_before = cur.pos;
+    let mut position_value_edited = false;
 
     let mut new_x = cur.pos[0];
     let mut new_y = cur.pos[1];
@@ -7660,6 +7798,7 @@ fn inspector_overlay_state_widgets(
         ui.label(param_label(highlight.is_active(param_ids::POS_X), "X:"));
         let r = ui.add(egui::DragValue::new(&mut new_x).speed(0.005));
         if r.changed() {
+            position_value_edited = true;
             crate::kf_anim::write_overlay_param(
                 layout,
                 animated_params,
@@ -7678,6 +7817,7 @@ fn inspector_overlay_state_widgets(
         ui.label(param_label(highlight.is_active(param_ids::POS_Y), "Y:"));
         let r = ui.add(egui::DragValue::new(&mut new_y).speed(0.005));
         if r.changed() {
+            position_value_edited = true;
             crate::kf_anim::write_overlay_param(
                 layout,
                 animated_params,
@@ -8008,9 +8148,7 @@ fn inspector_overlay_state_widgets(
         local_playhead,
         clip_duration,
     );
-    let cur_after = crate::kf_anim::sample_overlay(layout, animated_params, local_playhead);
-    (cur_after.pos[0] - pos_before[0]).abs() > 1.0e-5
-        || (cur_after.pos[1] - pos_before[1]).abs() > 1.0e-5
+    position_value_edited
 }
 
 /// Inspector layer-order actions for a text overlay. The buttons that
@@ -9989,6 +10127,7 @@ fn broadcast_timeline_move_delta(
                     continue;
                 }
                 let a = &state.scene.actors[ai];
+                let actor_id = a.id.clone();
                 let cur_in = a.t_in.unwrap_or(0.0);
                 let cur_dur = a.t_out.map(|out| out - cur_in).unwrap_or(0.0);
                 let dt_kfs = new_start - cur_in;
@@ -10003,6 +10142,7 @@ fn broadcast_timeline_move_delta(
                             kf.t += dt_kfs;
                         }
                     }
+                    shift_canvas_layout_timeline_by(s, &actor_id, dt_kfs);
                 });
                 sync_audio_to_actor(state, ai);
                 defer_overlap_resolution(state, MovedClipKind::Actor(ai));
@@ -10016,19 +10156,33 @@ fn broadcast_timeline_move_delta(
                     Overlay::Image(im) => im.t_out - im.t_in,
                     Overlay::Video(v) => v.t_out - v.t_in,
                 };
-                state.mutate_drag(token, |s| match &mut s.overlays[oi] {
-                    Overlay::Text(t) => {
-                        t.t_in = new_start;
-                        t.t_out = new_start + cur_dur.max(0.001);
+                let element_id = match &state.scene.overlays[oi] {
+                    Overlay::Text(t) => t.id.clone(),
+                    Overlay::Image(im) => im.id.clone(),
+                    Overlay::Video(v) => v.id.clone(),
+                };
+                let cur_in = match &state.scene.overlays[oi] {
+                    Overlay::Text(t) => t.t_in,
+                    Overlay::Image(im) => im.t_in,
+                    Overlay::Video(v) => v.t_in,
+                };
+                let dt_kfs = new_start - cur_in;
+                state.mutate_drag(token, |s| {
+                    match &mut s.overlays[oi] {
+                        Overlay::Text(t) => {
+                            t.t_in = new_start;
+                            t.t_out = new_start + cur_dur.max(0.001);
+                        }
+                        Overlay::Image(im) => {
+                            im.t_in = new_start;
+                            im.t_out = new_start + cur_dur.max(0.001);
+                        }
+                        Overlay::Video(v) => {
+                            v.t_in = new_start;
+                            v.t_out = new_start + cur_dur.max(0.001);
+                        }
                     }
-                    Overlay::Image(im) => {
-                        im.t_in = new_start;
-                        im.t_out = new_start + cur_dur.max(0.001);
-                    }
-                    Overlay::Video(v) => {
-                        v.t_in = new_start;
-                        v.t_out = new_start + cur_dur.max(0.001);
-                    }
+                    shift_canvas_layout_timeline_by(s, &element_id, dt_kfs);
                 });
                 defer_overlap_resolution(state, MovedClipKind::Overlay(oi));
             }
@@ -10379,15 +10533,23 @@ fn broadcast_timeline_trim_delta(
                 }
                 let a = &state.scene.actors[ai];
                 let cur_out = a.t_out.unwrap_or(state.scene.output.duration);
+                let edge_frame = a.mellstroy_footage.edge_frame;
                 let speed = a.speed.max(0.0001);
                 let source_start = a.source_start;
                 let cur_in = a.t_in.unwrap_or(0.0);
-                let min_in_from_source = (cur_in - source_start / speed).max(0.0);
+                let min_in_from_source = if edge_frame {
+                    0.0
+                } else {
+                    (cur_in - source_start / speed).max(0.0)
+                };
                 let new_in = new_edge.max(min_in_from_source).min(cur_out - 0.1);
                 let actual_delta = new_in - cur_in;
+                let actor_id = a.id.clone();
                 state.mutate_drag(token, |s| {
                     s.actors[ai].t_in = Some(new_in);
-                    s.actors[ai].source_start = (source_start + actual_delta * speed).max(0.0);
+                    if !edge_frame {
+                        s.actors[ai].source_start = (source_start + actual_delta * speed).max(0.0);
+                    }
                     // Crop scene-time keyframes that fall before the
                     // new in-edge — actor kfs are scene-time.
                     s.actors[ai].layout.retain(|kf| kf.t >= new_in - 1.0e-3);
@@ -10397,6 +10559,7 @@ fn broadcast_timeline_trim_delta(
                             memstroy_core::ActorState::default(),
                         ));
                     }
+                    retain_canvas_layout_scene_window(s, &actor_id, new_in, cur_out);
                 });
                 sync_audio_to_actor(state, ai);
                 defer_overlap_resolution(state, MovedClipKind::Actor(ai));
@@ -10408,13 +10571,12 @@ fn broadcast_timeline_trim_delta(
                 let a = &state.scene.actors[ai];
                 let cur_in = a.t_in.unwrap_or(0.0);
                 let mut new_out = new_edge.max(cur_in + 0.1);
-                if let Some(cap) =
-                    max_timeline_out_for_media(state, &a.source, a.source_start, a.speed, cur_in)
-                {
+                if let Some(cap) = max_timeline_out_for_actor(state, a, cur_in) {
                     if new_out > cap {
                         new_out = cap;
                     }
                 }
+                let actor_id = a.id.clone();
                 state.mutate_drag(token, |s| {
                     s.actors[ai].t_out = Some(new_out);
                     s.actors[ai].layout.retain(|kf| kf.t <= new_out + 1.0e-3);
@@ -10425,6 +10587,7 @@ fn broadcast_timeline_trim_delta(
                             memstroy_core::ActorState::default(),
                         ));
                     }
+                    retain_canvas_layout_scene_window(s, &actor_id, cur_in, new_out);
                 });
                 sync_audio_to_actor(state, ai);
                 defer_overlap_resolution(state, MovedClipKind::Actor(ai));
@@ -10438,6 +10601,11 @@ fn broadcast_timeline_trim_delta(
                     Overlay::Image(im) => (im.t_in, im.t_out),
                     Overlay::Video(v) => (v.t_in, v.t_out),
                 };
+                let element_id = match &state.scene.overlays[oi] {
+                    Overlay::Text(t) => t.id.clone(),
+                    Overlay::Image(im) => im.id.clone(),
+                    Overlay::Video(v) => v.id.clone(),
+                };
                 let video_source = match &state.scene.overlays[oi] {
                     Overlay::Video(v) => Some((v.source_start, v.speed.max(0.0001))),
                     _ => None,
@@ -10448,38 +10616,41 @@ fn broadcast_timeline_trim_delta(
                 }
                 let shift = new_in - cur_in;
                 state.mutate_drag(token, |s| {
-                    let layout: &mut Vec<memstroy_core::Keyframe<memstroy_core::OverlayState>> =
-                        match &mut s.overlays[oi] {
-                            Overlay::Text(t) => {
-                                t.t_in = new_in;
-                                &mut t.layout
+                    {
+                        let layout: &mut Vec<memstroy_core::Keyframe<memstroy_core::OverlayState>> =
+                            match &mut s.overlays[oi] {
+                                Overlay::Text(t) => {
+                                    t.t_in = new_in;
+                                    &mut t.layout
+                                }
+                                Overlay::Image(im) => {
+                                    im.t_in = new_in;
+                                    &mut im.layout
+                                }
+                                Overlay::Video(v) => {
+                                    let speed = v.speed.max(0.0001);
+                                    v.source_start = (v.source_start + shift * speed).max(0.0);
+                                    v.t_in = new_in;
+                                    &mut v.layout
+                                }
+                            };
+                        if shift.abs() > 1.0e-6 {
+                            for kf in layout.iter_mut() {
+                                kf.t -= shift;
                             }
-                            Overlay::Image(im) => {
-                                im.t_in = new_in;
-                                &mut im.layout
+                            layout.retain(|kf| kf.t >= -1.0e-3);
+                            for kf in layout.iter_mut() {
+                                kf.t = kf.t.max(0.0);
                             }
-                            Overlay::Video(v) => {
-                                let speed = v.speed.max(0.0001);
-                                v.source_start = (v.source_start + shift * speed).max(0.0);
-                                v.t_in = new_in;
-                                &mut v.layout
-                            }
-                        };
-                    if shift.abs() > 1.0e-6 {
-                        for kf in layout.iter_mut() {
-                            kf.t -= shift;
                         }
-                        layout.retain(|kf| kf.t >= -1.0e-3);
-                        for kf in layout.iter_mut() {
-                            kf.t = kf.t.max(0.0);
+                        if layout.is_empty() {
+                            layout.push(memstroy_core::Keyframe::new(
+                                0.0,
+                                memstroy_core::OverlayState::default(),
+                            ));
                         }
                     }
-                    if layout.is_empty() {
-                        layout.push(memstroy_core::Keyframe::new(
-                            0.0,
-                            memstroy_core::OverlayState::default(),
-                        ));
-                    }
+                    retain_canvas_layout_scene_window(s, &element_id, new_in, cur_out);
                 });
                 defer_overlap_resolution(state, MovedClipKind::Overlay(oi));
             }
@@ -10491,6 +10662,11 @@ fn broadcast_timeline_trim_delta(
                     Overlay::Text(t) => t.t_in,
                     Overlay::Image(im) => im.t_in,
                     Overlay::Video(v) => v.t_in,
+                };
+                let element_id = match &state.scene.overlays[oi] {
+                    Overlay::Text(t) => t.id.clone(),
+                    Overlay::Image(im) => im.id.clone(),
+                    Overlay::Video(v) => v.id.clone(),
                 };
                 let mut new_out = new_edge.max(cur_in + 0.1);
                 if let Some(cap) = match &state.scene.overlays[oi] {
@@ -10508,31 +10684,34 @@ fn broadcast_timeline_trim_delta(
                     }
                 }
                 state.mutate_drag(token, |s| {
-                    let (t_in_v, layout): (
-                        f32,
-                        &mut Vec<memstroy_core::Keyframe<memstroy_core::OverlayState>>,
-                    ) = match &mut s.overlays[oi] {
-                        Overlay::Text(t) => {
-                            t.t_out = new_out;
-                            (t.t_in, &mut t.layout)
+                    {
+                        let (t_in_v, layout): (
+                            f32,
+                            &mut Vec<memstroy_core::Keyframe<memstroy_core::OverlayState>>,
+                        ) = match &mut s.overlays[oi] {
+                            Overlay::Text(t) => {
+                                t.t_out = new_out;
+                                (t.t_in, &mut t.layout)
+                            }
+                            Overlay::Image(im) => {
+                                im.t_out = new_out;
+                                (im.t_in, &mut im.layout)
+                            }
+                            Overlay::Video(v) => {
+                                v.t_out = new_out;
+                                (v.t_in, &mut v.layout)
+                            }
+                        };
+                        let max_local = (new_out - t_in_v).max(0.0) + 1.0e-3;
+                        layout.retain(|kf| kf.t <= max_local);
+                        if layout.is_empty() {
+                            layout.push(memstroy_core::Keyframe::new(
+                                0.0,
+                                memstroy_core::OverlayState::default(),
+                            ));
                         }
-                        Overlay::Image(im) => {
-                            im.t_out = new_out;
-                            (im.t_in, &mut im.layout)
-                        }
-                        Overlay::Video(v) => {
-                            v.t_out = new_out;
-                            (v.t_in, &mut v.layout)
-                        }
-                    };
-                    let max_local = (new_out - t_in_v).max(0.0) + 1.0e-3;
-                    layout.retain(|kf| kf.t <= max_local);
-                    if layout.is_empty() {
-                        layout.push(memstroy_core::Keyframe::new(
-                            0.0,
-                            memstroy_core::OverlayState::default(),
-                        ));
                     }
+                    retain_canvas_layout_scene_window(s, &element_id, cur_in, new_out);
                 });
                 defer_overlap_resolution(state, MovedClipKind::Overlay(oi));
             }
@@ -10725,10 +10904,12 @@ fn show_footage_sequence_popup(ui: &mut egui::Ui, state: &mut EditorState) {
         .fixed_pos(popup.anchor)
         .show(ui.ctx(), |ui| {
             egui::Frame::popup(ui.style()).show(ui, |ui| {
-                ui.set_min_width(154.0);
+                const POPUP_W: f32 = 148.0;
+                ui.set_min_width(POPUP_W);
+                ui.set_max_width(POPUP_W);
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new(crate::i18n::t("Footage sequence"))
+                        RichText::new(crate::i18n::t("Sequence"))
                             .strong()
                             .size(12.0),
                     );
@@ -10740,7 +10921,10 @@ fn show_footage_sequence_popup(ui: &mut egui::Ui, state: &mut EditorState) {
                 });
                 ui.separator();
                 if ui
-                    .button(crate::i18n::t("Edge frame"))
+                    .add_sized(
+                        [POPUP_W - 12.0, 22.0],
+                        egui::Button::new(crate::i18n::t("Edge frame")),
+                    )
                     .on_hover_text(crate::i18n::t(
                         "Insert a short frozen segment from this clip edge",
                     ))
@@ -10753,7 +10937,10 @@ fn show_footage_sequence_popup(ui: &mut egui::Ui, state: &mut EditorState) {
                     close = true;
                 }
                 if ui
-                    .button(crate::i18n::t("Footage slot"))
+                    .add_sized(
+                        [POPUP_W - 12.0, 22.0],
+                        egui::Button::new(crate::i18n::t("Footage slot")),
+                    )
                     .on_hover_text(crate::i18n::t(
                         "Insert empty space that can be filled by a Mellstroy clip drop",
                     ))
@@ -11531,24 +11718,28 @@ fn apply_trim(state: &mut EditorState, op: TrimOp, token: u64) {
             if i >= s.actors.len() {
                 return;
             }
-            let a = &mut s.actors[i];
-            let old_in = a.t_in.unwrap_or(0.0);
-            // Bump source_start when shifting the in-edge so the
-            // visible content doesn't slip under the trim.
-            let shift_in = new_t_in - old_in;
-            if shift_in.abs() > 1.0e-6 {
-                a.source_start = (a.source_start + shift_in * a.speed.max(0.0001)).max(0.0);
+            let actor_id = s.actors[i].id.clone();
+            {
+                let a = &mut s.actors[i];
+                let old_in = a.t_in.unwrap_or(0.0);
+                // Bump source_start when shifting the in-edge so the
+                // visible content doesn't slip under the trim.
+                let shift_in = new_t_in - old_in;
+                if shift_in.abs() > 1.0e-6 && !a.mellstroy_footage.edge_frame {
+                    a.source_start = (a.source_start + shift_in * a.speed.max(0.0001)).max(0.0);
+                }
+                a.t_in = Some(new_t_in);
+                a.t_out = Some(new_t_out);
+                a.layout
+                    .retain(|kf| kf.t >= new_t_in - 1.0e-3 && kf.t <= new_t_out + 1.0e-3);
+                if a.layout.is_empty() {
+                    a.layout.push(memstroy_core::Keyframe::new(
+                        new_t_in,
+                        memstroy_core::ActorState::default(),
+                    ));
+                }
             }
-            a.t_in = Some(new_t_in);
-            a.t_out = Some(new_t_out);
-            a.layout
-                .retain(|kf| kf.t >= new_t_in - 1.0e-3 && kf.t <= new_t_out + 1.0e-3);
-            if a.layout.is_empty() {
-                a.layout.push(memstroy_core::Keyframe::new(
-                    new_t_in,
-                    memstroy_core::ActorState::default(),
-                ));
-            }
+            retain_canvas_layout_scene_window(s, &actor_id, new_t_in, new_t_out);
         }
         VictimKind::Overlay(i) => {
             if i >= s.overlays.len() {
@@ -11556,55 +11747,64 @@ fn apply_trim(state: &mut EditorState, op: TrimOp, token: u64) {
             }
             // Overlay kfs are clip-local. Shifting the in-edge requires
             // re-anchoring every kf by `-(new_t_in - old_t_in)`.
-            let (old_t_in, old_t_out, layout): (
-                f32,
-                f32,
-                &mut Vec<memstroy_core::Keyframe<memstroy_core::OverlayState>>,
-            ) = match &mut s.overlays[i] {
-                Overlay::Text(t) => {
-                    let oi = t.t_in;
-                    let oo = t.t_out;
-                    t.t_in = new_t_in;
-                    t.t_out = new_t_out;
-                    (oi, oo, &mut t.layout)
-                }
-                Overlay::Image(im) => {
-                    let oi = im.t_in;
-                    let oo = im.t_out;
-                    im.t_in = new_t_in;
-                    im.t_out = new_t_out;
-                    (oi, oo, &mut im.layout)
-                }
-                Overlay::Video(v) => {
-                    let oi = v.t_in;
-                    let oo = v.t_out;
-                    let shift = new_t_in - oi;
-                    if shift.abs() > 1.0e-6 {
-                        v.source_start = (v.source_start + shift * v.speed.max(0.0001)).max(0.0);
-                    }
-                    v.t_in = new_t_in;
-                    v.t_out = new_t_out;
-                    (oi, oo, &mut v.layout)
-                }
+            let element_id = match &s.overlays[i] {
+                Overlay::Text(t) => t.id.clone(),
+                Overlay::Image(im) => im.id.clone(),
+                Overlay::Video(v) => v.id.clone(),
             };
-            let shift = new_t_in - old_t_in;
-            let _ = old_t_out;
-            if shift.abs() > 1.0e-6 {
+            {
+                let (old_t_in, old_t_out, layout): (
+                    f32,
+                    f32,
+                    &mut Vec<memstroy_core::Keyframe<memstroy_core::OverlayState>>,
+                ) = match &mut s.overlays[i] {
+                    Overlay::Text(t) => {
+                        let oi = t.t_in;
+                        let oo = t.t_out;
+                        t.t_in = new_t_in;
+                        t.t_out = new_t_out;
+                        (oi, oo, &mut t.layout)
+                    }
+                    Overlay::Image(im) => {
+                        let oi = im.t_in;
+                        let oo = im.t_out;
+                        im.t_in = new_t_in;
+                        im.t_out = new_t_out;
+                        (oi, oo, &mut im.layout)
+                    }
+                    Overlay::Video(v) => {
+                        let oi = v.t_in;
+                        let oo = v.t_out;
+                        let shift = new_t_in - oi;
+                        if shift.abs() > 1.0e-6 {
+                            v.source_start =
+                                (v.source_start + shift * v.speed.max(0.0001)).max(0.0);
+                        }
+                        v.t_in = new_t_in;
+                        v.t_out = new_t_out;
+                        (oi, oo, &mut v.layout)
+                    }
+                };
+                let shift = new_t_in - old_t_in;
+                let _ = old_t_out;
+                if shift.abs() > 1.0e-6 {
+                    for kf in layout.iter_mut() {
+                        kf.t -= shift;
+                    }
+                }
+                let max_local = (new_t_out - new_t_in).max(0.0) + 1.0e-3;
+                layout.retain(|kf| kf.t >= -1.0e-3 && kf.t <= max_local);
                 for kf in layout.iter_mut() {
-                    kf.t -= shift;
+                    kf.t = kf.t.max(0.0);
+                }
+                if layout.is_empty() {
+                    layout.push(memstroy_core::Keyframe::new(
+                        0.0,
+                        memstroy_core::OverlayState::default(),
+                    ));
                 }
             }
-            let max_local = (new_t_out - new_t_in).max(0.0) + 1.0e-3;
-            layout.retain(|kf| kf.t >= -1.0e-3 && kf.t <= max_local);
-            for kf in layout.iter_mut() {
-                kf.t = kf.t.max(0.0);
-            }
-            if layout.is_empty() {
-                layout.push(memstroy_core::Keyframe::new(
-                    0.0,
-                    memstroy_core::OverlayState::default(),
-                ));
-            }
+            retain_canvas_layout_scene_window(s, &element_id, new_t_in, new_t_out);
         }
         VictimKind::Audio(i) => {
             if i >= s.audio.len() {
@@ -12007,18 +12207,77 @@ fn actor_window(actor: &Actor, scene_duration: f32) -> (f32, f32) {
     (t_in, t_out)
 }
 
+fn shift_canvas_layout_timeline_by(scene: &mut Scene, element_id: &str, dt: f32) {
+    if dt.abs() <= 1.0e-6 {
+        return;
+    }
+    if let Some(cl) = scene
+        .canvas_layouts
+        .iter_mut()
+        .find(|cl| cl.element_id == element_id)
+    {
+        for kf in &mut cl.keyframes {
+            kf.t = (kf.t + dt).max(0.0);
+        }
+        cl.keyframes
+            .sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
+    }
+}
+
+fn canvas_boundary_keyframe(
+    layout: &[Keyframe<CanvasTransform>],
+    t: f32,
+) -> Keyframe<CanvasTransform> {
+    let mut owners = std::collections::BTreeSet::new();
+    let mut has_legacy_full_state = false;
+    for kf in layout {
+        if kf.param_owners.is_empty() {
+            has_legacy_full_state = true;
+        } else {
+            owners.extend(kf.param_owners.iter().cloned());
+        }
+    }
+    let mut out = Keyframe::new(t.max(0.0), memstroy_core::sample_canvas_layout(layout, t));
+    if !has_legacy_full_state {
+        out.param_owners = owners;
+    }
+    out
+}
+
+fn retain_canvas_layout_scene_window(scene: &mut Scene, element_id: &str, t_in: f32, t_out: f32) {
+    let start = t_in.max(0.0);
+    let end = t_out.max(start + 0.001);
+    if let Some(cl) = scene
+        .canvas_layouts
+        .iter_mut()
+        .find(|cl| cl.element_id == element_id)
+    {
+        let boundary = canvas_boundary_keyframe(&cl.keyframes, start);
+        cl.keyframes
+            .retain(|kf| kf.t >= start - 1.0e-3 && kf.t <= end + 1.0e-3);
+        if cl.keyframes.is_empty() {
+            cl.keyframes.push(boundary);
+        }
+        cl.keyframes
+            .sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
+    }
+}
+
 fn shift_actor_timeline_by(state: &mut EditorState, actor_idx: usize, dt: f32) {
     if dt.abs() <= 1.0e-5 || actor_idx >= state.scene.actors.len() {
         return;
     }
+    let actor_id;
     {
         let actor = &mut state.scene.actors[actor_idx];
+        actor_id = actor.id.clone();
         actor.t_in = Some(actor.t_in.unwrap_or(0.0) + dt);
         actor.t_out = Some(actor.t_out.unwrap_or(state.scene.output.duration) + dt);
         for kf in &mut actor.layout {
             kf.t += dt;
         }
     }
+    shift_canvas_layout_timeline_by(&mut state.scene, &actor_id, dt);
     sync_audio_to_actor(state, actor_idx);
 }
 
@@ -12334,7 +12593,8 @@ fn insert_footage_sequence_clip_at(
     let actor_id = unique_actor_id_in_scene(&state.scene.actors, stem);
     let dur = clip_duration_for_placement(state, path, &actor_id).max(0.1);
     shift_footage_sequence_at_or_after(state, &sequence_id, insert_t, dur);
-    let idx = add_actor_from_clip_at_time_with_footage_flag(state, path, insert_t, true)?;
+    let idx =
+        add_actor_from_clip_at_time_with_footage_flag(state, path, insert_t, true, false, None)?;
     state.actor_track_assignments.insert(idx, track_idx);
     if let Some(actor) = state.scene.actors.get_mut(idx) {
         actor.mellstroy_footage.enabled = true;
@@ -14029,9 +14289,14 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             let delta_t = dx / pps;
                             let mut new_in = (clip_start + delta_t).max(0.0).min(clip_end - 0.1);
                             let source_start_before = state.scene.actors[ai].source_start;
+                            let actor_is_edge_frame =
+                                state.scene.actors[ai].mellstroy_footage.edge_frame;
                             let actor_speed = state.scene.actors[ai].speed.max(0.0001);
-                            let min_in_from_source =
-                                (clip_start - source_start_before / actor_speed).max(0.0);
+                            let min_in_from_source = if actor_is_edge_frame {
+                                0.0
+                            } else {
+                                (clip_start - source_start_before / actor_speed).max(0.0)
+                            };
                             new_in = new_in.max(min_in_from_source);
                             // Snap-to-edges on the in-edge.
                             let (snapped_in, _, snap_t) = apply_snap_to_window(
@@ -14046,10 +14311,13 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             state.timeline_drag.snap_indicator = snap_t;
                             let actual_delta = new_in - clip_start;
                             let token = EditorState::drag_token("trim_actor_left", ai);
+                            let actor_id_for_canvas = state.scene.actors[ai].id.clone();
                             state.mutate_drag(token, |s| {
                                 s.actors[ai].t_in = Some(new_in);
-                                s.actors[ai].source_start =
-                                    (source_start_before + actual_delta * actor_speed).max(0.0);
+                                if !actor_is_edge_frame {
+                                    s.actors[ai].source_start =
+                                        (source_start_before + actual_delta * actor_speed).max(0.0);
+                                }
                                 // Crop scene-time keyframes that fall before the new in-edge.
                                 s.actors[ai].layout.retain(|kf| kf.t >= new_in - 1.0e-3);
                                 if s.actors[ai].layout.is_empty() {
@@ -14058,6 +14326,12 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                         memstroy_core::ActorState::default(),
                                     ));
                                 }
+                                retain_canvas_layout_scene_window(
+                                    s,
+                                    &actor_id_for_canvas,
+                                    new_in,
+                                    clip_end,
+                                );
                             });
                             // Defer overlap-trim until the drag ends —
                             // neighbours stay intact while the clip is
@@ -14091,13 +14365,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             // `t_out_max = t_in + max_clip_dur` where
                             // `max_clip_dur = source_duration - source_start`.
                             let actor = &state.scene.actors[ai];
-                            let hard_cap_out = max_timeline_out_for_media(
-                                state,
-                                &actor.source,
-                                actor.source_start,
-                                actor.speed,
-                                clip_start,
-                            );
+                            let hard_cap_out = max_timeline_out_for_actor(state, actor, clip_start);
                             if let Some(cap) = hard_cap_out {
                                 if new_out > cap {
                                     new_out = cap;
@@ -14122,6 +14390,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             }
                             state.timeline_drag.snap_indicator = snap_t;
                             let token = EditorState::drag_token("trim_actor_right", ai);
+                            let actor_id_for_canvas = state.scene.actors[ai].id.clone();
                             state.mutate_drag(token, |s| {
                                 s.actors[ai].t_out = Some(new_out);
                                 // Crop scene-time keyframes that fall after the new out-edge.
@@ -14133,6 +14402,12 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                         memstroy_core::ActorState::default(),
                                     ));
                                 }
+                                retain_canvas_layout_scene_window(
+                                    s,
+                                    &actor_id_for_canvas,
+                                    clip_start,
+                                    new_out,
+                                );
                             });
                             // Defer overlap-trim until release — same
                             // reasoning as the trim-left arm above.
@@ -14348,6 +14623,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             // them visually attached to the clip bar.
                             let dt_kfs = new_start - clip_start;
                             let token = EditorState::drag_token("move_actor", ai);
+                            let actor_id_for_canvas = state.scene.actors[ai].id.clone();
                             state.mutate_drag(token, |s| {
                                 s.actors[ai].t_in = Some(new_start);
                                 s.actors[ai].t_out = Some(new_start + dur);
@@ -14356,6 +14632,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                         kf.t += dt_kfs;
                                     }
                                 }
+                                shift_canvas_layout_timeline_by(s, &actor_id_for_canvas, dt_kfs);
                             });
                             // Defer overlap-trim until the drag ends —
                             // neighbours on other clips stay intact while
@@ -14603,44 +14880,48 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             let shift = new_in - clip_start;
                             let token = EditorState::drag_token("trim_overlay_left", oi);
                             state.mutate_drag(token, |s| {
-                                let layout: &mut Vec<
-                                    memstroy_core::Keyframe<memstroy_core::OverlayState>,
-                                > = match &mut s.overlays[oi] {
-                                    Overlay::Text(t) => {
-                                        t.t_in = new_in;
-                                        &mut t.layout
+                                {
+                                    let layout: &mut Vec<
+                                        memstroy_core::Keyframe<memstroy_core::OverlayState>,
+                                    > = match &mut s.overlays[oi] {
+                                        Overlay::Text(t) => {
+                                            t.t_in = new_in;
+                                            &mut t.layout
+                                        }
+                                        Overlay::Image(im) => {
+                                            im.t_in = new_in;
+                                            &mut im.layout
+                                        }
+                                        Overlay::Video(v) => {
+                                            let speed = v.speed.max(0.0001);
+                                            v.source_start =
+                                                (v.source_start + shift * speed).max(0.0);
+                                            v.t_in = new_in;
+                                            &mut v.layout
+                                        }
+                                    };
+                                    // Overlay kfs are clip-local, so trimming
+                                    // the in-edge shifts every kf's local
+                                    // time by `-shift` to keep its scene-time
+                                    // anchor stable. Kfs that fall before
+                                    // local_t = 0 are dropped.
+                                    if shift.abs() > 1.0e-6 {
+                                        for kf in layout.iter_mut() {
+                                            kf.t -= shift;
+                                        }
+                                        layout.retain(|kf| kf.t >= -1.0e-3);
+                                        for kf in layout.iter_mut() {
+                                            kf.t = kf.t.max(0.0);
+                                        }
                                     }
-                                    Overlay::Image(im) => {
-                                        im.t_in = new_in;
-                                        &mut im.layout
-                                    }
-                                    Overlay::Video(v) => {
-                                        let speed = v.speed.max(0.0001);
-                                        v.source_start = (v.source_start + shift * speed).max(0.0);
-                                        v.t_in = new_in;
-                                        &mut v.layout
-                                    }
-                                };
-                                // Overlay kfs are clip-local, so trimming
-                                // the in-edge shifts every kf's local
-                                // time by `-shift` to keep its scene-time
-                                // anchor stable. Kfs that fall before
-                                // local_t = 0 are dropped.
-                                if shift.abs() > 1.0e-6 {
-                                    for kf in layout.iter_mut() {
-                                        kf.t -= shift;
-                                    }
-                                    layout.retain(|kf| kf.t >= -1.0e-3);
-                                    for kf in layout.iter_mut() {
-                                        kf.t = kf.t.max(0.0);
+                                    if layout.is_empty() {
+                                        layout.push(memstroy_core::Keyframe::new(
+                                            0.0,
+                                            memstroy_core::OverlayState::default(),
+                                        ));
                                     }
                                 }
-                                if layout.is_empty() {
-                                    layout.push(memstroy_core::Keyframe::new(
-                                        0.0,
-                                        memstroy_core::OverlayState::default(),
-                                    ));
-                                }
+                                retain_canvas_layout_scene_window(s, &element_id, new_in, clip_end);
                             });
                             // Defer overlap-trim until the drag ends.
                             defer_overlap_resolution(state, MovedClipKind::Overlay(oi));
@@ -14688,34 +14969,44 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             state.timeline_drag.snap_indicator = snap_t;
                             let token = EditorState::drag_token("trim_overlay_right", oi);
                             state.mutate_drag(token, |s| {
-                                let (t_in_v, layout): (
-                                    f32,
-                                    &mut Vec<memstroy_core::Keyframe<memstroy_core::OverlayState>>,
-                                ) = match &mut s.overlays[oi] {
-                                    Overlay::Text(t) => {
-                                        t.t_out = new_out;
-                                        (t.t_in, &mut t.layout)
+                                {
+                                    let (t_in_v, layout): (
+                                        f32,
+                                        &mut Vec<
+                                            memstroy_core::Keyframe<memstroy_core::OverlayState>,
+                                        >,
+                                    ) = match &mut s.overlays[oi] {
+                                        Overlay::Text(t) => {
+                                            t.t_out = new_out;
+                                            (t.t_in, &mut t.layout)
+                                        }
+                                        Overlay::Image(im) => {
+                                            im.t_out = new_out;
+                                            (im.t_in, &mut im.layout)
+                                        }
+                                        Overlay::Video(v) => {
+                                            v.t_out = new_out;
+                                            (v.t_in, &mut v.layout)
+                                        }
+                                    };
+                                    // Drop kfs whose local time runs past the
+                                    // new clip duration — they're outside the
+                                    // visible window after the trim.
+                                    let max_local = (new_out - t_in_v).max(0.0) + 1.0e-3;
+                                    layout.retain(|kf| kf.t <= max_local);
+                                    if layout.is_empty() {
+                                        layout.push(memstroy_core::Keyframe::new(
+                                            0.0,
+                                            memstroy_core::OverlayState::default(),
+                                        ));
                                     }
-                                    Overlay::Image(im) => {
-                                        im.t_out = new_out;
-                                        (im.t_in, &mut im.layout)
-                                    }
-                                    Overlay::Video(v) => {
-                                        v.t_out = new_out;
-                                        (v.t_in, &mut v.layout)
-                                    }
-                                };
-                                // Drop kfs whose local time runs past the
-                                // new clip duration — they're outside the
-                                // visible window after the trim.
-                                let max_local = (new_out - t_in_v).max(0.0) + 1.0e-3;
-                                layout.retain(|kf| kf.t <= max_local);
-                                if layout.is_empty() {
-                                    layout.push(memstroy_core::Keyframe::new(
-                                        0.0,
-                                        memstroy_core::OverlayState::default(),
-                                    ));
                                 }
+                                retain_canvas_layout_scene_window(
+                                    s,
+                                    &element_id,
+                                    clip_start,
+                                    new_out,
+                                );
                             });
                             defer_overlap_resolution(state, MovedClipKind::Overlay(oi));
                             to_select = Some(Selection::Overlay(oi));
@@ -14766,19 +15057,23 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                 }
                             }
                             let token = EditorState::drag_token("move_overlay", oi);
-                            state.mutate_drag(token, |s| match &mut s.overlays[oi] {
-                                Overlay::Text(t) => {
-                                    t.t_in = new_start;
-                                    t.t_out = new_end;
+                            let dt_kfs = new_start - clip_start;
+                            state.mutate_drag(token, |s| {
+                                match &mut s.overlays[oi] {
+                                    Overlay::Text(t) => {
+                                        t.t_in = new_start;
+                                        t.t_out = new_end;
+                                    }
+                                    Overlay::Image(im) => {
+                                        im.t_in = new_start;
+                                        im.t_out = new_end;
+                                    }
+                                    Overlay::Video(v) => {
+                                        v.t_in = new_start;
+                                        v.t_out = new_end;
+                                    }
                                 }
-                                Overlay::Image(im) => {
-                                    im.t_in = new_start;
-                                    im.t_out = new_end;
-                                }
-                                Overlay::Video(v) => {
-                                    v.t_in = new_start;
-                                    v.t_out = new_end;
-                                }
+                                shift_canvas_layout_timeline_by(s, &element_id, dt_kfs);
                             });
 
                             // Vertical: re-assign track based on pointer Y.
@@ -15171,6 +15466,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                             for kf in actor.layout.iter_mut() {
                                                 kf.t += dt;
                                             }
+                                            shift_canvas_layout_timeline_by(s, &parent_id, dt);
                                         });
                                     }
                                 }
@@ -15901,22 +16197,80 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                     .and_then(|slot_idx| state.scene.actors.get(slot_idx).map(|a| a.id.clone()))
                     .map(|actor_id| crate::jobs::ClipDropTarget::SequenceSlot { actor_id })
                     .unwrap_or(crate::jobs::ClipDropTarget::TimelineAt { t: drop_time });
+                let duration_hint = state.asset_drag.duration_secs;
                 if kind == AssetDragKind::Clip {
+                    if target_slot.is_none() && dragged_clip_needs_download(state, &asset_path) {
+                        if let Some(new_idx) = add_pending_actor_from_clip_at_time(
+                            state,
+                            &asset_path,
+                            drop_time,
+                            duration_hint,
+                        ) {
+                            state.actor_track_assignments.insert(new_idx, assigned);
+                            let token =
+                                EditorState::drag_token("timeline_pending_clip_drop", new_idx);
+                            let _ = enforce_no_overlap_on_layer(
+                                state,
+                                MovedClipKind::Actor(new_idx),
+                                token,
+                            );
+                            let actor_id = state.scene.actors[new_idx].id.clone();
+                            if try_spawn_lazy_clip_download(
+                                state,
+                                &asset_path,
+                                crate::jobs::ClipDropTarget::ExistingActor { actor_id },
+                            ) {
+                                state.clear_asset_drag();
+                                return;
+                            }
+                        }
+                    }
                     if try_spawn_lazy_clip_download(state, &asset_path, lazy_target) {
                         state.clear_asset_drag();
                         return;
                     }
-                } else if try_spawn_lazy_server_asset_download(
-                    state,
-                    &asset_path,
-                    kind,
-                    crate::jobs::ServerAssetDropTarget::TimelineAt {
-                        t: drop_time,
-                        track_idx: Some(assigned),
-                    },
-                ) {
-                    state.clear_asset_drag();
-                    return;
+                } else {
+                    if target_slot.is_none()
+                        && server_asset_needs_download(state, &asset_path, kind)
+                    {
+                        if let Some(new_idx) = add_pending_actor_from_video_at_time(
+                            state,
+                            &asset_path,
+                            drop_time,
+                            duration_hint,
+                        ) {
+                            state.actor_track_assignments.insert(new_idx, assigned);
+                            let token =
+                                EditorState::drag_token("timeline_pending_video_drop", new_idx);
+                            let _ = enforce_no_overlap_on_layer(
+                                state,
+                                MovedClipKind::Actor(new_idx),
+                                token,
+                            );
+                            let actor_id = state.scene.actors[new_idx].id.clone();
+                            if try_spawn_lazy_server_asset_download(
+                                state,
+                                &asset_path,
+                                kind,
+                                crate::jobs::ServerAssetDropTarget::ExistingActor { actor_id },
+                            ) {
+                                state.clear_asset_drag();
+                                return;
+                            }
+                        }
+                    }
+                    if try_spawn_lazy_server_asset_download(
+                        state,
+                        &asset_path,
+                        kind,
+                        crate::jobs::ServerAssetDropTarget::TimelineAt {
+                            t: drop_time,
+                            track_idx: Some(assigned),
+                        },
+                    ) {
+                        state.clear_asset_drag();
+                        return;
+                    }
                 }
                 if let Some(slot_idx) = target_slot {
                     if fill_footage_sequence_slot(state, slot_idx, &asset_path).is_some() {
@@ -16249,8 +16603,8 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             format!("{}    {}", label, dest_label)
         };
 
-        let card_w = 180.0_f32;
-        let card_h = 56.0_f32;
+        let card_w = 190.0_f32;
+        let card_h = 68.0_f32;
         // Anchor the preview slightly below-right of the cursor.
         let anchor = drag_pos + egui::vec2(14.0, 10.0);
         let card_rect = egui::Rect::from_min_size(anchor, Vec2::new(card_w, card_h));
@@ -16314,6 +16668,27 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             egui::FontId::proportional(11.0),
             Color32::from_rgb(240, 240, 255),
         );
+        let mut meta = Vec::new();
+        if preview_duration_known {
+            meta.push(format!("{:.2}s", preview_duration));
+        }
+        if let (Some(w), Some(h)) = (state.asset_drag.width, state.asset_drag.height) {
+            if w > 0 && h > 0 {
+                meta.push(format!("{}x{}", w, h));
+            }
+        }
+        if state.asset_drag.server_id.is_some() && !state.asset_drag.downloaded {
+            meta.push(crate::i18n::t("downloads on drop").to_string());
+        }
+        if !meta.is_empty() {
+            ui.painter().text(
+                text_anchor + egui::vec2(0.0, 18.0),
+                egui::Align2::LEFT_TOP,
+                meta.join("  |  "),
+                egui::FontId::proportional(9.5),
+                Color32::from_rgb(178, 185, 200),
+            );
+        }
         // Drop-time pill at the bottom of the card. When duration is
         // already known, show the real occupied interval instead of a
         // vague start-only hint.
@@ -19018,11 +19393,11 @@ fn draw_param_kf_rows(
             if !strip_visible {
                 continue;
             }
-            if x < strip_x_start - half - 200.0 || x > strip_x_end + half + 200.0 {
-                // Far off-screen — skip entirely. The 200 px padding
-                // keeps a kf alive (still hit-tested for drag continuity)
-                // when the user has dragged it just past the visible
-                // edge of the strip.
+            if x < strip_x_start - half || x > strip_x_end + half {
+                // Keep diamonds strictly attached to the owning clip.
+                // Keyframes outside the element window may exist in
+                // older projects or from pre-fix copy/paste, but they
+                // must not be shown where there is no clip.
                 continue;
             }
 
@@ -19956,6 +20331,49 @@ pub(crate) fn clip_thumbnail_for_source(
         .iter()
         .find(|c| c.server_id.as_deref() == Some(stem) || c.path == source)
         .and_then(|c| c.thumbnail.clone())
+        .or_else(|| {
+            state
+                .library
+                .videos
+                .iter()
+                .find(|asset| asset.server_id.as_deref() == Some(stem) || asset.path == source)
+                .and_then(|asset| asset.thumbnail.clone())
+        })
+}
+
+pub(crate) fn media_dimensions_for_source(
+    state: &EditorState,
+    source: &std::path::Path,
+) -> Option<(u32, u32)> {
+    fn valid_dims(width: Option<u32>, height: Option<u32>) -> Option<(u32, u32)> {
+        let (Some(w), Some(h)) = (width, height) else {
+            return None;
+        };
+        (w > 0 && h > 0).then_some((w, h))
+    }
+
+    if let Some(clip) = find_library_clip_by_path(state, source) {
+        if let Some(dims) = valid_dims(clip.width, clip.height) {
+            return Some(dims);
+        }
+    }
+    let stem = source.file_stem()?.to_str()?;
+    if let Some(clip) = state
+        .library
+        .mellstroy_clips
+        .iter()
+        .find(|c| c.server_id.as_deref() == Some(stem) || c.path == source)
+    {
+        if let Some(dims) = valid_dims(clip.width, clip.height) {
+            return Some(dims);
+        }
+    }
+    state
+        .library
+        .videos
+        .iter()
+        .find(|asset| asset.server_id.as_deref() == Some(stem) || asset.path == source)
+        .and_then(|asset| valid_dims(asset.width, asset.height))
 }
 
 fn spawn_media_duration_probe(state: &mut EditorState, path: &PathBuf, actor_id: String) {
@@ -20021,6 +20439,13 @@ fn max_timeline_out_for_media(
     Some(t_in + visible)
 }
 
+fn max_timeline_out_for_actor(state: &EditorState, actor: &Actor, t_in: f32) -> Option<f32> {
+    if actor.mellstroy_footage.edge_frame {
+        return None;
+    }
+    max_timeline_out_for_media(state, &actor.source, actor.source_start, actor.speed, t_in)
+}
+
 /// Re-measure actor clips from the duration cache and extend `t_out` when it
 /// was left at the placeholder length. Does not shell out to ffprobe on the
 /// UI thread — callers that know the real duration (frame extraction) should
@@ -20042,12 +20467,12 @@ pub fn reconcile_actor_clip_durations(state: &mut EditorState) {
 
 pub fn add_actor_from_clip(state: &mut EditorState, path: &PathBuf) {
     let t = state.playhead;
-    let _ = add_actor_from_clip_at_time_with_footage_flag(state, path, t, true);
+    let _ = add_actor_from_clip_at_time_with_footage_flag(state, path, t, true, false, None);
 }
 
 pub fn add_actor_from_video_asset(state: &mut EditorState, path: &PathBuf) {
     let t = state.playhead;
-    let _ = add_actor_from_clip_at_time_with_footage_flag(state, path, t, false);
+    let _ = add_actor_from_clip_at_time_with_footage_flag(state, path, t, false, false, None);
 }
 
 /// Load chroma sidecar for `path`, falling back to default when absent.
@@ -20127,6 +20552,39 @@ pub(crate) fn sync_audio_to_actor(state: &mut EditorState, actor_idx: usize) {
         au.t_out = t_out;
         au.source_start = source_start;
     }
+}
+
+pub(crate) fn finalize_pending_actor_download(
+    state: &mut EditorState,
+    actor_id: &str,
+    source: &PathBuf,
+) -> bool {
+    let Some(actor_idx) = state
+        .scene
+        .actors
+        .iter()
+        .position(|actor| actor.id == actor_id)
+    else {
+        return false;
+    };
+
+    let (t_in, t_out, source_start) = {
+        let actor = &mut state.scene.actors[actor_idx];
+        actor.source = source.clone();
+        actor.mute_audio = false;
+        (
+            actor.t_in.unwrap_or(0.0),
+            actor.t_out,
+            actor.source_start.max(0.0),
+        )
+    };
+    if find_audio_for_actor(state, actor_id).is_none() {
+        push_audio_track_for_actor(state, actor_id, source, t_in, t_out, source_start);
+    } else {
+        sync_audio_to_actor(state, actor_idx);
+    }
+    state.request_media_preview = true;
+    true
 }
 
 /// Mark every audio track bound to the actor as deleted (instead of removing
@@ -20259,7 +20717,7 @@ pub(crate) fn add_actor_from_clip_at_time(
     path: &PathBuf,
     t: f32,
 ) -> Option<usize> {
-    add_actor_from_clip_at_time_with_footage_flag(state, path, t, true)
+    add_actor_from_clip_at_time_with_footage_flag(state, path, t, true, false, None)
 }
 
 pub(crate) fn add_actor_from_video_at_time(
@@ -20267,7 +20725,25 @@ pub(crate) fn add_actor_from_video_at_time(
     path: &PathBuf,
     t: f32,
 ) -> Option<usize> {
-    add_actor_from_clip_at_time_with_footage_flag(state, path, t, false)
+    add_actor_from_clip_at_time_with_footage_flag(state, path, t, false, false, None)
+}
+
+pub(crate) fn add_pending_actor_from_clip_at_time(
+    state: &mut EditorState,
+    path: &PathBuf,
+    t: f32,
+    duration_hint: Option<f32>,
+) -> Option<usize> {
+    add_actor_from_clip_at_time_with_footage_flag(state, path, t, true, true, duration_hint)
+}
+
+pub(crate) fn add_pending_actor_from_video_at_time(
+    state: &mut EditorState,
+    path: &PathBuf,
+    t: f32,
+    duration_hint: Option<f32>,
+) -> Option<usize> {
+    add_actor_from_clip_at_time_with_footage_flag(state, path, t, false, true, duration_hint)
 }
 
 fn add_actor_from_clip_at_time_with_footage_flag(
@@ -20275,8 +20751,11 @@ fn add_actor_from_clip_at_time_with_footage_flag(
     path: &PathBuf,
     t: f32,
     mellstroy_footage_enabled: bool,
+    allow_unready: bool,
+    duration_hint: Option<f32>,
 ) -> Option<usize> {
-    if !is_usable_local_video(path) {
+    let source_ready = is_usable_local_video(path);
+    if !source_ready && !allow_unready {
         state.status = crate::i18n::t("Video file is not ready yet — wait for download").into();
         return None;
     }
@@ -20290,7 +20769,16 @@ fn add_actor_from_clip_at_time_with_footage_flag(
 
     // Never block the UI thread on ffprobe — use cache, a short default,
     // then refine timing when the background probe finishes.
-    let clip_duration = clip_duration_for_placement(state, path, &id);
+    let clip_duration = duration_hint
+        .filter(|d| d.is_finite() && *d > 0.01)
+        .or_else(|| state.video_duration_cache.get(path).copied())
+        .unwrap_or_else(|| {
+            if source_ready {
+                clip_duration_for_placement(state, path, &id)
+            } else {
+                crate::split_crop::CLIP_DURATION_PLACEHOLDER_SEC
+            }
+        });
     let t_in = t.max(0.0);
     let t_out = t_in + clip_duration.max(0.1);
     let target_lane = state.pick_or_create_empty_video_lane_for_range(t_in, t_out);
@@ -20298,9 +20786,15 @@ fn add_actor_from_clip_at_time_with_footage_flag(
     // Per-clip chroma settings live next to the source file (`<clip>.chroma.json`).
     // This is independent of the project, so re-using the same Mellstroy clip
     // in another scene starts pre-tuned.
-    let chroma = load_chroma_for_clip(path);
+    let chroma = if source_ready {
+        load_chroma_for_clip(path)
+    } else {
+        ChromaKeyParams::default()
+    };
     // Likewise, auto-attach a skeleton template if one was saved for this clip.
-    ensure_skeleton_template_for_clip(state, path);
+    if source_ready {
+        ensure_skeleton_template_for_clip(state, path);
+    }
 
     let actor = Actor {
         id: id.clone(),
@@ -20340,14 +20834,20 @@ fn add_actor_from_clip_at_time_with_footage_flag(
         .actor_track_assignments
         .insert(new_actor_idx, target_lane);
 
-    // Also push an AudioTrack referencing the same source so the embedded
-    // audio appears as its own row on the audio lanes (and gains a waveform,
-    // volume slider, etc. on the inspector).
-    push_audio_track_for_actor(state, &id, path, t_in, Some(t_out), 0.0);
+    // Also push an AudioTrack once the source is readable. Pending
+    // downloads keep the visual actor immediately visible and add audio
+    // in `finalize_pending_actor_download`.
+    if source_ready {
+        push_audio_track_for_actor(state, &id, path, t_in, Some(t_out), 0.0);
+    }
 
     state.selection = Selection::Actor(new_actor_idx);
     state.request_media_preview = true;
-    state.status = format!("{} {}", crate::i18n::t("Dropped actor:"), id);
+    state.status = if source_ready {
+        format!("{} {}", crate::i18n::t("Dropped actor:"), id)
+    } else {
+        format!("{} {}", crate::i18n::t("Downloading placeholder:"), id)
+    };
     Some(new_actor_idx)
 }
 
@@ -20382,7 +20882,8 @@ pub(crate) fn add_actor_from_clip_at_canvas(
     path: &PathBuf,
     world_pos: [f32; 2],
 ) {
-    add_actor_from_clip_at_canvas_with_footage_flag(state, path, world_pos, true);
+    let _ =
+        add_actor_from_clip_at_canvas_with_footage_flag(state, path, world_pos, true, false, None);
 }
 
 pub(crate) fn add_actor_from_video_at_canvas(
@@ -20390,7 +20891,40 @@ pub(crate) fn add_actor_from_video_at_canvas(
     path: &PathBuf,
     world_pos: [f32; 2],
 ) {
-    add_actor_from_clip_at_canvas_with_footage_flag(state, path, world_pos, false);
+    let _ =
+        add_actor_from_clip_at_canvas_with_footage_flag(state, path, world_pos, false, false, None);
+}
+
+pub(crate) fn add_pending_actor_from_clip_at_canvas(
+    state: &mut EditorState,
+    path: &PathBuf,
+    world_pos: [f32; 2],
+    duration_hint: Option<f32>,
+) -> Option<usize> {
+    add_actor_from_clip_at_canvas_with_footage_flag(
+        state,
+        path,
+        world_pos,
+        true,
+        true,
+        duration_hint,
+    )
+}
+
+pub(crate) fn add_pending_actor_from_video_at_canvas(
+    state: &mut EditorState,
+    path: &PathBuf,
+    world_pos: [f32; 2],
+    duration_hint: Option<f32>,
+) -> Option<usize> {
+    add_actor_from_clip_at_canvas_with_footage_flag(
+        state,
+        path,
+        world_pos,
+        false,
+        true,
+        duration_hint,
+    )
 }
 
 fn add_actor_from_clip_at_canvas_with_footage_flag(
@@ -20398,16 +20932,20 @@ fn add_actor_from_clip_at_canvas_with_footage_flag(
     path: &PathBuf,
     world_pos: [f32; 2],
     mellstroy_footage_enabled: bool,
-) {
+    allow_unready: bool,
+    duration_hint: Option<f32>,
+) -> Option<usize> {
     let t = state.playhead;
     let new_actor_idx = match add_actor_from_clip_at_time_with_footage_flag(
         state,
         path,
         t,
         mellstroy_footage_enabled,
+        allow_unready,
+        duration_hint,
     ) {
         Some(i) => i,
-        None => return,
+        None => return None,
     };
     let actor_id = state.scene.actors[new_actor_idx].id.clone();
 
@@ -20457,6 +20995,7 @@ fn add_actor_from_clip_at_canvas_with_footage_flag(
         world_pos[0],
         world_pos[1]
     );
+    Some(new_actor_idx)
 }
 
 #[cfg(test)]
@@ -20724,6 +21263,53 @@ mod timeline_resolution_tests {
         assert_close(state.scene.actors[1].t_out.unwrap(), 3.0);
         assert_close(state.scene.actors[2].t_in.unwrap(), 3.0);
         assert_close(state.scene.actors[2].t_out.unwrap(), 3.5);
+    }
+
+    #[test]
+    fn sequence_move_shifts_canvas_keyframes_with_actor() {
+        let mut state = test_state();
+        state.tracks = vec![crate::state::Track::video("V1")];
+
+        let mut clip = actor("clip", 2.0, 5.0, 0.0, 1.0);
+        clip.layout = vec![Keyframe::new(
+            2.0,
+            ActorState {
+                pos: [0.25, 0.4],
+                ..ActorState::default()
+            },
+        )
+        .with_param_owner(param_ids::POS_X)];
+        clip.mellstroy_footage.enabled = true;
+        clip.mellstroy_footage.sequence_id = Some("seq".into());
+        state.scene.actors.push(clip);
+        state.actor_track_assignments.insert(0, 0);
+        state.scene.canvas_layouts.push(CanvasLayout {
+            element_id: "clip".into(),
+            keyframes: vec![Keyframe::new(
+                2.0,
+                CanvasTransform {
+                    pos: WorldPos { x: 320.0, y: 240.0 },
+                    ..CanvasTransform::default()
+                },
+            )
+            .with_param_owner(param_ids::POS_X)],
+        });
+
+        let anchors = vec![crate::state::GroupMoveAnchor {
+            sel: Selection::Actor(0),
+            t_in: 2.0,
+            track: Some(0),
+        }];
+
+        let applied = move_footage_sequence_from_anchors(&mut state, "seq", &anchors, 1.5);
+
+        assert_close(applied, 1.5);
+        assert_close(state.scene.actors[0].t_in.unwrap(), 3.5);
+        assert_close(state.scene.actors[0].layout[0].t, 3.5);
+        assert_close(state.scene.canvas_layouts[0].keyframes[0].t, 3.5);
+        let sampled =
+            memstroy_core::sample_canvas_layout(&state.scene.canvas_layouts[0].keyframes, 3.5);
+        assert_close(sampled.pos.x, 320.0);
     }
 
     #[test]

@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 
 use crate::keyframe::{self, Keyframe};
 use crate::param_ids;
-use crate::{ActorState, OverlayState, RenderFrameState};
+use crate::{ActorState, CanvasTransform, OverlayState, RenderFrameState};
 
 const EPS: f32 = 1.0e-4;
 const TIME_EPS: f32 = 1.0 / 120.0;
@@ -133,59 +133,26 @@ where
 
 pub fn actor_param_timeline_times(
     layout: &[Keyframe<ActorState>],
-    animated_params: &BTreeSet<String>,
+    _animated_params: &BTreeSet<String>,
     param_id: &str,
 ) -> Vec<f32> {
-    param_timeline_times_with_owners(
-        layout,
-        |s| actor_get(s, param_id),
-        |i| other_actor_fields_changed_at(layout, animated_params, param_id, i),
-        |i| layout_keyframe_owns_param(layout, i, param_id),
-    )
+    owned_param_times(layout, |s| actor_get(s, param_id), param_id)
 }
 
 pub fn overlay_param_timeline_times(
     layout: &[Keyframe<OverlayState>],
-    animated_params: &BTreeSet<String>,
+    _animated_params: &BTreeSet<String>,
     param_id: &str,
 ) -> Vec<f32> {
-    param_timeline_times_with_owners(
-        layout,
-        |s| overlay_get(s, param_id),
-        |i| other_overlay_fields_changed_at(layout, animated_params, param_id, i),
-        |i| layout_keyframe_owns_param(layout, i, param_id),
-    )
+    owned_param_times(layout, |s| overlay_get(s, param_id), param_id)
 }
 
 pub fn render_frame_param_timeline_times(
     layout: &[Keyframe<RenderFrameState>],
-    animated_params: &BTreeSet<String>,
+    _animated_params: &BTreeSet<String>,
     param_id: &str,
 ) -> Vec<f32> {
-    param_timeline_times_with_owners(
-        layout,
-        |s| rf_get(s, param_id),
-        |i| other_rf_fields_changed_at(layout, animated_params, param_id, i),
-        |i| layout_keyframe_owns_param(layout, i, param_id),
-    )
-}
-
-fn layout_keyframe_owns_param<T>(layout: &[Keyframe<T>], i: usize, param_id: &str) -> bool {
-    layout
-        .get(i)
-        .map(|kf| kf.param_owners.is_empty() || kf.param_owners.contains(param_id))
-        .unwrap_or(false)
-}
-
-fn layout_keyframe_explicitly_owns_param<T>(
-    layout: &[Keyframe<T>],
-    i: usize,
-    param_id: &str,
-) -> bool {
-    layout
-        .get(i)
-        .map(|kf| kf.param_owners.contains(param_id))
-        .unwrap_or(false)
+    owned_param_times(layout, |s| rf_get(s, param_id), param_id)
 }
 
 fn layout_index_at_time<T>(layout: &[Keyframe<T>], t: f32) -> usize {
@@ -193,6 +160,79 @@ fn layout_index_at_time<T>(layout: &[Keyframe<T>], t: f32) -> usize {
         .iter()
         .position(|kf| (kf.t - t).abs() < TIME_EPS)
         .unwrap_or(0)
+}
+
+fn keyframe_relevant_to_param<T>(kf: &Keyframe<T>, param_id: &str) -> bool {
+    kf.param_owners.is_empty() || kf.param_owners.contains(param_id)
+}
+
+fn owned_param_times<T, F>(layout: &[Keyframe<T>], get: F, param_id: &str) -> Vec<f32>
+where
+    F: Fn(&T) -> f32 + Copy,
+{
+    if layout.is_empty() {
+        return Vec::new();
+    }
+
+    let mut explicit: Vec<f32> = layout
+        .iter()
+        .filter_map(|kf| kf.param_owners.contains(param_id).then_some(kf.t))
+        .collect();
+    if !explicit.is_empty() {
+        explicit.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        explicit.dedup_by(|a, b| (*a - *b).abs() < TIME_EPS);
+        return explicit;
+    }
+
+    let relevant: Vec<usize> = layout
+        .iter()
+        .enumerate()
+        .filter_map(|(i, kf)| keyframe_relevant_to_param(kf, param_id).then_some(i))
+        .collect();
+    if relevant.is_empty() {
+        return Vec::new();
+    }
+
+    if relevant.len() == 1 {
+        let kf = &layout[relevant[0]];
+        return if kf.param_owners.contains(param_id) || kf.t.abs() >= TIME_EPS {
+            vec![kf.t]
+        } else {
+            Vec::new()
+        };
+    }
+
+    let param_has_value_change = relevant.windows(2).any(|pair| {
+        let a = pair[0];
+        let b = pair[1];
+        (get(&layout[b].value) - get(&layout[a].value)).abs() > EPS
+    });
+
+    let mut times = Vec::new();
+    for pair in relevant.windows(2) {
+        let prev_i = pair[0];
+        let cur_i = pair[1];
+        let prev = &layout[prev_i];
+        let cur = &layout[cur_i];
+        if (get(&cur.value) - get(&prev.value)).abs() > EPS {
+            if times.is_empty() && prev_i == relevant[0] {
+                times.push(prev.t);
+            }
+            times.push(cur.t);
+        } else if !param_has_value_change && cur.param_owners.contains(param_id) {
+            times.push(cur.t);
+        }
+    }
+
+    if times.is_empty() {
+        let first = &layout[relevant[0]];
+        if first.param_owners.contains(param_id) || first.t.abs() >= TIME_EPS {
+            times.push(first.t);
+        }
+    }
+    times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    times.dedup_by(|a, b| (*a - *b).abs() < TIME_EPS);
+    times
 }
 
 /// Build a scalar track for one field. A single keyframe ⇒ constant value.
@@ -243,9 +283,7 @@ fn sample_actor_field(
     default: f32,
 ) -> f32 {
     if animated_params.contains(param_id) {
-        let times = param_change_times_with_owners(layout, &get, |i| {
-            layout_keyframe_explicitly_owns_param(layout, i, param_id)
-        });
+        let times = owned_param_times(layout, &get, param_id);
         sample_scalar_track(layout, &times, t, &get, default)
     } else {
         layout.first().map(|kf| get(&kf.value)).unwrap_or(default)
@@ -340,9 +378,7 @@ fn sample_overlay_field(
     default: f32,
 ) -> f32 {
     if animated_params.contains(param_id) {
-        let times = param_change_times_with_owners(layout, &get, |i| {
-            layout_keyframe_explicitly_owns_param(layout, i, param_id)
-        });
+        let times = owned_param_times(layout, &get, param_id);
         sample_scalar_track(layout, &times, t, &get, default)
     } else {
         layout.first().map(|kf| get(&kf.value)).unwrap_or(default)
@@ -437,9 +473,7 @@ fn sample_rf_field(
     default: f32,
 ) -> f32 {
     if animated_params.contains(param_id) {
-        let times = param_change_times_with_owners(layout, &get, |i| {
-            layout_keyframe_explicitly_owns_param(layout, i, param_id)
-        });
+        let times = owned_param_times(layout, &get, param_id);
         sample_scalar_track(layout, &times, t, &get, default)
     } else {
         layout.first().map(|kf| get(&kf.value)).unwrap_or(default)
@@ -492,6 +526,51 @@ pub fn sample_render_frame_layout(
             base.rotation_deg,
         ),
     }
+}
+
+pub fn canvas_param_timeline_times(
+    layout: &[Keyframe<CanvasTransform>],
+    param_id: &str,
+) -> Vec<f32> {
+    owned_param_times(layout, |s| canvas_get(s, param_id), param_id)
+}
+
+fn sample_canvas_field(
+    layout: &[Keyframe<CanvasTransform>],
+    param_id: &str,
+    t: f32,
+    get: impl Fn(&CanvasTransform) -> f32,
+    default: f32,
+) -> f32 {
+    let times = owned_param_times(layout, &get, param_id);
+    sample_scalar_track(layout, &times, t, &get, default)
+}
+
+pub fn sample_canvas_layout(layout: &[Keyframe<CanvasTransform>], t: f32) -> CanvasTransform {
+    if layout.is_empty() {
+        return CanvasTransform::default();
+    }
+    let base = &layout[0].value;
+    CanvasTransform {
+        pos: crate::canvas::WorldPos {
+            x: sample_canvas_field(layout, param_ids::POS_X, t, |s| s.pos.x, base.pos.x),
+            y: sample_canvas_field(layout, param_ids::POS_Y, t, |s| s.pos.y, base.pos.y),
+        },
+        width: base.width,
+        scale: sample_canvas_field(layout, param_ids::SCALE, t, |s| s.scale, base.scale),
+        rotation_deg: sample_canvas_field(
+            layout,
+            param_ids::ROTATION,
+            t,
+            |s| s.rotation_deg,
+            base.rotation_deg,
+        ),
+        opacity: sample_canvas_field(layout, param_ids::OPACITY, t, |s| s.opacity, base.opacity),
+    }
+}
+
+pub fn sample_canvas_param_at(layout: &[Keyframe<CanvasTransform>], param_id: &str, t: f32) -> f32 {
+    canvas_get(&sample_canvas_layout(layout, t), param_id)
 }
 
 fn remove_layout_times<T: Clone>(layout: &mut Vec<Keyframe<T>>, times: &[f32]) {
@@ -584,6 +663,29 @@ fn rf_set(s: &mut RenderFrameState, param_id: &str, v: f32) {
         param_ids::POS_Y => s.pos.y = v,
         param_ids::SCALE => s.zoom = v,
         param_ids::ROTATION => s.rotation_deg = v,
+        _ => {}
+    }
+}
+
+fn canvas_get(s: &CanvasTransform, param_id: &str) -> f32 {
+    match param_id {
+        param_ids::POS_X => s.pos.x,
+        param_ids::POS_Y => s.pos.y,
+        param_ids::SCALE => s.scale,
+        param_ids::ROTATION => s.rotation_deg,
+        param_ids::OPACITY => s.opacity,
+        _ => 0.0,
+    }
+}
+
+#[allow(dead_code)]
+fn canvas_set(s: &mut CanvasTransform, param_id: &str, v: f32) {
+    match param_id {
+        param_ids::POS_X => s.pos.x = v,
+        param_ids::POS_Y => s.pos.y = v,
+        param_ids::SCALE => s.scale = v,
+        param_ids::ROTATION => s.rotation_deg = v,
+        param_ids::OPACITY => s.opacity = v,
         _ => {}
     }
 }
@@ -1361,6 +1463,128 @@ mod tests {
             vec![8.0],
             "rotation row must not inherit position times: {rot_times:?}"
         );
+    }
+
+    #[test]
+    fn owned_keyframes_keep_animated_params_independent() {
+        let mut animated = BTreeSet::new();
+        animated.insert(param_ids::POS_X.to_string());
+        animated.insert(param_ids::SCALE.to_string());
+        animated.insert(param_ids::ROTATION.to_string());
+
+        let layout = vec![
+            Keyframe::new(
+                4.0,
+                ActorState {
+                    pos: [0.5, 0.7],
+                    scale: 1.0,
+                    rotation_deg: 0.0,
+                    ..ActorState::default()
+                },
+            )
+            .with_param_owner(param_ids::POS_X),
+            Keyframe::new(
+                5.5,
+                ActorState {
+                    pos: [0.1, 0.7],
+                    scale: 0.11,
+                    rotation_deg: 0.0,
+                    ..ActorState::default()
+                },
+            )
+            .with_param_owner(param_ids::SCALE),
+            Keyframe::new(
+                6.0,
+                ActorState {
+                    pos: [0.9, 0.7],
+                    scale: 0.11,
+                    rotation_deg: 30.0,
+                    ..ActorState::default()
+                },
+            )
+            .with_param_owner(param_ids::ROTATION),
+        ];
+
+        assert_eq!(
+            actor_param_timeline_times(&layout, &animated, param_ids::POS_X),
+            vec![4.0]
+        );
+        assert_eq!(
+            actor_param_timeline_times(&layout, &animated, param_ids::SCALE),
+            vec![5.5]
+        );
+        assert_eq!(
+            actor_param_timeline_times(&layout, &animated, param_ids::ROTATION),
+            vec![6.0]
+        );
+
+        let sampled = sample_actor_layout(&layout, &animated, 6.0);
+        assert!(
+            (sampled.pos[0] - 0.5).abs() < EPS,
+            "scale/rotation snapshots must not move position X"
+        );
+        assert!((sampled.scale - 0.11).abs() < EPS);
+        assert!((sampled.rotation_deg - 30.0).abs() < EPS);
+    }
+
+    #[test]
+    fn canvas_sampling_keeps_position_scale_rotation_independent() {
+        let layout = vec![
+            Keyframe::new(
+                1.0,
+                CanvasTransform {
+                    pos: crate::canvas::WorldPos { x: 100.0, y: 200.0 },
+                    scale: 1.0,
+                    rotation_deg: 0.0,
+                    opacity: 1.0,
+                    ..CanvasTransform::default()
+                },
+            )
+            .with_param_owner(param_ids::POS_X),
+            Keyframe::new(
+                2.0,
+                CanvasTransform {
+                    pos: crate::canvas::WorldPos { x: 999.0, y: 200.0 },
+                    scale: 0.25,
+                    rotation_deg: 0.0,
+                    opacity: 1.0,
+                    ..CanvasTransform::default()
+                },
+            )
+            .with_param_owner(param_ids::SCALE),
+            Keyframe::new(
+                3.0,
+                CanvasTransform {
+                    pos: crate::canvas::WorldPos { x: 444.0, y: 200.0 },
+                    scale: 0.25,
+                    rotation_deg: 45.0,
+                    opacity: 1.0,
+                    ..CanvasTransform::default()
+                },
+            )
+            .with_param_owner(param_ids::ROTATION),
+        ];
+
+        assert_eq!(
+            canvas_param_timeline_times(&layout, param_ids::POS_X),
+            vec![1.0]
+        );
+        assert_eq!(
+            canvas_param_timeline_times(&layout, param_ids::SCALE),
+            vec![2.0]
+        );
+        assert_eq!(
+            canvas_param_timeline_times(&layout, param_ids::ROTATION),
+            vec![3.0]
+        );
+
+        let sampled = sample_canvas_layout(&layout, 3.0);
+        assert!(
+            (sampled.pos.x - 100.0).abs() < EPS,
+            "unowned scale/rotation snapshots must not move canvas X"
+        );
+        assert!((sampled.scale - 0.25).abs() < EPS);
+        assert!((sampled.rotation_deg - 45.0).abs() < EPS);
     }
 
     #[test]

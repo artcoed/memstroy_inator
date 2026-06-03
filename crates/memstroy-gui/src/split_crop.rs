@@ -1,14 +1,34 @@
 //! Shared helpers for timeline / layer razor splits: trim clip windows and
 //! crop every keyframe track that uses scene-time or clip-local time.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use memstroy_core::{
     keyframe::{self, Keyframe, TrackModifier},
-    Actor, ActorState, Overlay, Scene, Transition,
+    Actor, ActorState, CanvasTransform, Overlay, Scene, Transition,
 };
 
 const EPS: f32 = 1.0e-3;
+
+fn canvas_boundary_keyframe(
+    layout: &[Keyframe<CanvasTransform>],
+    t: f32,
+) -> Keyframe<CanvasTransform> {
+    let mut owners = BTreeSet::new();
+    let mut has_legacy_full_state = false;
+    for kf in layout {
+        if kf.param_owners.is_empty() {
+            has_legacy_full_state = true;
+        } else {
+            owners.extend(kf.param_owners.iter().cloned());
+        }
+    }
+    let mut out = Keyframe::new(t.max(0.0), memstroy_core::sample_canvas_layout(layout, t));
+    if !has_legacy_full_state {
+        out.param_owners = owners;
+    }
+    out
+}
 
 /// Default timeline span before ffprobe / frame extraction report a real
 /// duration (`clip_duration_for_placement` in the timeline UI).
@@ -30,6 +50,9 @@ pub fn actor_source_window_cap(
 /// drop placeholder length, clamp overstretched bars, and leave razor splits /
 /// manual trims untouched.
 pub fn reconcile_actor_t_out_for_source(actor: &mut Actor, source_duration: f32) {
+    if actor.mellstroy_footage.edge_frame {
+        return;
+    }
     let t_in = actor.t_in.unwrap_or(0.0);
     let cap = actor_source_window_cap(t_in, actor.source_start, actor.speed, source_duration);
     let Some(cur) = actor.t_out else {
@@ -103,7 +126,13 @@ pub fn crop_canvas_layouts_left(scene: &mut Scene, element_id: &str, cut_t: f32)
     else {
         return;
     };
+    let boundary = canvas_boundary_keyframe(&cl.keyframes, cut_t);
     cl.keyframes.retain(|kf| kf.t <= cut_t + EPS);
+    if !cl.keyframes.iter().any(|kf| (kf.t - cut_t).abs() < EPS) {
+        cl.keyframes.push(boundary);
+    }
+    cl.keyframes
+        .sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
 }
 
 /// Duplicate canvas layout for a new element id (right half of a split).
@@ -121,23 +150,34 @@ pub fn duplicate_canvas_layout_for_split(
     else {
         return;
     };
-    let sample_at_cut = keyframe::sample(&src.keyframes, cut_t);
+    let sample_at_cut = canvas_boundary_keyframe(&src.keyframes, cut_t);
     let mut right_cl = src;
     right_cl.element_id = to_id.to_string();
     // Canvas layout keyframes use scene time — keep absolute `t`, only trim.
     right_cl.keyframes.retain(|kf| kf.t >= cut_t - EPS);
-    if right_cl.keyframes.is_empty() {
-        if let Some(v) = sample_at_cut {
-            right_cl.keyframes.push(Keyframe::new(cut_t, v));
-        }
+    if !right_cl
+        .keyframes
+        .iter()
+        .any(|kf| (kf.t - cut_t).abs() < EPS)
+    {
+        right_cl.keyframes.push(sample_at_cut.clone());
     }
+    right_cl
+        .keyframes
+        .sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
     scene.canvas_layouts.push(right_cl);
     if let Some(left) = scene
         .canvas_layouts
         .iter_mut()
         .find(|cl| cl.element_id == from_id)
     {
+        let boundary = canvas_boundary_keyframe(&left.keyframes, cut_t);
         left.keyframes.retain(|kf| kf.t <= cut_t + EPS);
+        if !left.keyframes.iter().any(|kf| (kf.t - cut_t).abs() < EPS) {
+            left.keyframes.push(boundary);
+        }
+        left.keyframes
+            .sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
     }
 }
 
@@ -427,7 +467,6 @@ mod tests {
         keyframe::TrackModifier, ActorState, ImageOverlay, Overlay, OverlayState, Transition,
         VideoOverlay,
     };
-    use serde_json::json;
 
     const TEPS: f32 = 1.0e-3;
 
@@ -931,5 +970,18 @@ mod tests {
         a.source_start = 0.0;
         super::reconcile_actor_t_out_for_source(&mut a, 30.0);
         assert_eq!(a.t_out, Some(30.0));
+    }
+
+    #[test]
+    fn reconcile_actor_t_out_keeps_edge_frame_open_ended() {
+        let mut a = mk_actor(Some(1.0), Some(500.0));
+        a.source_start = 99.0;
+        a.speed = 0.0001;
+        a.mellstroy_footage.edge_frame = true;
+
+        super::reconcile_actor_t_out_for_source(&mut a, 100.0);
+
+        assert_eq!(a.t_out, Some(500.0));
+        assert_eq!(a.source_start, 99.0);
     }
 }

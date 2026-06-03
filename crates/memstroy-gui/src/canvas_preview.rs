@@ -78,6 +78,77 @@ fn actor_track_index(state: &EditorState, actor_idx: usize) -> usize {
         })
 }
 
+fn actor_source_dimensions(state: &EditorState, actor_idx: usize) -> (f32, f32) {
+    if let Some(fc) = state.frame_caches.get(actor_idx) {
+        if fc.is_ready() && fc.frame_count > 0 {
+            return (fc.source_width as f32, fc.source_height as f32);
+        }
+    }
+    if let Some(actor) = state.scene.actors.get(actor_idx) {
+        if let Some((w, h)) = crate::panels::media_dimensions_for_source(state, &actor.source) {
+            if let Some((preview_w, preview_h)) =
+                crate::video_cache::scaled_preview_dimensions(w, h, state.scene.actors.len())
+            {
+                return (preview_w as f32, preview_h as f32);
+            }
+            return (w as f32, h as f32);
+        }
+    }
+    (1080.0, 1920.0)
+}
+
+fn actor_source_waits_for_download(state: &EditorState, source: &std::path::Path) -> bool {
+    if state.pending_clip_downloads.contains(source) {
+        return true;
+    }
+    let Some(stem) = source.file_stem().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    state.library.mellstroy_clips.iter().any(|clip| {
+        clip.server_id.is_some()
+            && !clip.downloaded
+            && (clip.path == source || clip.server_id.as_deref() == Some(stem))
+    }) || state.library.videos.iter().any(|asset| {
+        asset.server_id.is_some()
+            && !asset.downloaded
+            && (asset.path == source || asset.server_id.as_deref() == Some(stem))
+    })
+}
+
+fn draw_canvas_media_loader(ui: &egui::Ui, painter: &egui::Painter, rect: Rect, label: &str) {
+    painter.rect_filled(
+        rect,
+        Rounding::same(3.0),
+        Color32::from_rgba_premultiplied(18, 18, 20, 135),
+    );
+
+    let t = ui.input(|i| i.time) as f32;
+    let center = rect.center();
+    let dot_y = center.y - if rect.height() > 46.0 { 6.0 } else { 0.0 };
+    for i in 0..3 {
+        let phase = ((t * 3.2) + i as f32 * 0.28).fract();
+        let pulse = (1.0 - (phase - 0.5).abs() * 2.0).max(0.0);
+        let alpha = (75.0 + 180.0 * pulse) as u8;
+        painter.circle_filled(
+            egui::pos2(center.x - 12.0 + i as f32 * 12.0, dot_y),
+            3.0 + pulse * 1.2,
+            Color32::from_rgba_premultiplied(255, 210, 80, alpha),
+        );
+    }
+
+    if rect.width() > 72.0 && rect.height() > 38.0 {
+        painter.text(
+            egui::pos2(center.x, center.y + 14.0),
+            egui::Align2::CENTER_CENTER,
+            label,
+            egui::FontId::proportional(10.0),
+            Color32::from_rgb(225, 220, 190),
+        );
+    }
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(120));
+}
+
 /// True if any visible actor sits on a track ABOVE this overlay's row
 /// (i.e. with a smaller track index). When that is the case, the overlay
 /// must be drawn before the actors so it ends up visually behind them.
@@ -316,7 +387,9 @@ fn handle_eyedropper_click_actor(
     // Match the actor's playback speed so the eyedropper picks the
     // same pixel the user sees on canvas at the current playhead.
     let speed = actor.speed.max(0.0001);
-    let local_t = if t >= t_in && t <= t_out {
+    let local_t = if actor.mellstroy_footage.edge_frame {
+        actor.source_start
+    } else if t >= t_in && t <= t_out {
         (t - t_in) * speed + actor.source_start
     } else if t < t_in {
         actor.source_start
@@ -474,15 +547,7 @@ fn actor_screen_rect(
     let t = state.playhead;
 
     let world_pos = get_element_world_pos(state, &actor.id, &actor.layout, t);
-    let (src_w, src_h) = if let Some(fc) = state.frame_caches.get(idx) {
-        if fc.is_ready() && fc.frame_count > 0 {
-            (fc.source_width as f32, fc.source_height as f32)
-        } else {
-            (1080.0_f32, 1920.0)
-        }
-    } else {
-        (1080.0_f32, 1920.0)
-    };
+    let (src_w, src_h) = actor_source_dimensions(state, idx);
 
     let actor_state = memstroy_core::sample_actor_layout(&actor.layout, &actor.animated_params, t);
     let elem_w = src_w * actor_state.scale;
@@ -532,15 +597,7 @@ pub(crate) fn actor_world_aabb(
     let actor = state.scene.actors.get(idx)?;
 
     let world_pos = get_element_world_pos(state, &actor.id, &actor.layout, t);
-    let (src_w, src_h) = if let Some(fc) = state.frame_caches.get(idx) {
-        if fc.is_ready() && fc.frame_count > 0 {
-            (fc.source_width as f32, fc.source_height as f32)
-        } else {
-            (1080.0_f32, 1920.0)
-        }
-    } else {
-        (1080.0_f32, 1920.0)
-    };
+    let (src_w, src_h) = actor_source_dimensions(state, idx);
 
     let actor_state = memstroy_core::sample_actor_layout(&actor.layout, &actor.animated_params, t);
     let mut effective_scale = actor_state.scale;
@@ -1370,15 +1427,7 @@ fn resolve_overlay_attachment_world(
     let host_world = get_element_world_pos(state, &host_actor.id, &host_actor.layout, t);
     let host_state =
         memstroy_core::sample_actor_layout(&host_actor.layout, &host_actor.animated_params, t);
-    let (src_w, src_h) = if let Some(fc) = state.frame_caches.get(host_idx) {
-        if fc.is_ready() && fc.frame_count > 0 {
-            (fc.source_width as f32, fc.source_height as f32)
-        } else {
-            (1080.0_f32, 1920.0)
-        }
-    } else {
-        (1080.0_f32, 1920.0)
-    };
+    let (src_w, src_h) = actor_source_dimensions(state, host_idx);
     let elem_w = src_w * host_state.scale;
     let elem_h = src_h * host_state.scale * host_state.scale_y;
 
@@ -1653,15 +1702,7 @@ fn draw_single_actor(
     };
 
     let world_pos = get_element_world_pos(state, &actor.id, &actor.layout, t);
-    let (src_w, src_h) = if let Some(fc) = state.frame_caches.get(idx) {
-        if fc.is_ready() && fc.frame_count > 0 {
-            (fc.source_width as f32, fc.source_height as f32)
-        } else {
-            (1080.0_f32, 1920.0)
-        }
-    } else {
-        (1080.0_f32, 1920.0)
-    };
+    let (src_w, src_h) = actor_source_dimensions(state, idx);
     let actor_state = memstroy_core::sample_actor_layout(&actor.layout, &actor.animated_params, t);
     let mut actor_scale = actor_state.scale;
     let mut actor_scale_y = actor_state.scale_y;
@@ -1735,10 +1776,14 @@ fn draw_single_actor(
     );
 
     let speed = actor.speed.max(0.0001);
-    let mut local_t = match display_mode {
-        DisplayMode::Active => (t - t_in) * speed + actor.source_start,
-        DisplayMode::BeforeStart => actor.source_start,
-        DisplayMode::AfterEnd => actor.source_start + (t_out - t_in) * speed,
+    let mut local_t = if actor.mellstroy_footage.edge_frame {
+        actor.source_start
+    } else {
+        match display_mode {
+            DisplayMode::Active => (t - t_in) * speed + actor.source_start,
+            DisplayMode::BeforeStart => actor.source_start,
+            DisplayMode::AfterEnd => actor.source_start + (t_out - t_in) * speed,
+        }
     };
     if let Some(fc) = state.frame_caches.get(idx) {
         if fc.is_ready() && fc.duration > 0.01 {
@@ -1857,21 +1902,35 @@ fn draw_single_actor(
         let preview_pending =
             !preview_failed && (extracting || !cache_ready || needs_processed_warmup);
 
-        // While ffmpeg extracts preview frames, show the library
-        // thumbnail so the user sees the clip land on canvas; once
-        // extraction finishes `frame_shown` flips to the live video.
-        if preview_pending {
+        let source_downloading =
+            actor_source_waits_for_download(state, &state.scene.actors[idx].source);
+
+        // While the server video downloads or ffmpeg extracts preview
+        // frames, show the library thumbnail in the final actor bounds.
+        if preview_pending || source_downloading {
             if let Some(thumb) =
                 crate::panels::clip_thumbnail_for_source(state, &state.scene.actors[idx].source)
             {
                 let uri = format!("file://{}", thumb.display());
                 let img = egui::Image::from_uri(uri)
                     .fit_to_exact_size(elem_rect.size())
-                    .maintain_aspect_ratio(true)
+                    .maintain_aspect_ratio(false)
                     .rounding(Rounding::same(3.0));
                 img.paint_at(ui, elem_rect);
                 frame_shown = true;
             }
+        }
+
+        if source_downloading {
+            if !frame_shown {
+                let fill = match display_mode {
+                    DisplayMode::Active => Color32::from_rgb(44, 42, 28),
+                    _ => Color32::from_rgb(32, 30, 20),
+                };
+                painter.rect_filled(elem_rect, Rounding::same(3.0), fill);
+            }
+            draw_canvas_media_loader(ui, painter, elem_rect, crate::i18n::t("Loading video..."));
+            frame_shown = true;
         }
 
         if !frame_shown {
@@ -1882,7 +1941,7 @@ fn draw_single_actor(
             painter.rect_filled(elem_rect, Rounding::same(3.0), fill);
             let label = if preview_failed {
                 crate::i18n::t("Video preview failed")
-            } else if extracting {
+            } else if extracting || preview_pending {
                 crate::i18n::t("Loading video...")
             } else {
                 state.scene.actors[idx].id.as_str()
@@ -3439,7 +3498,7 @@ pub(crate) fn get_element_world_pos(
         .iter()
         .find(|cl| cl.element_id == element_id)
     {
-        keyframe::sample(&cl.keyframes, sample_t).map(|transform| transform.pos)
+        Some(memstroy_core::sample_canvas_layout(&cl.keyframes, sample_t).pos)
     } else {
         None
     };
@@ -4726,16 +4785,7 @@ fn current_selection_scale_y(state: &EditorState) -> Option<f32> {
 fn current_selection_base_dims(state: &EditorState) -> Option<(f32, f32)> {
     match state.selection {
         Selection::Actor(idx) if idx < state.scene.actors.len() => {
-            let (base_w, base_h) = if let Some(fc) = state.frame_caches.get(idx) {
-                if fc.is_ready() && fc.frame_count > 0 {
-                    (fc.source_width as f32, fc.source_height as f32)
-                } else {
-                    (1080.0, 1920.0)
-                }
-            } else {
-                (1080.0, 1920.0)
-            };
-            Some((base_w, base_h))
+            Some(actor_source_dimensions(state, idx))
         }
         Selection::Overlay(idx) if idx < state.scene.overlays.len() => {
             let ov = &state.scene.overlays[idx];
@@ -5037,13 +5087,18 @@ fn write_selection_world_center(
                 crate::kf_anim::write_canvas_param(
                     &mut cl.keyframes,
                     &animated_clone,
-                    &[
-                        memstroy_core::param_ids::POS_X,
-                        memstroy_core::param_ids::POS_Y,
-                    ],
+                    &[memstroy_core::param_ids::POS_X],
                     t,
                     |v| {
                         v.pos.x = sx;
+                    },
+                );
+                crate::kf_anim::write_canvas_param(
+                    &mut cl.keyframes,
+                    &animated_clone,
+                    &[memstroy_core::param_ids::POS_Y],
+                    t,
+                    |v| {
                         v.pos.y = sy;
                     },
                 );
@@ -5169,13 +5224,18 @@ fn write_selection_world_center(
                 crate::kf_anim::write_canvas_param(
                     &mut cl.keyframes,
                     &animated_clone,
-                    &[
-                        memstroy_core::param_ids::POS_X,
-                        memstroy_core::param_ids::POS_Y,
-                    ],
+                    &[memstroy_core::param_ids::POS_X],
                     t,
                     |v| {
                         v.pos.x = sx;
+                    },
+                );
+                crate::kf_anim::write_canvas_param(
+                    &mut cl.keyframes,
+                    &animated_clone,
+                    &[memstroy_core::param_ids::POS_Y],
+                    t,
+                    |v| {
                         v.pos.y = sy;
                     },
                 );
@@ -5826,15 +5886,7 @@ fn sniff_hit(state: &EditorState, pos: WorldPos) -> Option<Selection> {
                 );
             }
         }
-        let (base_w, base_h) = if let Some(fc) = state.frame_caches.get(idx) {
-            if fc.is_ready() && fc.frame_count > 0 {
-                (fc.source_width as f32, fc.source_height as f32)
-            } else {
-                (1080.0, 1920.0)
-            }
-        } else {
-            (1080.0, 1920.0)
-        };
+        let (base_w, base_h) = actor_source_dimensions(state, idx);
         let half_w = base_w * actor_scale * 0.5;
         let half_h = base_h * actor_scale * actor_scale_y * 0.5;
         if world_point_in_oriented_rect(pos, world_pos, half_w, half_h, rotation_deg) {
@@ -5887,15 +5939,7 @@ fn selected_element_gizmo(
                     );
                 }
             }
-            let (base_w, base_h) = if let Some(fc) = state.frame_caches.get(idx) {
-                if fc.is_ready() && fc.frame_count > 0 {
-                    (fc.source_width as f32, fc.source_height as f32)
-                } else {
-                    (1080.0, 1920.0)
-                }
-            } else {
-                (1080.0, 1920.0)
-            };
+            let (base_w, base_h) = actor_source_dimensions(state, idx);
             let center_screen = state
                 .canvas_viewport
                 .world_to_screen(world_pos, viewport_size);
@@ -6387,16 +6431,7 @@ fn draw_element_resize_handles(
             }
             let world_pos = get_element_world_pos(state, &actor.id, &actor.layout, t);
             let actor_scale = sample_actor_transform(actor, t).scale;
-            // Use real source dimensions from frame cache
-            let (base_w, base_h) = if let Some(fc) = state.frame_caches.get(idx) {
-                if fc.is_ready() && fc.frame_count > 0 {
-                    (fc.source_width as f32, fc.source_height as f32)
-                } else {
-                    (1080.0, 1920.0)
-                }
-            } else {
-                (1080.0, 1920.0)
-            };
+            let (base_w, base_h) = actor_source_dimensions(state, idx);
             let elem_width = base_w * actor_scale;
             let elem_height = base_h * actor_scale;
             let center_screen = state
@@ -7216,15 +7251,7 @@ fn try_select_at(state: &mut EditorState, pos: WorldPos) {
                 }
                 let world_pos = get_element_world_pos(state, &actor.id, &actor.layout, t);
                 let actor_scale = sample_actor_transform(actor, t).scale;
-                let (base_w, base_h) = if let Some(fc) = state.frame_caches.get(idx) {
-                    if fc.is_ready() && fc.frame_count > 0 {
-                        (fc.source_width as f32, fc.source_height as f32)
-                    } else {
-                        (1080.0, 1920.0)
-                    }
-                } else {
-                    (1080.0, 1920.0)
-                };
+                let (base_w, base_h) = actor_source_dimensions(state, idx);
                 let elem_width = base_w * actor_scale;
                 let elem_height = base_h * actor_scale;
                 let half_w = elem_width * 0.5;
@@ -7326,15 +7353,7 @@ fn is_point_on_selection(state: &EditorState, pos: WorldPos) -> bool {
             }
             let world_pos = get_element_world_pos(state, &actor.id, &actor.layout, t);
             let actor_scale = sample_actor_transform(actor, t).scale;
-            let (base_w, base_h) = if let Some(fc) = state.frame_caches.get(idx) {
-                if fc.is_ready() && fc.frame_count > 0 {
-                    (fc.source_width as f32, fc.source_height as f32)
-                } else {
-                    (1080.0, 1920.0)
-                }
-            } else {
-                (1080.0, 1920.0)
-            };
+            let (base_w, base_h) = actor_source_dimensions(state, idx);
             let half_w = base_w * actor_scale * 0.5;
             let half_h = base_h * actor_scale * 0.5;
             pos.x >= world_pos.x - half_w
@@ -8256,7 +8275,9 @@ fn sample_actor_pixel(state: &mut EditorState, idx: usize, uv: [f32; 2]) -> Opti
     let t_in = actor.t_in.unwrap_or(0.0);
     let t_out = actor.t_out.unwrap_or(state.scene.output.duration);
     let speed = actor.speed.max(0.0001);
-    let local_t = if t >= t_in && t <= t_out {
+    let local_t = if actor.mellstroy_footage.edge_frame {
+        actor.source_start
+    } else if t >= t_in && t <= t_out {
         (t - t_in) * speed + actor.source_start
     } else if t < t_in {
         actor.source_start
@@ -8877,8 +8898,8 @@ pub fn handle_canvas_asset_drag(
         );
 
         // Floating thumbnail card next to the cursor.
-        let card_w = 180.0_f32;
-        let card_h = 56.0_f32;
+        let card_w = 190.0_f32;
+        let card_h = 68.0_f32;
         let anchor = drag_pos + egui::vec2(20.0, 16.0);
         let card_rect = Rect::from_min_size(anchor, Vec2::new(card_w, card_h));
         painter.rect_filled(
@@ -8935,10 +8956,30 @@ pub fn handle_canvas_asset_drag(
             egui::FontId::proportional(11.0),
             Color32::from_rgb(220, 220, 240),
         );
+        let mut meta = Vec::new();
+        if let Some(d) = state
+            .asset_drag
+            .duration_secs
+            .filter(|d| d.is_finite() && *d > 0.01)
+        {
+            meta.push(format!("{:.2}s", d));
+        }
+        if let (Some(w), Some(h)) = (state.asset_drag.width, state.asset_drag.height) {
+            if w > 0 && h > 0 {
+                meta.push(format!("{}x{}", w, h));
+            }
+        }
+        if state.asset_drag.server_id.is_some() && !state.asset_drag.downloaded {
+            meta.push(crate::i18n::t("downloads on drop").to_string());
+        }
         painter.text(
             text_anchor + egui::vec2(0.0, 18.0),
             egui::Align2::LEFT_TOP,
-            crate::i18n::t("drop here to place at cursor"),
+            if meta.is_empty() {
+                crate::i18n::t("drop here to place at cursor").to_string()
+            } else {
+                meta.join("  |  ")
+            },
             egui::FontId::proportional(9.0),
             Color32::from_rgb(160, 160, 180),
         );
@@ -8966,10 +9007,29 @@ pub fn handle_canvas_asset_drag(
         let asset_path = state.asset_drag.dragging.clone().unwrap();
         let asset_label = state.asset_drag.label.clone();
         let kind = state.asset_drag.kind;
+        let duration_hint = state.asset_drag.duration_secs;
         match kind {
             crate::state::AssetDragKind::Clip => {
                 // Server-only stubs: download the full `.mp4` first;
                 // `ClipDownloaded` places the actor at the drop point.
+                if crate::panels::dragged_clip_needs_download(state, &asset_path) {
+                    if let Some(new_idx) = crate::panels::add_pending_actor_from_clip_at_canvas(
+                        state,
+                        &asset_path,
+                        [world.x, world.y],
+                        duration_hint,
+                    ) {
+                        let actor_id = state.scene.actors[new_idx].id.clone();
+                        if crate::panels::try_spawn_lazy_clip_download(
+                            state,
+                            &asset_path,
+                            crate::jobs::ClipDropTarget::ExistingActor { actor_id },
+                        ) {
+                            state.clear_asset_drag();
+                            return;
+                        }
+                    }
+                }
                 if crate::panels::try_spawn_lazy_clip_download(
                     state,
                     &asset_path,
@@ -8988,6 +9048,25 @@ pub fn handle_canvas_asset_drag(
                 );
             }
             crate::state::AssetDragKind::Video => {
+                if crate::panels::server_asset_needs_download(state, &asset_path, kind) {
+                    if let Some(new_idx) = crate::panels::add_pending_actor_from_video_at_canvas(
+                        state,
+                        &asset_path,
+                        [world.x, world.y],
+                        duration_hint,
+                    ) {
+                        let actor_id = state.scene.actors[new_idx].id.clone();
+                        if crate::panels::try_spawn_lazy_server_asset_download(
+                            state,
+                            &asset_path,
+                            kind,
+                            crate::jobs::ServerAssetDropTarget::ExistingActor { actor_id },
+                        ) {
+                            state.clear_asset_drag();
+                            return;
+                        }
+                    }
+                }
                 if crate::panels::try_spawn_lazy_server_asset_download(
                     state,
                     &asset_path,

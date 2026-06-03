@@ -27,6 +27,31 @@ const BUFFER_SIZE: usize = 90;
 static PRELOAD_SEMAPHORE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 const MAX_CONCURRENT_PRELOADS: usize = 3;
 
+pub fn adaptive_extract_width(actor_count: usize) -> u32 {
+    if actor_count >= 6 {
+        280
+    } else if actor_count >= 4 {
+        360
+    } else {
+        480
+    }
+}
+
+pub fn scaled_preview_dimensions(
+    source_width: u32,
+    source_height: u32,
+    actor_count: usize,
+) -> Option<(u32, u32)> {
+    if source_width == 0 || source_height == 0 {
+        return None;
+    }
+    let width = adaptive_extract_width(actor_count);
+    let height = ((source_height as f32 * width as f32) / source_width as f32)
+        .round()
+        .max(1.0) as u32;
+    Some((width, height))
+}
+
 /// Frame-cache: extracts video frames to disk via ffmpeg, then pre-loads
 /// frames into a memory ring buffer and uploads them to a single reusable
 /// texture handle for smooth playback.
@@ -2470,6 +2495,16 @@ mod tests {
         let img = ColorImage::new([100, 100], egui::Color32::RED);
         let out = downscale_for_preview(&img, 360);
         assert_eq!(out.size, [100, 100]);
+    }
+
+    #[test]
+    fn scaled_preview_dimensions_match_ffmpeg_width_policy() {
+        assert_eq!(adaptive_extract_width(1), 480);
+        assert_eq!(adaptive_extract_width(4), 360);
+        assert_eq!(adaptive_extract_width(6), 280);
+        assert_eq!(scaled_preview_dimensions(1080, 1920, 1), Some((480, 853)));
+        assert_eq!(scaled_preview_dimensions(1080, 1920, 4), Some((360, 640)));
+        assert_eq!(scaled_preview_dimensions(0, 1920, 1), None);
     }
 
     /// Ensure the SIMD path produces pixel-perfect (±1) output compared

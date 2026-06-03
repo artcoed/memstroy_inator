@@ -4,7 +4,7 @@
 use crate::canvas::WorldPos;
 use crate::keyframe::{self, TrackModifier};
 use crate::layout_sample::{
-    sample_actor_layout, sample_overlay_layout, sample_render_frame_layout,
+    sample_actor_layout, sample_canvas_layout, sample_overlay_layout, sample_render_frame_layout,
 };
 use crate::{Overlay, OverlayState, Scene};
 
@@ -114,7 +114,7 @@ pub fn resolve_parent_transform(
             .canvas_layouts
             .iter()
             .find(|cl| cl.element_id == actor.id)
-            .and_then(|cl| keyframe::sample(&cl.keyframes, t));
+            .map(|cl| sample_canvas_layout(&cl.keyframes, t));
 
         let mut pos = if let Some(transform) = canvas_transform {
             WorldPos {
@@ -182,7 +182,7 @@ pub fn resolve_parent_transform(
             .canvas_layouts
             .iter()
             .find(|cl| cl.element_id == *overlay_id)
-            .and_then(|cl| keyframe::sample(&cl.keyframes, t));
+            .map(|cl| sample_canvas_layout(&cl.keyframes, t));
 
         let mut pos = if let Some(transform) = canvas_transform {
             WorldPos {
@@ -245,7 +245,7 @@ pub fn element_world_pos(scene: &Scene, element_id: &str, scene_t: f32) -> World
         .iter()
         .find(|cl| cl.element_id == element_id)
     {
-        keyframe::sample(&cl.keyframes, scene_t).map(|transform| transform.pos)
+        Some(sample_canvas_layout(&cl.keyframes, scene_t).pos)
     } else {
         None
     };

@@ -158,6 +158,8 @@ pub enum ClipDropTarget {
     CanvasAt { world_x: f32, world_y: f32 },
     /// Drop on timeline at scene-time.
     TimelineAt { t: f32 },
+    /// A placeholder actor already exists; only finalize its media.
+    ExistingActor { actor_id: String },
     /// Fill an existing Mellstroy-footage sequence slot after download.
     SequenceSlot { actor_id: String },
     /// Just download into the cache; don't auto-place.
@@ -169,6 +171,7 @@ pub enum ClipDropTarget {
 pub enum ServerAssetDropTarget {
     CanvasAt { world_x: f32, world_y: f32 },
     TimelineAt { t: f32, track_idx: Option<usize> },
+    ExistingActor { actor_id: String },
     None,
 }
 

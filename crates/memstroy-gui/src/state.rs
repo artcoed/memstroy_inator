@@ -1193,6 +1193,10 @@ pub struct LibraryClip {
     /// downloaded — the GUI uses it to fetch downloads on demand.
     /// `None` for purely-local clips that aren't on the server.
     pub server_id: Option<String>,
+    /// Search string of the server page that last yielded this row.
+    /// Lets the Clips tab show fuzzy/server-side matches even when the
+    /// local substring filter would not match the visible text exactly.
+    pub server_query: Option<String>,
     pub label: String,
     pub duration_secs: Option<f32>,
     pub width: Option<u32>,
@@ -3051,6 +3055,7 @@ impl EditorState {
                     downloaded,
                     thumbnail,
                     server_id: Some(stem),
+                    server_query: None,
                     duration_secs: None,
                     width: None,
                     height: None,
@@ -3120,6 +3125,7 @@ impl EditorState {
                     downloaded,
                     thumbnail: Some(path),
                     server_id: Some(stem),
+                    server_query: None,
                     duration_secs: None,
                     width: None,
                     height: None,
@@ -3185,6 +3191,7 @@ impl EditorState {
                     downloaded: true,
                     thumbnail,
                     server_id: Some(stem),
+                    server_query: None,
                     duration_secs: None,
                     width: None,
                     height: None,
@@ -3271,6 +3278,10 @@ impl EditorState {
                 new.duration_secs = new.duration_secs.or(old.duration_secs);
                 new.width = new.width.or(old.width);
                 new.height = new.height.or(old.height);
+                new.server_query = new
+                    .server_query
+                    .clone()
+                    .or_else(|| old.server_query.clone());
                 new.downloaded = new.downloaded || old.downloaded;
                 if !new.path.is_file() && old.path.is_file() {
                     new.path = old.path.clone();
@@ -3556,7 +3567,7 @@ impl EditorState {
 
         for item in page.items {
             match tab {
-                LibraryTab::Clips => self.merge_server_clip(item),
+                LibraryTab::Clips => self.merge_server_clip(item, query),
                 LibraryTab::Videos | LibraryTab::Sounds | LibraryTab::Images => {
                     self.merge_server_library_asset(tab, item);
                 }
@@ -3632,7 +3643,7 @@ impl EditorState {
         }
     }
 
-    fn merge_server_clip(&mut self, item: crate::jobs::ServerAssetSummary) {
+    fn merge_server_clip(&mut self, item: crate::jobs::ServerAssetSummary, query: &str) {
         let safe_id = crate::jobs::sanitise_id(&item.id);
         let ext = non_empty_ext(&item.extension).unwrap_or("mp4");
         let path = self.clips_dir().join(format!("{safe_id}.{ext}"));
@@ -3665,6 +3676,7 @@ impl EditorState {
             downloaded,
             thumbnail,
             server_id: Some(item.id.clone()),
+            server_query: Some(query.to_string()),
             duration_secs: item.duration_secs,
             width: item.width,
             height: item.height,
@@ -3682,6 +3694,7 @@ impl EditorState {
             row.duration_secs = row.duration_secs.or(existing.duration_secs);
             row.width = row.width.or(existing.width);
             row.height = row.height.or(existing.height);
+            row.server_query = Some(query.to_string());
             *existing = row;
         } else {
             self.library.mellstroy_clips.push(row);
@@ -4073,7 +4086,11 @@ impl EditorState {
             match sel {
                 Selection::Actor(i) if i < self.scene.actors.len() => {
                     let actor = &self.scene.actors[i];
-                    buf.push(ClipboardItem::Actor(actor.clone()));
+                    let canvas_layout = canvas_layout_for_element(&self.scene, &actor.id);
+                    buf.push(ClipboardItem::Actor {
+                        actor: actor.clone(),
+                        canvas_layout,
+                    });
                     // Also copy any audio tracks bound to this actor so
                     // pasting a video clip also brings its linked audio.
                     let actor_id = &actor.id;
@@ -4084,7 +4101,12 @@ impl EditorState {
                     }
                 }
                 Selection::Overlay(i) if i < self.scene.overlays.len() => {
-                    buf.push(ClipboardItem::Overlay(self.scene.overlays[i].clone()));
+                    let overlay = &self.scene.overlays[i];
+                    let canvas_layout = canvas_layout_for_element(&self.scene, overlay_id(overlay));
+                    buf.push(ClipboardItem::Overlay {
+                        overlay: overlay.clone(),
+                        canvas_layout,
+                    });
                 }
                 Selection::Background(i) if i < self.scene.backgrounds.len() => {
                     buf.push(ClipboardItem::Background(self.scene.backgrounds[i].clone()));
@@ -4135,26 +4157,53 @@ impl EditorState {
         // the freshly-pasted duplicate instead of becoming orphans.
         let mut actor_id_remap: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
+        let mut footage_sequence_id_remap: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
 
         for item in buf {
             match item {
-                ClipboardItem::Actor(mut a) => {
-                    let old_id = a.id.clone();
-                    a.id = unique_actor_id(&self.scene.actors, &a.id);
-                    actor_id_remap.insert(old_id, a.id.clone());
+                ClipboardItem::Actor {
+                    mut actor,
+                    canvas_layout,
+                } => {
+                    let old_t_in = actor.t_in.unwrap_or(0.0);
+                    let old_t_out = actor
+                        .t_out
+                        .unwrap_or(self.scene.output.duration)
+                        .max(old_t_in + 0.1);
+                    let old_id = actor.id.clone();
+                    actor.id = unique_actor_id(&self.scene.actors, &actor.id);
+                    actor_id_remap.insert(old_id, actor.id.clone());
+                    if actor.mellstroy_footage.enabled {
+                        if let Some(old_seq) = actor.mellstroy_footage.sequence_id.clone() {
+                            let new_seq = footage_sequence_id_remap
+                                .entry(old_seq.clone())
+                                .or_insert_with(|| {
+                                    unique_footage_sequence_id(&self.scene, &old_seq)
+                                })
+                                .clone();
+                            actor.mellstroy_footage.sequence_id = Some(new_seq);
+                        }
+                    }
                     // Re-anchor the duplicate to the current playhead so
                     // it lands where the user expects to see it. The
                     // original clip-local duration is preserved.
-                    let dur = match (a.t_in, a.t_out) {
-                        (Some(ti), Some(to)) => (to - ti).max(0.1),
-                        _ => self.scene.output.duration.max(0.1),
-                    };
-                    a.t_in = Some(playhead);
-                    a.t_out = Some(playhead + dur);
+                    let dur = (old_t_out - old_t_in).max(0.1);
+                    rebase_actor_for_paste(&mut actor, old_t_in, old_t_out, playhead);
                     let t_out = playhead + dur;
                     let new_track = self.pick_or_create_empty_video_lane_for_range(playhead, t_out);
                     let new_idx = self.scene.actors.len();
-                    self.scene.actors.push(a);
+                    let new_actor_id = actor.id.clone();
+                    self.scene.actors.push(actor);
+                    if let Some(cl) = rebase_canvas_layout_for_paste(
+                        canvas_layout,
+                        &new_actor_id,
+                        old_t_in,
+                        old_t_out,
+                        playhead,
+                    ) {
+                        self.scene.canvas_layouts.push(cl);
+                    }
                     // Each pasted actor lands on the first empty video
                     // lane at the playhead — only when none is free do
                     // we spawn a fresh track at the top. Mirrors the
@@ -4164,8 +4213,11 @@ impl EditorState {
                     self.actor_track_assignments.insert(new_idx, new_track);
                     new_selections.push(Selection::Actor(new_idx));
                 }
-                ClipboardItem::Overlay(mut o) => {
-                    let (orig_t_in, orig_t_out) = match &o {
+                ClipboardItem::Overlay {
+                    mut overlay,
+                    canvas_layout,
+                } => {
+                    let (orig_t_in, orig_t_out) = match &overlay {
                         memstroy_core::Overlay::Text(t) => (t.t_in, t.t_out),
                         memstroy_core::Overlay::Image(im) => (im.t_in, im.t_out),
                         memstroy_core::Overlay::Video(v) => (v.t_in, v.t_out),
@@ -4173,27 +4225,40 @@ impl EditorState {
                     let dur = (orig_t_out - orig_t_in).max(0.1);
                     let new_t_in = playhead;
                     let new_t_out = playhead + dur;
-                    match &mut o {
+                    let new_overlay_id = match &mut overlay {
                         memstroy_core::Overlay::Text(t) => {
                             t.id = unique_overlay_id(&self.scene.overlays, &t.id);
                             t.t_in = new_t_in;
                             t.t_out = new_t_out;
+                            t.id.clone()
                         }
                         memstroy_core::Overlay::Image(im) => {
                             im.id = unique_overlay_id(&self.scene.overlays, &im.id);
                             im.t_in = new_t_in;
                             im.t_out = new_t_out;
+                            im.id.clone()
                         }
                         memstroy_core::Overlay::Video(v) => {
                             v.id = unique_overlay_id(&self.scene.overlays, &v.id);
                             v.t_in = new_t_in;
                             v.t_out = new_t_out;
+                            v.id.clone()
                         }
-                    }
+                    };
+                    crop_overlay_for_paste(&mut overlay, dur);
                     let new_track =
                         self.pick_or_create_empty_video_lane_for_range(playhead, new_t_out);
                     let new_idx = self.scene.overlays.len();
-                    self.scene.overlays.push(o);
+                    self.scene.overlays.push(overlay);
+                    if let Some(cl) = rebase_canvas_layout_for_paste(
+                        canvas_layout,
+                        &new_overlay_id,
+                        orig_t_in,
+                        orig_t_out,
+                        new_t_in,
+                    ) {
+                        self.scene.canvas_layouts.push(cl);
+                    }
                     self.overlay_track_assignments.insert(new_idx, new_track);
                     new_selections.push(Selection::Overlay(new_idx));
                 }
@@ -4204,6 +4269,9 @@ impl EditorState {
                     self.scene.backgrounds.push(bg);
                 }
                 ClipboardItem::Audio(mut au) => {
+                    let old_audio_in = au.t_in;
+                    let old_audio_out = au.t_out.unwrap_or(old_audio_in + 1.0);
+                    let audio_dur = (old_audio_out - old_audio_in).max(0.1);
                     au.id = unique_audio_id(&self.scene.audio, &au.id);
                     // If this audio was bound to an actor that was also
                     // pasted in this batch, re-link to the new actor id
@@ -4231,6 +4299,7 @@ impl EditorState {
                         None => {
                             au.parent_actor = None;
                             au.t_in = playhead;
+                            au.t_out = Some(playhead + audio_dur);
                         }
                     }
                     let new_track =
@@ -4913,6 +4982,169 @@ fn paste_overlay_keyframe(
     true
 }
 
+const CLIPBOARD_KF_EPS: f32 = 1.0e-3;
+
+fn overlay_id(overlay: &memstroy_core::Overlay) -> &str {
+    match overlay {
+        memstroy_core::Overlay::Text(t) => &t.id,
+        memstroy_core::Overlay::Image(im) => &im.id,
+        memstroy_core::Overlay::Video(v) => &v.id,
+    }
+}
+
+fn canvas_layout_for_element(
+    scene: &memstroy_core::Scene,
+    element_id: &str,
+) -> Option<memstroy_core::CanvasLayout> {
+    scene
+        .canvas_layouts
+        .iter()
+        .find(|cl| cl.element_id == element_id)
+        .cloned()
+}
+
+fn carry_param_owners<T>(dst: &mut memstroy_core::Keyframe<T>, src: &[memstroy_core::Keyframe<T>]) {
+    let mut owners = std::collections::BTreeSet::new();
+    let mut has_legacy_full_state = false;
+    for kf in src {
+        if kf.param_owners.is_empty() {
+            has_legacy_full_state = true;
+        } else {
+            owners.extend(kf.param_owners.iter().cloned());
+        }
+    }
+    if !has_legacy_full_state && !owners.is_empty() {
+        dst.param_owners = owners;
+    }
+}
+
+fn rebase_actor_for_paste(
+    actor: &mut memstroy_core::Actor,
+    old_t_in: f32,
+    old_t_out: f32,
+    new_t_in: f32,
+) {
+    let old_layout = actor.layout.clone();
+    let delta = new_t_in - old_t_in;
+    let mut next_layout: Vec<memstroy_core::Keyframe<memstroy_core::ActorState>> = old_layout
+        .iter()
+        .filter(|kf| kf.t >= old_t_in - CLIPBOARD_KF_EPS && kf.t <= old_t_out + CLIPBOARD_KF_EPS)
+        .cloned()
+        .map(|mut kf| {
+            kf.t = (kf.t + delta).max(0.0);
+            kf
+        })
+        .collect();
+
+    if !next_layout
+        .iter()
+        .any(|kf| (kf.t - new_t_in).abs() < CLIPBOARD_KF_EPS)
+    {
+        let mut boundary = memstroy_core::Keyframe::new(
+            new_t_in.max(0.0),
+            memstroy_core::sample_actor_layout(&old_layout, &actor.animated_params, old_t_in),
+        );
+        carry_param_owners(&mut boundary, &old_layout);
+        next_layout.push(boundary);
+    }
+    next_layout.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
+    actor.layout = next_layout;
+
+    let dur = (old_t_out - old_t_in).max(0.1);
+    actor.t_in = Some(new_t_in);
+    actor.t_out = Some(new_t_in + dur);
+    crop_effect_param_kfs(&mut actor.effects, dur);
+    crop_param_kfs_map(&mut actor.color_correction.kfs, dur);
+}
+
+fn crop_overlay_for_paste(overlay: &mut memstroy_core::Overlay, dur: f32) {
+    let (layout, animated_params, effects) = match overlay {
+        memstroy_core::Overlay::Text(t) => (&mut t.layout, &t.animated_params, &mut t.effects),
+        memstroy_core::Overlay::Image(im) => (&mut im.layout, &im.animated_params, &mut im.effects),
+        memstroy_core::Overlay::Video(v) => (&mut v.layout, &v.animated_params, &mut v.effects),
+    };
+    let old_layout = layout.clone();
+    layout.retain(|kf| kf.t >= -CLIPBOARD_KF_EPS && kf.t <= dur + CLIPBOARD_KF_EPS);
+    if !layout.iter().any(|kf| kf.t.abs() < CLIPBOARD_KF_EPS) {
+        let mut boundary = memstroy_core::Keyframe::new(
+            0.0,
+            memstroy_core::sample_overlay_layout(&old_layout, animated_params, 0.0),
+        );
+        carry_param_owners(&mut boundary, &old_layout);
+        layout.push(boundary);
+    }
+    layout.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
+    crop_effect_param_kfs(effects, dur);
+}
+
+fn crop_effect_param_kfs(effects: &mut [memstroy_core::Effect], dur: f32) {
+    for eff in effects {
+        crop_param_kfs_map(&mut eff.param_kfs, dur);
+    }
+}
+
+fn crop_param_kfs_map(
+    map: &mut std::collections::BTreeMap<String, Vec<memstroy_core::Keyframe<f32>>>,
+    dur: f32,
+) {
+    for kfs in map.values_mut() {
+        kfs.retain(|kf| kf.t >= -CLIPBOARD_KF_EPS && kf.t <= dur + CLIPBOARD_KF_EPS);
+        kfs.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
+    }
+}
+
+fn rebase_canvas_layout_for_paste(
+    canvas_layout: Option<memstroy_core::CanvasLayout>,
+    new_element_id: &str,
+    old_t_in: f32,
+    old_t_out: f32,
+    new_t_in: f32,
+) -> Option<memstroy_core::CanvasLayout> {
+    let mut cl = canvas_layout?;
+    let old_keyframes = cl.keyframes.clone();
+    let delta = new_t_in - old_t_in;
+    cl.element_id = new_element_id.to_string();
+    cl.keyframes = old_keyframes
+        .iter()
+        .filter(|kf| kf.t >= old_t_in - CLIPBOARD_KF_EPS && kf.t <= old_t_out + CLIPBOARD_KF_EPS)
+        .cloned()
+        .map(|mut kf| {
+            kf.t = (kf.t + delta).max(0.0);
+            kf
+        })
+        .collect();
+    if !cl
+        .keyframes
+        .iter()
+        .any(|kf| (kf.t - new_t_in).abs() < CLIPBOARD_KF_EPS)
+    {
+        let mut boundary = memstroy_core::Keyframe::new(
+            new_t_in.max(0.0),
+            memstroy_core::sample_canvas_layout(&old_keyframes, old_t_in),
+        );
+        carry_param_owners(&mut boundary, &old_keyframes);
+        cl.keyframes.push(boundary);
+    }
+    cl.keyframes
+        .sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
+    Some(cl)
+}
+
+fn unique_footage_sequence_id(scene: &memstroy_core::Scene, base: &str) -> String {
+    let stem = strip_copy_suffix(base);
+    let mut candidate = format!("{}_copy", stem);
+    let mut n = 2;
+    while scene
+        .actors
+        .iter()
+        .any(|actor| actor.mellstroy_footage.sequence_id.as_deref() == Some(candidate.as_str()))
+    {
+        candidate = format!("{}_copy{}", stem, n);
+        n += 1;
+    }
+    candidate
+}
+
 fn unique_actor_id(actors: &[memstroy_core::Actor], base: &str) -> String {
     let stem = strip_copy_suffix(base);
     let mut candidate = format!("{}_copy", stem);
@@ -5295,8 +5527,14 @@ pub enum SnapAxis {
 /// depend on the source still existing.
 #[derive(Clone)]
 pub enum ClipboardItem {
-    Actor(memstroy_core::Actor),
-    Overlay(memstroy_core::Overlay),
+    Actor {
+        actor: memstroy_core::Actor,
+        canvas_layout: Option<memstroy_core::CanvasLayout>,
+    },
+    Overlay {
+        overlay: memstroy_core::Overlay,
+        canvas_layout: Option<memstroy_core::CanvasLayout>,
+    },
     Background(memstroy_core::Background),
     Audio(memstroy_core::AudioTrack),
 }
@@ -5533,8 +5771,8 @@ mod timeline_lane_tests {
     use std::{collections::BTreeSet, path::PathBuf};
 
     use memstroy_core::{
-        Actor, ActorState, AudioTrack, ChromaKeyParams, ColorCorrection, Effect, Keyframe,
-        Transition,
+        param_ids, Actor, ActorState, AudioTrack, CanvasLayout, CanvasTransform, ChromaKeyParams,
+        ColorCorrection, Effect, Keyframe, Transition, WorldPos,
     };
 
     use super::{EditorState, Selection, Track, TrackKind};
@@ -5701,6 +5939,123 @@ mod timeline_lane_tests {
         assert_eq!(state.scene.actors[3].t_in, Some(5.0));
         assert_eq!(state.actor_track_assignments.get(&2), Some(&0));
         assert_eq!(state.actor_track_assignments.get(&3), Some(&1));
+    }
+
+    #[test]
+    fn paste_actor_rebases_keyframes_to_copied_element_window() {
+        let mut state = EditorState::new();
+        let mut actor = test_actor("seq_part", 10.0, 20.0);
+        actor.mellstroy_footage.enabled = true;
+        actor.mellstroy_footage.sequence_id = Some("seq_original".into());
+        actor.animated_params.insert(param_ids::POS_X.to_string());
+        actor
+            .animated_params
+            .insert(param_ids::ROTATION.to_string());
+        actor.layout = vec![
+            Keyframe::new(4.0, ActorState::default()).with_param_owner(param_ids::POS_X),
+            Keyframe::new(
+                12.0,
+                ActorState {
+                    pos: [0.25, 0.5],
+                    ..ActorState::default()
+                },
+            )
+            .with_param_owner(param_ids::POS_X),
+            Keyframe::new(
+                18.0,
+                ActorState {
+                    rotation_deg: 45.0,
+                    ..ActorState::default()
+                },
+            )
+            .with_param_owner(param_ids::ROTATION),
+            Keyframe::new(25.0, ActorState::default()).with_param_owner(param_ids::POS_X),
+        ];
+        state.scene.actors.push(actor);
+        state.actor_track_assignments.insert(0, 0);
+        state.scene.canvas_layouts.push(CanvasLayout {
+            element_id: "seq_part".into(),
+            keyframes: vec![
+                Keyframe::new(
+                    6.0,
+                    CanvasTransform {
+                        pos: WorldPos { x: 10.0, y: 20.0 },
+                        ..CanvasTransform::default()
+                    },
+                )
+                .with_param_owner(param_ids::POS_X),
+                Keyframe::new(
+                    14.0,
+                    CanvasTransform {
+                        pos: WorldPos { x: 140.0, y: 200.0 },
+                        ..CanvasTransform::default()
+                    },
+                )
+                .with_param_owner(param_ids::POS_X),
+                Keyframe::new(
+                    16.0,
+                    CanvasTransform {
+                        pos: WorldPos { x: 140.0, y: 260.0 },
+                        ..CanvasTransform::default()
+                    },
+                )
+                .with_param_owner(param_ids::POS_Y),
+                Keyframe::new(
+                    26.0,
+                    CanvasTransform {
+                        pos: WorldPos { x: 260.0, y: 20.0 },
+                        ..CanvasTransform::default()
+                    },
+                )
+                .with_param_owner(param_ids::POS_X),
+            ],
+        });
+
+        state.selection = Selection::Actor(0);
+        state.playhead = 30.0;
+
+        assert_eq!(state.copy_selection_to_clipboard(), 1);
+        assert_eq!(state.paste_clipboard(), 1);
+
+        let pasted = &state.scene.actors[1];
+        assert_eq!(pasted.t_in, Some(30.0));
+        assert_eq!(pasted.t_out, Some(40.0));
+        assert_ne!(
+            pasted.mellstroy_footage.sequence_id.as_deref(),
+            Some("seq_original")
+        );
+        assert!(pasted
+            .layout
+            .iter()
+            .all(|kf| kf.t >= 30.0 - 1.0e-3 && kf.t <= 40.0 + 1.0e-3));
+        assert!(pasted.layout.iter().any(|kf| (kf.t - 30.0).abs() < 1.0e-3));
+        assert!(pasted.layout.iter().any(|kf| (kf.t - 32.0).abs() < 1.0e-3));
+        assert!(pasted.layout.iter().any(|kf| (kf.t - 38.0).abs() < 1.0e-3));
+        assert!(!pasted.layout.iter().any(|kf| (kf.t - 4.0).abs() < 1.0e-3));
+        assert!(!pasted.layout.iter().any(|kf| (kf.t - 25.0).abs() < 1.0e-3));
+
+        let pasted_canvas = state
+            .scene
+            .canvas_layouts
+            .iter()
+            .find(|cl| cl.element_id == pasted.id)
+            .expect("canvas layout copied to pasted actor");
+        assert!(pasted_canvas
+            .keyframes
+            .iter()
+            .all(|kf| kf.t >= 30.0 - 1.0e-3 && kf.t <= 40.0 + 1.0e-3));
+        assert!(pasted_canvas
+            .keyframes
+            .iter()
+            .any(|kf| (kf.t - 30.0).abs() < 1.0e-3));
+        assert!(pasted_canvas
+            .keyframes
+            .iter()
+            .any(|kf| (kf.t - 34.0).abs() < 1.0e-3));
+        assert!(pasted_canvas
+            .keyframes
+            .iter()
+            .any(|kf| (kf.t - 36.0).abs() < 1.0e-3));
     }
 
     #[test]

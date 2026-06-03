@@ -717,7 +717,11 @@ fn paint_actor(
 
     // Pull the frame for this scene-time from the pre-extracted cache.
     let speed = actor.speed.max(1.0e-4);
-    let local_t = (t - t_in) * speed + actor.source_start;
+    let local_t = if actor.mellstroy_footage.edge_frame {
+        actor.source_start
+    } else {
+        (t - t_in) * speed + actor.source_start
+    };
     let resolved = resolve_path(assets_root, &actor.source);
     let mut layer = match clip_caches.frame_at(&resolved, local_t, actor.loop_source) {
         Some(img) => img,

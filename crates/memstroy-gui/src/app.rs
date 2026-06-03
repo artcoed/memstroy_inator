@@ -961,6 +961,13 @@ impl App {
             ClipDropTarget::TimelineAt { t } => {
                 crate::panels::add_actor_from_clip_at_time(&mut self.state, &pb, t);
             }
+            ClipDropTarget::ExistingActor { actor_id } => {
+                if !crate::panels::finalize_pending_actor_download(&mut self.state, &actor_id, &pb)
+                {
+                    self.state.status =
+                        crate::i18n::t("Downloaded placeholder disappeared.").into();
+                }
+            }
             ClipDropTarget::SequenceSlot { actor_id } => {
                 if let Some(idx) = self
                     .state
@@ -1090,6 +1097,16 @@ impl App {
                 self.state.playhead = saved_t;
             }
             crate::jobs::ServerAssetDropTarget::None => {}
+            crate::jobs::ServerAssetDropTarget::ExistingActor { actor_id } => {
+                if !crate::panels::finalize_pending_actor_download(
+                    &mut self.state,
+                    &actor_id,
+                    &path,
+                ) {
+                    self.state.status =
+                        crate::i18n::t("Downloaded placeholder disappeared.").into();
+                }
+            }
         }
     }
 
@@ -3200,7 +3217,11 @@ impl App {
         let right_id = right.id.clone();
         right.t_in = Some(t);
         right.t_out = Some(end);
-        right.source_start = a.source_start + (t - start) * a.speed.max(0.0001);
+        right.source_start = if a.mellstroy_footage.edge_frame {
+            a.source_start
+        } else {
+            a.source_start + (t - start) * a.speed.max(0.0001)
+        };
         let original_lane = self.state.actor_track_assignments.get(&i).copied();
         self.state.mutate(move |s| {
             s.actors[i].t_out = Some(t);
@@ -3758,13 +3779,7 @@ impl App {
         // pressure. The visual quality at 320px is still sufficient for
         // preview purposes (the canvas typically shows actors at 200-400px
         // on screen anyway).
-        let extract_width: u32 = if num_actors >= 6 {
-            280
-        } else if num_actors >= 4 {
-            360
-        } else {
-            480
-        };
+        let extract_width: u32 = crate::video_cache::adaptive_extract_width(num_actors);
 
         for actor_idx in 0..num_actors {
             let source = self.state.scene.actors[actor_idx].source.clone();
