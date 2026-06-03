@@ -134,7 +134,8 @@ export MEMSTROY_CLIENT_BUILD=1
 export MEMSTROY_DEFAULT_SERVER_URL="${SERVER_URL}"
 cargo build --release \
     -p memstroy-gui \
-    -p memstroy-cli
+    -p memstroy-cli \
+    --no-default-features
 
 # ─── Stage the bundle ────────────────────────────────────────────────
 echo "==> staging bundle"

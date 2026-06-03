@@ -44,6 +44,7 @@ fn upsert_index<T: Clone + keyframe::Lerp>(
         t,
         value: seed_value,
         easing: Easing::Linear,
+        param_owners: Default::default(),
     });
     layout.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
     layout
@@ -232,6 +233,7 @@ pub fn write_actor_param<F>(
         let idx = upsert_index(layout, t, seed);
         if let Some(kf) = layout.get_mut(idx) {
             f(&mut kf.value);
+            kf.mark_param_owner(param_id);
         }
     } else {
         for kf in layout.iter_mut() {
@@ -585,10 +587,16 @@ pub fn canvas_param_timeline_times(
     canvas: &[Keyframe<CanvasTransform>],
     param_id: &str,
 ) -> Vec<f32> {
-    memstroy_core::param_timeline_times(
+    memstroy_core::param_timeline_times_with_owners(
         canvas,
         |v| canvas_scalar_get(v, param_id),
         |i| canvas_other_fields_changed_at(canvas, param_id, i),
+        |i| {
+            canvas
+                .get(i)
+                .map(|kf| kf.param_owners.is_empty() || kf.param_owners.contains(param_id))
+                .unwrap_or(false)
+        },
     )
 }
 
@@ -648,6 +656,7 @@ fn canvas_param_value_at(
                     t: tm,
                     value: get(&canvas[idx].value),
                     easing: canvas[idx].easing,
+                    param_owners: Default::default(),
                 }
             })
             .collect();

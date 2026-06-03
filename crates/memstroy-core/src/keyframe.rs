@@ -14,6 +14,14 @@ pub struct Keyframe<T> {
     pub value: T,
     #[serde(default)]
     pub easing: Easing,
+    /// Parameters that explicitly authored this full-state keyframe.
+    ///
+    /// Full-state layout tracks need this for flat seed keyframes: when a
+    /// newly animated parameter is enabled without changing value, the value
+    /// snapshot is identical to neighbouring keyframes and would otherwise look
+    /// like a keyframe for every other flat parameter too.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub param_owners: BTreeSet<String>,
 }
 
 impl<T> Keyframe<T> {
@@ -22,12 +30,26 @@ impl<T> Keyframe<T> {
             t,
             value,
             easing: Easing::default(),
+            param_owners: BTreeSet::new(),
         }
     }
 
     pub fn with_easing(mut self, e: Easing) -> Self {
         self.easing = e;
         self
+    }
+
+    pub fn with_param_owner(mut self, param_id: &str) -> Self {
+        self.param_owners.insert(param_id.to_string());
+        self
+    }
+
+    pub fn mark_param_owner(&mut self, param_id: &str) {
+        self.param_owners.insert(param_id.to_string());
+    }
+
+    pub fn clear_param_owner(&mut self, param_id: &str) {
+        self.param_owners.remove(param_id);
     }
 }
 

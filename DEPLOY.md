@@ -33,6 +33,8 @@ The project uses **conditional compilation** to optimize build times:
    - `ASSETS_ROOT` is optional. If set, it must point inside the mounted
      Railway Volume. Otherwise the server uses Railway's automatic
      `RAILWAY_VOLUME_MOUNT_PATH`.
+   - `MEMSTROY_ADMIN_TOKEN` (or legacy `ADMIN_TOKEN`) protects
+     `POST /api/admin/assets`.
 4. Railway will build via the `nixpacks.toml` config (in repo root):
    - Build: `cargo build --release -p memstroy-assets-server`
    - Start: `./target/release/memstroy-assets-server`
@@ -44,7 +46,9 @@ The project uses **conditional compilation** to optimize build times:
 
 ## Endpoint summary
 
-- `GET /api/health` — health check (used by Railway's healthcheck)
+- `GET /api/health` — health check plus asset-root diagnostics
+  (`asset_root`, `railway_volume_mount_path`, `root_inside_railway_volume`,
+  `asset_root_writable`, counts by kind)
 - `GET /api/assets?kind=clip&limit=100&offset=0&q=query` — list assets with paginated fuzzy search
 - `GET /api/assets/:id` — full asset record (path, mime, etc.)
 - `GET /api/assets/:id/preview` — thumbnail bytes (if available)
@@ -64,8 +68,9 @@ The project uses **conditional compilation** to optimize build times:
 - `tags`: optional comma- or newline-separated tags.
 - `thumbnail`: optional `png`, `jpg`, `jpeg`, or `webp` preview.
 
-If `ADMIN_TOKEN` is set in Railway variables, calls must include either
-`Authorization: Bearer <token>` or `X-Admin-Token: <token>`.
+If `MEMSTROY_ADMIN_TOKEN` or `ADMIN_TOKEN` is set in Railway variables,
+calls must include either `Authorization: Bearer <token>` or
+`X-Admin-Token: <token>`.
 
 Example:
 
@@ -110,7 +115,14 @@ curl http://localhost:8080/api/health
 ## Volume troubleshooting
 
 On Railway, the server logs `persistent asset volume ready` with the resolved
-root path. If Volume Usage stays at `0 B` while uploads return success, the
-server is probably writing outside the mounted volume. Check the Volume
-Settings mount path and either remove `ASSETS_ROOT` or set it to that mount
-path (or a subdirectory inside it).
+root path. You can also check it over HTTP:
+
+```bash
+curl https://your-app.up.railway.app/api/health
+```
+
+If `Volume Usage` stays at `0 B` while uploads return success, compare
+`asset_root` and `railway_volume_mount_path`. When Railway exposes
+`RAILWAY_VOLUME_MOUNT_PATH`, `root_inside_railway_volume` must be `true`.
+If it is `false` or `null`, remove `ASSETS_ROOT` or set it to the mount
+path (or a subdirectory inside it), then redeploy.

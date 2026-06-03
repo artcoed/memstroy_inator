@@ -66,7 +66,12 @@ async fn main() -> Result<()> {
         tracing::info!(kind = ?kind, count, "indexed");
     }
 
-    tracing::info!(root = %root.display(), "persistent asset volume ready");
+    tracing::info!(
+        root = %root.display(),
+        assets_root_env = ?std::env::var_os("ASSETS_ROOT"),
+        railway_volume_mount_path = ?std::env::var_os("RAILWAY_VOLUME_MOUNT_PATH"),
+        "persistent asset volume ready"
+    );
 
     let handle = start(addr, store);
 

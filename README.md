@@ -159,6 +159,9 @@ cargo run -p memstroy-assets-server --release -- \
 
 Пользовательские клиенты читают каталог через:
 
+- `GET /api/health` — диагностика сервера и volume (`asset_root`,
+  `railway_volume_mount_path`, `root_inside_railway_volume`,
+  `asset_root_writable`, счётчики по типам);
 - `GET /api/assets?kind=clip&q=zapros&limit=100&offset=0` — список с
   пагинацией и fuzzy-поиском по Левенштейну;
 - `GET /api/assets/:id/download` — потоковая отдача файла;
@@ -168,8 +171,9 @@ cargo run -p memstroy-assets-server --release -- \
 `POST /api/admin/assets` (`multipart/form-data`): `kind`, файл `asset`,
 `description`, опционально `id`, `label`, `tags`, `thumbnail`. Для
 клипов контракт выглядит как `kind=clip`, видеофайл в `asset` и
-описание в `description`. Если переменная `ADMIN_TOKEN` задана, запрос
-должен передать `Authorization: Bearer <token>` или `X-Admin-Token`.
+описание в `description`. Если переменная `MEMSTROY_ADMIN_TOKEN` или
+`ADMIN_TOKEN` задана, запрос должен передать
+`Authorization: Bearer <token>` или `X-Admin-Token`.
 
 Уровень логов по умолчанию — `info`. Для отладки сервера:
 `RUST_LOG=memstroy_assets_server=debug`.

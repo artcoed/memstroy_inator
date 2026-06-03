@@ -29,9 +29,12 @@ use crate::undo::UndoStack;
 /// `https://assets.example.com` keeps working.
 /// When `true`, the editor never contacts `memstroy-assets-server` or
 /// downloads remote clips — only files under `assets/` are shown.
-/// Server fields and job hooks remain in the codebase for a future
-/// online-library mode.
-pub const LIBRARY_LOCAL_ONLY: bool = true;
+///
+/// Production client builds rely on the remote catalogue: the server
+/// URL is baked at build time, assets are fetched lazily, and files are
+/// cached under the per-user cache root. Keep this `false` by default
+/// so the shipped editor actually talks to the configured backend.
+pub const LIBRARY_LOCAL_ONLY: bool = false;
 
 pub fn rewrite_server_url_for_client(url: &str) -> String {
     let trimmed = url.trim();
@@ -353,6 +356,13 @@ pub struct FootageSequencePopup {
     pub actor_idx: usize,
     pub side: FootageSequenceSide,
     pub anchor: egui::Pos2,
+}
+
+#[derive(Clone, Debug)]
+pub struct AssetRenamePopup {
+    pub path: PathBuf,
+    pub name: String,
+    pub error: Option<String>,
 }
 
 /// Drag-and-drop state for an item being dragged out of the clip library.
@@ -763,6 +773,8 @@ pub struct EditorState {
     /// app's external file-drop handler can route OS drops to the right
     /// asset directory based on which tab is visible.
     pub library_panel_rect: Option<egui::Rect>,
+    /// Rename dialog opened from the library panel context menu.
+    pub asset_rename_popup: Option<AssetRenamePopup>,
     /// Vertical split ratio inside the library panel between the
     /// "Local" (user-imported, drop-zone) section on top and the
     /// "Global" (auto-fetched / built-in) section on the bottom.
@@ -4184,6 +4196,7 @@ impl EditorState {
                     t: new_t,
                     value: item.value,
                     easing: item.easing,
+                    param_owners: Default::default(),
                 });
                 kfs.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
                 true
@@ -4568,6 +4581,7 @@ fn paste_effect_keyframe(
         t: new_t,
         value: item.value,
         easing: item.easing,
+        param_owners: Default::default(),
     });
     kfs.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
     true

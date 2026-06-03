@@ -7,7 +7,8 @@ use memstroy_core::*;
 
 use crate::i18n::t;
 use crate::state::{
-    AssetDragKind, EditorState, FootageSequenceSide, LibraryTab, Selection, TrackKind,
+    AssetDragKind, AssetRenamePopup, EditorState, FootageSequenceSide, LibraryTab, Selection,
+    TrackKind,
 };
 
 // ─── DRAG MODE FOR TIMELINE CLIPS ────────────────────────────────────
@@ -194,6 +195,7 @@ pub fn library(ui: &mut egui::Ui, state: &mut EditorState, _request_refresh: imp
         LibraryTab::Images => library_assets_tab(ui, state, AssetDragKind::Image),
         LibraryTab::Particles => library_assets_tab(ui, state, AssetDragKind::Particle),
     }
+    show_library_rename_popup(ui.ctx(), state);
 }
 
 fn server_page_limit(ui: &egui::Ui) -> u64 {
@@ -1037,6 +1039,20 @@ fn draw_asset_grid_cell(
 /// Right-click menu for a library file row / grid cell.
 fn library_path_context_menu(resp: &egui::Response, state: &mut EditorState, path: &Path) {
     resp.context_menu(|ui| {
+        if is_renameable_library_path(state, path)
+            && ui.button(crate::i18n::t("Rename...")).clicked()
+        {
+            ui.close_menu();
+            state.asset_rename_popup = Some(AssetRenamePopup {
+                path: path.to_path_buf(),
+                name: path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string(),
+                error: None,
+            });
+        }
         if ui.button(crate::i18n::t("Show in folder")).clicked() {
             ui.close_menu();
             if let Err(e) = crate::shell_reveal::reveal_path_in_file_manager(path) {
@@ -1044,6 +1060,191 @@ fn library_path_context_menu(resp: &egui::Response, state: &mut EditorState, pat
             }
         }
     });
+}
+
+fn show_library_rename_popup(ctx: &egui::Context, state: &mut EditorState) {
+    let Some(mut popup) = state.asset_rename_popup.take() else {
+        return;
+    };
+    let mut keep_open = true;
+    let mut apply = false;
+    let mut cancel = false;
+
+    egui::Window::new(crate::i18n::t("Rename"))
+        .collapsible(false)
+        .resizable(false)
+        .open(&mut keep_open)
+        .default_width(280.0)
+        .show(ctx, |ui| {
+            ui.label(
+                RichText::new(
+                    popup
+                        .path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(""),
+                )
+                .small()
+                .color(COL_TEXT_DIM),
+            );
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut popup.name)
+                    .desired_width(ui.available_width())
+                    .hint_text(crate::i18n::t("New file name")),
+            );
+            resp.request_focus();
+            if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                apply = true;
+            }
+            if let Some(err) = &popup.error {
+                ui.label(RichText::new(err).color(Color32::from_rgb(255, 130, 110)));
+            }
+            ui.horizontal(|ui| {
+                if ui.button(crate::i18n::t("Rename")).clicked() {
+                    apply = true;
+                }
+                if ui.button(crate::i18n::t("Cancel")).clicked() {
+                    cancel = true;
+                }
+            });
+        });
+
+    if cancel || !keep_open {
+        return;
+    }
+    if apply {
+        match rename_library_asset(state, &popup.path, &popup.name) {
+            Ok(new_path) => {
+                state.status = format!(
+                    "{}: {}",
+                    crate::i18n::t("Renamed"),
+                    new_path.file_name().and_then(|s| s.to_str()).unwrap_or("")
+                );
+                ctx.request_repaint();
+                return;
+            }
+            Err(e) => {
+                popup.error = Some(e);
+            }
+        }
+    }
+    state.asset_rename_popup = Some(popup);
+}
+
+fn is_renameable_library_path(state: &EditorState, path: &Path) -> bool {
+    let Ok(path) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    if !path.is_file() {
+        return false;
+    }
+    local_library_roots(state).into_iter().any(|root| {
+        std::fs::canonicalize(root)
+            .ok()
+            .is_some_and(|root| path.starts_with(root))
+    })
+}
+
+fn local_library_roots(state: &EditorState) -> Vec<PathBuf> {
+    let mut roots = state.library_dirs().into_iter().collect::<Vec<_>>();
+    for tab in [
+        LibraryTab::Clips,
+        LibraryTab::Videos,
+        LibraryTab::Sounds,
+        LibraryTab::Images,
+    ] {
+        if let Some(dir) = state.server_cache_dir_for_tab(tab) {
+            roots.push(dir);
+        }
+    }
+    roots
+}
+
+fn rename_library_asset(
+    state: &mut EditorState,
+    path: &Path,
+    requested_name: &str,
+) -> Result<PathBuf, String> {
+    let path = std::fs::canonicalize(path)
+        .map_err(|e| format!("{}: {e}", crate::i18n::t("File not found")))?;
+    if !is_renameable_library_path(state, &path) {
+        return Err(crate::i18n::t("Only local library files can be renamed.").into());
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| crate::i18n::t("File has no parent directory.").to_string())?;
+    let trimmed = requested_name.trim();
+    if trimmed.is_empty() {
+        return Err(crate::i18n::t("Name cannot be empty.").into());
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') || trimmed.contains('\0') {
+        return Err(crate::i18n::t("Name must not contain path separators.").into());
+    }
+    if trimmed
+        .chars()
+        .any(|c| matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
+    {
+        return Err(crate::i18n::t("Name contains characters forbidden by the filesystem.").into());
+    }
+
+    let mut final_name = trimmed.to_string();
+    if Path::new(trimmed).extension().is_none() {
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            final_name.push('.');
+            final_name.push_str(ext);
+        }
+    }
+    let target = parent.join(final_name);
+    if target == path {
+        return Ok(target);
+    }
+    if target.exists() {
+        return Err(crate::i18n::t("A file with this name already exists.").into());
+    }
+
+    let old_duration = state.video_duration_cache.remove(&path);
+    std::fs::rename(&path, &target)
+        .map_err(|e| format!("{}: {e}", crate::i18n::t("Rename failed")))?;
+    if let Some(duration) = old_duration {
+        state.video_duration_cache.insert(target.clone(), duration);
+    }
+    rename_library_sidecars(&path, &target);
+    state.library_dir_fingerprint.clear();
+    state.library_reload_pending = true;
+    Ok(target)
+}
+
+fn rename_library_sidecars(old_path: &Path, new_path: &Path) {
+    for ext in ["txt", "chroma.json", "meta.json"] {
+        rename_sidecar_if_free(&old_path.with_extension(ext), &new_path.with_extension(ext));
+    }
+
+    let Some(old_stem) = old_path.file_stem().and_then(|s| s.to_str()) else {
+        return;
+    };
+    let Some(new_stem) = new_path.file_stem().and_then(|s| s.to_str()) else {
+        return;
+    };
+    let Some(parent) = old_path.parent() else {
+        return;
+    };
+    for ext in ["png", "jpg", "jpeg", "webp"] {
+        rename_sidecar_if_free(
+            &parent.join(format!("{old_stem}.thumb.{ext}")),
+            &parent.join(format!("{new_stem}.thumb.{ext}")),
+        );
+        rename_sidecar_if_free(
+            &parent.join("thumbs").join(format!("{old_stem}.{ext}")),
+            &parent.join("thumbs").join(format!("{new_stem}.{ext}")),
+        );
+    }
+}
+
+fn rename_sidecar_if_free(old_path: &Path, new_path: &Path) {
+    if old_path == new_path || !old_path.exists() || new_path.exists() {
+        return;
+    }
+    let _ = std::fs::rename(old_path, new_path);
 }
 
 fn asset_hover_text(
@@ -2293,6 +2494,24 @@ fn inspector_actor(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
         .color(COL_TEXT_DIM),
     );
     ui.add_space(6.0);
+
+    if state.scene.actors[i].mellstroy_footage.slot {
+        ui.label(
+            RichText::new(crate::i18n::t("Footage slot"))
+                .size(11.0)
+                .strong()
+                .color(COL_TEXT_DIM),
+        );
+        ui.label(
+            RichText::new(crate::i18n::t(
+                "Drop a footage clip onto this slot in the sequence.",
+            ))
+            .size(10.0)
+            .italics()
+            .color(COL_TEXT_DIM),
+        );
+        return;
+    }
 
     {
         let mut enabled = state.scene.actors[i].mellstroy_footage.enabled;
@@ -10196,7 +10415,7 @@ fn show_footage_sequence_popup(ui: &mut egui::Ui, state: &mut EditorState) {
         .fixed_pos(popup.anchor)
         .show(ui.ctx(), |ui| {
             egui::Frame::popup(ui.style()).show(ui, |ui| {
-                ui.set_min_width(190.0);
+                ui.set_min_width(154.0);
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new(crate::i18n::t("Footage sequence"))
@@ -11618,7 +11837,7 @@ pub(crate) fn fill_footage_sequence_slot(
     Some(slot_idx)
 }
 
-fn detach_actor_from_footage_sequence(state: &mut EditorState, actor_idx: usize) {
+pub(crate) fn detach_actor_from_footage_sequence(state: &mut EditorState, actor_idx: usize) {
     if actor_idx >= state.scene.actors.len() {
         return;
     }
@@ -11689,6 +11908,109 @@ fn find_footage_sequence_slot_at(state: &EditorState, track_idx: usize, t: f32) 
                 None
             }
         })
+}
+
+fn footage_sequence_slot_window(state: &EditorState, slot_idx: usize) -> Option<(f32, f32)> {
+    let actor = state.scene.actors.get(slot_idx)?;
+    if !actor.mellstroy_footage.enabled || !actor.mellstroy_footage.slot {
+        return None;
+    }
+    Some(actor_window(actor, state.scene.output.duration.max(0.1)))
+}
+
+fn find_footage_sequence_insert_at(
+    state: &EditorState,
+    track_idx: usize,
+    t: f32,
+) -> Option<(String, f32)> {
+    const SEAM_HIT_SEC: f32 = 0.20;
+    let mut clips: Vec<(String, f32, f32)> = state
+        .scene
+        .actors
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, actor)| {
+            if !actor.mellstroy_footage.enabled || actor.mellstroy_footage.slot {
+                return None;
+            }
+            let sequence_id = actor.mellstroy_footage.sequence_id.clone()?;
+            let assigned = state
+                .actor_track_assignments
+                .get(&idx)
+                .copied()
+                .unwrap_or_else(|| state.video_track_indices().first().copied().unwrap_or(0));
+            if assigned != track_idx {
+                return None;
+            }
+            let (t_in, t_out) = actor_window(actor, state.scene.output.duration.max(0.1));
+            Some((sequence_id, t_in, t_out))
+        })
+        .collect();
+    clips.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    for pair in clips.windows(2) {
+        let left = &pair[0];
+        let right = &pair[1];
+        if left.0 != right.0 {
+            continue;
+        }
+        if (right.1 - left.2).abs() > 0.05 {
+            continue;
+        }
+        let seam_t = (left.2 + right.1) * 0.5;
+        if (t - seam_t).abs() <= SEAM_HIT_SEC {
+            return Some((left.0.clone(), seam_t));
+        }
+    }
+    None
+}
+
+fn insert_footage_sequence_clip_at(
+    state: &mut EditorState,
+    path: &PathBuf,
+    track_idx: usize,
+    sequence_id: String,
+    insert_t: f32,
+) -> Option<usize> {
+    if !is_usable_local_video(path) {
+        return None;
+    }
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("mellstroy");
+    let actor_id = unique_actor_id_in_scene(&state.scene.actors, stem);
+    let dur = clip_duration_for_placement(state, path, &actor_id).max(0.1);
+    shift_footage_sequence_at_or_after(state, &sequence_id, insert_t, dur);
+    let idx = add_actor_from_clip_at_time_with_footage_flag(state, path, insert_t, true)?;
+    state.actor_track_assignments.insert(idx, track_idx);
+    if let Some(actor) = state.scene.actors.get_mut(idx) {
+        actor.mellstroy_footage.enabled = true;
+        actor.mellstroy_footage.sequence_id = Some(sequence_id);
+        actor.mellstroy_footage.slot = false;
+        actor.mellstroy_footage.edge_frame = false;
+    }
+    sync_audio_to_actor(state, idx);
+    state.request_media_preview = true;
+    Some(idx)
+}
+
+pub(crate) fn collapse_footage_sequence_gap_for_actor(state: &mut EditorState, actor_idx: usize) {
+    let Some(actor) = state.scene.actors.get(actor_idx) else {
+        return;
+    };
+    if !actor.mellstroy_footage.enabled {
+        return;
+    }
+    let Some(sequence_id) = actor.mellstroy_footage.sequence_id.clone() else {
+        return;
+    };
+    let (t_in, t_out) = actor_window(actor, state.scene.output.duration.max(0.1));
+    let dur = (t_out - t_in).max(0.0);
+    if dur <= 1.0e-4 {
+        return;
+    }
+    shift_footage_sequence_at_or_after(state, &sequence_id, t_out, -dur);
+    state.request_media_preview = true;
 }
 
 pub(crate) fn unique_audio_id_in_scene(audios: &[memstroy_core::AudioTrack], base: &str) -> String {
@@ -12965,7 +13287,9 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
         // ABOVE the clip bar — mirroring the transform-param rows
         // below. Layers without animated mask params yield 0 here so
         // the existing layout is unchanged in the common case.
-        let mask_above = selected_layer_mask_above_height(state, track_idx, v_zoom);
+        let sequence_above = selected_footage_sequence_panel_height(state, track_idx, v_zoom);
+        let mask_rows_above = selected_layer_mask_rows_height(state, track_idx, v_zoom);
+        let mask_above = sequence_above + mask_rows_above;
         let expansion = selected_layer_expansion(state, track_idx, v_zoom);
         let effective_track_h = mask_above + track_h + expansion;
         let track_kind = track.kind;
@@ -13044,6 +13368,26 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             egui::pos2(tracks_rect.max.x, clip_top + track_h - 1.0),
         )
         .intersect(tracks_rect);
+
+        if sequence_above > 4.0 {
+            let panel_rect = egui::Rect::from_min_max(
+                egui::pos2(tracks_rect.min.x, row_top + 2.0),
+                egui::pos2(tracks_rect.max.x, row_top + sequence_above - 2.0),
+            )
+            .intersect(tracks_rect);
+            let scroll_for_sequence_panel = state.timeline_scroll;
+            draw_selected_footage_sequence_panel(
+                ui,
+                painter,
+                state,
+                track_idx,
+                panel_rect,
+                scroll_for_sequence_panel,
+                pps,
+                track_left,
+                track_right,
+            );
+        }
 
         // Draw clips on this track
         match track_kind {
@@ -14717,7 +15061,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
         // reserved at the top of the row via `mask_above`. Layers
         // with no animated mask params reserve no space and so this
         // block is a no-op for the common case.
-        if mask_above > 4.0 {
+        if mask_rows_above > 4.0 {
             if let Some((sel_layer, rows)) = selected_layer_mask_param_rows(state, track_idx) {
                 if !rows.is_empty() {
                     let layer_label = match sel_layer {
@@ -14744,8 +15088,8 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                         painter,
                         &layer_label,
                         &rows,
-                        row_top,
-                        mask_above,
+                        row_top + sequence_above,
+                        mask_rows_above,
                         track_left,
                         track_right,
                         pps,
@@ -15176,9 +15520,29 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                 } else {
                     None
                 };
+                let target_sequence_insert = if target_slot.is_none()
+                    && matches!(kind, AssetDragKind::Clip | AssetDragKind::Video)
+                {
+                    find_footage_sequence_insert_at(state, assigned, drop_time)
+                } else {
+                    None
+                };
 
                 // Server-only stubs: download the `.mp4` first; the
                 // `ClipDownloaded` handler spawns the actor when done.
+                if target_sequence_insert.is_some()
+                    && ((kind == AssetDragKind::Clip
+                        && dragged_clip_needs_download(state, &asset_path))
+                        || (kind == AssetDragKind::Video
+                            && server_asset_needs_download(state, &asset_path, kind)))
+                {
+                    state.status = crate::i18n::t(
+                        "Download the footage first, then drop it on the sequence join.",
+                    )
+                    .into();
+                    state.clear_asset_drag();
+                    return;
+                }
                 let lazy_target = target_slot
                     .and_then(|slot_idx| state.scene.actors.get(slot_idx).map(|a| a.id.clone()))
                     .map(|actor_id| crate::jobs::ClipDropTarget::SequenceSlot { actor_id })
@@ -15202,6 +15566,20 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                 }
                 if let Some(slot_idx) = target_slot {
                     if fill_footage_sequence_slot(state, slot_idx, &asset_path).is_some() {
+                        state.clear_asset_drag();
+                        return;
+                    }
+                }
+                if let Some((sequence_id, seam_t)) = target_sequence_insert {
+                    if insert_footage_sequence_clip_at(
+                        state,
+                        &asset_path,
+                        assigned,
+                        sequence_id,
+                        seam_t,
+                    )
+                    .is_some()
+                    {
                         state.clear_asset_drag();
                         return;
                     }
@@ -15349,7 +15727,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                 })
                 .filter(|d| d.is_finite() && *d > 0.01)
                 .map(|d| (d, true))
-                .unwrap_or((1.0, false)),
+                .unwrap_or((crate::split_crop::CLIP_DURATION_PLACEHOLDER_SEC, false)),
             AssetDragKind::None => (1.0, false),
         };
         let drop_end_secs = drop_t_secs + preview_duration.max(0.1);
@@ -15374,56 +15752,128 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                 state.tracks[i].kind == TrackKind::Audio
                             };
                             if lane_kind_ok {
-                                return Some((*top, *bot, state.tracks[i].name.clone()));
+                                return Some((i, *top, *bot, state.tracks[i].name.clone()));
                             }
                         }
                     }
                     None
                 })();
-                if let Some((top, bot, name)) = target {
-                    let span_rect = egui::Rect::from_min_max(
-                        egui::pos2(span_x0.clamp(track_left, track_right), top + 3.0),
-                        egui::pos2(span_x1.clamp(track_left, track_right), bot - 3.0),
-                    );
-                    let min_w = 18.0;
-                    let span_rect = if span_rect.width() < min_w {
-                        egui::Rect::from_min_size(
-                            span_rect.min,
-                            egui::vec2(
-                                min_w.min(track_right - span_rect.min.x),
-                                span_rect.height(),
-                            ),
-                        )
+                if let Some((track_idx, top, bot, name)) = target {
+                    let sequence_target = if want_video
+                        && matches!(
+                            state.asset_drag.kind,
+                            AssetDragKind::Clip | AssetDragKind::Video
+                        ) {
+                        let slot = find_footage_sequence_slot_at(state, track_idx, drop_t_secs);
+                        let insert = if slot.is_none() {
+                            find_footage_sequence_insert_at(state, track_idx, drop_t_secs)
+                        } else {
+                            None
+                        };
+                        Some((slot, insert))
                     } else {
-                        span_rect
+                        None
                     };
-                    let col = if want_video {
-                        Color32::from_rgba_premultiplied(120, 220, 120, 72)
+                    if let Some((Some(slot_idx), _)) = sequence_target.clone() {
+                        let slot_window = footage_sequence_slot_window(state, slot_idx)
+                            .unwrap_or((drop_t_secs, drop_end_secs));
+                        let slot_start = slot_window.0;
+                        let slot_end = slot_start + preview_duration.max(0.1);
+                        let slot_x0 = (slot_start - state.timeline_scroll) * pps + track_left;
+                        let slot_x1 = (slot_end - state.timeline_scroll) * pps + track_left;
+                        let slot_rect = egui::Rect::from_min_max(
+                            egui::pos2(slot_x0.clamp(track_left, track_right), top + 3.0),
+                            egui::pos2(slot_x1.clamp(track_left, track_right), bot - 3.0),
+                        );
+                        ui.painter().rect_filled(
+                            slot_rect,
+                            Rounding::same(3.0),
+                            Color32::from_rgba_premultiplied(105, 165, 215, 86),
+                        );
+                        ui.painter().rect_stroke(
+                            slot_rect,
+                            Rounding::same(3.0),
+                            Stroke::new(2.0, Color32::from_rgb(110, 210, 240)),
+                        );
+                        ui.painter().text(
+                            slot_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            crate::i18n::t("Footage slot"),
+                            egui::FontId::proportional(10.0),
+                            Color32::from_rgb(215, 245, 255),
+                        );
+                        format!("-> {} / {}", name, crate::i18n::t("Footage slot"))
+                    } else if let Some((_, Some((_sequence_id, seam_t)))) = sequence_target {
+                        let seam_x = (seam_t - state.timeline_scroll) * pps + track_left;
+                        let seam_rect = egui::Rect::from_min_max(
+                            egui::pos2((seam_x - 5.0).clamp(track_left, track_right), top + 2.0),
+                            egui::pos2((seam_x + 5.0).clamp(track_left, track_right), bot - 2.0),
+                        );
+                        ui.painter().rect_filled(
+                            seam_rect,
+                            Rounding::same(2.0),
+                            Color32::from_rgba_premultiplied(90, 220, 240, 96),
+                        );
+                        ui.painter().line_segment(
+                            [
+                                egui::pos2(seam_x.clamp(track_left, track_right), top + 2.0),
+                                egui::pos2(seam_x.clamp(track_left, track_right), bot - 2.0),
+                            ],
+                            Stroke::new(2.5, Color32::from_rgb(90, 235, 255)),
+                        );
+                        ui.painter().text(
+                            seam_rect.center_top() + egui::vec2(0.0, 4.0),
+                            egui::Align2::CENTER_TOP,
+                            crate::i18n::t("Sequence join"),
+                            egui::FontId::proportional(10.0),
+                            Color32::from_rgb(215, 250, 255),
+                        );
+                        format!("-> {} / {}", name, crate::i18n::t("Sequence join"))
                     } else {
-                        Color32::from_rgba_premultiplied(120, 200, 240, 72)
-                    };
-                    ui.painter()
-                        .rect_filled(span_rect, Rounding::same(3.0), col);
-                    ui.painter().rect_stroke(
-                        span_rect,
-                        Rounding::same(3.0),
-                        Stroke::new(1.5, Color32::from_rgb(120, 220, 120)),
-                    );
-                    ui.painter().line_segment(
-                        [
-                            egui::pos2(span_rect.left(), top + 2.0),
-                            egui::pos2(span_rect.left(), bot - 2.0),
-                        ],
-                        Stroke::new(2.0, Color32::from_rgb(255, 245, 160)),
-                    );
-                    ui.painter().line_segment(
-                        [
-                            egui::pos2(span_rect.right(), top + 2.0),
-                            egui::pos2(span_rect.right(), bot - 2.0),
-                        ],
-                        Stroke::new(2.0, Color32::from_rgb(255, 245, 160)),
-                    );
-                    format!("-> {}", name)
+                        let span_rect = egui::Rect::from_min_max(
+                            egui::pos2(span_x0.clamp(track_left, track_right), top + 3.0),
+                            egui::pos2(span_x1.clamp(track_left, track_right), bot - 3.0),
+                        );
+                        let min_w = 18.0;
+                        let span_rect = if span_rect.width() < min_w {
+                            egui::Rect::from_min_size(
+                                span_rect.min,
+                                egui::vec2(
+                                    min_w.min(track_right - span_rect.min.x),
+                                    span_rect.height(),
+                                ),
+                            )
+                        } else {
+                            span_rect
+                        };
+                        let col = if want_video {
+                            Color32::from_rgba_premultiplied(120, 220, 120, 72)
+                        } else {
+                            Color32::from_rgba_premultiplied(120, 200, 240, 72)
+                        };
+                        ui.painter()
+                            .rect_filled(span_rect, Rounding::same(3.0), col);
+                        ui.painter().rect_stroke(
+                            span_rect,
+                            Rounding::same(3.0),
+                            Stroke::new(1.5, Color32::from_rgb(120, 220, 120)),
+                        );
+                        ui.painter().line_segment(
+                            [
+                                egui::pos2(span_rect.left(), top + 2.0),
+                                egui::pos2(span_rect.left(), bot - 2.0),
+                            ],
+                            Stroke::new(2.0, Color32::from_rgb(255, 245, 160)),
+                        );
+                        ui.painter().line_segment(
+                            [
+                                egui::pos2(span_rect.right(), top + 2.0),
+                                egui::pos2(span_rect.right(), bot - 2.0),
+                            ],
+                            Stroke::new(2.0, Color32::from_rgb(255, 245, 160)),
+                        );
+                        format!("-> {}", name)
+                    }
                 } else if want_video {
                     format!("-> {}", crate::i18n::t("New layer"))
                 } else {
@@ -17053,6 +17503,11 @@ fn mask_row_label(kind: &memstroy_core::EffectKind, key: &str) -> String {
 /// Returns 0.0 when the selected layer has no animated mask params,
 /// so the existing layout is unchanged in the common case.
 fn selected_layer_mask_above_height(state: &EditorState, track_idx: usize, v_zoom: f32) -> f32 {
+    selected_footage_sequence_panel_height(state, track_idx, v_zoom)
+        + selected_layer_mask_rows_height(state, track_idx, v_zoom)
+}
+
+fn selected_layer_mask_rows_height(state: &EditorState, track_idx: usize, v_zoom: f32) -> f32 {
     let Some((_, rows)) = selected_layer_mask_param_rows(state, track_idx) else {
         return 0.0;
     };
@@ -17060,6 +17515,187 @@ fn selected_layer_mask_above_height(state: &EditorState, track_idx: usize, v_zoo
         return 0.0;
     }
     (rows.len() as f32) * PARAM_ROW_BASE * v_zoom + PARAM_ROW_PAD_Y * 2.0
+}
+
+fn selected_footage_sequence_panel_height(
+    state: &EditorState,
+    track_idx: usize,
+    v_zoom: f32,
+) -> f32 {
+    let Some((_sequence_id, _actor_idx)) = selected_footage_sequence_on_track(state, track_idx)
+    else {
+        return 0.0;
+    };
+    (26.0 * v_zoom).clamp(22.0, 34.0)
+}
+
+fn selected_footage_sequence_on_track(
+    state: &EditorState,
+    track_idx: usize,
+) -> Option<(String, usize)> {
+    let actor_idx = match state.selection {
+        Selection::Actor(i) => i,
+        _ => return None,
+    };
+    let actor = state.scene.actors.get(actor_idx)?;
+    if !actor.mellstroy_footage.enabled || actor.mellstroy_footage.slot {
+        return None;
+    }
+    let sequence_id = actor.mellstroy_footage.sequence_id.clone()?;
+    let assigned = state
+        .actor_track_assignments
+        .get(&actor_idx)
+        .copied()
+        .unwrap_or_else(|| state.video_track_indices().first().copied().unwrap_or(0));
+    if assigned != track_idx {
+        return None;
+    }
+    Some((sequence_id, actor_idx))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_selected_footage_sequence_panel(
+    ui: &mut egui::Ui,
+    painter: &egui::Painter,
+    state: &mut EditorState,
+    track_idx: usize,
+    panel_rect: egui::Rect,
+    scroll: f32,
+    pps: f32,
+    track_left: f32,
+    track_right: f32,
+) {
+    let Some((sequence_id, selected_actor_idx)) =
+        selected_footage_sequence_on_track(state, track_idx)
+    else {
+        return;
+    };
+    let scene_duration = state.scene.output.duration.max(0.1);
+    let mut min_t = f32::INFINITY;
+    let mut max_t = 0.0_f32;
+    let mut indices = Vec::new();
+    for (idx, actor) in state.scene.actors.iter().enumerate() {
+        if actor.mellstroy_footage.enabled
+            && actor.mellstroy_footage.sequence_id.as_deref() == Some(sequence_id.as_str())
+        {
+            let assigned = state
+                .actor_track_assignments
+                .get(&idx)
+                .copied()
+                .unwrap_or_else(|| state.video_track_indices().first().copied().unwrap_or(0));
+            if assigned != track_idx {
+                continue;
+            }
+            let (t_in, t_out) = actor_window(actor, scene_duration);
+            min_t = min_t.min(t_in);
+            max_t = max_t.max(t_out);
+            indices.push(idx);
+        }
+    }
+    if indices.is_empty() || !min_t.is_finite() {
+        return;
+    }
+
+    let x0 = ((min_t - scroll) * pps + track_left).clamp(track_left, track_right);
+    let x1 = ((max_t - scroll) * pps + track_left).clamp(track_left, track_right);
+    let rect = egui::Rect::from_min_max(
+        egui::pos2(x0, panel_rect.min.y),
+        egui::pos2(x1.max(x0 + 120.0).min(track_right), panel_rect.max.y),
+    );
+    let resp = ui.interact(
+        rect,
+        egui::Id::new(("footage_sequence_panel", sequence_id.as_str())),
+        Sense::click_and_drag(),
+    );
+    if resp.clicked() {
+        state.selection = Selection::Actor(selected_actor_idx);
+    }
+    if resp.drag_started() {
+        state.timeline_drag.footage_sequence_anchor = indices
+            .iter()
+            .filter_map(|idx| {
+                let actor = state.scene.actors.get(*idx)?;
+                Some(crate::state::GroupMoveAnchor {
+                    sel: Selection::Actor(*idx),
+                    t_in: actor.t_in.unwrap_or(0.0),
+                    track: state.actor_track_assignments.get(idx).copied(),
+                })
+            })
+            .collect();
+        state.timeline_drag.footage_sequence_id = Some(sequence_id.clone());
+    }
+    if resp.dragged() {
+        let dt = resp.drag_delta().x / pps.max(1.0);
+        let anchors = state.timeline_drag.footage_sequence_anchor.clone();
+        if state.timeline_drag.footage_sequence_id.as_deref() == Some(sequence_id.as_str()) {
+            for anchor in anchors {
+                let Selection::Actor(idx) = anchor.sel else {
+                    continue;
+                };
+                if idx >= state.scene.actors.len() {
+                    continue;
+                }
+                let cur = state.scene.actors[idx].t_in.unwrap_or(0.0);
+                let target = (anchor.t_in + dt).max(0.0);
+                shift_actor_timeline_by(state, idx, target - cur);
+            }
+        }
+        ui.ctx().request_repaint();
+    }
+
+    let fill = if resp.hovered() {
+        Color32::from_rgba_premultiplied(60, 130, 155, 150)
+    } else {
+        Color32::from_rgba_premultiplied(40, 90, 115, 130)
+    };
+    painter.rect_filled(rect, Rounding::same(3.0), fill);
+    painter.rect_stroke(
+        rect,
+        Rounding::same(3.0),
+        Stroke::new(1.2, Color32::from_rgb(100, 220, 240)),
+    );
+    let mut x = rect.left() + 8.0;
+    painter.text(
+        egui::pos2(x, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        crate::i18n::t("Footage sequence"),
+        egui::FontId::proportional(10.5),
+        Color32::from_rgb(220, 245, 250),
+    );
+    x += 108.0;
+    for (tab, label) in [
+        (0usize, crate::i18n::t("Transform")),
+        (1usize, crate::i18n::t("Masks")),
+        (2usize, crate::i18n::t("Effects")),
+    ] {
+        let btn_rect = egui::Rect::from_min_size(
+            egui::pos2(x, rect.center().y - 9.0),
+            egui::vec2(58.0, 18.0),
+        );
+        let btn = ui.interact(
+            btn_rect,
+            egui::Id::new(("footage_sequence_panel_tab", sequence_id.as_str(), tab)),
+            Sense::click(),
+        );
+        if btn.clicked() {
+            state.inspector_tab = tab;
+            state.selection = Selection::Actor(selected_actor_idx);
+        }
+        let btn_fill = if btn.hovered() {
+            Color32::from_rgb(68, 80, 88)
+        } else {
+            Color32::from_rgb(48, 56, 62)
+        };
+        painter.rect_filled(btn_rect, Rounding::same(3.0), btn_fill);
+        painter.text(
+            btn_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            label,
+            egui::FontId::proportional(9.0),
+            Color32::from_rgb(225, 230, 235),
+        );
+        x += 62.0;
+    }
 }
 
 /// Sample-and-extract the keyframe times for a given (layer, param) so
@@ -18683,9 +19319,6 @@ fn paint_parent_pick_timeline_feedback(
     let Some(child_id) = state.parent_pick_child_id.as_deref() else {
         return;
     };
-    if child_id == element_id {
-        return;
-    }
     let Some(rect) = timeline_clip_visible_rect(
         content_rect,
         clip_start,
@@ -18701,13 +19334,27 @@ fn paint_parent_pick_timeline_feedback(
         .input(|i| i.pointer.hover_pos())
         .map(|p| rect.contains(p))
         .unwrap_or(false);
-    if hovered {
+    let is_child = child_id == element_id;
+    let stroke_col = if is_child {
+        Color32::from_rgb(255, 170, 70)
+    } else if hovered {
+        Color32::from_rgb(100, 235, 255)
+    } else {
+        Color32::from_rgb(80, 200, 230)
+    };
+    let fill_col = if is_child {
+        Color32::from_rgba_premultiplied(255, 165, 70, 24)
+    } else {
+        Color32::from_rgba_premultiplied(70, 210, 240, if hovered { 36 } else { 18 })
+    };
+    painter.rect_filled(rect.expand(2.0), Rounding::same(3.0), fill_col);
+    painter.rect_stroke(
+        rect.expand(2.0),
+        Rounding::same(3.0),
+        Stroke::new(if hovered { 2.2 } else { 1.6 }, stroke_col),
+    );
+    if hovered && !is_child {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        painter.rect_stroke(
-            rect.expand(2.0),
-            Rounding::same(3.0),
-            Stroke::new(2.0, Color32::from_rgb(255, 220, 90)),
-        );
     }
 }
 

@@ -790,35 +790,73 @@ async fn download_response_to_file(
         return Err(format!("unexpected content-type={ct}: {snippet}"));
     }
 
-    let bytes = resp.bytes().await.map_err(|e| format!("read error: {e}"))?;
-    if let Some(cl) = content_len {
-        if cl != bytes.len() as u64 {
-            return Err(format!(
-                "incomplete download: content-length={cl} got={}",
-                bytes.len()
-            ));
-        }
-    }
-    if bytes.len() < min_bytes {
-        return Err(format!(
-            "download too small: {} bytes (content-type={ct})",
-            bytes.len()
-        ));
-    }
-    if require_image && !is_valid_image_bytes(&bytes) {
-        return Err(format!(
-            "not a valid image: {} bytes (content-type={ct})",
-            bytes.len()
-        ));
-    }
-
     let tmp = target.with_extension("partial");
     if let Some(parent) = tmp.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
     }
-    tokio::fs::write(&tmp, &bytes)
-        .await
-        .map_err(|e| format!("write error: {e}"))?;
+
+    if require_image {
+        let bytes = resp.bytes().await.map_err(|e| format!("read error: {e}"))?;
+        if let Some(cl) = content_len {
+            if cl != bytes.len() as u64 {
+                return Err(format!(
+                    "incomplete download: content-length={cl} got={}",
+                    bytes.len()
+                ));
+            }
+        }
+        if bytes.len() < min_bytes {
+            return Err(format!(
+                "download too small: {} bytes (content-type={ct})",
+                bytes.len()
+            ));
+        }
+        if !is_valid_image_bytes(&bytes) {
+            return Err(format!(
+                "not a valid image: {} bytes (content-type={ct})",
+                bytes.len()
+            ));
+        }
+        tokio::fs::write(&tmp, &bytes)
+            .await
+            .map_err(|e| format!("write error: {e}"))?;
+    } else {
+        let mut file = tokio::fs::File::create(&tmp)
+            .await
+            .map_err(|e| format!("create temp file: {e}"))?;
+        let mut total = 0usize;
+        let mut response = resp;
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| format!("read error: {e}"))?
+        {
+            total += chunk.len();
+            tokio::io::AsyncWriteExt::write_all(&mut file, &chunk)
+                .await
+                .map_err(|e| format!("write error: {e}"))?;
+        }
+        tokio::io::AsyncWriteExt::flush(&mut file)
+            .await
+            .map_err(|e| format!("flush error: {e}"))?;
+        drop(file);
+        if let Some(cl) = content_len {
+            if cl != total as u64 {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                return Err(format!(
+                    "incomplete download: content-length={cl} got={total}"
+                ));
+            }
+        }
+        if total < min_bytes {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(format!(
+                "download too small: {} bytes (content-type={ct})",
+                total
+            ));
+        }
+    }
+
     match tokio::fs::rename(&tmp, target).await {
         Ok(()) => Ok(()),
         Err(first_err) => {

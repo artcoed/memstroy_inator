@@ -8,7 +8,7 @@ use memstroy_core::Scene;
 use tokio::runtime::Runtime;
 
 use crate::audio_engine::AudioEngine;
-use crate::jobs::{spawn_refresh, spawn_render, JobEvent};
+use crate::jobs::{spawn_render, JobEvent};
 use crate::panels;
 use crate::state::{EditorState, SceneExitAction, Selection};
 
@@ -2782,6 +2782,7 @@ impl App {
                 if i >= self.state.scene.actors.len() {
                     continue;
                 }
+                crate::panels::collapse_footage_sequence_gap_for_actor(&mut self.state, i);
                 let actor_id = self.state.scene.actors[i].id.clone();
                 let _removed_audio =
                     crate::panels::remove_audio_bound_to_actor(&mut self.state, &actor_id);
@@ -2871,6 +2872,7 @@ impl App {
                     }
                     for idx in actor_idxs.iter().rev().copied() {
                         if idx < s.scene.actors.len() {
+                            crate::panels::collapse_footage_sequence_gap_for_actor(s, idx);
                             s.scene.actors.remove(idx);
                         }
                         crate::panels::shift_assignments_after_remove(
@@ -2939,6 +2941,7 @@ impl App {
                     }
                     for idx in actor_idxs.iter().rev().copied() {
                         if idx < s.scene.actors.len() {
+                            crate::panels::collapse_footage_sequence_gap_for_actor(s, idx);
                             s.scene.actors.remove(idx);
                         }
                         crate::panels::shift_assignments_after_remove(
@@ -4034,16 +4037,10 @@ impl App {
             self.state.status = crate::i18n::t("Local library refreshed.").into();
             return;
         }
-        self.state.refreshing = true;
-        self.state.status = crate::i18n::t("Refreshing clips via assets-server...").into();
-        spawn_refresh(
-            self.rt.as_ref().unwrap().handle(),
-            self.tx.clone(),
-            self.state.server_url.clone(),
-            self.state.tg_channel.clone(),
-            self.state.tg_limit,
-            self.state.clips_dir(),
-        );
+        self.state
+            .reset_server_page_for_tab(self.state.library_tab, self.state.library_search.clone());
+        self.state.reload_library();
+        self.state.status = crate::i18n::t("Server library refresh requested.").into();
     }
 
     // ─── AUTO-SAVE / RECOVERY ────────────────────────────────────────

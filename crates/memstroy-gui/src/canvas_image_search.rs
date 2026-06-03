@@ -642,9 +642,9 @@ pub fn show_canvas_search_ui(
         .collapsible(false)
         .resizable(true)
         .title_bar(true)
-        .default_size(Vec2::new(460.0, 420.0))
-        .min_size(Vec2::new(320.0, 260.0))
-        .max_size(Vec2::new(920.0, 980.0));
+        .default_size(Vec2::new(420.0, 390.0))
+        .min_size(Vec2::new(300.0, 260.0))
+        .max_size(Vec2::new(760.0, 900.0));
 
     if let Some([x, y]) = state
         .canvas_image_search
@@ -851,12 +851,11 @@ fn draw_popup_body(
                         let start = session.carousel_start;
                         let total = session.results.len();
                         let thumb = 72.0;
-                        let controls_w = 64.0;
-                        carousel_page_size =
-                            (((ui.available_width() - controls_w) / (thumb + 10.0))
-                                .floor()
-                                .max(2.0) as usize)
-                                .min(CAROUSEL_PAGE_SIZE);
+                        let arrow_w = 32.0;
+                        let gap = 8.0;
+                        let cards_w = (ui.available_width() - arrow_w * 2.0 - gap * 2.0).max(thumb);
+                        carousel_page_size = ((cards_w / (thumb + 10.0)).floor().max(1.0) as usize)
+                            .min(CAROUSEL_PAGE_SIZE);
                         let can_prev = start >= carousel_page_size;
                         let end = (start + carousel_page_size).min(total);
                         let has_next_local = end < total;
@@ -867,8 +866,6 @@ fn draw_popup_body(
                         let row_h = thumb + 28.0;
                         let (row_rect, _) =
                             ui.allocate_exact_size(Vec2::new(row_w, row_h), Sense::hover());
-                        let arrow_w = 32.0;
-                        let gap = 8.0;
                         let prev_rect =
                             Rect::from_min_size(row_rect.left_top(), Vec2::new(arrow_w, thumb));
                         let next_rect = Rect::from_min_size(
@@ -977,6 +974,7 @@ fn draw_popup_body(
         state.canvas_image_search = None;
         return;
     }
+    draw_popup_element_tools(ui, state, tx);
     if kick_search_now || re_search_transparent {
         kick_canvas_search(state, tx, false);
     }
@@ -1015,6 +1013,450 @@ fn draw_popup_body(
     }
     if let Some(idx) = download_idx {
         kick_canvas_download(state, tx, idx);
+    }
+}
+
+fn draw_popup_element_tools(ui: &mut egui::Ui, state: &mut EditorState, tx: &Sender<JobEvent>) {
+    let Some(overlay_idx) = state
+        .canvas_image_search
+        .as_ref()
+        .and_then(|s| s.placed_overlay)
+    else {
+        return;
+    };
+    if !matches!(
+        state.scene.overlays.get(overlay_idx),
+        Some(Overlay::Image(_))
+    ) {
+        return;
+    }
+
+    let mut apply_ai = false;
+    let mut arm_existing: Option<(MaskTool, usize)> = None;
+    let mut push_and_arm: Option<(Effect, MaskTool)> = None;
+    let mut stop_tool = false;
+    let mut live_changed = false;
+
+    ui.add_space(8.0);
+    egui::Frame::none()
+        .fill(Color32::from_rgba_premultiplied(18, 20, 24, 235))
+        .rounding(Rounding::same(6.0))
+        .stroke(Stroke::new(1.0, Color32::from_rgb(70, 110, 150)))
+        .inner_margin(egui::Margin::same(8.0))
+        .show(ui, |ui| {
+            ui.collapsing(crate::i18n::t("Background removal"), |ui| {
+                let ai_busy = state
+                    .canvas_image_search
+                    .as_ref()
+                    .is_some_and(|s| s.ai_removing);
+                let status = state
+                    .canvas_image_search
+                    .as_ref()
+                    .map(|s| s.status.clone())
+                    .unwrap_or_default();
+
+                ui.horizontal(|ui| {
+                    ui.label(crate::i18n::t("Brush"));
+                    ui.add(egui::Slider::new(
+                        &mut state.mask_brush_radius_uv,
+                        0.004..=0.14,
+                    ));
+                });
+                ui.horizontal(|ui| {
+                    ui.label(crate::i18n::t("Feather"));
+                    ui.add(egui::Slider::new(&mut state.mask_brush_feather, 0.0..=0.12));
+                });
+                ui.horizontal(|ui| {
+                    ui.label(crate::i18n::t("Pressure"));
+                    ui.add(egui::Slider::new(
+                        &mut state.mask_brush_pressure,
+                        0.05..=1.0,
+                    ));
+                });
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(!ai_busy, egui::Button::new(crate::i18n::t("Brush select")))
+                        .clicked()
+                    {
+                        arm_existing = None;
+                        push_and_arm = Some((
+                            Effect::new(EffectKind::Mask {
+                                shape: MaskShape::BrushStroke {
+                                    points: vec![[0.45, 0.5], [0.55, 0.5]],
+                                    radius: state.mask_brush_radius_uv,
+                                },
+                                feather: state.mask_brush_feather,
+                                invert: false,
+                            }),
+                            MaskTool::FreehandMask,
+                        ));
+                    }
+                    if ui
+                        .add_enabled(
+                            !ai_busy,
+                            egui::Button::new(crate::i18n::t("Apply AI cutout")),
+                        )
+                        .clicked()
+                    {
+                        apply_ai = true;
+                    }
+                    if ui
+                        .button(crate::i18n::t("Reapply checkerboard strip"))
+                        .clicked()
+                    {
+                        if let Err(e) = reapply_checkerboard_strip(state, overlay_idx) {
+                            if let Some(s) = state.canvas_image_search.as_mut() {
+                                s.status = e;
+                            }
+                        }
+                    }
+                });
+                if ai_busy {
+                    ui.label(RichText::new(crate::i18n::t("Removing background…")).small());
+                } else if !status.is_empty() {
+                    ui.label(RichText::new(status).small().weak());
+                }
+            });
+
+            ui.collapsing(crate::i18n::t("Masks and chroma key"), |ui| {
+                let mut remove_idx: Option<usize> = None;
+                if let Some(effects) = image_overlay_effects_mut(state, overlay_idx) {
+                    for (ei, eff) in effects.iter_mut().enumerate() {
+                        let label = match &eff.kind {
+                            EffectKind::Mask { shape, .. } => mask_shape_label(shape),
+                            EffectKind::Crop { .. } => crate::i18n::t("Crop"),
+                            EffectKind::ColorKey { .. } => crate::i18n::t("Color key mask"),
+                            _ => continue,
+                        };
+                        egui::Frame::none()
+                            .fill(Color32::from_rgb(28, 30, 36))
+                            .rounding(Rounding::same(4.0))
+                            .stroke(Stroke::new(1.0, Color32::from_rgb(58, 70, 92)))
+                            .inner_margin(egui::Margin::same(6.0))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    if ui.checkbox(&mut eff.enabled, "").changed() {
+                                        live_changed = true;
+                                    }
+                                    ui.label(
+                                        RichText::new(label)
+                                            .size(11.0)
+                                            .strong()
+                                            .color(Color32::from_rgb(220, 230, 240)),
+                                    );
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if ui.small_button("x").clicked() {
+                                                remove_idx = Some(ei);
+                                            }
+                                        },
+                                    );
+                                });
+                                match &mut eff.kind {
+                                    EffectKind::Mask {
+                                        shape,
+                                        feather,
+                                        invert,
+                                    } => {
+                                        ui.horizontal(|ui| {
+                                            ui.label(crate::i18n::t("Feather"));
+                                            if ui
+                                                .add(egui::Slider::new(feather, 0.0..=0.5))
+                                                .changed()
+                                            {
+                                                live_changed = true;
+                                            }
+                                        });
+                                        if ui.checkbox(invert, crate::i18n::t("Invert")).changed() {
+                                            live_changed = true;
+                                        }
+                                        match shape {
+                                            MaskShape::Rect { .. } => {
+                                                if ui
+                                                    .button(crate::i18n::t("Repaint rectangle"))
+                                                    .clicked()
+                                                {
+                                                    arm_existing = Some((MaskTool::RectMask, ei));
+                                                }
+                                            }
+                                            MaskShape::Ellipse { .. } => {
+                                                if ui
+                                                    .button(crate::i18n::t("Repaint ellipse"))
+                                                    .clicked()
+                                                {
+                                                    arm_existing =
+                                                        Some((MaskTool::EllipseMask, ei));
+                                                }
+                                            }
+                                            MaskShape::Polygon { .. } => {
+                                                ui.horizontal(|ui| {
+                                                    if ui
+                                                        .button(crate::i18n::t("Freehand"))
+                                                        .clicked()
+                                                    {
+                                                        arm_existing =
+                                                            Some((MaskTool::FreehandMask, ei));
+                                                    }
+                                                    if ui
+                                                        .button(crate::i18n::t("Segments"))
+                                                        .clicked()
+                                                    {
+                                                        arm_existing =
+                                                            Some((MaskTool::SegmentMask, ei));
+                                                    }
+                                                });
+                                            }
+                                            MaskShape::BrushStroke { radius, .. } => {
+                                                ui.horizontal(|ui| {
+                                                    ui.label(crate::i18n::t("Radius"));
+                                                    if ui
+                                                        .add(egui::Slider::new(radius, 0.002..=0.2))
+                                                        .changed()
+                                                    {
+                                                        live_changed = true;
+                                                    }
+                                                });
+                                                ui.horizontal(|ui| {
+                                                    if ui.button(crate::i18n::t("Draw")).clicked() {
+                                                        arm_existing =
+                                                            Some((MaskTool::BrushDraw, ei));
+                                                    }
+                                                    if ui.button(crate::i18n::t("Eraser")).clicked()
+                                                    {
+                                                        arm_existing = Some((MaskTool::Eraser, ei));
+                                                    }
+                                                });
+                                            }
+                                        }
+                                    }
+                                    EffectKind::Crop {
+                                        left,
+                                        top,
+                                        right,
+                                        bottom,
+                                    } => {
+                                        for (label, value) in [
+                                            (crate::i18n::t("Left"), left),
+                                            (crate::i18n::t("Top"), top),
+                                            (crate::i18n::t("Right"), right),
+                                            (crate::i18n::t("Bottom"), bottom),
+                                        ] {
+                                            ui.horizontal(|ui| {
+                                                ui.label(label);
+                                                if ui
+                                                    .add(egui::Slider::new(value, 0.0..=0.49))
+                                                    .changed()
+                                                {
+                                                    live_changed = true;
+                                                }
+                                            });
+                                        }
+                                        if ui.button(crate::i18n::t("Repaint crop")).clicked() {
+                                            arm_existing = Some((MaskTool::CropRect, ei));
+                                        }
+                                    }
+                                    EffectKind::ColorKey {
+                                        color,
+                                        similarity,
+                                        blend,
+                                        spill,
+                                        invert,
+                                    } => {
+                                        ui.horizontal(|ui| {
+                                            ui.label(crate::i18n::t("Key colour"));
+                                            let mut rgb = [
+                                                color[0] as f32 / 255.0,
+                                                color[1] as f32 / 255.0,
+                                                color[2] as f32 / 255.0,
+                                            ];
+                                            if ui.color_edit_button_rgb(&mut rgb).changed() {
+                                                color[0] =
+                                                    (rgb[0] * 255.0).round().clamp(0.0, 255.0)
+                                                        as u8;
+                                                color[1] =
+                                                    (rgb[1] * 255.0).round().clamp(0.0, 255.0)
+                                                        as u8;
+                                                color[2] =
+                                                    (rgb[2] * 255.0).round().clamp(0.0, 255.0)
+                                                        as u8;
+                                                live_changed = true;
+                                            }
+                                        });
+                                        ui.horizontal(|ui| {
+                                            ui.label(crate::i18n::t("Similarity"));
+                                            if ui
+                                                .add(egui::Slider::new(similarity, 0.0..=1.0))
+                                                .changed()
+                                            {
+                                                live_changed = true;
+                                            }
+                                        });
+                                        ui.horizontal(|ui| {
+                                            ui.label(crate::i18n::t("Blend"));
+                                            if ui.add(egui::Slider::new(blend, 0.0..=1.0)).changed()
+                                            {
+                                                live_changed = true;
+                                            }
+                                        });
+                                        ui.horizontal(|ui| {
+                                            ui.label(crate::i18n::t("Spill"));
+                                            if ui.add(egui::Slider::new(spill, 0.0..=1.0)).changed()
+                                            {
+                                                live_changed = true;
+                                            }
+                                        });
+                                        if ui.checkbox(invert, crate::i18n::t("Invert")).changed() {
+                                            live_changed = true;
+                                        }
+                                        if ui.button(crate::i18n::t("Re-pick")).clicked() {
+                                            arm_existing = Some((MaskTool::Eyedropper, ei));
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            });
+                        ui.add_space(4.0);
+                    }
+                }
+                if let Some(idx) = remove_idx {
+                    if let Some(effects) = image_overlay_effects_mut(state, overlay_idx) {
+                        if idx < effects.len() {
+                            effects.remove(idx);
+                            live_changed = true;
+                        }
+                    }
+                }
+
+                ui.add_space(4.0);
+                egui::Grid::new(("popup_mask_tools", overlay_idx))
+                    .num_columns(2)
+                    .spacing([6.0, 6.0])
+                    .show(ui, |ui| {
+                        if ui.button(crate::i18n::t("Rectangle mask")).clicked() {
+                            push_and_arm = Some((Effect::mask_rect(), MaskTool::RectMask));
+                        }
+                        if ui.button(crate::i18n::t("Ellipse mask")).clicked() {
+                            push_and_arm = Some((Effect::mask_ellipse(), MaskTool::EllipseMask));
+                        }
+                        ui.end_row();
+                        if ui.button(crate::i18n::t("Freehand mask")).clicked() {
+                            push_and_arm = Some((Effect::mask_freehand(), MaskTool::FreehandMask));
+                        }
+                        if ui.button(crate::i18n::t("Segment selection")).clicked() {
+                            push_and_arm = Some((Effect::mask_freehand(), MaskTool::SegmentMask));
+                        }
+                        ui.end_row();
+                        if ui.button(crate::i18n::t("Crop")).clicked() {
+                            push_and_arm = Some((Effect::crop(), MaskTool::CropRect));
+                        }
+                        if ui.button(crate::i18n::t("Color key")).clicked() {
+                            push_and_arm = Some((Effect::color_key(), MaskTool::Eyedropper));
+                        }
+                        ui.end_row();
+                        if ui.button(crate::i18n::t("Draw")).clicked() {
+                            push_and_arm = Some((
+                                Effect::new(EffectKind::Mask {
+                                    shape: MaskShape::BrushStroke {
+                                        points: vec![[0.45, 0.5], [0.55, 0.5]],
+                                        radius: state.mask_brush_radius_uv,
+                                    },
+                                    feather: state.mask_brush_feather,
+                                    invert: false,
+                                }),
+                                MaskTool::BrushDraw,
+                            ));
+                        }
+                        if ui.button(crate::i18n::t("Eraser")).clicked() {
+                            push_and_arm = Some((
+                                Effect::new(EffectKind::Mask {
+                                    shape: MaskShape::BrushStroke {
+                                        points: vec![[0.45, 0.5], [0.55, 0.5]],
+                                        radius: state.mask_brush_radius_uv,
+                                    },
+                                    feather: state.mask_brush_feather,
+                                    invert: true,
+                                }),
+                                MaskTool::Eraser,
+                            ));
+                        }
+                        ui.end_row();
+                    });
+
+                if state.mask_tool.is_active() {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "{}: {}",
+                                crate::i18n::t("Drawing"),
+                                state.mask_tool.label(),
+                            ))
+                            .size(11.0)
+                            .color(Color32::from_rgb(255, 210, 90)),
+                        );
+                        if ui.button(crate::i18n::t("Stop")).clicked() {
+                            stop_tool = true;
+                        }
+                    });
+                }
+            });
+        });
+
+    if let Some((tool, idx)) = arm_existing {
+        arm_popup_mask_tool(state, overlay_idx, tool, Some(idx));
+    }
+    if let Some((effect, tool)) = push_and_arm {
+        let mut new_idx = None;
+        if let Some(effects) = image_overlay_effects_mut(state, overlay_idx) {
+            effects.push(effect);
+            new_idx = Some(effects.len().saturating_sub(1));
+            live_changed = true;
+        }
+        arm_popup_mask_tool(state, overlay_idx, tool, new_idx);
+    }
+    if stop_tool {
+        state.mask_tool = MaskTool::None;
+        state.mask_replace_target = None;
+    }
+    if apply_ai {
+        kick_ai_background_remove(state, tx, overlay_idx);
+    }
+    if live_changed {
+        state.request_media_preview = true;
+        ui.ctx().request_repaint();
+    }
+}
+
+fn image_overlay_effects_mut(
+    state: &mut EditorState,
+    overlay_idx: usize,
+) -> Option<&mut Vec<Effect>> {
+    match state.scene.overlays.get_mut(overlay_idx) {
+        Some(Overlay::Image(im)) => Some(&mut im.effects),
+        _ => None,
+    }
+}
+
+fn arm_popup_mask_tool(
+    state: &mut EditorState,
+    overlay_idx: usize,
+    tool: MaskTool,
+    replace_idx: Option<usize>,
+) {
+    state.selection = Selection::Overlay(overlay_idx);
+    state.mask_tool = tool;
+    state.mask_replace_target = replace_idx.map(|idx| (Selection::Overlay(overlay_idx), idx));
+    state.mask_draft_points.clear();
+    state.status = format!("{}: {}", crate::i18n::t("Drawing"), tool.label());
+}
+
+fn mask_shape_label(shape: &MaskShape) -> &'static str {
+    match shape {
+        MaskShape::Rect { .. } => crate::i18n::t("Rectangle mask"),
+        MaskShape::Ellipse { .. } => crate::i18n::t("Ellipse mask"),
+        MaskShape::Polygon { .. } => crate::i18n::t("Freehand mask"),
+        MaskShape::BrushStroke { .. } => crate::i18n::t("Brush mask"),
     }
 }
 

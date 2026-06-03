@@ -76,61 +76,15 @@ impl AssetStore {
                 if !is_primary_for_kind(&path, kind) {
                     continue;
                 }
-                let stem = match path.file_stem().and_then(|s| s.to_str()) {
-                    Some(s) => s.to_string(),
-                    None => continue,
-                };
-                let metadata = match ent.metadata() {
-                    Ok(m) => m,
-                    Err(e) => {
-                        warn!(path = %path.display(), error = %e, "metadata read failed");
-                        continue;
-                    }
-                };
-                let size_bytes = metadata.len();
-
-                let label = read_sidecar_string(&path, "label").unwrap_or_else(|| stem.clone());
-
-                let description = match kind {
-                    AssetKind::Text => std::fs::read_to_string(&path).unwrap_or_default(),
-                    _ => read_sidecar_string(&path, "txt").unwrap_or_default(),
-                };
-
-                let tags = read_sidecar_string(&path, "tags")
-                    .map(parse_tags)
-                    .unwrap_or_default();
                 let _ = ensure_asset_derivatives(&path, kind);
-                let thumbnail = find_thumbnail(&path, kind);
-                let media_meta = read_media_meta(&path).unwrap_or_default();
-                let file_name = path
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let extension = path
-                    .extension()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or_default()
-                    .to_ascii_lowercase();
-
-                by_id.insert(
-                    stem.clone(),
-                    AssetEntry {
-                        id: stem,
-                        kind,
-                        label,
-                        description,
-                        path,
-                        thumbnail,
-                        size_bytes,
-                        file_name,
-                        extension,
-                        duration_secs: media_meta.duration_secs,
-                        width: media_meta.width,
-                        height: media_meta.height,
-                        tags,
-                    },
-                );
+                match entry_from_primary(&path, kind) {
+                    Ok(entry) => {
+                        by_id.insert(entry.id.clone(), entry);
+                    }
+                    Err(e) => {
+                        warn!(path = %path.display(), error = %e, "asset indexing failed");
+                    }
+                }
             }
         }
 
@@ -139,6 +93,24 @@ impl AssetStore {
         inner.by_id = by_id;
         info!(count = inner.by_id.len(), root = %root.display(), "asset index rebuilt");
         Ok(())
+    }
+
+    /// Insert or replace one primary asset in the in-memory index.
+    ///
+    /// Upload handlers use this after persisting a new file so readers
+    /// do not pay for a full recursive reindex on every admin upload.
+    pub fn upsert_primary(&self, root: &Path, path: &Path, kind: AssetKind) -> Result<AssetEntry> {
+        let entry = entry_from_primary(path, kind)?;
+        let mut inner = self.inner.write().expect("store rwlock poisoned");
+        inner.root = root.to_path_buf();
+        inner.by_id.insert(entry.id.clone(), entry.clone());
+        debug!(
+            id = %entry.id,
+            kind = ?entry.kind,
+            path = %entry.path.display(),
+            "asset index upserted"
+        );
+        Ok(entry)
     }
 
     /// Total number of indexed assets.
@@ -225,6 +197,54 @@ impl AssetStore {
             .collect();
         (total, page)
     }
+}
+
+fn entry_from_primary(path: &Path, kind: AssetKind) -> Result<AssetEntry> {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .with_context(|| format!("{} has no valid UTF-8 stem", path.display()))?
+        .to_string();
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("reading metadata for {}", path.display()))?;
+    let size_bytes = metadata.len();
+
+    let label = read_sidecar_string(path, "label").unwrap_or_else(|| stem.clone());
+    let description = match kind {
+        AssetKind::Text => std::fs::read_to_string(path).unwrap_or_default(),
+        _ => read_sidecar_string(path, "txt").unwrap_or_default(),
+    };
+    let tags = read_sidecar_string(path, "tags")
+        .map(parse_tags)
+        .unwrap_or_default();
+    let thumbnail = find_thumbnail(path, kind);
+    let media_meta = read_media_meta(path).unwrap_or_default();
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_string();
+    let extension = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    Ok(AssetEntry {
+        id: stem,
+        kind,
+        label,
+        description,
+        path: path.to_path_buf(),
+        thumbnail,
+        size_bytes,
+        file_name,
+        extension,
+        duration_secs: media_meta.duration_secs,
+        width: media_meta.width,
+        height: media_meta.height,
+        tags,
+    })
 }
 
 fn relevance_score(entry: &AssetEntry, query: &str) -> Option<u32> {

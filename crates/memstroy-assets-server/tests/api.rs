@@ -39,13 +39,18 @@ fn fixture_store() -> (TempDir, AssetStore) {
 }
 
 async fn body_json(resp: axum::response::Response) -> Value {
+    let bytes = body_bytes(resp).await;
+    serde_json::from_slice(&bytes).expect("valid json")
+}
+
+async fn body_bytes(resp: axum::response::Response) -> bytes::Bytes {
     let bytes = resp
         .into_body()
         .collect()
         .await
         .expect("collect body")
         .to_bytes();
-    serde_json::from_slice(&bytes).expect("valid json")
+    bytes
 }
 
 #[tokio::test]
@@ -213,6 +218,32 @@ async fn full_record_endpoint_returns_untruncated_description() {
     assert_eq!(v["id"], Value::from("clip_a"));
     assert_eq!(v["description"], Value::from("description for clip a"));
     assert_eq!(v["tags"].as_array().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn download_supports_byte_ranges() {
+    let (_tmp, store) = fixture_store();
+    let app = router(store);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/assets/clip_a/download")
+                .header("range", "bytes=0-3")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        resp.headers()
+            .get("content-range")
+            .and_then(|v| v.to_str().ok()),
+        Some("bytes 0-3/14")
+    );
+    let bytes = body_bytes(resp).await;
+    assert_eq!(&bytes[..], b"fake");
 }
 
 #[tokio::test]

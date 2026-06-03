@@ -6,7 +6,9 @@
 //! "trust the network" — it's expected to live next to the editor on
 //! a developer machine, not on the public internet.
 
+use std::io::SeekFrom;
 use std::path::{Path as FsPath, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -20,9 +22,9 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tower_http::cors::{Any, CorsLayer};
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::model::{AssetKind, AssetSummary};
 use crate::store::{ensure_asset_derivatives, AssetStore};
@@ -47,6 +49,9 @@ const FALLBACK_IMAGE: &[u8] = include_bytes!("../assets/fallback.jpg");
 
 /// 1-second silent WAV used for missing sound assets.
 const FALLBACK_SOUND: &[u8] = include_bytes!("../assets/fallback.wav");
+
+const DEFAULT_MAX_UPLOAD_BYTES: u64 = 512 * 1024 * 1024;
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 fn fallback_download_response(id: &str, kind: AssetKind) -> Response {
     let (bytes, mime, ext): (&'static [u8], &'static str, &'static str) = match kind {
@@ -128,12 +133,58 @@ pub fn router(store: AssetStore) -> Router {
 // ---------------------------------------------------------------------------
 
 async fn health(State(store): State<AssetStore>) -> Json<serde_json::Value> {
+    let root = store.root();
+    let root_metadata = tokio::fs::metadata(&root).await.ok();
+    let railway_volume_mount_path = env_string("RAILWAY_VOLUME_MOUNT_PATH");
+    let root_inside_railway_volume = railway_volume_mount_path.as_deref().map(|mount| {
+        let mount = FsPath::new(mount);
+        !mount.as_os_str().is_empty() && root.starts_with(mount)
+    });
+    let counts_by_kind: Vec<_> = store
+        .count_by_kind()
+        .into_iter()
+        .map(|(kind, count)| json!({ "kind": kind, "count": count }))
+        .collect();
+
     Json(json!({
         "ok": true,
         "count": store.count(),
+        "counts_by_kind": counts_by_kind,
+        "asset_root": root,
+        "asset_root_exists": root_metadata.is_some(),
+        "asset_root_is_dir": root_metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false),
+        "asset_root_writable": root_writable(&store.root()).await,
+        "assets_root_env": env_string("ASSETS_ROOT"),
+        "railway_volume_mount_path": railway_volume_mount_path,
+        "root_inside_railway_volume": root_inside_railway_volume,
+        "admin_token_configured": configured_admin_token().is_some(),
+        "max_upload_bytes": max_upload_bytes(),
         "version": env!("CARGO_PKG_VERSION"),
         "git_hash": option_env!("GIT_HASH").unwrap_or("unknown"),
     }))
+}
+
+fn env_string(name: &str) -> Option<String> {
+    let raw = std::env::var(name).ok()?;
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+async fn root_writable(root: &FsPath) -> bool {
+    if root.as_os_str().is_empty() {
+        return false;
+    }
+    if tokio::fs::create_dir_all(root).await.is_err() {
+        return false;
+    }
+    let probe = root.join(format!(".healthcheck-{}.tmp", monotonic_stamp()));
+    match tokio::fs::write(&probe, b"ok").await {
+        Ok(()) => {
+            let _ = tokio::fs::remove_file(&probe).await;
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -210,6 +261,7 @@ async fn get_asset(
 async fn get_preview(
     State(store): State<AssetStore>,
     Path(id): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let Some(entry) = store.get(&id) else {
         return Ok(fallback_preview_response());
@@ -227,16 +279,29 @@ async fn get_preview(
         }
     };
 
+    let metadata = match file.metadata().await {
+        Ok(m) => m,
+        Err(e) => {
+            warn!(path = %thumb.display(), error = %e, "thumbnail metadata failed; serving placeholder");
+            return Ok(fallback_preview_response());
+        }
+    };
+    let etag = weak_etag(&metadata);
+    if request_etag_matches(&headers, &etag) {
+        return Ok(not_modified_response(&etag));
+    }
+
     let mime = mime_guess::from_path(&thumb).first_or_octet_stream();
     let stream = tokio_util::io::ReaderStream::new(file);
     let body = Body::from_stream(stream);
-
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, mime.as_ref())
+        .header(header::CONTENT_LENGTH, metadata.len().to_string())
+        .header(header::ETAG, etag)
         .header(
             header::CACHE_CONTROL,
-            HeaderValue::from_static("public, max-age=300"),
+            HeaderValue::from_static("public, max-age=86400, immutable"),
         )
         .body(body)
         .expect("valid response"))
@@ -249,6 +314,7 @@ async fn get_preview(
 async fn get_download(
     State(store): State<AssetStore>,
     Path(id): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let Some(entry) = store.get(&id) else {
         return Ok(fallback_download_response(&id, AssetKind::Clip));
@@ -263,34 +329,13 @@ async fn get_download(
         }
     };
 
-    let mime = mime_guess::from_path(&entry.path).first_or_octet_stream();
-    let filename = entry
-        .path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .map(sanitize_filename)
-        .unwrap_or_else(|| entry.id.clone());
-    let disposition = format!("attachment; filename=\"{}\"", filename);
-
-    let file_size = metadata.len();
-    let body = match tokio::fs::File::open(&entry.path).await {
-        Ok(file) => {
-            let stream = tokio_util::io::ReaderStream::new(file);
-            Body::from_stream(stream)
-        }
-        Err(e) => {
-            warn!(path = %entry.path.display(), error = %e, "asset open failed; serving placeholder");
-            return Ok(fallback_download_response(&entry.id, entry.kind));
-        }
-    };
-
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, mime.as_ref())
-        .header(header::CONTENT_DISPOSITION, disposition)
-        .header(header::CONTENT_LENGTH, file_size.to_string())
-        .body(body)
-        .expect("valid response"))
+    stream_file_response(&entry.path, &entry.id, &headers, metadata)
+        .await
+        .map_err(|e| {
+            warn!(path = %entry.path.display(), error = ?e, "asset stream failed; serving placeholder");
+            e
+        })
+        .or_else(|_| Ok(fallback_download_response(&entry.id, entry.kind)))
 }
 
 fn sanitize_filename(name: &str) -> String {
@@ -300,6 +345,152 @@ fn sanitize_filename(name: &str) -> String {
             other => other,
         })
         .collect()
+}
+
+async fn stream_file_response(
+    path: &FsPath,
+    id: &str,
+    headers: &HeaderMap,
+    metadata: std::fs::Metadata,
+) -> Result<Response, ApiError> {
+    let file_size = metadata.len();
+    let etag = weak_etag(&metadata);
+    if request_etag_matches(headers, &etag) {
+        return Ok(not_modified_response(&etag));
+    }
+
+    let mime = mime_guess::from_path(path).first_or_octet_stream();
+    let filename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(sanitize_filename)
+        .unwrap_or_else(|| id.to_string());
+    let disposition = format!("attachment; filename=\"{}\"", filename);
+
+    let range = headers
+        .get(header::RANGE)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|raw| parse_byte_range(raw, file_size));
+
+    let Some((start, end)) = range else {
+        if headers.get(header::RANGE).is_some() {
+            return Ok(range_not_satisfiable(file_size));
+        }
+        let file = tokio::fs::File::open(path)
+            .await
+            .map_err(|e| ApiError::BadRequest(format!("open asset: {e}").into()))?;
+        let stream = tokio_util::io::ReaderStream::new(file);
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, mime.as_ref())
+            .header(header::CONTENT_DISPOSITION, disposition)
+            .header(header::CONTENT_LENGTH, file_size.to_string())
+            .header(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=86400"),
+            )
+            .header(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"))
+            .header(header::ETAG, etag)
+            .body(Body::from_stream(stream))
+            .expect("valid response"));
+    };
+
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| ApiError::BadRequest(format!("open asset: {e}").into()))?;
+    file.seek(SeekFrom::Start(start))
+        .await
+        .map_err(|e| ApiError::BadRequest(format!("seek asset: {e}").into()))?;
+    let read_len = end.saturating_sub(start).saturating_add(1);
+    let stream = tokio_util::io::ReaderStream::new(file.take(read_len));
+    Ok(Response::builder()
+        .status(StatusCode::PARTIAL_CONTENT)
+        .header(header::CONTENT_TYPE, mime.as_ref())
+        .header(header::CONTENT_DISPOSITION, disposition)
+        .header(header::CONTENT_LENGTH, read_len.to_string())
+        .header(
+            header::CONTENT_RANGE,
+            format!("bytes {start}-{end}/{file_size}"),
+        )
+        .header(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=86400"),
+        )
+        .header(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"))
+        .header(header::ETAG, etag)
+        .body(Body::from_stream(stream))
+        .expect("valid response"))
+}
+
+fn parse_byte_range(raw: &str, file_size: u64) -> Option<(u64, u64)> {
+    if file_size == 0 {
+        return None;
+    }
+    let spec = raw.trim().strip_prefix("bytes=")?;
+    if spec.contains(',') {
+        return None;
+    }
+    let (start_raw, end_raw) = spec.split_once('-')?;
+    if start_raw.is_empty() {
+        let suffix_len = end_raw.trim().parse::<u64>().ok()?;
+        if suffix_len == 0 {
+            return None;
+        }
+        let start = file_size.saturating_sub(suffix_len);
+        return Some((start, file_size - 1));
+    }
+    let start = start_raw.trim().parse::<u64>().ok()?;
+    if start >= file_size {
+        return None;
+    }
+    let end = if end_raw.trim().is_empty() {
+        file_size - 1
+    } else {
+        end_raw.trim().parse::<u64>().ok()?.min(file_size - 1)
+    };
+    (start <= end).then_some((start, end))
+}
+
+fn weak_etag(metadata: &std::fs::Metadata) -> String {
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("W/\"{:x}-{:x}\"", metadata.len(), modified)
+}
+
+fn request_etag_matches(headers: &HeaderMap, etag: &str) -> bool {
+    headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|h| h.to_str().ok())
+        .map(|raw| {
+            raw.split(',')
+                .any(|part| part.trim() == etag || part.trim() == "*")
+        })
+        .unwrap_or(false)
+}
+
+fn not_modified_response(etag: &str) -> Response {
+    Response::builder()
+        .status(StatusCode::NOT_MODIFIED)
+        .header(header::ETAG, etag)
+        .header(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=86400"),
+        )
+        .body(Body::empty())
+        .expect("valid response")
+}
+
+fn range_not_satisfiable(file_size: u64) -> Response {
+    Response::builder()
+        .status(StatusCode::RANGE_NOT_SATISFIABLE)
+        .header(header::CONTENT_RANGE, format!("bytes */{file_size}"))
+        .header(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"))
+        .body(Body::empty())
+        .expect("valid response")
 }
 
 // ---------------------------------------------------------------------------
@@ -362,6 +553,9 @@ async fn get_text(
 struct AdminAssetResponse {
     created: bool,
     asset: AssetSummary,
+    asset_root: PathBuf,
+    stored_path: PathBuf,
+    size_bytes: u64,
 }
 
 #[derive(Debug)]
@@ -381,6 +575,7 @@ async fn post_admin_asset(
     if root.as_os_str().is_empty() {
         return Err(ApiError::BadRequest("asset root is not configured".into()));
     }
+    let max_upload_bytes = max_upload_bytes();
 
     let tmp_dir = root.join(".tmp");
     tokio::fs::create_dir_all(&tmp_dir)
@@ -403,10 +598,10 @@ async fn post_admin_asset(
         let name = field.name().unwrap_or("").to_string();
         match name.as_str() {
             "asset" | "file" => {
-                asset = Some(save_upload_field(&tmp_dir, &mut field).await?);
+                asset = Some(save_upload_field(&tmp_dir, &mut field, max_upload_bytes).await?);
             }
             "thumbnail" | "preview" => {
-                thumbnail = Some(save_upload_field(&tmp_dir, &mut field).await?);
+                thumbnail = Some(save_upload_field(&tmp_dir, &mut field, max_upload_bytes).await?);
             }
             "kind" => {
                 let raw = field.text().await.map_err(ApiError::from_multipart)?;
@@ -491,7 +686,14 @@ async fn post_admin_asset(
         }
     }
 
-    if let Err(e) = ensure_asset_derivatives(&dest, kind) {
+    let derivative_path = dest.clone();
+    let derivative_result =
+        tokio::task::spawn_blocking(move || ensure_asset_derivatives(&derivative_path, kind))
+            .await
+            .map_err(|e| {
+                ApiError::BadRequest(format!("asset derivative task failed: {e}").into())
+            })?;
+    if let Err(e) = derivative_result {
         warn!(
             path = %dest.display(),
             error = %e,
@@ -499,22 +701,32 @@ async fn post_admin_asset(
         );
     }
 
-    store
-        .index_dir(&root)
-        .map_err(|e| ApiError::BadRequest(format!("reindex after upload: {e}").into()))?;
-    let entry = store.get(&stem).ok_or_else(|| {
-        ApiError::BadRequest(format!("uploaded asset {stem} was not indexed").into())
-    })?;
+    let entry = store
+        .upsert_primary(&root, &dest, kind)
+        .map_err(|e| ApiError::BadRequest(format!("index uploaded asset: {e}").into()))?;
+
+    info!(
+        id = %entry.id,
+        kind = ?kind,
+        bytes = entry.size_bytes,
+        root = %root.display(),
+        path = %dest.display(),
+        "admin asset uploaded"
+    );
 
     Ok(Json(AdminAssetResponse {
         created: true,
         asset: AssetSummary::from_entry(&entry),
+        asset_root: root,
+        stored_path: dest,
+        size_bytes: entry.size_bytes,
     }))
 }
 
 async fn save_upload_field(
     tmp_dir: &FsPath,
     field: &mut axum::extract::multipart::Field<'_>,
+    max_bytes: u64,
 ) -> Result<UploadedFile, ApiError> {
     let file_name = field
         .file_name()
@@ -524,7 +736,16 @@ async fn save_upload_field(
     let mut out = tokio::fs::File::create(&tmp_path)
         .await
         .map_err(|e| ApiError::BadRequest(format!("create upload temp file: {e}").into()))?;
+    let mut total: u64 = 0;
     while let Some(chunk) = field.chunk().await.map_err(ApiError::from_multipart)? {
+        total = total.saturating_add(chunk.len() as u64);
+        if total > max_bytes {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(ApiError::PayloadTooLarge {
+                limit: max_bytes,
+                actual: total,
+            });
+        }
         out.write_all(&chunk)
             .await
             .map_err(|e| ApiError::BadRequest(format!("write upload chunk: {e}").into()))?;
@@ -539,13 +760,9 @@ async fn save_upload_field(
 }
 
 fn check_admin_token(headers: &HeaderMap) -> Result<(), ApiError> {
-    let Ok(expected) = std::env::var("ADMIN_TOKEN") else {
+    let Some(expected) = configured_admin_token() else {
         return Ok(());
     };
-    let expected = expected.trim();
-    if expected.is_empty() {
-        return Ok(());
-    }
     let bearer = headers
         .get(header::AUTHORIZATION)
         .and_then(|h| h.to_str().ok())
@@ -555,11 +772,37 @@ fn check_admin_token(headers: &HeaderMap) -> Result<(), ApiError> {
         .get("x-admin-token")
         .and_then(|h| h.to_str().ok())
         .map(str::trim);
-    if bearer == Some(expected) || x_token == Some(expected) {
+    if bearer == Some(expected.as_str()) || x_token == Some(expected.as_str()) {
         Ok(())
     } else {
         Err(ApiError::Unauthorized)
     }
+}
+
+fn configured_admin_token() -> Option<String> {
+    for name in ["ADMIN_TOKEN", "MEMSTROY_ADMIN_TOKEN"] {
+        let Ok(raw) = std::env::var(name) else {
+            continue;
+        };
+        let token = raw.trim();
+        if !token.is_empty() {
+            return Some(token.to_string());
+        }
+    }
+    None
+}
+
+fn max_upload_bytes() -> u64 {
+    for name in ["MEMSTROY_MAX_UPLOAD_BYTES", "MAX_UPLOAD_BYTES"] {
+        if let Ok(raw) = std::env::var(name) {
+            if let Ok(value) = raw.trim().parse::<u64>() {
+                if value > 0 {
+                    return value;
+                }
+            }
+        }
+    }
+    DEFAULT_MAX_UPLOAD_BYTES
 }
 
 async fn write_sidecar(path: &FsPath, body: &str) -> Result<(), ApiError> {
@@ -626,10 +869,12 @@ fn non_empty(raw: String) -> Option<String> {
 }
 
 fn monotonic_stamp() -> u128 {
-    SystemTime::now()
+    let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
-        .unwrap_or(0)
+        .unwrap_or(0);
+    let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed) as u128;
+    (nanos << 16) ^ seq
 }
 
 // ---------------------------------------------------------------------------
@@ -640,6 +885,7 @@ fn monotonic_stamp() -> u128 {
 enum ApiError {
     NotFound,
     Unauthorized,
+    PayloadTooLarge { limit: u64, actual: u64 },
     BadRequest(Arc<str>),
 }
 
@@ -658,6 +904,15 @@ impl IntoResponse for ApiError {
             ApiError::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
                 Json(json!({ "error": "unauthorized" })),
+            )
+                .into_response(),
+            ApiError::PayloadTooLarge { limit, actual } => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(json!({
+                    "error": "payload_too_large",
+                    "limit": limit,
+                    "actual": actual,
+                })),
             )
                 .into_response(),
             ApiError::BadRequest(msg) => (

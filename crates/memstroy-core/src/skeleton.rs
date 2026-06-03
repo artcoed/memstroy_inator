@@ -239,6 +239,7 @@ impl SkeletonTemplate {
                 t,
                 value: state,
                 easing,
+                param_owners: Default::default(),
             });
             point.track.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap());
         }

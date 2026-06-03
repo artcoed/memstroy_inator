@@ -193,6 +193,7 @@ pub fn canvas_preview(ui: &mut egui::Ui, state: &mut EditorState) {
 
     // ── Draw multi-select outlines (every secondary entry in canvas_selection) ──
     draw_multi_selection_borders(&painter, full_rect, state, viewport_size);
+    draw_parent_pick_canvas_borders(&painter, full_rect, state, viewport_size);
 
     // ── Draw render frame LAST so it sits on top of every layer ──
     //    The render frame is the output region marker — the user must
@@ -874,6 +875,60 @@ fn draw_multi_selection_borders(
             Rounding::same(2.0),
             Stroke::new(1.5, COL_MULTI_SELECT_BORDER),
         );
+    }
+}
+
+fn draw_parent_pick_canvas_borders(
+    painter: &egui::Painter,
+    full_rect: Rect,
+    state: &EditorState,
+    viewport_size: [f32; 2],
+) {
+    let Some(child_id) = state.parent_pick_child_id.as_deref() else {
+        return;
+    };
+    let draw = |id: &str, aabb: Option<([f32; 2], [f32; 2])>| {
+        let Some((mn, mx)) = aabb else {
+            return;
+        };
+        let tl = state.canvas_viewport.world_to_screen(
+            memstroy_core::WorldPos { x: mn[0], y: mn[1] },
+            viewport_size,
+        );
+        let br = state.canvas_viewport.world_to_screen(
+            memstroy_core::WorldPos { x: mx[0], y: mx[1] },
+            viewport_size,
+        );
+        let rect = Rect::from_min_max(
+            Pos2::new(full_rect.min.x + tl[0], full_rect.min.y + tl[1]),
+            Pos2::new(full_rect.min.x + br[0], full_rect.min.y + br[1]),
+        )
+        .expand(3.0);
+        let is_child = id == child_id;
+        let fill = if is_child {
+            Color32::from_rgba_premultiplied(255, 165, 70, 24)
+        } else {
+            Color32::from_rgba_premultiplied(80, 220, 245, 20)
+        };
+        let stroke = if is_child {
+            Color32::from_rgb(255, 170, 70)
+        } else {
+            Color32::from_rgb(90, 225, 245)
+        };
+        painter.rect_filled(rect, Rounding::same(3.0), fill);
+        painter.rect_stroke(rect, Rounding::same(3.0), Stroke::new(2.0, stroke));
+    };
+
+    for (idx, actor) in state.scene.actors.iter().enumerate() {
+        draw(&actor.id, actor_world_aabb(state, idx, state.playhead));
+    }
+    for (idx, overlay) in state.scene.overlays.iter().enumerate() {
+        let id = match overlay {
+            Overlay::Text(t) => t.id.as_str(),
+            Overlay::Image(im) => im.id.as_str(),
+            Overlay::Video(v) => v.id.as_str(),
+        };
+        draw(id, overlay_world_aabb(state, idx, state.playhead));
     }
 }
 

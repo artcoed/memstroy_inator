@@ -430,6 +430,7 @@ fn cmd_add_actor_keyframe(args: &[String], scene: &mut Scene) -> Result<(), Stri
             flip_y_anim: 1.0,
         },
         easing,
+        param_owners: Default::default(),
     };
     actor.layout.push(kf);
     actor.layout.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap());
@@ -485,6 +486,7 @@ fn cmd_add_canvas_keyframe(args: &[String], scene: &mut Scene) -> Result<(), Str
         t,
         value: transform,
         easing,
+        param_owners: Default::default(),
     };
     if let Some(cl) = scene
         .canvas_layouts
@@ -747,6 +749,7 @@ fn cmd_add_render_frame_kf(args: &[String], scene: &mut Scene) -> Result<(), Str
             rotation_deg: rot,
         },
         easing,
+        param_owners: Default::default(),
     };
     scene.render_frame.layout.push(kf);
     scene

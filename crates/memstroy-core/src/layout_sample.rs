@@ -23,23 +23,44 @@ pub fn param_change_times<T, F>(layout: &[Keyframe<T>], get: F) -> Vec<f32>
 where
     F: Fn(&T) -> f32,
 {
+    param_change_times_with_owners(layout, get, |_| false)
+}
+
+fn param_change_times_with_owners<T, F>(
+    layout: &[Keyframe<T>],
+    get: F,
+    owns_keyframe: impl Fn(usize) -> bool,
+) -> Vec<f32>
+where
+    F: Fn(&T) -> f32,
+{
     if layout.is_empty() {
         return Vec::new();
     }
     if layout.len() == 1 {
-        return vec![layout[0].t];
+        return if layout[0].t.abs() < TIME_EPS {
+            Vec::new()
+        } else {
+            vec![layout[0].t]
+        };
     }
     let mut times = Vec::new();
-    for win in layout.windows(2) {
-        if (get(&win[1].value) - get(&win[0].value)).abs() > EPS {
+    for i in 1..layout.len() {
+        if (get(&layout[i].value) - get(&layout[i - 1].value)).abs() > EPS {
             if times.is_empty() {
-                times.push(win[0].t);
+                if i == 1 || owns_keyframe(i - 1) {
+                    times.push(layout[i - 1].t);
+                }
             }
-            times.push(win[1].t);
+            times.push(layout[i].t);
         }
     }
     if times.is_empty() {
-        return vec![layout[0].t];
+        return if layout[0].t.abs() < TIME_EPS {
+            Vec::new()
+        } else {
+            vec![layout[0].t]
+        };
     }
     times
 }
@@ -55,11 +76,27 @@ pub fn param_timeline_times<T, F>(
 where
     F: Fn(&T) -> f32 + Copy,
 {
+    param_timeline_times_with_owners(layout, get, other_fields_changed_at, |_| true)
+}
+
+pub fn param_timeline_times_with_owners<T, F>(
+    layout: &[Keyframe<T>],
+    get: F,
+    other_fields_changed_at: impl Fn(usize) -> bool,
+    owns_flat_keyframe: impl Fn(usize) -> bool,
+) -> Vec<f32>
+where
+    F: Fn(&T) -> f32 + Copy,
+{
     if layout.is_empty() {
         return Vec::new();
     }
     if layout.len() == 1 {
-        return vec![layout[0].t];
+        return if owns_flat_keyframe(0) {
+            vec![layout[0].t]
+        } else {
+            Vec::new()
+        };
     }
     let param_has_value_change = layout
         .windows(2)
@@ -74,14 +111,20 @@ where
                 times.push(layout[i - 1].t);
             }
             times.push(t);
-        } else if !other_fields_changed_at(i) && !param_has_value_change {
+        } else if !other_fields_changed_at(i) && !param_has_value_change && owns_flat_keyframe(i) {
             // Constant param newly enabled at the playhead — show a
-            // diamond even though the value matches the previous kf.
+            // diamond even though the value matches the previous kf. Full-state
+            // layout snapshots share values across every param, so only the
+            // param that explicitly authored this flat keyframe may claim it.
             times.push(t);
         }
     }
     if times.is_empty() {
-        return vec![layout[0].t];
+        return if owns_flat_keyframe(0) {
+            vec![layout[0].t]
+        } else {
+            Vec::new()
+        };
     }
     times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     times.dedup_by(|a, b| (*a - *b).abs() < TIME_EPS);
@@ -93,10 +136,11 @@ pub fn actor_param_timeline_times(
     animated_params: &BTreeSet<String>,
     param_id: &str,
 ) -> Vec<f32> {
-    param_timeline_times(
+    param_timeline_times_with_owners(
         layout,
         |s| actor_get(s, param_id),
         |i| other_actor_fields_changed_at(layout, animated_params, param_id, i),
+        |i| layout_keyframe_owns_param(layout, i, param_id),
     )
 }
 
@@ -105,10 +149,11 @@ pub fn overlay_param_timeline_times(
     animated_params: &BTreeSet<String>,
     param_id: &str,
 ) -> Vec<f32> {
-    param_timeline_times(
+    param_timeline_times_with_owners(
         layout,
         |s| overlay_get(s, param_id),
         |i| other_overlay_fields_changed_at(layout, animated_params, param_id, i),
+        |i| layout_keyframe_owns_param(layout, i, param_id),
     )
 }
 
@@ -117,11 +162,30 @@ pub fn render_frame_param_timeline_times(
     animated_params: &BTreeSet<String>,
     param_id: &str,
 ) -> Vec<f32> {
-    param_timeline_times(
+    param_timeline_times_with_owners(
         layout,
         |s| rf_get(s, param_id),
         |i| other_rf_fields_changed_at(layout, animated_params, param_id, i),
+        |i| layout_keyframe_owns_param(layout, i, param_id),
     )
+}
+
+fn layout_keyframe_owns_param<T>(layout: &[Keyframe<T>], i: usize, param_id: &str) -> bool {
+    layout
+        .get(i)
+        .map(|kf| kf.param_owners.is_empty() || kf.param_owners.contains(param_id))
+        .unwrap_or(false)
+}
+
+fn layout_keyframe_explicitly_owns_param<T>(
+    layout: &[Keyframe<T>],
+    i: usize,
+    param_id: &str,
+) -> bool {
+    layout
+        .get(i)
+        .map(|kf| kf.param_owners.contains(param_id))
+        .unwrap_or(false)
 }
 
 fn layout_index_at_time<T>(layout: &[Keyframe<T>], t: f32) -> usize {
@@ -150,6 +214,9 @@ where
     }
     if times.len() == 1 {
         let idx = layout_index_at_time(layout, times[0]);
+        if t < times[0] - TIME_EPS {
+            return get(&layout[0].value);
+        }
         return get(&layout[idx].value);
     }
     let track: Vec<Keyframe<f32>> = times
@@ -160,6 +227,7 @@ where
                 t: tm,
                 value: get(&layout[idx].value),
                 easing: layout[idx].easing,
+                param_owners: Default::default(),
             }
         })
         .collect();
@@ -175,7 +243,9 @@ fn sample_actor_field(
     default: f32,
 ) -> f32 {
     if animated_params.contains(param_id) {
-        let times = param_change_times(layout, &get);
+        let times = param_change_times_with_owners(layout, &get, |i| {
+            layout_keyframe_explicitly_owns_param(layout, i, param_id)
+        });
         sample_scalar_track(layout, &times, t, &get, default)
     } else {
         layout.first().map(|kf| get(&kf.value)).unwrap_or(default)
@@ -270,7 +340,9 @@ fn sample_overlay_field(
     default: f32,
 ) -> f32 {
     if animated_params.contains(param_id) {
-        let times = param_change_times(layout, &get);
+        let times = param_change_times_with_owners(layout, &get, |i| {
+            layout_keyframe_explicitly_owns_param(layout, i, param_id)
+        });
         sample_scalar_track(layout, &times, t, &get, default)
     } else {
         layout.first().map(|kf| get(&kf.value)).unwrap_or(default)
@@ -365,7 +437,9 @@ fn sample_rf_field(
     default: f32,
 ) -> f32 {
     if animated_params.contains(param_id) {
-        let times = param_change_times(layout, &get);
+        let times = param_change_times_with_owners(layout, &get, |i| {
+            layout_keyframe_explicitly_owns_param(layout, i, param_id)
+        });
         sample_scalar_track(layout, &times, t, &get, default)
     } else {
         layout.first().map(|kf| get(&kf.value)).unwrap_or(default)
@@ -585,7 +659,7 @@ fn other_actor_param_changes_at(
         if pid == except {
             continue;
         }
-        let times = param_change_times(layout, |s| actor_get(s, pid));
+        let times = actor_param_timeline_times(layout, animated_params, pid);
         if times.iter().any(|t| (*t - at_t).abs() < TIME_EPS) {
             return true;
         }
@@ -603,7 +677,7 @@ fn other_overlay_param_changes_at(
         if pid == except {
             continue;
         }
-        let times = param_change_times(layout, |s| overlay_get(s, pid));
+        let times = overlay_param_timeline_times(layout, animated_params, pid);
         if times.iter().any(|t| (*t - at_t).abs() < TIME_EPS) {
             return true;
         }
@@ -621,7 +695,7 @@ fn other_rf_param_changes_at(
         if pid == except {
             continue;
         }
-        let times = param_change_times(layout, |s| rf_get(s, pid));
+        let times = render_frame_param_timeline_times(layout, animated_params, pid);
         if times.iter().any(|t| (*t - at_t).abs() < TIME_EPS) {
             return true;
         }
@@ -652,10 +726,11 @@ pub fn clear_actor_param_animation(
         }
     }
     remove_layout_times(layout, &remove);
+    prune_empty_layout(layout);
     for kf in layout.iter_mut() {
         actor_set(&mut kf.value, param_id, static_val);
+        kf.clear_param_owner(param_id);
     }
-    prune_empty_layout(layout);
 }
 
 pub fn clear_overlay_param_animation(
@@ -679,10 +754,11 @@ pub fn clear_overlay_param_animation(
         }
     }
     remove_layout_times(layout, &remove);
+    prune_empty_layout(layout);
     for kf in layout.iter_mut() {
         overlay_set(&mut kf.value, param_id, static_val);
+        kf.clear_param_owner(param_id);
     }
-    prune_empty_layout(layout);
 }
 
 pub fn clear_render_frame_param_animation(
@@ -706,10 +782,11 @@ pub fn clear_render_frame_param_animation(
         }
     }
     remove_layout_times(layout, &remove);
+    prune_empty_layout(layout);
     for kf in layout.iter_mut() {
         rf_set(&mut kf.value, param_id, static_val);
+        kf.clear_param_owner(param_id);
     }
-    prune_empty_layout(layout);
 }
 
 fn layout_state_at_or_before<T: Clone>(layout: &[Keyframe<T>], t: f32, fallback: T) -> T {
@@ -732,6 +809,7 @@ fn upsert_actor_param_keyframe(
     let eps = TIME_EPS;
     if let Some(kf) = layout.iter_mut().find(|k| (k.t - seed_t).abs() < eps) {
         actor_set(&mut kf.value, param_id, value);
+        kf.mark_param_owner(param_id);
         return;
     }
     let fallback = sample_actor_layout(layout, animated_params, seed_t);
@@ -741,6 +819,7 @@ fn upsert_actor_param_keyframe(
         t: seed_t,
         value: state,
         easing: crate::easing::Easing::Linear,
+        param_owners: std::iter::once(param_id.to_string()).collect(),
     });
     layout.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
 }
@@ -756,6 +835,7 @@ fn upsert_overlay_param_keyframe(
     let eps = TIME_EPS;
     if let Some(kf) = layout.iter_mut().find(|k| (k.t - seed_t).abs() < eps) {
         overlay_set(&mut kf.value, param_id, value);
+        kf.mark_param_owner(param_id);
         return;
     }
     let fallback = sample_overlay_layout(layout, animated_params, seed_t);
@@ -765,6 +845,7 @@ fn upsert_overlay_param_keyframe(
         t: seed_t,
         value: state,
         easing: crate::easing::Easing::Linear,
+        param_owners: std::iter::once(param_id.to_string()).collect(),
     });
     layout.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
 }
@@ -780,6 +861,7 @@ fn upsert_render_frame_param_keyframe(
     let eps = TIME_EPS;
     if let Some(kf) = layout.iter_mut().find(|k| (k.t - seed_t).abs() < eps) {
         rf_set(&mut kf.value, param_id, value);
+        kf.mark_param_owner(param_id);
         return;
     }
     let fallback = sample_render_frame_layout(layout, animated_params, seed_t);
@@ -789,6 +871,7 @@ fn upsert_render_frame_param_keyframe(
         t: seed_t,
         value: state,
         easing: crate::Easing::Linear,
+        param_owners: std::iter::once(param_id.to_string()).collect(),
     });
     layout.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
 }
@@ -875,6 +958,7 @@ pub fn delete_actor_param_keyframe_at(
             let prev = actor_get(&layout[i - 1].value, param_id);
             actor_set(&mut layout[i].value, param_id, prev);
         }
+        layout[i].clear_param_owner(param_id);
         return;
     }
     remove_layout_times(layout, &[at_t]);
@@ -895,6 +979,7 @@ pub fn delete_overlay_param_keyframe_at(
             let prev = overlay_get(&layout[i - 1].value, param_id);
             overlay_set(&mut layout[i].value, param_id, prev);
         }
+        layout[i].clear_param_owner(param_id);
         return;
     }
     remove_layout_times(layout, &[at_t]);
@@ -915,6 +1000,7 @@ pub fn delete_render_frame_param_keyframe_at(
             let prev = rf_get(&layout[i - 1].value, param_id);
             rf_set(&mut layout[i].value, param_id, prev);
         }
+        layout[i].clear_param_owner(param_id);
         return;
     }
     remove_layout_times(layout, &[at_t]);
@@ -1214,6 +1300,32 @@ mod tests {
     }
 
     #[test]
+    fn enabling_second_flat_param_does_not_create_extra_diamond_for_first() {
+        let mut animated = BTreeSet::new();
+        let mut layout = vec![Keyframe::new(0.0, ActorState::default())];
+
+        animated.insert(param_ids::OPACITY.to_string());
+        enable_actor_param_animation(&mut layout, &animated, param_ids::OPACITY, 1.0);
+
+        animated.insert(param_ids::SCALE.to_string());
+        enable_actor_param_animation(&mut layout, &animated, param_ids::SCALE, 2.0);
+
+        let opacity_times = actor_param_timeline_times(&layout, &animated, param_ids::OPACITY);
+        assert_eq!(
+            opacity_times,
+            vec![1.0],
+            "opacity row must not claim scale's flat seed keyframe: {opacity_times:?}"
+        );
+
+        let scale_times = actor_param_timeline_times(&layout, &animated, param_ids::SCALE);
+        assert_eq!(
+            scale_times,
+            vec![2.0],
+            "scale row should own only its playhead seed keyframe: {scale_times:?}"
+        );
+    }
+
+    #[test]
     fn enabling_rotation_does_not_reuse_position_keyframe_times() {
         let mut animated = BTreeSet::new();
         animated.insert(param_ids::POS_X.to_string());
@@ -1253,7 +1365,6 @@ mod tests {
 
     #[test]
     fn disable_removes_param_keyframes() {
-        let animated: BTreeSet<String> = std::iter::once(param_ids::OPACITY.to_string()).collect();
         let mut layout = vec![
             Keyframe::new(
                 1.0,
@@ -1274,7 +1385,7 @@ mod tests {
         assert!(param_change_times(&layout, |s| s.opacity).is_empty());
         let flat = sample_actor_layout(&layout, &BTreeSet::new(), 2.0).opacity;
         assert!(
-            (flat - 0.55).abs() < 0.1,
+            (flat - 0.73333335).abs() < 0.01,
             "flattened to value at t=2, got {flat}"
         );
     }
