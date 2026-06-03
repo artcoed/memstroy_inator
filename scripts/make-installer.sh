@@ -31,7 +31,7 @@
 #
 #   # reuse an already-staged bundle directory (skips cargo build)
 #   scripts/make-installer.sh \
-#       --bundle-dir dist/Memstroy-inator-linux-x86_64-0.1.0
+#       --bundle-dir dist/Memstroy-inator-linux-x86_64-0.2.0
 #
 #   # custom output dir / installer name
 #   scripts/make-installer.sh --server-url https://assets.example.com \
@@ -236,7 +236,7 @@ echo "==> extracting payload"
 tail -n +"${ARCHIVE_LINE}" "$0" | tar -xz -C "${EXTRACT_TMP}"
 
 # The tarball was built with the bundle's own directory at the top,
-# e.g. Memstroy-inator-linux-x86_64-0.1.0/. Move its contents into
+# e.g. Memstroy-inator-linux-x86_64-0.2.0/. Move its contents into
 # INSTALL_DIR so the layout becomes flat: INSTALL_DIR/bin/, etc.
 PAYLOAD_ROOT="${EXTRACT_TMP}/${PAYLOAD_BASENAME}"
 if [[ ! -d "${PAYLOAD_ROOT}" ]]; then

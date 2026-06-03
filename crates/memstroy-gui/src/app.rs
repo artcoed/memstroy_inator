@@ -821,6 +821,35 @@ impl App {
                             format!("{} {}", crate::i18n::t("Server assets failed:"), e);
                     }
                 },
+                JobEvent::ServerAssetCountsLoaded { result } => match result {
+                    Ok(counts) => {
+                        let first_load = self.state.server_asset_counts.is_none();
+                        let total = counts.total;
+                        self.state.apply_server_asset_counts(counts);
+                        if first_load {
+                            self.state.status =
+                                format!("{} {}", crate::i18n::t("Server assets:"), total);
+                        }
+                    }
+                    Err(e) => {
+                        self.state.set_server_asset_counts_error(e.clone());
+                        self.state.status =
+                            format!("{} {}", crate::i18n::t("Server counts failed:"), e);
+                    }
+                },
+                JobEvent::ServerAssetPreviewLoaded {
+                    tab,
+                    server_id,
+                    result,
+                } => match result {
+                    Ok(path) => {
+                        self.state.mark_server_preview_loaded(tab, &server_id, path);
+                        ctx.request_repaint();
+                    }
+                    Err(e) => {
+                        self.state.mark_server_preview_failed(tab, &server_id, e);
+                    }
+                },
                 JobEvent::ServerAssetDownloaded {
                     server_id,
                     kind,

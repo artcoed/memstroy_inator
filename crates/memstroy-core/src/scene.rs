@@ -878,7 +878,7 @@ impl crate::keyframe::Lerp for ActorState {
 ///   1. brightness/contrast/saturation/temperature (legacy block)
 ///   2. lift → gain → gamma per channel
 ///   3. master curve, then R / G / B curves.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ColorCorrection {
     #[serde(default)]
     pub brightness: f32,
@@ -931,7 +931,7 @@ fn default_gain() -> [f32; 3] {
 /// Master + per-channel tone curves. Each curve is a list of `[input, output]`
 /// control points in 0..1, sorted by input. The endpoints (`x=0` and `x=1`)
 /// are always present; intermediate points can be added/removed in the UI.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToneCurves {
     #[serde(default = "identity_curve")]
     pub master: Vec<[f32; 2]>,
@@ -1067,7 +1067,7 @@ impl ColorCorrection {
 }
 
 /// Chroma-keying parameters for actor source video.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChromaKeyParams {
     /// When false, preview / export skip chromakey regardless of sliders.
     #[serde(default)]

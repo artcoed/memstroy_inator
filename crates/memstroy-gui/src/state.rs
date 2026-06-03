@@ -323,6 +323,16 @@ impl std::fmt::Debug for GroupMoveAnchor {
     }
 }
 
+#[derive(Clone, PartialEq)]
+pub struct FootageSequenceControllerSnapshot {
+    pub layout: Vec<memstroy_core::Keyframe<memstroy_core::ActorState>>,
+    pub animated_params: std::collections::BTreeSet<String>,
+    pub modifiers: Vec<memstroy_core::TrackModifier>,
+    pub effects: Vec<memstroy_core::Effect>,
+    pub chroma_key: memstroy_core::ChromaKeyParams,
+    pub color_correction: memstroy_core::ColorCorrection,
+}
+
 /// Lightweight mirror of `panels::MovedClipKind` used to persist
 /// "deferred overlap-trim" requests on the EditorState across frames
 /// without exposing that internal type from the panels module.
@@ -748,6 +758,13 @@ pub struct EditorState {
     /// Small helper menu opened by the plus handles on Mellstroy footage
     /// timeline clips.
     pub footage_sequence_popup: Option<FootageSequencePopup>,
+    /// Sequence-level edit mode opened from the turquoise sequence
+    /// header in the timeline. When set, the selected actor is treated
+    /// as the sequence controller: inspector edits to transform, masks,
+    /// modifiers, chroma/color, and effects are mirrored to every
+    /// non-slot segment in the same sequence. Normal clip selection
+    /// clears this so individual segment edits remain available.
+    pub footage_sequence_edit_id: Option<String>,
 
     // ─── Curve editor marquee (rubber-band multi-select) ───────────
     /// Active marquee for selecting keyframes in the curve editor.
@@ -886,6 +903,11 @@ pub struct EditorState {
     /// Paged server catalogue state. Each visible library tab advances
     /// its own cursor and stops requesting once `exhausted` is true.
     pub server_library_pages: ServerLibraryPages,
+    /// Aggregate server catalogue counts from `/api/assets/counts`.
+    pub server_asset_counts: Option<crate::jobs::ServerAssetCounts>,
+    pub server_asset_counts_loading: bool,
+    pub server_asset_counts_error: Option<String>,
+    pub last_server_counts_refresh: Option<std::time::Instant>,
     /// Telegram channel name (without the leading `@`) the GUI asks the
     /// server to refresh. Surfaced on the Clips tab so the user can
     /// edit it without leaving the editor.
@@ -937,6 +959,13 @@ pub struct EditorState {
     /// handlers must not spawn actors against a partial/missing file
     /// while the path is listed here.
     pub pending_clip_downloads: std::collections::HashSet<std::path::PathBuf>,
+    /// Server preview downloads currently in flight. Keys are stable
+    /// `kind:id` strings, so visible cells do not spawn duplicate
+    /// thumbnail requests every frame.
+    pub pending_server_previews: std::collections::HashSet<String>,
+    /// Recent preview failures. Short cooldown prevents flickering
+    /// retry storms when a bucket object is still being indexed.
+    pub failed_server_previews: std::collections::HashMap<String, (std::time::Instant, String)>,
 
     /// Drops that arrived for a finished download but whose .mp4 isn't
     /// yet readable (server-side processing, OneDrive sync, etc.).
@@ -1548,6 +1577,89 @@ impl EditorState {
         self.request_media_preview = true;
     }
 
+    pub fn actor_footage_sequence_edit_id(&self, actor_idx: usize) -> Option<&str> {
+        let actor = self.scene.actors.get(actor_idx)?;
+        if !actor.mellstroy_footage.enabled || actor.mellstroy_footage.slot {
+            return None;
+        }
+        let sequence_id = actor.mellstroy_footage.sequence_id.as_deref()?;
+        (self.footage_sequence_edit_id.as_deref() == Some(sequence_id)).then_some(sequence_id)
+    }
+
+    pub fn footage_sequence_controller_snapshot(
+        &self,
+        actor_idx: usize,
+    ) -> Option<FootageSequenceControllerSnapshot> {
+        let actor = self.scene.actors.get(actor_idx)?;
+        Some(FootageSequenceControllerSnapshot {
+            layout: actor.layout.clone(),
+            animated_params: actor.animated_params.clone(),
+            modifiers: actor.modifiers.clone(),
+            effects: actor.effects.clone(),
+            chroma_key: actor.chroma_key.clone(),
+            color_correction: actor.color_correction.clone(),
+        })
+    }
+
+    pub fn sync_footage_sequence_controller_from_snapshot(
+        &mut self,
+        controller_idx: usize,
+        before: &FootageSequenceControllerSnapshot,
+    ) -> bool {
+        let Some(after) = self.footage_sequence_controller_snapshot(controller_idx) else {
+            return false;
+        };
+        if &after == before {
+            return false;
+        }
+        self.sync_footage_sequence_controller_now(controller_idx)
+    }
+
+    pub fn sync_footage_sequence_controller_now(&mut self, controller_idx: usize) -> bool {
+        let Some(controller) = self.scene.actors.get(controller_idx) else {
+            return false;
+        };
+        if !controller.mellstroy_footage.enabled || controller.mellstroy_footage.slot {
+            return false;
+        }
+        let Some(sequence_id) = controller.mellstroy_footage.sequence_id.clone() else {
+            return false;
+        };
+        let Some(snapshot) = self.footage_sequence_controller_snapshot(controller_idx) else {
+            return false;
+        };
+
+        let mut touched = false;
+        for (idx, actor) in self.scene.actors.iter_mut().enumerate() {
+            if idx == controller_idx
+                || !actor.mellstroy_footage.enabled
+                || actor.mellstroy_footage.slot
+                || actor.mellstroy_footage.sequence_id.as_deref() != Some(sequence_id.as_str())
+            {
+                continue;
+            }
+            actor.layout = snapshot.layout.clone();
+            actor.animated_params = snapshot.animated_params.clone();
+            actor.modifiers = snapshot.modifiers.clone();
+            actor.effects = snapshot.effects.clone();
+            actor.chroma_key = snapshot.chroma_key.clone();
+            actor.color_correction = snapshot.color_correction.clone();
+            touched = true;
+        }
+        if touched {
+            self.request_media_preview = true;
+        }
+        touched
+    }
+
+    fn clear_history_interaction_state(&mut self) {
+        self.last_drag_group = None;
+        self.parent_pick_child_id = None;
+        self.footage_sequence_popup = None;
+        self.footage_sequence_edit_id = None;
+        self.reset_timeline_pointer_gesture();
+    }
+
     /// Save undo snapshot, then apply a mutation that may touch lane
     /// assignments, selection, or other editor state outside `Scene`.
     pub fn mutate_state(&mut self, f: impl FnOnce(&mut Self)) {
@@ -1685,7 +1797,7 @@ impl EditorState {
     pub fn undo(&mut self) {
         // Pressing Ctrl+Z must finalise any in-flight drag group so the
         // next drag pushes a fresh snapshot afterwards.
-        self.last_drag_group = None;
+        self.clear_history_interaction_state();
         let cur = self.build_undo_snapshot();
         if let Some(prev) = self.undo.undo_full(cur) {
             self.restore_undo_snapshot(prev);
@@ -1696,7 +1808,7 @@ impl EditorState {
 
     /// Redo the last undone action.
     pub fn redo(&mut self) {
-        self.last_drag_group = None;
+        self.clear_history_interaction_state();
         let cur = self.build_undo_snapshot();
         if let Some(next) = self.undo.redo_full(cur) {
             self.restore_undo_snapshot(next);
@@ -3108,6 +3220,12 @@ impl EditorState {
 
     /// Apply a background scan result on the UI thread.
     pub fn apply_library_snapshot(&mut self, snap: LibraryScanSnapshot) {
+        let mut snap = snap;
+        Self::preserve_server_clip_rows(&mut snap.mellstroy_clips, &self.library.mellstroy_clips);
+        Self::preserve_server_asset_rows(&mut snap.videos, &self.library.videos);
+        Self::preserve_server_asset_rows(&mut snap.sounds, &self.library.sounds);
+        Self::preserve_server_asset_rows(&mut snap.images, &self.library.images);
+
         let downloaded_count = snap.mellstroy_clips.iter().filter(|c| c.downloaded).count();
         let server_only_count = snap
             .mellstroy_clips
@@ -3127,6 +3245,70 @@ impl EditorState {
         self.library.videos = snap.videos;
         self.library_dir_fingerprint = self.compute_library_dir_fingerprint();
         self.last_library_rescan = Some(std::time::Instant::now());
+    }
+
+    fn preserve_server_clip_rows(target: &mut Vec<LibraryClip>, previous: &[LibraryClip]) {
+        for old in previous.iter().filter(|clip| clip.server_id.is_some()) {
+            let Some(server_id) = old.server_id.as_deref() else {
+                continue;
+            };
+            if let Some(new) = target
+                .iter_mut()
+                .find(|clip| clip.server_id.as_deref() == Some(server_id) || clip.path == old.path)
+            {
+                if new.server_id.is_none() {
+                    new.server_id = old.server_id.clone();
+                }
+                if !old.label.trim().is_empty() {
+                    new.label = old.label.clone();
+                }
+                if !old.description.trim().is_empty() {
+                    new.description = old.description.clone();
+                }
+                if new.thumbnail.is_none() {
+                    new.thumbnail = old.thumbnail.clone();
+                }
+                new.duration_secs = new.duration_secs.or(old.duration_secs);
+                new.width = new.width.or(old.width);
+                new.height = new.height.or(old.height);
+                new.downloaded = new.downloaded || old.downloaded;
+                if !new.path.is_file() && old.path.is_file() {
+                    new.path = old.path.clone();
+                }
+            } else {
+                target.push(old.clone());
+            }
+        }
+    }
+
+    fn preserve_server_asset_rows(target: &mut Vec<LibraryAsset>, previous: &[LibraryAsset]) {
+        for old in previous.iter().filter(|asset| asset.server_id.is_some()) {
+            let Some(server_id) = old.server_id.as_deref() else {
+                continue;
+            };
+            if let Some(new) = target.iter_mut().find(|asset| {
+                asset.server_id.as_deref() == Some(server_id) || asset.path == old.path
+            }) {
+                if new.server_id.is_none() {
+                    new.server_id = old.server_id.clone();
+                }
+                if !old.label.trim().is_empty() {
+                    new.label = old.label.clone();
+                }
+                if new.thumbnail.is_none() {
+                    new.thumbnail = old.thumbnail.clone();
+                }
+                new.duration_secs = new.duration_secs.or(old.duration_secs);
+                new.width = new.width.or(old.width);
+                new.height = new.height.or(old.height);
+                new.downloaded = new.downloaded || old.downloaded;
+                if !new.path.is_file() && old.path.is_file() {
+                    new.path = old.path.clone();
+                }
+            } else {
+                target.push(old.clone());
+            }
+        }
     }
 
     pub fn reload_library(&mut self) {
@@ -3161,6 +3343,146 @@ impl EditorState {
         }
     }
 
+    pub fn server_asset_count_for_tab(&self, tab: LibraryTab) -> Option<u64> {
+        let kind = Self::server_kind_for_tab(tab)?;
+        self.server_asset_counts
+            .as_ref()
+            .and_then(|counts| counts.count_for(kind))
+            .or_else(|| self.server_page_state(tab).and_then(|page| page.total))
+    }
+
+    pub fn local_asset_count_for_tab(&self, tab: LibraryTab) -> usize {
+        match tab {
+            LibraryTab::Clips => self
+                .library
+                .mellstroy_clips
+                .iter()
+                .filter(|clip| clip.downloaded)
+                .count(),
+            LibraryTab::Videos => self
+                .library
+                .videos
+                .iter()
+                .filter(|asset| asset.server_id.is_none())
+                .count(),
+            LibraryTab::Sounds => self
+                .library
+                .sounds
+                .iter()
+                .filter(|asset| asset.server_id.is_none())
+                .count(),
+            LibraryTab::Images => self
+                .library
+                .images
+                .iter()
+                .filter(|asset| asset.server_id.is_none())
+                .count(),
+            LibraryTab::Particles => self.library.particles.len(),
+        }
+    }
+
+    pub fn display_count_for_tab(&self, tab: LibraryTab, fallback_loaded: usize) -> usize {
+        let Some(server_total) = self.server_asset_count_for_tab(tab) else {
+            return fallback_loaded;
+        };
+        self.local_asset_count_for_tab(tab)
+            .saturating_add(server_total as usize)
+    }
+
+    pub fn mark_server_asset_counts_loading(&mut self) {
+        self.server_asset_counts_loading = true;
+        self.server_asset_counts_error = None;
+        self.last_server_counts_refresh = Some(std::time::Instant::now());
+    }
+
+    pub fn apply_server_asset_counts(&mut self, counts: crate::jobs::ServerAssetCounts) {
+        self.server_asset_counts_loading = false;
+        self.server_asset_counts_error = None;
+        if let Some(total) = counts.count_for("clip") {
+            self.server_library_pages.clips.total = Some(total);
+        }
+        if let Some(total) = counts.count_for("video") {
+            self.server_library_pages.videos.total = Some(total);
+        }
+        if let Some(total) = counts.count_for("sound") {
+            self.server_library_pages.sounds.total = Some(total);
+        }
+        if let Some(total) = counts.count_for("image") {
+            self.server_library_pages.images.total = Some(total);
+        }
+        self.server_asset_counts = Some(counts);
+    }
+
+    pub fn set_server_asset_counts_error(&mut self, error: String) {
+        self.server_asset_counts_loading = false;
+        self.server_asset_counts_error = Some(error);
+    }
+
+    pub fn server_preview_key(tab: LibraryTab, server_id: &str) -> Option<String> {
+        let kind = Self::server_kind_for_tab(tab)?;
+        Some(format!("{}:{}", kind, crate::jobs::sanitise_id(server_id)))
+    }
+
+    pub fn server_preview_cache_path_for(
+        &self,
+        tab: LibraryTab,
+        server_id: &str,
+    ) -> Option<PathBuf> {
+        let kind = Self::server_kind_for_tab(tab)?;
+        let safe_id = crate::jobs::sanitise_id(server_id);
+        Some(
+            self.server_preview_cache_root()
+                .join(kind)
+                .join(format!("{safe_id}.jpg")),
+        )
+    }
+
+    pub fn mark_server_preview_loaded(&mut self, tab: LibraryTab, server_id: &str, path: PathBuf) {
+        if let Some(key) = Self::server_preview_key(tab, server_id) {
+            self.pending_server_previews.remove(&key);
+            self.failed_server_previews.remove(&key);
+        }
+        match tab {
+            LibraryTab::Clips => {
+                for clip in &mut self.library.mellstroy_clips {
+                    if clip.server_id.as_deref() == Some(server_id) {
+                        clip.thumbnail = Some(path.clone());
+                    }
+                }
+            }
+            LibraryTab::Videos => {
+                for asset in &mut self.library.videos {
+                    if asset.server_id.as_deref() == Some(server_id) {
+                        asset.thumbnail = Some(path.clone());
+                    }
+                }
+            }
+            LibraryTab::Sounds => {
+                for asset in &mut self.library.sounds {
+                    if asset.server_id.as_deref() == Some(server_id) {
+                        asset.thumbnail = Some(path.clone());
+                    }
+                }
+            }
+            LibraryTab::Images => {
+                for asset in &mut self.library.images {
+                    if asset.server_id.as_deref() == Some(server_id) {
+                        asset.thumbnail = Some(path.clone());
+                    }
+                }
+            }
+            LibraryTab::Particles => {}
+        }
+    }
+
+    pub fn mark_server_preview_failed(&mut self, tab: LibraryTab, server_id: &str, error: String) {
+        if let Some(key) = Self::server_preview_key(tab, server_id) {
+            self.pending_server_previews.remove(&key);
+            self.failed_server_previews
+                .insert(key, (std::time::Instant::now(), error));
+        }
+    }
+
     pub fn server_page_state(&self, tab: LibraryTab) -> Option<&ServerLibraryPageState> {
         match tab {
             LibraryTab::Clips => Some(&self.server_library_pages.clips),
@@ -3192,22 +3514,6 @@ impl EditorState {
             page.loading = false;
             page.exhausted = false;
             page.error = None;
-        }
-        match tab {
-            LibraryTab::Clips => self.library.mellstroy_clips.retain(|c| c.downloaded),
-            LibraryTab::Videos => self
-                .library
-                .videos
-                .retain(|a| a.server_id.is_none() || a.downloaded),
-            LibraryTab::Sounds => self
-                .library
-                .sounds
-                .retain(|a| a.server_id.is_none() || a.downloaded),
-            LibraryTab::Images => self
-                .library
-                .images
-                .retain(|a| a.server_id.is_none() || a.downloaded),
-            LibraryTab::Particles => {}
         }
     }
 
@@ -3246,25 +3552,6 @@ impl EditorState {
             state_page.total = Some(page.total);
             state_page.offset = page.offset.saturating_add(page.items.len() as u64);
             state_page.exhausted = !page.has_more || page.items.is_empty();
-        }
-
-        if page.offset == 0 {
-            match tab {
-                LibraryTab::Clips => self.library.mellstroy_clips.retain(|c| c.downloaded),
-                LibraryTab::Videos => self
-                    .library
-                    .videos
-                    .retain(|a| a.server_id.is_none() || a.downloaded),
-                LibraryTab::Sounds => self
-                    .library
-                    .sounds
-                    .retain(|a| a.server_id.is_none() || a.downloaded),
-                LibraryTab::Images => self
-                    .library
-                    .images
-                    .retain(|a| a.server_id.is_none() || a.downloaded),
-                LibraryTab::Particles => {}
-            }
         }
 
         for item in page.items {
@@ -3370,7 +3657,7 @@ impl EditorState {
         if let Some(duration) = item.duration_secs.filter(|d| d.is_finite() && *d > 0.01) {
             self.video_duration_cache.insert(path.clone(), duration);
         }
-        let row = LibraryClip {
+        let mut row = LibraryClip {
             id,
             path,
             label,
@@ -3388,6 +3675,13 @@ impl EditorState {
             .iter_mut()
             .find(|c| c.server_id.as_deref() == Some(item.id.as_str()))
         {
+            if row.thumbnail.is_none() {
+                row.thumbnail = existing.thumbnail.clone();
+            }
+            row.downloaded = row.downloaded || existing.downloaded;
+            row.duration_secs = row.duration_secs.or(existing.duration_secs);
+            row.width = row.width.or(existing.width);
+            row.height = row.height.or(existing.height);
             *existing = row;
         } else {
             self.library.mellstroy_clips.push(row);
@@ -3425,7 +3719,7 @@ impl EditorState {
                 self.video_duration_cache.insert(path.clone(), duration);
             }
         }
-        let row = LibraryAsset {
+        let mut row = LibraryAsset {
             id: safe_id,
             path,
             label,
@@ -3446,6 +3740,13 @@ impl EditorState {
             .iter_mut()
             .find(|a| a.server_id.as_deref() == Some(item.id.as_str()))
         {
+            if row.thumbnail.is_none() {
+                row.thumbnail = existing.thumbnail.clone();
+            }
+            row.downloaded = row.downloaded || existing.downloaded;
+            row.duration_secs = row.duration_secs.or(existing.duration_secs);
+            row.width = row.width.or(existing.width);
+            row.height = row.height.or(existing.height);
             *existing = row;
         } else {
             target.push(row);
@@ -5232,7 +5533,8 @@ mod timeline_lane_tests {
     use std::{collections::BTreeSet, path::PathBuf};
 
     use memstroy_core::{
-        Actor, ActorState, AudioTrack, ChromaKeyParams, ColorCorrection, Keyframe, Transition,
+        Actor, ActorState, AudioTrack, ChromaKeyParams, ColorCorrection, Effect, Keyframe,
+        Transition,
     };
 
     use super::{EditorState, Selection, Track, TrackKind};
@@ -5275,6 +5577,40 @@ mod timeline_lane_tests {
         audio.t_in = t_in;
         audio.t_out = Some(t_out);
         audio
+    }
+
+    #[test]
+    fn sequence_controller_sync_copies_group_fields_but_skips_slots() {
+        let mut state = EditorState::new();
+        let mut controller = test_actor("controller", 0.0, 1.0);
+        let mut peer = test_actor("peer", 1.0, 2.0);
+        let mut slot = test_actor("slot", 2.0, 3.0);
+        for actor in [&mut controller, &mut peer, &mut slot] {
+            actor.mellstroy_footage.enabled = true;
+            actor.mellstroy_footage.sequence_id = Some("seq".into());
+        }
+        slot.mellstroy_footage.slot = true;
+        state.scene.actors = vec![controller, peer, slot];
+        state.footage_sequence_edit_id = Some("seq".into());
+
+        let before = state
+            .footage_sequence_controller_snapshot(0)
+            .expect("controller snapshot");
+        state.scene.actors[0].layout[0].value.pos = [0.25, 0.33];
+        state.scene.actors[0]
+            .animated_params
+            .insert(memstroy_core::param_ids::POS_X.to_string());
+        state.scene.actors[0].effects.push(Effect::color_key());
+
+        assert!(state.sync_footage_sequence_controller_from_snapshot(0, &before));
+        assert_eq!(state.scene.actors[1].layout, state.scene.actors[0].layout);
+        assert_eq!(
+            state.scene.actors[1].animated_params,
+            state.scene.actors[0].animated_params
+        );
+        assert_eq!(state.scene.actors[1].effects, state.scene.actors[0].effects);
+        assert_ne!(state.scene.actors[2].layout, state.scene.actors[0].layout);
+        assert!(state.request_media_preview);
     }
 
     #[test]

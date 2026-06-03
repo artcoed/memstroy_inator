@@ -3,7 +3,7 @@
 //! router is a plain `tower::Service` that we can call directly.
 
 use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use axum::http::{header, Request, StatusCode};
 use http_body_util::BodyExt; // for `.collect()`
 use memstroy_assets_server::{router, AssetStore};
 use serde_json::Value;
@@ -88,6 +88,12 @@ async fn list_returns_total_offset_items() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("public, max-age=5, stale-while-revalidate=30")
+    );
     let v = body_json(resp).await;
     assert_eq!(v["total"], Value::from(3));
     assert_eq!(v["offset"], Value::from(0));
@@ -108,6 +114,39 @@ async fn list_returns_total_offset_items() {
         let pu = &item["preview_url"];
         assert!(pu.is_string() || pu.is_null());
     }
+}
+
+#[tokio::test]
+async fn counts_endpoint_returns_totals_by_kind() {
+    let (_tmp, store) = fixture_store();
+    let app = router(store);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/assets/counts")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("public, max-age=5, stale-while-revalidate=30")
+    );
+    let v = body_json(resp).await;
+    assert_eq!(v["total"], Value::from(3));
+    assert_eq!(v["counts"]["clip"], Value::from(1));
+    assert_eq!(v["counts"]["image"], Value::from(1));
+    assert_eq!(v["counts"]["text"], Value::from(1));
+    assert_eq!(v["counts"]["video"], Value::from(0));
+    let counts = v["counts_by_kind"].as_array().expect("counts array");
+    assert!(counts
+        .iter()
+        .any(|entry| entry["kind"] == Value::from("clip") && entry["count"] == Value::from(1)));
 }
 
 #[tokio::test]
@@ -301,6 +340,84 @@ async fn admin_upload_persists_and_reindexes_asset() {
         "uploaded description"
     );
     assert!(store.get("sample").is_some());
+}
+
+#[tokio::test]
+async fn admin_upload_with_explicit_id_replaces_existing_asset() {
+    std::env::remove_var("ADMIN_TOKEN");
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    let store = AssetStore::new();
+    store.index_dir(root).unwrap();
+
+    async fn upload(app: axum::Router, id: &str, description: &str, body_bytes: &str) -> Value {
+        let boundary = format!("memstroy-test-boundary-{id}");
+        let body = format!(
+            concat!(
+                "--{b}\r\n",
+                "Content-Disposition: form-data; name=\"kind\"\r\n\r\n",
+                "clip\r\n",
+                "--{b}\r\n",
+                "Content-Disposition: form-data; name=\"id\"\r\n\r\n",
+                "{id}\r\n",
+                "--{b}\r\n",
+                "Content-Disposition: form-data; name=\"description\"\r\n\r\n",
+                "{description}\r\n",
+                "--{b}\r\n",
+                "Content-Disposition: form-data; name=\"asset\"; filename=\"sample.mp4\"\r\n",
+                "Content-Type: video/mp4\r\n\r\n",
+                "{body_bytes}\r\n",
+                "--{b}--\r\n"
+            ),
+            b = boundary,
+            id = id,
+            description = description,
+            body_bytes = body_bytes
+        );
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/assets")
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        body_json(resp).await
+    }
+
+    let first = upload(
+        router(store.clone()),
+        "fixed",
+        "first description",
+        "first bytes",
+    )
+    .await;
+    let second = upload(
+        router(store.clone()),
+        "fixed",
+        "second description",
+        "second bytes",
+    )
+    .await;
+
+    assert_eq!(first["asset"]["id"], Value::from("fixed"));
+    assert_eq!(second["asset"]["id"], Value::from("fixed"));
+    assert!(root.join("clips/fixed.mp4").exists());
+    assert!(!root.join("clips/fixed-1.mp4").exists());
+    assert_eq!(
+        std::fs::read_to_string(root.join("clips/fixed.txt")).unwrap(),
+        "second description"
+    );
+    let indexed = store.get("fixed").unwrap();
+    assert_eq!(indexed.description, "second description");
+    assert_eq!(store.count(), 1);
 }
 
 #[tokio::test]

@@ -244,8 +244,8 @@ pwsh scripts/make-installer.ps1 -ServerUrl https://assets.your-domain.example
 Если бандл уже готов и нужно только обернуть его без пересборки:
 
 ```bash
-scripts/make-installer.sh --bundle-dir dist/Memstroy-inator-linux-x86_64-0.1.0
-pwsh scripts/make-installer.ps1 -BundleDir .\dist\Memstroy-inator-windows-amd64-0.1.0
+scripts/make-installer.sh --bundle-dir dist/Memstroy-inator-linux-x86_64-0.2.0
+pwsh scripts/make-installer.ps1 -BundleDir .\dist\Memstroy-inator-windows-amd64-0.2.0
 ```
 
 Куда установщики кладут файлы по умолчанию:

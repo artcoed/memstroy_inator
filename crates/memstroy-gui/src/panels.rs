@@ -110,6 +110,7 @@ pub fn library(ui: &mut egui::Ui, state: &mut EditorState, _request_refresh: imp
     // can route drops onto this region into the Videos / Images / Sounds
     // sub-folder rather than dropping straight onto the timeline.
     state.library_panel_rect = Some(ui.max_rect());
+    request_server_asset_counts_if_needed(state);
 
     ui.label(RichText::new(crate::i18n::t("Library")).size(16.0).strong());
     ui.add_space(4.0);
@@ -266,6 +267,167 @@ fn request_server_library_page_if_needed(
     );
 }
 
+fn request_server_asset_counts_if_needed(state: &mut EditorState) {
+    if crate::state::LIBRARY_LOCAL_ONLY || state.server_asset_counts_loading {
+        return;
+    }
+    if let Some(last) = state.last_server_counts_refresh {
+        let ttl = if state.server_asset_counts.is_some() {
+            std::time::Duration::from_secs(30)
+        } else {
+            std::time::Duration::from_secs(2)
+        };
+        if last.elapsed() < ttl {
+            return;
+        }
+    }
+    let (Some(handle), Some(tx)) = (state.tokio_handle.clone(), state.image_fx_tx.clone()) else {
+        return;
+    };
+    state.mark_server_asset_counts_loading();
+    crate::jobs::spawn_server_asset_counts(&handle, tx, state.server_url.clone());
+}
+
+fn maybe_request_server_preview(
+    ui: &mut egui::Ui,
+    state: &mut EditorState,
+    tab: LibraryTab,
+    server_id: Option<&str>,
+) -> bool {
+    if crate::state::LIBRARY_LOCAL_ONLY {
+        return false;
+    }
+    let Some(server_id) = server_id.filter(|id| !id.trim().is_empty()) else {
+        return false;
+    };
+    let Some(target) = state.server_preview_cache_path_for(tab, server_id) else {
+        return false;
+    };
+    if target.exists() {
+        state.mark_server_preview_loaded(tab, server_id, target);
+        return false;
+    }
+    let Some(key) = EditorState::server_preview_key(tab, server_id) else {
+        return false;
+    };
+    if state.pending_server_previews.contains(&key) {
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(120));
+        return true;
+    }
+    if let Some((when, _)) = state.failed_server_previews.get(&key).cloned() {
+        if when.elapsed() < std::time::Duration::from_secs(20) {
+            return false;
+        }
+        state.failed_server_previews.remove(&key);
+    }
+
+    const PER_FRAME_SERVER_PREVIEW_STARTS: u32 = 3;
+    let budget_id = egui::Id::new("server_preview_start_budget");
+    let used = ui.ctx().data(|d| d.get_temp::<u32>(budget_id).unwrap_or(0));
+    if used >= PER_FRAME_SERVER_PREVIEW_STARTS {
+        ui.ctx().request_repaint();
+        return true;
+    }
+    let (Some(handle), Some(tx)) = (state.tokio_handle.clone(), state.image_fx_tx.clone()) else {
+        return false;
+    };
+    state.pending_server_previews.insert(key);
+    ui.ctx()
+        .data_mut(|d| d.insert_temp(budget_id, used.saturating_add(1)));
+    crate::jobs::spawn_server_asset_preview(
+        &handle,
+        tx,
+        state.server_url.clone(),
+        tab,
+        server_id.to_string(),
+        target,
+    );
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(120));
+    true
+}
+
+fn draw_cell_loader(ui: &egui::Ui, painter: &egui::Painter, rect: Rect, accent: Color32) {
+    let t = ui.input(|i| i.time) as f32;
+    let center = rect.center();
+    let base_y = center.y + 18.0;
+    for i in 0..3 {
+        let phase = ((t * 3.0) + i as f32 * 0.33).fract();
+        let alpha = (70.0 + 155.0 * (1.0 - (phase - 0.5).abs() * 2.0).max(0.0)) as u8;
+        let col = Color32::from_rgba_premultiplied(accent.r(), accent.g(), accent.b(), alpha);
+        painter.circle_filled(
+            egui::pos2(center.x - 10.0 + i as f32 * 10.0, base_y),
+            2.6,
+            col,
+        );
+    }
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(120));
+}
+
+fn draw_loading_grid_placeholders(ui: &mut egui::Ui, count: usize, accent: Color32, icon: &str) {
+    let avail_w = ui.available_width().max(80.0);
+    let cell_size = LIBRARY_CELL_SIZE;
+    let spacing = LIBRARY_CELL_SPACING;
+    let cell_h = cell_size + LIBRARY_CELL_LABEL_H;
+    let cols = ((avail_w + spacing) / (cell_size + spacing))
+        .floor()
+        .max(1.0) as usize;
+    let count = count.max(cols).min(cols * 2).max(1);
+    let rows = (count + cols - 1) / cols;
+    for row in 0..rows {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(spacing, spacing);
+            for col in 0..cols {
+                let idx = row * cols + col;
+                if idx >= count {
+                    break;
+                }
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(cell_size, cell_h), Sense::hover());
+                let painter = ui.painter_at(rect);
+                let thumb_rect = Rect::from_min_size(
+                    rect.min + egui::vec2(2.0, 2.0),
+                    egui::vec2(cell_size - 4.0, cell_size - 4.0),
+                );
+                painter.rect_filled(
+                    thumb_rect,
+                    Rounding::same(3.0),
+                    Color32::from_rgb(44, 42, 28),
+                );
+                painter.text(
+                    thumb_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    icon,
+                    egui::FontId::proportional(20.0),
+                    accent.gamma_multiply(0.35),
+                );
+                draw_cell_loader(ui, &painter, thumb_rect, accent);
+                let label_rect = Rect::from_min_size(
+                    egui::pos2(rect.min.x, rect.min.y + cell_size),
+                    egui::vec2(cell_size, LIBRARY_CELL_LABEL_H),
+                );
+                painter.rect_filled(
+                    label_rect.shrink2(egui::vec2(12.0, 6.0)),
+                    Rounding::same(2.0),
+                    Color32::from_rgba_premultiplied(120, 120, 140, 55),
+                );
+            }
+        });
+    }
+}
+
+fn tab_for_asset_kind(kind: AssetDragKind) -> LibraryTab {
+    match kind {
+        AssetDragKind::Video => LibraryTab::Videos,
+        AssetDragKind::Sound => LibraryTab::Sounds,
+        AssetDragKind::Image => LibraryTab::Images,
+        AssetDragKind::Particle => LibraryTab::Particles,
+        AssetDragKind::Clip | AssetDragKind::None => LibraryTab::Clips,
+    }
+}
+
 /// Render a "Local | Global" split inside the library panel — kept
 /// here as dead code in case future iterations want to bring back a
 /// per-tab user/global division. The current UI flattens the list
@@ -381,16 +543,21 @@ fn library_split_panel<L, G>(
 fn library_clips_tab(ui: &mut egui::Ui, state: &mut EditorState) {
     // Reset per-frame thumbnail load budget for clip cards.
     let budget_id_init = egui::Id::new("library_thumb_budget");
-    ui.ctx().data_mut(|d| d.insert_temp(budget_id_init, 0u32));
+    let preview_budget_id = egui::Id::new("server_preview_start_budget");
+    ui.ctx().data_mut(|d| {
+        d.insert_temp(budget_id_init, 0u32);
+        d.insert_temp(preview_budget_id, 0u32);
+    });
     let page_limit = server_page_limit(ui);
 
     let search_lower = state.library_search.to_lowercase();
     let clip_count = state.library.mellstroy_clips.len();
+    let display_count = state.display_count_for_tab(LibraryTab::Clips, clip_count);
 
     // ── Header row: clip count ──
     // Clips are loaded automatically on scroll and search.
     ui.label(
-        RichText::new(format!("{} ({})", t("Clips"), clip_count))
+        RichText::new(format!("{} ({})", t("Clips"), display_count))
             .size(12.0)
             .strong()
             .color(Color32::from_rgb(220, 130, 50)),
@@ -451,25 +618,43 @@ fn library_clips_tab(ui: &mut egui::Ui, state: &mut EditorState) {
         .auto_shrink([false; 2])
         .show(ui, |ui| {
             if state.library.mellstroy_clips.is_empty() {
-                let hint = if state.refreshing {
-                    t("Refreshing local clips...")
-                } else if crate::state::LIBRARY_LOCAL_ONLY {
-                    t("No clips yet — copy .mp4 files into assets/clips/ and choose Refresh in the menu.")
-                } else {
-                    t("No clips yet — start typing in the search box or scroll down to load clips.")
-                };
-                ui.label(
-                    RichText::new(hint)
-                        .italics()
-                        .color(COL_TEXT_DIM)
-                        .size(11.0),
-                );
                 if !crate::state::LIBRARY_LOCAL_ONLY {
                     request_server_library_page_if_needed(
                         state,
                         LibraryTab::Clips,
                         page_limit,
                         false,
+                    );
+                    if state
+                        .server_page_state(LibraryTab::Clips)
+                        .map(|page| page.loading)
+                        .unwrap_or(false)
+                    {
+                        draw_loading_grid_placeholders(
+                            ui,
+                            page_limit as usize,
+                            Color32::from_rgb(255, 200, 80),
+                            "VID",
+                        );
+                    } else {
+                        ui.label(
+                            RichText::new(t("No clips yet — start typing in the search box or scroll down to load clips."))
+                                .italics()
+                                .color(COL_TEXT_DIM)
+                                .size(11.0),
+                        );
+                    }
+                } else {
+                    let hint = if state.refreshing {
+                        t("Refreshing local clips...")
+                    } else {
+                        t("No clips yet — copy .mp4 files into assets/clips/ and choose Refresh in the menu.")
+                    };
+                    ui.label(
+                        RichText::new(hint)
+                            .italics()
+                            .color(COL_TEXT_DIM)
+                            .size(11.0),
                     );
                 }
                 return;
@@ -538,6 +723,19 @@ fn library_clips_tab(ui: &mut egui::Ui, state: &mut EditorState) {
                     });
                 });
             }
+            if state
+                .server_page_state(LibraryTab::Clips)
+                .map(|page| page.loading)
+                .unwrap_or(false)
+            {
+                ui.add_space(6.0);
+                draw_loading_grid_placeholders(
+                    ui,
+                    page_limit as usize,
+                    Color32::from_rgb(255, 200, 80),
+                    "VID",
+                );
+            }
         });
 
     // ── Auto-refresh on near-bottom scroll ──
@@ -561,7 +759,11 @@ fn library_assets_tab(ui: &mut egui::Ui, state: &mut EditorState, kind: AssetDra
     // Reset the per-frame thumbnail load budget at the start of every
     // tab paint so each frame can load up to N more thumbnails.
     let budget_id = egui::Id::new("library_thumb_budget");
-    ui.ctx().data_mut(|d| d.insert_temp(budget_id, 0u32));
+    let preview_budget_id = egui::Id::new("server_preview_start_budget");
+    ui.ctx().data_mut(|d| {
+        d.insert_temp(budget_id, 0u32);
+        d.insert_temp(preview_budget_id, 0u32);
+    });
 
     let (title, dir, title_color) = match kind {
         AssetDragKind::Sound => (
@@ -610,8 +812,9 @@ fn library_assets_tab(ui: &mut egui::Ui, state: &mut EditorState, kind: AssetDra
 
     let search_lower = state.library_search.to_lowercase();
     let count = assets.len();
+    let display_count = state.display_count_for_tab(tab, count);
     ui.label(
-        RichText::new(format!("{} ({})", title, count))
+        RichText::new(format!("{} ({})", title, display_count))
             .size(12.0)
             .strong()
             .color(title_color),
@@ -718,7 +921,9 @@ fn library_assets_tab(ui: &mut egui::Ui, state: &mut EditorState, kind: AssetDra
                 RichText::new(format!(
                     "G {} ({})",
                     crate::i18n::t("Server (auto-fetched)"),
-                    server_rows.len()
+                    state
+                        .server_asset_count_for_tab(tab)
+                        .unwrap_or(server_rows.len() as u64)
                 ))
                 .size(11.0)
                 .strong()
@@ -734,7 +939,20 @@ fn library_assets_tab(ui: &mut egui::Ui, state: &mut EditorState, kind: AssetDra
                 .italics()
                 .color(COL_TEXT_DIM),
             );
-            if server_rows.is_empty() {
+            let server_loading = state
+                .server_page_state(tab)
+                .map(|page| page.loading)
+                .unwrap_or(false);
+            if server_rows.is_empty() && server_loading {
+                let icon = match kind {
+                    AssetDragKind::Sound => "SND",
+                    AssetDragKind::Image => "IMG",
+                    AssetDragKind::Particle => "FX",
+                    AssetDragKind::Video => "VID",
+                    _ => "?",
+                };
+                draw_loading_grid_placeholders(ui, page_limit as usize, title_color, icon);
+            } else if server_rows.is_empty() {
                 ui.label(
                     RichText::new(crate::i18n::t(
                         "(none — server hasn't ingested anything in this category yet)",
@@ -745,6 +963,17 @@ fn library_assets_tab(ui: &mut egui::Ui, state: &mut EditorState, kind: AssetDra
                 );
             } else {
                 library_asset_grid(ui, state, &server_rows, kind, title_color);
+                if server_loading {
+                    let icon = match kind {
+                        AssetDragKind::Sound => "SND",
+                        AssetDragKind::Image => "IMG",
+                        AssetDragKind::Particle => "FX",
+                        AssetDragKind::Video => "VID",
+                        _ => "?",
+                    };
+                    ui.add_space(6.0);
+                    draw_loading_grid_placeholders(ui, page_limit as usize, title_color, icon);
+                }
             }
         });
     let viewport_bottom = scroll_out.state.offset.y + scroll_out.inner_rect.height();
@@ -850,6 +1079,14 @@ fn draw_asset_grid_cell(
         rect.min + egui::vec2(2.0, 2.0),
         egui::vec2(cell_size - 4.0, cell_size - 4.0),
     );
+    let preview_loading = asset.thumbnail.is_none()
+        && ui.is_rect_visible(rect)
+        && maybe_request_server_preview(
+            ui,
+            state,
+            tab_for_asset_kind(kind),
+            asset.server_id.as_deref(),
+        );
     if ui.is_rect_visible(rect) {
         const PER_FRAME_THUMB_BUDGET: u32 = 1;
         let budget_id = egui::Id::new("library_thumb_budget");
@@ -912,6 +1149,11 @@ fn draw_asset_grid_cell(
                 AssetDragKind::Video => "VID",
                 _ => "?",
             };
+            painter.rect_filled(
+                thumb_rect,
+                Rounding::same(3.0),
+                Color32::from_rgb(44, 42, 28),
+            );
             painter.text(
                 thumb_rect.center(),
                 egui::Align2::CENTER_CENTER,
@@ -919,6 +1161,9 @@ fn draw_asset_grid_cell(
                 egui::FontId::proportional(24.0),
                 accent,
             );
+            if preview_loading {
+                draw_cell_loader(ui, &painter, thumb_rect, accent);
+            }
         }
     }
 
@@ -1574,6 +1819,8 @@ fn clip_card_grid_item(
         rect.min + egui::vec2(2.0, 2.0),
         egui::vec2(cell_size - 4.0, cell_size - 4.0),
     );
+    let preview_loading = clip.thumbnail.is_none()
+        && maybe_request_server_preview(ui, state, LibraryTab::Clips, clip.server_id.as_deref());
     if let Some(thumb) = &clip.thumbnail {
         // Per-frame load budget — see draw_asset_grid_cell for rationale.
         const PER_FRAME_THUMB_BUDGET: u32 = 1;
@@ -1631,6 +1878,9 @@ fn clip_card_grid_item(
             egui::FontId::proportional(20.0),
             Color32::WHITE,
         );
+        if preview_loading {
+            draw_cell_loader(ui, &painter, thumb_rect, Color32::from_rgb(255, 200, 80));
+        }
     }
 
     // Label below thumbnail
@@ -2471,16 +2721,37 @@ fn inspector_actor(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
     let actor_count = state.scene.actors.len();
     let cache_count = state.frame_caches.len();
 
+    let mut sequence_group_edit_id = state.actor_footage_sequence_edit_id(i).map(str::to_string);
+    if state.footage_sequence_edit_id.is_some() && sequence_group_edit_id.is_none() {
+        state.footage_sequence_edit_id = None;
+    }
+
     // Header with name (delete button removed — use Delete/Backspace shortcut
     // or right-click on the timeline clip instead).
     ui.horizontal(|ui| {
-        ui.label(
-            RichText::new(format!("{}: {}", t("Actor"), state.scene.actors[i].id))
-                .strong()
-                .size(14.0)
-                .color(COL_CLIP_ACTOR),
-        );
+        if let Some(sequence_id) = sequence_group_edit_id.as_deref() {
+            ui.label(
+                RichText::new(format!("{}: {}", t("Footage sequence"), sequence_id))
+                    .strong()
+                    .size(14.0)
+                    .color(Color32::from_rgb(100, 220, 240)),
+            );
+            if ui.small_button(t("Edit clip")).clicked() {
+                state.footage_sequence_edit_id = None;
+                sequence_group_edit_id = None;
+            }
+        } else {
+            ui.label(
+                RichText::new(format!("{}: {}", t("Actor"), state.scene.actors[i].id))
+                    .strong()
+                    .size(14.0)
+                    .color(COL_CLIP_ACTOR),
+            );
+        }
     });
+    let sequence_before = sequence_group_edit_id
+        .as_ref()
+        .and_then(|_| state.footage_sequence_controller_snapshot(i));
     ui.add_space(2.0);
     ui.label(
         RichText::new(
@@ -2522,11 +2793,17 @@ fn inspector_actor(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
             ))
             .changed()
         {
-            state.scene.actors[i].mellstroy_footage.enabled = enabled;
-            if enabled {
-                let _ = ensure_actor_footage_sequence_id(state, i);
-            } else {
-                detach_actor_from_footage_sequence(state, i);
+            state.mutate_state(|s| {
+                s.scene.actors[i].mellstroy_footage.enabled = enabled;
+                if enabled {
+                    let _ = ensure_actor_footage_sequence_id(s, i);
+                } else {
+                    detach_actor_from_footage_sequence(s, i);
+                    s.footage_sequence_edit_id = None;
+                }
+            });
+            if !enabled {
+                sequence_group_edit_id = None;
             }
         }
         if state.scene.actors[i].mellstroy_footage.slot {
@@ -2577,14 +2854,21 @@ fn inspector_actor(ui: &mut egui::Ui, state: &mut EditorState, i: usize) {
     match state.inspector_tab {
         0 => {
             inspector_actor_transform(ui, state, i);
-            inspector_actor_speed(ui, state, i);
+            if sequence_group_edit_id.is_none() {
+                inspector_actor_speed(ui, state, i);
+            }
         }
         1 => inspector_actor_masks(ui, state, i),
         2 => inspector_actor_effects(ui, state, i, actor_count, cache_count),
         _ => {
             inspector_actor_transform(ui, state, i);
-            inspector_actor_speed(ui, state, i);
+            if sequence_group_edit_id.is_none() {
+                inspector_actor_speed(ui, state, i);
+            }
         }
+    }
+    if let Some(before) = sequence_before.as_ref() {
+        let _ = state.sync_footage_sequence_controller_from_snapshot(i, before);
     }
 }
 
@@ -2699,7 +2983,7 @@ fn inspector_actor_transform(ui: &mut egui::Ui, state: &mut EditorState, i: usiz
     let playhead = state.playhead;
 
     // ── Parent element selector ──
-    {
+    if state.actor_footage_sequence_edit_id(i).is_none() {
         ui.label(RichText::new(t("Parent element")).size(12.0).strong());
         ui.add_space(2.0);
         let actor_id = state.scene.actors[i].id.clone();
@@ -9834,7 +10118,7 @@ fn broadcast_footage_sequence_move_delta(
         state.timeline_drag.footage_sequence_anchor = anchors;
         state.timeline_drag.footage_sequence_anchor_token = Some(token);
         state.timeline_drag.footage_sequence_mover_anchor = Some(mover_orig_t_in);
-        state.timeline_drag.footage_sequence_id = Some(sequence_id);
+        state.timeline_drag.footage_sequence_id = Some(sequence_id.clone());
     }
 
     let primary_now = state
@@ -9846,8 +10130,31 @@ fn broadcast_footage_sequence_move_delta(
     let Some(mover_anchor) = state.timeline_drag.footage_sequence_mover_anchor else {
         return;
     };
-    let accumulated = primary_now - mover_anchor;
     let anchors = state.timeline_drag.footage_sequence_anchor.clone();
+    let min_anchor_t = anchors
+        .iter()
+        .filter_map(|anchor| {
+            let Selection::Actor(ai) = anchor.sel else {
+                return None;
+            };
+            state.scene.actors.get(ai).map(|actor| (actor, anchor.t_in))
+        })
+        .filter_map(|(actor, t_in)| {
+            (actor.mellstroy_footage.enabled
+                && actor.mellstroy_footage.sequence_id.as_deref() == Some(sequence_id.as_str()))
+            .then_some(t_in)
+        })
+        .fold(f32::INFINITY, f32::min);
+    if !min_anchor_t.is_finite() {
+        return;
+    }
+    let requested = primary_now - mover_anchor;
+    let accumulated = requested.max(-min_anchor_t);
+    if (accumulated - requested).abs() > 1.0e-5 {
+        let target = mover_anchor + accumulated;
+        shift_actor_timeline_by(state, mover_idx, target - primary_now);
+        defer_overlap_resolution(state, MovedClipKind::Actor(mover_idx));
+    }
     for anchor in anchors {
         let Selection::Actor(ai) = anchor.sel else {
             continue;
@@ -10347,7 +10654,10 @@ fn draw_footage_sequence_handles(
     let Some(actor) = state.scene.actors.get(actor_idx) else {
         return false;
     };
-    if !actor.mellstroy_footage.enabled {
+    if !actor.mellstroy_footage.enabled
+        || actor.mellstroy_footage.slot
+        || actor.mellstroy_footage.edge_frame
+    {
         return false;
     }
     let Some((x0, x1)) =
@@ -11710,6 +12020,49 @@ fn shift_actor_timeline_by(state: &mut EditorState, actor_idx: usize, dt: f32) {
         }
     }
     sync_audio_to_actor(state, actor_idx);
+}
+
+fn move_footage_sequence_from_anchors(
+    state: &mut EditorState,
+    sequence_id: &str,
+    anchors: &[crate::state::GroupMoveAnchor],
+    raw_dt: f32,
+) -> f32 {
+    let min_anchor_t = anchors
+        .iter()
+        .filter_map(|anchor| {
+            let Selection::Actor(idx) = anchor.sel else {
+                return None;
+            };
+            let actor = state.scene.actors.get(idx)?;
+            (actor.mellstroy_footage.enabled
+                && actor.mellstroy_footage.sequence_id.as_deref() == Some(sequence_id))
+            .then_some(anchor.t_in)
+        })
+        .fold(f32::INFINITY, f32::min);
+    if !min_anchor_t.is_finite() {
+        return 0.0;
+    }
+
+    let dt = raw_dt.max(-min_anchor_t);
+    for anchor in anchors {
+        let Selection::Actor(idx) = anchor.sel else {
+            continue;
+        };
+        let Some(actor) = state.scene.actors.get(idx) else {
+            continue;
+        };
+        if !actor.mellstroy_footage.enabled
+            || actor.mellstroy_footage.sequence_id.as_deref() != Some(sequence_id)
+        {
+            continue;
+        }
+        let cur = actor.t_in.unwrap_or(0.0);
+        let target = (anchor.t_in + dt).max(0.0);
+        shift_actor_timeline_by(state, idx, target - cur);
+        defer_overlap_resolution(state, MovedClipKind::Actor(idx));
+    }
+    dt
 }
 
 fn shift_footage_sequence_at_or_after(state: &mut EditorState, sequence_id: &str, t: f32, dt: f32) {
@@ -15452,6 +15805,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                 state.selection = sel;
             }
         } else {
+            state.footage_sequence_edit_id = None;
             state.selection = sel;
         }
     }
@@ -15942,6 +16296,14 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                 egui::FontId::proportional(24.0),
                 Color32::from_rgb(255, 200, 50),
             );
+            if state.asset_drag.server_id.is_some() && !state.asset_drag.downloaded {
+                draw_cell_loader(
+                    ui,
+                    ui.painter(),
+                    thumb_rect,
+                    Color32::from_rgb(255, 200, 50),
+                );
+            }
         }
         // Two-line label: name + destination hint.
         let text_anchor = thumb_rect.right_top() + egui::vec2(6.0, 2.0);
@@ -17608,6 +17970,7 @@ fn draw_selected_footage_sequence_panel(
         Sense::click_and_drag(),
     );
     if resp.clicked() {
+        state.footage_sequence_edit_id = Some(sequence_id.clone());
         state.selection = Selection::Actor(selected_actor_idx);
     }
     if resp.drag_started() {
@@ -17622,22 +17985,19 @@ fn draw_selected_footage_sequence_panel(
                 })
             })
             .collect();
+        state.timeline_drag.footage_sequence_anchor_token = Some(EditorState::drag_token(
+            "drag_footage_sequence_panel",
+            selected_actor_idx,
+        ));
         state.timeline_drag.footage_sequence_id = Some(sequence_id.clone());
     }
     if resp.dragged() {
-        let dt = resp.drag_delta().x / pps.max(1.0);
+        let raw_dt = resp.drag_delta().x / pps.max(1.0);
         let anchors = state.timeline_drag.footage_sequence_anchor.clone();
         if state.timeline_drag.footage_sequence_id.as_deref() == Some(sequence_id.as_str()) {
-            for anchor in anchors {
-                let Selection::Actor(idx) = anchor.sel else {
-                    continue;
-                };
-                if idx >= state.scene.actors.len() {
-                    continue;
-                }
-                let cur = state.scene.actors[idx].t_in.unwrap_or(0.0);
-                let target = (anchor.t_in + dt).max(0.0);
-                shift_actor_timeline_by(state, idx, target - cur);
+            if let Some(token) = state.timeline_drag.footage_sequence_anchor_token {
+                state.push_drag_undo_if_needed(token);
+                move_footage_sequence_from_anchors(state, &sequence_id, &anchors, raw_dt);
             }
         }
         ui.ctx().request_repaint();
@@ -17668,10 +18028,8 @@ fn draw_selected_footage_sequence_panel(
         (1usize, crate::i18n::t("Masks")),
         (2usize, crate::i18n::t("Effects")),
     ] {
-        let btn_rect = egui::Rect::from_min_size(
-            egui::pos2(x, rect.center().y - 9.0),
-            egui::vec2(58.0, 18.0),
-        );
+        let btn_rect =
+            egui::Rect::from_min_size(egui::pos2(x, rect.center().y - 9.0), egui::vec2(58.0, 18.0));
         let btn = ui.interact(
             btn_rect,
             egui::Id::new(("footage_sequence_panel_tab", sequence_id.as_str(), tab)),
@@ -17679,6 +18037,7 @@ fn draw_selected_footage_sequence_panel(
         );
         if btn.clicked() {
             state.inspector_tab = tab;
+            state.footage_sequence_edit_id = Some(sequence_id.clone());
             state.selection = Selection::Actor(selected_actor_idx);
         }
         let btn_fill = if btn.hovered() {
@@ -20317,6 +20676,54 @@ mod timeline_resolution_tests {
         assert!(edge.speed < 0.001);
         assert_close(edge.t_in.unwrap(), 3.0);
         assert_close(edge.t_out.unwrap(), 3.5);
+    }
+
+    #[test]
+    fn sequence_panel_move_clamps_left_edge_as_rigid_group() {
+        let mut state = test_state();
+        state.tracks = vec![crate::state::Track::video("V1")];
+
+        for (idx, (id, t_in, t_out)) in [
+            ("first", 1.0, 2.0),
+            ("second", 2.0, 4.0),
+            ("edge", 4.0, 4.5),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut actor = actor(id, t_in, t_out, 0.0, 1.0);
+            actor.mellstroy_footage.enabled = true;
+            actor.mellstroy_footage.sequence_id = Some("seq".into());
+            if id == "edge" {
+                actor.mellstroy_footage.edge_frame = true;
+                actor.speed = 0.0001;
+                actor.mute_audio = true;
+            }
+            state.scene.actors.push(actor);
+            state.actor_track_assignments.insert(idx, 0);
+        }
+
+        let anchors: Vec<crate::state::GroupMoveAnchor> = state
+            .scene
+            .actors
+            .iter()
+            .enumerate()
+            .map(|(idx, actor)| crate::state::GroupMoveAnchor {
+                sel: Selection::Actor(idx),
+                t_in: actor.t_in.unwrap_or(0.0),
+                track: state.actor_track_assignments.get(&idx).copied(),
+            })
+            .collect();
+
+        let applied = move_footage_sequence_from_anchors(&mut state, "seq", &anchors, -2.5);
+
+        assert_close(applied, -1.0);
+        assert_close(state.scene.actors[0].t_in.unwrap(), 0.0);
+        assert_close(state.scene.actors[0].t_out.unwrap(), 1.0);
+        assert_close(state.scene.actors[1].t_in.unwrap(), 1.0);
+        assert_close(state.scene.actors[1].t_out.unwrap(), 3.0);
+        assert_close(state.scene.actors[2].t_in.unwrap(), 3.0);
+        assert_close(state.scene.actors[2].t_out.unwrap(), 3.5);
     }
 
     #[test]

@@ -23,7 +23,7 @@
 #   pwsh scripts/make-installer.ps1 -ServerUrl https://assets.example.com
 #
 #   # reuse an already-staged bundle (skips cargo build)
-#   pwsh scripts/make-installer.ps1 -BundleDir .\dist\Memstroy-inator-windows-amd64-0.1.0
+#   pwsh scripts/make-installer.ps1 -BundleDir .\dist\Memstroy-inator-windows-amd64-0.2.0
 #
 #   # custom output dir / installer name / Inno Setup compiler path
 #   pwsh scripts/make-installer.ps1 -ServerUrl https://assets.example.com `
@@ -212,7 +212,7 @@ if ([string]::IsNullOrWhiteSpace($Version)) { $Version = "0.0.0" }
 # Inno Setup's `VersionInfoVersion` / `VersionInfoProductVersion`
 # directives expect a 4-part dotted version (Win32 VS_VERSIONINFO
 # format: "major.minor.patch.build"). The workspace version is
-# usually 3-part SemVer ("0.1.0"); pad missing components with "0".
+# usually 3-part SemVer ("0.2.0"); pad missing components with "0".
 $VersionParts = @($Version -split '\.')
 while ($VersionParts.Count -lt 4) { $VersionParts += '0' }
 $VersionInfoVersion = ($VersionParts[0..3]) -join '.'

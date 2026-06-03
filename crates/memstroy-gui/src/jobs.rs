@@ -24,6 +24,7 @@
 //! When the server is unreachable or the catalogue is empty, the user
 //! gets a clear status string instead of a silent no-op.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::time::Duration;
@@ -108,6 +109,16 @@ pub enum JobEvent {
         offset: u64,
         limit: u64,
         result: Result<ServerAssetsPage, String>,
+    },
+    /// Lightweight aggregate counts from `/api/assets/counts`.
+    ServerAssetCountsLoaded {
+        result: Result<ServerAssetCounts, String>,
+    },
+    /// One visible server-backed card preview finished downloading.
+    ServerAssetPreviewLoaded {
+        tab: crate::state::LibraryTab,
+        server_id: String,
+        result: Result<PathBuf, String>,
     },
     /// A generic server-backed asset (image/sound/video) finished
     /// downloading after the user dropped its preview.
@@ -573,6 +584,69 @@ pub struct ServerAssetsPage {
     pub items: Vec<ServerAssetSummary>,
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ServerAssetKindCount {
+    pub kind: String,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ServerAssetCounts {
+    #[serde(default)]
+    pub total: u64,
+    #[serde(default)]
+    pub counts_by_kind: Vec<ServerAssetKindCount>,
+    #[serde(default)]
+    pub counts: HashMap<String, u64>,
+}
+
+impl ServerAssetCounts {
+    pub fn count_for(&self, kind: &str) -> Option<u64> {
+        self.counts.get(kind).copied().or_else(|| {
+            self.counts_by_kind
+                .iter()
+                .find(|entry| entry.kind == kind)
+                .map(|entry| entry.count)
+        })
+    }
+}
+
+pub fn spawn_server_asset_counts(rt: &Handle, tx: Sender<JobEvent>, server_url: String) {
+    rt.spawn(async move {
+        let result = fetch_server_asset_counts(server_url).await;
+        let _ = tx.send(JobEvent::ServerAssetCountsLoaded { result });
+    });
+}
+
+async fn fetch_server_asset_counts(server_url: String) -> Result<ServerAssetCounts, String> {
+    let server = crate::state::rewrite_server_url_for_client(&server_url)
+        .trim_end_matches('/')
+        .to_string();
+    if server.is_empty() {
+        return Err("assets-server URL is empty".into());
+    }
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(6))
+        .build()
+        .map_err(|e| format!("HTTP client init: {e}"))?;
+    let url = format!("{}/api/assets/counts", server);
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("server unavailable: {e}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        let snippet: String = body.chars().take(180).collect();
+        return Err(format!("server counts HTTP {status}: {snippet}"));
+    }
+    resp.json()
+        .await
+        .map_err(|e| format!("server counts parse failed: {e}"))
+}
+
 pub fn spawn_server_assets_page(
     rt: &Handle,
     tx: Sender<JobEvent>,
@@ -649,32 +723,11 @@ async fn fetch_server_assets_page(
         .map_err(|e| format!("server list parse failed: {e}"))?;
 
     let preview_dir = preview_cache_root.join(kind_token);
-    let _ = tokio::fs::create_dir_all(&preview_dir).await;
     for item in &mut list.items {
-        let Some(preview_url) = item.preview_url.clone() else {
-            continue;
-        };
         let safe_id = sanitise_id(&item.id);
         let target = preview_dir.join(format!("{safe_id}.jpg"));
         if target.exists() {
             item.local_preview = Some(target);
-            continue;
-        }
-        let full_url = if preview_url.starts_with("http://") || preview_url.starts_with("https://")
-        {
-            preview_url
-        } else {
-            format!("{}{}", server, preview_url)
-        };
-        match download_thumbnail(&client, &full_url, &target).await {
-            Ok(()) => item.local_preview = Some(target),
-            Err(e) => {
-                warn!(
-                    id = %item.id,
-                    error = %e,
-                    "server preview download failed"
-                );
-            }
         }
     }
 
@@ -691,6 +744,52 @@ async fn fetch_server_assets_page(
         has_more,
         items: list.items,
     })
+}
+
+pub fn spawn_server_asset_preview(
+    rt: &Handle,
+    tx: Sender<JobEvent>,
+    server_url: String,
+    tab: crate::state::LibraryTab,
+    server_id: String,
+    target: PathBuf,
+) {
+    rt.spawn(async move {
+        let result = fetch_server_asset_preview(server_url, &server_id, &target)
+            .await
+            .map(|_| target.clone());
+        let _ = tx.send(JobEvent::ServerAssetPreviewLoaded {
+            tab,
+            server_id,
+            result,
+        });
+    });
+}
+
+async fn fetch_server_asset_preview(
+    server_url: String,
+    server_id: &str,
+    target: &std::path::Path,
+) -> Result<(), String> {
+    if target.exists() {
+        return Ok(());
+    }
+    let server = crate::state::rewrite_server_url_for_client(&server_url)
+        .trim_end_matches('/')
+        .to_string();
+    if server.is_empty() {
+        return Err("assets-server URL is empty".into());
+    }
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(20))
+        .build()
+        .map_err(|e| format!("HTTP client init: {e}"))?;
+    if let Some(parent) = target.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
+    let url = format!("{}/api/assets/{}/preview", server, server_id);
+    download_thumbnail(&client, &url, target).await
 }
 
 fn url_query_encode(raw: &str) -> String {

@@ -6,6 +6,7 @@
 //! "trust the network" — it's expected to live next to the editor on
 //! a developer machine, not on the public internet.
 
+use std::collections::BTreeMap;
 use std::io::SeekFrom;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -52,6 +53,8 @@ const FALLBACK_IMAGE: &[u8] = include_bytes!("../assets/fallback.jpg");
 const FALLBACK_SOUND: &[u8] = include_bytes!("../assets/fallback.wav");
 
 const DEFAULT_MAX_UPLOAD_BYTES: u64 = 512 * 1024 * 1024;
+const CATALOG_CACHE_CONTROL: HeaderValue =
+    HeaderValue::from_static("public, max-age=5, stale-while-revalidate=30");
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
@@ -122,6 +125,14 @@ fn fallback_text_response() -> Response {
         .expect("valid response")
 }
 
+fn cached_json<T: Serialize>(value: T, cache_control: HeaderValue) -> Response {
+    let mut response = Json(value).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, cache_control);
+    response
+}
+
 /// Build the public router. Exposed via `crate::router` so tests can
 /// drive it through `tower::ServiceExt::oneshot` without binding a
 /// real socket.
@@ -139,6 +150,7 @@ pub fn router_with_bucket(store: AssetStore, bucket: Option<BucketStore>) -> Rou
 
     Router::new()
         .route("/api/health", get(health))
+        .route("/api/assets/counts", get(asset_counts))
         .route("/api/assets", get(list_assets))
         .route("/api/assets/:id", get(get_asset))
         .route("/api/assets/:id/preview", get(get_preview))
@@ -218,6 +230,48 @@ async fn root_writable(root: &FsPath) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// /api/assets/counts
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+struct AssetKindCount {
+    kind: AssetKind,
+    count: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct AssetCountsResponse {
+    total: u64,
+    counts_by_kind: Vec<AssetKindCount>,
+    counts: BTreeMap<AssetKind, u64>,
+}
+
+async fn asset_counts(State(state): State<AppState>) -> Response {
+    let counts_by_kind: Vec<AssetKindCount> = state
+        .store
+        .count_by_kind()
+        .into_iter()
+        .map(|(kind, count)| AssetKindCount {
+            kind,
+            count: count as u64,
+        })
+        .collect();
+    let counts = counts_by_kind
+        .iter()
+        .map(|entry| (entry.kind, entry.count))
+        .collect();
+
+    cached_json(
+        AssetCountsResponse {
+            total: state.store.count() as u64,
+            counts_by_kind,
+            counts,
+        },
+        CATALOG_CACHE_CONTROL,
+    )
+}
+
+// ---------------------------------------------------------------------------
 // /api/assets (listing)
 // ---------------------------------------------------------------------------
 
@@ -249,7 +303,7 @@ struct ListResponse {
 async fn list_assets(
     State(state): State<AppState>,
     Query(q): Query<ListQuery>,
-) -> Result<Json<ListResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let kinds = parse_kind_list(q.kind.as_deref());
     let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
 
@@ -259,13 +313,16 @@ async fn list_assets(
     let items: Vec<AssetSummary> = page.iter().map(AssetSummary::from_entry).collect();
     let has_more = q.offset.saturating_add(items.len() as u64) < total;
 
-    Ok(Json(ListResponse {
-        total,
-        offset: q.offset,
-        limit,
-        has_more,
-        items,
-    }))
+    Ok(cached_json(
+        ListResponse {
+            total,
+            offset: q.offset,
+            limit,
+            has_more,
+            items,
+        },
+        CATALOG_CACHE_CONTROL,
+    ))
 }
 
 fn parse_kind_list(raw: Option<&str>) -> Vec<AssetKind> {
@@ -748,16 +805,21 @@ async fn post_admin_asset(
         ));
     }
 
-    let stem_hint = id
+    let explicit_stem = id
         .as_deref()
-        .or_else(|| {
-            FsPath::new(&asset.file_name)
-                .file_stem()
-                .and_then(|s| s.to_str())
-        })
-        .unwrap_or("asset");
-    let requested_stem = sanitize_stem(stem_hint);
-    let stem = if bucket.is_some() {
+        .map(sanitize_stem)
+        .filter(|stem| !stem.is_empty());
+    let requested_stem = explicit_stem.clone().unwrap_or_else(|| {
+        let stem_hint = FsPath::new(&asset.file_name)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("asset");
+        sanitize_stem(stem_hint)
+    });
+    let replacing_explicit_id = explicit_stem.is_some();
+    let stem = if replacing_explicit_id {
+        requested_stem
+    } else if bucket.is_some() {
         unique_stem_in_store(&store, &requested_stem)
     } else {
         unique_stem(&root.join(kind.subdir()), &requested_stem, &ext).await
@@ -768,6 +830,9 @@ async fn post_admin_asset(
         .map_err(|e| ApiError::BadRequest(format!("create destination dir: {e}").into()))?;
     let dest = dest_dir.join(format!("{stem}.{ext}"));
 
+    if replacing_explicit_id {
+        cleanup_uploaded_local_files(&dest).await;
+    }
     tokio::fs::rename(&asset.tmp_path, &dest)
         .await
         .map_err(|e| ApiError::BadRequest(format!("persist asset: {e}").into()))?;

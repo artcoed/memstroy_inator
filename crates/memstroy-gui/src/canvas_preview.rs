@@ -3865,6 +3865,7 @@ fn draw_selection_gizmo(
             match state.canvas_drag.mode {
                 CanvasDragMode::MoveRenderFrame { .. }
                 | CanvasDragMode::ResizeRenderFrame { .. } => {
+                    state.footage_sequence_edit_id = None;
                     state.selection = Selection::RenderFrame;
                     state.canvas_drag.actor_legacy_snapshot.clear();
                     state.canvas_drag.overlay_world_snapshot.clear();
@@ -3968,6 +3969,7 @@ fn draw_selection_gizmo(
                 if apply_parent_pick_if_active(state, Selection::RenderFrame) {
                     return;
                 }
+                state.footage_sequence_edit_id = None;
                 state.selection = Selection::RenderFrame;
             } else {
                 try_select_at(state, click_world);
@@ -5270,12 +5272,15 @@ pub fn set_element_parent_preserve_world(
         }
         _ => return false,
     };
-    let token = canvas_drag_token(CANVAS_TOKEN_POS, sel);
+    let token = canvas_drag_token("parent_pick", sel);
+    state.end_drag_group();
     state.push_drag_undo_if_needed(token);
     if !state.scene.set_element_parent_id(element_id, new_parent_id) {
+        state.end_drag_group();
         return false;
     }
     write_selection_world_center(state, sel, [current_world.x, current_world.y], token, false);
+    state.end_drag_group();
     true
 }
 
@@ -7255,6 +7260,7 @@ fn try_select_at(state: &mut EditorState, pos: WorldPos) {
         if apply_parent_pick_if_active(state, picked) {
             return;
         }
+        state.footage_sequence_edit_id = None;
         state.selection = picked;
         return;
     }
@@ -7297,6 +7303,7 @@ fn try_select_at(state: &mut EditorState, pos: WorldPos) {
         if apply_parent_pick_if_active(state, Selection::RenderFrame) {
             return;
         }
+        state.footage_sequence_edit_id = None;
         state.selection = Selection::RenderFrame;
         return;
     }
@@ -8106,6 +8113,11 @@ fn commit_mask_draft(
         }
         _ => {}
     });
+    if let Selection::Actor(i) = target {
+        if state.actor_footage_sequence_edit_id(i).is_some() {
+            let _ = state.sync_footage_sequence_controller_now(i);
+        }
+    }
     state.status = format!("\u{2702} {} {}", tool.label(), crate::i18n::t("applied"));
     state.mask_tool = MaskTool::None;
     state.mask_draft_points.clear();
@@ -8219,6 +8231,11 @@ fn handle_eyedropper_mask_click(
             effects.push(eff);
         }
     });
+    if let Selection::Actor(i) = target {
+        if state.actor_footage_sequence_edit_id(i).is_some() {
+            let _ = state.sync_footage_sequence_controller_now(i);
+        }
+    }
     state.status = label;
     state.mask_tool = MaskTool::None;
     state.mask_draft_points.clear();
@@ -9487,5 +9504,32 @@ mod transform_hierarchy_tests {
         let roundtrip = apply_parent_transform(local, &parent);
         assert_close(roundtrip.x, world.x);
         assert_close(roundtrip.y, world.y);
+    }
+
+    #[test]
+    fn parent_pick_reparent_preserves_world_and_undo_restores_parent() {
+        let mut state = EditorState::new();
+        state.scene.actors = vec![actor("parent", None), actor("child", None)];
+        state.scene.canvas_layouts = vec![
+            canvas_layout("parent", WorldPos { x: 100.0, y: 100.0 }, 1.0, 0.0),
+            canvas_layout("child", WorldPos { x: 150.0, y: 170.0 }, 1.0, 0.0),
+        ];
+
+        let before = get_element_world_pos(&state, "child", &state.scene.actors[1].layout, 0.0);
+        assert!(set_element_parent_preserve_world(
+            &mut state,
+            "child",
+            Some("parent".to_string())
+        ));
+        assert_eq!(state.scene.actors[1].parent_id.as_deref(), Some("parent"));
+        let after = get_element_world_pos(&state, "child", &state.scene.actors[1].layout, 0.0);
+        assert_close(after.x, before.x);
+        assert_close(after.y, before.y);
+
+        state.undo();
+        assert_eq!(state.scene.actors[1].parent_id, None);
+        let undone = get_element_world_pos(&state, "child", &state.scene.actors[1].layout, 0.0);
+        assert_close(undone.x, before.x);
+        assert_close(undone.y, before.y);
     }
 }
