@@ -20421,6 +20421,7 @@ pub(crate) fn try_spawn_lazy_clip_download(
         return true;
     };
     let local_path = clip_path.to_path_buf();
+    state.failed_clip_downloads.remove(&local_path);
     state.pending_clip_downloads.insert(local_path.clone());
     crate::jobs::spawn_clip_download(
         &handle,
@@ -20470,6 +20471,7 @@ pub(crate) fn try_spawn_lazy_server_asset_download(
         return true;
     };
     let local_path = path.to_path_buf();
+    state.failed_clip_downloads.remove(&local_path);
     state.pending_clip_downloads.insert(local_path.clone());
     crate::jobs::spawn_server_asset_download(
         &handle,

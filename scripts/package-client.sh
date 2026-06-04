@@ -150,7 +150,7 @@ for bin in memstroy-gui memstroy; do
         echo "missing release binary: ${src}" >&2
         exit 1
     fi
-    cp -p "${src}" "${BUNDLE_DIR}/bin/"
+    cp "${src}" "${BUNDLE_DIR}/bin/"
 done
 
 # ─── Bundled FFmpeg ──────────────────────────────────────────────────
@@ -182,14 +182,13 @@ validate_real_ffmpeg_tool() {
     local size
 
     size="$(wc -c < "${tool_path}" | tr -d '[:space:]')"
-    if [[ "${size}" -lt 1048576 ]]; then
-        echo "error: ${tool_name} resolved to a tiny launcher/shim (${size} bytes): ${tool_path}" >&2
-        echo "       Install/copy a real static FFmpeg binary or set MEMSTROY_FFMPEG/MEMSTROY_FFPROBE." >&2
-        exit 1
-    fi
     if ! "${tool_path}" -version >/dev/null 2>&1; then
         echo "error: ${tool_name} failed '-version' check: ${tool_path}" >&2
         exit 1
+    fi
+    if [[ "${size}" -lt 1048576 ]]; then
+        echo "warning: ${tool_name} is smaller than a static build (${size} bytes): ${tool_path}" >&2
+        echo "         continuing because '${tool_name} -version' works" >&2
     fi
 }
 
@@ -203,8 +202,8 @@ else
 fi
 validate_real_ffmpeg_tool "${FFMPEG_SRC}" ffmpeg
 validate_real_ffmpeg_tool "${FFPROBE_SRC}" ffprobe
-cp -p "${FFMPEG_SRC}" "${BUNDLE_DIR}/bin/ffmpeg"
-cp -p "${FFPROBE_SRC}" "${BUNDLE_DIR}/bin/ffprobe"
+cp "${FFMPEG_SRC}" "${BUNDLE_DIR}/bin/ffmpeg"
+cp "${FFPROBE_SRC}" "${BUNDLE_DIR}/bin/ffprobe"
 echo "    bundled   : bin/ffmpeg"
 echo "    bundled   : bin/ffprobe"
 
@@ -215,7 +214,7 @@ if [[ ! -f "${MODEL_SRC}" ]]; then
     exit 1
 fi
 mkdir -p "${BUNDLE_DIR}/models"
-cp -p "${MODEL_SRC}" "${BUNDLE_DIR}/models/u2netp.onnx"
+cp "${MODEL_SRC}" "${BUNDLE_DIR}/models/u2netp.onnx"
 echo "    bundled   : models/u2netp.onnx"
 
 # ─── Belt-and-braces strip (Linux/macOS) ─────────────────────────────
@@ -237,8 +236,8 @@ fi
 
 # ─── Examples + docs ─────────────────────────────────────────────────
 mkdir -p "${BUNDLE_DIR}/examples"
-cp -p examples/*.yaml "${BUNDLE_DIR}/examples/" 2>/dev/null || true
-cp -p README.md "${BUNDLE_DIR}/" 2>/dev/null || true
+cp examples/*.yaml "${BUNDLE_DIR}/examples/" 2>/dev/null || true
+cp README.md "${BUNDLE_DIR}/" 2>/dev/null || true
 
 # ─── App icon ────────────────────────────────────────────────────────
 # The Linux installer (scripts/make-installer.sh) installs this PNG
@@ -250,12 +249,12 @@ cp -p README.md "${BUNDLE_DIR}/" 2>/dev/null || true
 ICON_PNG_SRC="${ROOT_DIR}/assets/internal_images/catost.png"
 ICON_ICO_SRC="${ROOT_DIR}/assets/internal_images/catost.ico"
 if [[ -f "${ICON_PNG_SRC}" ]]; then
-    cp -p "${ICON_PNG_SRC}" "${BUNDLE_DIR}/catost.png"
+    cp "${ICON_PNG_SRC}" "${BUNDLE_DIR}/catost.png"
 else
     echo "warning: app icon not found at ${ICON_PNG_SRC}; menu entry will use the generic icon" >&2
 fi
 if [[ -f "${ICON_ICO_SRC}" ]]; then
-    cp -p "${ICON_ICO_SRC}" "${BUNDLE_DIR}/catost.ico"
+    cp "${ICON_ICO_SRC}" "${BUNDLE_DIR}/catost.ico"
 fi
 
 # ─── Top-level launcher ──────────────────────────────────────────────

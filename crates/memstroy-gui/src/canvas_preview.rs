@@ -105,6 +105,9 @@ fn actor_source_dimensions(state: &EditorState, actor_idx: usize) -> (f32, f32) 
 }
 
 fn actor_source_waits_for_download(state: &EditorState, source: &std::path::Path) -> bool {
+    if state.failed_clip_downloads.contains_key(source) {
+        return false;
+    }
     if state.pending_clip_downloads.contains(source) {
         return true;
     }
@@ -120,6 +123,24 @@ fn actor_source_waits_for_download(state: &EditorState, source: &std::path::Path
             && !asset.downloaded
             && (asset.path == source || asset.server_id.as_deref() == Some(stem))
     })
+}
+
+fn actor_source_download_failed<'a>(
+    state: &'a EditorState,
+    source: &std::path::Path,
+) -> Option<&'a str> {
+    state.failed_clip_downloads.get(source).map(String::as_str)
+}
+
+fn truncate_canvas_error(reason: &str) -> String {
+    let reason = reason.trim();
+    const MAX_CHARS: usize = 46;
+    if reason.chars().count() <= MAX_CHARS {
+        return reason.to_string();
+    }
+    let mut out: String = reason.chars().take(MAX_CHARS.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
 
 fn draw_canvas_media_loader(ui: &egui::Ui, painter: &egui::Painter, rect: Rect, label: &str) {
@@ -1822,11 +1843,7 @@ fn draw_single_actor(
 
             let texture = if has_effects {
                 fc.ensure_processed_preload(local_t, actor_ck, actor_cc, actor_fx);
-                if fc.processed_frame_warm() {
-                    fc.processed_frame_at_time(local_t, actor_ck, actor_cc, actor_fx, ui.ctx())
-                } else {
-                    None
-                }
+                fc.processed_frame_at_time(local_t, actor_ck, actor_cc, actor_fx, ui.ctx())
             } else {
                 fc.frame_at_time(local_t, ui.ctx())
             };
@@ -1911,10 +1928,12 @@ fn draw_single_actor(
 
         let source_downloading =
             actor_source_waits_for_download(state, &state.scene.actors[idx].source);
+        let source_download_failed =
+            actor_source_download_failed(state, &state.scene.actors[idx].source);
 
         // While the server video downloads or ffmpeg extracts preview
         // frames, show the library thumbnail in the final actor bounds.
-        if preview_pending || source_downloading {
+        if preview_pending || source_downloading || source_download_failed.is_some() {
             if let Some(thumb) =
                 crate::panels::clip_thumbnail_for_source(state, &state.scene.actors[idx].source)
             {
@@ -1940,6 +1959,33 @@ fn draw_single_actor(
             frame_shown = true;
         }
 
+        if let Some(download_error) = source_download_failed {
+            if !frame_shown {
+                let fill = match display_mode {
+                    DisplayMode::Active => Color32::from_rgb(44, 30, 28),
+                    _ => Color32::from_rgb(32, 24, 22),
+                };
+                painter.rect_filled(elem_rect, Rounding::same(3.0), fill);
+            }
+            painter.text(
+                elem_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                crate::i18n::t("Video download failed"),
+                egui::FontId::proportional(10.0),
+                Color32::from_rgb(235, 150, 145),
+            );
+            if elem_rect.width() > 96.0 && elem_rect.height() > 54.0 {
+                painter.text(
+                    egui::pos2(elem_rect.center().x, elem_rect.center().y + 14.0),
+                    egui::Align2::CENTER_CENTER,
+                    truncate_canvas_error(download_error),
+                    egui::FontId::proportional(9.0),
+                    Color32::from_rgb(210, 165, 160),
+                );
+            }
+            frame_shown = true;
+        }
+
         if !frame_shown {
             let fill = match display_mode {
                 DisplayMode::Active => Color32::from_rgb(44, 42, 28),
@@ -1948,6 +1994,8 @@ fn draw_single_actor(
             painter.rect_filled(elem_rect, Rounding::same(3.0), fill);
             let label = if preview_failed {
                 crate::i18n::t("Video preview failed")
+            } else if source_download_failed.is_some() {
+                crate::i18n::t("Video download failed")
             } else if extracting || preview_pending {
                 crate::i18n::t("Loading video...")
             } else {

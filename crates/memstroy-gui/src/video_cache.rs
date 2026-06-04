@@ -595,7 +595,9 @@ impl FrameCache {
             }
         }
 
-        None
+        // Cold processed cache or a stuck background worker: show the raw
+        // frame immediately instead of keeping the canvas on a loader.
+        self.frame_at_time(t, ctx)
     }
 
     /// Load a single frame from disk as a ColorImage.
@@ -772,36 +774,43 @@ impl FrameCache {
 
         self.processed_preloading = true;
 
-        thread::Builder::new()
+        match thread::Builder::new()
             .name(format!("memstroy-processed-preload-{}", self.actor_index))
             .spawn(move || {
-                let mut frames = Vec::with_capacity(buffer_size);
-                for i in 0..buffer_size {
-                    let idx = start_frame + i;
-                    if idx >= frame_count {
-                        frames.push(None);
-                        continue;
-                    }
-
-                    // Decode raw JPEG from disk (same path as raw preload).
-                    let file_name = format!("{:06}.jpg", idx + 1);
-                    let frame_path = cache_dir.join(&file_name);
-                    let img = match image::open(&frame_path) {
-                        Ok(img) => {
-                            let rgba = img.to_rgba8();
-                            let size = [rgba.width() as usize, rgba.height() as usize];
-                            let pixels = rgba.into_raw();
-                            Some(ColorImage::from_rgba_unmultiplied(size, &pixels))
+                let frames = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut frames = Vec::with_capacity(buffer_size);
+                    for i in 0..buffer_size {
+                        let idx = start_frame + i;
+                        if idx >= frame_count {
+                            frames.push(None);
+                            continue;
                         }
-                        Err(_) => None,
-                    };
 
-                    let processed = img.map(|raw| {
-                        FrameCache::process_raw_frame(&raw, &ck, &cc, &effects, preview_dim)
-                    });
+                        // Decode raw JPEG from disk (same path as raw preload).
+                        let file_name = format!("{:06}.jpg", idx + 1);
+                        let frame_path = cache_dir.join(&file_name);
+                        let img = match image::open(&frame_path) {
+                            Ok(img) => {
+                                let rgba = img.to_rgba8();
+                                let size = [rgba.width() as usize, rgba.height() as usize];
+                                let pixels = rgba.into_raw();
+                                Some(ColorImage::from_rgba_unmultiplied(size, &pixels))
+                            }
+                            Err(_) => None,
+                        };
 
-                    frames.push(processed);
-                }
+                        let processed = img.map(|raw| {
+                            FrameCache::process_raw_frame(&raw, &ck, &cc, &effects, preview_dim)
+                        });
+
+                        frames.push(processed);
+                    }
+                    frames
+                }))
+                .unwrap_or_else(|_| {
+                    tracing::warn!("processed frame preload panicked");
+                    Vec::new()
+                });
 
                 if let Ok(mut guard) = slot.lock() {
                     *guard = Some(ProcessedPreloadResult {
@@ -812,8 +821,13 @@ impl FrameCache {
                 }
                 // Note: we do NOT reset processed_preloading here —
                 // that flag is cleared by poll_processed_preload on the UI thread.
-            })
-            .ok(); // Ignore spawn failure — worst case we fall back to raw frames.
+            }) {
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!("failed to spawn processed frame preload: {e}");
+                self.processed_preloading = false;
+            }
+        }
     }
 
     /// Poll for completed background *processed* pre-load and apply

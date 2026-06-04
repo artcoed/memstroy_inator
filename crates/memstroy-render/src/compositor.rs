@@ -24,7 +24,7 @@
 //! 1. `extract_video_clips` — for every distinct video source in the
 //!    scene, extract ONLY the frames we'll actually need (clipped to
 //!    `[t_in, t_out]` and the source's `duration`) at the output's
-//!    `fps`. Frames land in `<temp>/memstroy-cpu-cache-…/000001.jpg`.
+//!    `fps`. Frames land in `<temp>/memstroy-cpu-cache-…/000001.png`.
 //!    This step is the single largest time cost of a render; we
 //!    parallelise across distinct sources and emit live progress so
 //!    the UI never freezes at "0%" for ages.
@@ -504,7 +504,14 @@ fn compose_frame(
                 let local = (t - bg.start).max(0.0) + *start_at;
                 let resolved = resolve_path(assets_root, path);
                 if let Some(layer) = clip_caches.frame_at(&resolved, local, *r#loop) {
-                    composite_fit(canvas, &layer, bg.fit, rw, rh);
+                    if let Some((logical_w, logical_h)) = clip_caches.logical_dimensions(&resolved)
+                    {
+                        composite_fit_with_logical_size(
+                            canvas, &layer, bg.fit, rw, rh, logical_w, logical_h,
+                        );
+                    } else {
+                        composite_fit(canvas, &layer, bg.fit, rw, rh);
+                    }
                 } else {
                     warn!(path = %resolved.display(), "video bg frame unavailable");
                 }
@@ -727,8 +734,9 @@ fn paint_actor(
         Some(img) => img,
         None => return,
     };
-    let src_w = layer.width();
-    let src_h = layer.height();
+    let (src_w, src_h) = clip_caches
+        .logical_dimensions(&resolved)
+        .unwrap_or_else(|| (layer.width(), layer.height()));
     if src_w == 0 || src_h == 0 {
         return;
     }
@@ -813,7 +821,7 @@ fn paint_image_overlay(
     }
     let sample_t = t - img_ov.t_in;
     let ov_ref = &scene.overlays[overlay_idx];
-    let mut ov_state = memstroy_core::overlay_visual_state(
+    let ov_state = memstroy_core::overlay_visual_state(
         scene,
         ov_ref,
         &img_ov.id,
@@ -897,7 +905,7 @@ fn paint_video_overlay(
     }
     let sample_t = t - vid.t_in;
     let ov_ref = &scene.overlays[overlay_idx];
-    let mut ov_state = memstroy_core::overlay_visual_state(
+    let ov_state = memstroy_core::overlay_visual_state(
         scene,
         ov_ref,
         &vid.id,
@@ -922,8 +930,9 @@ fn paint_video_overlay(
     if !vid.effects.is_empty() {
         apply_effect_stack_rgba(&mut layer, &vid.effects, sample_t);
     }
-    let src_w = layer.width();
-    let src_h = layer.height();
+    let (src_w, src_h) = clip_caches
+        .logical_dimensions(&resolved)
+        .unwrap_or_else(|| (layer.width(), layer.height()));
     if src_w == 0 || src_h == 0 {
         return;
     }
@@ -977,7 +986,7 @@ fn paint_text_overlay(
     }
     let sample_t = t - txt.t_in;
     let ov_ref = &scene.overlays[overlay_idx];
-    let mut ov_state = memstroy_core::overlay_visual_state(
+    let ov_state = memstroy_core::overlay_visual_state(
         scene,
         ov_ref,
         &txt.id,
@@ -988,14 +997,21 @@ fn paint_text_overlay(
     );
     let mod_delta = keyframe::evaluate_modifiers(&txt.modifiers, sample_t);
 
-    let raster = match crate::text_rasterize::rasterize_text_overlay(txt, rw, rh) {
-        Ok(Some(r)) => r,
-        Ok(None) => return,
-        Err(e) => {
-            warn!(error = %e, "text rasterise failed");
-            return;
-        }
-    };
+    let abs_fx = ov_state.flip_x_anim.abs().max(0.02);
+    let abs_fy = ov_state.flip_y_anim.abs().max(0.02);
+    let scale_x = ov_state.scale * abs_fx * rf_state.zoom;
+    let scale_y = ov_state.scale * ov_state.scale_y * abs_fy * rf_state.zoom;
+    let raster_scale = scale_x.abs().max(scale_y.abs()).max(1.0);
+
+    let raster =
+        match crate::text_rasterize::rasterize_text_overlay_at_scale(txt, rw, rh, raster_scale) {
+            Ok(Some(r)) => r,
+            Ok(None) => return,
+            Err(e) => {
+                warn!(error = %e, "text rasterise failed");
+                return;
+            }
+        };
     let mut layer = match image::open(&raster.png_path).map(|i| i.to_rgba8()) {
         Ok(img) => img,
         Err(_) => {
@@ -1021,12 +1037,10 @@ fn paint_text_overlay(
     };
     let (cx, cy) = world_to_output(world_pos, rf_state, rw, rh);
 
-    let abs_fx = ov_state.flip_x_anim.abs().max(0.02);
-    let abs_fy = ov_state.flip_y_anim.abs().max(0.02);
-    let scale_x = ov_state.scale * abs_fx * rf_state.zoom;
-    let scale_y = ov_state.scale * ov_state.scale_y * abs_fy * rf_state.zoom;
-    let out_w = png_w * scale_x;
-    let out_h = png_h * scale_y;
+    let draw_scale_x = scale_x / raster_scale;
+    let draw_scale_y = scale_y / raster_scale;
+    let out_w = png_w * draw_scale_x;
+    let out_h = png_h * draw_scale_y;
 
     let mut local_dx = raster.anchor_dx_from_left - png_w * 0.5;
     let mut local_dy = raster.anchor_dy_from_top - png_h * 0.5;
@@ -1038,8 +1052,8 @@ fn paint_text_overlay(
     if flip_y {
         local_dy = -local_dy;
     }
-    let out_dx = local_dx * scale_x;
-    let out_dy = local_dy * scale_y;
+    let out_dx = local_dx * draw_scale_x;
+    let out_dy = local_dy * draw_scale_y;
     let rotation_rad = (ov_state.rotation_deg - rf_state.rotation_deg).to_radians();
     let cos_r = rotation_rad.cos();
     let sin_r = rotation_rad.sin();
@@ -1071,11 +1085,23 @@ fn paint_solid_background(canvas: &mut RgbaImage, color: [u8; 3]) {
 }
 
 fn composite_fit(canvas: &mut RgbaImage, layer: &RgbaImage, fit: Fit, rw: u32, rh: u32) {
+    composite_fit_with_logical_size(canvas, layer, fit, rw, rh, layer.width(), layer.height());
+}
+
+fn composite_fit_with_logical_size(
+    canvas: &mut RgbaImage,
+    layer: &RgbaImage,
+    fit: Fit,
+    rw: u32,
+    rh: u32,
+    logical_w: u32,
+    logical_h: u32,
+) {
     if rw == 0 || rh == 0 {
         return;
     }
-    let lw = layer.width().max(1);
-    let lh = layer.height().max(1);
+    let lw = logical_w.max(1);
+    let lh = logical_h.max(1);
     let aspect_layer = lw as f32 / lh as f32;
     let aspect_canvas = rw as f32 / rh as f32;
 
@@ -2045,8 +2071,14 @@ struct ClipCacheEntry {
     cache_dir: PathBuf,
     fps: u32,
     /// Number of frames ACTUALLY in `cache_dir`. The first frame is
-    /// always `000001.jpg`; the last is `cache_dir/{frame_count:06}.jpg`.
+    /// always `000001.png`; the last is `cache_dir/{frame_count:06}.png`.
     frame_count: usize,
+    /// Scene-geometry reference size. Export decodes high-resolution
+    /// frames, but actor scale values were authored against the GUI's
+    /// reduced preview width, so draw size must stay separate from
+    /// source pixel density.
+    logical_width: u32,
+    logical_height: u32,
     /// Absolute scene-time of the first cached frame. The cache only
     /// holds frames inside the source's `[seek_start, seek_end]`
     /// window; values outside this clamp to first / last.
@@ -2079,7 +2111,7 @@ impl ClipCacheStore {
         let rel = (local - entry.seek_start).max(0.0);
         let frame_idx =
             ((rel * entry.fps as f32).floor() as usize).min(entry.frame_count.saturating_sub(1));
-        let p = entry.cache_dir.join(format!("{:06}.jpg", frame_idx + 1));
+        let p = entry.cache_dir.join(format!("{:06}.png", frame_idx + 1));
         match image::open(&p) {
             Ok(img) => Some(img.to_rgba8()),
             Err(e) => {
@@ -2091,6 +2123,11 @@ impl ClipCacheStore {
                 None
             }
         }
+    }
+
+    fn logical_dimensions(&self, path: &Path) -> Option<(u32, u32)> {
+        let entry = self.caches.get(path)?;
+        Some((entry.logical_width, entry.logical_height))
     }
 
     fn cleanup(self) {
@@ -2227,7 +2264,7 @@ where
 
     // Run extraction in parallel batches.
     let extracted_count = Arc::new(AtomicUsize::new(0));
-    let results: Vec<Result<(PathBuf, PathBuf, f32, usize)>> = {
+    let results: Vec<Result<(PathBuf, PathBuf, f32, ExtractedFrames)>> = {
         let chunks: Vec<&[ExtractionJob]> = jobs.chunks(max_parallel).collect();
         let mut all_results = Vec::with_capacity(jobs.len());
         for chunk in chunks {
@@ -2265,7 +2302,7 @@ where
             Ok((src, cache_dir, seek_start, frames)) => {
                 info!(
                     src = %src.display(),
-                    frames,
+                    frames = frames.frame_count,
                     seek_start,
                     cache = %cache_dir.display(),
                     "extracted clip frames"
@@ -2275,7 +2312,9 @@ where
                     ClipCacheEntry {
                         cache_dir,
                         fps,
-                        frame_count: frames,
+                        frame_count: frames.frame_count,
+                        logical_width: frames.logical_width,
+                        logical_height: frames.logical_height,
                         seek_start,
                     },
                 );
@@ -2302,13 +2341,19 @@ fn make_temp_dir(prefix: &str) -> Result<PathBuf> {
 
 static TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+struct ExtractedFrames {
+    frame_count: usize,
+    logical_width: u32,
+    logical_height: u32,
+}
+
 fn extract_frames(
     src: &Path,
     fps: u32,
     seek_start: f32,
     span: f32,
     out_dir: &Path,
-) -> Result<usize> {
+) -> Result<ExtractedFrames> {
     let bin = crate::ffmpeg_binary();
     let mut cmd = Command::new(&bin);
     cmd.args(["-y", "-hide_banner", "-loglevel", "error"]);
@@ -2319,25 +2364,13 @@ fn extract_frames(
     if span > 0.0 {
         cmd.args(["-t", &format!("{:.3}", span)]);
     }
-    // Frames are extracted at the SAME downscaled resolution the GUI's
-    // `FrameCache` uses (`scale=480:-1`). This is the size the canvas
-    // preview reads as `source_width`/`source_height`, and every
-    // `actor.scale` value the user authored on the canvas was sized
-    // against this 480-px-wide reference. If we extract at native
-    // resolution instead, the rendered output would show every actor
-    // ~2.25× too large compared to the canvas (`1080 / 480`) — which
-    // is exactly the user-reported "rendered output doesn't look like
-    // what's inside the render frame on the canvas" bug.
-    //
-    // Quality is fine because:
-    //   * the canvas already locks the user's effective resolution at
-    //     480 wide, so any `actor.scale` they dialed in is calibrated
-    //     for that size,
-    //   * the output frame is up-scaled into the render-frame's
-    //     1080×1920 (or whatever) rectangle via bilinear sampling,
-    //     which preserves the subjective look of the canvas.
-    cmd.args(["-vf", &format!("fps={},scale=480:-1", fps), "-q:v", "3"])
-        .arg(out_dir.join("%06d.jpg"))
+    // Export quality path: decode frames at source resolution and store
+    // them as lossless PNGs. Geometry remains tied to the old 480px preview
+    // reference through `logical_width` / `logical_height` below, so existing
+    // scenes keep their canvas-authored sizing while the sampler sees the
+    // best pixels available from the source.
+    cmd.args(["-vf", &format!("fps={}", fps), "-compression_level", "1"])
+        .arg(out_dir.join("%06d.png"))
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     proc::hide_console_std(&mut cmd);
@@ -2355,11 +2388,22 @@ fn extract_frames(
     let mut n = 0;
     for entry in std::fs::read_dir(out_dir).context("read clip cache dir")? {
         let entry = entry?;
-        if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+        if entry.file_type().map(|t| t.is_file()).unwrap_or(false)
+            && entry.path().extension().and_then(|s| s.to_str()) == Some("png")
+        {
             n += 1;
         }
     }
-    Ok(n)
+    let (source_w, source_h) = probe_video_dimensions(src)
+        .or_else(|| first_cached_frame_dimensions(out_dir))
+        .unwrap_or((480, 270));
+    let (logical_width, logical_height) = preview_reference_dimensions(source_w, source_h);
+
+    Ok(ExtractedFrames {
+        frame_count: n,
+        logical_width,
+        logical_height,
+    })
 }
 
 fn probe_duration(src: &Path) -> Option<f32> {
@@ -2380,6 +2424,48 @@ fn probe_duration(src: &Path) -> Option<f32> {
     let out = cmd.output().ok()?;
     let s = String::from_utf8_lossy(&out.stdout);
     s.trim().parse::<f32>().ok()
+}
+
+fn probe_video_dimensions(src: &Path) -> Option<(u32, u32)> {
+    let probe = crate::ffprobe_binary();
+    let mut cmd = Command::new(&probe);
+    cmd.args([
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=width,height",
+        "-of",
+        "csv=s=x:p=0",
+    ])
+    .arg(src)
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null());
+    proc::hide_console_std(&mut cmd);
+    let out = cmd.output().ok()?;
+    let s = String::from_utf8_lossy(&out.stdout);
+    let (w, h) = s.trim().split_once('x')?;
+    let w = w.parse::<u32>().ok()?;
+    let h = h.parse::<u32>().ok()?;
+    (w > 0 && h > 0).then_some((w, h))
+}
+
+fn first_cached_frame_dimensions(out_dir: &Path) -> Option<(u32, u32)> {
+    let first = out_dir.join("000001.png");
+    let img = image::open(first).ok()?;
+    Some((img.width(), img.height()))
+}
+
+fn preview_reference_dimensions(source_w: u32, source_h: u32) -> (u32, u32) {
+    if source_w == 0 || source_h == 0 {
+        return (480, 270);
+    }
+    let width = 480_u32;
+    let height = ((source_h as f32 * width as f32) / source_w as f32)
+        .round()
+        .max(1.0) as u32;
+    (width, height)
 }
 
 // ─── ENCODER (raw RGBA → MP4 via ffmpeg stdin) ──────────────────────
@@ -2410,27 +2496,18 @@ fn spawn_encoder(w: u32, h: u32, fps: u32, output_path: &Path) -> Result<std::pr
         "-",
         "-c:v",
         "libx264",
-        // ── Encoder speed/quality trade-off ──
-        //
-        // `faster` + `crf=20` roughly halves encode wall-clock vs
-        // `medium` + `crf=19` while keeping perceptual quality
-        // essentially identical for short-form overlay-heavy footage.
-        // A +1 CRF step is below the visible-difference threshold;
-        // the bitrate goes up ~10% to compensate but the time savings
-        // are far larger.
+        // Prioritise final render quality over throughput. Text, masks and
+        // chroma-key edges show compression artifacts quickly, so keep CRF
+        // low and let x264 spend more time on mode decisions.
         "-preset",
-        "faster",
+        "slow",
         "-crf",
-        "20",
+        "12",
         "-pix_fmt",
         "yuv420p",
         // Use all CPU cores for x264's internal threading.
         "-threads",
         &threads,
-        // Tune for fast-cut / animated content: disables psy-rdo
-        // tweaks tuned for dark grain, saves 10-15% encode time.
-        "-tune",
-        "fastdecode",
         "-movflags",
         "+faststart",
     ])

@@ -960,6 +960,11 @@ pub struct EditorState {
     /// handlers must not spawn actors against a partial/missing file
     /// while the path is listed here.
     pub pending_clip_downloads: std::collections::HashSet<std::path::PathBuf>,
+    /// Recent lazy-download failures keyed by the target local path.
+    /// Without this, a server-only library row that failed to download
+    /// still looked "not downloaded", so canvas placeholders kept
+    /// showing the generic loading spinner forever.
+    pub failed_clip_downloads: std::collections::HashMap<std::path::PathBuf, String>,
     /// Server preview downloads currently in flight. Keys are stable
     /// `kind:id` strings, so visible cells do not spawn duplicate
     /// thumbnail requests every frame.

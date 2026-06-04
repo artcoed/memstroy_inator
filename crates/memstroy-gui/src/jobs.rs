@@ -25,6 +25,7 @@
 //! gets a clear status string instead of a silent no-op.
 
 use std::collections::HashMap;
+use std::io::SeekFrom;
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::time::Duration;
@@ -32,6 +33,7 @@ use std::time::Duration;
 use memstroy_core::{Overlay, Scene};
 use memstroy_render::{ffmpeg_binary, render_scene};
 use serde::Deserialize;
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::runtime::Handle;
 use tracing::{info, warn};
 
@@ -339,6 +341,15 @@ pub fn spawn_refresh(
                 return;
             }
         };
+        let download_client = match binary_download_client(Duration::from_secs(30)) {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = tx.send(JobEvent::RefreshFinished(Err(format!(
+                    "Couldn't build download HTTP client: {e}"
+                ))));
+                return;
+            }
+        };
 
         // 1. POST /api/ingest/tg — fire-and-forget kick to the server.
         let ingest_url = format!("{}/api/ingest/tg", server);
@@ -505,7 +516,7 @@ pub fn spawn_refresh(
                     server, item.id
                 );
                 info!("Downloading thumbnail from: {}", thumb_url);
-                match download_thumbnail(&client, &thumb_url, &thumb_jpg).await {
+                match download_thumbnail(&download_client, &thumb_url, &thumb_jpg).await {
                     Ok(_) => {
                         info!("✓ Downloaded thumbnail for {}", safe_id);
                         // Verify file was created
@@ -818,11 +829,7 @@ async fn fetch_server_asset_preview(
     if server.is_empty() {
         return Err("assets-server URL is empty".into());
     }
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(3))
-        .timeout(Duration::from_secs(20))
-        .build()
-        .map_err(|e| format!("HTTP client init: {e}"))?;
+    let client = binary_download_client(Duration::from_secs(20))?;
     if let Some(parent) = target.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
     }
@@ -895,6 +902,7 @@ async fn download_response_to_file(
 ) -> Result<(), String> {
     let resp = client
         .get(url)
+        .header(reqwest::header::ACCEPT_ENCODING, "identity")
         .send()
         .await
         .map_err(|e| format!("network error: {e}"))?;
@@ -933,7 +941,10 @@ async fn download_response_to_file(
     }
 
     if require_image {
-        let bytes = resp.bytes().await.map_err(|e| format!("read error: {e}"))?;
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| format!("read error: {e} (content-type={ct})"))?;
         if let Some(cl) = content_len {
             if cl != bytes.len() as u64 {
                 return Err(format!(
@@ -966,7 +977,7 @@ async fn download_response_to_file(
         while let Some(chunk) = response
             .chunk()
             .await
-            .map_err(|e| format!("read error: {e}"))?
+            .map_err(|e| format!("read error: {e} (content-type={ct})"))?
         {
             total += chunk.len();
             tokio::io::AsyncWriteExt::write_all(&mut file, &chunk)
@@ -1005,9 +1016,18 @@ async fn download_response_to_file(
     }
 }
 
-/// HTTP GET → file. Buffers the whole body in memory because the
-/// per-clip files are small enough (TG preview pages cap clip duration
-/// to ~60 s).
+fn binary_download_client(timeout: Duration) -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .no_gzip()
+        .http1_only()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(timeout)
+        .build()
+        .map_err(|e| format!("HTTP client init: {e}"))
+}
+
+/// HTTP GET → file. Videos are streamed to a temp file; callers validate
+/// the result before the cache starts using it.
 pub async fn download_file(
     client: &reqwest::Client,
     url: &str,
@@ -1015,12 +1035,195 @@ pub async fn download_file(
 ) -> Result<(), String> {
     // Guard against HTML/error pages or truncated bodies saved as `.mp4`.
     // The GUI's `is_usable_local_video` uses the same 4KB threshold.
-    download_response_to_file(client, url, target, 4097, false).await?;
+    let first_err = match download_response_to_file(client, url, target, 4097, false).await {
+        Ok(()) => {
+            if crate::state::EditorState::is_usable_local_video(target) {
+                return Ok(());
+            }
+            let _ = tokio::fs::remove_file(target).await;
+            "download is not a valid video file".to_string()
+        }
+        Err(e) => e,
+    };
+
+    if !should_retry_download_via_proxy(&first_err) {
+        return Err(first_err);
+    }
+
+    let _ = tokio::fs::remove_file(target.with_extension("partial")).await;
+    let proxy_url = proxy_download_url(url);
+    download_proxy_in_ranges(client, &proxy_url, target, 4097)
+        .await
+        .map_err(|proxy_err| {
+            format!("{first_err}; ranged server-proxy retry failed: {proxy_err}")
+        })?;
     if !crate::state::EditorState::is_usable_local_video(target) {
         let _ = tokio::fs::remove_file(target).await;
-        return Err("download is not a valid video file".into());
+        return Err(format!(
+            "{first_err}; ranged server-proxy retry produced invalid video"
+        ));
     }
     Ok(())
+}
+
+fn should_retry_download_via_proxy(error: &str) -> bool {
+    error.contains("error decoding response body")
+        || error.contains("read error:")
+        || error.contains("incomplete download:")
+        || error.contains("not a valid video")
+}
+
+fn proxy_download_url(url: &str) -> String {
+    if url.contains('?') {
+        format!("{url}&proxy=1")
+    } else {
+        format!("{url}?proxy=1")
+    }
+}
+
+struct RangeChunk {
+    bytes: Vec<u8>,
+    total_len: u64,
+}
+
+async fn download_proxy_in_ranges(
+    client: &reqwest::Client,
+    url: &str,
+    target: &std::path::Path,
+    min_bytes: usize,
+) -> Result<(), String> {
+    const CHUNK_SIZE: u64 = 1024 * 1024;
+    const MAX_ATTEMPTS: usize = 4;
+
+    let tmp = target.with_extension("partial");
+    if let Some(parent) = tmp.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
+    let _ = tokio::fs::remove_file(&tmp).await;
+
+    let first = download_range_with_retries(client, url, 0, 0, MAX_ATTEMPTS).await?;
+    let total_len = first.total_len;
+    if total_len < min_bytes as u64 {
+        return Err(format!("download too small: {total_len} bytes"));
+    }
+
+    let mut file = tokio::fs::File::create(&tmp)
+        .await
+        .map_err(|e| format!("create temp file: {e}"))?;
+    file.set_len(total_len)
+        .await
+        .map_err(|e| format!("preallocate temp file: {e}"))?;
+    file.seek(SeekFrom::Start(0))
+        .await
+        .map_err(|e| format!("seek temp file: {e}"))?;
+    file.write_all(&first.bytes)
+        .await
+        .map_err(|e| format!("write range 0-0: {e}"))?;
+
+    let mut start = first.bytes.len() as u64;
+    while start < total_len {
+        let end = (start + CHUNK_SIZE - 1).min(total_len - 1);
+        let expected = end - start + 1;
+        let chunk = download_range_with_retries(client, url, start, end, MAX_ATTEMPTS).await?;
+        if chunk.total_len != total_len {
+            return Err(format!(
+                "range total changed: first={total_len} got={}",
+                chunk.total_len
+            ));
+        }
+        if chunk.bytes.len() as u64 != expected {
+            return Err(format!(
+                "range size mismatch {start}-{end}: expected={expected} got={}",
+                chunk.bytes.len()
+            ));
+        }
+        file.seek(SeekFrom::Start(start))
+            .await
+            .map_err(|e| format!("seek temp file: {e}"))?;
+        file.write_all(&chunk.bytes)
+            .await
+            .map_err(|e| format!("write range {start}-{end}: {e}"))?;
+        start = end + 1;
+    }
+
+    file.flush()
+        .await
+        .map_err(|e| format!("flush temp file: {e}"))?;
+    drop(file);
+
+    match tokio::fs::rename(&tmp, target).await {
+        Ok(()) => Ok(()),
+        Err(first_err) => {
+            let _ = tokio::fs::remove_file(target).await;
+            tokio::fs::rename(&tmp, target)
+                .await
+                .map_err(|e| format!("rename error: {e}; first attempt: {first_err}"))
+        }
+    }
+}
+
+async fn download_range_with_retries(
+    client: &reqwest::Client,
+    url: &str,
+    start: u64,
+    end: u64,
+    attempts: usize,
+) -> Result<RangeChunk, String> {
+    let mut last_err = None;
+    for attempt in 1..=attempts {
+        match download_range(client, url, start, end).await {
+            Ok(chunk) => return Ok(chunk),
+            Err(e) => {
+                last_err = Some(e);
+                if attempt < attempts {
+                    tokio::time::sleep(Duration::from_millis(180 * attempt as u64)).await;
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| format!("range {start}-{end} failed")))
+}
+
+async fn download_range(
+    client: &reqwest::Client,
+    url: &str,
+    start: u64,
+    end: u64,
+) -> Result<RangeChunk, String> {
+    let range = format!("bytes={start}-{end}");
+    let resp = client
+        .get(url)
+        .header(reqwest::header::ACCEPT_ENCODING, "identity")
+        .header(reqwest::header::RANGE, range.clone())
+        .send()
+        .await
+        .map_err(|e| format!("range {range} network error: {e}"))?;
+    if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        let snippet: String = body.chars().take(160).collect();
+        return Err(format!("range {range} HTTP {status}: {snippet}"));
+    }
+    let total_len = resp
+        .headers()
+        .get(reqwest::header::CONTENT_RANGE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_content_range_total)
+        .ok_or_else(|| format!("range {range} missing/invalid Content-Range"))?;
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("range {range} read error: {e}"))?;
+    Ok(RangeChunk {
+        bytes: bytes.to_vec(),
+        total_len,
+    })
+}
+
+fn parse_content_range_total(raw: &str) -> Option<u64> {
+    let raw = raw.trim();
+    let (_, total) = raw.rsplit_once('/')?;
+    total.trim().parse().ok()
 }
 
 /// Download a preview JPEG/PNG/WebP from the assets server. Thumbnails
@@ -1065,16 +1268,12 @@ pub fn spawn_clip_download(
         let server = crate::state::rewrite_server_url_for_client(&server_url)
             .trim_end_matches('/')
             .to_string();
-        let client = match reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(30))
-            .build()
-        {
+        let client = match binary_download_client(Duration::from_secs(180)) {
             Ok(c) => c,
             Err(e) => {
                 let _ = tx.send(JobEvent::ClipDownloaded {
                     server_id: server_id.clone(),
-                    result: Err(format!("HTTP client init: {e}")),
+                    result: Err(e),
                     drop_target,
                 });
                 return;
@@ -1114,17 +1313,13 @@ pub fn spawn_server_asset_download(
         let server = crate::state::rewrite_server_url_for_client(&server_url)
             .trim_end_matches('/')
             .to_string();
-        let client = match reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(60))
-            .build()
-        {
+        let client = match binary_download_client(Duration::from_secs(180)) {
             Ok(c) => c,
             Err(e) => {
                 let _ = tx.send(JobEvent::ServerAssetDownloaded {
                     server_id,
                     kind,
-                    result: Err(format!("HTTP client init: {e}")),
+                    result: Err(e),
                     drop_target,
                 });
                 return;

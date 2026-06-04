@@ -1159,6 +1159,8 @@ fn ru_lookup(key: &str) -> Option<&'static str> {
         "Loading..." => "Загрузка…",
         "Loading video..." => "Загрузка видео…",
         "Video preview failed" => "Не удалось загрузить превью видео",
+        "Video download failed" => "Не удалось скачать видео",
+        "Clip download incomplete" => "Загрузка клипа не завершена",
         "\u{274C} Preview frames failed:" => "\u{274C} Не удалось извлечь кадры превью:",
         "\u{274C} Waveform failed:" => "\u{274C} Не удалось извлечь звуковую волну:",
         "Video file is not ready yet — wait for download" => {

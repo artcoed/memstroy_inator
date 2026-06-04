@@ -62,10 +62,31 @@ pub struct RasterizedText {
 /// overlay entirely in that case.
 pub fn rasterize_text_overlay(
     txt: &TextOverlay,
+    output_w: u32,
+    output_h: u32,
+) -> Result<Option<RasterizedText>> {
+    rasterize_text_overlay_at_scale(txt, output_w, output_h, 1.0)
+}
+
+/// Rasterise `txt` at an additional uniform pixel-density multiplier.
+///
+/// The returned anchor and dimensions are expressed in the enlarged PNG's
+/// pixel space. Callers that need the original layout size should draw the
+/// PNG back with a reciprocal scale. This lets the CPU compositor render
+/// scaled-up text sharply instead of rasterising a small glyph atlas and
+/// magnifying it with bilinear sampling.
+pub fn rasterize_text_overlay_at_scale(
+    txt: &TextOverlay,
     _output_w: u32,
     _output_h: u32,
+    raster_scale: f32,
 ) -> Result<Option<RasterizedText>> {
     let style = &txt.style;
+    let raster_scale = if raster_scale.is_finite() {
+        raster_scale.max(1.0)
+    } else {
+        1.0
+    };
     let raw_lines: Vec<&str> = if txt.text.is_empty() {
         return Ok(None);
     } else {
@@ -98,7 +119,7 @@ pub fn rasterize_text_overlay(
     // that's a viewport zoom; the model's font_size is already in
     // output-pixel units (matches what `drawtext fontsize=` consumed
     // before this rewrite).
-    let font_size = style.font_size.max(1.0);
+    let font_size = style.font_size.max(1.0) * raster_scale;
     let scale = PxScale::from(font_size);
     let scaled = font.as_scaled(scale);
     let ascent = scaled.ascent();
@@ -120,17 +141,17 @@ pub fn rasterize_text_overlay(
     // PNG is rasterised at output resolution at scale = 1.0 (we let
     // the per-frame scale_expr resize the final PNG via the overlay
     // path, so animation continues to drive size).
-    let pad = style.box_padding.max(0.0);
-    let pad_l = style.box_extra_left.max(0.0);
-    let pad_r = style.box_extra_right.max(0.0);
-    let radius = style.box_corner_radius.max(0.0);
+    let pad = style.box_padding.max(0.0) * raster_scale;
+    let pad_l = style.box_extra_left.max(0.0) * raster_scale;
+    let pad_r = style.box_extra_right.max(0.0) * raster_scale;
+    let radius = style.box_corner_radius.max(0.0) * raster_scale;
     let plate_w = max_line_w + pad * 2.0 + pad_l + pad_r;
     let plate_h = total_h + pad * 2.0;
 
     // Stroke bleed — the glyph outline can extend beyond the plate by
     // up to `outline_width` px. Pad the canvas so we don't clip it.
     let stroke_w = if style.outline.is_some() {
-        style.outline_width.max(0.0)
+        style.outline_width.max(0.0) * raster_scale
     } else {
         0.0
     };
@@ -182,9 +203,9 @@ pub fn rasterize_text_overlay(
                 let border_rgb = style.box_outline_color.unwrap_or([0, 0, 0]);
                 let border_color = Rgba([border_rgb[0], border_rgb[1], border_rgb[2], box_alpha]);
                 let bw = if style.box_outline_width > 0.0 {
-                    style.box_outline_width
+                    style.box_outline_width * raster_scale
                 } else {
-                    2.0
+                    2.0 * raster_scale
                 };
                 draw_rounded_rect_outline(
                     &mut img,
@@ -261,7 +282,7 @@ pub fn rasterize_text_overlay(
                 plate_w,
                 plate_h,
                 radius,
-                style.box_outline_width,
+                style.box_outline_width * raster_scale,
                 border_color,
             );
         }
@@ -309,7 +330,7 @@ pub fn rasterize_text_overlay(
         // Synthesise weight by drawing each line a couple of sub-pixel
         // offsets to the right (matches the canvas preview's bold
         // synthesis when the bundled font has no real bold variant).
-        &[0.0, 0.7, 1.4]
+        &[0.0, 0.7 * raster_scale, 1.4 * raster_scale]
     } else {
         &[0.0]
     };

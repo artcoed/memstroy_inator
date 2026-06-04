@@ -55,6 +55,13 @@ pub struct UploadedBucketAsset {
     pub thumbnail_key: Option<String>,
 }
 
+pub struct BucketObjectStream {
+    pub body: ByteStream,
+    pub content_length: Option<i64>,
+    pub content_type: Option<String>,
+    pub e_tag: Option<String>,
+}
+
 impl BucketStore {
     /// Build a bucket store when enough env vars are present. Returns
     /// `Ok(None)` when bucket mode is not configured.
@@ -123,6 +130,40 @@ impl BucketStore {
             .await
             .with_context(|| format!("presign bucket object {key}"))?;
         Ok(request.uri().to_string())
+    }
+
+    pub async fn get_object_stream(&self, key: &str) -> Result<BucketObjectStream> {
+        self.get_object_stream_inner(key, None).await
+    }
+
+    pub async fn get_object_stream_range(
+        &self,
+        key: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<BucketObjectStream> {
+        self.get_object_stream_inner(key, Some((start, end))).await
+    }
+
+    async fn get_object_stream_inner(
+        &self,
+        key: &str,
+        range: Option<(u64, u64)>,
+    ) -> Result<BucketObjectStream> {
+        let mut req = self.client.get_object().bucket(&self.bucket).key(key);
+        if let Some((start, end)) = range {
+            req = req.range(format!("bytes={start}-{end}"));
+        }
+        let object = req
+            .send()
+            .await
+            .with_context(|| format!("get bucket object {key}"))?;
+        Ok(BucketObjectStream {
+            content_length: object.content_length(),
+            content_type: object.content_type().map(str::to_string),
+            e_tag: object.e_tag().map(str::to_string),
+            body: object.body,
+        })
     }
 
     pub async fn put_file(

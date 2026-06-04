@@ -928,6 +928,7 @@ impl App {
         match result {
             Ok(path) => {
                 self.state.pending_clip_downloads.remove(&path);
+                self.state.failed_clip_downloads.remove(&path);
                 self.schedule_library_reload();
 
                 // Fast path: the file is already readable, place the
@@ -963,6 +964,21 @@ impl App {
             }
             Err(e) => {
                 let safe = crate::jobs::sanitise_id(&server_id);
+                let failed_paths: Vec<_> = self
+                    .state
+                    .pending_clip_downloads
+                    .iter()
+                    .filter(|p| {
+                        p.file_stem()
+                            .and_then(|s| s.to_str())
+                            .map(|stem| stem == safe)
+                            .unwrap_or(false)
+                    })
+                    .cloned()
+                    .collect();
+                for path in failed_paths {
+                    self.state.failed_clip_downloads.insert(path, e.clone());
+                }
                 self.state.pending_clip_downloads.retain(|p| {
                     p.file_stem()
                         .and_then(|s| s.to_str())
@@ -1034,6 +1050,7 @@ impl App {
         match result {
             Ok(path) => {
                 self.state.pending_clip_downloads.remove(&path);
+                self.state.failed_clip_downloads.remove(&path);
                 self.state
                     .mark_server_asset_downloaded(kind, &server_id, path.clone());
                 self.place_server_asset_drop_target(&path, kind, drop_target);
@@ -1045,10 +1062,26 @@ impl App {
                 );
             }
             Err(e) => {
+                let safe = crate::jobs::sanitise_id(&server_id);
+                let failed_paths: Vec<_> = self
+                    .state
+                    .pending_clip_downloads
+                    .iter()
+                    .filter(|p| {
+                        p.file_stem()
+                            .and_then(|s| s.to_str())
+                            .map(|stem| stem == safe)
+                            .unwrap_or(false)
+                    })
+                    .cloned()
+                    .collect();
+                for path in failed_paths {
+                    self.state.failed_clip_downloads.insert(path, e.clone());
+                }
                 self.state.pending_clip_downloads.retain(|p| {
                     p.file_stem()
                         .and_then(|s| s.to_str())
-                        .map(|stem| stem != crate::jobs::sanitise_id(&server_id))
+                        .map(|stem| stem != safe)
                         .unwrap_or(true)
                 });
                 self.state.status = format!(
@@ -1182,6 +1215,10 @@ impl App {
                     server_id,
                     detail,
                     path.display()
+                );
+                self.state.failed_clip_downloads.insert(
+                    path,
+                    format!("{} ({detail})", crate::i18n::t("Clip download incomplete")),
                 );
             } else {
                 keep.push((path, drop_target, server_id, deadline));

@@ -241,6 +241,17 @@ pwsh scripts/make-installer.ps1 -ServerUrl https://assets.your-domain.example
 В конце работы оба скрипта печатают абсолютный путь до получившегося
 установщика. Этот файл и есть то, что раздавать пользователям.
 
+Для Linux-сборки "скачал и работает почти везде" сначала положите
+статические `ffmpeg`/`ffprobe` в `tools/ffmpeg/bin`:
+
+```bash
+scripts/fetch-static-ffmpeg-linux.sh
+scripts/make-installer.sh --server-url https://assets.your-domain.example
+```
+
+Без этого скрипт может забандлить маленький системный `/usr/bin/ffmpeg`,
+который зависит от библиотек конкретного дистрибутива.
+
 Если бандл уже готов и нужно только обернуть его без пересборки:
 
 ```bash

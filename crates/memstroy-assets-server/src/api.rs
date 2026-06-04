@@ -410,15 +410,33 @@ async fn get_preview(
 // /api/assets/:id/download
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Default, Deserialize)]
+struct DownloadQuery {
+    /// `?proxy=1` forces the server to stream bucket bytes through this
+    /// endpoint instead of redirecting the client to a presigned bucket URL.
+    /// Keep redirects as the default fast path; use proxy only as a
+    /// compatibility fallback for client networks that corrupt CDN bodies.
+    proxy: Option<String>,
+}
+
 async fn get_download(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(query): Query<DownloadQuery>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let Some(entry) = state.store.get(&id) else {
         return Ok(fallback_download_response(&id, AssetKind::Clip));
     };
     if let (Some(bucket), Some(key)) = (state.bucket.as_ref(), entry.object_key.as_deref()) {
+        if query_bool(query.proxy.as_deref()) || env_truthy("MEMSTROY_BUCKET_PROXY_DOWNLOADS") {
+            return stream_bucket_object_response(bucket, key, &entry.id, entry.size_bytes, &headers)
+                .await
+                .or_else(|e| {
+                    warn!(id = %entry.id, key, error = ?e, "bucket download proxy failed; serving placeholder");
+                    Ok(fallback_download_response(&entry.id, entry.kind))
+                });
+        }
         return redirect_to_presigned(bucket, key, "download")
             .await
             .or_else(|e| {
@@ -470,6 +488,92 @@ async fn redirect_to_presigned(
         )
         .body(Body::empty())
         .expect("valid response"))
+}
+
+async fn stream_bucket_object_response(
+    bucket: &BucketStore,
+    key: &str,
+    id: &str,
+    file_size: u64,
+    headers: &HeaderMap,
+) -> Result<Response, ApiError> {
+    let range = headers
+        .get(header::RANGE)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|raw| parse_byte_range(raw, file_size));
+
+    let (status, object, content_length, content_range) = if let Some((start, end)) = range {
+        let read_len = end.saturating_sub(start).saturating_add(1);
+        let object = bucket
+            .get_object_stream_range(key, start, end)
+            .await
+            .map_err(|e| ApiError::BadRequest(format!("read bucket object range: {e}").into()))?;
+        (
+            StatusCode::PARTIAL_CONTENT,
+            object,
+            Some(read_len),
+            Some(format!("bytes {start}-{end}/{file_size}")),
+        )
+    } else {
+        if headers.get(header::RANGE).is_some() {
+            return Ok(range_not_satisfiable(file_size));
+        }
+        let object = bucket
+            .get_object_stream(key)
+            .await
+            .map_err(|e| ApiError::BadRequest(format!("read bucket object: {e}").into()))?;
+        let len = object
+            .content_length
+            .and_then(|len| u64::try_from(len).ok())
+            .or(Some(file_size));
+        (StatusCode::OK, object, len, None)
+    };
+    let content_type = object.content_type.unwrap_or_else(|| {
+        mime_guess::from_path(key)
+            .first_or_octet_stream()
+            .essence_str()
+            .to_string()
+    });
+    let filename = FsPath::new(key)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(sanitize_filename)
+        .unwrap_or_else(|| id.to_string());
+    let disposition = format!("attachment; filename=\"{}\"", filename);
+
+    let reader = object.body.into_async_read();
+    let stream = tokio_util::io::ReaderStream::new(reader);
+    let mut builder = Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_DISPOSITION, disposition)
+        .header(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=86400"),
+        )
+        .header("x-memstroy-storage", HeaderValue::from_static("bucket-proxy"))
+        .header(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    if let Some(len) = content_length {
+        builder = builder.header(header::CONTENT_LENGTH, len.to_string());
+    }
+    if let Some(content_range) = content_range {
+        builder = builder.header(header::CONTENT_RANGE, content_range);
+    }
+    if let Some(etag) = object.e_tag {
+        if let Ok(value) = HeaderValue::from_str(&etag) {
+            builder = builder.header(header::ETAG, value);
+        }
+    }
+    Ok(builder
+        .body(Body::from_stream(stream))
+        .expect("valid response"))
+}
+
+fn query_bool(value: Option<&str>) -> bool {
+    matches!(
+        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
 }
 
 fn sanitize_filename(name: &str) -> String {
