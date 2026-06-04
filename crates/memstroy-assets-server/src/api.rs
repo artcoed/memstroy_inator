@@ -340,6 +340,7 @@ async fn get_asset(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<crate::model::AssetEntry>, ApiError> {
+    validate_asset_id(&id)?;
     state.store.get(&id).map(Json).ok_or(ApiError::NotFound)
 }
 
@@ -352,6 +353,7 @@ async fn get_preview(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
+    validate_asset_id(&id)?;
     let Some(entry) = state.store.get(&id) else {
         return Ok(fallback_preview_response());
     };
@@ -425,6 +427,7 @@ async fn get_download(
     Query(query): Query<DownloadQuery>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
+    validate_asset_id(&id)?;
     let Some(entry) = state.store.get(&id) else {
         return Ok(fallback_download_response(&id, AssetKind::Clip));
     };
@@ -551,7 +554,10 @@ async fn stream_bucket_object_response(
             header::CACHE_CONTROL,
             HeaderValue::from_static("public, max-age=86400"),
         )
-        .header("x-memstroy-storage", HeaderValue::from_static("bucket-proxy"))
+        .header(
+            "x-memstroy-storage",
+            HeaderValue::from_static("bucket-proxy"),
+        )
         .header(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
     if let Some(len) = content_length {
         builder = builder.header(header::CONTENT_LENGTH, len.to_string());
@@ -739,6 +745,7 @@ async fn get_text(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
+    validate_asset_id(&id)?;
     let Some(entry) = state.store.get(&id) else {
         return Ok(fallback_text_response());
     };
@@ -1219,6 +1226,14 @@ fn monotonic_stamp() -> u128 {
         .unwrap_or(0);
     let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed) as u128;
     (nanos << 16) ^ seq
+}
+
+fn validate_asset_id(id: &str) -> Result<(), ApiError> {
+    if id.trim().is_empty() {
+        Err(ApiError::BadRequest("asset id is required".into()))
+    } else {
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------

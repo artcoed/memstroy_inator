@@ -286,6 +286,26 @@ async fn download_supports_byte_ranges() {
 }
 
 #[tokio::test]
+async fn download_rejects_empty_asset_id_instead_of_placeholder() {
+    let (_tmp, store) = fixture_store();
+    let app = router(store);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/assets//download")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let v = body_json(resp).await;
+    assert_eq!(v["error"], Value::from("bad_request"));
+    assert_eq!(v["message"], Value::from("asset id is required"));
+}
+
+#[tokio::test]
 async fn admin_upload_persists_and_reindexes_asset() {
     std::env::remove_var("ADMIN_TOKEN");
     let tmp = TempDir::new().unwrap();

@@ -517,7 +517,8 @@ pub fn spawn_refresh(
             if find_local_thumbnail(&clips_dir, &safe_id).is_none() {
                 let thumb_url = format!(
                     "{}/api/assets/{}/preview",
-                    server, item.id
+                    server,
+                    url_path_segment_encode(&item.id)
                 );
                 info!("Downloading thumbnail from: {}", thumb_url);
                 match download_thumbnail(&download_client, &thumb_url, &thumb_jpg).await {
@@ -837,7 +838,11 @@ async fn fetch_server_asset_preview(
     if let Some(parent) = target.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
     }
-    let url = format!("{}/api/assets/{}/preview", server, server_id);
+    let url = format!(
+        "{}/api/assets/{}/preview",
+        server,
+        url_path_segment_encode(server_id)
+    );
     download_thumbnail(&client, &url, target).await
 }
 
@@ -849,6 +854,19 @@ fn url_query_encode(raw: &str) -> String {
                 out.push(char::from(b))
             }
             b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+pub(crate) fn url_path_segment_encode(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for b in raw.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(char::from(b))
+            }
             _ => out.push_str(&format!("%{b:02X}")),
         }
     }
@@ -921,6 +939,12 @@ async fn download_response_to_file(
         let body = resp.text().await.unwrap_or_default();
         let snippet: String = body.chars().take(200).collect();
         return Err(format!("HTTP {status} (content-type={ct}): {snippet}"));
+    }
+    if is_download_endpoint(url) && resp.headers().contains_key("x-memstroy-placeholder") {
+        return Err(
+            "server returned a placeholder instead of the requested asset; check asset id/catalog"
+                .to_string(),
+        );
     }
     let ct = resp
         .headers()
@@ -1071,10 +1095,21 @@ pub async fn download_file(
 }
 
 fn should_retry_download_via_proxy(error: &str) -> bool {
-    error.contains("error decoding response body")
+    error.contains("network error:")
+        || error.contains("error sending request")
+        || error.contains("operation timed out")
+        || error.contains("connection closed")
+        || error.contains("connection reset")
+        || error.contains("error decoding response body")
         || error.contains("read error:")
         || error.contains("incomplete download:")
         || error.contains("not a valid video")
+        || error.contains("HTTP 403")
+        || error.contains("HTTP 429")
+        || error.contains("HTTP 500")
+        || error.contains("HTTP 502")
+        || error.contains("HTTP 503")
+        || error.contains("HTTP 504")
 }
 
 fn proxy_download_url(url: &str) -> String {
@@ -1083,6 +1118,13 @@ fn proxy_download_url(url: &str) -> String {
     } else {
         format!("{url}?proxy=1")
     }
+}
+
+fn is_download_endpoint(url: &str) -> bool {
+    url.split('?')
+        .next()
+        .map(|path| path.ends_with("/download"))
+        .unwrap_or(false)
 }
 
 struct RangeChunk {
@@ -1283,7 +1325,11 @@ pub fn spawn_clip_download(
                 return;
             }
         };
-        let url = format!("{}/api/assets/{}/download", server, server_id);
+        let url = format!(
+            "{}/api/assets/{}/download",
+            server,
+            url_path_segment_encode(&server_id)
+        );
         if let Some(parent) = local_path.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
         }
@@ -1329,7 +1375,11 @@ pub fn spawn_server_asset_download(
                 return;
             }
         };
-        let url = format!("{}/api/assets/{}/download", server, server_id);
+        let url = format!(
+            "{}/api/assets/{}/download",
+            server,
+            url_path_segment_encode(&server_id)
+        );
         if let Some(parent) = local_path.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
         }
@@ -2022,6 +2072,52 @@ fn sanitise_filename_stem(title: &str) -> String {
         "image".to_string()
     } else {
         trimmed
+    }
+}
+
+#[cfg(test)]
+mod download_tests {
+    use super::*;
+
+    #[test]
+    fn path_segment_encoding_preserves_safe_ids_and_escapes_unsafe_bytes() {
+        assert_eq!(url_path_segment_encode("tg_100"), "tg_100");
+        assert_eq!(
+            url_path_segment_encode("clip name/ру"),
+            "clip%20name%2F%D1%80%D1%83"
+        );
+    }
+
+    #[test]
+    fn proxy_retry_covers_blocked_redirect_hosts() {
+        assert!(should_retry_download_via_proxy(
+            "network error: error sending request for url (https://bucket.example/clip.mp4)"
+        ));
+        assert!(should_retry_download_via_proxy(
+            "read error: operation timed out"
+        ));
+        assert!(should_retry_download_via_proxy(
+            "HTTP 403 (content-type=text/xml)"
+        ));
+    }
+
+    #[test]
+    fn proxy_retry_does_not_mask_missing_asset_placeholders() {
+        assert!(!should_retry_download_via_proxy(
+            "server returned a placeholder instead of the requested asset; check asset id/catalog"
+        ));
+    }
+
+    #[test]
+    fn proxy_url_preserves_existing_query_strings() {
+        assert_eq!(
+            proxy_download_url("https://api.example/api/assets/tg_100/download"),
+            "https://api.example/api/assets/tg_100/download?proxy=1"
+        );
+        assert_eq!(
+            proxy_download_url("https://api.example/api/assets/tg_100/download?foo=bar"),
+            "https://api.example/api/assets/tg_100/download?foo=bar&proxy=1"
+        );
     }
 }
 

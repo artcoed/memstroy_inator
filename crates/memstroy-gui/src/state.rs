@@ -4011,7 +4011,11 @@ impl EditorState {
 
                 // Retry thumbnail download when the clip is known but preview is missing.
                 if !has_local_thumb {
-                    let thumb_url = format!("{}/api/assets/{}/preview", server, item.id);
+                    let thumb_url = format!(
+                        "{}/api/assets/{}/preview",
+                        server,
+                        crate::jobs::url_path_segment_encode(&item.id)
+                    );
                     match crate::jobs::download_thumbnail(&client, &thumb_url, &thumb_jpg).await {
                         Ok(_) => {
                             tracing::debug!("✓ Downloaded thumbnail for {}", safe_id);

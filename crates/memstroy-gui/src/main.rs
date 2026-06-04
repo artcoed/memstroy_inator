@@ -81,31 +81,77 @@ fn graphics_mode() -> String {
         .unwrap_or_default()
 }
 
+fn memstroy_user_dir() -> std::path::PathBuf {
+    if let Ok(home) = std::env::var("USERPROFILE") {
+        return std::path::PathBuf::from(home).join(".memstroy");
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        return std::path::PathBuf::from(home).join(".memstroy");
+    }
+    std::env::temp_dir().join("memstroy")
+}
+
+fn default_log_filter() -> EnvFilter {
+    EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new(
+            // Default: app at debug, everything else at info, but
+            // silence the symphonia container/codec parsers since they
+            // spam "skipping junk" / "invalid mpeg audio header" warnings
+            // for clips that simply have no decodable audio stream.
+            "info,memstroy_gui=debug,\
+                 symphonia=error,\
+                 symphonia_core=error,\
+                 symphonia_format_mp3=error,\
+                 symphonia_format_wav=error,\
+                 symphonia_format_isomp4=error,\
+                 symphonia_codec_pcm=error,\
+                 symphonia_bundle_mp3=error,\
+                 symphonia_bundle_flac=error,\
+                 lewton=error",
+        )
+    })
+}
+
+fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
+    let log_dir = std::env::var_os("MEMSTROY_LOG_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| memstroy_user_dir().join("logs"));
+
+    match std::fs::create_dir_all(&log_dir) {
+        Ok(()) => {
+            let file_appender = tracing_appender::rolling::daily(&log_dir, "memstroy-gui.log");
+            let (writer, guard) = tracing_appender::non_blocking(file_appender);
+            let init = tracing_subscriber::fmt()
+                .with_env_filter(default_log_filter())
+                .with_target(false)
+                .with_ansi(false)
+                .with_writer(writer)
+                .try_init();
+            if init.is_ok() {
+                tracing::info!(log_dir = %log_dir.display(), "file logging initialized");
+                return Some(guard);
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "failed to create Memstroy-inator log dir {}: {e}",
+                log_dir.display()
+            );
+        }
+    }
+
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(default_log_filter())
+        .with_target(false)
+        .try_init();
+    None
+}
+
 fn main() -> Result<()> {
     #[cfg(windows)]
     let _installer_app_mutex = create_installer_app_mutex();
 
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            EnvFilter::new(
-                // Default: app at debug, everything else at info, but
-                // silence the symphonia container/codec parsers since they
-                // spam "skipping junk" / "invalid mpeg audio header" warnings
-                // for clips that simply have no decodable audio stream.
-                "info,memstroy_gui=debug,\
-                     symphonia=error,\
-                     symphonia_core=error,\
-                     symphonia_format_mp3=error,\
-                     symphonia_format_wav=error,\
-                     symphonia_format_isomp4=error,\
-                     symphonia_codec_pcm=error,\
-                     symphonia_bundle_mp3=error,\
-                     symphonia_bundle_flac=error,\
-                     lewton=error",
-            )
-        }))
-        .with_target(false)
-        .try_init();
+    let _log_guard = init_logging();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

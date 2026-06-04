@@ -41,6 +41,7 @@ url = "2"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
 futures = "0.3"
 indicatif = "0.17"
 async-trait = "0.1"
