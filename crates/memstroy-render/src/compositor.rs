@@ -89,6 +89,7 @@ use memstroy_core::{
 };
 use tracing::{info, warn};
 
+use crate::plan::RenderQuality;
 use crate::proc;
 
 // ─── PROGRESS REPORTING ─────────────────────────────────────────────
@@ -134,6 +135,25 @@ pub fn render_scene_cpu<F>(
     scene: &Scene,
     assets_root: &Path,
     output_path: &Path,
+    progress_cb: F,
+) -> Result<()>
+where
+    F: FnMut(Progress) + Send,
+{
+    render_scene_cpu_with_quality(
+        scene,
+        assets_root,
+        output_path,
+        RenderQuality::default(),
+        progress_cb,
+    )
+}
+
+pub fn render_scene_cpu_with_quality<F>(
+    scene: &Scene,
+    assets_root: &Path,
+    output_path: &Path,
+    quality: RenderQuality,
     mut progress_cb: F,
 ) -> Result<()>
 where
@@ -151,8 +171,12 @@ where
     );
     progress_cb(Progress::Stage {
         message: format!(
-            "Rendering {}×{} @ {}fps, {} frames",
-            out_w, out_h, fps, total_frames
+            "Rendering {}×{} @ {}fps, {} frames ({})",
+            out_w,
+            out_h,
+            fps,
+            total_frames,
+            quality.label()
         ),
         percent: 0.0,
     });
@@ -173,7 +197,7 @@ where
         percent: 5.0,
     });
 
-    let mut encoder = spawn_encoder(out_w, out_h, fps, output_path)?;
+    let mut encoder = spawn_encoder(out_w, out_h, fps, output_path, quality)?;
 
     // Drain the encoder's stderr in a background thread so it never
     // fills its pipe buffer (which would deadlock the encoder when
@@ -2470,9 +2494,16 @@ fn preview_reference_dimensions(source_w: u32, source_h: u32) -> (u32, u32) {
 
 // ─── ENCODER (raw RGBA → MP4 via ffmpeg stdin) ──────────────────────
 
-fn spawn_encoder(w: u32, h: u32, fps: u32, output_path: &Path) -> Result<std::process::Child> {
+fn spawn_encoder(
+    w: u32,
+    h: u32,
+    fps: u32,
+    output_path: &Path,
+    quality: RenderQuality,
+) -> Result<std::process::Child> {
     let bin = crate::ffmpeg_binary();
     let mut cmd = Command::new(&bin);
+    let encoder = quality.encoder_settings();
     // Determine thread count for x264. Use all available cores.
     let threads = std::thread::available_parallelism()
         .map(|n| n.get().to_string())
@@ -2500,9 +2531,9 @@ fn spawn_encoder(w: u32, h: u32, fps: u32, output_path: &Path) -> Result<std::pr
         // chroma-key edges show compression artifacts quickly, so keep CRF
         // low and let x264 spend more time on mode decisions.
         "-preset",
-        "slow",
+        encoder.preset,
         "-crf",
-        "12",
+        encoder.crf,
         "-pix_fmt",
         "yuv420p",
         // Use all CPU cores for x264's internal threading.

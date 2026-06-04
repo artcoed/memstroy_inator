@@ -1841,7 +1841,11 @@ fn draw_single_actor(
             let any_fx_active = actor_fx.iter().any(|e| e.enabled && e.intensity > 0.001);
             let has_effects = actor_ck.is_active() || !actor_cc.is_identity() || any_fx_active;
 
-            let texture = if has_effects {
+            let force_raw_for_eyedropper = state.eyedropper_active
+                && matches!(state.selection, Selection::Actor(sel) if sel == idx);
+            let texture = if force_raw_for_eyedropper {
+                fc.frame_at_time(local_t, ui.ctx())
+            } else if has_effects {
                 fc.ensure_processed_preload(local_t, actor_ck, actor_cc, actor_fx);
                 fc.processed_frame_at_time(local_t, actor_ck, actor_cc, actor_fx, ui.ctx())
             } else {
@@ -3821,8 +3825,16 @@ fn commit_canvas_drag_preview(state: &mut EditorState) {
     // `drag_start_playhead` before the write made animated drags land
     // at the live playhead (often mid-playback) instead of drag start.
     let frozen_t = state.canvas_drag.drag_start_playhead;
+    let resize_token = if matches!(
+        state.canvas_drag.mode,
+        crate::state::CanvasDragMode::ResizeSelection { .. }
+    ) {
+        Some(canvas_drag_token(CANVAS_TOKEN_RESIZE, sel))
+    } else {
+        None
+    };
     if let Some(center) = state.canvas_drag.preview_world_center.take() {
-        let token = canvas_drag_token(CANVAS_TOKEN_POS, sel);
+        let token = resize_token.unwrap_or_else(|| canvas_drag_token(CANVAS_TOKEN_POS, sel));
         state.canvas_drag.drag_start_playhead = frozen_t;
         write_selection_world_center(state, sel, center, token, false);
     }
@@ -3832,12 +3844,12 @@ fn commit_canvas_drag_preview(state: &mut EditorState) {
         write_selection_rotation(state, sel, rot, token, false);
     }
     if let Some(scale) = state.canvas_drag.preview_scale.take() {
-        let token = canvas_drag_token(CANVAS_TOKEN_SCALE, sel);
+        let token = resize_token.unwrap_or_else(|| canvas_drag_token(CANVAS_TOKEN_SCALE, sel));
         state.canvas_drag.drag_start_playhead = frozen_t;
         write_selection_scale(state, sel, scale, token, false);
     }
     if let Some(scale_y) = state.canvas_drag.preview_scale_y.take() {
-        let token = canvas_drag_token(CANVAS_TOKEN_SCALE_Y, sel);
+        let token = resize_token.unwrap_or_else(|| canvas_drag_token(CANVAS_TOKEN_SCALE_Y, sel));
         state.canvas_drag.drag_start_playhead = frozen_t;
         write_selection_scale_y(state, sel, scale_y, token, false);
     }
@@ -4042,8 +4054,17 @@ fn draw_selection_gizmo(
     if response.dragged() {
         if let Some(cur) = response.interact_pointer_pos() {
             let local = [cur.x - full_rect.min.x, cur.y - full_rect.min.y];
-            let shift_held = ui.input(|i| i.modifiers.shift);
-            apply_drag(state, full_rect, viewport_size, cur, local, shift_held);
+            let (shift_held, center_resize_held) =
+                ui.input(|i| (i.modifiers.shift, i.modifiers.ctrl || i.modifiers.command));
+            apply_drag(
+                state,
+                full_rect,
+                viewport_size,
+                cur,
+                local,
+                shift_held,
+                center_resize_held,
+            );
         }
     }
 
@@ -4332,6 +4353,7 @@ fn apply_drag(
     cur: Pos2,
     cur_local: [f32; 2],
     shift_held: bool,
+    center_resize_held: bool,
 ) {
     use crate::state::CanvasDragMode;
 
@@ -4366,10 +4388,14 @@ fn apply_drag(
             if actor_idx < state.scene.actors.len() {
                 let proposed_x = initial_pos[0] + world_dx;
                 let proposed_y = initial_pos[1] + world_dy;
-                let (snapped_x, snapped_y, guides) = snap_world_center(
+                let (snap_half_w, snap_half_h) =
+                    selection_snap_half_extents_world(state, state.selection).unwrap_or((0.0, 0.0));
+                let (snapped_x, snapped_y, guides) = snap_world_rect_center(
                     state,
                     proposed_x,
                     proposed_y,
+                    snap_half_w,
+                    snap_half_h,
                     Some(SnapExclude::Actor(actor_idx)),
                 );
                 state.canvas_drag.snap_guides = guides;
@@ -4397,10 +4423,14 @@ fn apply_drag(
                 // map back through the parent chain when needed.
                 let proposed_x = initial_pos[0] + world_dx;
                 let proposed_y = initial_pos[1] + world_dy;
-                let (snapped_x, snapped_y, guides) = snap_world_center(
+                let (snap_half_w, snap_half_h) =
+                    selection_snap_half_extents_world(state, state.selection).unwrap_or((0.0, 0.0));
+                let (snapped_x, snapped_y, guides) = snap_world_rect_center(
                     state,
                     proposed_x,
                     proposed_y,
+                    snap_half_w,
+                    snap_half_h,
                     Some(SnapExclude::Actor(actor_idx)),
                 );
                 state.canvas_drag.snap_guides = guides;
@@ -4418,10 +4448,14 @@ fn apply_drag(
             if overlay_idx < state.scene.overlays.len() {
                 let proposed_x = initial_pos[0] + world_dx;
                 let proposed_y = initial_pos[1] + world_dy;
-                let (snapped_x, snapped_y, guides) = snap_world_center(
+                let (snap_half_w, snap_half_h) =
+                    selection_snap_half_extents_world(state, state.selection).unwrap_or((0.0, 0.0));
+                let (snapped_x, snapped_y, guides) = snap_world_rect_center(
                     state,
                     proposed_x,
                     proposed_y,
+                    snap_half_w,
+                    snap_half_h,
                     Some(SnapExclude::Overlay(overlay_idx)),
                 );
                 state.canvas_drag.snap_guides = guides;
@@ -4503,12 +4537,26 @@ fn apply_drag(
             let init_h = base_h * initial_scale * initial_scale_y;
 
             let new_w = if changes_x {
-                ((snapped_cur_x - anchor_world[0]).abs()).max(base_w * 0.05)
+                let anchor_x = if center_resize_held {
+                    initial_pos_world[0]
+                } else {
+                    anchor_world[0]
+                };
+                let dist = (snapped_cur_x - anchor_x).abs();
+                let width = if center_resize_held { dist * 2.0 } else { dist };
+                width.max(base_w * 0.05)
             } else {
                 init_w
             };
             let new_h = if changes_y {
-                ((snapped_cur_y - anchor_world[1]).abs()).max(base_h * 0.05)
+                let anchor_y = if center_resize_held {
+                    initial_pos_world[1]
+                } else {
+                    anchor_world[1]
+                };
+                let dist = (snapped_cur_y - anchor_y).abs();
+                let height = if center_resize_held { dist * 2.0 } else { dist };
+                height.max(base_h * 0.05)
             } else {
                 init_h
             };
@@ -4528,22 +4576,30 @@ fn apply_drag(
             //   - For axes that change: midpoint between pointer and anchor.
             //   - For axes that don't change: keep initial center.
             let cx = if changes_x {
-                let signed = if snapped_cur_x >= anchor_world[0] {
-                    1.0
+                if center_resize_held {
+                    initial_pos_world[0]
                 } else {
-                    -1.0
-                };
-                anchor_world[0] + signed * final_w * 0.5
+                    let signed = if snapped_cur_x >= anchor_world[0] {
+                        1.0
+                    } else {
+                        -1.0
+                    };
+                    anchor_world[0] + signed * final_w * 0.5
+                }
             } else {
                 initial_pos_world[0]
             };
             let cy = if changes_y {
-                let signed = if snapped_cur_y >= anchor_world[1] {
-                    1.0
+                if center_resize_held {
+                    initial_pos_world[1]
                 } else {
-                    -1.0
-                };
-                anchor_world[1] + signed * final_h * 0.5
+                    let signed = if snapped_cur_y >= anchor_world[1] {
+                        1.0
+                    } else {
+                        -1.0
+                    };
+                    anchor_world[1] + signed * final_h * 0.5
+                }
             } else {
                 initial_pos_world[1]
             };
@@ -4553,9 +4609,15 @@ fn apply_drag(
             let new_scale_y_total = (final_h / base_h.max(1e-3)).clamp(0.05, 100.0);
             let new_scale_y = (new_scale_y_total / new_scale.max(1e-3)).clamp(0.05, 100.0);
 
-            set_selection_scale(state, new_scale);
-            set_selection_scale_y(state, new_scale_y);
-            set_selection_world_center(state, [cx, cy]);
+            let resize_token = canvas_drag_token(CANVAS_TOKEN_RESIZE, state.selection);
+            write_selection_resize_transform(
+                state,
+                state.selection,
+                new_scale,
+                new_scale_y,
+                [cx, cy],
+                resize_token,
+            );
 
             // Broadcast the same scale ratio to every other lassoed
             // element. We use ratios (not absolute values) so each
@@ -4574,7 +4636,7 @@ fn apply_drag(
             // modes' job.
             let scale_factor = new_scale / initial_scale.max(1e-3);
             let scale_y_factor = new_scale_y / initial_scale_y.max(1e-3);
-            broadcast_multi_scale(state, scale_factor, scale_y_factor);
+            broadcast_multi_scale(state, scale_factor, scale_y_factor, resize_token);
         }
 
         CanvasDragMode::MoveRenderFrame { initial_pos } => {
@@ -4918,6 +4980,7 @@ fn current_selection_world_center(state: &EditorState) -> Option<[f32; 2]> {
 const CANVAS_TOKEN_POS: &str = "canvas_pos";
 const CANVAS_TOKEN_SCALE: &str = "canvas_scale";
 const CANVAS_TOKEN_SCALE_Y: &str = "canvas_scale_y";
+const CANVAS_TOKEN_RESIZE: &str = "canvas_resize";
 const CANVAS_TOKEN_ROTATION: &str = "canvas_rotation";
 
 /// Compute a per-element token salt for canvas drag undo. Passing 0 for
@@ -5038,13 +5101,16 @@ fn broadcast_multi_translation(state: &mut EditorState, total_dx: f32, total_dy:
 /// Apply the same scale ratio to every snapshot entry that is NOT the
 /// primary selection. `scale_factor` is the multiplier between the
 /// primary's drag-start scale and its current value.
-fn broadcast_multi_scale(state: &mut EditorState, scale_factor: f32, scale_y_factor: f32) {
+fn broadcast_multi_scale(
+    state: &mut EditorState,
+    scale_factor: f32,
+    scale_y_factor: f32,
+    token: u64,
+) {
     if state.canvas_drag.multi_drag_snapshot.is_empty() {
         return;
     }
     let primary = state.selection;
-    let token_x = canvas_drag_token(CANVAS_TOKEN_SCALE, state.selection);
-    let token_y = canvas_drag_token(CANVAS_TOKEN_SCALE_Y, state.selection);
     let snapshot = state.canvas_drag.multi_drag_snapshot.clone();
     for entry in snapshot {
         if entry.selection == primary {
@@ -5052,8 +5118,8 @@ fn broadcast_multi_scale(state: &mut EditorState, scale_factor: f32, scale_y_fac
         }
         let new_scale = (entry.initial_scale * scale_factor).clamp(0.05, 100.0);
         let new_scale_y = (entry.initial_scale_y * scale_y_factor).clamp(0.05, 100.0);
-        write_selection_scale(state, entry.selection, new_scale, token_x, true);
-        write_selection_scale_y(state, entry.selection, new_scale_y, token_y, true);
+        write_selection_scale(state, entry.selection, new_scale, token, true);
+        write_selection_scale_y(state, entry.selection, new_scale_y, token, true);
     }
 }
 
@@ -5356,6 +5422,20 @@ fn write_selection_world_center(
         }
         _ => {}
     }
+}
+
+fn write_selection_resize_transform(
+    state: &mut EditorState,
+    sel: Selection,
+    new_scale: f32,
+    new_scale_y: f32,
+    center: [f32; 2],
+    token: u64,
+) {
+    let defer = state.canvas_drag.drag_start_playhead.is_some();
+    write_selection_scale(state, sel, new_scale, token, defer);
+    write_selection_scale_y(state, sel, new_scale_y, token, defer);
+    write_selection_world_center(state, sel, center, token, defer);
 }
 
 pub fn set_element_parent_preserve_world(
@@ -7541,13 +7621,7 @@ fn is_point_on_selection(state: &EditorState, pos: WorldPos) -> bool {
             } else {
                 ov_world
             };
-            world_point_in_oriented_rect(
-                pos,
-                hit_center,
-                ew * 0.5,
-                eh * 0.5,
-                ov_state.rotation_deg,
-            )
+            world_point_in_oriented_rect(pos, hit_center, ew * 0.5, eh * 0.5, ov_state.rotation_deg)
         }
         _ => false,
     }
@@ -8673,9 +8747,8 @@ enum SnapExclude {
 }
 
 /// Snap a proposed world-space CENTER position to the nearest snap target on
-/// each axis. Targets include:
-///   - the render frame's left/center/right (X) and top/center/bottom (Y);
-///   - every other element's centre (actors + overlays).
+/// each axis. With `half_w` / `half_h`, the selected element can align its
+/// left/centre/right and top/centre/bottom lines to another target.
 ///
 /// Threshold is fixed to ~6 screen pixels (converted to world space via the
 /// current zoom) so the snap distance feels consistent regardless of zoom.
@@ -8684,6 +8757,17 @@ fn snap_world_center(
     state: &EditorState,
     proposed_x: f32,
     proposed_y: f32,
+    exclude: Option<SnapExclude>,
+) -> (f32, f32, Vec<crate::state::SnapGuide>) {
+    snap_world_rect_center(state, proposed_x, proposed_y, 0.0, 0.0, exclude)
+}
+
+fn snap_world_rect_center(
+    state: &EditorState,
+    proposed_x: f32,
+    proposed_y: f32,
+    half_w: f32,
+    half_h: f32,
     exclude: Option<SnapExclude>,
 ) -> (f32, f32, Vec<crate::state::SnapGuide>) {
     if !state.snap_enabled {
@@ -8695,37 +8779,47 @@ fn snap_world_center(
     let thresh = 6.0 / zoom;
 
     let (xs, ys) = collect_snap_targets(state, exclude);
+    let x_offsets = [0.0, -half_w.abs(), half_w.abs()];
+    let y_offsets = [0.0, -half_h.abs(), half_h.abs()];
 
     let mut guides: Vec<crate::state::SnapGuide> = Vec::new();
     let mut snapped_x = proposed_x;
+    let mut guide_x = proposed_x;
     let mut best_x = thresh;
     for &tx in &xs {
-        let d = (proposed_x - tx).abs();
-        if d < best_x {
-            best_x = d;
-            snapped_x = tx;
+        for &offset in &x_offsets {
+            let d = (proposed_x + offset - tx).abs();
+            if d < best_x {
+                best_x = d;
+                snapped_x = tx - offset;
+                guide_x = tx;
+            }
         }
     }
     if best_x < thresh {
         guides.push(crate::state::SnapGuide::axis_aligned(
             crate::state::SnapAxis::Vertical,
-            snapped_x,
+            guide_x,
         ));
     }
 
     let mut snapped_y = proposed_y;
+    let mut guide_y = proposed_y;
     let mut best_y = thresh;
     for &ty in &ys {
-        let d = (proposed_y - ty).abs();
-        if d < best_y {
-            best_y = d;
-            snapped_y = ty;
+        for &offset in &y_offsets {
+            let d = (proposed_y + offset - ty).abs();
+            if d < best_y {
+                best_y = d;
+                snapped_y = ty - offset;
+                guide_y = ty;
+            }
         }
     }
     if best_y < thresh {
         guides.push(crate::state::SnapGuide::axis_aligned(
             crate::state::SnapAxis::Horizontal,
-            snapped_y,
+            guide_y,
         ));
     }
 
@@ -8749,6 +8843,19 @@ fn snap_world_center(
     }
 
     (snapped_x, snapped_y, guides)
+}
+
+fn selection_snap_half_extents_world(state: &EditorState, sel: Selection) -> Option<(f32, f32)> {
+    let t = state.playhead;
+    let (min, max) = match sel {
+        Selection::Actor(i) => actor_world_aabb(state, i, t)?,
+        Selection::Overlay(i) => overlay_world_aabb(state, i, t)?,
+        _ => return None,
+    };
+    Some((
+        ((max[0] - min[0]).abs() * 0.5).max(0.0),
+        ((max[1] - min[1]).abs() * 0.5).max(0.0),
+    ))
 }
 
 /// Snap a proposed point to the closest rotated edge of the render
@@ -8884,32 +8991,34 @@ fn collect_snap_targets(state: &EditorState, exclude: Option<SnapExclude>) -> (V
         ys.push(cy + world_h * 0.5);
     }
 
-    // Other actors' centres.
+    // Other actors' bounds: left / centre / right and top / centre / bottom.
     let t = state.playhead;
-    for (i, actor) in state.scene.actors.iter().enumerate() {
+    for (i, _actor) in state.scene.actors.iter().enumerate() {
         if exclude == Some(SnapExclude::Actor(i)) {
             continue;
         }
-        let pos = get_element_world_pos(state, &actor.id, &actor.layout, t);
-        xs.push(pos.x);
-        ys.push(pos.y);
+        if let Some((min, max)) = actor_world_aabb(state, i, t) {
+            xs.push(min[0]);
+            xs.push((min[0] + max[0]) * 0.5);
+            xs.push(max[0]);
+            ys.push(min[1]);
+            ys.push((min[1] + max[1]) * 0.5);
+            ys.push(max[1]);
+        }
     }
 
-    // Overlays' centres (convert from normalized to world).
-    for (i, ov) in state.scene.overlays.iter().enumerate() {
+    // Overlays' bounds.
+    for (i, _ov) in state.scene.overlays.iter().enumerate() {
         if exclude == Some(SnapExclude::Overlay(i)) {
             continue;
         }
-        let layout_first = match ov {
-            Overlay::Text(t) => t.layout.first().map(|kf| kf.value.pos),
-            Overlay::Image(im) => im.layout.first().map(|kf| kf.value.pos),
-            Overlay::Video(v) => v.layout.first().map(|kf| kf.value.pos),
-        };
-        if let Some([nx, ny]) = layout_first {
-            let world_x = cx - world_w * 0.5 + nx * world_w;
-            let world_y = cy - world_h * 0.5 + ny * world_h;
-            xs.push(world_x);
-            ys.push(world_y);
+        if let Some((min, max)) = overlay_world_aabb(state, i, t) {
+            xs.push(min[0]);
+            xs.push((min[0] + max[0]) * 0.5);
+            xs.push(max[0]);
+            ys.push(min[1]);
+            ys.push((min[1] + max[1]) * 0.5);
+            ys.push(max[1]);
         }
     }
 
@@ -9768,5 +9877,130 @@ mod transform_hierarchy_tests {
         let undone = get_element_world_pos(&state, "child", &state.scene.actors[1].layout, 0.0);
         assert_close(undone.x, before.x);
         assert_close(undone.y, before.y);
+    }
+
+    #[test]
+    fn selection_resize_drag_undoes_as_one_history_step() {
+        let mut state = EditorState::new();
+        state.snap_enabled = false;
+        state.scene.actors = vec![actor("clip", None)];
+        state.selection = Selection::Actor(0);
+        state.canvas_selection = vec![state.selection];
+        state.canvas_drag.mode = CanvasDragMode::ResizeSelection {
+            handle: 5,
+            initial_scale: 1.0,
+            initial_scale_y: 1.0,
+            initial_pos_world: [50.0, 25.0],
+            anchor_world: [0.0, 25.0],
+            base_w: 100.0,
+            base_h: 50.0,
+        };
+        state.canvas_drag.drag_start_playhead = Some(0.0);
+        let before = state.scene.actors[0].layout[0].value;
+
+        let viewport_size = [2000.0, 2000.0];
+        let target_screen = state
+            .canvas_viewport
+            .world_to_screen(WorldPos { x: 220.0, y: 25.0 }, viewport_size);
+        let cur = Pos2::new(target_screen[0], target_screen[1]);
+        let full_rect = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(2000.0, 2000.0));
+        apply_drag(
+            &mut state,
+            full_rect,
+            viewport_size,
+            cur,
+            target_screen,
+            false,
+            false,
+        );
+
+        assert_eq!(
+            state.undo.undo_count(),
+            1,
+            "one resize gesture should create one undo snapshot"
+        );
+        let resized = state.scene.actors[0].layout[0].value;
+        assert!(
+            (resized.scale - before.scale).abs() > 1.0e-3,
+            "test setup must actually resize the actor"
+        );
+
+        state.undo();
+        let undone = state.scene.actors[0].layout[0].value;
+        assert_close(undone.scale, before.scale);
+        assert_close(undone.scale_y, before.scale_y);
+        assert_close(undone.pos[0], before.pos[0]);
+        assert_close(undone.pos[1], before.pos[1]);
+    }
+
+    #[test]
+    fn ctrl_resize_uses_selection_center_as_anchor() {
+        let mut state = EditorState::new();
+        state.snap_enabled = false;
+        state.scene.actors = vec![actor("clip", None)];
+        state.selection = Selection::Actor(0);
+        state.canvas_selection = vec![state.selection];
+        state.canvas_drag.mode = CanvasDragMode::ResizeSelection {
+            handle: 5,
+            initial_scale: 1.0,
+            initial_scale_y: 1.0,
+            initial_pos_world: [50.0, 25.0],
+            anchor_world: [0.0, 25.0],
+            base_w: 100.0,
+            base_h: 50.0,
+        };
+        let viewport_size = [2000.0, 2000.0];
+        let target_screen = state
+            .canvas_viewport
+            .world_to_screen(WorldPos { x: 125.0, y: 25.0 }, viewport_size);
+        let cur = Pos2::new(target_screen[0], target_screen[1]);
+        let full_rect = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(2000.0, 2000.0));
+
+        apply_drag(
+            &mut state,
+            full_rect,
+            viewport_size,
+            cur,
+            target_screen,
+            false,
+            true,
+        );
+
+        let resized = state.scene.actors[0].layout[0].value;
+        assert_close(resized.scale, 1.5);
+        assert_close(resized.scale_y, 1.0 / 1.5);
+        assert_close(
+            resized.pos[0],
+            50.0 / state.scene.render_frame.resolution[0] as f32,
+        );
+        assert_close(
+            resized.pos[1],
+            25.0 / state.scene.render_frame.resolution[1] as f32,
+        );
+    }
+
+    #[test]
+    fn rect_snap_aligns_selected_edge_to_other_element_edge() {
+        let mut state = EditorState::new();
+        state.snap_enabled = true;
+        state.canvas_viewport.zoom = 1.0;
+
+        let [rw, rh] = state.scene.render_frame.resolution;
+        let mut target = actor("target", None);
+        target.layout[0].value.pos = [200.0 / rw as f32, 100.0 / rh as f32];
+        target.layout[0].value.scale = 0.1;
+        state.scene.actors = vec![target];
+
+        let (_, target_max) = actor_world_aabb(&state, 0, 0.0).expect("target actor bounds");
+        let target_right = target_max[0];
+        let proposed_x = target_right + 50.0 + 4.0;
+        let (snapped_x, _, guides) =
+            snap_world_rect_center(&state, proposed_x, 777.0, 50.0, 10.0, None);
+
+        assert_close(snapped_x, target_right + 50.0);
+        assert!(guides.iter().any(|g| {
+            matches!(g.axis, crate::state::SnapAxis::Vertical)
+                && (g.world - target_right).abs() < 1.0e-3
+        }));
     }
 }

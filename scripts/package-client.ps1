@@ -31,6 +31,8 @@
 #   pwsh scripts/package-client.ps1 -ServerUrl https://assets.example.com -Zip
 #   pwsh scripts/package-client.ps1 -ServerUrl https://assets.example.com `
 #                                   -Out .\build -Name memstroy-1.2.3
+#   pwsh scripts/package-client.ps1 -ServerUrl https://assets.example.com `
+#                                   -Target aarch64-pc-windows-msvc
 #
 # Required:
 #   -ServerUrl <URL>        Backend the shipped editor talks to.
@@ -39,6 +41,8 @@
 #   -Out <path>             Output directory (default: .\dist).
 #   -Name <name>            Bundle name (default:
 #                           Memstroy-inator-windows-<arch>-<version>).
+#   -Target <triple>        Optional Rust Windows target triple, e.g.
+#                           aarch64-pc-windows-msvc for ARM64.
 #   -Zip                    Also produce <bundle-name>.zip.
 #   -AllowLoopback          Allow -ServerUrl to point at 127.* / ::1
 #                           / localhost. Off by default to catch typos.
@@ -49,6 +53,7 @@ param(
 
     [string] $Out  = "",
     [string] $Name = "",
+    [string] $Target = "",
     [switch] $Zip,
     [switch] $AllowLoopback
 )
@@ -78,7 +83,117 @@ $Version = (Select-String -Path "Cargo.toml" -Pattern '^version\s*=\s*"([^"]+)"'
     | Select-Object -First 1).Matches[0].Groups[1].Value
 if ([string]::IsNullOrWhiteSpace($Version)) { $Version = "dev" }
 
-$Arch = $env:PROCESSOR_ARCHITECTURE.ToLower()
+function Get-WindowsArchName {
+    param([string]$TargetTriple)
+
+    if ([string]::IsNullOrWhiteSpace($TargetTriple)) {
+        $HostArch = $env:PROCESSOR_ARCHITECTURE.ToLowerInvariant()
+        switch ($HostArch) {
+            "amd64" { return "amd64" }
+            "x86_64" { return "amd64" }
+            "arm64" { return "arm64" }
+            "aarch64" { return "arm64" }
+            "x86" { return "x86" }
+            default { return $HostArch }
+        }
+    }
+
+    switch ($TargetTriple) {
+        "x86_64-pc-windows-msvc" { return "amd64" }
+        "aarch64-pc-windows-msvc" { return "arm64" }
+        "i686-pc-windows-msvc" { return "x86" }
+        default {
+            Write-Error "error: unsupported Windows target '$TargetTriple'. Supported: x86_64-pc-windows-msvc, aarch64-pc-windows-msvc, i686-pc-windows-msvc."
+            exit 5
+        }
+    }
+}
+
+function Get-CargoReleaseDir {
+    param([string]$TargetTriple)
+
+    if ([string]::IsNullOrWhiteSpace($TargetTriple)) {
+        return (Join-Path $RootDir "target\release")
+    }
+    return (Join-Path $RootDir "target\$TargetTriple\release")
+}
+
+function Find-VcVarsAll {
+    $vswhereCandidates = @(
+        "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe",
+        "$env:ProgramFiles\Microsoft Visual Studio\Installer\vswhere.exe"
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and (Test-Path $_) }
+
+    foreach ($vswhere in $vswhereCandidates) {
+        $installPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null
+        if (-not [string]::IsNullOrWhiteSpace($installPath)) {
+            $vcvars = Join-Path $installPath "VC\Auxiliary\Build\vcvarsall.bat"
+            if (Test-Path $vcvars) { return (Resolve-Path $vcvars).Path }
+        }
+    }
+
+    $fallbacks = @(
+        "$env:ProgramFiles\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvarsall.bat",
+        "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat",
+        "$env:ProgramFiles\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat"
+    )
+    foreach ($candidate in $fallbacks) {
+        if (-not [string]::IsNullOrWhiteSpace($candidate) -and (Test-Path $candidate)) {
+            return (Resolve-Path $candidate).Path
+        }
+    }
+
+    return $null
+}
+
+function Find-LlvmBinDir {
+    $clang = Get-Command clang.exe -ErrorAction SilentlyContinue
+    if ($clang -and $clang.Source) {
+        return (Split-Path -Parent $clang.Source)
+    }
+
+    $scoopLlvm = Join-Path $env:USERPROFILE "scoop\apps\llvm\current\bin"
+    if (Test-Path (Join-Path $scoopLlvm "clang.exe")) {
+        return (Resolve-Path $scoopLlvm).Path
+    }
+
+    $programFilesLlvm = Join-Path $env:ProgramFiles "LLVM\bin"
+    if (Test-Path (Join-Path $programFilesLlvm "clang.exe")) {
+        return (Resolve-Path $programFilesLlvm).Path
+    }
+
+    return $null
+}
+
+function Assert-WindowsArm64MsvcLibs {
+    $vswhereCandidates = @(
+        "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe",
+        "$env:ProgramFiles\Microsoft Visual Studio\Installer\vswhere.exe"
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and (Test-Path $_) }
+
+    foreach ($vswhere in $vswhereCandidates) {
+        $installPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null
+        if ([string]::IsNullOrWhiteSpace($installPath)) { continue }
+
+        $msvcRoot = Join-Path $installPath "VC\Tools\MSVC"
+        if (-not (Test-Path $msvcRoot)) { continue }
+
+        $toolset = Get-ChildItem -Path $msvcRoot -Directory -ErrorAction SilentlyContinue |
+            Sort-Object Name -Descending |
+            Select-Object -First 1
+        if (-not $toolset) { continue }
+
+        $libcmt = Join-Path $toolset.FullName "lib\arm64\libcmt.lib"
+        if (Test-Path $libcmt) { return }
+
+        throw "Windows ARM64 MSVC static CRT is missing: $libcmt. Install the Visual Studio C++ ARM64 build tools/component, then rerun. In Visual Studio Installer, add the ARM64/ARM64EC C++ build tools under Individual components."
+    }
+
+    throw "Visual Studio with MSVC C++ tools was not found. Install Visual Studio Build Tools/Community with Desktop C++ and ARM64 build tools."
+}
+
+$Arch = Get-WindowsArchName $Target
+$CargoReleaseDir = Get-CargoReleaseDir $Target
 $DefaultName = "Memstroy-inator-windows-$Arch-$Version"
 
 if ([string]::IsNullOrEmpty($Out))  { $Out  = Join-Path $RootDir "dist" }
@@ -90,6 +205,7 @@ Write-Host "==> Memstroy-inator client packager"
 Write-Host "    workspace  : $RootDir"
 Write-Host "    bundle     : $BundleDir"
 Write-Host "    server URL : $ServerUrl"
+Write-Host "    target     : $(if ([string]::IsNullOrWhiteSpace($Target)) { 'host' } else { $Target })"
 
 # ── Build release binaries (client mode) ────────────────────────────
 # Pass the build-time signals through env vars so build.rs bakes the
@@ -113,12 +229,43 @@ if ([string]::IsNullOrWhiteSpace($PreviousRustflags)) {
 }
 Write-Host "    RUSTFLAGS  : $env:RUSTFLAGS"
 
+function Invoke-ClientCargoBuild {
+    param([Parameter(Mandatory=$true)][string]$Package)
+
+    $Args = @("build", "--release")
+    if (-not [string]::IsNullOrWhiteSpace($Target)) {
+        $Args += @("--target", $Target)
+    }
+    $Args += @("-p", $Package, "--no-default-features")
+
+    if ($Target -eq "aarch64-pc-windows-msvc") {
+        Assert-WindowsArm64MsvcLibs
+
+        $vcvars = Find-VcVarsAll
+        if (-not $vcvars) {
+            throw "Visual Studio vcvarsall.bat not found. Install MSVC Build Tools with C++ support before building Windows ARM64."
+        }
+
+        $llvmBin = Find-LlvmBinDir
+        if (-not $llvmBin) {
+            throw "clang.exe not found. Windows ARM64 builds need LLVM for ring; install it (for example: scoop install llvm) and rerun."
+        }
+
+        $argLine = ($Args | ForEach-Object { '"' + ($_ -replace '"', '\"') + '"' }) -join ' '
+        $cmdLine = "call `"$vcvars`" amd64_arm64 && set `"PATH=$llvmBin;!PATH!`" && cargo $argLine"
+        & cmd /d /s /v:on /c $cmdLine
+        return
+    }
+
+    & cargo @Args
+}
+
 # Build GUI without local-server feature
-& cargo build --release -p memstroy-gui --no-default-features
+Invoke-ClientCargoBuild "memstroy-gui"
 if ($LASTEXITCODE -ne 0) { throw "cargo build failed (memstroy-gui)" }
 
 # Build CLI without telegram feature
-& cargo build --release -p memstroy-cli --no-default-features
+Invoke-ClientCargoBuild "memstroy-cli"
 if ($LASTEXITCODE -ne 0) { throw "cargo build failed (memstroy-cli)" }
 
 function Assert-NoDynamicVcruntime {
@@ -230,8 +377,8 @@ function Assert-NoDynamicVcruntime {
     Write-Host "    CRT check : PE imports parsed without dumpbin/objdump"
 }
 
-Assert-NoDynamicVcruntime (Join-Path $RootDir "target\release\memstroy-gui.exe")
-Assert-NoDynamicVcruntime (Join-Path $RootDir "target\release\memstroy.exe")
+Assert-NoDynamicVcruntime (Join-Path $CargoReleaseDir "memstroy-gui.exe")
+Assert-NoDynamicVcruntime (Join-Path $CargoReleaseDir "memstroy.exe")
 
 # ── Stage the bundle ────────────────────────────────────────────────
 Write-Host "==> staging bundle"
@@ -242,7 +389,7 @@ New-Item -ItemType Directory -Path (Join-Path $BundleDir "bin") | Out-Null
 # server lives on the operator's backend, not on the client.
 $BinNames = @("memstroy-gui.exe", "memstroy.exe")
 foreach ($bin in $BinNames) {
-    $src = Join-Path $RootDir "target\release\$bin"
+    $src = Join-Path $CargoReleaseDir $bin
     if (-not (Test-Path $src)) { throw "missing release binary: $src" }
     Copy-Item -Path $src -Destination (Join-Path $BundleDir "bin")
 }
@@ -252,6 +399,20 @@ foreach ($bin in $BinNames) {
 # vcruntime140.dll / vcruntime140_1.dll. Do not rely on the end user's
 # machine having the VC++ redistributable installed: stage the runtime
 # DLLs next to the executables so the app starts out of the box.
+$VcRedistArch = switch ($Arch) {
+    "amd64" { "x64" }
+    "arm64" { "arm64" }
+    "x86" { "x86" }
+    default { $Arch }
+}
+$HostVcRedistArch = switch ($env:PROCESSOR_ARCHITECTURE.ToLowerInvariant()) {
+    "amd64" { "x64" }
+    "x86_64" { "x64" }
+    "arm64" { "arm64" }
+    "aarch64" { "arm64" }
+    "x86" { "x86" }
+    default { $env:PROCESSOR_ARCHITECTURE.ToLowerInvariant() }
+}
 function Resolve-VcRuntimeDll {
     param([Parameter(Mandatory=$true)][string]$DllName)
 
@@ -260,23 +421,26 @@ function Resolve-VcRuntimeDll {
         $candidates.Add((Join-Path $env:MEMSTROY_VC_REDIST_DIR $DllName))
     }
     if (-not [string]::IsNullOrWhiteSpace($env:VCToolsRedistDir)) {
-        $candidates.Add((Join-Path $env:VCToolsRedistDir "x64\Microsoft.VC143.CRT\$DllName"))
-        $candidates.Add((Join-Path $env:VCToolsRedistDir "x64\Microsoft.VC142.CRT\$DllName"))
+        $candidates.Add((Join-Path $env:VCToolsRedistDir "$VcRedistArch\Microsoft.VC143.CRT\$DllName"))
+        $candidates.Add((Join-Path $env:VCToolsRedistDir "$VcRedistArch\Microsoft.VC142.CRT\$DllName"))
     }
 
     $vsRedistRoots = @(
         "$env:ProgramFiles\Microsoft Visual Studio",
         "${env:ProgramFiles(x86)}\Microsoft Visual Studio"
     ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and (Test-Path $_) }
+    $redistArchPattern = [regex]::Escape($VcRedistArch)
     foreach ($root in $vsRedistRoots) {
         Get-ChildItem -Path $root -Recurse -Filter $DllName -ErrorAction SilentlyContinue |
-            Where-Object { $_.FullName -match '\\VC\\Redist\\MSVC\\[^\\]+\\x64\\Microsoft\.VC\d+\.CRT\\' } |
+            Where-Object { $_.FullName -match "\\VC\\Redist\\MSVC\\[^\\]+\\$redistArchPattern\\Microsoft\.VC\d+\.CRT\\" } |
             Sort-Object LastWriteTime -Descending |
             ForEach-Object { $candidates.Add($_.FullName) }
     }
 
-    $system32 = Join-Path $env:WINDIR "System32\$DllName"
-    $candidates.Add($system32)
+    if ($VcRedistArch -eq $HostVcRedistArch) {
+        $system32 = Join-Path $env:WINDIR "System32\$DllName"
+        $candidates.Add($system32)
+    }
 
     foreach ($candidate in $candidates) {
         if (-not [string]::IsNullOrWhiteSpace($candidate) -and (Test-Path $candidate)) {

@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use egui::{Color32, RichText, Rounding, Stroke, Vec2, ViewportCommand};
 use memstroy_core::Scene;
+use memstroy_render::RenderQuality;
 use tokio::runtime::Runtime;
 
 use crate::audio_engine::AudioEngine;
@@ -20,6 +21,23 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
     let mut out = text.chars().take(keep).collect::<String>();
     out.push('…');
     out
+}
+
+fn sanitize_export_file_stem(stem: &str) -> String {
+    let mut out: String = stem
+        .chars()
+        .map(|ch| match ch {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+            ch if ch.is_control() => '_',
+            ch => ch,
+        })
+        .collect();
+    out = out.trim_matches([' ', '.']).trim().to_string();
+    if out.is_empty() {
+        "project".to_string()
+    } else {
+        out
+    }
 }
 
 pub struct App {
@@ -514,10 +532,13 @@ impl App {
                         }
                     }
                 }
-                JobEvent::RenderOutputChosen(Some(path)) => {
-                    self.start_render_to_path(path);
+                JobEvent::RenderOutputChosen {
+                    path: Some(path),
+                    quality,
+                } => {
+                    self.start_render_to_path(path, quality);
                 }
-                JobEvent::RenderOutputChosen(None) => {
+                JobEvent::RenderOutputChosen { path: None, .. } => {
                     if self
                         .state
                         .status
@@ -1761,7 +1782,11 @@ impl App {
                 }
                 ui.separator();
                 if menu_row(ui, "EX", t("Export").to_string()) {
-                    self.run_render();
+                    self.run_render(RenderQuality::High);
+                    ui.close_menu();
+                }
+                if menu_row(ui, "MAX", t("Export in maximum quality").to_string()) {
+                    self.run_render(RenderQuality::Maximum);
                     ui.close_menu();
                 }
                 ui.separator();
@@ -2768,25 +2793,24 @@ impl App {
         // require remapping. The kinds themselves are independent
         // (actors / overlays / audio / backgrounds live in separate
         // Vecs) so the order across kinds doesn't matter.
-        let multi_targets: Vec<Selection> = if state_canvas_selection_count(self) > 1
-            || self.state.multi_select.len() > 1
-        {
-            let mut targets = self.state.canvas_selection.clone();
-            for &actor_idx in &self.state.multi_select {
-                let sel = Selection::Actor(actor_idx);
-                if !targets.contains(&sel) {
-                    targets.push(sel);
+        let multi_targets: Vec<Selection> =
+            if state_canvas_selection_count(self) > 1 || self.state.multi_select.len() > 1 {
+                let mut targets = self.state.canvas_selection.clone();
+                for &actor_idx in &self.state.multi_select {
+                    let sel = Selection::Actor(actor_idx);
+                    if !targets.contains(&sel) {
+                        targets.push(sel);
+                    }
                 }
-            }
-            if !matches!(self.state.selection, Selection::None)
-                && !targets.contains(&self.state.selection)
-            {
-                targets.push(self.state.selection);
-            }
-            targets
-        } else {
-            Vec::new()
-        };
+                if !matches!(self.state.selection, Selection::None)
+                    && !targets.contains(&self.state.selection)
+                {
+                    targets.push(self.state.selection);
+                }
+                targets
+            } else {
+                Vec::new()
+            };
 
         if !multi_targets.is_empty() {
             // Single undo entry for the whole batch.
@@ -3028,11 +3052,6 @@ impl App {
                 overlay_idxs.sort_unstable();
                 overlay_idxs.dedup();
 
-                for idx in actor_idxs.iter().rev().copied() {
-                    let aid = self.state.scene.actors[idx].id.clone();
-                    let _removed_audio =
-                        crate::panels::remove_audio_bound_to_actor(&mut self.state, &aid);
-                }
                 self.state.mutate_state(|s| {
                     s.scene
                         .canvas_layouts
@@ -3048,6 +3067,9 @@ impl App {
                     }
                     for idx in actor_idxs.iter().rev().copied() {
                         if idx < s.scene.actors.len() {
+                            let aid = s.scene.actors[idx].id.clone();
+                            let _removed_audio =
+                                crate::panels::remove_audio_bound_to_actor(s, &aid);
                             crate::panels::collapse_footage_sequence_gap_for_actor(s, idx);
                             s.scene.actors.remove(idx);
                         }
@@ -3097,11 +3119,6 @@ impl App {
                 actor_idxs.sort_unstable();
                 actor_idxs.dedup();
 
-                for idx in actor_idxs.iter().rev().copied() {
-                    let aid = self.state.scene.actors[idx].id.clone();
-                    let _removed_audio =
-                        crate::panels::remove_audio_bound_to_actor(&mut self.state, &aid);
-                }
                 self.state.mutate_state(|s| {
                     s.scene
                         .canvas_layouts
@@ -3117,6 +3134,9 @@ impl App {
                     }
                     for idx in actor_idxs.iter().rev().copied() {
                         if idx < s.scene.actors.len() {
+                            let aid = s.scene.actors[idx].id.clone();
+                            let _removed_audio =
+                                crate::panels::remove_audio_bound_to_actor(s, &aid);
                             crate::panels::collapse_footage_sequence_gap_for_actor(s, idx);
                             s.scene.actors.remove(idx);
                         }
@@ -3192,8 +3212,21 @@ impl App {
                 // Mark as deleted instead of removing from array to prevent
                 // index shifts that cause other audio tracks to "jump" layers.
                 // For unlinked rows we still try to infer the originating
-                // actor and mute its embedded fallback audio.
-                self.mark_audio_track_deleted(i);
+                // actor and mute its embedded fallback audio. Keep both writes
+                // in one undo snapshot so Ctrl+Z revives the row and embedded
+                // soundtrack together.
+                let actor_idx = self.infer_actor_for_audio_track(i);
+                self.state.mutate_state(|s| {
+                    if i >= s.scene.audio.len() || s.scene.audio[i].deleted {
+                        return;
+                    }
+                    s.scene.audio[i].deleted = true;
+                    if let Some(ai) = actor_idx {
+                        if let Some(actor) = s.scene.actors.get_mut(ai) {
+                            actor.mute_audio = true;
+                        }
+                    }
+                });
                 // No need to remove from side-tables since we're not
                 // removing from the array — the track is just marked
                 // as deleted and will be hidden in the UI.
@@ -4149,20 +4182,46 @@ impl App {
         }
     }
 
-    fn run_render(&mut self) {
+    fn run_render(&mut self, quality: RenderQuality) {
         let tx = self.tx.clone();
+        let suggested_name = self.export_file_name();
         self.state.status = crate::i18n::t("Choosing export path...").into();
         self.rt.as_ref().unwrap().spawn(async move {
             let picked = rfd::AsyncFileDialog::new()
                 .add_filter("MP4", &["mp4"])
+                .set_file_name(&suggested_name)
                 .save_file()
                 .await
                 .map(|file| file.path().to_path_buf());
-            let _ = tx.send(JobEvent::RenderOutputChosen(picked));
+            let _ = tx.send(JobEvent::RenderOutputChosen {
+                path: picked,
+                quality,
+            });
         });
     }
 
-    fn start_render_to_path(&mut self, path: std::path::PathBuf) {
+    fn export_file_name(&self) -> String {
+        let stem = self
+            .state
+            .scene_path
+            .as_ref()
+            .and_then(|path| path.file_stem())
+            .and_then(|stem| stem.to_str())
+            .filter(|stem| !stem.trim().is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                self.state
+                    .scene_tabs
+                    .get(self.state.active_tab)
+                    .map(|tab| tab.name.trim())
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| "project".to_string());
+        format!("{}.mp4", sanitize_export_file_stem(&stem))
+    }
+
+    fn start_render_to_path(&mut self, path: std::path::PathBuf, quality: RenderQuality) {
         self.state.render_progress = Some(crate::state::RenderProgress {
             started: std::time::Instant::now(),
             last_log: String::new(),
@@ -4198,8 +4257,13 @@ impl App {
             scene_for_render,
             self.state.assets_root.clone(),
             path,
+            quality,
         );
-        self.state.status = format!("▶ {}", crate::i18n::t("Exporting..."),);
+        let status = match quality {
+            RenderQuality::High => crate::i18n::t("Exporting..."),
+            RenderQuality::Maximum => crate::i18n::t("Exporting in maximum quality..."),
+        };
+        self.state.status = format!("▶ {status}");
     }
 
     fn run_refresh(&mut self) {

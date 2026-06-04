@@ -891,15 +891,6 @@ pub fn clear_render_frame_param_animation(
     }
 }
 
-fn layout_state_at_or_before<T: Clone>(layout: &[Keyframe<T>], t: f32, fallback: T) -> T {
-    layout
-        .iter()
-        .filter(|k| k.t <= t + TIME_EPS)
-        .last()
-        .map(|k| k.value.clone())
-        .unwrap_or(fallback)
-}
-
 fn upsert_actor_param_keyframe(
     layout: &mut Vec<Keyframe<ActorState>>,
     animated_params: &BTreeSet<String>,
@@ -914,8 +905,7 @@ fn upsert_actor_param_keyframe(
         kf.mark_param_owner(param_id);
         return;
     }
-    let fallback = sample_actor_layout(layout, animated_params, seed_t);
-    let mut state = layout_state_at_or_before(layout, seed_t, fallback);
+    let mut state = sample_actor_layout(layout, animated_params, seed_t);
     actor_set(&mut state, param_id, value);
     layout.push(Keyframe {
         t: seed_t,
@@ -940,8 +930,7 @@ fn upsert_overlay_param_keyframe(
         kf.mark_param_owner(param_id);
         return;
     }
-    let fallback = sample_overlay_layout(layout, animated_params, seed_t);
-    let mut state = layout_state_at_or_before(layout, seed_t, fallback);
+    let mut state = sample_overlay_layout(layout, animated_params, seed_t);
     overlay_set(&mut state, param_id, value);
     layout.push(Keyframe {
         t: seed_t,
@@ -966,8 +955,7 @@ fn upsert_render_frame_param_keyframe(
         kf.mark_param_owner(param_id);
         return;
     }
-    let fallback = sample_render_frame_layout(layout, animated_params, seed_t);
-    let mut state = layout_state_at_or_before(layout, seed_t, fallback);
+    let mut state = sample_render_frame_layout(layout, animated_params, seed_t);
     rf_set(&mut state, param_id, value);
     layout.push(Keyframe {
         t: seed_t,
@@ -1399,6 +1387,46 @@ mod tests {
             scale_times.iter().any(|t| (*t - 1.5).abs() < EPS),
             "scale row should show playhead diamond, got {scale_times:?}"
         );
+    }
+
+    #[test]
+    fn enabling_position_seeds_keyframe_with_sampled_scale() {
+        let mut animated = BTreeSet::new();
+        animated.insert(param_ids::SCALE.to_string());
+        animated.insert(param_ids::POS_X.to_string());
+        let mut layout = vec![
+            Keyframe::new(
+                0.0,
+                ActorState {
+                    scale: 1.0,
+                    ..ActorState::default()
+                },
+            )
+            .with_param_owner(param_ids::SCALE),
+            Keyframe::new(
+                10.0,
+                ActorState {
+                    scale: 3.0,
+                    ..ActorState::default()
+                },
+            )
+            .with_param_owner(param_ids::SCALE),
+        ];
+
+        enable_actor_param_animation(&mut layout, &animated, param_ids::POS_X, 5.0);
+
+        let pos_seed = layout
+            .iter()
+            .find(|kf| (kf.t - 5.0).abs() < EPS)
+            .expect("position seed keyframe");
+        assert!(pos_seed.param_owners.contains(param_ids::POS_X));
+        assert!(
+            (pos_seed.value.scale - 2.0).abs() < EPS,
+            "position seed must carry sampled scale, got {}",
+            pos_seed.value.scale
+        );
+        let sampled = sample_actor_layout(&layout, &animated, 5.0);
+        assert!((sampled.scale - 2.0).abs() < EPS);
     }
 
     #[test]

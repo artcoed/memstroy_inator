@@ -23,6 +23,7 @@ Cargo.lock.bak
 # Build outputs
 /dist/
 /target/
+/tools/ffmpeg/
 
 # Executables
 *.exe

@@ -217,8 +217,12 @@ pwsh scripts/package-client.ps1 -ServerUrl https://assets.your-domain.example
 В бандл попадают:
 
 1. `bin/memstroy-gui` (плюс `bin/memstroy` CLI на поддерживаемых ОС);
-2. `examples/*.yaml` и `README.md`;
-3. Лаунчер верхнего уровня (`Memstroy-inator.sh` /
+2. `bin/ffmpeg` / `bin/ffprobe` для превью, аудио и финального рендера;
+3. `models/u2netp.onnx` для AI-вырезки фона;
+4. на Linux — `lib/` с переносимыми runtime-библиотеками из `ldd`
+   (без glibc и драйверов видеокарты);
+5. `examples/*.yaml` и `README.md`;
+6. Лаунчер верхнего уровня (`Memstroy-inator.sh` /
    `Memstroy-inator.bat`), запускающий GUI.
 
 ## Сборка установщика «в один файл»
@@ -230,7 +234,9 @@ pwsh scripts/package-client.ps1 -ServerUrl https://assets.your-domain.example
 
 ```bash
 # Linux: само-распаковывающийся .run, без внешних зависимостей
-scripts/make-installer.sh --server-url https://assets.your-domain.example
+scripts/make-installer.sh \
+  --server-url https://assets.your-domain.example \
+  --fetch-ffmpeg
 # → dist/Memstroy-inator-linux-<arch>-<ver>.run
 
 # Windows PowerShell: требуется Inno Setup 6 (https://jrsoftware.org/isinfo.php)
@@ -241,16 +247,22 @@ pwsh scripts/make-installer.ps1 -ServerUrl https://assets.your-domain.example
 В конце работы оба скрипта печатают абсолютный путь до получившегося
 установщика. Этот файл и есть то, что раздавать пользователям.
 
-Для Linux-сборки "скачал и работает почти везде" сначала положите
-статические `ffmpeg`/`ffprobe` в `tools/ffmpeg/bin`:
+`--fetch-ffmpeg` скачивает статические Linux `ffmpeg`/`ffprobe` на
+машину сборки и кладёт их в `tools/ffmpeg/bin`; в `.run` они попадают
+уже готовыми, поэтому клиенту не нужен `apt install ffmpeg`.
+Если статические бинарники уже лежат в `tools/ffmpeg/bin`, флаг можно
+не указывать:
 
 ```bash
 scripts/fetch-static-ffmpeg-linux.sh
 scripts/make-installer.sh --server-url https://assets.your-domain.example
 ```
 
-Без этого скрипт может забандлить маленький системный `/usr/bin/ffmpeg`,
-который зависит от библиотек конкретного дистрибутива.
+Linux-бандл также копирует не-glibc зависимости GUI/CLI из `ldd` в
+`lib/`, а меню и `memstroy-gui` в `PATH` запускают приложение через
+обёртку с `LD_LIBRARY_PATH`. Не бандлятся glibc, системный загрузчик и
+драйверы GPU: для максимального охвата собирайте релиз на достаточно
+старой x86_64 glibc-системе, например Ubuntu 20.04/22.04.
 
 Если бандл уже готов и нужно только обернуть его без пересборки:
 
@@ -269,7 +281,8 @@ pwsh scripts/make-installer.ps1 -BundleDir .\dist\Memstroy-inator-windows-amd64-
 - **Linux.** `/opt/Memstroy-inator/` при запуске под `sudo`, иначе
   `~/.local/share/Memstroy-inator/`. `.desktop`-файл в меню
   приложений, ярлык на `~/Desktop/` (только при пользовательской
-  установке), симлинк `memstroy-gui` в `PATH` и скрипт
+  установке), симлинки `memstroy-gui` / `memstroy` в `PATH`, пункт
+  **Memstroy-inator (safe graphics)** для проблемных GPU и скрипт
   `uninstall.sh` в каталоге установки.
 
 ## Формат сцены (фрагмент)

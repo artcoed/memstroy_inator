@@ -45,6 +45,14 @@
 #                        Memstroy-inator-<os>-<arch>-<version>).
 #   --zip                Also produce <bundle-name>.zip alongside the
 #                        directory.
+#   --fetch-ffmpeg       Linux only: download static ffmpeg/ffprobe into
+#                        tools/ffmpeg/bin before staging the bundle.
+#   --allow-dynamic-ffmpeg
+#                        Linux only: allow a dynamically-linked FFmpeg
+#                        pair. Off by default because the Linux .run is
+#                        meant to work without distro FFmpeg packages.
+#   --no-bundle-libs     Linux only: do not copy non-glibc ELF runtime
+#                        libraries into bundle/lib.
 #   --allow-loopback     Allow `--server-url` to point at 127.* / ::1
 #                        / localhost. By default that's an error to
 #                        catch typos; pass this flag for staging
@@ -70,6 +78,9 @@ BUNDLE_NAME="${DEFAULT_NAME}"
 SERVER_URL=""
 ALLOW_LOOPBACK=0
 MAKE_ZIP=0
+FETCH_FFMPEG=0
+ALLOW_DYNAMIC_FFMPEG=0
+BUNDLE_LINUX_LIBS=1
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -77,9 +88,12 @@ while [[ $# -gt 0 ]]; do
         --name)            BUNDLE_NAME="$2"; shift 2 ;;
         --server-url)      SERVER_URL="$2"; shift 2 ;;
         --zip)             MAKE_ZIP=1; shift ;;
+        --fetch-ffmpeg)    FETCH_FFMPEG=1; shift ;;
+        --allow-dynamic-ffmpeg) ALLOW_DYNAMIC_FFMPEG=1; shift ;;
+        --no-bundle-libs)  BUNDLE_LINUX_LIBS=0; shift ;;
         --allow-loopback)  ALLOW_LOOPBACK=1; shift ;;
         -h|--help)
-            sed -n '2,55p' "$0"
+            sed -n '2,64p' "$0"
             exit 0
             ;;
         *)
@@ -154,6 +168,15 @@ for bin in memstroy-gui memstroy; do
 done
 
 # ─── Bundled FFmpeg ──────────────────────────────────────────────────
+if [[ "${FETCH_FFMPEG}" -eq 1 ]]; then
+    if [[ "${OS_NAME}" != linux* ]]; then
+        echo "error: --fetch-ffmpeg is only supported on Linux build hosts" >&2
+        exit 1
+    fi
+    echo "==> fetching static Linux FFmpeg"
+    "${SCRIPT_DIR}/fetch-static-ffmpeg-linux.sh"
+fi
+
 resolve_required_tool() {
     local tool_name="$1"
     local env_path="${2:-}"
@@ -180,11 +203,21 @@ validate_real_ffmpeg_tool() {
     local tool_path="$1"
     local tool_name="$2"
     local size
+    local ldd_out
 
     size="$(wc -c < "${tool_path}" | tr -d '[:space:]')"
     if ! "${tool_path}" -version >/dev/null 2>&1; then
         echo "error: ${tool_name} failed '-version' check: ${tool_path}" >&2
         exit 1
+    fi
+    if [[ "${OS_NAME}" == linux* && "${ALLOW_DYNAMIC_FFMPEG}" -eq 0 ]] && command -v ldd >/dev/null 2>&1; then
+        ldd_out="$(ldd "${tool_path}" 2>&1 || true)"
+        if [[ "${ldd_out}" != *"not a dynamic executable"* && "${ldd_out}" != *"statically linked"* ]]; then
+            echo "error: ${tool_name} is dynamically linked: ${tool_path}" >&2
+            echo "       Run scripts/fetch-static-ffmpeg-linux.sh or pass --fetch-ffmpeg." >&2
+            echo "       Use --allow-dynamic-ffmpeg only for non-portable test bundles." >&2
+            exit 1
+        fi
     fi
     if [[ "${size}" -lt 1048576 ]]; then
         echo "warning: ${tool_name} is smaller than a static build (${size} bytes): ${tool_path}" >&2
@@ -234,6 +267,112 @@ if command -v strip >/dev/null 2>&1; then
     esac
 fi
 
+# ─── Linux ELF runtime libraries ─────────────────────────────────────
+# Client Linux machines should not have to install most app-facing
+# runtime libraries. We copy portable non-glibc dynamic dependencies
+# reported by ldd into bundle/lib and launch the app through a wrapper
+# that prepends this directory to LD_LIBRARY_PATH.
+#
+# We intentionally do NOT bundle glibc, the dynamic loader, or GPU
+# driver/vendor libraries. Those belong to the target OS and graphics
+# stack; shipping build-host copies is more likely to break machines
+# than help them. Build Linux releases on an old-enough distro (for
+# example Ubuntu 20.04/22.04) to keep the glibc floor broad.
+should_bundle_linux_lib() {
+    local lib_path="$1"
+    local name
+    name="$(basename "${lib_path}")"
+
+    case "${name}" in
+        linux-vdso*|ld-linux*|ld-musl*|libc.so.*|libm.so.*|libdl.so.*|librt.so.*|libpthread.so.*|libresolv.so.*|libutil.so.*|libnsl.so.*|libanl.so.*)
+            return 1
+            ;;
+        # ALSA loads PulseAudio/PipeWire/rate-converter plugins from the
+        # target system at runtime. Shipping a build-host libasound without
+        # its matching plugin set can make preview audio fail on otherwise
+        # healthy Linux desktops.
+        libasound.so.*)
+            return 1
+            ;;
+        libGLX_nvidia*|libEGL_nvidia*|libnvidia-*|libcuda*|libOpenCL*|libdrm*|libgbm*|libva*|libvdpau*|libwayland-egl*|libEGL_mesa*|libGLX_mesa*)
+            return 1
+            ;;
+    esac
+
+    return 0
+}
+
+bundle_linux_elf_dependencies() {
+    if [[ "${OS_NAME}" != linux* || "${BUNDLE_LINUX_LIBS}" -eq 0 ]]; then
+        return 0
+    fi
+    if ! command -v ldd >/dev/null 2>&1; then
+        echo "error: ldd is required to bundle Linux runtime libraries" >&2
+        exit 1
+    fi
+
+    echo "==> bundling Linux ELF runtime libraries"
+    local lib_dir="${BUNDLE_DIR}/lib"
+    local manifest="${lib_dir}/manifest.txt"
+    local target line path name copied missing
+    mkdir -p "${lib_dir}"
+    : > "${manifest}"
+
+    declare -A seen_libs=()
+    copied=0
+    missing=0
+
+    for target in "${BUNDLE_DIR}/bin/memstroy-gui" "${BUNDLE_DIR}/bin/memstroy"; do
+        while IFS= read -r line; do
+            if [[ "${line}" == *"not found"* ]]; then
+                echo "error: unresolved ELF dependency for ${target}: ${line}" >&2
+                missing=1
+                continue
+            fi
+
+            path=""
+            if [[ "${line}" =~ \=\>[[:space:]]*(/[^[:space:]]+) ]]; then
+                path="${BASH_REMATCH[1]}"
+            elif [[ "${line}" =~ ^[[:space:]]*(/[^[:space:]]+) ]]; then
+                path="${BASH_REMATCH[1]}"
+            fi
+
+            if [[ -z "${path}" || ! -f "${path}" ]]; then
+                continue
+            fi
+            if ! should_bundle_linux_lib "${path}"; then
+                continue
+            fi
+
+            name="$(basename "${path}")"
+            if [[ -n "${seen_libs[${name}]:-}" ]]; then
+                continue
+            fi
+
+            cp -L "${path}" "${lib_dir}/${name}"
+            chmod 0644 "${lib_dir}/${name}" 2>/dev/null || true
+            seen_libs["${name}"]="${path}"
+            printf '%s <- %s\n' "${name}" "${path}" >> "${manifest}"
+            copied=$((copied + 1))
+        done < <(ldd "${target}")
+    done
+
+    if [[ "${missing}" -ne 0 ]]; then
+        exit 1
+    fi
+
+    if [[ "${copied}" -eq 0 ]]; then
+        rm -f "${manifest}"
+        rmdir "${lib_dir}" 2>/dev/null || true
+        echo "    bundled   : no extra ELF libraries needed"
+    else
+        echo "    bundled   : ${copied} library file(s) in lib/"
+        echo "    manifest  : lib/manifest.txt"
+    fi
+}
+
+bundle_linux_elf_dependencies
+
 # ─── Examples + docs ─────────────────────────────────────────────────
 mkdir -p "${BUNDLE_DIR}/examples"
 cp examples/*.yaml "${BUNDLE_DIR}/examples/" 2>/dev/null || true
@@ -259,9 +398,10 @@ fi
 
 # ─── Top-level launcher ──────────────────────────────────────────────
 # The launcher no longer cd's into the bundle to find a local `assets/`
-# directory — there isn't one in client mode. The editor reads its
-# cache from `~/.memstroy/cache/` regardless of where the launcher was
-# invoked from, so we just exec the binary.
+# directory - there isn't one in client mode. It does set up the
+# bundled Linux runtime surface (PATH, LD_LIBRARY_PATH, FFmpeg env
+# vars), so desktop entries and ~/.local/bin symlinks must point at
+# this wrapper instead of directly at bin/memstroy-gui.
 cat > "${BUNDLE_DIR}/Memstroy-inator.sh" <<'LAUNCH'
 #!/usr/bin/env bash
 # Launch the Memstroy-inator editor.
@@ -271,10 +411,71 @@ cat > "${BUNDLE_DIR}/Memstroy-inator.sh" <<'LAUNCH'
 # the editor's Settings dialog if the operator has migrated their
 # backend.
 set -e
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "${SOURCE}" ]]; do
+    DIR="$(cd -P "$(dirname "${SOURCE}")" && pwd)"
+    SOURCE="$(readlink "${SOURCE}")"
+    [[ "${SOURCE}" != /* ]] && SOURCE="${DIR}/${SOURCE}"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "${SOURCE}")" && pwd)"
+
+export PATH="${SCRIPT_DIR}/bin${PATH:+:${PATH}}"
+if [[ -d "${SCRIPT_DIR}/lib" ]]; then
+    export LD_LIBRARY_PATH="${SCRIPT_DIR}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+fi
+if [[ -x "${SCRIPT_DIR}/bin/ffmpeg" ]]; then
+    export MEMSTROY_FFMPEG="${SCRIPT_DIR}/bin/ffmpeg"
+fi
+if [[ -x "${SCRIPT_DIR}/bin/ffprobe" ]]; then
+    export MEMSTROY_FFPROBE="${SCRIPT_DIR}/bin/ffprobe"
+fi
+
 exec "${SCRIPT_DIR}/bin/memstroy-gui" "$@"
 LAUNCH
 chmod +x "${BUNDLE_DIR}/Memstroy-inator.sh"
+
+cat > "${BUNDLE_DIR}/Memstroy-inator-safe-graphics.sh" <<'LAUNCH'
+#!/usr/bin/env bash
+# Launch through the WGPU path for machines where the default OpenGL
+# window opens black.
+set -e
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "${SOURCE}" ]]; do
+    DIR="$(cd -P "$(dirname "${SOURCE}")" && pwd)"
+    SOURCE="$(readlink "${SOURCE}")"
+    [[ "${SOURCE}" != /* ]] && SOURCE="${DIR}/${SOURCE}"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "${SOURCE}")" && pwd)"
+exec "${SCRIPT_DIR}/Memstroy-inator.sh" --graphics=safe "$@"
+LAUNCH
+chmod +x "${BUNDLE_DIR}/Memstroy-inator-safe-graphics.sh"
+
+cat > "${BUNDLE_DIR}/memstroy.sh" <<'LAUNCH'
+#!/usr/bin/env bash
+# Launch the bundled CLI with the same runtime environment as the GUI.
+set -e
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "${SOURCE}" ]]; do
+    DIR="$(cd -P "$(dirname "${SOURCE}")" && pwd)"
+    SOURCE="$(readlink "${SOURCE}")"
+    [[ "${SOURCE}" != /* ]] && SOURCE="${DIR}/${SOURCE}"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "${SOURCE}")" && pwd)"
+
+export PATH="${SCRIPT_DIR}/bin${PATH:+:${PATH}}"
+if [[ -d "${SCRIPT_DIR}/lib" ]]; then
+    export LD_LIBRARY_PATH="${SCRIPT_DIR}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+fi
+if [[ -x "${SCRIPT_DIR}/bin/ffmpeg" ]]; then
+    export MEMSTROY_FFMPEG="${SCRIPT_DIR}/bin/ffmpeg"
+fi
+if [[ -x "${SCRIPT_DIR}/bin/ffprobe" ]]; then
+    export MEMSTROY_FFPROBE="${SCRIPT_DIR}/bin/ffprobe"
+fi
+
+exec "${SCRIPT_DIR}/bin/memstroy" "$@"
+LAUNCH
+chmod +x "${BUNDLE_DIR}/memstroy.sh"
 
 # ─── Optional zip ────────────────────────────────────────────────────
 if [[ "${MAKE_ZIP}" -eq 1 ]]; then

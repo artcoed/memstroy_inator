@@ -45,6 +45,35 @@ enum ClipDragMode {
 // number `<= -1.0`.
 const MOVE_DRAG_BIAS: f32 = 1.0;
 
+fn clip_drag_original_window(
+    ui: &egui::Ui,
+    clip_id: egui::Id,
+    fallback_start: f32,
+    fallback_end: f32,
+) -> (f32, f32) {
+    let original_start = ui
+        .data(|d| d.get_temp::<f32>(clip_id.with("original_start")))
+        .unwrap_or(fallback_start);
+    let original_end = ui
+        .data(|d| d.get_temp::<f32>(clip_id.with("original_end")))
+        .unwrap_or(fallback_end);
+    (original_start, original_end.max(original_start))
+}
+
+fn clip_drag_total_delta_t(ui: &egui::Ui, clip_id: egui::Id, pps: f32) -> f32 {
+    if !pps.is_finite() || pps.abs() <= 1.0e-6 {
+        return 0.0;
+    }
+    let press_x = ui.data(|d| d.get_temp::<f32>(clip_id.with("press_origin_x")));
+    let cur_x = ui
+        .input(|i| i.pointer.interact_pos().or_else(|| i.pointer.hover_pos()))
+        .map(|p| p.x);
+    match (press_x, cur_x) {
+        (Some(px), Some(cx)) => (cx - px) / pps,
+        _ => ui.input(|i| i.pointer.delta().x) / pps,
+    }
+}
+
 // ─── COLORS ──────────────────────────────────────────────────────────
 
 const COL_BG_TRACK: Color32 = Color32::from_rgb(28, 26, 16);
@@ -9448,6 +9477,19 @@ struct SnapTargets {
     element_edges: Vec<f32>,
 }
 
+fn push_snap_window(edges: &mut Vec<f32>, start: f32, end: f32) {
+    if !start.is_finite() || !end.is_finite() {
+        return;
+    }
+    let start = start.max(0.0);
+    let end = end.max(start);
+    if end - start < 1.0e-4 {
+        return;
+    }
+    edges.push(start);
+    edges.push(end);
+}
+
 /// Collect every snap-eligible scene-time on the timeline:
 /// every clip edge except the dragged clip's own, plus timeline markers
 /// such as the playhead and scene boundaries. Used by
@@ -9465,15 +9507,13 @@ fn collect_snap_targets(state: &EditorState, exclude: &SnapExcludeList) -> SnapT
         if exclude.actors.contains(&i) {
             continue;
         }
-        out.push(a.t_in.unwrap_or(0.0));
-        out.push(a.t_out.unwrap_or(dur));
+        push_snap_window(&mut out, a.t_in.unwrap_or(0.0), a.t_out.unwrap_or(dur));
     }
     for (i, bg) in state.scene.backgrounds.iter().enumerate() {
         if exclude.backgrounds.contains(&i) {
             continue;
         }
-        out.push(bg.start);
-        out.push(bg.start + bg.duration);
+        push_snap_window(&mut out, bg.start, bg.start + bg.duration);
     }
     for (i, ov) in state.scene.overlays.iter().enumerate() {
         if exclude.overlays.contains(&i) {
@@ -9484,8 +9524,7 @@ fn collect_snap_targets(state: &EditorState, exclude: &SnapExcludeList) -> SnapT
             Overlay::Image(im) => (im.t_in, im.t_out),
             Overlay::Video(v) => (v.t_in, v.t_out),
         };
-        out.push(s);
-        out.push(e);
+        push_snap_window(&mut out, s, e);
     }
     for (i, au) in state.scene.audio.iter().enumerate() {
         if au.deleted {
@@ -9494,8 +9533,7 @@ fn collect_snap_targets(state: &EditorState, exclude: &SnapExcludeList) -> SnapT
         if exclude.audio.contains(&i) {
             continue;
         }
-        out.push(au.t_in);
-        out.push(au.t_out.unwrap_or(dur));
+        push_snap_window(&mut out, au.t_in, au.t_out.unwrap_or(dur));
     }
     out.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     out.dedup_by(|a, b| (*a - *b).abs() < 1.0e-5);
@@ -10285,9 +10323,15 @@ fn broadcast_footage_sequence_move_delta(
         .get(mover_idx)
         .and_then(|a| a.t_in)
         .unwrap_or(0.0);
+    if !primary_now.is_finite() {
+        return;
+    }
     let Some(mover_anchor) = state.timeline_drag.footage_sequence_mover_anchor else {
         return;
     };
+    if !mover_anchor.is_finite() {
+        return;
+    }
     let anchors = state.timeline_drag.footage_sequence_anchor.clone();
     let min_anchor_t = anchors
         .iter()
@@ -10308,6 +10352,9 @@ fn broadcast_footage_sequence_move_delta(
     }
     let requested = primary_now - mover_anchor;
     let accumulated = requested.max(-min_anchor_t);
+    if !accumulated.is_finite() {
+        return;
+    }
     if (accumulated - requested).abs() > 1.0e-5 {
         let target = mover_anchor + accumulated;
         shift_actor_timeline_by(state, mover_idx, target - primary_now);
@@ -11964,10 +12011,73 @@ fn split_time_for_pointer_x(
     Some(x_to_time(pointer_x, scroll, pps, track_left).clamp(min_t, max_t))
 }
 
+fn split_window_for_selection(state: &EditorState, sel: Selection) -> Option<(f32, f32)> {
+    let dur = state.scene.output.duration.max(0.0);
+    match sel {
+        Selection::Actor(i) => state
+            .scene
+            .actors
+            .get(i)
+            .map(|a| (a.t_in.unwrap_or(0.0), a.t_out.unwrap_or(dur))),
+        Selection::Overlay(i) => state.scene.overlays.get(i).map(|ov| match ov {
+            Overlay::Text(t) => (t.t_in, t.t_out),
+            Overlay::Image(im) => (im.t_in, im.t_out),
+            Overlay::Video(v) => (v.t_in, v.t_out),
+        }),
+        Selection::Audio(i) => state
+            .scene
+            .audio
+            .get(i)
+            .filter(|au| !au.deleted)
+            .map(|au| (au.t_in, au.t_out.unwrap_or(dur))),
+        Selection::Background(i) => state
+            .scene
+            .backgrounds
+            .get(i)
+            .map(|bg| (bg.start, bg.start + bg.duration)),
+        _ => None,
+    }
+}
+
+fn snap_split_time(state: &EditorState, sel: Selection, cut_t: f32) -> (f32, Option<f32>) {
+    let Some((clip_start, clip_end)) = split_window_for_selection(state, sel) else {
+        return (cut_t, None);
+    };
+    if !cut_t.is_finite()
+        || !clip_start.is_finite()
+        || !clip_end.is_finite()
+        || clip_end <= clip_start
+    {
+        return (cut_t, None);
+    }
+    let min_t = clip_start + MIN_SPLIT_HALF_SEC;
+    let max_t = clip_end - MIN_SPLIT_HALF_SEC;
+    if max_t <= min_t {
+        return (cut_t, None);
+    }
+    let cut_t = cut_t.clamp(min_t, max_t);
+    if !state.snap_enabled {
+        return (cut_t, None);
+    }
+
+    let mut exclude = SnapExcludeList::default();
+    exclude.insert_selection(sel);
+    let targets = collect_snap_targets(state, &exclude);
+    let threshold = snap_threshold_for_state(state);
+    if let Some(snapped) = snap_time(cut_t, &targets.element_edges, threshold) {
+        if snapped >= min_t && snapped <= max_t {
+            return (snapped, Some(snapped));
+        }
+    }
+    (cut_t, None)
+}
+
 /// Queue a timeline razor split at scene-time `cut_t` for `sel`.
 pub(crate) fn queue_timeline_split(state: &mut EditorState, sel: Selection, cut_t: f32) {
+    let (cut_t, snap_t) = snap_split_time(state, sel, cut_t);
     state.pending_timeline_split = Some((sel, cut_t));
     state.playhead = cut_t;
+    state.timeline_drag.snap_indicator = snap_t;
 }
 
 fn sel_for_victim(victim: VictimKind) -> Selection {
@@ -12236,13 +12346,21 @@ fn ensure_actor_footage_sequence_id(state: &mut EditorState, actor_idx: usize) -
 }
 
 fn actor_window(actor: &Actor, scene_duration: f32) -> (f32, f32) {
-    let t_in = actor.t_in.unwrap_or(0.0);
-    let t_out = actor.t_out.unwrap_or(scene_duration).max(t_in + 0.001);
+    let t_in = actor.t_in.filter(|t| t.is_finite()).unwrap_or(0.0).max(0.0);
+    let fallback_out = scene_duration
+        .is_finite()
+        .then_some(scene_duration)
+        .unwrap_or(t_in + 0.001);
+    let t_out = actor
+        .t_out
+        .filter(|t| t.is_finite())
+        .unwrap_or(fallback_out)
+        .max(t_in + 0.001);
     (t_in, t_out)
 }
 
 fn shift_canvas_layout_timeline_by(scene: &mut Scene, element_id: &str, dt: f32) {
-    if dt.abs() <= 1.0e-6 {
+    if !dt.is_finite() || dt.abs() <= 1.0e-6 {
         return;
     }
     if let Some(cl) = scene
@@ -12253,8 +12371,8 @@ fn shift_canvas_layout_timeline_by(scene: &mut Scene, element_id: &str, dt: f32)
         for kf in &mut cl.keyframes {
             kf.t = (kf.t + dt).max(0.0);
         }
-        cl.keyframes
-            .sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
+        cl.keyframes.retain(|kf| kf.t.is_finite());
+        cl.keyframes.sort_by(|a, b| a.t.total_cmp(&b.t));
     }
 }
 
@@ -12292,31 +12410,50 @@ fn retain_canvas_layout_scene_window(scene: &mut Scene, element_id: &str, t_in: 
         if cl.keyframes.is_empty() {
             cl.keyframes.push(boundary);
         }
-        cl.keyframes
-            .sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
+        cl.keyframes.retain(|kf| kf.t.is_finite());
+        cl.keyframes.sort_by(|a, b| a.t.total_cmp(&b.t));
     }
 }
 
 fn shift_actor_timeline_by(state: &mut EditorState, actor_idx: usize, dt: f32) {
-    if dt.abs() <= 1.0e-5 || actor_idx >= state.scene.actors.len() {
+    if !dt.is_finite() || dt.abs() <= 1.0e-5 || actor_idx >= state.scene.actors.len() {
         return;
     }
+    let scene_duration = state.scene.output.duration.max(0.1);
     let actor_id;
     {
         let actor = &mut state.scene.actors[actor_idx];
+        let (cur_in, cur_out) = actor_window(actor, scene_duration);
         actor_id = actor.id.clone();
-        actor.t_in = Some(actor.t_in.unwrap_or(0.0) + dt);
-        actor.t_out = Some(actor.t_out.unwrap_or(state.scene.output.duration) + dt);
+        let next_in = (cur_in + dt).max(0.0);
+        let next_out = (cur_out + dt).max(next_in + 0.001);
+        actor.t_in = Some(next_in);
+        actor.t_out = Some(next_out);
         for kf in &mut actor.layout {
-            kf.t += dt;
+            kf.t = (kf.t + dt).max(0.0);
         }
+        actor.layout.retain(|kf| kf.t.is_finite());
+        actor.layout.sort_by(|a, b| a.t.total_cmp(&b.t));
     }
     shift_canvas_layout_timeline_by(&mut state.scene, &actor_id, dt);
     sync_audio_to_actor(state, actor_idx);
 }
 
+fn shift_overlay_window(t_in: &mut f32, t_out: &mut f32, dt: f32) {
+    let cur_in = t_in.is_finite().then_some(*t_in).unwrap_or(0.0).max(0.0);
+    let cur_out = t_out
+        .is_finite()
+        .then_some(*t_out)
+        .unwrap_or(cur_in + 0.001)
+        .max(cur_in + 0.001);
+    let next_in = (cur_in + dt).max(0.0);
+    let next_out = (cur_out + dt).max(next_in + 0.001);
+    *t_in = next_in;
+    *t_out = next_out;
+}
+
 fn shift_overlay_timeline_by(state: &mut EditorState, overlay_idx: usize, dt: f32) {
-    if dt.abs() <= 1.0e-5 || overlay_idx >= state.scene.overlays.len() {
+    if !dt.is_finite() || dt.abs() <= 1.0e-5 || overlay_idx >= state.scene.overlays.len() {
         return;
     }
     let element_id = match &state.scene.overlays[overlay_idx] {
@@ -12325,18 +12462,9 @@ fn shift_overlay_timeline_by(state: &mut EditorState, overlay_idx: usize, dt: f3
         Overlay::Video(v) => v.id.clone(),
     };
     match &mut state.scene.overlays[overlay_idx] {
-        Overlay::Text(t) => {
-            t.t_in = (t.t_in + dt).max(0.0);
-            t.t_out = (t.t_out + dt).max(t.t_in + 0.001);
-        }
-        Overlay::Image(im) => {
-            im.t_in = (im.t_in + dt).max(0.0);
-            im.t_out = (im.t_out + dt).max(im.t_in + 0.001);
-        }
-        Overlay::Video(v) => {
-            v.t_in = (v.t_in + dt).max(0.0);
-            v.t_out = (v.t_out + dt).max(v.t_in + 0.001);
-        }
+        Overlay::Text(t) => shift_overlay_window(&mut t.t_in, &mut t.t_out, dt),
+        Overlay::Image(im) => shift_overlay_window(&mut im.t_in, &mut im.t_out, dt),
+        Overlay::Video(v) => shift_overlay_window(&mut v.t_in, &mut v.t_out, dt),
     }
     shift_canvas_layout_timeline_by(&mut state.scene, &element_id, dt);
 }
@@ -12390,11 +12518,16 @@ fn shift_element_timeline_by_id(
         shift_actor_timeline_by(state, actor_idx, dt);
         return Some(Selection::Actor(actor_idx));
     }
-    if let Some(overlay_idx) = state.scene.overlays.iter().position(|overlay| match overlay {
-        Overlay::Text(o) => o.id == element_id,
-        Overlay::Image(o) => o.id == element_id,
-        Overlay::Video(o) => o.id == element_id,
-    }) {
+    if let Some(overlay_idx) = state
+        .scene
+        .overlays
+        .iter()
+        .position(|overlay| match overlay {
+            Overlay::Text(o) => o.id == element_id,
+            Overlay::Image(o) => o.id == element_id,
+            Overlay::Video(o) => o.id == element_id,
+        })
+    {
         shift_overlay_timeline_by(state, overlay_idx, dt);
         return Some(Selection::Overlay(overlay_idx));
     }
@@ -12407,7 +12540,7 @@ fn shift_parented_descendants_timeline_by(
     dt: f32,
     excluded: &std::collections::HashSet<String>,
 ) {
-    if dt.abs() <= 1.0e-5 {
+    if !dt.is_finite() || dt.abs() <= 1.0e-5 {
         return;
     }
     let descendants = collect_parented_descendants_excluding(&state.scene, root_id, excluded);
@@ -12442,6 +12575,9 @@ fn move_footage_sequence_from_anchors(
     anchors: &[crate::state::GroupMoveAnchor],
     raw_dt: f32,
 ) -> f32 {
+    if !raw_dt.is_finite() {
+        return 0.0;
+    }
     let min_anchor_t = anchors
         .iter()
         .filter_map(|anchor| {
@@ -12490,6 +12626,9 @@ fn move_footage_sequence_from_anchors(
 }
 
 fn shift_footage_sequence_at_or_after(state: &mut EditorState, sequence_id: &str, t: f32, dt: f32) {
+    if !t.is_finite() || !dt.is_finite() || dt.abs() <= 1.0e-6 {
+        return;
+    }
     let indices: Vec<usize> = state
         .scene
         .actors
@@ -12588,7 +12727,11 @@ pub(crate) fn fill_footage_sequence_slot(
         .and_then(|s| s.to_str())
         .unwrap_or("mellstroy");
     let id = unique_actor_id_in_scene(&state.scene.actors, stem);
-    let clip_duration = clip_duration_for_placement(state, path, &id).max(0.1);
+    let clip_duration = clip_duration_for_placement(state, path, &id);
+    if !clip_duration.is_finite() {
+        return None;
+    }
+    let clip_duration = clip_duration.max(0.1);
     let new_out = t_in + clip_duration;
     let delta = new_out - old_out;
 
@@ -12727,7 +12870,8 @@ fn find_footage_sequence_insert_at(
             Some((sequence_id, t_in, t_out))
         })
         .collect();
-    clips.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    clips.retain(|(_, t_in, t_out)| t_in.is_finite() && t_out.is_finite());
+    clips.sort_by(|a, b| a.1.total_cmp(&b.1));
     for pair in clips.windows(2) {
         let left = &pair[0];
         let right = &pair[1];
@@ -12761,6 +12905,9 @@ fn insert_footage_sequence_clip_at(
         .unwrap_or("mellstroy");
     let actor_id = unique_actor_id_in_scene(&state.scene.actors, stem);
     let dur = clip_duration_for_placement(state, path, &actor_id).max(0.1);
+    if !dur.is_finite() {
+        return None;
+    }
     shift_footage_sequence_at_or_after(state, &sequence_id, insert_t, dur);
     let idx =
         add_actor_from_clip_at_time_with_footage_flag(state, path, insert_t, true, false, None)?;
@@ -13038,11 +13185,11 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             add_text_overlay(state);
         }
 
-        // Extract Frame tool — bake the render frame at the current
-        // playhead into a fresh image asset + image overlay layer.
-        // Selection is deliberately ignored: this button is a screenshot
-        // of the render area, not a "selected-only" crop command.
-        let extract_hover = t("Extract render frame as image");
+        // Extract Frame tool — without a visual selection, bake the
+        // render frame; with actors/overlays selected, bake those
+        // elements into a transparent image at their canvas bounds.
+        let extract_hover =
+            t("Extract selected elements, or the render frame when nothing is selected");
         if ui.button(RichText::new(format!("IMG+ {}", t("Extract as image"))).color(Color32::from_rgb(255, 200, 120)))
             .on_hover_text(extract_hover)
             .clicked()
@@ -14227,22 +14374,23 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             if clicked == f32::INFINITY {
                                 // Trim left: pull the start forward, keep the
                                 // end fixed (Premiere "ripple-trim from in").
-                                let dx = ui.input(|i| i.pointer.delta().x);
-                                let delta_t = dx / pps;
+                                let (orig_start, orig_end) =
+                                    clip_drag_original_window(ui, bg_id, clip_start, clip_end);
+                                let delta_t = clip_drag_total_delta_t(ui, bg_id, pps);
                                 let mut new_start =
-                                    (clip_start + delta_t).max(0.0).min(clip_end - 0.1);
+                                    (orig_start + delta_t).max(0.0).min(orig_end - 0.1);
                                 // Snap-to-edges: glue the in-edge to a
                                 // neighbour edge / playhead within ~5 px.
                                 let (snapped_in, _, snap_t) = apply_snap_to_window(
                                     state,
                                     new_start,
-                                    clip_end,
+                                    orig_end,
                                     SnapMode::TrimLeft,
                                     Selection::Background(bi),
                                 );
                                 new_start = snapped_in;
                                 state.timeline_drag.snap_indicator = snap_t;
-                                let new_dur = (clip_end - new_start).max(0.1);
+                                let new_dur = (orig_end - new_start).max(0.1);
                                 let token = EditorState::drag_token("trim_bg_left", bi);
                                 state.mutate_drag(token, |s| {
                                     s.backgrounds[bi].start = new_start;
@@ -14258,24 +14406,25 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                     state,
                                     MovedClipKind::Background(bi),
                                     TrimEdge::Left,
-                                    clip_start,
+                                    orig_start,
                                     token,
                                 );
                             } else if clicked == f32::NEG_INFINITY {
                                 // Trim right: stretch / shrink the duration.
-                                let dx = ui.input(|i| i.pointer.delta().x);
-                                let delta_t = dx / pps;
-                                let mut new_end = (clip_end + delta_t).max(clip_start + 0.1);
+                                let (orig_start, orig_end) =
+                                    clip_drag_original_window(ui, bg_id, clip_start, clip_end);
+                                let delta_t = clip_drag_total_delta_t(ui, bg_id, pps);
+                                let mut new_end = (orig_end + delta_t).max(orig_start + 0.1);
                                 let (_, snapped_out, snap_t) = apply_snap_to_window(
                                     state,
-                                    clip_start,
+                                    orig_start,
                                     new_end,
                                     SnapMode::TrimRight,
                                     Selection::Background(bi),
                                 );
                                 new_end = snapped_out;
                                 state.timeline_drag.snap_indicator = snap_t;
-                                let new_dur = (new_end - clip_start).max(0.1);
+                                let new_dur = (new_end - orig_start).max(0.1);
                                 let token = EditorState::drag_token("trim_bg_right", bi);
                                 state.mutate_drag(token, |s| {
                                     s.backgrounds[bi].duration = new_dur;
@@ -14286,7 +14435,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                     state,
                                     MovedClipKind::Background(bi),
                                     TrimEdge::Right,
-                                    clip_end,
+                                    orig_end,
                                     token,
                                 );
                             } else if clicked < 0.0 {
@@ -14454,9 +14603,10 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                     if let Some(clicked) = clicked {
                         if clicked == f32::INFINITY {
                             // Trim left edge: adjust t_in
-                            let dx = ui.input(|i| i.pointer.delta().x);
-                            let delta_t = dx / pps;
-                            let mut new_in = (clip_start + delta_t).max(0.0).min(clip_end - 0.1);
+                            let (orig_start, orig_end) =
+                                clip_drag_original_window(ui, actor_id, clip_start, clip_end);
+                            let delta_t = clip_drag_total_delta_t(ui, actor_id, pps);
+                            let mut new_in = (orig_start + delta_t).max(0.0).min(orig_end - 0.1);
                             let source_start_before = state.scene.actors[ai].source_start;
                             let actor_is_edge_frame =
                                 state.scene.actors[ai].mellstroy_footage.edge_frame;
@@ -14471,7 +14621,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             let (snapped_in, _, snap_t) = apply_snap_to_window(
                                 state,
                                 new_in,
-                                clip_end,
+                                orig_end,
                                 SnapMode::TrimLeft,
                                 Selection::Actor(ai),
                             );
@@ -14499,7 +14649,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                     s,
                                     &actor_id_for_canvas,
                                     new_in,
-                                    clip_end,
+                                    orig_end,
                                 );
                             });
                             // Defer overlap-trim until the drag ends —
@@ -14515,7 +14665,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                 state,
                                 MovedClipKind::Actor(ai),
                                 TrimEdge::Left,
-                                clip_start,
+                                orig_start,
                                 token,
                             );
                         } else if clicked == f32::NEG_INFINITY {
@@ -14526,15 +14676,16 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             // its real footage. Without this clamp the timeline
                             // happily lets you drag the right edge into infinity
                             // and the trailing area plays as a frozen black frame.
-                            let dx = ui.input(|i| i.pointer.delta().x);
-                            let delta_t = dx / pps;
-                            let mut new_out = (clip_end + delta_t).max(clip_start + 0.1);
+                            let (orig_start, orig_end) =
+                                clip_drag_original_window(ui, actor_id, clip_start, clip_end);
+                            let delta_t = clip_drag_total_delta_t(ui, actor_id, pps);
+                            let mut new_out = (orig_end + delta_t).max(orig_start + 0.1);
                             // Source duration upper bound, only applied when the
                             // frame cache for the actor has finished probing.
                             // `t_out_max = t_in + max_clip_dur` where
                             // `max_clip_dur = source_duration - source_start`.
                             let actor = &state.scene.actors[ai];
-                            let hard_cap_out = max_timeline_out_for_actor(state, actor, clip_start);
+                            let hard_cap_out = max_timeline_out_for_actor(state, actor, orig_start);
                             if let Some(cap) = hard_cap_out {
                                 if new_out > cap {
                                     new_out = cap;
@@ -14546,12 +14697,12 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             // past its real footage.
                             let (_, snapped_out, snap_t) = apply_snap_to_window(
                                 state,
-                                clip_start,
+                                orig_start,
                                 new_out,
                                 SnapMode::TrimRight,
                                 Selection::Actor(ai),
                             );
-                            new_out = snapped_out.max(clip_start + 0.1);
+                            new_out = snapped_out.max(orig_start + 0.1);
                             if let Some(cap) = hard_cap_out {
                                 if new_out > cap {
                                     new_out = cap;
@@ -14574,7 +14725,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                 retain_canvas_layout_scene_window(
                                     s,
                                     &actor_id_for_canvas,
-                                    clip_start,
+                                    orig_start,
                                     new_out,
                                 );
                             });
@@ -14588,7 +14739,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                 state,
                                 MovedClipKind::Actor(ai),
                                 TrimEdge::Right,
-                                clip_end,
+                                orig_end,
                                 token,
                             );
                         } else if clicked < 0.0 {
@@ -15023,9 +15174,10 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                     if let Some(clicked) = clicked {
                         if clicked == f32::INFINITY {
                             // Trim left edge.
-                            let dx = ui.input(|i| i.pointer.delta().x);
-                            let delta_t = dx / pps;
-                            let mut new_in = (clip_start + delta_t).max(0.0).min(clip_end - 0.1);
+                            let (orig_start, orig_end) =
+                                clip_drag_original_window(ui, ov_id, clip_start, clip_end);
+                            let delta_t = clip_drag_total_delta_t(ui, ov_id, pps);
+                            let mut new_in = (orig_start + delta_t).max(0.0).min(orig_end - 0.1);
                             let video_source = match &state.scene.overlays[oi] {
                                 Overlay::Video(v) => Some((v.source_start, v.speed.max(0.0001))),
                                 _ => None,
@@ -15037,7 +15189,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             let (snapped_in, _, snap_t) = apply_snap_to_window(
                                 state,
                                 new_in,
-                                clip_end,
+                                orig_end,
                                 SnapMode::TrimLeft,
                                 Selection::Overlay(oi),
                             );
@@ -15090,7 +15242,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                         ));
                                     }
                                 }
-                                retain_canvas_layout_scene_window(s, &element_id, new_in, clip_end);
+                                retain_canvas_layout_scene_window(s, &element_id, new_in, orig_end);
                             });
                             // Defer overlap-trim until the drag ends.
                             defer_overlap_resolution(state, MovedClipKind::Overlay(oi));
@@ -15099,21 +15251,22 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                 state,
                                 MovedClipKind::Overlay(oi),
                                 TrimEdge::Left,
-                                clip_start,
+                                orig_start,
                                 token,
                             );
                         } else if clicked == f32::NEG_INFINITY {
                             // Trim right edge.
-                            let dx = ui.input(|i| i.pointer.delta().x);
-                            let delta_t = dx / pps;
-                            let mut new_out = (clip_end + delta_t).max(clip_start + 0.1);
+                            let (orig_start, orig_end) =
+                                clip_drag_original_window(ui, ov_id, clip_start, clip_end);
+                            let delta_t = clip_drag_total_delta_t(ui, ov_id, pps);
+                            let mut new_out = (orig_end + delta_t).max(orig_start + 0.1);
                             let hard_cap_out = match &state.scene.overlays[oi] {
                                 Overlay::Video(v) => max_timeline_out_for_media(
                                     state,
                                     &v.source,
                                     v.source_start,
                                     v.speed,
-                                    clip_start,
+                                    orig_start,
                                 ),
                                 _ => None,
                             };
@@ -15124,12 +15277,12 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             }
                             let (_, snapped_out, snap_t) = apply_snap_to_window(
                                 state,
-                                clip_start,
+                                orig_start,
                                 new_out,
                                 SnapMode::TrimRight,
                                 Selection::Overlay(oi),
                             );
-                            new_out = snapped_out.max(clip_start + 0.1);
+                            new_out = snapped_out.max(orig_start + 0.1);
                             if let Some(cap) = hard_cap_out {
                                 if new_out > cap {
                                     new_out = cap;
@@ -15173,7 +15326,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                 retain_canvas_layout_scene_window(
                                     s,
                                     &element_id,
-                                    clip_start,
+                                    orig_start,
                                     new_out,
                                 );
                             });
@@ -15183,7 +15336,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                 state,
                                 MovedClipKind::Overlay(oi),
                                 TrimEdge::Right,
-                                clip_end,
+                                orig_end,
                                 token,
                             );
                         } else if clicked < 0.0 {
@@ -15493,9 +15646,10 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             // source_start by the same delta so the playback
                             // offset stays consistent (the audio doesn't
                             // appear to skip ahead under the user's hand).
-                            let dx = ui.input(|i| i.pointer.delta().x);
-                            let delta_t = dx / pps;
-                            let mut new_in = (clip_start + delta_t).max(0.0).min(clip_end - 0.1);
+                            let (orig_start, orig_end) =
+                                clip_drag_original_window(ui, audio_id, clip_start, clip_end);
+                            let delta_t = clip_drag_total_delta_t(ui, audio_id, pps);
+                            let mut new_in = (orig_start + delta_t).max(0.0).min(orig_end - 0.1);
                             let source_start_before = state.scene.audio[aui].source_start;
                             let audio_speed = state.scene.audio[aui].speed.max(0.0001);
                             let min_in_from_source =
@@ -15505,7 +15659,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             let (snapped_in, _, snap_t) = apply_snap_to_window(
                                 state,
                                 new_in,
-                                clip_end,
+                                orig_end,
                                 SnapMode::TrimLeft,
                                 Selection::Audio(aui),
                             );
@@ -15526,20 +15680,21 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                 state,
                                 MovedClipKind::Audio(aui),
                                 TrimEdge::Left,
-                                clip_start,
+                                orig_start,
                                 token,
                             );
                         } else if clicked == f32::NEG_INFINITY {
                             // Trim right: extend / shrink the audible window.
-                            let dx = ui.input(|i| i.pointer.delta().x);
-                            let delta_t = dx / pps;
-                            let mut new_out = (clip_end + delta_t).max(clip_start + 0.1);
+                            let (orig_start, orig_end) =
+                                clip_drag_original_window(ui, audio_id, clip_start, clip_end);
+                            let delta_t = clip_drag_total_delta_t(ui, audio_id, pps);
+                            let mut new_out = (orig_end + delta_t).max(orig_start + 0.1);
                             let hard_cap_out = max_timeline_out_for_media(
                                 state,
                                 &state.scene.audio[aui].source,
                                 state.scene.audio[aui].source_start,
                                 state.scene.audio[aui].speed,
-                                clip_start,
+                                orig_start,
                             );
                             if let Some(cap) = hard_cap_out {
                                 if new_out > cap {
@@ -15548,12 +15703,12 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             }
                             let (_, snapped_out, snap_t) = apply_snap_to_window(
                                 state,
-                                clip_start,
+                                orig_start,
                                 new_out,
                                 SnapMode::TrimRight,
                                 Selection::Audio(aui),
                             );
-                            new_out = snapped_out.max(clip_start + 0.1);
+                            new_out = snapped_out.max(orig_start + 0.1);
                             if let Some(cap) = hard_cap_out {
                                 if new_out > cap {
                                     new_out = cap;
@@ -15570,7 +15725,7 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                 state,
                                 MovedClipKind::Audio(aui),
                                 TrimEdge::Right,
-                                clip_end,
+                                orig_end,
                                 token,
                             );
                         } else if clicked < 0.0 {
@@ -16322,27 +16477,45 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             }
 
             if matches!(kind, AssetDragKind::Clip | AssetDragKind::Video) {
-                // Pick the destination video lane. Cursor wins even
-                // when that lane is already occupied: dropping onto an
-                // existing lane is an intentional overwrite/insert, so
-                // the overlap resolver trims or splits the previous
-                // contents after the new clip is placed.
                 let cursor_lane = drop_track.filter(|i| {
                     state.tracks[*i].kind == TrackKind::Video && !state.tracks[*i].locked
                 });
-                let assigned = match cursor_lane {
-                    Some(t) => t,
-                    None => state.pick_or_create_empty_video_lane_at(drop_time),
-                };
-                let target_slot = if matches!(kind, AssetDragKind::Clip | AssetDragKind::Video) {
-                    find_footage_sequence_slot_at(state, assigned, drop_time)
+                let cursor_slot = cursor_lane
+                    .and_then(|lane| find_footage_sequence_slot_at(state, lane, drop_time));
+                let cursor_sequence_insert = if cursor_slot.is_none() {
+                    cursor_lane
+                        .and_then(|lane| find_footage_sequence_insert_at(state, lane, drop_time))
                 } else {
                     None
                 };
-                let target_sequence_insert = if target_slot.is_none()
-                    && matches!(kind, AssetDragKind::Clip | AssetDragKind::Video)
-                {
-                    find_footage_sequence_insert_at(state, assigned, drop_time)
+                let sequence_drop =
+                    cursor_slot.is_some() || cursor_sequence_insert.as_ref().is_some();
+                let destructive_drop = ui.input(|i| i.modifiers.alt);
+                let duration_hint = state.asset_drag.duration_secs;
+                let placement_duration = duration_hint
+                    .or_else(|| state.video_duration_cache.get(&asset_path).copied())
+                    .filter(|d| d.is_finite() && *d > 0.01)
+                    .unwrap_or(crate::split_crop::CLIP_DURATION_PLACEHOLDER_SEC)
+                    .max(0.1);
+                let assigned = if sequence_drop || destructive_drop {
+                    match cursor_lane {
+                        Some(t) => t,
+                        None => state.pick_or_create_nearest_empty_video_lane_for_range(
+                            drop_time,
+                            drop_time + placement_duration,
+                            None,
+                        ),
+                    }
+                } else {
+                    state.pick_or_create_nearest_empty_video_lane_for_range(
+                        drop_time,
+                        drop_time + placement_duration,
+                        cursor_lane,
+                    )
+                };
+                let target_slot = if sequence_drop { cursor_slot } else { None };
+                let target_sequence_insert = if sequence_drop {
+                    cursor_sequence_insert
                 } else {
                     None
                 };
@@ -16366,7 +16539,6 @@ pub fn timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                     .and_then(|slot_idx| state.scene.actors.get(slot_idx).map(|a| a.id.clone()))
                     .map(|actor_id| crate::jobs::ClipDropTarget::SequenceSlot { actor_id })
                     .unwrap_or(crate::jobs::ClipDropTarget::TimelineAt { t: drop_time });
-                let duration_hint = state.asset_drag.duration_secs;
                 if kind == AssetDragKind::Clip {
                     if target_slot.is_none() && dragged_clip_needs_download(state, &asset_path) {
                         if let Some(new_idx) = add_pending_actor_from_clip_at_time(
@@ -17551,6 +17723,7 @@ fn draw_clip(
     let mode_id = id.with("drag_mode");
     let origin_id = id.with("press_origin_x");
     let original_start_id = id.with("original_start");
+    let original_end_id = id.with("original_end");
 
     if resp.drag_started() && !locked && !split_mode {
         let press_x = ui
@@ -17579,6 +17752,7 @@ fn draw_clip(
             d.insert_temp(mode_id, mode);
             d.insert_temp(origin_id, press_x);
             d.insert_temp(original_start_id, clip_start);
+            d.insert_temp(original_end_id, clip_end);
         });
     }
 
@@ -17953,6 +18127,7 @@ fn draw_audio_clip(
     let mode_id = id.with("drag_mode");
     let origin_id = id.with("press_origin_x");
     let original_start_id = id.with("original_start");
+    let original_end_id = id.with("original_end");
 
     if resp.drag_started() && !locked && !_split_mode {
         let press_x = ui
@@ -17972,6 +18147,7 @@ fn draw_audio_clip(
             d.insert_temp(mode_id, mode);
             d.insert_temp(origin_id, press_x);
             d.insert_temp(original_start_id, clip_start);
+            d.insert_temp(original_end_id, clip_end);
         });
     }
 
@@ -20598,7 +20774,11 @@ fn ensure_media_duration_probe(state: &mut EditorState, path: &PathBuf) {
 
 /// Non-blocking duration: use cache, else spawn ffprobe in the background.
 fn clip_duration_for_placement(state: &mut EditorState, path: &PathBuf, actor_id: &str) -> f32 {
-    if let Some(&d) = state.video_duration_cache.get(path) {
+    if let Some(&d) = state
+        .video_duration_cache
+        .get(path)
+        .filter(|d| d.is_finite() && **d > 0.01)
+    {
         return d;
     }
     // Never block the UI thread on ffprobe when dropping a clip — use a
@@ -21223,11 +21403,14 @@ pub(crate) fn fit_actor_to_selection_rect(
     let (mn, mx) = rect;
     let rect_w = (mx[0] - mn[0]).abs().max(1.0);
     let rect_h = (mx[1] - mn[1]).abs().max(1.0);
+    if !rect_w.is_finite() || !rect_h.is_finite() || !mn[0].is_finite() || !mn[1].is_finite() {
+        return;
+    }
     let Some((src_w, src_h)) = fit_actor_source_dims_for_canvas(state, actor_idx, hinted_dims)
     else {
         return;
     };
-    if src_w < 1.0 || src_h < 1.0 {
+    if !src_w.is_finite() || !src_h.is_finite() || src_w < 1.0 || src_h < 1.0 {
         return;
     }
 
@@ -21393,6 +21576,48 @@ mod timeline_resolution_tests {
         );
     }
 
+    #[test]
+    fn sequence_actor_window_sanitizes_invalid_edges() {
+        let mut clip = actor("broken", 1.0, 2.0, 0.0, 1.0);
+        clip.t_in = Some(f32::NAN);
+        clip.t_out = Some(f32::INFINITY);
+
+        let (t_in, t_out) = actor_window(&clip, 20.0);
+
+        assert_close(t_in, 0.0);
+        assert_close(t_out, 20.0);
+        assert!(t_in.is_finite());
+        assert!(t_out.is_finite());
+    }
+
+    #[test]
+    fn snap_targets_ignore_invalid_or_zero_length_windows() {
+        let mut state = test_state();
+        state.scene.actors.push(actor("ok", 1.0, 3.0, 0.0, 1.0));
+        state.scene.actors.push(actor("zero", 5.0, 5.0, 0.0, 1.0));
+        state
+            .scene
+            .actors
+            .push(actor("reversed", 8.0, 7.0, 0.0, 1.0));
+        state.scene.backgrounds.push(Background {
+            id: "bg_zero".into(),
+            source: MediaSource::SolidColor { color: [0, 0, 0] },
+            start: 9.0,
+            duration: 0.0,
+            fit: Fit::Cover,
+            transition: Transition::Cut,
+        });
+        state
+            .scene
+            .audio
+            .push(audio("deleted", 10.0, 12.0, 0.0, 1.0));
+        state.scene.audio[0].deleted = true;
+
+        let targets = collect_snap_targets(&state, &SnapExcludeList::default()).element_edges;
+
+        assert_eq!(targets, vec![1.0, 3.0]);
+    }
+
     fn temp_video(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "memstroy-sequence-test-{}-{}.mp4",
@@ -21431,6 +21656,48 @@ mod timeline_resolution_tests {
         let t = split_time_for_pointer_x(50.0, 0.0, 100.0, 0.0, 1.0, 2.0)
             .expect("normal clip should split");
         assert_close(t, 1.05);
+    }
+
+    #[test]
+    fn split_tool_snaps_cut_to_nearby_clip_edge() {
+        let mut state = test_state();
+        state.timeline_zoom = 100.0;
+        state.snap_enabled = true;
+        state.scene.actors.push(actor("cut_me", 1.0, 5.0, 0.0, 1.0));
+        state
+            .scene
+            .actors
+            .push(actor("snap_target", 3.0, 4.0, 0.0, 1.0));
+
+        queue_timeline_split(&mut state, Selection::Actor(0), 2.94);
+
+        let Some((Selection::Actor(0), cut_t)) = state.pending_timeline_split else {
+            panic!("split should be queued for the clicked actor");
+        };
+        assert_close(cut_t, 3.0);
+        assert_close(state.playhead, 3.0);
+        assert_close(state.timeline_drag.snap_indicator.unwrap(), 3.0);
+    }
+
+    #[test]
+    fn split_tool_keeps_raw_cut_time_when_snap_is_disabled() {
+        let mut state = test_state();
+        state.timeline_zoom = 100.0;
+        state.snap_enabled = false;
+        state.scene.actors.push(actor("cut_me", 1.0, 5.0, 0.0, 1.0));
+        state
+            .scene
+            .actors
+            .push(actor("snap_target", 3.0, 4.0, 0.0, 1.0));
+
+        queue_timeline_split(&mut state, Selection::Actor(0), 2.94);
+
+        let Some((Selection::Actor(0), cut_t)) = state.pending_timeline_split else {
+            panic!("split should be queued for the clicked actor");
+        };
+        assert_close(cut_t, 2.94);
+        assert_close(state.playhead, 2.94);
+        assert!(state.timeline_drag.snap_indicator.is_none());
     }
 
     #[test]

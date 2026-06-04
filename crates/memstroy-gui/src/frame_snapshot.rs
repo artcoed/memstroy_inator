@@ -13,10 +13,11 @@
 //!
 //! Two modes:
 //!
-//! - **Full frame**: every visible layer at `t` is composited like the
-//!   rendered frame. The toolbar action always captures the render area;
-//!   regular canvas/layer selection is ignored so clips do not vanish
-//!   from the screenshot when a few image layers happen to be selected.
+//! - **Full frame**: when nothing visual is selected, every visible layer
+//!   at `t` is composited inside the render frame.
+//! - **Selected elements**: when at least one actor / overlay is selected,
+//!   only those elements are composited into a transparent image sized to
+//!   their canvas-world bounds, independent of the render-frame crop.
 //!
 //! In both modes the resulting RGBA is saved as
 //! `assets/images/frame_<unix-millis>.png` and a fresh
@@ -55,7 +56,7 @@
 //! - empty text body (silently treated as success — there's nothing
 //!   to draw).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use image::{Rgba, RgbaImage};
 use memstroy_core::{
@@ -65,7 +66,7 @@ use memstroy_core::{
 };
 
 use crate::image_effects;
-use crate::state::{EditorState, Selection};
+use crate::state::{EditorState, Selection, SnapshotImagePlacement};
 use crate::video_cache;
 
 /// Public entry point — composes the canvas at the playhead, saves
@@ -77,17 +78,13 @@ pub fn extract_frame_to_image_layer(state: &mut EditorState) -> Result<usize, St
 
     // ── Decide which layers to capture ───────────────────────────
     //
-    // Always capture the WHOLE render frame. The plain inspector /
-    // timeline selection is intentionally ignored here: leaving one
-    // element selected should not make the toolbar action crop a
-    // seemingly random fragment instead of baking the current frame.
     let (subset, full_frame) = resolve_extract_subset(state);
 
     // ── Compose ──────────────────────────────────────────────────
     let summary = if full_frame {
         compose_full_frame_via_render_compositor(state, t)?
     } else {
-        compose_frame(state, &subset, full_frame, t)
+        compose_frame(state, &subset, full_frame, t)?
     };
     let img = summary.image;
     let w = img.width();
@@ -98,7 +95,7 @@ pub fn extract_frame_to_image_layer(state: &mut EditorState) -> Result<usize, St
 
     // ── Save into project library + spawn the new overlay ────────
     let asset = state.save_snapshot_image_to_library(img.as_raw(), w, h)?;
-    let idx = state.add_image_overlay_at_playhead(&asset);
+    let idx = state.add_image_overlay_at_playhead_with_placement(&asset, summary.placement);
 
     // Status message — mention any layers we had to skip so the user
     // isn't surprised when they look at the resulting picture.
@@ -150,24 +147,58 @@ pub fn extract_frame_to_image_layer(state: &mut EditorState) -> Result<usize, St
 
 /// Build the extract subset and whether to capture the full frame.
 ///
-/// The timeline toolbar button is a render-frame snapshot, not a
-/// "selected layers only" command. Keeping this as a function makes the
-/// call-site explicit and leaves room for a separate selected-subset
-/// action later without reintroducing selection bleed into this button.
-fn resolve_extract_subset(_state: &EditorState) -> (Vec<Selection>, bool) {
-    (Vec::new(), true)
+/// The timeline toolbar button is contextual: any selected actor /
+/// overlay becomes a selected-elements snapshot, while non-visual
+/// selections (audio, render frame, tracks) fall back to the full render
+/// frame capture.
+fn resolve_extract_subset(state: &EditorState) -> (Vec<Selection>, bool) {
+    let mut subset: Vec<Selection> = if !state.canvas_selection.is_empty() {
+        state.canvas_selection.clone()
+    } else if state.selection != Selection::None {
+        vec![state.selection]
+    } else {
+        Vec::new()
+    };
+
+    subset.retain(|sel| match *sel {
+        Selection::Actor(i) => i < state.scene.actors.len(),
+        Selection::Overlay(i) => i < state.scene.overlays.len(),
+        _ => false,
+    });
+    subset.sort_by_key(selection_sort_key);
+    subset.dedup();
+
+    let full_frame = subset.is_empty();
+    (subset, full_frame)
+}
+
+fn selection_sort_key(sel: &Selection) -> (u8, usize) {
+    match *sel {
+        Selection::Actor(i) => (0, i),
+        Selection::Overlay(i) => (1, i),
+        _ => (255, 0),
+    }
 }
 
 // ─── COMPOSITOR ────────────────────────────────────────────────────
 
-/// World-space bounding box of every actor / overlay / background in
-/// `subset` at time `t`. Returns `None` when nothing in the subset
-/// resolves to a valid bbox. Used by the subset-mode extract to size
-/// the output canvas exactly to the union of selected element bounds
-/// (no render-frame clipping).
+const SELECTED_SNAPSHOT_PAD_WORLD: f32 = 1.0;
+const SELECTED_SNAPSHOT_MAX_DIM: u32 = 8192;
+
+#[derive(Debug, Clone, Copy)]
+struct SelectedSnapshotArea {
+    rf_state: RenderFrameState,
+    pixel_w: u32,
+    pixel_h: u32,
+    placement: SnapshotImagePlacement,
+}
+
+/// World-space bounding box of every selected actor / overlay at time
+/// `t`. Returns `None` when nothing selected is actually visible at the
+/// playhead. This intentionally does not clip against the render frame:
+/// selected `IMG+` is a canvas-world bake.
 fn compute_subset_world_bbox(
     state: &EditorState,
-    _scene: &Scene,
     subset: &[Selection],
     t: f32,
 ) -> Option<([f32; 2], [f32; 2])> {
@@ -177,11 +208,7 @@ fn compute_subset_world_bbox(
     let mut max_y = f32::NEG_INFINITY;
     let mut any = false;
     for sel in subset {
-        let bbox = match *sel {
-            Selection::Actor(ai) => crate::canvas_preview::actor_world_aabb(state, ai, t),
-            Selection::Overlay(oi) => crate::canvas_preview::overlay_world_aabb(state, oi, t),
-            _ => None,
-        };
+        let bbox = selection_world_aabb_for_snapshot(state, *sel, t);
         if let Some((mn, mx)) = bbox {
             min_x = min_x.min(mn[0]);
             min_y = min_y.min(mn[1]);
@@ -197,12 +224,282 @@ fn compute_subset_world_bbox(
     }
 }
 
+fn selected_snapshot_area(
+    state: &EditorState,
+    subset: &[Selection],
+    t: f32,
+) -> Result<SelectedSnapshotArea, String> {
+    let Some((mut mn, mut mx)) = compute_subset_world_bbox(state, subset, t) else {
+        return Err(crate::i18n::t("selected elements are not visible at the playhead").into());
+    };
+
+    mn[0] -= SELECTED_SNAPSHOT_PAD_WORLD;
+    mn[1] -= SELECTED_SNAPSHOT_PAD_WORLD;
+    mx[0] += SELECTED_SNAPSHOT_PAD_WORLD;
+    mx[1] += SELECTED_SNAPSHOT_PAD_WORLD;
+
+    let world_w = (mx[0] - mn[0]).max(1.0);
+    let world_h = (mx[1] - mn[1]).max(1.0);
+    if !world_w.is_finite() || !world_h.is_finite() {
+        return Err(crate::i18n::t("selected elements have invalid bounds").into());
+    }
+
+    let max_dim = SELECTED_SNAPSHOT_MAX_DIM as f32;
+    let zoom = (max_dim / world_w)
+        .min(max_dim / world_h)
+        .min(1.0)
+        .max(1.0e-4);
+    let pixel_w = (world_w * zoom).ceil().clamp(1.0, max_dim) as u32;
+    let pixel_h = (world_h * zoom).ceil().clamp(1.0, max_dim) as u32;
+    let center = WorldPos {
+        x: (mn[0] + mx[0]) * 0.5,
+        y: (mn[1] + mx[1]) * 0.5,
+    };
+
+    Ok(SelectedSnapshotArea {
+        rf_state: RenderFrameState {
+            pos: center,
+            zoom,
+            rotation_deg: 0.0,
+        },
+        pixel_w,
+        pixel_h,
+        placement: SnapshotImagePlacement {
+            center,
+            world_size: [world_w, world_h],
+        },
+    })
+}
+
+fn selection_world_aabb_for_snapshot(
+    state: &EditorState,
+    sel: Selection,
+    t: f32,
+) -> Option<([f32; 2], [f32; 2])> {
+    match sel {
+        Selection::Actor(i) => actor_snapshot_world_aabb(state, i, t),
+        Selection::Overlay(i) => overlay_snapshot_world_aabb(state, i, t),
+        _ => None,
+    }
+}
+
+fn actor_snapshot_world_aabb(
+    state: &EditorState,
+    idx: usize,
+    t: f32,
+) -> Option<([f32; 2], [f32; 2])> {
+    let actor = state.scene.actors.get(idx)?;
+    if !actor.visible {
+        return None;
+    }
+    let scene_dur = state.scene.output.duration;
+    let t_in = actor.t_in.unwrap_or(0.0);
+    let t_out = actor.t_out.unwrap_or(scene_dur);
+    if t < t_in || t > t_out {
+        return None;
+    }
+
+    let mut actor_state =
+        memstroy_core::sample_actor_layout(&actor.layout, &actor.animated_params, t);
+    let mod_delta = keyframe::evaluate_modifiers(&actor.modifiers, t - t_in);
+    actor_state.scale = (actor_state.scale + mod_delta.d_scale).max(0.001);
+    actor_state.rotation_deg += mod_delta.d_rotation_deg;
+    if let Some(pid) = actor.parent_id.as_ref() {
+        let mut visited = vec![actor.id.clone()];
+        if let Some(pxf) =
+            memstroy_core::resolve_parent_transform(&state.scene, pid, t, &mut visited)
+        {
+            memstroy_core::apply_parent_inheritance_actor(
+                &mut actor_state.rotation_deg,
+                &mut actor_state.scale,
+                &mut actor_state.scale_y,
+                &pxf,
+            );
+        }
+    }
+
+    let (src_w, src_h) = actor_snapshot_source_dimensions(state, idx)?;
+    let combined_x = if actor.flip_horizontal {
+        -actor_state.flip_x_anim
+    } else {
+        actor_state.flip_x_anim
+    };
+    let abs_fx = combined_x.abs().max(0.02);
+    let abs_fy = actor_state.flip_y_anim.abs().max(0.02);
+    let world_w = src_w * actor_state.scale * abs_fx;
+    let world_h = src_h * actor_state.scale * actor_state.scale_y * abs_fy;
+    let center = crate::canvas_preview::get_element_world_pos(state, &actor.id, &actor.layout, t);
+    rotated_rect_world_aabb(
+        WorldPos {
+            x: center.x + mod_delta.dx,
+            y: center.y + mod_delta.dy,
+        },
+        world_w,
+        world_h,
+        actor_state.rotation_deg,
+    )
+}
+
+fn actor_snapshot_source_dimensions(state: &EditorState, idx: usize) -> Option<(f32, f32)> {
+    if let Some(fc) = state.frame_caches.get(idx) {
+        if fc.is_ready() && fc.frame_count > 0 && fc.source_width > 0 && fc.source_height > 0 {
+            return Some((fc.source_width as f32, fc.source_height as f32));
+        }
+    }
+    let actor = state.scene.actors.get(idx)?;
+    let (w, h) = crate::panels::media_dimensions_for_source(state, &actor.source)?;
+    crate::video_cache::scaled_preview_dimensions(w, h, state.scene.actors.len())
+        .map(|(pw, ph)| (pw as f32, ph as f32))
+        .or(Some((w as f32, h as f32)))
+}
+
+fn overlay_snapshot_world_aabb(
+    state: &EditorState,
+    idx: usize,
+    t: f32,
+) -> Option<([f32; 2], [f32; 2])> {
+    let overlay = state.scene.overlays.get(idx)?;
+    match overlay {
+        Overlay::Image(img) => image_overlay_snapshot_world_aabb(state, img, t),
+        Overlay::Video(vid) => video_overlay_snapshot_world_aabb(state, vid, t),
+        Overlay::Text(_) => crate::canvas_preview::overlay_world_aabb(state, idx, t),
+    }
+}
+
+fn image_overlay_snapshot_world_aabb(
+    state: &EditorState,
+    img: &ImageOverlay,
+    t: f32,
+) -> Option<([f32; 2], [f32; 2])> {
+    if t < img.t_in || t > img.t_out {
+        return None;
+    }
+    let sample_t = t - img.t_in;
+    let mut ov_state =
+        memstroy_core::sample_overlay_layout(&img.layout, &img.animated_params, sample_t);
+    let mod_delta = keyframe::evaluate_modifiers(&img.modifiers, sample_t);
+    ov_state.scale = (ov_state.scale + mod_delta.d_scale).max(0.001);
+    ov_state.rotation_deg += mod_delta.d_rotation_deg;
+
+    let path = resolve_asset_path(state, &img.source);
+    let decoded = image::open(&path).ok()?.to_rgba8();
+    let src_w = decoded.width().max(1) as f32;
+    let src_h = decoded.height().max(1) as f32;
+    let crop = crate::image_effects::accumulated_crop_inset(&img.effects);
+    let crop_left = crop[0].max(0.0);
+    let crop_top = crop[1].max(0.0);
+    let crop_right = crop[2].max(0.0);
+    let crop_bottom = crop[3].max(0.0);
+    let crop_w_factor = (1.0_f32 - crop_left - crop_right).max(1.0e-3);
+    let crop_h_factor = (1.0_f32 - crop_top - crop_bottom).max(1.0e-3);
+    let abs_fx = ov_state.flip_x_anim.abs().max(0.02);
+    let abs_fy = ov_state.flip_y_anim.abs().max(0.02);
+    let world_w = src_w * ov_state.scale * crop_w_factor * abs_fx;
+    let world_h = src_h * ov_state.scale * ov_state.scale_y * crop_h_factor * abs_fy;
+
+    let layout_world = crate::canvas_preview::get_element_world_pos(state, &img.id, &[], t);
+    let layout_world = WorldPos {
+        x: layout_world.x + mod_delta.dx,
+        y: layout_world.y + mod_delta.dy,
+    };
+    let crop_dx_norm = (crop_left - crop_right) * 0.5;
+    let crop_dy_norm = (crop_top - crop_bottom) * 0.5;
+    let centre_offset_x = src_w * ov_state.scale * abs_fx * crop_dx_norm;
+    let centre_offset_y = src_h * ov_state.scale * ov_state.scale_y * abs_fy * crop_dy_norm;
+    let rotation_rad = ov_state.rotation_deg.to_radians();
+    let center = WorldPos {
+        x: layout_world.x + centre_offset_x * rotation_rad.cos()
+            - centre_offset_y * rotation_rad.sin(),
+        y: layout_world.y
+            + centre_offset_x * rotation_rad.sin()
+            + centre_offset_y * rotation_rad.cos(),
+    };
+    rotated_rect_world_aabb(center, world_w, world_h, ov_state.rotation_deg)
+}
+
+fn video_overlay_snapshot_world_aabb(
+    state: &EditorState,
+    vid: &VideoOverlay,
+    t: f32,
+) -> Option<([f32; 2], [f32; 2])> {
+    if t < vid.t_in || t > vid.t_out {
+        return None;
+    }
+    let sample_t = t - vid.t_in;
+    let mut ov_state =
+        memstroy_core::sample_overlay_layout(&vid.layout, &vid.animated_params, sample_t);
+    let mod_delta = keyframe::evaluate_modifiers(&vid.modifiers, sample_t);
+    ov_state.scale = (ov_state.scale + mod_delta.d_scale).max(0.001);
+    ov_state.rotation_deg += mod_delta.d_rotation_deg;
+    let (src_w, src_h) = crate::panels::media_dimensions_for_source(state, &vid.source)
+        .map(|(w, h)| (w as f32, h as f32))
+        .unwrap_or((300.0, 300.0 * 16.0 / 9.0));
+    let abs_fx = ov_state.flip_x_anim.abs().max(0.02);
+    let abs_fy = ov_state.flip_y_anim.abs().max(0.02);
+    let world_w = src_w * ov_state.scale * abs_fx;
+    let world_h = src_h * ov_state.scale * ov_state.scale_y * abs_fy;
+    let center = crate::canvas_preview::get_element_world_pos(state, &vid.id, &[], t);
+    rotated_rect_world_aabb(
+        WorldPos {
+            x: center.x + mod_delta.dx,
+            y: center.y + mod_delta.dy,
+        },
+        world_w,
+        world_h,
+        ov_state.rotation_deg,
+    )
+}
+
+fn rotated_rect_world_aabb(
+    center: WorldPos,
+    width: f32,
+    height: f32,
+    rotation_deg: f32,
+) -> Option<([f32; 2], [f32; 2])> {
+    if !center.x.is_finite()
+        || !center.y.is_finite()
+        || !width.is_finite()
+        || !height.is_finite()
+        || width <= 0.0
+        || height <= 0.0
+    {
+        return None;
+    }
+    let half_w = width * 0.5;
+    let half_h = height * 0.5;
+    let r = rotation_deg.to_radians();
+    let (c, s) = (r.cos(), r.sin());
+    let mut min_x = f32::INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for (lx, ly) in [
+        (-half_w, -half_h),
+        (half_w, -half_h),
+        (half_w, half_h),
+        (-half_w, half_h),
+    ] {
+        let x = center.x + lx * c - ly * s;
+        let y = center.y + lx * s + ly * c;
+        min_x = min_x.min(x);
+        min_y = min_y.min(y);
+        max_x = max_x.max(x);
+        max_y = max_y.max(y);
+    }
+    if min_x.is_finite() && min_y.is_finite() && max_x.is_finite() && max_y.is_finite() {
+        Some(([min_x, min_y], [max_x, max_y]))
+    } else {
+        None
+    }
+}
+
 #[derive(Default)]
 struct CompositeSummary {
     image: RgbaImage,
     skipped_text: u32,
     skipped_video: u32,
     skipped_image_bg: u32,
+    placement: Option<SnapshotImagePlacement>,
 }
 
 fn compose_full_frame_via_render_compositor(
@@ -242,31 +539,31 @@ fn compose_frame(
     subset: &[Selection],
     full_frame: bool,
     t: f32,
-) -> CompositeSummary {
+) -> Result<CompositeSummary, String> {
     let scene_clone = state.scene.clone();
     let rf = &scene_clone.render_frame;
     let [rw_full, rh_full] = rf.resolution;
     let rw_full = rw_full.max(1);
     let rh_full = rh_full.max(1);
-    let rf_state = sample_render_frame_eased(rf, t);
+    let mut rf_state = sample_render_frame_eased(rf, t);
+    let mut rw = rw_full;
+    let mut rh = rh_full;
+    let mut placement = None;
 
-    // Always composite at full render-frame resolution with the real
-    // camera transform, then crop to the selection bbox in output
-    // space. The old "synthetic camera centred on the bbox" path
-    // mis-aligned subset extracts when elements used canvas_layouts
-    // or parent transforms — the saved region looked like a random
-    // crop of the frame instead of the selected layer.
-    let subset_crop_bbox = if full_frame {
-        None
-    } else {
-        compute_subset_world_bbox(state, &scene_clone, subset, t)
+    if !full_frame {
+        let area = selected_snapshot_area(state, subset, t)?;
+        rf_state = area.rf_state;
+        rw = area.pixel_w;
+        rh = area.pixel_h;
+        placement = Some(area.placement);
     };
 
     // Transparent output — extracted images are meant to be composited
     // elsewhere, not pasted with an opaque scene background.
-    let mut canvas = RgbaImage::new(rw_full, rh_full);
+    let mut canvas = RgbaImage::new(rw, rh);
 
     let mut summary = CompositeSummary::default();
+    summary.placement = placement;
 
     // ── Pass 1: backgrounds ──────────────────────────────────────
     //
@@ -291,10 +588,10 @@ fn compose_frame(
         }
         match &bg.source {
             MediaSource::SolidColor { color } => {
-                paint_solid_background(&mut canvas, *color, &rf_state, rw_full, rh_full);
+                paint_solid_background(&mut canvas, *color, &rf_state, rw, rh);
             }
             MediaSource::Image { path } => {
-                if !paint_image_background(&mut canvas, path, bg.fit, rw_full, rh_full) {
+                if !paint_image_background(state, &mut canvas, path, bg.fit, rw, rh) {
                     summary.skipped_image_bg += 1;
                 }
             }
@@ -304,15 +601,8 @@ fn compose_frame(
                 start_at,
             } => {
                 let local = (t - bg.start).max(0.0) + *start_at;
-                if !paint_video_background(
-                    &mut canvas,
-                    path,
-                    local,
-                    *r#loop,
-                    bg.fit,
-                    rw_full,
-                    rh_full,
-                ) {
+                if !paint_video_background(state, &mut canvas, path, local, *r#loop, bg.fit, rw, rh)
+                {
                     summary.skipped_image_bg += 1;
                 }
             }
@@ -407,55 +697,22 @@ fn compose_frame(
                 let overlay_owned = scene_clone.overlays[oi].clone();
                 match overlay_owned {
                     Overlay::Image(img_ov) => {
-                        paint_image_overlay(
-                            state,
-                            &mut canvas,
-                            &img_ov,
-                            &rf_state,
-                            rw_full,
-                            rh_full,
-                            t,
-                        );
+                        paint_image_overlay(state, &mut canvas, &img_ov, &rf_state, rw, rh, t);
                     }
                     Overlay::Text(txt) => {
-                        if !paint_text_overlay(
-                            state,
-                            &mut canvas,
-                            &txt,
-                            &rf_state,
-                            rw_full,
-                            rh_full,
-                            t,
-                        ) {
+                        if !paint_text_overlay(state, &mut canvas, &txt, &rf_state, rw, rh, t) {
                             summary.skipped_text += 1;
                         }
                     }
                     Overlay::Video(vid) => {
-                        if !paint_video_overlay(
-                            state,
-                            &mut canvas,
-                            &vid,
-                            &rf_state,
-                            rw_full,
-                            rh_full,
-                            t,
-                        ) {
+                        if !paint_video_overlay(state, &mut canvas, &vid, &rf_state, rw, rh, t) {
                             summary.skipped_video += 1;
                         }
                     }
                 }
             }
             PaintOp::Actor(ai) => {
-                paint_actor(
-                    state,
-                    &scene_clone,
-                    ai,
-                    &rf_state,
-                    rw_full,
-                    rh_full,
-                    t,
-                    &mut canvas,
-                );
+                paint_actor(state, &scene_clone, ai, &rf_state, rw, rh, t, &mut canvas);
             }
         }
     }
@@ -465,70 +722,11 @@ fn compose_frame(
     // Effect layers operate on the already-composited canvas within
     // their bounding box. Applied after all content layers.
     if !scene_clone.effect_layers.is_empty() {
-        apply_snapshot_effect_layers(
-            state,
-            &scene_clone,
-            &rf_state,
-            rw_full,
-            rh_full,
-            t,
-            &mut canvas,
-        );
+        apply_snapshot_effect_layers(state, &scene_clone, &rf_state, rw, rh, t, &mut canvas);
     }
 
-    summary.image = if let Some((mn, mx)) = subset_crop_bbox {
-        crop_canvas_to_world_bbox(&canvas, mn, mx, &rf_state, rw_full, rh_full)
-    } else {
-        canvas
-    };
-    summary
-}
-
-/// Crop a full-frame composite to the output-pixel bounds of a
-/// world-space rectangle (with a little padding).
-fn crop_canvas_to_world_bbox(
-    canvas: &RgbaImage,
-    world_min: [f32; 2],
-    world_max: [f32; 2],
-    rf_state: &RenderFrameState,
-    rw: u32,
-    rh: u32,
-) -> RgbaImage {
-    let pad_world = 8.0_f32;
-    let corners = [
-        [world_min[0] - pad_world, world_min[1] - pad_world],
-        [world_max[0] + pad_world, world_min[1] - pad_world],
-        [world_max[0] + pad_world, world_max[1] + pad_world],
-        [world_min[0] - pad_world, world_max[1] + pad_world],
-    ];
-    let mut min_x = f32::INFINITY;
-    let mut min_y = f32::INFINITY;
-    let mut max_x = f32::NEG_INFINITY;
-    let mut max_y = f32::NEG_INFINITY;
-    for c in corners {
-        let (ox, oy) = world_to_output(WorldPos { x: c[0], y: c[1] }, rf_state, rw, rh);
-        min_x = min_x.min(ox);
-        min_y = min_y.min(oy);
-        max_x = max_x.max(ox);
-        max_y = max_y.max(oy);
-    }
-    if !min_x.is_finite() || !min_y.is_finite() {
-        return canvas.clone();
-    }
-    let x0 = (min_x.floor() as i32).max(0).min(rw as i32 - 1) as u32;
-    let y0 = (min_y.floor() as i32).max(0).min(rh as i32 - 1) as u32;
-    let x1 = (max_x.ceil() as i32).max(x0 as i32 + 1).min(rw as i32) as u32;
-    let y1 = (max_y.ceil() as i32).max(y0 as i32 + 1).min(rh as i32) as u32;
-    let cw = (x1 - x0).max(1);
-    let ch = (y1 - y0).max(1);
-    let mut out = RgbaImage::new(cw, ch);
-    for y in 0..ch {
-        for x in 0..cw {
-            let p = *canvas.get_pixel(x0 + x, y0 + y);
-            out.put_pixel(x, y, p);
-        }
-    }
-    out
+    summary.image = canvas;
+    Ok(summary)
 }
 
 // ─── BACKGROUND ────────────────────────────────────────────────────
@@ -591,7 +789,8 @@ fn paint_image_overlay(
         .collect();
 
     // Decode the source picture.
-    let raw = match image::open(&img_ov.source) {
+    let source = resolve_asset_path(state, &img_ov.source);
+    let raw = match image::open(&source) {
         Ok(img) => img.to_rgba8(),
         Err(_) => return, // missing / undecodable file → skip silently
     };
@@ -623,9 +822,15 @@ fn paint_image_overlay(
     let cw = r_px - l_px;
     let ch = b_px - t_px;
     let layer = if cw == src_w && ch == src_h && (l_px, t_px) == (0, 0) {
-        RgbaImage::from_raw(src_w, src_h, buf).expect("rgba buffer matches dims")
+        match RgbaImage::from_raw(src_w, src_h, buf) {
+            Some(img) => img,
+            None => return,
+        }
     } else {
-        let full = RgbaImage::from_raw(src_w, src_h, buf).expect("rgba buffer matches dims");
+        let full = match RgbaImage::from_raw(src_w, src_h, buf) {
+            Some(img) => img,
+            None => return,
+        };
         let mut sub = RgbaImage::new(cw, ch);
         for y in 0..ch {
             for x in 0..cw {
@@ -847,17 +1052,17 @@ fn load_actor_frame_rgba(
     // This covers the case where the frame cache hasn't finished
     // extracting (or doesn't exist at all for this actor).
     let actor = state.scene.actors.get(actor_idx)?;
-    let source = &actor.source;
+    let source = resolve_asset_path(state, &actor.source);
     // Handle looping: wrap seek time around source duration.
     let seek = if actor.loop_source {
-        match probe_video_duration_sync(source) {
+        match probe_video_duration_sync(&source) {
             Some(dur) if dur > 0.001 => local_t.rem_euclid(dur),
             _ => local_t.max(0.0),
         }
     } else {
         local_t.max(0.0)
     };
-    extract_video_frame_sync(source, seek)
+    extract_video_frame_sync(&source, seek)
 }
 
 /// Apply chroma-key + colour-correction + effect-stack to an RGBA8
@@ -980,8 +1185,9 @@ fn apply_snapshot_effect_layers(
             .collect();
         let mut buf = region.into_raw();
         image_effects::apply_effect_stack(&mut buf, region_w, region_h, &baked, sample_t);
-        let region = RgbaImage::from_raw(region_w, region_h, buf)
-            .expect("effect layer region buffer matches dims");
+        let Some(region) = RgbaImage::from_raw(region_w, region_h, buf) else {
+            continue;
+        };
 
         // Write back.
         for y in 0..region_h {
@@ -994,6 +1200,14 @@ fn apply_snapshot_effect_layers(
 }
 
 // ─── COMMON HELPERS ────────────────────────────────────────────────
+
+fn resolve_asset_path(state: &EditorState, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        state.assets_root.join(path)
+    }
+}
 
 /// Sample the render-frame state with animation modifiers layered on
 /// top — direct port of `canvas_preview::sample_render_frame_eased`.
@@ -1175,8 +1389,16 @@ fn sample_bilinear(img: &RgbaImage, x: f32, y: f32) -> [u8; 4] {
 /// canvas using the supplied `fit` mode. Returns `false` when the
 /// file can't be decoded (so the caller can record the skip in the
 /// status message).
-fn paint_image_background(canvas: &mut RgbaImage, path: &Path, fit: Fit, rw: u32, rh: u32) -> bool {
-    let layer = match image::open(path) {
+fn paint_image_background(
+    state: &EditorState,
+    canvas: &mut RgbaImage,
+    path: &Path,
+    fit: Fit,
+    rw: u32,
+    rh: u32,
+) -> bool {
+    let source = resolve_asset_path(state, path);
+    let layer = match image::open(&source) {
         Ok(img) => img.to_rgba8(),
         Err(_) => return false,
     };
@@ -1197,6 +1419,7 @@ fn paint_image_background(canvas: &mut RgbaImage, path: &Path, fit: Fit, rw: u32
 /// is treated as "skipped" instead of holding the last frame
 /// (the export's `r#loop=false` clamps too).
 fn paint_video_background(
+    state: &EditorState,
     canvas: &mut RgbaImage,
     path: &Path,
     t_local: f32,
@@ -1206,14 +1429,16 @@ fn paint_video_background(
     rh: u32,
 ) -> bool {
     let seek = if looping {
-        match probe_video_duration_sync(path) {
+        let source = resolve_asset_path(state, path);
+        match probe_video_duration_sync(&source) {
             Some(dur) if dur > 0.001 => t_local.rem_euclid(dur),
             _ => t_local.max(0.0),
         }
     } else {
         t_local.max(0.0)
     };
-    let (rgba, w, h) = match extract_video_frame_sync(path, seek) {
+    let source = resolve_asset_path(state, path);
+    let (rgba, w, h) = match extract_video_frame_sync(&source, seek) {
         Some(f) => f,
         None => return false,
     };
@@ -1370,14 +1595,16 @@ fn paint_video_overlay(
     let speed = vid.speed.max(1.0e-4);
     let raw_seek = sample_t * speed + vid.source_start;
     let seek = if vid.loop_source {
-        match probe_video_duration_sync(&vid.source) {
+        let source = resolve_asset_path(state, &vid.source);
+        match probe_video_duration_sync(&source) {
             Some(dur) if dur > 0.001 => raw_seek.rem_euclid(dur),
             _ => raw_seek.max(0.0),
         }
     } else {
         raw_seek.max(0.0)
     };
-    let (mut frame_buf, src_w, src_h) = match extract_video_frame_sync(&vid.source, seek) {
+    let source = resolve_asset_path(state, &vid.source);
+    let (mut frame_buf, src_w, src_h) = match extract_video_frame_sync(&source, seek) {
         Some(f) => f,
         None => return false,
     };
@@ -1540,8 +1767,87 @@ fn composite_fit_image(canvas: &mut RgbaImage, layer: &RgbaImage, fit: Fit, rw: 
     paint_layer_rgba(canvas, layer, cx, cy, out_w, out_h, 0.0, false, false, 1.0);
 }
 
-// Suppress unused-import warning when `Path` only appears in the
-// public docs — keep the import explicit to make the file portable
-// if more disk-touching helpers land here.
-#[allow(dead_code)]
-const _PATH: Option<&Path> = None;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    use memstroy_core::{Keyframe, OverlayState};
+
+    fn test_image_overlay(id: &str) -> Overlay {
+        Overlay::Image(ImageOverlay {
+            id: id.to_string(),
+            source: PathBuf::from("missing.png"),
+            t_in: 0.0,
+            t_out: 10.0,
+            layout: vec![Keyframe::new(0.0, OverlayState::default())],
+            modifiers: Vec::new(),
+            skeleton_attachment: None,
+            effects: Vec::new(),
+            animated_params: BTreeSet::new(),
+            chroma_key: None,
+            z_order: 0,
+            parent_id: None,
+        })
+    }
+
+    #[test]
+    fn extract_subset_uses_only_visual_selection() {
+        let mut state = EditorState::new();
+        state.scene.overlays.push(test_image_overlay("img"));
+        state.canvas_selection = vec![
+            Selection::Audio(0),
+            Selection::Overlay(0),
+            Selection::RenderFrame,
+        ];
+
+        let (subset, full_frame) = resolve_extract_subset(&state);
+
+        assert!(!full_frame);
+        assert_eq!(subset.len(), 1);
+        assert!(matches!(subset[0], Selection::Overlay(0)));
+    }
+
+    #[test]
+    fn snapshot_placement_reinserts_image_at_canvas_bounds() {
+        let mut state = EditorState::new();
+        state.playhead = 2.0;
+        state.scene.output.duration = 10.0;
+        let asset = crate::state::LibraryAsset {
+            id: "snap".into(),
+            path: PathBuf::from("snap.png"),
+            label: "snap".into(),
+            thumbnail: None,
+            downloaded: true,
+            server_id: None,
+            duration_secs: None,
+            width: Some(100),
+            height: Some(50),
+        };
+
+        let idx = state.add_image_overlay_at_playhead_with_placement(
+            &asset,
+            Some(SnapshotImagePlacement {
+                center: WorldPos { x: 200.0, y: 300.0 },
+                world_size: [200.0, 200.0],
+            }),
+        );
+
+        let Overlay::Image(img) = &state.scene.overlays[idx] else {
+            panic!("expected image overlay");
+        };
+        let st = img.layout[0].value;
+        assert!((st.scale - 2.0).abs() < 1.0e-4);
+        assert!((st.scale_y - 2.0).abs() < 1.0e-4);
+        let cl = state
+            .scene
+            .canvas_layouts
+            .iter()
+            .find(|cl| cl.element_id == img.id)
+            .expect("snapshot placement creates canvas layout");
+        let pos = cl.keyframes[0].value.pos;
+        assert!((pos.x - 200.0).abs() < 1.0e-4);
+        assert!((pos.y - 300.0).abs() < 1.0e-4);
+        assert!((cl.keyframes[0].value.width - 200.0).abs() < 1.0e-4);
+    }
+}

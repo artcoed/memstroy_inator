@@ -201,6 +201,7 @@ fn step_easing_does_not_emit_linear_segment() {
                 ..ActorState::default()
             },
             easing: Easing::Step,
+            param_owners: Default::default(),
         },
     ];
     scene.actors.push(actor);
@@ -1583,11 +1584,13 @@ fn audio_volume_keyframes_lower_to_per_segment_chain() {
             t: 0.0,
             value: 0.0_f32,
             easing: Easing::default(),
+            param_owners: Default::default(),
         },
         Keyframe {
             t: 2.0,
             value: 1.0_f32,
             easing: Easing::default(),
+            param_owners: Default::default(),
         },
     ];
     scene.audio.push(tr);
@@ -1623,11 +1626,13 @@ fn audio_pan_keyframes_lower_to_per_segment_chain() {
             t: 0.0,
             value: -1.0_f32,
             easing: Easing::default(),
+            param_owners: Default::default(),
         },
         Keyframe {
             t: 2.0,
             value: 1.0_f32,
             easing: Easing::default(),
+            param_owners: Default::default(),
         },
     ];
     scene.audio.push(tr);
@@ -1668,11 +1673,13 @@ fn audio_low_pass_keyframes_lower_to_per_segment_chain() {
             t: 0.0,
             value: 1000.0_f32,
             easing: Easing::default(),
+            param_owners: Default::default(),
         },
         Keyframe {
             t: 2.0,
             value: 8000.0_f32,
             easing: Easing::default(),
+            param_owners: Default::default(),
         },
     ];
     scene.audio.push(tr);
@@ -1709,11 +1716,13 @@ fn audio_low_pass_disabled_in_inspector_skips_animation() {
             t: 0.0,
             value: 1000.0_f32,
             easing: Easing::default(),
+            param_owners: Default::default(),
         },
         Keyframe {
             t: 2.0,
             value: 8000.0_f32,
             easing: Easing::default(),
+            param_owners: Default::default(),
         },
     ];
     scene.audio.push(tr);
@@ -1738,11 +1747,13 @@ fn audio_reverb_keyframes_lower_to_per_segment_chain() {
             t: 0.0,
             value: 0.0_f32,
             easing: Easing::default(),
+            param_owners: Default::default(),
         },
         Keyframe {
             t: 2.0,
             value: 0.8_f32,
             easing: Easing::default(),
+            param_owners: Default::default(),
         },
     ];
     scene.audio.push(tr);
@@ -1776,11 +1787,13 @@ fn audio_mute_overrides_animated_volume() {
             t: 0.0,
             value: 0.5_f32,
             easing: Easing::default(),
+            param_owners: Default::default(),
         },
         Keyframe {
             t: 2.0,
             value: 1.0_f32,
             easing: Easing::default(),
+            param_owners: Default::default(),
         },
     ];
     scene.audio.push(tr);
@@ -2539,6 +2552,7 @@ fn cpu_pipeline_places_image_overlay_at_world_position() {
             rotation_deg: 0.0,
         },
         easing: Easing::Linear,
+        param_owners: Default::default(),
     }];
     scene.output.duration = 0.5;
     scene.output.background_color = [0, 200, 0]; // bright green
@@ -2561,6 +2575,7 @@ fn cpu_pipeline_places_image_overlay_at_world_position() {
                 flip_y_anim: 1.0,
             },
             easing: Easing::Linear,
+            param_owners: Default::default(),
         }],
         modifiers: Vec::new(),
         skeleton_attachment: None,
@@ -2653,6 +2668,7 @@ fn cpu_pipeline_honours_render_frame_pos_offset() {
             rotation_deg: 0.0,
         },
         easing: Easing::Linear,
+        param_owners: Default::default(),
     }];
 
     // Image overlay anchored at world (700, 1100) via canvas_layouts.
@@ -2665,6 +2681,7 @@ fn cpu_pipeline_honours_render_frame_pos_offset() {
             t: 0.0,
             value: OverlayState::default(),
             easing: Easing::Linear,
+            param_owners: Default::default(),
         }],
         modifiers: Vec::new(),
         skeleton_attachment: None,
@@ -2689,6 +2706,7 @@ fn cpu_pipeline_honours_render_frame_pos_offset() {
                 opacity: 1.0,
             },
             easing: Easing::Linear,
+            param_owners: Default::default(),
         }],
     });
 

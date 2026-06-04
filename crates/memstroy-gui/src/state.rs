@@ -1240,6 +1240,12 @@ pub struct ServerLibraryPages {
     pub images: ServerLibraryPageState,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SnapshotImagePlacement {
+    pub center: memstroy_core::WorldPos,
+    pub world_size: [f32; 2],
+}
+
 /// Result of scanning asset folders on a background thread.
 #[derive(Debug, Clone)]
 pub struct LibraryScanSnapshot {
@@ -1295,7 +1301,7 @@ impl EditorState {
         s.timeline_v_zoom = 1.0;
         s.timeline_v_scroll = 0.0;
         s.timeline_follow_playhead = false;
-        s.canvas_show_inactive_previews = true;
+        s.canvas_show_inactive_previews = false;
         s.split_tool_active = false;
         s.ffmpeg_available = check_ffmpeg();
         s.razor_mode = false;
@@ -4904,12 +4910,52 @@ impl EditorState {
     /// OS turns into "image now lives in the library AND on the canvas
     /// at the current time" in a single gesture.
     pub fn add_image_overlay_at_playhead(&mut self, asset: &LibraryAsset) -> usize {
+        self.add_image_overlay_at_playhead_with_placement(asset, None)
+    }
+
+    pub(crate) fn add_image_overlay_at_playhead_with_placement(
+        &mut self,
+        asset: &LibraryAsset,
+        placement: Option<SnapshotImagePlacement>,
+    ) -> usize {
         let t = self.playhead;
         let dur = self.scene.output.duration.max(0.1);
         let t_in = t;
         let t_out = (t + 1.0).min(dur.max(t + 0.1)).max(t + 0.1);
         let overlay_id = unique_overlay_id(&self.scene.overlays, &asset.id);
         let source = asset.path.clone();
+        let mut overlay_state = memstroy_core::OverlayState::default();
+        if let Some(p) = placement {
+            let src_w = asset
+                .width
+                .filter(|w| *w > 0)
+                .unwrap_or_else(|| p.world_size[0].round().max(1.0) as u32)
+                as f32;
+            let src_h = asset
+                .height
+                .filter(|h| *h > 0)
+                .unwrap_or_else(|| p.world_size[1].round().max(1.0) as u32)
+                as f32;
+            let scale_x = (p.world_size[0].max(1.0) / src_w.max(1.0)).max(0.001);
+            let scale_y_abs = (p.world_size[1].max(1.0) / src_h.max(1.0)).max(0.001);
+            overlay_state.scale = scale_x;
+            overlay_state.scale_y = (scale_y_abs / scale_x.max(0.001)).max(0.001);
+            let [rw, rh] = self.scene.render_frame.resolution;
+            if rw > 0 && rh > 0 {
+                overlay_state.pos = [p.center.x / rw as f32, p.center.y / rh as f32];
+            }
+        }
+        let canvas_layout = placement.map(|p| memstroy_core::CanvasLayout {
+            element_id: overlay_id.clone(),
+            keyframes: vec![memstroy_core::Keyframe::new(
+                t,
+                memstroy_core::CanvasTransform {
+                    pos: p.center,
+                    width: p.world_size[0].max(1.0),
+                    ..Default::default()
+                },
+            )],
+        });
         let mut new_idx = 0usize;
         self.mutate_state(|s| {
             let lane = s.pick_or_create_empty_video_lane_for_range(t_in, t_out);
@@ -4921,10 +4967,7 @@ impl EditorState {
                     source,
                     t_in,
                     t_out,
-                    layout: vec![memstroy_core::Keyframe::new(
-                        0.0,
-                        memstroy_core::OverlayState::default(),
-                    )],
+                    layout: vec![memstroy_core::Keyframe::new(0.0, overlay_state)],
                     modifiers: Vec::new(),
                     skeleton_attachment: None,
                     effects: Vec::new(),
@@ -4933,6 +4976,9 @@ impl EditorState {
                     z_order: 0,
                     parent_id: None,
                 }));
+            if let Some(cl) = canvas_layout {
+                s.scene.canvas_layouts.push(cl);
+            }
             s.overlay_track_assignments.insert(new_idx, lane);
             s.selection = Selection::Overlay(new_idx);
             s.canvas_selection.clear();
@@ -4963,13 +5009,17 @@ fn upsert_sequence_keyframe<T: Clone>(
     t: f32,
     value: T,
 ) {
+    if !t.is_finite() {
+        return;
+    }
     const EPS: f32 = 1.0e-3;
     if let Some(kf) = layout.iter_mut().find(|kf| (kf.t - t).abs() < EPS) {
         kf.value = value;
         return;
     }
     layout.push(memstroy_core::Keyframe::new(t, value));
-    layout.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
+    layout.retain(|kf| kf.t.is_finite());
+    layout.sort_by(|a, b| a.t.total_cmp(&b.t));
 }
 
 fn footage_sequence_controller_snapshot_eq(
@@ -5025,15 +5075,38 @@ fn footage_sequence_delta_times(
     if times.is_empty() {
         times.push(0.0);
     }
-    times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    times.sort_by(|a, b| a.total_cmp(b));
     times
 }
 
 fn sequence_ratio(after: f32, before: f32) -> f32 {
     if before.abs() > 1.0e-6 && after.is_finite() && before.is_finite() {
-        after / before
+        let ratio = after / before;
+        if ratio.is_finite() {
+            ratio
+        } else {
+            1.0
+        }
     } else {
         1.0
+    }
+}
+
+fn sequence_delta(after: f32, before: f32) -> f32 {
+    let delta = after - before;
+    if delta.is_finite() {
+        delta
+    } else {
+        0.0
+    }
+}
+
+fn sequence_add(value: f32, delta: f32, fallback: f32) -> f32 {
+    let next = value + delta;
+    if next.is_finite() {
+        next
+    } else {
+        fallback
     }
 }
 
@@ -5042,16 +5115,44 @@ fn apply_actor_sequence_delta(
     before: memstroy_core::ActorState,
     after: memstroy_core::ActorState,
 ) -> memstroy_core::ActorState {
-    child.pos[0] += after.pos[0] - before.pos[0];
-    child.pos[1] += after.pos[1] - before.pos[1];
-    child.scale = (child.scale * sequence_ratio(after.scale, before.scale)).max(0.001);
-    child.scale_y = (child.scale_y * sequence_ratio(after.scale_y, before.scale_y)).max(0.001);
-    child.rotation_deg += after.rotation_deg - before.rotation_deg;
-    child.opacity = (child.opacity + (after.opacity - before.opacity)).clamp(0.0, 1.0);
-    child.flip_x_anim =
-        (child.flip_x_anim + (after.flip_x_anim - before.flip_x_anim)).clamp(-1.0, 1.0);
-    child.flip_y_anim =
-        (child.flip_y_anim + (after.flip_y_anim - before.flip_y_anim)).clamp(-1.0, 1.0);
+    child.pos[0] = crate::editor_limits::clamp_pos_norm(sequence_add(
+        child.pos[0],
+        sequence_delta(after.pos[0], before.pos[0]),
+        child.pos[0],
+    ));
+    child.pos[1] = crate::editor_limits::clamp_pos_norm(sequence_add(
+        child.pos[1],
+        sequence_delta(after.pos[1], before.pos[1]),
+        child.pos[1],
+    ));
+    child.scale =
+        crate::editor_limits::clamp_scale(child.scale * sequence_ratio(after.scale, before.scale));
+    child.scale_y = crate::editor_limits::clamp_scale_y(
+        child.scale_y * sequence_ratio(after.scale_y, before.scale_y),
+    );
+    child.rotation_deg = crate::editor_limits::clamp_rotation_deg(sequence_add(
+        child.rotation_deg,
+        sequence_delta(after.rotation_deg, before.rotation_deg),
+        child.rotation_deg,
+    ));
+    child.opacity = sequence_add(
+        child.opacity,
+        sequence_delta(after.opacity, before.opacity),
+        child.opacity,
+    )
+    .clamp(0.0, 1.0);
+    child.flip_x_anim = sequence_add(
+        child.flip_x_anim,
+        sequence_delta(after.flip_x_anim, before.flip_x_anim),
+        child.flip_x_anim,
+    )
+    .clamp(-1.0, 1.0);
+    child.flip_y_anim = sequence_add(
+        child.flip_y_anim,
+        sequence_delta(after.flip_y_anim, before.flip_y_anim),
+        child.flip_y_anim,
+    )
+    .clamp(-1.0, 1.0);
     child
 }
 
@@ -5083,14 +5184,18 @@ fn apply_actor_sequence_layout_delta(
     }
 
     let original = layout.clone();
-    let mut times = original.iter().map(|kf| kf.t).collect::<Vec<_>>();
+    let mut times = original
+        .iter()
+        .map(|kf| kf.t)
+        .filter(|t| t.is_finite())
+        .collect::<Vec<_>>();
     for &t in delta_times {
         push_sequence_time(&mut times, t);
     }
     if times.is_empty() {
         times.push(0.0);
     }
-    times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    times.sort_by(|a, b| a.total_cmp(b));
 
     for t in times {
         let child = memstroy_core::sample_actor_layout(&original, &child_sample_params, t);
@@ -5133,11 +5238,29 @@ fn apply_canvas_sequence_delta(
     before: memstroy_core::CanvasTransform,
     after: memstroy_core::CanvasTransform,
 ) -> memstroy_core::CanvasTransform {
-    child.pos.x += after.pos.x - before.pos.x;
-    child.pos.y += after.pos.y - before.pos.y;
-    child.scale = (child.scale * sequence_ratio(after.scale, before.scale)).max(0.001);
-    child.rotation_deg += after.rotation_deg - before.rotation_deg;
-    child.opacity = (child.opacity + (after.opacity - before.opacity)).clamp(0.0, 1.0);
+    child.pos.x = sequence_add(
+        child.pos.x,
+        sequence_delta(after.pos.x, before.pos.x),
+        child.pos.x,
+    );
+    child.pos.y = sequence_add(
+        child.pos.y,
+        sequence_delta(after.pos.y, before.pos.y),
+        child.pos.y,
+    );
+    child.scale =
+        crate::editor_limits::clamp_scale(child.scale * sequence_ratio(after.scale, before.scale));
+    child.rotation_deg = crate::editor_limits::clamp_rotation_deg(sequence_add(
+        child.rotation_deg,
+        sequence_delta(after.rotation_deg, before.rotation_deg),
+        child.rotation_deg,
+    ));
+    child.opacity = sequence_add(
+        child.opacity,
+        sequence_delta(after.opacity, before.opacity),
+        child.opacity,
+    )
+    .clamp(0.0, 1.0);
     child
 }
 
@@ -5149,14 +5272,18 @@ fn apply_canvas_sequence_layout_delta(
     delta_times: &[f32],
 ) {
     let original = layout.keyframes.clone();
-    let mut times = original.iter().map(|kf| kf.t).collect::<Vec<_>>();
+    let mut times = original
+        .iter()
+        .map(|kf| kf.t)
+        .filter(|t| t.is_finite())
+        .collect::<Vec<_>>();
     for &t in delta_times {
         push_sequence_time(&mut times, t);
     }
     if times.is_empty() {
         times.push(0.0);
     }
-    times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    times.sort_by(|a, b| a.total_cmp(b));
 
     for t in times {
         let child = memstroy_core::sample_canvas_layout(&original, t);
@@ -6119,6 +6246,55 @@ mod timeline_lane_tests {
     }
 
     #[test]
+    fn actor_delete_audio_cleanup_restores_audio_on_undo() {
+        let mut state = EditorState::new();
+        let actor = test_actor("clip", 0.0, 5.0);
+        let mut audio = test_audio("clip_audio", 0.0, 5.0);
+        audio.source = actor.source.clone();
+        audio.parent_actor = Some("clip".into());
+        state.scene.actors = vec![actor];
+        state.scene.audio = vec![audio];
+
+        state.mutate_state(|s| {
+            crate::panels::remove_audio_bound_to_actor(s, "clip");
+            s.scene.actors.remove(0);
+            crate::panels::shift_assignments_after_remove(&mut s.actor_track_assignments, 0);
+        });
+
+        assert!(state.scene.actors.is_empty());
+        assert!(state.scene.audio[0].deleted);
+
+        state.undo();
+        assert_eq!(state.scene.actors.len(), 1);
+        assert_eq!(state.scene.audio.len(), 1);
+        assert!(!state.scene.audio[0].deleted);
+        assert_eq!(state.scene.audio[0].parent_actor.as_deref(), Some("clip"));
+        assert!(!state.scene.actors[0].mute_audio);
+    }
+
+    #[test]
+    fn audio_delete_mutation_restores_actor_mute_state_on_undo() {
+        let mut state = EditorState::new();
+        let actor = test_actor("clip", 0.0, 5.0);
+        let mut audio = test_audio("loose_audio", 0.0, 5.0);
+        audio.source = actor.source.clone();
+        state.scene.actors = vec![actor];
+        state.scene.audio = vec![audio];
+
+        state.mutate_state(|s| {
+            s.scene.audio[0].deleted = true;
+            s.scene.actors[0].mute_audio = true;
+        });
+
+        assert!(state.scene.audio[0].deleted);
+        assert!(state.scene.actors[0].mute_audio);
+
+        state.undo();
+        assert!(!state.scene.audio[0].deleted);
+        assert!(!state.scene.actors[0].mute_audio);
+    }
+
+    #[test]
     fn sequence_controller_sync_applies_transform_delta_and_skips_slots() {
         let mut state = EditorState::new();
         let mut controller = test_actor("controller", 0.0, 1.0);
@@ -6152,6 +6328,28 @@ mod timeline_lane_tests {
         assert_eq!(state.scene.actors[1].effects, state.scene.actors[0].effects);
         assert_ne!(state.scene.actors[2].layout, state.scene.actors[0].layout);
         assert!(state.request_media_preview);
+    }
+
+    #[test]
+    fn sequence_controller_sync_rejects_infinite_scale_delta() {
+        let mut state = EditorState::new();
+        let mut controller = test_actor("controller", 0.0, 1.0);
+        let mut peer = test_actor("peer", 1.0, 2.0);
+        for actor in [&mut controller, &mut peer] {
+            actor.mellstroy_footage.enabled = true;
+            actor.mellstroy_footage.sequence_id = Some("seq".into());
+        }
+        state.scene.actors = vec![controller, peer];
+
+        let before = state
+            .footage_sequence_controller_snapshot(0)
+            .expect("controller snapshot");
+        state.scene.actors[0].layout[0].value.scale = f32::INFINITY;
+
+        assert!(state.sync_footage_sequence_controller_from_snapshot(0, &before));
+        let peer_scale = state.scene.actors[1].layout[0].value.scale;
+        assert!(peer_scale.is_finite(), "peer scale became {peer_scale}");
+        assert!((0.01..=8.0).contains(&peer_scale));
     }
 
     #[test]

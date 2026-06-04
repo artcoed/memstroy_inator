@@ -122,6 +122,7 @@ fn ru_lookup(key: &str) -> Option<&'static str> {
         // Export menu
         "Render" => "Экспорт",
         "Export" => "Экспорт",
+        "Export in maximum quality" => "Экспорт в максимальном качестве",
         "\u{1F3AC} Render" => "\u{1F3AC} Экспорт",
         "Render full clip..." => "Экспорт ролика…",
         "\u{1F3A5} Render full clip..." => "\u{1F3A5} Экспорт ролика…",
@@ -794,6 +795,7 @@ fn ru_lookup(key: &str) -> Option<&'static str> {
         "Render complete" => "Экспорт завершён",
         "Rendering..." => "Идёт экспорт…",
         "Exporting..." => "Идёт экспорт…",
+        "Exporting in maximum quality..." => "Идёт экспорт в максимальном качестве…",
         "Elapsed" => "Прошло",
         "ETA" => "осталось",
         "Refreshing clips via assets-server..." =>

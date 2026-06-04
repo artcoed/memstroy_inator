@@ -30,6 +30,10 @@
 #       -Out .\build -Name Memstroy-inator-1.2.3 `
 #       -IsccPath "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
 #
+#   # Windows ARM64 client bundle + installer
+#   pwsh scripts/make-installer.ps1 -ServerUrl https://assets.example.com `
+#       -Target aarch64-pc-windows-msvc
+#
 # Required (one of):
 #   -ServerUrl <URL>       Forwarded to package-client.ps1 to build a
 #                          fresh bundle. Either this or -BundleDir
@@ -42,6 +46,8 @@
 #                          which is usually .\dist).
 #   -Name <name>           Installer base name (without "-Setup.exe");
 #                          defaults to the bundle directory name.
+#   -Target <triple>       Optional Rust Windows target triple forwarded
+#                          to package-client.ps1.
 #   -IsccPath <path>       Path to ISCC.exe. Auto-detected from PATH
 #                          and standard install locations if omitted.
 #   -AllowLoopback         Forwarded to package-client.ps1.
@@ -54,6 +60,7 @@ param(
     [string] $BundleDir     = "",
     [string] $Out           = "",
     [string] $Name          = "",
+    [string] $Target        = "",
     [string] $IsccPath      = "",
     [switch] $AllowLoopback
 )
@@ -69,6 +76,68 @@ if ([string]::IsNullOrWhiteSpace($BundleDir) -and [string]::IsNullOrWhiteSpace($
     exit 2
 }
 
+function Get-WindowsArchName {
+    param(
+        [string]$TargetTriple,
+        [string]$BundleName
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($TargetTriple)) {
+        switch ($TargetTriple) {
+            "x86_64-pc-windows-msvc" { return "amd64" }
+            "aarch64-pc-windows-msvc" { return "arm64" }
+            "i686-pc-windows-msvc" { return "x86" }
+            default {
+                Write-Error "error: unsupported Windows target '$TargetTriple'. Supported: x86_64-pc-windows-msvc, aarch64-pc-windows-msvc, i686-pc-windows-msvc."
+                exit 5
+            }
+        }
+    }
+
+    if ($BundleName -match 'windows-(arm64|amd64|x86)-') {
+        return $Matches[1]
+    }
+
+    $HostArch = $env:PROCESSOR_ARCHITECTURE.ToLowerInvariant()
+    switch ($HostArch) {
+        "amd64" { return "amd64" }
+        "x86_64" { return "amd64" }
+        "arm64" { return "arm64" }
+        "aarch64" { return "arm64" }
+        "x86" { return "x86" }
+        default { return $HostArch }
+    }
+}
+
+function Get-InnoArchitectureDirectives {
+    param([string]$Arch)
+
+    switch ($Arch) {
+        "amd64" {
+            return [pscustomobject]@{
+                Allowed = "x64compatible"
+                InstallIn64BitMode = "x64compatible"
+            }
+        }
+        "arm64" {
+            return [pscustomobject]@{
+                Allowed = "arm64"
+                InstallIn64BitMode = "arm64"
+            }
+        }
+        "x86" {
+            return [pscustomobject]@{
+                Allowed = ""
+                InstallIn64BitMode = ""
+            }
+        }
+        default {
+            Write-Error "error: unsupported installer architecture '$Arch'."
+            exit 5
+        }
+    }
+}
+
 # ── Build the bundle if not pre-supplied ────────────────────────────
 if ([string]::IsNullOrWhiteSpace($BundleDir)) {
     Write-Host "==> building client bundle via scripts/package-client.ps1"
@@ -77,6 +146,7 @@ if ([string]::IsNullOrWhiteSpace($BundleDir)) {
     # Array splatting can mis-bind "-ServerUrl" as the *value* of $ServerUrl
     # when the target parameter has an implicit position.
     $pkgArgs = @{ ServerUrl = $ServerUrl }
+    if (-not [string]::IsNullOrWhiteSpace($Target)) { $pkgArgs.Target = $Target }
     if ($AllowLoopback) { $pkgArgs.AllowLoopback = $true }
     & (Join-Path $ScriptDir "package-client.ps1") @pkgArgs
     if ($LASTEXITCODE -ne 0) { throw "package-client.ps1 failed" }
@@ -86,7 +156,7 @@ if ([string]::IsNullOrWhiteSpace($BundleDir)) {
     $Version = (Select-String -Path "Cargo.toml" -Pattern '^version\s*=\s*"([^"]+)"' `
         | Select-Object -First 1).Matches[0].Groups[1].Value
     if ([string]::IsNullOrWhiteSpace($Version)) { $Version = "dev" }
-    $Arch       = $env:PROCESSOR_ARCHITECTURE.ToLower()
+    $Arch       = Get-WindowsArchName -TargetTriple $Target -BundleName ""
     $BundleName = "Memstroy-inator-windows-$Arch-$Version"
     $BundleDir  = Join-Path $RootDir "dist\$BundleName"
 }
@@ -97,6 +167,8 @@ if (-not (Test-Path $BundleDir -PathType Container)) {
 }
 $BundleDirAbs   = (Resolve-Path $BundleDir).Path
 $BundleBaseName = Split-Path $BundleDirAbs -Leaf
+$BundleArch     = Get-WindowsArchName -TargetTriple $Target -BundleName $BundleBaseName
+$InnoArch       = Get-InnoArchitectureDirectives $BundleArch
 $GuiExe         = Join-Path $BundleDirAbs "bin\memstroy-gui.exe"
 if (-not (Test-Path $GuiExe)) {
     Write-Error "error: $GuiExe not found"
@@ -128,17 +200,17 @@ Write-Host "    bin\ffmpeg.exe  ${FfmpegSizeMb} MB"
 Write-Host "    bin\ffprobe.exe ${FfprobeSizeMb} MB"
 
 # ── Verify side-by-side VC++ runtime DLLs ───────────────────────────
-# Users without the Microsoft VC++ Redistributable installed otherwise
-# fail at process start with "vcruntime140.dll was not found" before
-# our own error handling can run.
+# Client bundles are built with crt-static and package-client.ps1 checks
+# that the shipped Rust binaries do not import VC runtime DLLs. If the
+# DLLs are present we list them; if not, a static-CRT bundle is still OK.
 $RequiredVcRuntime = Join-Path $BundleDirAbs "bin\vcruntime140.dll"
-if (-not (Test-Path $RequiredVcRuntime)) {
-    Write-Error "error: bundled VC runtime is missing: $RequiredVcRuntime. Rebuild the bundle with scripts/package-client.ps1 so vcruntime140.dll is staged next to memstroy-gui.exe."
-    exit 3
-}
 $OptionalVcRuntimeDlls = @("vcruntime140_1.dll", "msvcp140.dll", "concrt140.dll")
-Write-Host "==> verified bundled VC runtime:"
-Write-Host "    bin\vcruntime140.dll"
+Write-Host "==> bundled VC runtime:"
+if (Test-Path $RequiredVcRuntime) {
+    Write-Host "    bin\vcruntime140.dll"
+} else {
+    Write-Host "    none found; static CRT bundle expected"
+}
 foreach ($dll in $OptionalVcRuntimeDlls) {
     $dllPath = Join-Path $BundleDirAbs "bin\$dll"
     if (Test-Path $dllPath) {
@@ -265,7 +337,16 @@ $IssLines = @(
     'WizardStyle=modern'
     'PrivilegesRequired=lowest'
     'PrivilegesRequiredOverridesAllowed=dialog commandline'
-    'ArchitecturesInstallIn64BitMode=x64'
+    $(if (-not [string]::IsNullOrWhiteSpace($InnoArch.Allowed)) {
+        "ArchitecturesAllowed=$($InnoArch.Allowed)"
+    } else {
+        '; ArchitecturesAllowed= (32-bit compatible bundle)'
+    })
+    $(if (-not [string]::IsNullOrWhiteSpace($InnoArch.InstallIn64BitMode)) {
+        "ArchitecturesInstallIn64BitMode=$($InnoArch.InstallIn64BitMode)"
+    } else {
+        '; ArchitecturesInstallIn64BitMode= (32-bit install mode)'
+    })
     "AppMutex=$AppMutexName"
     'CloseApplications=yes'
     'RestartApplications=no'

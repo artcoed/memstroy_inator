@@ -31,7 +31,7 @@ use std::sync::mpsc::Sender;
 use std::time::Duration;
 
 use memstroy_core::{Overlay, Scene};
-use memstroy_render::{ffmpeg_binary, render_scene};
+use memstroy_render::{ffmpeg_binary, render_scene_with_quality, RenderQuality};
 use serde::Deserialize;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::runtime::Handle;
@@ -43,7 +43,10 @@ use tracing::{info, warn};
 pub enum JobEvent {
     Status(String),
     RenderLog(String),
-    RenderOutputChosen(Option<PathBuf>),
+    RenderOutputChosen {
+        path: Option<PathBuf>,
+        quality: RenderQuality,
+    },
     RenderFinished(Result<PathBuf, String>),
     RefreshProgress(String),
     /// Mid-refresh signal: the worker has just downloaded one or more
@@ -198,10 +201,11 @@ pub fn spawn_render(
     scene: Scene,
     assets: PathBuf,
     out_path: PathBuf,
+    quality: RenderQuality,
 ) {
     rt.spawn(async move {
         let log_tx = tx.clone();
-        let result = render_scene(&scene, &assets, &out_path, |line| {
+        let result = render_scene_with_quality(&scene, &assets, &out_path, quality, |line| {
             let _ = log_tx.send(JobEvent::RenderLog(line.to_string()));
         })
         .await;

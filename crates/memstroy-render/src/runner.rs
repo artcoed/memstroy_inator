@@ -7,7 +7,7 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tracing::{info, warn};
 
-use crate::plan::{build_plan, FfmpegPlan};
+use crate::plan::{build_plan, FfmpegPlan, RenderQuality};
 
 /// Locate ffmpeg: env var `MEMSTROY_FFMPEG`, bundled copy next to the
 /// installed executable, then PATH.
@@ -97,9 +97,29 @@ pub async fn render_scene<F>(
 where
     F: FnMut(&str) + Send,
 {
+    render_scene_with_quality(
+        scene,
+        assets_root,
+        output_path,
+        RenderQuality::default(),
+        &mut on_log,
+    )
+    .await
+}
+
+pub async fn render_scene_with_quality<F>(
+    scene: &Scene,
+    assets_root: &Path,
+    output_path: &Path,
+    quality: RenderQuality,
+    mut on_log: F,
+) -> Result<()>
+where
+    F: FnMut(&str) + Send,
+{
     if use_legacy_filtergraph_backend() {
         let plan = build_plan(scene, output_path, assets_root)?;
-        return run_plan(&plan, &mut on_log).await;
+        return run_plan_with_quality(&plan, quality, &mut on_log).await;
     }
 
     // CPU path. We stream progress back to the caller in real time
@@ -109,7 +129,10 @@ where
     // of "0% for 5 minutes, then jump to 100%". Without the channel
     // the user reported "бесконечный 0%" because we only flushed
     // log events AFTER the worker returned.
-    on_log("CPU compositor: preparing scene...");
+    on_log(&format!(
+        "CPU compositor: preparing scene ({})...",
+        quality.label()
+    ));
 
     let scene_owned = scene.clone();
     let assets_root_owned = assets_root.to_path_buf();
@@ -117,10 +140,11 @@ where
     let (prog_tx, prog_rx) = std::sync::mpsc::channel::<crate::compositor::Progress>();
 
     let join_handle = tokio::task::spawn_blocking(move || {
-        crate::compositor::render_scene_cpu(
+        crate::compositor::render_scene_cpu_with_quality(
             &scene_owned,
             &assets_root_owned,
             &output_path_owned,
+            quality,
             |progress| {
                 let _ = prog_tx.send(progress);
             },
@@ -239,8 +263,12 @@ async fn render_preview_frame_filtergraph(
     result
 }
 
-async fn run_plan<F: FnMut(&str)>(plan: &FfmpegPlan, on_log: &mut F) -> Result<()> {
-    let args = plan.to_args();
+async fn run_plan_with_quality<F: FnMut(&str)>(
+    plan: &FfmpegPlan,
+    quality: RenderQuality,
+    on_log: &mut F,
+) -> Result<()> {
+    let args = plan.to_args_with_quality(quality);
     let result = run_args(&args, on_log).await;
     if result.is_err() {
         // Surface the filter complex string into the structured log so

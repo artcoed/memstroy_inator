@@ -12,16 +12,20 @@
 #       models/u2netp.onnx                 AI background removal
 #       examples/, README.md
 #       Memstroy-inator.sh                 launcher copied from the bundle
+#       Memstroy-inator-safe-graphics.sh   fallback launcher
+#       memstroy.sh                        CLI launcher
 #       uninstall.sh                       uninstaller (removes everything)
 #
-#   ~/.local/bin/memstroy-gui              symlink → bin/memstroy-gui
+#   ~/.local/bin/memstroy-gui              symlink -> Memstroy-inator.sh
+#   ~/.local/bin/memstroy                  symlink -> memstroy.sh
 #   ~/.local/share/applications/
 #       Memstroy-inator.desktop            menu entry
+#       Memstroy-inator-safe-graphics.desktop
 #   ~/Desktop/Memstroy-inator.desktop      desktop shortcut (chmod +x)
 #
 # If the user runs the installer with `sudo`, it switches to a
 # system-wide install at `/opt/Memstroy-inator/` with menu entries in
-# `/usr/share/applications/` and the binary symlinked to
+# `/usr/share/applications/` and the launcher symlinked to
 # `/usr/local/bin/memstroy-gui`. The desktop shortcut is skipped in
 # that mode (no single "Desktop" to drop it on).
 #
@@ -49,6 +53,11 @@
 #                          (default: ./dist).
 #   --name <name>          Installer base name (without .run suffix);
 #                          defaults to the bundle directory's name.
+#   --fetch-ffmpeg         Forwarded to package-client.sh for fresh
+#                          Linux bundles.
+#   --allow-dynamic-ffmpeg Forwarded to package-client.sh. Use only
+#                          for non-portable test bundles.
+#   --no-bundle-libs       Forwarded to package-client.sh.
 #   --allow-loopback       Forwarded to package-client.sh.
 #
 # The script writes ONE artefact: <out>/<name>.run. That file is the
@@ -66,6 +75,9 @@ INSTALLER_NAME=""
 BUNDLE_DIR=""
 SERVER_URL=""
 ALLOW_LOOPBACK=0
+FETCH_FFMPEG=0
+ALLOW_DYNAMIC_FFMPEG=0
+NO_BUNDLE_LIBS=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -73,9 +85,12 @@ while [[ $# -gt 0 ]]; do
         --name)           INSTALLER_NAME="$2"; shift 2 ;;
         --bundle-dir)     BUNDLE_DIR="$2"; shift 2 ;;
         --server-url)     SERVER_URL="$2"; shift 2 ;;
+        --fetch-ffmpeg)   FETCH_FFMPEG=1; shift ;;
+        --allow-dynamic-ffmpeg) ALLOW_DYNAMIC_FFMPEG=1; shift ;;
+        --no-bundle-libs) NO_BUNDLE_LIBS=1; shift ;;
         --allow-loopback) ALLOW_LOOPBACK=1; shift ;;
         -h|--help)
-            sed -n '2,55p' "$0"
+            sed -n '2,63p' "$0"
             exit 0
             ;;
         *)
@@ -96,6 +111,15 @@ if [[ -z "${BUNDLE_DIR}" ]]; then
     if [[ "${ALLOW_LOOPBACK}" -eq 1 ]]; then
         pkg_args+=(--allow-loopback)
     fi
+    if [[ "${FETCH_FFMPEG}" -eq 1 ]]; then
+        pkg_args+=(--fetch-ffmpeg)
+    fi
+    if [[ "${ALLOW_DYNAMIC_FFMPEG}" -eq 1 ]]; then
+        pkg_args+=(--allow-dynamic-ffmpeg)
+    fi
+    if [[ "${NO_BUNDLE_LIBS}" -eq 1 ]]; then
+        pkg_args+=(--no-bundle-libs)
+    fi
     echo "==> building client bundle via scripts/package-client.sh"
     "${SCRIPT_DIR}/package-client.sh" "${pkg_args[@]}"
 
@@ -115,6 +139,52 @@ fi
 if [[ ! -x "${BUNDLE_DIR}/bin/memstroy-gui" ]]; then
     echo "error: ${BUNDLE_DIR}/bin/memstroy-gui not found or not executable" >&2
     exit 3
+fi
+if [[ ! -x "${BUNDLE_DIR}/Memstroy-inator.sh" ]]; then
+    echo "error: ${BUNDLE_DIR}/Memstroy-inator.sh not found or not executable" >&2
+    echo "       Rebuild the bundle with scripts/package-client.sh." >&2
+    exit 3
+fi
+
+check_bundled_ffmpeg_tool() {
+    local tool_path="$1"
+    local tool_name="$2"
+    local size
+    local ldd_out
+
+    if [[ ! -x "${tool_path}" ]]; then
+        echo "error: bundled ${tool_name} is missing or not executable: ${tool_path}" >&2
+        exit 3
+    fi
+    if ! "${tool_path}" -version >/dev/null 2>&1; then
+        echo "error: bundled ${tool_name} failed '-version' check: ${tool_path}" >&2
+        exit 3
+    fi
+
+    size="$(wc -c < "${tool_path}" | tr -d '[:space:]')"
+    if [[ "${size}" -lt 1048576 ]]; then
+        echo "error: bundled ${tool_name} is too small and is probably a launcher/shim: ${tool_path}" >&2
+        exit 3
+    fi
+
+    if [[ "${ALLOW_DYNAMIC_FFMPEG}" -eq 0 ]] && command -v ldd >/dev/null 2>&1; then
+        ldd_out="$(ldd "${tool_path}" 2>&1 || true)"
+        if [[ "${ldd_out}" != *"not a dynamic executable"* && "${ldd_out}" != *"statically linked"* ]]; then
+            echo "error: bundled ${tool_name} is dynamically linked: ${tool_path}" >&2
+            echo "       Rebuild with scripts/make-installer.sh --fetch-ffmpeg or pass --allow-dynamic-ffmpeg for tests." >&2
+            exit 3
+        fi
+    fi
+}
+
+check_bundled_ffmpeg_tool "${BUNDLE_DIR}/bin/ffmpeg" ffmpeg
+check_bundled_ffmpeg_tool "${BUNDLE_DIR}/bin/ffprobe" ffprobe
+
+if [[ -f "${BUNDLE_DIR}/lib/manifest.txt" ]]; then
+    echo "==> verified bundled Linux runtime libraries:"
+    echo "    manifest: ${BUNDLE_DIR}/lib/manifest.txt"
+elif [[ "${NO_BUNDLE_LIBS}" -eq 0 ]]; then
+    echo "==> verified bundled Linux runtime libraries: none needed"
 fi
 
 # Optional bundled app icon (catost.png). When absent, the .desktop
@@ -252,6 +322,8 @@ cp -a "${PAYLOAD_ROOT}/." "${INSTALL_DIR}/"
 chmod +x "${INSTALL_DIR}/bin/memstroy-gui" 2>/dev/null || true
 chmod +x "${INSTALL_DIR}/bin/memstroy"     2>/dev/null || true
 chmod +x "${INSTALL_DIR}/Memstroy-inator.sh" 2>/dev/null || true
+chmod +x "${INSTALL_DIR}/Memstroy-inator-safe-graphics.sh" 2>/dev/null || true
+chmod +x "${INSTALL_DIR}/memstroy.sh" 2>/dev/null || true
 
 # ─── App icon (branding logo) ────────────────────────────────────────
 # When the bundle carried a catost.png, place a copy under
@@ -271,21 +343,22 @@ fi
 
 # ─── PATH symlink ────────────────────────────────────────────────────
 mkdir -p "${BIN_LINK_DIR}"
-ln -sf "${INSTALL_DIR}/bin/memstroy-gui" "${BIN_LINK_DIR}/memstroy-gui"
-if [[ -x "${INSTALL_DIR}/bin/memstroy" ]]; then
-    ln -sf "${INSTALL_DIR}/bin/memstroy" "${BIN_LINK_DIR}/memstroy"
+ln -sf "${INSTALL_DIR}/Memstroy-inator.sh" "${BIN_LINK_DIR}/memstroy-gui"
+if [[ -x "${INSTALL_DIR}/memstroy.sh" ]]; then
+    ln -sf "${INSTALL_DIR}/memstroy.sh" "${BIN_LINK_DIR}/memstroy"
 fi
 
 # ─── Menu / desktop entries ──────────────────────────────────────────
 mkdir -p "${DESKTOP_DIR}"
 DESKTOP_FILE="${DESKTOP_DIR}/${APP_NAME}.desktop"
+SAFE_DESKTOP_FILE="${DESKTOP_DIR}/${APP_NAME}-safe-graphics.desktop"
 {
     echo "[Desktop Entry]"
     echo "Type=Application"
     echo "Name=Memstroy-inator"
     echo "GenericName=Meme Video Editor"
     echo "Comment=Assemble Mellstroy-style memes for vertical short videos"
-    echo "Exec=${INSTALL_DIR}/bin/memstroy-gui %F"
+    echo "Exec=${INSTALL_DIR}/Memstroy-inator.sh %F"
     # `Icon=` accepts either an icon-theme name or an absolute path.
     # We use the absolute path the cp above produced when available;
     # when the bundle had no icon we omit the field entirely so the
@@ -299,6 +372,22 @@ DESKTOP_FILE="${DESKTOP_DIR}/${APP_NAME}.desktop"
     echo "StartupNotify=true"
 } > "${DESKTOP_FILE}"
 chmod 644 "${DESKTOP_FILE}"
+
+{
+    echo "[Desktop Entry]"
+    echo "Type=Application"
+    echo "Name=Memstroy-inator (safe graphics)"
+    echo "GenericName=Meme Video Editor"
+    echo "Comment=Launch Memstroy-inator through the WGPU graphics path"
+    echo "Exec=${INSTALL_DIR}/Memstroy-inator-safe-graphics.sh %F"
+    if [[ -n "${ICON_INSTALLED}" ]]; then
+        echo "Icon=${ICON_INSTALLED}"
+    fi
+    echo "Terminal=false"
+    echo "Categories=AudioVideo;Video;AudioVideoEditing;"
+    echo "StartupNotify=true"
+} > "${SAFE_DESKTOP_FILE}"
+chmod 644 "${SAFE_DESKTOP_FILE}"
 
 if command -v update-desktop-database >/dev/null 2>&1; then
     update-desktop-database "${DESKTOP_DIR}" >/dev/null 2>&1 || true
@@ -329,6 +418,7 @@ APP_NAME="${APP_NAME}"
 
 echo "==> Removing menu entry"
 rm -f "\${DESKTOP_DIR}/\${APP_NAME}.desktop"
+rm -f "\${DESKTOP_DIR}/\${APP_NAME}-safe-graphics.desktop"
 if [[ -n "\${USER_DESKTOP}" ]]; then
     rm -f "\${USER_DESKTOP}/\${APP_NAME}.desktop"
 fi
@@ -353,6 +443,7 @@ chmod +x "${UNINSTALL_SCRIPT}"
 echo
 echo "==> installation complete"
 echo "    launch with: memstroy-gui   (or pick it from the menu)"
+echo "    safe mode : Memstroy-inator (safe graphics)"
 echo "    uninstall  : ${UNINSTALL_SCRIPT}"
 exit 0
 

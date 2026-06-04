@@ -32,6 +32,16 @@ Create an installer for distribution to clients:
 pwsh scripts/make-installer.ps1 -ServerUrl "https://your-server.railway.app" -AllowLoopback
 ```
 
+For a native Windows ARM64 client build:
+
+```powershell
+rustup target add aarch64-pc-windows-msvc
+scoop install llvm
+pwsh scripts/make-installer.ps1 `
+  -ServerUrl "https://your-server.railway.app" `
+  -Target aarch64-pc-windows-msvc
+```
+
 This internally calls `scripts/package-client.ps1` which:
 - Builds GUI **without** `local-server` feature (excludes `memstroy-assets-server`, `axum`, `tower-http`)
 - Builds CLI **without** `telegram` feature (excludes `memstroy-tg`, `scraper`, `reqwest`)
@@ -42,6 +52,32 @@ The resulting installer will:
 - Connect to your remote assets-server only (no local server)
 - CLI will have `render`, `preview`, `chroma`, `remove-bg`, `new` commands
 - CLI will **not** have `download` command (Telegram scraping not needed for clients)
+
+## Client Distribution (Linux .run)
+
+Build one self-extracting installer for GitHub Releases:
+
+```bash
+scripts/make-installer.sh \
+  --server-url "https://your-server.railway.app" \
+  --fetch-ffmpeg
+```
+
+This internally calls `scripts/package-client.sh`, which:
+- Builds GUI **without** `local-server`
+- Builds CLI **without** `telegram`
+- Bundles static Linux `ffmpeg` / `ffprobe` into `bin/`
+- Bundles non-glibc ELF runtime libraries from `ldd` into `lib/`
+- Creates launchers that set `PATH`, `LD_LIBRARY_PATH`, `MEMSTROY_FFMPEG`, and `MEMSTROY_FFPROBE`
+
+The resulting `dist/Memstroy-inator-linux-<arch>-<version>.run` is the file to publish. Users install it with:
+
+```bash
+chmod +x Memstroy-inator-linux-x86_64-0.2.0.run
+./Memstroy-inator-linux-x86_64-0.2.0.run
+```
+
+For widest compatibility, build the Linux release on an old-enough glibc desktop distro, for example Ubuntu 20.04/22.04 x86_64. The bundle intentionally does not ship glibc, the system dynamic loader, or GPU driver libraries.
 
 ## Railway Deployment (Server Only)
 
@@ -58,7 +94,8 @@ This builds **only** the server, not the entire workspace.
 | Scenario | Command | Build Time | Dependencies |
 |----------|---------|------------|--------------|
 | **Local dev** | `cargo build --release` | ~Full | All (GUI + CLI with all features) |
-| **Client** | `scripts/package-client.ps1` | ~50-70% faster | Minimal (no server, no Telegram) |
+| **Client Windows** | `scripts/package-client.ps1` | ~50-70% faster | Minimal (no server, no Telegram) |
+| **Client Linux** | `scripts/make-installer.sh --fetch-ffmpeg` | ~50-70% faster | Minimal + bundled FFmpeg/libs |
 | **Railway** | `nixpacks.toml` | Minimal | Server only |
 
 ## Why Two Binaries?

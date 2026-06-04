@@ -46,9 +46,50 @@ pub enum InputKind {
     Audio,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RenderQuality {
+    #[default]
+    High,
+    Maximum,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncoderSettings {
+    pub preset: &'static str,
+    pub crf: &'static str,
+}
+
+impl RenderQuality {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::High => "high quality",
+            Self::Maximum => "maximum quality",
+        }
+    }
+
+    pub fn encoder_settings(self) -> EncoderSettings {
+        match self {
+            Self::High => EncoderSettings {
+                preset: "slow",
+                crf: "10",
+            },
+            Self::Maximum => EncoderSettings {
+                preset: "veryslow",
+                crf: "6",
+            },
+        }
+    }
+}
+
 impl FfmpegPlan {
     /// Convert into argv form ready for `Command::args`.
     pub fn to_args(&self) -> Vec<String> {
+        self.to_args_with_quality(RenderQuality::default())
+    }
+
+    /// Convert into argv form with explicit final-encode quality.
+    pub fn to_args_with_quality(&self, quality: RenderQuality) -> Vec<String> {
+        let encoder = quality.encoder_settings();
         let mut args = vec!["-y".into(), "-hide_banner".into()];
         for inp in &self.inputs {
             // Image inputs are looped at the FPS of the output and
@@ -116,33 +157,18 @@ impl FfmpegPlan {
         args.push("yuv420p".into());
         args.push("-c:v".into());
         args.push("libx264".into());
-        // ── x264 speed/quality trade-off ──
-        //
-        // Was `medium`+`crf=19`. Switching to `faster`+`crf=20`
-        // roughly halves the encode wall-clock on typical scenes
-        // while keeping perceptual quality essentially identical:
-        // a +1 CRF step is below the visible-difference threshold
-        // for short-form footage (the bitrate goes up ~10–12% to
-        // compensate, but the encode-time savings are far larger
-        // than the bitrate hit on file size). The user explicitly
-        // asked for "ускорить рендер видео при том что качество
-        // отлично соответствует требуемому".
+        // Prioritise final render quality over throughput. Text, masks
+        // and chroma-key edges show compression artifacts quickly, so keep
+        // CRF low and let x264 spend more time on mode decisions.
         args.push("-preset".into());
-        args.push("faster".into());
+        args.push(encoder.preset.into());
         args.push("-crf".into());
-        args.push("20".into());
+        args.push(encoder.crf.into());
         // Use as many CPU cores as ffmpeg auto-detects. `0` is
         // ffmpeg's documented "automatic" sentinel; explicit so we
         // don't inherit a 1-thread limit from a sandboxed parent.
         args.push("-threads".into());
         args.push("0".into());
-        // Tune for fast-cut / animated content: disables psy-rdo
-        // tweaks tuned for dark grain and cuts another 10–15% off
-        // the encode cost. Memstroy footage is mostly bright,
-        // overlay-heavy short-form clips, so the `fastdecode` tune
-        // matches the actual content profile.
-        args.push("-tune".into());
-        args.push("fastdecode".into());
         // `+faststart` relocates the moov atom to the front of the
         // file after encoding finishes, so players (and the editor
         // itself when re-importing the result) can start playback
@@ -190,4 +216,48 @@ pub fn build_plan(scene: &Scene, output: &Path, assets_root: &Path) -> Result<Ff
         duration: canonical.output.duration,
         cleanup_paths,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minimal_plan() -> FfmpegPlan {
+        FfmpegPlan {
+            inputs: Vec::new(),
+            filter_complex: "nullsrc=s=16x16:d=1[v]".into(),
+            map_video: "[v]".into(),
+            map_audio: None,
+            output: PathBuf::from("out.mp4"),
+            fps: 30,
+            resolution: [16, 16],
+            duration: 1.0,
+            cleanup_paths: Vec::new(),
+        }
+    }
+
+    fn arg_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+        args.windows(2)
+            .find(|pair| pair[0] == flag)
+            .map(|pair| pair[1].as_str())
+    }
+
+    #[test]
+    fn default_quality_uses_improved_high_encode_settings() {
+        let args = minimal_plan().to_args();
+
+        assert_eq!(arg_value(&args, "-preset"), Some("slow"));
+        assert_eq!(arg_value(&args, "-crf"), Some("10"));
+        assert_eq!(arg_value(&args, "-pix_fmt"), Some("yuv420p"));
+        assert!(!args.iter().any(|arg| arg == "fastdecode"));
+    }
+
+    #[test]
+    fn maximum_quality_uses_veryslow_low_crf_settings() {
+        let args = minimal_plan().to_args_with_quality(RenderQuality::Maximum);
+
+        assert_eq!(arg_value(&args, "-preset"), Some("veryslow"));
+        assert_eq!(arg_value(&args, "-crf"), Some("6"));
+        assert_eq!(arg_value(&args, "-pix_fmt"), Some("yuv420p"));
+    }
 }
