@@ -14,7 +14,7 @@ buildCommand = "cargo build --release -p memstroy-assets-server"
 [deploy]
 startCommand = "./target/release/memstroy-assets-server"
 healthcheckPath = "/api/health"
-healthcheckTimeout = 30
+healthcheckTimeout = 120
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 5
 
