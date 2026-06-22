@@ -348,9 +348,15 @@ async fn get_asset(
 // /api/assets/:id/preview
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Default, Deserialize)]
+struct PreviewQuery {
+    proxy: Option<String>,
+}
+
 async fn get_preview(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(query): Query<PreviewQuery>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     validate_asset_id(&id)?;
@@ -360,6 +366,14 @@ async fn get_preview(
     if let (Some(bucket), Some(key)) =
         (state.bucket.as_ref(), entry.thumbnail_object_key.as_deref())
     {
+        if query_bool(query.proxy.as_deref()) || env_truthy("MEMSTROY_BUCKET_PROXY_DOWNLOADS") {
+            return stream_bucket_object_response(bucket, key, &entry.id, 0, &headers)
+                .await
+                .or_else(|e| {
+                    warn!(id = %entry.id, key, error = ?e, "bucket preview proxy failed; serving placeholder");
+                    Ok(fallback_preview_response())
+                });
+        }
         return redirect_to_presigned(bucket, key, "preview")
             .await
             .or_else(|e| {

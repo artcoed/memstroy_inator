@@ -915,7 +915,62 @@ fn is_valid_image_bytes(bytes: &[u8]) -> bool {
     bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP"
 }
 
-async fn download_response_to_file(
+static PREFER_PROXY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub async fn download_response_to_file(
+    client: &reqwest::Client,
+    url: &str,
+    target: &std::path::Path,
+    min_bytes: usize,
+    require_image: bool,
+) -> Result<(), String> {
+    if url.contains("proxy=1") {
+        return download_response_to_file_inner(client, url, target, min_bytes, require_image).await;
+    }
+
+    let use_proxy_first = PREFER_PROXY.load(std::sync::atomic::Ordering::Relaxed);
+    if use_proxy_first {
+        let proxy_url = proxy_download_url(url);
+        let _ = tokio::fs::remove_file(target.with_extension("partial")).await;
+        match download_response_to_file_inner(client, &proxy_url, target, min_bytes, require_image).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                PREFER_PROXY.store(false, std::sync::atomic::Ordering::Relaxed);
+                return Err(e);
+            }
+        }
+    }
+
+    // Direct download
+    let direct_future = download_response_to_file_inner(client, url, target, min_bytes, require_image);
+    let first_err = match tokio::time::timeout(std::time::Duration::from_secs(5), direct_future).await {
+        Ok(Ok(())) => {
+            PREFER_PROXY.store(false, std::sync::atomic::Ordering::Relaxed);
+            return Ok(());
+        }
+        Ok(Err(e)) => e,
+        Err(_) => {
+            let _ = tokio::fs::remove_file(target).await;
+            "operation timed out: direct download exceeded 5 seconds".to_string()
+        }
+    };
+
+    if !should_retry_download_via_proxy(&first_err) {
+        return Err(first_err);
+    }
+
+    let _ = tokio::fs::remove_file(target.with_extension("partial")).await;
+    let proxy_url = proxy_download_url(url);
+    match download_response_to_file_inner(client, &proxy_url, target, min_bytes, require_image).await {
+        Ok(()) => {
+            PREFER_PROXY.store(true, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+async fn download_response_to_file_inner(
     client: &reqwest::Client,
     url: &str,
     target: &std::path::Path,
@@ -1047,7 +1102,6 @@ async fn download_response_to_file(
 fn binary_download_client(timeout: Duration) -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .no_gzip()
-        .http1_only()
         .connect_timeout(Duration::from_secs(5))
         .timeout(timeout)
         .build()
@@ -1061,17 +1115,42 @@ pub async fn download_file(
     url: &str,
     target: &std::path::Path,
 ) -> Result<(), String> {
-    // Guard against HTML/error pages or truncated bodies saved as `.mp4`.
-    // The GUI's `is_usable_local_video` uses the same 4KB threshold.
-    let first_err = match download_response_to_file(client, url, target, 4097, false).await {
-        Ok(()) => {
+    let use_proxy_first = PREFER_PROXY.load(std::sync::atomic::Ordering::Relaxed);
+    if use_proxy_first {
+        let proxy_url = proxy_download_url(url);
+        let _ = tokio::fs::remove_file(target.with_extension("partial")).await;
+        match download_proxy_in_ranges(client, &proxy_url, target, 4097).await {
+            Ok(()) => {
+                if crate::state::EditorState::is_usable_local_video(target) {
+                    return Ok(());
+                }
+                let _ = tokio::fs::remove_file(target).await;
+                PREFER_PROXY.store(false, std::sync::atomic::Ordering::Relaxed);
+                return Err("proxy download produced invalid video".to_string());
+            }
+            Err(e) => {
+                PREFER_PROXY.store(false, std::sync::atomic::Ordering::Relaxed);
+                return Err(e);
+            }
+        }
+    }
+
+    // Direct download
+    let direct_future = download_response_to_file_inner(client, url, target, 4097, false);
+    let first_err = match tokio::time::timeout(std::time::Duration::from_secs(6), direct_future).await {
+        Ok(Ok(())) => {
             if crate::state::EditorState::is_usable_local_video(target) {
+                PREFER_PROXY.store(false, std::sync::atomic::Ordering::Relaxed);
                 return Ok(());
             }
             let _ = tokio::fs::remove_file(target).await;
             "download is not a valid video file".to_string()
         }
-        Err(e) => e,
+        Ok(Err(e)) => e,
+        Err(_) => {
+            let _ = tokio::fs::remove_file(target).await;
+            "operation timed out: direct download exceeded 6 seconds".to_string()
+        }
     };
 
     if !should_retry_download_via_proxy(&first_err) {
@@ -1080,18 +1159,21 @@ pub async fn download_file(
 
     let _ = tokio::fs::remove_file(target.with_extension("partial")).await;
     let proxy_url = proxy_download_url(url);
-    download_proxy_in_ranges(client, &proxy_url, target, 4097)
-        .await
-        .map_err(|proxy_err| {
-            format!("{first_err}; ranged server-proxy retry failed: {proxy_err}")
-        })?;
-    if !crate::state::EditorState::is_usable_local_video(target) {
-        let _ = tokio::fs::remove_file(target).await;
-        return Err(format!(
-            "{first_err}; ranged server-proxy retry produced invalid video"
-        ));
+    match download_proxy_in_ranges(client, &proxy_url, target, 4097).await {
+        Ok(()) => {
+            if crate::state::EditorState::is_usable_local_video(target) {
+                PREFER_PROXY.store(true, std::sync::atomic::Ordering::Relaxed);
+                return Ok(());
+            }
+            let _ = tokio::fs::remove_file(target).await;
+            Err(format!(
+                "{first_err}; ranged server-proxy retry produced invalid video"
+            ))
+        }
+        Err(proxy_err) => {
+            Err(format!("{first_err}; ranged server-proxy retry failed: {proxy_err}"))
+        }
     }
-    Ok(())
 }
 
 fn should_retry_download_via_proxy(error: &str) -> bool {
